@@ -168,11 +168,25 @@ def _require_object_list(payload: Any, kind: str) -> list[dict[str, Any]]:
     return payload
 
 
-def _require_int(payload: Any, kind: str) -> int:
-    """Enforce the expected integer response shape (bools rejected)."""
-    if isinstance(payload, bool) or not isinstance(payload, int):
-        raise ChainError(f"{kind} response was not an integer")
-    return payload
+def _max_block_list_height(payload: list[Any], kind: str) -> int:
+    """Return the maximum ``height`` across a list of block objects (fail closed).
+
+    Accepts only a non-empty list of dicts each carrying an integer
+    ``height`` >= 0 (bools rejected). Any other entry, malformed ``height``,
+    or an empty list raises :class:`ChainError`. The tip is the highest
+    known block.
+    """
+    if not payload:
+        raise ChainError(f"{kind} response was an empty block list")
+    max_height = -1
+    for index, entry in enumerate(payload):
+        if not isinstance(entry, dict):
+            raise ChainError(f"{kind} response block {index} is not an object")
+        height = entry.get("height")
+        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+            raise ChainError(f"{kind} response block {index} has invalid 'height'")
+        max_height = max(max_height, height)
+    return max_height
 
 
 class EsploraClient:
@@ -260,9 +274,26 @@ class EsploraClient:
         return _require_object_list(payload, _KIND_ADDRESS_UTXOS)
 
     def get_tip_height(self) -> int:
-        """Fetch the current chain tip height (``GET {base}/blocks/tip``)."""
+        """Fetch the current chain tip height (``GET {base}/blocks/tip``).
+
+        Mempool.space has been observed (2026-08) to serve this endpoint as
+        a JSON *list* of recent block objects (each carrying an integer
+        ``height``) rather than the documented bare integer, on both
+        testnet4 and mainnet. We therefore tolerate both shapes: a bare
+        non-negative integer (the documented Esplora shape), or a non-empty
+        list of block objects whose maximum ``height`` is returned as the
+        tip (highest known block). Anything else fails closed as
+        :class:`ChainError` — we never fabricate or guess a height.
+        """
         payload = self._request_json(_KIND_TIP_HEIGHT, "/blocks/tip")
-        parsed = _require_int(payload, _KIND_TIP_HEIGHT)
+        if isinstance(payload, bool):
+            raise ChainError(f"{_KIND_TIP_HEIGHT} response was not an integer or block list")
+        if isinstance(payload, int):
+            parsed = payload
+        elif isinstance(payload, list):
+            parsed = _max_block_list_height(payload, _KIND_TIP_HEIGHT)
+        else:
+            raise ChainError(f"{_KIND_TIP_HEIGHT} response was not an integer or block list")
         if parsed < 0:
             raise ChainError(f"{_KIND_TIP_HEIGHT} response was a negative integer")
         return parsed

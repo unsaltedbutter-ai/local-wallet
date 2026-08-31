@@ -147,6 +147,40 @@ def test_zero_tip_height_is_accepted():
     assert len(server.requests) == 1
 
 
+def test_tip_height_list_shape_returns_max_height():
+    # mempool.space has been observed (2026-08) to return a block list here.
+    payload = [{"height": 100}, {"height": 105}, {"height": 102, "extra": "x"}]
+    server = ScriptedServer(httpx.Response(200, json=payload))
+    with server.client() as client:
+        assert client.get_tip_height() == 105  # tip = highest known block
+    assert len(server.requests) == 1
+
+
+def test_tip_height_single_element_list():
+    server = ScriptedServer(httpx.Response(200, json=[{"height": 300_000}]))
+    with server.client() as client:
+        assert client.get_tip_height() == 300_000
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],  # empty list
+        [{}],  # missing height
+        [{"height": "100"}],  # non-int height
+        [{"height": -1}],  # negative height
+        [{"height": True}],  # bool height
+        [123],  # non-dict item
+        [{"height": 1}, "junk"],  # non-dict item among valid entries
+    ],
+)
+def test_tip_height_malformed_list_raises_chain_error(payload):
+    server = ScriptedServer(httpx.Response(200, json=payload))
+    with server.client() as client, pytest.raises(ChainError):
+        client.get_tip_height()
+    assert len(server.requests) == 1  # shape errors are not retried
+
+
 def test_retries_on_429_then_succeeds(monkeypatch: pytest.MonkeyPatch):
     sleeps = _record_sleeps(monkeypatch)
     server = ScriptedServer(httpx.Response(429), httpx.Response(200, json=TXS_PAYLOAD))
