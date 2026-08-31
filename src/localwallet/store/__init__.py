@@ -1,0 +1,1 @@
+"""Store subsystem: SQLite persistence."""

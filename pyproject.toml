@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-wallet"
+version = "0.1.0"
+description = "Local-first testnet Bitcoin wallet driven by a grammar-constrained local LLM."
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+    "embit",
+    "httpx>=0.27",
+    "llama-cpp-python>=0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
