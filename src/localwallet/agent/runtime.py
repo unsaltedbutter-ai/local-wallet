@@ -1,0 +1,222 @@
+"""Model runtime for the agent subsystem (TCK-P0-005; ADR-0001).
+
+Wraps the local GGUF model behind :class:`ModelRuntime` so the rest of the
+agent never touches llama.cpp directly. Design points:
+
+- **Lazy wheel import.** ``llama_cpp`` is imported only when a real
+  generation is first attempted, so this module (and the whole ``agent``
+  package) imports cleanly on machines without the wheel installed. Tests
+  inject a ``generate_fn`` stub instead.
+- **Grammar-constrained decoding.** The real path loads the envelope GBNF
+  grammar (``agent/grammar/envelope.gbnf`` via :data:`GRAMMAR_PATH`) and
+  passes it to every completion, so malformed envelope JSON is
+  syntactically impossible at decode time (PROJECT.md §5 principle 4).
+- **Model path at call time.** The default model path comes from the
+  ``LOCALWALLET_MODEL_PATH`` environment variable and is read when
+  generation happens — never at import time.
+- **No network I/O.** This module performs no network imports and no
+  network calls (lint-enforced; only ``chain/`` may network).
+- **No logging.** Library code never logs (and never logs model paths or
+  user text).
+
+Sampling defaults follow PROJECT.md §7.1 (Gemma 4 model-card defaults:
+temp 1.0, top_p 0.95, top_k 64) with a v0 context budget of 8K
+(ADR-0006).
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Callable
+from pathlib import Path
+from typing import Final
+
+from localwallet.agent.grammar import GRAMMAR_PATH
+
+__all__ = [
+    "DEFAULT_N_CTX",
+    "DEFAULT_TEMPERATURE",
+    "DEFAULT_TOP_K",
+    "DEFAULT_TOP_P",
+    "MODEL_PATH_ENV_VAR",
+    "GenerateFn",
+    "ModelRuntime",
+    "ModelRuntimeError",
+    "load_grammar_text",
+]
+
+#: Environment variable that supplies the default GGUF model path.
+#: Read at generation time (call time), never at import time.
+MODEL_PATH_ENV_VAR: Final[str] = "LOCALWALLET_MODEL_PATH"
+
+#: v0 context budget — ADR-0006 caps context at 8K tokens.
+DEFAULT_N_CTX: Final[int] = 8192
+
+#: Sampling defaults (PROJECT.md §7.1, Gemma 4 model-card defaults).
+DEFAULT_TEMPERATURE: Final[float] = 1.0
+DEFAULT_TOP_P: Final[float] = 0.95
+DEFAULT_TOP_K: Final[int] = 64
+
+#: Test injection seam: given the prompt and the grammar text, return the
+#: raw model completion. ``grammar_text`` is ``None`` only when a caller
+#: explicitly suppresses the grammar; the runtime always passes real text.
+type GenerateFn = Callable[[str, str | None], str]
+
+
+class ModelRuntimeError(RuntimeError):
+    """The model runtime could not produce a completion.
+
+    Raised for: the ``llama-cpp-python`` wheel being absent, a missing or
+    unset model path, a model file that does not exist, or a llama.cpp
+    runtime failure. Messages name configuration values (such as the model
+    path) so the user can fix them; nothing is logged anywhere.
+    """
+
+
+def load_grammar_text() -> str:
+    """Return the envelope GBNF grammar text (read fresh from disk).
+
+    Reads :data:`localwallet.agent.grammar.GRAMMAR_PATH` — a package
+    resource, so no network and no user-visible configuration involved.
+    The file is tiny; caching is deliberately skipped so tests can
+    monkeypatch ``GRAMMAR_PATH`` freely.
+
+    Raises:
+        OSError: the grammar package resource is missing or unreadable
+            (a packaging bug, not a runtime condition).
+    """
+    return GRAMMAR_PATH.read_text(encoding="utf-8")
+
+
+class ModelRuntime:
+    """Single-model completion runtime (llama-cpp-python, in-process).
+
+    The heavy llama.cpp objects are created on the first real generation
+    and reused afterwards. With ``generate_fn`` set, no llama.cpp machinery
+    is ever constructed — the callable *is* the runtime (test seam).
+
+    Args:
+        model_path: Explicit GGUF model path. When ``None``,
+            :data:`MODEL_PATH_ENV_VAR` is consulted at generation time.
+        n_ctx: Context window size (v0 budget: 8K, ADR-0006).
+        temperature: Sampling temperature (default 1.0).
+        top_p: Nucleus sampling cutoff (default 0.95).
+        top_k: Top-k sampling cutoff (default 64).
+        generate_fn: Optional injection seam
+            (``generate_fn(prompt, grammar_text) -> str``). When provided,
+            llama.cpp is never imported and the model path is irrelevant.
+    """
+
+    def __init__(
+        self,
+        model_path: str | None = None,
+        *,
+        n_ctx: int = DEFAULT_N_CTX,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = DEFAULT_TOP_P,
+        top_k: int = DEFAULT_TOP_K,
+        generate_fn: GenerateFn | None = None,
+    ) -> None:
+        self.model_path = model_path
+        self.n_ctx = n_ctx
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self._generate_fn = generate_fn
+        self._llama: object | None = None
+        self._grammar_cls: type | None = None
+        self._grammar: object | None = None
+        self._grammar_text: str | None = None
+
+    def resolve_model_path(self) -> str | None:
+        """Return the effective model path, resolved **at call time**.
+
+        Precedence: the explicit constructor argument, then the
+        :data:`MODEL_PATH_ENV_VAR` environment variable. ``None`` when
+        neither is set.
+        """
+        if self.model_path:
+            return self.model_path
+        return os.environ.get(MODEL_PATH_ENV_VAR) or None
+
+    def generate(self, prompt: str, *, grammar_text: str | None = None) -> str:
+        """Produce one grammar-constrained completion for ``prompt``.
+
+        With an injected ``generate_fn``, delegates to it, passing the
+        envelope grammar text (loaded from :data:`GRAMMAR_PATH` unless
+        overridden). Otherwise runs the llama.cpp real path with the
+        grammar applied to decoding.
+
+        Args:
+            prompt: The fully assembled prompt (system + facts +
+                conversation + user turn — see ``agent/loop.py``).
+            grammar_text: Optional grammar override; defaults to the
+                package's ``envelope.gbnf`` text.
+
+        Returns:
+            The raw model output string. Callers must treat it as
+            untrusted input — the only sanctioned consumer is
+            :func:`localwallet.protocol.handle_raw`.
+
+        Raises:
+            ModelRuntimeError: the runtime is unusable (wheel absent,
+                model path unset/missing) or generation failed.
+        """
+        text = grammar_text if grammar_text is not None else load_grammar_text()
+        if self._generate_fn is not None:
+            return self._generate_fn(prompt, text)
+        return self._generate_with_llama(prompt, text)
+
+    def _generate_with_llama(self, prompt: str, grammar_text: str) -> str:
+        """Real llama.cpp path: cached model + cached grammar, one call."""
+        llama = self._ensure_llama()
+        grammar = self._ensure_grammar(grammar_text)
+        return llama(  # type: ignore[operator]
+            prompt=prompt,
+            grammar=grammar,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+        )
+
+    def _ensure_llama(self) -> object:
+        """Lazily import llama_cpp and load the model (first use only).
+
+        The import lives here — not at module top level — so this module
+        imports cleanly without the wheel installed (TCK-P0-005).
+        """
+        if self._llama is not None:
+            return self._llama
+        try:
+            from llama_cpp import (  # deliberate lazy import (ADR-0001)
+                Llama,
+                LlamaGrammar,
+            )
+        except ImportError as exc:
+            msg = (
+                "llama-cpp-python is not installed; install it to run the local "
+                "model, or inject a generate_fn for testing"
+            )
+            raise ModelRuntimeError(msg) from exc
+
+        model_path = self.resolve_model_path()
+        if not model_path:
+            msg = f"no model path configured: pass model_path= or set {MODEL_PATH_ENV_VAR}"
+            raise ModelRuntimeError(msg)
+        if not Path(model_path).is_file():
+            raise ModelRuntimeError(f"model file not found: {model_path}")
+
+        self._llama = Llama(model_path=model_path, n_ctx=self.n_ctx, verbose=False)
+        self._grammar_cls = LlamaGrammar
+        return self._llama
+
+    def _ensure_grammar(self, grammar_text: str) -> object:
+        """Compile (and cache) the GBNF grammar for constrained decoding."""
+        if self._grammar is not None and self._grammar_text == grammar_text:
+            return self._grammar
+        grammar_cls = self._grammar_cls
+        if grammar_cls is None:  # pragma: no cover — always set together with _llama
+            raise ModelRuntimeError("llama runtime is not initialized")
+        self._grammar = grammar_cls.from_string(grammar_text)
+        self._grammar_text = grammar_text
+        return self._grammar
