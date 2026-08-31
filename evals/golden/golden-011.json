@@ -1,0 +1,5 @@
+{
+  "id": "golden-011",
+  "prompt": "bc1qexample is my address, what's my balance?",
+  "expectation": {"intent": "get_balance", "params": {}}
+}

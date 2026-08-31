@@ -1,0 +1,5 @@
+{
+  "id": "golden-010",
+  "prompt": "Tell me about Bitcoin testnet",
+  "expectation": {"intent": "respond", "text_nonempty": true}
+}

@@ -1,0 +1,5 @@
+{
+  "id": "golden-009",
+  "prompt": "",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

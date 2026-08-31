@@ -1,0 +1,5 @@
+{
+  "id": "golden-005",
+  "prompt": "hello!",
+  "expectation": {"intent": "respond", "text_nonempty": true}
+}

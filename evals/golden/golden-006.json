@@ -1,0 +1,5 @@
+{
+  "id": "golden-006",
+  "prompt": "how much is that in dollars?",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}
