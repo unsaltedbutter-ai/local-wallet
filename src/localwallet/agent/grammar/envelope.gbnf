@@ -1,0 +1,68 @@
+# envelope.gbnf — v0 intent envelope grammar (llama.cpp GBNF)
+#
+# Constrains model decoding to EXACTLY the canonical envelope contract v0:
+#
+#   {"v": 0, "intent": "respond"|"clarify"|"get_balance", "params": {...}}
+#
+#   v        : integer 0 exactly
+#   intent   : closed enum of the three names
+#   params   : required object, whose shape depends on intent:
+#                respond     -> {"text": string}
+#                clarify     -> {"question": string}
+#                get_balance -> {}
+#
+# KEY ORDER: STRICT. The model must emit keys in order v, intent, params.
+# This is simpler for a small model and removes any ambiguity in the
+# intent->params pairing. The chosen intent branch is coupled to its params
+# shape at the grammar level, so a mismatched combination (e.g. intent
+# "respond" with params {}) is syntactically impossible, not just caught later.
+#
+# STRINGS: conservative JSON string rule — standard JSON escapes only
+# (\" \\ \/ \b \f \n \r \t, and \uXXXX), no raw control characters
+# (\x00-\x1f) and no raw quote or backslash.
+#
+# WHITESPACE: optional ASCII whitespace is allowed around tokens so the model
+# can emit readable JSON without being penalized.
+#
+# CROSS-REFERENCE: this grammar maps 1:1 to the pydantic envelope schema v0
+# and MUST be updated together with it (docs/adr/0002-envelope-spec.md).
+
+# Root rule: exactly one envelope (with optional trailing whitespace).
+root ::= envelope ws
+
+# A complete envelope. Opening brace, v=0, then an intent body which carries
+# the intent key, its params, and closes the object. Strict key order; the
+# only keys allowed are v, intent, params — no extras.
+envelope ::= "{" ws "\"v\"" ws ":" ws "0" ws "," ws intent_body
+
+# Each intent branch carries its exact params shape and closes the params
+# object and the envelope. This couples intent -> params at decode time.
+intent_body ::= respond | clarify | get_balance
+
+# intent "respond" -> params {"text": string}
+respond ::=
+  "\"intent\"" ws ":" ws "\"respond\"" ws "," ws
+  "\"params\"" ws ":" ws
+  "{" ws "\"text\"" ws ":" ws string ws "}" ws "}" ws
+
+# intent "clarify" -> params {"question": string}
+clarify ::=
+  "\"intent\"" ws ":" ws "\"clarify\"" ws "," ws
+  "\"params\"" ws ":" ws
+  "{" ws "\"question\"" ws ":" ws string ws "}" ws "}" ws
+
+# intent "get_balance" -> params {} (empty object)
+get_balance ::=
+  "\"intent\"" ws ":" ws "\"get_balance\"" ws "," ws
+  "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
+
+# Conservative JSON string: any char except quote, backslash, and control
+# chars (\x00-\x1f), OR a valid escape sequence. No raw control characters.
+string ::=
+  "\"" (
+    [^"\\\x00-\x1f] |
+    "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})
+  )* "\""
+
+# Optional ASCII whitespace.
+ws ::= ([ \t\n] ws)?
