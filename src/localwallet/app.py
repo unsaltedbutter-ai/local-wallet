@@ -36,6 +36,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Final
 
+from localwallet.agent.context import sanitize_tool_output
 from localwallet.agent.loop import AgentLoop, AgentTurnResult, AgentTurnStatus
 from localwallet.agent.runtime import MODEL_PATH_ENV_VAR, GenerateFn, ModelRuntime
 from localwallet.chain import ChainError, EsploraClient, balance_from_utxos
@@ -352,26 +353,32 @@ def _print_turn(turn: AgentTurnResult, output_fn: Callable[[str], None]) -> None
     Balance values are printed verbatim from the handler result dict —
     the UI computes nothing, and the model narrates no numbers.
     """
+    # Every string that may originate from the model (or that the model can
+    # influence) is passed through sanitize_tool_output immediately before
+    # printing (SR-006 minor 1): the envelope grammar permits \\uXXXX, so ESC
+    # (ANSI) and bidi control characters could otherwise reach the terminal.
+    # Code-owned fallback strings are sanitized uniformly too. Plain text is
+    # unaffected — only Cc/Cf Unicode categories are stripped.
     if turn.status is AgentTurnStatus.CLARIFIED:
-        output_fn(turn.user_message or _GENERIC_FAILURE)
+        output_fn(sanitize_tool_output(turn.user_message or _GENERIC_FAILURE))
         return
     if turn.status is AgentTurnStatus.FAILED:
-        output_fn(turn.user_message or _GENERIC_FAILURE)
+        output_fn(sanitize_tool_output(turn.user_message or _GENERIC_FAILURE))
         return
 
     envelope = turn.envelope
     if envelope is None:  # pragma: no cover — OK turns always carry one
-        output_fn(_GENERIC_FAILURE)
+        output_fn(sanitize_tool_output(_GENERIC_FAILURE))
         return
 
     if envelope.intent is IntentName.RESPOND and isinstance(envelope.params, RespondParams):
-        output_fn(envelope.params.text)
+        output_fn(sanitize_tool_output(envelope.params.text))
     elif envelope.intent is IntentName.CLARIFY and isinstance(envelope.params, ClarifyParams):
-        output_fn(envelope.params.question)
+        output_fn(sanitize_tool_output(envelope.params.question))
     elif envelope.intent is IntentName.GET_BALANCE:
         _print_balance(turn.result or {}, output_fn)
     else:  # pragma: no cover — closed intent enum
-        output_fn(_GENERIC_FAILURE)
+        output_fn(sanitize_tool_output(_GENERIC_FAILURE))
 
 
 def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
@@ -386,7 +393,13 @@ def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None
     total = result.get("total_sats", 0)
     scanned = result.get("addresses_scanned", 0)
     tip = result.get("tip_height", 0)
+    # SR-006 minor 2: an absent tip_height (handler deliberately omitted it
+    # after a tip-lookup failure) must print "tip unavailable", never a
+    # fabricated "tip height 0".
+    tip_label = f"tip height {tip}" if "tip_height" in result else "tip unavailable"
     output_fn(
         f"Balance (testnet): {confirmed} sats (confirmed) + {unconfirmed} sats (unconfirmed)"
     )
-    output_fn(f"Total {total} sats · {scanned} addresses scanned · tip height {tip}")
+    output_fn(
+        f"Total {total} sats · {scanned} addresses scanned · {tip_label}"
+    )

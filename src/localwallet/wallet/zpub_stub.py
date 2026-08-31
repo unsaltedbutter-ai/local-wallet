@@ -193,11 +193,11 @@ def derive_receive_addresses(
 
     Raises:
         WatchKeyError: ``parsed`` is a mainnet key (Phase 0 testnet gate:
-            "Phase 0 is testnet-only — provide a vpub/tpub"), or ``count``
+            "Phase 0 is testnet-only — provide a vpub/upub/tpub"), or ``count``
             /``branch`` are out of range. Messages never echo key material.
     """
     if parsed.network == "main":
-        raise WatchKeyError("Phase 0 is testnet-only — provide a vpub/tpub")
+        raise WatchKeyError("Phase 0 is testnet-only — provide a vpub/upub/tpub")
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= _MAX_DERIVE_COUNT:
         raise WatchKeyError(f"count must be an integer between 1 and {_MAX_DERIVE_COUNT}")
     if isinstance(branch, bool) or branch not in (0, 1):

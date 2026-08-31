@@ -20,6 +20,9 @@ dev = [
     "ruff>=0.5",
 ]
 
+[project.scripts]
+local-wallet = "localwallet.ui.cli:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
@@ -28,6 +31,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["network: tests that hit the live network (opt-in via LOCALWALLET_E2E_LIVE=1)"]
 
 [tool.ruff]
 line-length = 100

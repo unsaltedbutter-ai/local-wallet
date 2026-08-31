@@ -321,7 +321,7 @@ def test_mainnet_zpub_refused_by_testnet_gate() -> None:
         derive_receive_addresses(parsed)
     message = str(excinfo.value)
     assert "Phase 0 is testnet-only" in message
-    assert "vpub/tpub" in message
+    assert "vpub/upub/tpub" in message
     assert MAINNET_ZPUB not in message  # key never echoed
 
 
@@ -628,6 +628,33 @@ def test_repl_reports_chain_unavailable(monkeypatch: pytest.MonkeyPatch) -> None
     joined = "\n".join(outputs)
     assert "chain unavailable" in joined
     assert "Balance (testnet):" not in joined
+
+
+def test_repl_omitted_tip_prints_tip_unavailable_not_tip_height_0(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SR-006 minor 2: when the handler omits tip_height (tip-lookup
+    failure), the CLI prints 'tip unavailable' — never a fabricated
+    'tip height 0'."""
+    recorded: list[httpx.Request] = []
+    addresses = derive_fixture_addresses()
+    handler = _utxo_handler(
+        {addresses[0]: UTXOS_ADDR0, addresses[1]: UTXOS_ADDR1},
+        recorded,
+        tip_status=500,  # tip lookup fails → tip_height key omitted
+    )
+
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", VPUB],
+        monkeypatch,
+        handler,
+        ["What's my balance?", "exit"],
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    assert "tip unavailable" in joined
+    assert "tip height 0" not in joined
 
 
 def test_repl_refuses_mainnet_zpub_with_exit_code_2(
