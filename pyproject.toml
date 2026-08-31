@@ -31,7 +31,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["network: tests that hit the live network (opt-in via LOCALWALLET_E2E_LIVE=1)"]
+markers = ["network: tests that hit the live network (opt-in via LOCALWALLET_E2E_LIVE=1 or LOCALWALLET_LLM_LIVE=1)"]
 
 [tool.ruff]
 line-length = 100

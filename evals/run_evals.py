@@ -10,16 +10,22 @@ Two modes:
   no network.
 
 - **Model mode** (``--model``): runs each golden prompt through the real
-  local model via ``AgentLoop`` with a recording dispatch table and compares
+  runtime via ``AgentLoop`` with a recording dispatch table and compares
   the emitted intent (and exact params where the expectation demands) against
-  the expectation. Requires a downloaded GGUF via ``--model-path`` or the
-  ``LOCALWALLET_MODEL_PATH`` environment variable.
+  the expectation. Runtime selection mirrors ``app.py``: when
+  ``LOCALWALLET_LLM_BASE_URL`` is set, the ADR-0007 TEMPORARY remote
+  OpenAI-compatible debug bridge is used (debug only — do not draw E2B eval
+  conclusions from it; a one-line disclosure is printed to stderr);
+  otherwise a local GGUF via ``--model-path`` or ``LOCALWALLET_MODEL_PATH``.
 
 Exit codes: ``0`` success (fixture mode all valid; model mode ran and, in
 Phase 0, reports the Phase 6 gate informational score); ``1`` fixture /
-validation failure; ``2`` model mode requested but no model path available.
+validation failure; ``2`` model mode requested but neither the remote
+endpoint nor a model path is available.
 
-No network imports, no randomness, no pytest dependency. Run as
+No network imports at module level (the ADR-0007 remote bridge, which
+speaks HTTP, is imported lazily only when model mode selects it), no
+randomness, no pytest dependency. Run as
 ``python evals/run_evals.py`` or ``python -m evals.run_evals``. The runner
 never executes model text: it only routes raw output through
 ``validate_payload``/``handle_raw`` and the agent loop.
@@ -32,6 +38,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 # --- sys.path shim ---------------------------------------------------------
 # Let both entrypoints (script and ``python -m``) resolve ``localwallet``
@@ -47,10 +54,20 @@ from localwallet.protocol import (
     handle_raw,
 )
 
+if TYPE_CHECKING:
+    from localwallet.agent.remote_runtime import RemoteOpenAIRuntime, TransportFn
+    from localwallet.agent.runtime import ModelRuntime
+
 _GOLDEN_DIR = Path(__file__).resolve().parent / "golden"
 
 #: Env var supplying the default GGUF model path (matches agent/runtime.py).
 _MODEL_PATH_ENV_VAR = "LOCALWALLET_MODEL_PATH"
+
+#: Env vars for the ADR-0007 TEMPORARY remote-LLM debug bridge (match
+#: agent/remote_runtime.py; kept as literals here so fixture mode never
+#: imports the network-capable module).
+_LLM_BASE_URL_ENV_VAR = "LOCALWALLET_LLM_BASE_URL"
+_LLM_MODEL_ENV_VAR = "LOCALWALLET_LLM_MODEL"
 
 #: Phase 6 gate threshold (PROJECT.md §12 Phase 6 AC: eval pass >= 95%).
 #: In Phase 0 this is informational (see :data:`_ENFORCE_PHASE6_GATE`).
@@ -196,18 +213,59 @@ def _matches_expectation(result, expectation: dict[str, object]) -> bool:
     return _params_ok(expectation, result.envelope.params.model_dump())
 
 
-def _run_model_mode(cases: list[dict[str, object]], model_path: str) -> int:
+def select_runtime(
+    model_path: str | None = None,
+    *,
+    transport: TransportFn | None = None,
+) -> tuple[ModelRuntime | RemoteOpenAIRuntime | None, str | None]:
+    """Pick the ``--model``-mode runtime, mirroring ``app.py`` precedence.
+
+    1. ``LOCALWALLET_LLM_BASE_URL`` set → :class:`RemoteOpenAIRuntime`
+       (ADR-0007 TEMPORARY debug bridge) plus the one-line disclosure
+       notice (second tuple element; the caller prints it to stderr).
+    2. Else a model path — the explicit ``model_path`` argument
+       (``--model-path``) or, failing that, ``LOCALWALLET_MODEL_PATH`` — →
+       :class:`ModelRuntime` with no notice.
+    3. Else ``(None, None)`` — the caller exits 2 with the existing message.
+
+    Pure: prints nothing, performs no network I/O. ``transport`` is a test
+    seam forwarded to the remote runtime; production callers omit it.
+    """
+    base_url = os.environ.get(_LLM_BASE_URL_ENV_VAR, "").strip()
+    if base_url:
+        # Imported lazily inside the remote branch only, so fixture mode and
+        # local-GGUF mode never import httpx transitively (the ADR-0007
+        # bridge is the sole non-chain network-capable module).
+        from localwallet.agent.remote_runtime import RemoteOpenAIRuntime, debug_notice
+
+        model = os.environ.get(_LLM_MODEL_ENV_VAR, "").strip() or None
+        return RemoteOpenAIRuntime(transport=transport), debug_notice(base_url, model)
+
+    from localwallet.agent.runtime import ModelRuntime
+
+    resolved_path = model_path or os.environ.get(_MODEL_PATH_ENV_VAR)
+    if resolved_path:
+        return ModelRuntime(model_path=resolved_path), None
+    return None, None
+
+
+def _run_model_mode(
+    cases: list[dict[str, object]],
+    runtime: ModelRuntime | RemoteOpenAIRuntime,
+) -> int:
     from localwallet.agent.loop import AgentLoop
     from localwallet.agent.runtime import ModelRuntime
 
-    runtime = ModelRuntime(model_path=model_path)
     recorder = _StubTable()
     loop = AgentLoop(runtime, recorder.table())
 
     passed = 0
     total = len(cases)
     print("MODEL MODE")
-    print(f"model_path: {runtime.resolve_model_path()}")
+    if isinstance(runtime, ModelRuntime):
+        print(f"model_path: {runtime.resolve_model_path()}")
+    else:
+        print("runtime: remote OpenAI-compatible endpoint (ADR-0007; see notice)")
     print()
     print(f"{'case':<12} {'status':<10} {'intent':<14} verdict")
     print("-" * 56)
@@ -262,15 +320,17 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.model:
-        model_path = args.model_path or os.environ.get(_MODEL_PATH_ENV_VAR)
-        if not model_path:
+        runtime, notice = select_runtime(args.model_path)
+        if runtime is None:
             print(
                 f"error: --model requires a model path via --model-path or "
                 f"{_MODEL_PATH_ENV_VAR}",
                 file=sys.stderr,
             )
             return 2
-        return _run_model_mode(cases, model_path)
+        if notice is not None:
+            print(notice, file=sys.stderr)
+        return _run_model_mode(cases, runtime)
 
     return _run_fixture_mode(cases)
 

@@ -52,3 +52,41 @@ def test_lint_allows_network_import_inside_chain(tmp_path):
     ok = chain_dir / "esplora.py"
     ok.write_text("import httpx\n", encoding="utf-8")
     assert LINT.check_tree(tmp_path) == []
+
+
+# ------------------------------------------------- ADR-0007 bridge exception
+
+
+def test_lint_exception_names_exactly_the_bridge_file():
+    """The single lint exception is agent/remote_runtime.py (ADR-0007)."""
+    assert LINT.AGENT_LLM_TRANSPORT_FILES == ("agent/remote_runtime.py",)
+
+
+def test_lint_allows_network_import_in_remote_runtime_bridge(tmp_path):
+    """Network imports are permitted in exactly the ADR-0007 bridge file."""
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    bridge = agent_dir / "remote_runtime.py"
+    bridge.write_text(
+        "import httpx\nfrom httpx import URL\nfrom urllib.parse import urlsplit\n",
+        encoding="utf-8",
+    )
+    assert LINT.check_tree(tmp_path) == []
+
+
+def test_lint_still_flags_network_imports_in_other_agent_files(tmp_path):
+    """Every other agent/ file stays banned — the exception is not a prefix."""
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "remote_runtime.py").write_text("# no imports here\n", encoding="utf-8")
+    (agent_dir / "loop.py").write_text("import httpx\n", encoding="utf-8")
+    (agent_dir / "runtime.py").write_text("import socket\n", encoding="utf-8")
+    (agent_dir / "remote_runtime_v2.py").write_text("import requests\n", encoding="utf-8")
+    violations = LINT.check_tree(tmp_path)
+    flagged = {v.path.name for v in violations}
+    assert flagged == {"loop.py", "runtime.py", "remote_runtime_v2.py"}
+
+
+def test_lint_passes_on_real_tree_with_bridge_import():
+    """The real remote_runtime.py (which imports httpx) lints clean."""
+    assert LINT.check_tree(LINT.SRC_ROOT) == []

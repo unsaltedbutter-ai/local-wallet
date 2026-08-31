@@ -37,7 +37,15 @@ LOCALWALLET_MODEL_PATH=/path/to/model.gguf python evals/run_evals.py --model
 python evals/run_evals.py --model --model-path /path/to/model.gguf
 ```
 
-Without a model path in model mode, the runner fails loudly (exit 2).
+Remote bridge mode — instead of a local GGUF, set
+`LOCALWALLET_LLM_BASE_URL` (plus `LOCALWALLET_LLM_MODEL`) to use an
+OpenAI-compatible endpoint. This is a temporary debug bridge
+(`docs/adr/0007-temporary-openai-compat-runtime.md`); chat text leaves the
+machine to that host. No eval conclusions about the pinned E2B should be
+drawn from a non-E2B endpoint.
+
+Without a model path (and no remote endpoint) in model mode, the runner
+fails loudly (exit 2).
 
 ## What golden / redteam are
 

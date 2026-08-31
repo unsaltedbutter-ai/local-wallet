@@ -10,8 +10,9 @@ protocol, wallet, or chain logic itself:
 - :func:`run` / :func:`main` — CLI wiring: read the watch-only key from
   ``--zpub`` or ``LOCALWALLET_ZPUB``, derive addresses (the testnet gate
   lives in the wallet stub), build the chain client from
-  :class:`~localwallet.config.Settings`, pick the model runtime (the real
-  local GGUF via ``LOCALWALLET_MODEL_PATH``, or the documented
+  :class:`~localwallet.config.Settings`, pick the model runtime (the
+  temporary remote debug bridge via ``LOCALWALLET_LLM_BASE_URL``, ADR-0007;
+  the real local GGUF via ``LOCALWALLET_MODEL_PATH``; or the documented
   ``--stub-llm`` dev mode), and run the chat REPL.
 
 Invariants honored here:
@@ -33,11 +34,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import Final
 
 from localwallet.agent.context import sanitize_tool_output
 from localwallet.agent.loop import AgentLoop, AgentTurnResult, AgentTurnStatus
+from localwallet.agent.remote_runtime import (
+    LLM_BASE_URL_ENV_VAR,
+    LLM_MODEL_ENV_VAR,
+    RemoteOpenAIRuntime,
+    debug_notice,
+)
 from localwallet.agent.runtime import MODEL_PATH_ENV_VAR, GenerateFn, ModelRuntime
 from localwallet.chain import ChainError, EsploraClient, balance_from_utxos
 from localwallet.config import Settings
@@ -245,8 +253,10 @@ def run(
     """Wire the application from ``argv``/environment and run the REPL.
 
     Configuration precedence: ``--zpub`` overrides ``LOCALWALLET_ZPUB``;
-    the real model runtime (:data:`MODEL_PATH_ENV_VAR`) takes precedence
-    over ``--stub-llm`` dev mode.
+    the model runtime is picked as remote debug bridge
+    (:data:`~localwallet.agent.remote_runtime.LLM_BASE_URL_ENV_VAR`, ADR-0007,
+    with a one-line disclosure), then the real local model
+    (:data:`MODEL_PATH_ENV_VAR`), then ``--stub-llm`` dev mode.
 
     Args:
         argv: CLI arguments (defaults to ``sys.argv[1:]``).
@@ -273,8 +283,28 @@ def run(
         output_fn(f"Watch key rejected: {exc}")
         return 2
 
-    if os.environ.get(MODEL_PATH_ENV_VAR):
-        generate: ModelRuntime | GenerateFn = ModelRuntime()
+    # Pre-flight (SR minor): if the remote debug bridge is opted into but no
+    # model id resolves, fail at startup (exit 2, mirroring the zpub config
+    # error) instead of selecting a runtime that would fail every turn. The
+    # message never echoes the env value.
+    remote_base_url = os.environ.get(LLM_BASE_URL_ENV_VAR, "").strip()
+    remote_model = os.environ.get(LLM_MODEL_ENV_VAR, "").strip()
+    if remote_base_url and not remote_model:
+        print(
+            f"No model configured for the remote bridge: set {LLM_MODEL_ENV_VAR} "
+            f"alongside {LLM_BASE_URL_ENV_VAR}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    generate: ModelRuntime | GenerateFn | RemoteOpenAIRuntime
+    if remote_base_url:
+        # ADR-0007 (TEMPORARY debug bridge): selected only via explicit env,
+        # with a one-line disclosure that chat text leaves this machine.
+        generate = RemoteOpenAIRuntime()
+        output_fn(debug_notice(remote_base_url, remote_model))
+    elif os.environ.get(MODEL_PATH_ENV_VAR):
+        generate = ModelRuntime()
     elif args.stub_llm:
         generate = stub_generate
     else:
@@ -301,6 +331,11 @@ def run(
         pass  # clean exit on Ctrl-C
     finally:
         client.close()
+        # The remote debug bridge also owns a client (httpx) — close it
+        # alongside the Esplora client when it exposes close().
+        close = getattr(generate, "close", None)
+        if callable(close):
+            close()
     return 0
 
 
