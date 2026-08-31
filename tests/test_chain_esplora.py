@@ -121,6 +121,32 @@ def test_default_client_uses_settings_defaults():
     assert request.url.path == "/testnet4/api/blocks/tip"
 
 
+def test_env_override_flows_through_to_client(monkeypatch: pytest.MonkeyPatch):
+    # The defaults source honors LOCALWALLET_* env vars via Settings.from_env().
+    monkeypatch.setenv("LOCALWALLET_REQUEST_TIMEOUT_S", "3.5")
+    server = ScriptedServer(httpx.Response(200, json=870_000))
+    client = EsploraClient(transport=httpx.MockTransport(server.handler))
+    try:
+        # The defaults source honored the env override for a value we left at None.
+        assert client._config.timeout_s == 3.5
+    finally:
+        client.close()
+
+
+def test_negative_tip_height_raises_chain_error():
+    server = ScriptedServer(httpx.Response(200, json=-1))
+    with server.client() as client, pytest.raises(ChainError, match="negative integer"):
+        client.get_tip_height()
+    assert len(server.requests) == 1  # shape/bound errors are not retried
+
+
+def test_zero_tip_height_is_accepted():
+    server = ScriptedServer(httpx.Response(200, json=0))
+    with server.client() as client:
+        assert client.get_tip_height() == 0
+    assert len(server.requests) == 1
+
+
 def test_retries_on_429_then_succeeds(monkeypatch: pytest.MonkeyPatch):
     sleeps = _record_sleeps(monkeypatch)
     server = ScriptedServer(httpx.Response(429), httpx.Response(200, json=TXS_PAYLOAD))

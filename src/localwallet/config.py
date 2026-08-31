@@ -20,15 +20,13 @@ class Settings:
     network: str = "testnet"
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         """Build a Settings instance, overriding defaults from LOCALWALLET_* env vars.
 
         Recognized variables: ``LOCALWALLET_ESPLORA_BASE_URL``,
         ``LOCALWALLET_REQUEST_TIMEOUT_S``, ``LOCALWALLET_MAX_RETRIES``,
         ``LOCALWALLET_NETWORK``. Unknown variables are ignored.
         """
-        defaults = {f.name: f.default for f in fields(cls)}
-
         def _coerce(name: str, value: str):
             field = next(f for f in fields(cls) if f.name == name)
             if isinstance(field.default, int):

@@ -44,7 +44,7 @@ def _check_file(path: Path, violations: list[Violation]) -> None:
                     violations.append(Violation(path, node.lineno, alias.name))
         elif isinstance(node, ast.ImportFrom):
             if node.module and node.module.split(".")[0] in BANNED_TOP_LEVELS:
-                violations.append(Violation(path, node.lineno, node.module))
+                violations.append(Violation(path, node.lineno, node.module.split(".")[0]))
         elif isinstance(node, ast.Call):
             func = node.func
             if (

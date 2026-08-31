@@ -10,6 +10,11 @@ LINT_PATH = REPO_ROOT / "tools" / "lint_network.py"
 def _load_lint():
     spec = importlib.util.spec_from_file_location("lint_network", LINT_PATH)
     module = importlib.util.module_from_spec(spec)
+    # py3.14: dataclass resolution (Violation) requires the module to be in
+    # sys.modules before exec_module, so register it first.
+    import sys
+
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 

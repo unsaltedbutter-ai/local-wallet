@@ -178,10 +178,10 @@ def _require_int(payload: Any, kind: str) -> int:
 class EsploraClient:
     """Synchronous client for a public or self-hosted Esplora API.
 
-    Defaults come from :class:`localwallet.config.Settings` (the pure
-    dataclass defaults — pass ``Settings.from_env()`` values explicitly to
-    honor environment overrides). One ``httpx.Client`` is created per
-    instance and closed on :meth:`close` or context-manager exit.
+    Defaults come from :class:`localwallet.config.Settings` loaded via
+    ``Settings.from_env()``, so ``LOCALWALLET_*`` environment overrides are
+    honored. One ``httpx.Client`` is created per instance and closed on
+    :meth:`close` or context-manager exit.
 
     Retry policy: connection errors, timeouts, HTTP 429 and 5xx are retried
     up to ``max_retries`` times with exponential backoff + jitter. Every
@@ -209,7 +209,7 @@ class EsploraClient:
         *,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        defaults = ChainConfig.from_settings(Settings())
+        defaults = ChainConfig.from_settings(Settings.from_env())
         self._config = ChainConfig(
             base_url=defaults.base_url if base_url is None else base_url,
             timeout_s=defaults.timeout_s if timeout_s is None else timeout_s,
@@ -262,7 +262,10 @@ class EsploraClient:
     def get_tip_height(self) -> int:
         """Fetch the current chain tip height (``GET {base}/blocks/tip``)."""
         payload = self._request_json(_KIND_TIP_HEIGHT, "/blocks/tip")
-        return _require_int(payload, _KIND_TIP_HEIGHT)
+        parsed = _require_int(payload, _KIND_TIP_HEIGHT)
+        if parsed < 0:
+            raise ChainError(f"{_KIND_TIP_HEIGHT} response was a negative integer")
+        return parsed
 
     def _request_json(self, kind: str, path: str) -> Any:
         """GET ``{base}{path}`` under the retry policy; return parsed JSON.
