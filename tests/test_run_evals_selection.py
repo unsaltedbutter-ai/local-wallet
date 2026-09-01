@@ -8,6 +8,7 @@ transport — no live network.
 
 from __future__ import annotations
 
+import collections
 import importlib.util
 import sys
 from pathlib import Path
@@ -126,3 +127,22 @@ def test_fixture_mode_default_exit_zero(capsys: pytest.CaptureFixture[str]) -> N
     assert code == 0
     assert "FIXTURE MODE" in out
     assert "RESULT: all fixtures valid" in out
+
+
+def test_version_guard_rejects_old_python(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """On Python < 3.12 the guard exits 2 with a clear message, not a SyntaxError."""
+    # In production the guard runs at import time; here we call the factored
+    # function with sys.version_info faked to an old interpreter.
+    # ``sys.version_info`` cannot be instantiated directly, so fake a
+    # compatible namedtuple exposing major/minor/micro and tuple ordering.
+    _OldVersion = collections.namedtuple("_OldVersion", "major minor micro")
+    monkeypatch.setattr(RUN_EVALS.sys, "version_info", _OldVersion(3, 11, 0))
+    with pytest.raises(SystemExit) as excinfo:
+        RUN_EVALS.ensure_python_version()
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "requires Python 3.12+" in err
+    assert "3.11.0" in err
+    assert "Hint: python3 -m venv .venv" in err

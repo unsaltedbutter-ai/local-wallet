@@ -40,6 +40,26 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+
+def ensure_python_version() -> None:
+    """Refuse to run under anything older than Python 3.12.
+
+    The protocol schemas and runtime rely on Python 3.12 syntax and behavior
+    (e.g. PEP 695 ``type`` statements), so an older interpreter fails with a
+    raw SyntaxError before any helpful message. Exit 2 mirrors the existing
+    config-error convention (e.g. ``--model`` without a path).
+    """
+    if sys.version_info < (3, 12):  # noqa: UP036 - guard is for friendly UX on old interpreters
+        sys.stderr.write(
+            f"local-wallet requires Python 3.12+ (you are running "
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}).\n"
+            "Hint: python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'\n"
+        )
+        raise SystemExit(2)
+
+
+ensure_python_version()
+
 # --- sys.path shim ---------------------------------------------------------
 # Let both entrypoints (script and ``python -m``) resolve ``localwallet``
 # from the repo's src/ regardless of the working directory.
