@@ -629,6 +629,50 @@ def _make_new_address_handler(
     return handler
 
 
+def _pending_remaining_s(flow: TxFlow) -> int:
+    """Seconds until the pending transaction expires, floored at 0.
+
+    The age is measured with the flow's OWN injected clock — the same
+    clock that stamped ``created_at`` and that :meth:`TxFlow.confirm`
+    compares against :data:`PENDING_TTL_S` — so a re-shown card or an
+    injected FACTS value can never claim more remaining lifetime than
+    the confirm gate will actually grant (TCK-P2-004 SR fix: expiry
+    honesty). At or past the TTL this reports ``0``; the next confirm
+    attempt then reports the expiry (CREATED → EXPIRED).
+    """
+    pending = flow.pending
+    if pending is None:
+        return 0
+    remaining = PENDING_TTL_S - (flow._clock() - pending.created_at)
+    return max(0, int(remaining))
+
+
+def _pending_tx_facts(flow: TxFlow) -> dict[str, object]:
+    """The pending-transaction FACTS the model must quote verbatim.
+
+    Injected on every turn that STARTS with the flow in ``CREATED``
+    (TCK-P2-004 SR fix): the system prompt instructs the model to quote
+    ``tx_ref`` VERBATIM from the confirmation card, but the card is only
+    printed to the terminal — the model never sees terminal output.
+    These facts are the machine-readable counterpart of the card, built
+    exclusively from the dispatcher-owned pending record (never from
+    user or model text) so a production ``confirm_tx`` envelope can name
+    the right transaction. The values reach the prompt through
+    :func:`~localwallet.agent.context.render_facts` inside the loop,
+    which sanitizes each value (R8); the keys here are code-controlled
+    by construction.
+    """
+    pending = flow.pending
+    if pending is None:  # defensive: CREATED always carries a pending tx
+        return {}
+    return {
+        "pending_tx_ref": pending.tx_ref,
+        "pending_tx_amount_sats": pending.amount_sats,
+        "pending_tx_recipient": pending.recipient,
+        "pending_tx_expires_in_s": _pending_remaining_s(flow),
+    }
+
+
 def _tx_pending_result(flow: TxFlow) -> dict[str, object]:
     """The ``tx_pending`` refusal result, carrying the pending card fields.
 
@@ -636,8 +680,10 @@ def _tx_pending_result(flow: TxFlow) -> dict[str, object]:
     pending (ADR-0013: at most one pending transaction; a stale one is
     recovered explicitly, never reaped). The pending card is re-shown
     from the flow's own record so the user can act on it; rate fields
-    are unknown on re-show (``usd_cents=None``) and ``expires_in_s``
-    keeps the card's nominal TTL label.
+    are unknown on re-show (``usd_cents=None``) and ``expires_in_s`` is
+    the REMAINING ttl (flow's clock, floored at 0) — a re-shown card
+    never claims more lifetime than the confirm gate will grant (a
+    pending expired by the clock is refused at confirm anyway).
     """
     result: dict[str, object] = {"error": "tx_pending"}
     pending = flow.pending
@@ -657,7 +703,7 @@ def _tx_pending_result(flow: TxFlow) -> dict[str, object]:
                 "rate_age_s": None,
                 "rate_fetched_at": None,
                 "fee_target": pending.fee_target,
-                "expires_in_s": PENDING_TTL_S,
+                "expires_in_s": _pending_remaining_s(flow),
             }
         )
     return result
@@ -983,7 +1029,10 @@ def run(
     reference for confirm envelopes) through this seam. ``generate_fn``
     likewise injects a bare model callable ahead of the env/flag
     selection (send-flow e2e tests quote the flow's real pending
-    ``tx_ref``, which the canned stub cannot know).
+    ``tx_ref``, which the canned stub cannot know). Pending
+    confirmations are session-scoped (ADR-0013): the flow lives in
+    memory for this process only, and a pending transaction — including
+    its confirmation state — is lost when the app exits.
 
     Args:
         argv: CLI arguments (defaults to ``sys.argv[1:]``).
@@ -1294,6 +1343,13 @@ def _run_turn(
       did not emit ``confirm_tx``): a guidance line — the flow is
       untouched.
     - NOT_A_DECISION: normal chat; a pending card simply stays pending.
+    - FACTS (TCK-P2-004 SR fix): when the turn starts with a live
+      pending transaction, its machine-readable card (``tx_ref``,
+      amount, recipient, remaining ttl) is injected as the turn's FACTS
+      block — the model quotes ``tx_ref`` from THERE (it never sees the
+      printed card). After a DENY-cancel no pending exists and the
+      facts stay empty; the gate decision above remains the only
+      confirmation authority either way.
     """
     session.gate_decision = (
         ConfirmGate.classify(line)
@@ -1304,7 +1360,8 @@ def _run_turn(
     if session.gate_decision is GateDecision.DENY and flow.state is TxFlowStatus.CREATED:
         flow.cancel()
         cancelled = True
-    _print_turn(loop.run(line, {}), output_fn)
+    facts = _pending_tx_facts(flow) if flow.state is TxFlowStatus.CREATED else {}
+    _print_turn(loop.run(line, facts), output_fn)
     if cancelled:
         output_fn(sanitize_tool_output(_CANCELLED_LINE))
         return

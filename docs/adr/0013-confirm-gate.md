@@ -75,7 +75,10 @@ boundary second itself is still valid). Rationale: fee/UTXO state drifts
 (the confirmation card's numbers go stale), users abandon flows, and an
 unbounded pending window turns "confirm" into a hazard. Expiry is
 evaluated at confirm time against an injected clock — deterministic and
-testable; production supplies wall time.
+testable; production supplies wall time. Pending state is also
+session-scoped: the flow lives only in memory for the life of the process,
+so a pending transaction — and its confirmation — is lost when the app
+exits; after a restart the user simply re-creates the send.
 
 ### 5. Whitelist-exact utterance classification (no fuzzy matching)
 

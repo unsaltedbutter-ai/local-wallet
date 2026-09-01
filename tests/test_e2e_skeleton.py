@@ -29,6 +29,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -1753,6 +1754,43 @@ def _send_generate(flow: Any, plan: list[str], create_params: dict[str, Any] | N
     return generate
 
 
+class FactsQuotingGenerate:
+    """PRODUCTION-PATH fake model: quotes ``tx_ref`` from the injected FACTS.
+
+    Unlike :func:`_send_generate` (the old seam, which captures the
+    ``TxFlow`` object), this fake NEVER sees the flow — it only sees the
+    assembled prompt, exactly like the real model. On a ``"confirm"``
+    plan step it extracts the ``pending_tx_ref`` line from the prompt's
+    FACTS block and quotes that value VERBATIM in a ``confirm_tx``
+    envelope — precisely what the system prompt instructs the production
+    model to do (quote verbatim from the confirmation context).
+    ``"create"``/``"respond"`` steps behave like the stub's canned
+    envelopes. Every prompt received is recorded for assertions.
+    """
+
+    def __init__(self, plan: list[str]) -> None:
+        self.plan = list(plan)
+        self.prompts: list[str] = []
+        self._n = 0
+
+    def __call__(self, prompt: str, grammar_text: str | None) -> str:
+        del grammar_text
+        self.prompts.append(prompt)
+        step = self.plan[self._n] if self._n < len(self.plan) else RESPOND_NOTED_JSON
+        self._n += 1
+        if step == "create":
+            return _create_tx_envelope_json()
+        if step == "confirm":
+            match = re.search(r"^pending_tx_ref: (\S+)$", prompt, re.MULTILINE)
+            assert match is not None, "test bug: no pending_tx_ref fact in the prompt"
+            return json.dumps(
+                {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": match.group(1)}}
+            )
+        if step == "respond":
+            return RESPOND_NOTED_JSON
+        return step
+
+
 def _run_send_repl(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1763,11 +1801,17 @@ def _run_send_repl(
     flow: Any | None = None,
     create_params: dict[str, Any] | None = None,
     extra_env: dict[str, str | None] | None = None,
+    generate: GenerateFn | None = None,
+    before_line: Callable[[], None] | None = None,
 ) -> tuple[int, list[str], Any]:
     """Run app.run() over the real REPL with the send-flow fixtures.
 
     Returns ``(exit_code, output_lines, flow)`` — the flow is the very
     instance the handlers used, so tests assert dispatcher-owned state.
+    ``generate`` replaces the default flow-capturing
+    :func:`_send_generate` seam wholesale (production-path tests); when
+    ``before_line`` is given it runs just before each input line is
+    returned (e.g. to advance an injected clock mid-session).
     """
     store_path = _store_path(tmp_path)
     _preset_store(store_path)
@@ -1783,15 +1827,21 @@ def _run_send_repl(
             monkeypatch.setenv(name, value)
     monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
     tx_flow = flow if flow is not None else TxFlow()
-    generate = _send_generate(tx_flow, plan, create_params)
+    fake = generate if generate is not None else _send_generate(tx_flow, plan, create_params)
     inputs = iter(lines)
+
+    def read_line(_prompt: str) -> str:
+        if before_line is not None:
+            before_line()
+        return next(inputs)
+
     outputs: list[str] = []
     code = run(
         ["--zpub", VPUB],
-        input_fn=lambda _prompt: next(inputs),
+        input_fn=read_line,
         output_fn=outputs.append,
         flow=tx_flow,
-        generate_fn=generate,
+        generate_fn=fake,
     )
     return code, outputs, tx_flow
 
@@ -2271,6 +2321,166 @@ def test_send_flow_fee_estimate_failure_surfaces_chain_unavailable(
     assert "Could not create the transaction — chain unavailable" in outputs[0]
     client.close()
     _store.close()
+
+
+# ---------------------------------- send-flow SR fixes (TCK-P2-004 review)
+#
+# FIX 1 (facts injection): the production confirm path needs no
+# flow-capturing seam — the pending card reaches the model as a FACTS
+# block and the model quotes ``tx_ref`` from it. FIX 3 (expiry honesty):
+# re-shown cards advertise the REMAINING ttl, not the nominal one.
+
+
+def test_send_flow_confirm_production_path_quotes_tx_ref_from_facts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """PRODUCTION-PATH confirm (FIX 1): the fake model never sees the
+    flow — it parses the ``pending_tx_ref`` out of the prompt's FACTS
+    block (the verbatim-quote contract) and emits ``confirm_tx`` with
+    it. The full happy path (card → FACTS → confirm_tx → dual key →
+    CONFIRMED) works without the old seam; the same-turn 'yes please'
+    still supplies the gate's key."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    fake = FactsQuotingGenerate(["create", "confirm"])
+    code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "yes please", "exit"],
+        ["create", "confirm"],
+        generate=fake,
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    # Create turn: nothing pending yet → no pending facts in that prompt.
+    assert "pending_tx_ref" not in fake.prompts[0]
+    # Confirm turn: the pending context WAS injected, and quoting it
+    # completed the flow (a wrong ref would refuse with a mismatch).
+    match = re.search(r"^pending_tx_ref: (\S+)$", fake.prompts[1], re.MULTILINE)
+    assert match is not None
+    fact_ref = match.group(1)
+    card_ref = next(
+        line.split("Ref: ", 1)[1] for line in outputs if line.startswith("Ref: ")
+    )
+    assert fact_ref == card_ref  # FACTS value == the printed card's ref
+    assert "Pending transaction — review it carefully" in joined
+    assert "Approved. The signed-transaction step arrives in Phase 3" in joined
+    assert flow.state is TxFlowStatus.CONFIRMED
+    assert flow.pending is None
+    assert "Not confirmed" not in joined
+
+
+def test_send_flow_facts_absent_when_no_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FIX 1 (b): with no pending transaction the prompt carries no
+    pending-tx FACTS at all (facts stay {} on plain chat turns)."""
+    handler = _send_chain_handler([], utxos_by_addr={})
+    fake = FactsQuotingGenerate(["respond"])
+    code, _outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        ["what can this app do?", "exit"],
+        ["respond"],
+        generate=fake,
+    )
+
+    assert code == 0
+    assert flow.state is TxFlowStatus.IDLE
+    assert len(fake.prompts) == 1
+    assert "FACTS BEGIN" not in fake.prompts[0]  # empty facts → no block
+    assert "pending_tx" not in fake.prompts[0]
+
+
+def test_send_flow_facts_show_remaining_expiry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FIX 1 (c): with the clock injected, the pending FACTS carry the
+    REMAINING ttl — ~599s one second after staging, less later — plus the
+    ref/amount/recipient the confirm must quote; quoting them still
+    completes the flow under the dual key."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    clock = {"now": 1000.0}
+    reads = {"n": 0}
+
+    def before_line() -> None:
+        reads["n"] += 1
+        if reads["n"] == 2:  # just before the 'whatever' turn
+            clock["now"] = 1001.0
+        elif reads["n"] == 3:  # just before the 'yes please' turn
+            clock["now"] = 1050.0
+
+    fake = FactsQuotingGenerate(["create", "respond", "confirm"])
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "whatever",  # NOT_A_DECISION: flow stays pending, facts flow
+            "yes please",
+            "exit",
+        ],
+        ["create", "respond", "confirm"],
+        flow=TxFlow(clock=lambda: clock["now"]),
+        generate=fake,
+        before_line=before_line,
+    )
+
+    joined = "\n".join(outputs)
+    # Turn 2 runs 1s after staging: 600 − 1 = 599 s remaining, and the
+    # full pending context is present for the model to quote.
+    assert "pending_tx_expires_in_s: 599" in fake.prompts[1]
+    assert "pending_tx_ref: " in fake.prompts[1]
+    assert "pending_tx_amount_sats: 60000" in fake.prompts[1]
+    assert f"pending_tx_recipient: {SEND_RECIPIENT}" in fake.prompts[1]
+    # Turn 3 runs 50s after staging: less remaining than turn 2.
+    assert "pending_tx_expires_in_s: 550" in fake.prompts[2]
+    # The confirm quoted the FACTS ref → dual-key confirm completed.
+    assert "Approved." in joined
+    assert flow.state is TxFlowStatus.CONFIRMED
+
+
+def test_send_flow_reshowed_card_shows_remaining_expiry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FIX 3 (expiry honesty): re-showing the pending card 500s after
+    staging advertises the REMAINING ttl (~1 min), not the nominal
+    600s/10 min."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    clock = {"now": 1000.0}
+    reads = {"n": 0}
+
+    def before_line() -> None:
+        reads["n"] += 1
+        if reads["n"] == 2:  # just before the SECOND send attempt
+            clock["now"] = 1500.0  # 500 s have passed
+
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "exit",
+        ],
+        ["create", "create"],
+        flow=TxFlow(clock=lambda: clock["now"]),
+        before_line=before_line,
+    )
+
+    joined = "\n".join(outputs)
+    assert "A transaction is already pending — confirm or cancel it first." in joined
+    # First card: the full ttl; the re-shown card: 100 s ≈ 1 min left.
+    assert "Expires: ~10 min" in joined
+    assert "Expires: ~1 min" in joined
+    assert flow.state is TxFlowStatus.CREATED
 
 
 # ------------------------------------------------- live-network integration
