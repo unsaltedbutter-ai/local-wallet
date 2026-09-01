@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +49,10 @@ _PSBT_MAGIC = b"psbt\xff"
 #: Length of the transaction-reference prefix embedded in filenames.
 _REF_LEN = 8
 
+#: ASCII characters allowed verbatim in a transaction-reference prefix
+#: (ADR-0014: hex/alnum only — nothing outside [0-9A-Za-z]).
+_REF_ALNUM_ASCII = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
 #: Signer identifier reported in SignedResult (ADR-0014).
 _SIGNER_NAME = "file"
 
@@ -62,17 +68,57 @@ class ExportedFiles:
 def _sanitize_tx_ref(tx_ref: str) -> str:
     """Return a filename-safe transaction-reference prefix (≤ 8 chars).
 
-    ADR-0014: a reference that is non-empty and hex/alnum-only is used as-is
-    (truncated to :data:`_REF_LEN`). Anything else — including an empty
-    string, slashes, or other path-sensitive characters — is hashed with
-    SHA-256 and truncated, so no ``tx_ref`` can ever inject a path
+    ADR-0014: a reference that is non-empty and ASCII hex/alnum-only
+    (``[0-9A-Za-z]``) is used as-is (truncated to :data:`_REF_LEN`).
+    Anything else — including an empty string, non-ASCII alphanumerics
+    (e.g. ÄÖÜ), slashes, or other path-sensitive characters — is hashed
+    with SHA-256 and truncated, so no ``tx_ref`` can ever inject a path
     separator or collide with the directory layout. The output is value-free
     (a hash, never user content).
     """
-    if tx_ref and all(c.isalnum() for c in tx_ref):
+    if tx_ref and all(c in _REF_ALNUM_ASCII for c in tx_ref):
         return tx_ref[:_REF_LEN]
     digest = hashlib.sha256(tx_ref.encode("utf-8")).hexdigest()
     return digest[:_REF_LEN]
+
+
+def _validate_psbt_text(content: str) -> None:
+    """Refuse an export payload that is not a well-formed base64 PSBT.
+
+    Strict base64 decode → BIP174 magic prefix → embit parse, run BEFORE any
+    byte is written toward a device (A6): a device must never receive a
+    malformed or mislabeled container. Errors are value-free.
+    """
+    try:
+        raw = base64.b64decode(content, validate=True)
+    except Exception as exc:  # containment: invalid base64
+        raise SignerError("psbt text is not valid base64") from exc
+    if not raw.startswith(_PSBT_MAGIC):
+        raise SignerError("psbt text is not a PSBT")
+    try:
+        PSBT.parse(raw)
+    except Exception as exc:  # containment: embit parse errors vary
+        raise SignerError("psbt text is not a valid PSBT") from exc
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically (temp file + ``os.replace``).
+
+    The temp file is created in the same directory (required for an atomic
+    rename) with a unique name; on failure the temp is cleaned up and the
+    export refuses. A reader never observes a partially-written file.
+    """
+    try:
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except OSError as exc:
+        raise SignerError("could not write export file") from exc
 
 
 class FilePsbtSigner:
@@ -104,8 +150,12 @@ class FilePsbtSigner:
 
         Refusals (value-free):
         - a non-string / empty PSBT;
+        - a payload that does not decode as base64 PSBT text (validated
+          BEFORE any write toward a device);
+        - a non-string ``tx_ref``;
         - an existing unsigned file with *different* content (same content is
-          idempotent and allowed);
+          idempotent and allowed — and the sidecar is (re)written per
+          ADR-0014, healing a missing/mismatched one);
         - a ``tx_ref`` whose sanitized prefix would collide with an existing
           ``localwallet-signed-<ref>.psbt.b64`` file.
 
@@ -121,6 +171,11 @@ class FilePsbtSigner:
         content = psbt_base64.strip()
         if not content:
             raise SignerError("no PSBT text to export")
+        if not isinstance(tx_ref, str):
+            raise SignerError("tx_ref must be a string")
+
+        # Validate the payload before writing anything toward a device.
+        _validate_psbt_text(content)
 
         ref = _sanitize_tx_ref(tx_ref)
         unsigned_path = self.directory / f"{_UNSIGNED_PREFIX}{ref}{_SUFFIX}"
@@ -134,7 +189,12 @@ class FilePsbtSigner:
                 "existing signed file"
             )
 
-        # Overwrite policy: same content is idempotent; different content is refused.
+        file_bytes = (content + "\n").encode("utf-8")
+        digest = hashlib.sha256(file_bytes).hexdigest()
+
+        # Overwrite policy: same content is idempotent; different content is
+        # refused. The idempotent path ALSO (re)writes the sidecar (ADR-0014
+        # "every export writes a sidecar"), healing a missing/mismatched one.
         if unsigned_path.exists():
             try:
                 existing = unsigned_path.read_text(encoding="utf-8").strip()
@@ -144,14 +204,11 @@ class FilePsbtSigner:
                 raise SignerError(
                     "refused: an existing unsigned file has different content"
                 )
-            return ExportedFiles(
-                unsigned_path=unsigned_path, checksum_path=checksum_path
-            )
 
-        file_bytes = (content + "\n").encode("utf-8")
+        # Atomic export (temp + os.replace) for payload AND sidecar.
         self.directory.mkdir(parents=True, exist_ok=True)
-        unsigned_path.write_bytes(file_bytes)
-        checksum_path.write_text(hashlib.sha256(file_bytes).hexdigest() + "\n", encoding="utf-8")
+        _atomic_write(unsigned_path, file_bytes)
+        _atomic_write(checksum_path, (digest + "\n").encode("utf-8"))
         return ExportedFiles(
             unsigned_path=unsigned_path, checksum_path=checksum_path
         )
@@ -182,8 +239,10 @@ class FilePsbtSigner:
                 must match the sanitized reference of this value.
 
         Returns:
-            :class:`SignedResult` with normalized base64 PSBT text,
-            ``signer_name="file"``, and the sidecar-verification flag.
+            :class:`SignedResult` with the stripped base64 PSBT text returned
+            **verbatim** from the file (exactly what was read, never
+            re-serialized — so ``checksum_verified`` attests precisely that
+            text), ``signer_name="file"``, and the sidecar-verification flag.
         """
         if not isinstance(path, Path):
             raise SignerError("path must be a pathlib.Path")
@@ -248,7 +307,7 @@ class FilePsbtSigner:
                 raise SignerError("file contains no signatures (unsigned PSBT?)")
 
         return SignedResult(
-            psbt_base64=psbt.to_base64(),
+            psbt_base64=text,
             signer_name=_SIGNER_NAME,
             checksum_verified=checksum_verified,
         )
@@ -265,9 +324,14 @@ class FilePsbtSigner:
 
 
 def _input_is_signed(scope) -> bool:
-    """True when an input scope carries a signature (partial sig or final)."""
+    """True when an input scope carries a signature (partial sig or final).
+
+    Uses truthiness, not ``is not None``: an input whose final fields are
+    PRESENT but EMPTY carries no signature and must not count as signed
+    (A1) — only non-empty final data or a partial signature satisfy it.
+    """
     if getattr(scope, "partial_sigs", None):
         return True
-    if getattr(scope, "final_scriptsig", None) is not None:
+    if getattr(scope, "final_scriptsig", None):
         return True
-    return getattr(scope, "final_scriptwitness", None) is not None
+    return bool(getattr(scope, "final_scriptwitness", None))

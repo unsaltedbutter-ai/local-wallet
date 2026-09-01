@@ -85,7 +85,7 @@ directions using the prefixes above; it does not require a subfolder split.
 
 | Device family | Intended layout | Notes (to verify on real device, Phase 3 AC) |
 |---|---|---|
-| Coldcard | SD card root (`/`); user saves the unsigned file on the SD, device renames on save | Coldcard saves under its own name and may rename on save; our import scans any `localwallet-signed-*.psbt.b64` in the folder, so the device's rename is harmless. |
+| Coldcard | SD card root (`/`); user saves the unsigned file on the SD, device renames on save | Coldcard saves under its own name and may rename on save; our import scans any `localwallet-signed-*.psbt.b64` in the folder, so the device's rename is expected harmless — verify at the Phase 3 device run. |
 | Passport / SeedSigner | SD root or a single folder | Similar to Coldcard; import scans by filename convention, not fixed path. |
 | Generic / USB stick | one folder, both directions OK | Default: both `unsigned-` and `signed-` live in the same transfer folder. |
 | Generic (optional) | `from/` and `to/` subfolders | Documented as an option for users who prefer strict direction separation; `FilePsbtSigner` targets one directory, so this is a caller choice, not enforced here. |
@@ -108,10 +108,14 @@ or amended.
 ## Consequences
 
 - `FilePsbtSigner` (TCK-P3-001) implements encoding, naming, checksums, and
-  refusals per this ADR: export writes base64 text + sidecar; import
+  refusals per this ADR: export validates the payload (base64 → magic →
+  parse) before writing, then writes payload + sidecar atomically; import
   validates filename convention → sidecar (must-match-if-present) → base64 →
   magic → signature presence (an unsigned PSBT is refused). All errors are
-  value-free.
+  value-free. Import returns the stripped file text verbatim.
+- Import acceptance is NOT broadcast authorization — the deterministic
+  re-validation gate (`tx/revalidate.py`, PROJECT.md §7.5) hard-stops before
+  broadcast.
 - The CLI device-handoff narration (PROJECT.md §10) uses
   `FilePsbtSigner.list_pending_exports()` to describe what the user should
   save to the device, and reports `checksum_verified` on import.

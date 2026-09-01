@@ -39,8 +39,10 @@ class SignerError(Exception):
 class SignedResult:
     """Outcome of a signing operation: base64 PSBT text.
 
-    ``psbt_base64`` is normalized base64 PSBT text returned verbatim by the
-    signer. ``signer_name`` identifies which implementation produced it.
+    ``psbt_base64`` is the base64 PSBT text returned **verbatim** by the
+    signer: the file signer returns the stripped file text exactly as read
+    (never re-serialized), so ``checksum_verified`` attests precisely that
+    text. ``signer_name`` identifies which implementation produced it.
     ``checksum_verified`` is ``True`` only when the file signer confirmed a
     checksum sidecar matched the signed file on import (ADR-0014); other
     signers and sidecar-less imports report ``False``.

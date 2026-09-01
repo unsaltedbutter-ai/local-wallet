@@ -18,6 +18,7 @@ import pytest
 from embit import bip32, ec, script
 from embit.networks import NETWORKS
 from embit.psbt import PSBT
+from embit.transaction import Witness
 
 from localwallet.signer import ExportedFiles, FilePsbtSigner, SignedResult, SignerError
 from localwallet.tx.psbt import (
@@ -132,6 +133,20 @@ class TestExport:
         assert second.unsigned_path == first.unsigned_path
         assert second.unsigned_path.read_text(encoding="utf-8").strip() == b64
 
+    def test_sidecar_healed_on_idempotent_reexport(self, signer: FilePsbtSigner):
+        # ADR-0014 "every export writes a sidecar": deleting the sidecar
+        # (e.g. partial SD copy) is healed by an idempotent re-export.
+        b64 = psbt_to_base64(build_unsigned())
+        first = signer.export_unsigned(b64, "abc12345")
+        assert first.checksum_path.exists()
+        first.checksum_path.unlink()
+        assert not first.checksum_path.exists()
+
+        second = signer.export_unsigned(b64, "abc12345")  # no raise, rewrites
+        assert second.checksum_path.exists()
+        digest = second.checksum_path.read_text(encoding="utf-8").strip()
+        assert digest == hashlib.sha256(first.unsigned_path.read_bytes()).hexdigest()
+
     def test_overwrite_different_content_refused(self, signer: FilePsbtSigner):
         signer.export_unsigned(psbt_to_base64(build_unsigned()), "abc12345")
         other = psbt_to_base64(build_unsigned())  # byte-identical for same build...
@@ -175,6 +190,16 @@ class TestFilenameSanitization:
         signer.export_unsigned(psbt_to_base64(build_unsigned()), "")
         digest = hashlib.sha256(b"").hexdigest()[:8]
         assert (folder / f"localwallet-unsigned-{digest}.psbt.b64").exists()
+
+    def test_non_ascii_alnum_ref_is_hashed(self, signer: FilePsbtSigner, folder: Path):
+        # A5: only ASCII [0-9A-Za-z] is used verbatim — Unicode isalnum
+        # admits ÄÖÜ, but ADR-0014 says hex/alnum, so they must be hashed.
+        ref = "äöü1234"
+        assert all(c.isalnum() for c in ref)  # Unicode would pass isalnum...
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), ref)
+        digest = hashlib.sha256(ref.encode("utf-8")).hexdigest()[:8]
+        assert (folder / f"localwallet-unsigned-{digest}.psbt.b64").exists()
+        assert not (folder / "localwallet-unsigned-äöü1234.psbt.b64").exists()
 
 
 class TestImportRoundTrip:
@@ -264,6 +289,33 @@ class TestImportRefusals:
         path.write_bytes(bytes(data))
         with pytest.raises(SignerError):
             signer.import_signed(path)
+
+    def test_truncated_base64_torn_write_refused(self, signer: FilePsbtSigner, folder: Path):
+        # Sidecar-less torn write (e.g. mid-copy SD removal): the text is cut
+        # mid-base64-string and must be refused, never silently accepted.
+        path = make_signed_file(
+            folder, "localwallet-signed-abc12345.psbt.b64", sidecar=False
+        )
+        text = path.read_text(encoding="utf-8").strip()
+        torn = text[: len(text) // 2]
+        assert torn  # genuinely truncated, not empty
+        path.write_text(torn + "\n", encoding="utf-8")
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(path)
+        assert "not valid base64" in str(exc.value)
+
+    def test_empty_final_fields_unsigned_refused(self, signer: FilePsbtSigner, folder: Path):
+        # A1: an input whose final fields are PRESENT but EMPTY carries no
+        # signature and must NOT count as signed (truthiness, not is-not-None).
+        psbt = build_unsigned()
+        scope = psbt.inputs[0]
+        scope.final_scriptsig = script.Script(b"")  # empty, present
+        scope.final_scriptwitness = Witness([])  # empty, present
+        path = folder / "localwallet-signed-abc12345.psbt.b64"
+        path.write_text(psbt.to_base64() + "\n", encoding="utf-8")
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(path)
+        assert "no signatures" in str(exc.value)
 
 
 class TestValueFreeErrors:

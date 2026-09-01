@@ -45,7 +45,9 @@ Check pipeline (documented order — first failure wins, all fail closed)
  1. intended-transaction sanity   (caller-owned state itself is well-formed)
  2. base64 decode                 (strict alphabet/padding, no whitespace)
  3. PSBT magic bytes              (``psbt\\xff`` prefix)
- 4. embit parse                   (malformed / truncated / trailing bytes)
+ 4. embit parse                   (malformed / truncated / trailing bytes;
+     parse runs before any size ceiling — the container-size bound is
+     enforced at the gateway boundary, P3-005 will pass bounded data)
  5. container version + structural shape: PSBT version, tx version,
     input count, per-input sequence present and equal to intended,
     witness UTXO present/positive/P2WPKH (v1 spend policy, ADR-0008),
@@ -101,6 +103,14 @@ change what the transaction pays.
 Input outpoint tampering — covered by the
 signature digest (prevouts are hashed)
 ===========================================  ==============================
+High-S standardness (BIP62) is NOT a consensus rule: high-S signatures are
+consensus-valid and a default-policy node may refuse them only as
+non-standard (economically inert — wtxid-only). In practice this embit/
+libsecp256k1 build's ``pubkey.verify`` path rejects high-S outright, so the
+gate currently refuses them (stricter than a relay policy requires). A
+future change may normalize-before-verify to permit high-S if desired;
+until then the gate fails closed on them.
+
 Pre-finalized containers (``final_scriptwitness``/``final_scriptsig``
 already set) are REFUSED as ambiguous state (check 5): this module always
 rebuilds the final witness itself from signatures it has verified, so a
@@ -111,7 +121,9 @@ they cannot influence any compared quantity.
 Input outpoints are *not* part of :class:`IntendedTx` (dispatcher-owned
 state carries only the count): outpoint integrity is enforced
 transitively — every outpoint is covered by the BIP-143 prevout hash, so
-a swapped input fails signature verification.
+a swapped input fails signature verification. Duplicate outpoints (the
+same UTXO spent twice) are *not* caught transitively, so check 5 refuses
+them explicitly.
 """
 
 from __future__ import annotations
@@ -355,11 +367,19 @@ def revalidate_signed_psbt(psbt_base64: str, intended: IntendedTx) -> Revalidate
         raise TamperedPsbtError(
             "signed psbt input count does not match the intended transaction"
         )
+    seen_outpoints: set[tuple[bytes, int]] = set()
     for scope in psbt.inputs:
         if scope.sequence is None:
             raise TamperedPsbtError("input is missing its sequence field")
         if scope.sequence != intended.expected_sequence:
             raise TamperedPsbtError("input sequence does not match the intended transaction")
+        # Duplicate outpoints = the same UTXO spent twice: an invalid
+        # transaction no node would relay. Not caught transitively (each
+        # signature verifies independently), so refuse explicitly.
+        outpoint = (scope.vin.txid, scope.vin.vout)
+        if outpoint in seen_outpoints:
+            raise TamperedPsbtError("duplicate input outpoints are not allowed")
+        seen_outpoints.add(outpoint)
         if scope.witness_utxo is None:
             raise TamperedPsbtError("input is missing its witness utxo")
         if scope.witness_utxo.value <= 0:
@@ -447,28 +467,30 @@ def revalidate_signed_psbt(psbt_base64: str, intended: IntendedTx) -> Revalidate
 
     # -- Check 11: deterministic signature verification --------------------
     for index, scope in enumerate(psbt.inputs):
-        (pubkey, sig_value), = scope.partial_sigs.items()
-        if not isinstance(sig_value, (bytes, bytearray, memoryview)):
-            raise TamperedPsbtError("signature is malformed")
-        sig_value = bytes(sig_value)
-        if len(sig_value) < 2 or sig_value[-1] != _SIGHASH_ALL:
-            raise TamperedPsbtError("signature hash type is not supported")
         try:
-            signature = Signature.parse(sig_value[:-1])
-        except Exception as exc:  # containment: DER parse errors vary
-            raise TamperedPsbtError("signature is malformed") from exc
-        program = bytes(scope.witness_utxo.script_pubkey.data)[2:]  # type: ignore[union-attr]
-        if hashes.hash160(pubkey.sec()) != program:
-            raise TamperedPsbtError("signature public key does not match the input script")
-        try:
+            (pubkey, sig_value), = scope.partial_sigs.items()
+            if not isinstance(sig_value, (bytes, bytearray, memoryview)):
+                raise TamperedPsbtError("signature is malformed")
+            sig_value = bytes(sig_value)
+            if len(sig_value) < 2 or sig_value[-1] != _SIGHASH_ALL:
+                raise TamperedPsbtError("signature hash type is not supported")
+            try:
+                signature = Signature.parse(sig_value[:-1])
+            except Exception as exc:  # containment: DER parse errors vary
+                raise TamperedPsbtError("signature is malformed") from exc
+            program = bytes(scope.witness_utxo.script_pubkey.data)[2:]  # type: ignore[union-attr]
+            if hashes.hash160(pubkey.sec()) != program:
+                raise TamperedPsbtError("signature public key does not match the input script")
             # Consensus BIP-143 digest: PSBT.sighash substitutes the P2PKH
             # scriptCode for P2WPKH inputs (all out-of-policy script states
             # were refused in check 5, so this path is deterministic).
             digest = psbt.sighash(index)
-        except Exception as exc:  # containment: fail closed on any surprise
-            raise TamperedPsbtError("signature digest could not be computed") from exc
-        if not pubkey.verify(signature, digest):
-            raise TamperedPsbtError("signature does not verify against the transaction")
+            if not pubkey.verify(signature, digest):
+                raise TamperedPsbtError("signature does not verify against the transaction")
+        except TamperedPsbtError:
+            raise
+        except Exception as exc:  # containment: no non-contract exception escapes
+            raise TamperedPsbtError("signature verification failed") from exc
 
     # -- Check 12: fee sanity against the extracted transaction ------------
     if fee_sats <= 0:

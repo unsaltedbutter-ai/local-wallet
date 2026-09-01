@@ -123,6 +123,52 @@ def to_b64(psbt: PSBT) -> str:
     return base64.b64encode(psbt.serialize()).decode()
 
 
+#: secp256k1 group order (for the high-S S-negation helper below).
+_SECP256K1_ORDER = (
+    0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+)
+
+
+def _high_s_signature_der(sig_der: bytes) -> bytes:
+    """Return the DER of the S-negated (high-S) counterpart of ``sig_der``.
+
+    A DER ECDSA signature is ``(r, s)``; ``(r, n - s)`` is the equally valid
+    high-S form (BIP62 low-S is a *standardness*, not a consensus, rule).
+    Used to pin that this embit/libsecp build's ``verify`` refuses high-S.
+    """
+    def _parse(der: bytes) -> tuple[int, int]:
+        i = 0
+        assert der[i] == 0x30
+        i += 1
+        i += 1  # sequence length
+        assert der[i] == 0x02
+        i += 1
+        rl = der[i]
+        i += 1
+        r = int.from_bytes(der[i : i + rl], "big")
+        i += rl
+        assert der[i] == 0x02
+        i += 1
+        sl = der[i]
+        i += 1
+        s = int.from_bytes(der[i : i + sl], "big")
+        return r, s
+
+    def _encode(r: int, s: int) -> bytes:
+        rb = r.to_bytes((r.bit_length() + 7) // 8 or 1, "big")
+        if rb[0] & 0x80:
+            rb = b"\x00" + rb
+        sb = s.to_bytes((s.bit_length() + 7) // 8 or 1, "big")
+        if sb[0] & 0x80:
+            sb = b"\x00" + sb
+        body = b"\x02" + bytes([len(rb)]) + rb + b"\x02" + bytes([len(sb)]) + sb
+        return b"\x30" + bytes([len(body)]) + body
+
+    r, s = _parse(sig_der)
+    high_s = _SECP256K1_ORDER - s if s <= _SECP256K1_ORDER // 2 else s
+    return _encode(r, high_s)
+
+
 def tamper(
     psbt_b64: str, intended: IntendedTx, mutate, expected_check: str
 ) -> None:
@@ -467,6 +513,133 @@ class TestTamperMatrix:
         with pytest.raises(TamperedPsbtError) as exc:
             revalidate_signed_psbt(psbt_to_base64(psbt), intended)
         assert "input is missing its signature" in str(exc.value)
+
+
+class TestTamperMatrixStructural:
+    """Caught-but-untested check-5 rows pinned explicitly (regression pins)."""
+
+    def test_prebuilt_final_scriptwitness_refused(self):
+        # The PRIMARY anti-bypass check: a prebuilt witness can never be
+        # proven to match, so it is refused and check 11 always wins.
+        psbt_b64, _meta, intended = signed_container()
+
+        def prefinalize(p: PSBT) -> None:
+            (pub, sig), = p.inputs[0].partial_sigs.items()
+            p.inputs[0].final_scriptwitness = Witness([sig[:-1], pub.sec()])
+
+        tamper(
+            psbt_b64,
+            intended,
+            prefinalize,
+            "input carries unexpected finalization data",
+        )
+
+    def test_taproot_fields_refused(self):
+        psbt_b64, _meta, intended = signed_container()
+
+        def add_taproot(p: PSBT) -> None:
+            p.inputs[0].taproot_internal_key = (
+                bip32.HDKey.from_seed(SEED).derive([0, 0]).to_public().key
+            )
+
+        tamper(
+            psbt_b64,
+            intended,
+            add_taproot,
+            "input carries taproot fields outside the v1 policy",
+        )
+
+    def test_container_sighash_type_0x02_refused(self):
+        psbt_b64, _meta, intended = signed_container()
+        tamper(
+            psbt_b64,
+            intended,
+            lambda p: setattr(p.inputs[0], "sighash_type", 0x02),
+            "input sighash type field is unsupported",
+        )
+
+    def test_v2_container_refused(self):
+        psbt_b64, _meta, intended = signed_container()
+        tamper(
+            psbt_b64,
+            intended,
+            lambda p: setattr(p, "version", 2),
+            "unsupported psbt container version",
+        )
+
+    def test_empty_psbt_container_refused(self):
+        _psbt_b64, _meta, intended = signed_container()
+        empty = base64.b64encode(b"psbt\xff\x00").decode()
+        with pytest.raises(TamperedPsbtError) as exc:
+            revalidate_signed_psbt(empty, intended)
+        assert "input count does not match the intended transaction" in str(exc.value)
+
+    def test_duplicate_outpoint_inputs_refused(self):
+        # Two inputs spending the SAME outpoint = a double-spend no node
+        # would relay. Not caught transitively (each sig verifies), so check
+        # 5 refuses explicitly — pinned so it does not regress.
+        psbt_b64, _meta, intended = signed_container()
+
+        def duplicate(p: PSBT) -> None:
+            tx = p.tx
+            tx.vin[1].txid = tx.vin[0].txid
+            tx.vin[1].vout = tx.vin[0].vout
+            rebuilt = PSBT(tx=tx)
+            for dst, src in zip(rebuilt.inputs, p.inputs):
+                dst.witness_utxo = src.witness_utxo
+                dst.partial_sigs = src.partial_sigs
+                dst.bip32_derivations = src.bip32_derivations
+            # Both inputs now spend the same program/outpoint: re-sign both
+            # so the ONLY reason this is refused is the duplicate-outpoint
+            # check (clean regression pin).
+            for i, inp in enumerate(rebuilt.inputs):
+                (ppub, d), = inp.bip32_derivations.items()
+                priv = bip32.HDKey.from_seed(SEED).derive(d.derivation).key
+                digest = rebuilt.sighash(i)
+                stream = BytesIO()
+                ec.Signature.write_to(priv.sign(digest), stream)
+                inp.partial_sigs[ppub] = stream.getvalue() + b"\x01"
+            p.inputs = rebuilt.inputs
+            p.outputs = rebuilt.outputs
+
+        tamper(
+            psbt_b64,
+            intended,
+            duplicate,
+            "duplicate input outpoints are not allowed",
+        )
+
+    def test_tx_version_tampered_refused(self):
+        psbt_b64, _meta, intended = signed_container()
+        tamper(
+            psbt_b64,
+            intended,
+            lambda p: setattr(p, "tx_version", 1),
+            "unexpected transaction version",
+        )
+
+    def test_high_s_signature_refused_by_this_embit_build(self):
+        # DEVIATION from ticket C3 ("high-S ACCEPTED"): this embit/libsecp
+        # build's ``pubkey.verify`` rejects high-S, so the gate currently
+        # refuses it (stricter than the BIP62 default-policy relay rule).
+        # Pins the ACTUAL behavior; a future change may normalize-and-permit.
+        psbt_b64, _meta, intended = signed_container()
+
+        def to_high_s(p: PSBT) -> None:
+            (pub, d), = p.inputs[0].bip32_derivations.items()
+            priv = bip32.HDKey.from_seed(SEED).derive(d.derivation).key
+            digest = p.sighash(0)
+            stream = BytesIO()
+            ec.Signature.write_to(priv.sign(digest), stream)
+            low = stream.getvalue()
+            p.inputs[0].partial_sigs[pub] = _high_s_signature_der(low) + b"\x01"
+
+        tamper(
+            psbt_b64,
+            intended,
+            to_high_s,
+            "signature does not verify against the transaction",
+        )
 
 
 class TestDeterminism:
