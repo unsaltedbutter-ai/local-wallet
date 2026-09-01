@@ -1,0 +1,5 @@
+{
+  "id": "golden-024",
+  "prompt": "send 0.5 btc",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

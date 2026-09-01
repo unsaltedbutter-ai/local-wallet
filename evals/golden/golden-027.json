@@ -1,0 +1,5 @@
+{
+  "id": "golden-027",
+  "prompt": "confirm the transaction",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

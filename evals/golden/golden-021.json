@@ -1,0 +1,11 @@
+{
+  "id": "golden-021",
+  "prompt": "send $12 to tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9",
+  "expectation": {
+    "intent": "create_tx",
+    "params": {
+      "recipient": "tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9",
+      "amount_usd": 12
+    }
+  }
+}

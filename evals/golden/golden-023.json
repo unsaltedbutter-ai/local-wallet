@@ -1,0 +1,5 @@
+{
+  "id": "golden-023",
+  "prompt": "send some money to tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

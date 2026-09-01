@@ -1,0 +1,5 @@
+{
+  "id": "golden-025",
+  "prompt": "send 100 sats to bc1qexample0000000000000000000000000000000",
+  "expectation": {"intent_in": ["clarify"]}
+}

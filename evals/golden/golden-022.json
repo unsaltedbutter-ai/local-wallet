@@ -1,0 +1,12 @@
+{
+  "id": "golden-022",
+  "prompt": "pay tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9 250000 sats quickly",
+  "expectation": {
+    "intent": "create_tx",
+    "params": {
+      "recipient": "tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9",
+      "amount_sats": 250000,
+      "fee_target": "fast"
+    }
+  }
+}
