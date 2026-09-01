@@ -191,3 +191,36 @@ wallet-state intents: `get_history`, `get_utxos`, `new_address`. This is a
 - Handlers and golden eval fixtures land in TCK-P1-004 / TCK-P1-005; until
   then a valid new-intent envelope surfaces `dispatch_error` ("no handler
   registered"), which is the intended fail-closed behavior.
+
+## v0 extensions (2026-09, Phase 2 — tickets TCK-P2-003 / TCK-P2-004)
+
+Phase 2 extended the closed intent enum with the first two steps of the
+dispatcher-owned destructive send flow (ADR-0013): `create_tx` and
+`confirm_tx`. This is a **backward-compatible extension of v0, not a version
+bump**:
+
+- Old envelopes remain valid unchanged and `v` stays `0` — same bump-policy
+  reasoning as the Phase 1 extension (§2 reserves a bump for breaking
+  changes; adding enum members and required-key params shapes only widens
+  the accepted set, never invalidating a previously-valid envelope).
+- Final params contract:
+  - `create_tx` → `{"recipient": str, 14..100}`, plus EXACTLY ONE of
+    `{"amount_sats": int, 546..21_000_000_000_000_000}` |
+    `{"amount_usd": number, 0.01..1_000_000}`, plus optional
+    `{"fee_target": "fast"|"medium"|"slow"}`. Grammar-side, the amount-pair
+    alternation makes emitting both syntactically impossible; the recipient
+    meaning-check (testnet witness-v0 P2WPKH per ADR-0008) is layer 3.
+  - `confirm_tx` → `{"tx_ref": str, 1..64}` — a reference to the pending
+    transaction, quoted verbatim from the confirmation card the flow
+    produced; content matching against flow state is the flow's job, never
+    the rules'.
+- Grammar, schema, system prompt, and the flow moved in lockstep per the
+  cross-reference rule: new grammar branches in
+  `agent/grammar/envelope.gbnf`, params models + `INTENT_REGISTRY` in
+  `protocol/envelope.py`, layer-3 rules in `protocol/intents.py`, the prompt
+  intent list + few-shots in `agent/prompt.py`, and the dispatcher-owned
+  state machine + confirm gate in `tx/flow.py` (ADR-0013). The two intents
+  are one lockstep change because the flow needs both.
+- Handler wiring and golden eval fixtures land in TCK-P2-004 / TCK-P2-005;
+  until then a valid new-intent envelope surfaces `dispatch_error` ("no
+  handler registered"), which is the intended fail-closed behavior.

@@ -1,12 +1,13 @@
 # envelope.gbnf — v0 intent envelope grammar (llama.cpp GBNF)
 #
 # Constrains model decoding to EXACTLY the canonical envelope contract v0
-# (extended in Phase 1 — see docs/adr/0002-envelope-spec.md):
+# (extended in Phase 1 and Phase 2 — see docs/adr/0002-envelope-spec.md and
+# docs/adr/0013-confirm-gate.md):
 #
 #   {"v": 0, "intent": <closed enum>, "params": {...}}
 #
 #   v        : integer 0 exactly
-#   intent   : closed enum of the six names
+#   intent   : closed enum of the eight names
 #   params   : required object, whose shape depends on intent:
 #                respond     -> {"text": string}
 #                clarify     -> {"question": string}
@@ -17,6 +18,11 @@
 #                get_utxos   -> {}
 #                new_address -> {} or {"branch": "0"|"1"}
 #                               (0 = receive chain default, 1 = change)
+#                create_tx   -> {"recipient": string} then EXACTLY ONE of
+#                               {"amount_sats": <int>} |
+#                               {"amount_usd": <decimal number>},
+#                               then OPTIONAL {"fee_target": fast|medium|slow}
+#                confirm_tx  -> {"tx_ref": string}
 #
 # KEY ORDER: STRICT. The model must emit keys in order v, intent, params.
 # This is simpler for a small model and removes any ambiguity in the
@@ -31,8 +37,23 @@
 # WHITESPACE: optional ASCII whitespace is allowed around tokens so the model
 # can emit readable JSON without being penalized.
 #
+# NUMBERS (create_tx): JSON-consistent integers/decimals only.
+#   - amount_sats: no leading zeros (a single "0" is legal JSON and admitted
+#     here; the schema rejects it below its 546 floor), up to 16 digits —
+#     i.e. every syntactically possible value up to ~1e16, comfortably
+#     covering the semantic ceiling (21_000_000_000_000_000 sats). Values
+#     between ~9.99e15 and the schema ceiling are grammar-rejected: the
+#     narrowing direction only restricts what the model can emit, never
+#     admits an envelope the schema would reject.
+#   - amount_usd: digits with an optional fractional part (>= 1 digit after
+#     the "."), no exponent notation. Exponent forms (e.g. 1e2) are
+#     schema-legal JSON numbers but grammar-rejected — the same safe
+#     narrowing direction as above; the model emits plain decimals.
+#     The integer form ("10" for 10.00 USD) is admitted.
+#
 # CROSS-REFERENCE: this grammar maps 1:1 to the pydantic envelope schema v0
-# and MUST be updated together with it (docs/adr/0002-envelope-spec.md).
+# and MUST be updated together with it (docs/adr/0002-envelope-spec.md and
+# docs/adr/0013-confirm-gate.md).
 
 # Root rule: exactly one envelope (with optional trailing whitespace).
 root ::= envelope ws
@@ -44,7 +65,7 @@ envelope ::= "{" ws "\"v\"" ws ":" ws "0" ws "," ws intent_body
 
 # Each intent branch carries its exact params shape and closes the params
 # object and the envelope. This couples intent -> params at decode time.
-intent_body ::= respond | clarify | get_balance | get_history | get_utxos | new_address
+intent_body ::= respond | clarify | get_balance | get_history | get_utxos | new_address | create_tx | confirm_tx
 
 # intent "respond" -> params {"text": string}
 respond ::=
@@ -93,6 +114,53 @@ params_new_address ::= "{" ws "}" ws "}" ws
 
 # branch: single digit, 0 (receive chain) or 1 (change chain).
 branch_digit ::= "0" | "1"
+
+# intent "create_tx" -> params {"recipient": string, (amount_sats | amount_usd)[, "fee_target"]}
+# Keys in FIXED order: recipient first, then exactly one amount key
+# (alternation at the amount-pair level — both amounts at once is
+# syntactically impossible), then an OPTIONAL fee_target tail. The optional
+# tail is a named two-branch rule so no other key can slip in and the order
+# recipient < amount < fee_target stays strict.
+create_tx ::=
+  "\"intent\"" ws ":" ws "\"create_tx\"" ws "," ws
+  "\"params\"" ws ":" ws params_create_tx
+
+params_create_tx ::=
+  "{" ws recipient_kv ws "," ws amount_pair ws create_tx_tail
+
+recipient_kv ::= "\"recipient\"" ws ":" ws string
+
+amount_pair ::= amount_sats_kv | amount_usd_kv
+
+amount_sats_kv ::= "\"amount_sats\"" ws ":" ws sats_int
+
+amount_usd_kv ::= "\"amount_usd\"" ws ":" ws usd_num
+
+create_tx_tail ::=
+  "}" ws "}" ws
+  | "," ws fee_target_kv ws "}" ws "}" ws
+
+fee_target_kv ::= "\"fee_target\"" ws ":" ws fee_target
+
+# fee target: the closed enum, quoted literals only.
+fee_target ::= "\"fast\"" | "\"medium\"" | "\"slow\""
+
+# amount_sats: JSON integer, no leading zeros (single "0" allowed — the
+# schema rejects it below the 546 floor), up to 16 digits. The semantic
+# bound 546..21_000_000_000_000_000 is enforced at the schema layer.
+sats_int ::= [1-9] [0-9]{0,15} | "0"
+
+# amount_usd: JSON decimal WITHOUT exponent notation — integer part ("0" or
+# nonzero-start) with an optional fractional part of >= 1 digit. Exponent
+# forms (1e2) are schema-legal but grammar-rejected (conservative narrowing:
+# only restricts model freedom, never admits an invalid envelope).
+usd_num ::= ("0" | [1-9] [0-9]*) ("." [0-9] [0-9]*)?
+
+# intent "confirm_tx" -> params {"tx_ref": string}
+confirm_tx ::=
+  "\"intent\"" ws ":" ws "\"confirm_tx\"" ws "," ws
+  "\"params\"" ws ":" ws
+  "{" ws "\"tx_ref\"" ws ":" ws string ws "}" ws "}" ws
 
 # Conservative JSON string: any char except quote, backslash, and control
 # chars (\x00-\x1f), OR a valid escape sequence. No raw control characters.

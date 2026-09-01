@@ -5,8 +5,9 @@ Canonical envelope contract v0 — the model-emitted wire format::
     {"v": 0, "intent": <closed enum>, "params": {...}}
 
 - ``v``: integer, exactly ``0`` (booleans are not integers for this purpose).
-- ``intent``: closed enum — see :class:`IntentName` (six members as of the
-  Phase 1 v0 extension; see ``docs/adr/0002-envelope-spec.md``).
+- ``intent``: closed enum — see :class:`IntentName` (eight members as of the
+  Phase 2 v0 extension; see ``docs/adr/0002-envelope-spec.md`` and
+  ``docs/adr/0013-confirm-gate.md``).
 - ``params``: REQUIRED object, shape fixed per intent:
   ``respond`` → ``{"text": str, 1..4000 chars}``;
   ``clarify`` → ``{"question": str, 1..1000 chars}``;
@@ -15,7 +16,15 @@ Canonical envelope contract v0 — the model-emitted wire format::
   handler applies its default of 20);
   ``get_utxos`` → ``{}`` (reserved for future opts);
   ``new_address`` → ``{}`` or ``{"branch": 0|1}`` (0 = receive chain,
-  the default; 1 = change chain, rarely user-requested but allowed).
+  the default; 1 = change chain, rarely user-requested but allowed);
+  ``create_tx`` → ``{"recipient": str, 14..100 chars}`` plus EXACTLY ONE of
+  ``{"amount_sats": int, 546..21e15}`` | ``{"amount_usd": number,
+  0.01..1_000_000}``, plus optional ``{"fee_target": "fast"|"medium"|"slow"}``
+  (the send entry point of the dispatcher-owned destructive flow — the
+  semantic recipient check is a testnet witness-v0 P2WPKH address, layer 3);
+  ``confirm_tx`` → ``{"tx_ref": str, 1..64 chars}`` (references the pending
+  transaction created by ``create_tx``; content is matched against the
+  dispatcher-owned flow state, not here).
 
 Adding enum members and optional params keys is a backward-compatible v0
 extension: previously-valid envelopes remain valid, so ``v`` stays ``0``
@@ -53,6 +62,7 @@ trailing ``…`` marker when truncated.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from enum import StrEnum
 from types import MappingProxyType
@@ -73,10 +83,19 @@ from localwallet.protocol.errors import EnvelopeValidationError
 
 __all__ = [
     "INTENT_REGISTRY",
+    "MAX_AMOUNT_SATS",
+    "MAX_AMOUNT_USD",
     "MAX_QUESTION_CHARS",
+    "MAX_RECIPIENT_CHARS",
     "MAX_TEXT_CHARS",
+    "MAX_TX_REF_CHARS",
+    "MIN_AMOUNT_SATS",
+    "MIN_AMOUNT_USD",
+    "MIN_RECIPIENT_CHARS",
     "BaseParams",
     "ClarifyParams",
+    "ConfirmTxParams",
+    "CreateTxParams",
     "Envelope",
     "GetBalanceParams",
     "GetHistoryParams",
@@ -93,12 +112,57 @@ MAX_TEXT_CHARS: Final[int] = 4000
 #: Maximum accepted length of ``clarify`` params ``question`` (characters).
 MAX_QUESTION_CHARS: Final[int] = 1000
 
+#: Accepted length bounds of ``create_tx`` params ``recipient`` (characters).
+#: The floor is the shape of the shortest bech32 segwit address (hrp + sep +
+#: minimal data + checksum); the ceiling is a generous transport bound. The
+#: effective BIP173 bound on a real witness-v0 P2WPKH address is 90
+#: characters, so the schema's 100 is deliberately transport headroom: a
+#: longer string passes this layer only to be refused at layer 3, where embit
+#: enforces the 90-char bech32 ceiling. The semantic check — a testnet
+#: witness-v0 P2WPKH address — is layer 3 (:mod:`localwallet.protocol.intents`).
+MIN_RECIPIENT_CHARS: Final[int] = 14
+MAX_RECIPIENT_CHARS: Final[int] = 100
+
+#: Accepted bounds of ``create_tx`` params ``amount_sats`` (schema layer).
+#: The floor mirrors the canonical legacy-output dust figure at Core default
+#: relaying; the real dust/min-relay decision is computed from script size in
+#: :mod:`localwallet.tx.dust` — this is a coarse schema bound, never the dust
+#: rule. The ceiling is the total possible supply in sats (21M BTC).
+MIN_AMOUNT_SATS: Final[int] = 546
+MAX_AMOUNT_SATS: Final[int] = 21_000_000_000_000_000
+
+#: Accepted bounds of ``create_tx`` params ``amount_usd`` (schema layer).
+#: Coarse sanity bounds for a USD-denominated send request; the sats amount
+#: is computed by the tx engine from a quoted rate, never trusted from the
+#: model.
+MIN_AMOUNT_USD: Final[float] = 0.01
+MAX_AMOUNT_USD: Final[float] = 1_000_000.0
+
+#: Maximum accepted length of ``confirm_tx`` params ``tx_ref`` (characters).
+MAX_TX_REF_CHARS: Final[int] = 64
+
 #: Schema field names that may appear verbatim in failure locations. Any
 #: other string component of a pydantic ``loc`` is model-controlled content
 #: (an extra-key name chosen by the untrusted payload) and is rendered as
 #: the literal ``<key>`` instead.
 _KNOWN_LOC_FIELDS: Final[frozenset[str]] = frozenset(
-    {"v", "intent", "params", "text", "question", "limit", "branch", "error", "detail", "code"}
+    {
+        "v",
+        "intent",
+        "params",
+        "text",
+        "question",
+        "limit",
+        "branch",
+        "recipient",
+        "amount_sats",
+        "amount_usd",
+        "fee_target",
+        "tx_ref",
+        "error",
+        "detail",
+        "code",
+    }
 )
 
 #: Maximum total length (characters) of the ``"; "-joined`` failure text
@@ -116,6 +180,14 @@ class IntentName(StrEnum):
     Phase 1 v0 extension (backward-compatible — see
     ``docs/adr/0002-envelope-spec.md``): ``get_history``, ``get_utxos``,
     ``new_address`` joined the original three members.
+
+    Phase 2 v0 extension (backward-compatible — see
+    ``docs/adr/0013-confirm-gate.md``): ``create_tx`` and ``confirm_tx``
+    join as the first two steps of the dispatcher-owned send-flow state
+    machine. Emitting ``confirm_tx`` is necessary but NOT sufficient to
+    move the flow: the same-turn user utterance must pass the deterministic
+    confirm gate (``localwallet.tx.flow``) — an LLM "yes" never counts as
+    user confirmation (PROJECT.md §8.6).
     """
 
     RESPOND = "respond"
@@ -124,6 +196,8 @@ class IntentName(StrEnum):
     GET_HISTORY = "get_history"
     GET_UTXOS = "get_utxos"
     NEW_ADDRESS = "new_address"
+    CREATE_TX = "create_tx"
+    CONFIRM_TX = "confirm_tx"
 
 
 class BaseParams(BaseModel):
@@ -232,6 +306,103 @@ class NewAddressParams(_OmitNoneDump):
         raise ValueError("branch must be an integer when present")
 
 
+class CreateTxParams(_OmitNoneDump):
+    """Params for ``create_tx``: recipient + exactly one amount + optional fee.
+
+    Contract (Phase 2 v0 extension, ADR-0013):
+
+    - ``recipient``: REQUIRED string, 14..100 characters. Only the coarse
+      shape is schema-checked here; the meaning-level check (a valid TESTNET
+      witness-v0 P2WPKH bech32 address per ADR-0008) is layer 3 in
+      :mod:`localwallet.protocol.intents`. The address value is never echoed
+      in failures (value-free guarantee).
+    - ``amount_sats`` XOR ``amount_usd``: EXACTLY ONE must be present —
+      enforced by a model validator here and re-checked at layer 3. Both or
+      neither is invalid (an ambiguous amount must never reach the tx
+      engine; fail closed per PROJECT.md §5.5).
+      ``amount_sats``: true JSON integer only (the strict-int pattern from
+      ``limit``: strings/bools/floats/null rejected), 546..21_000_000_000_000_000.
+      ``amount_usd``: true JSON number only (the strict-float variant of the
+      same pattern: strings/bools/null rejected, non-finite floats —
+      ``NaN``/``Infinity`` — rejected), 0.01..1_000_000. JSON integers are
+      accepted for whole-dollar amounts (``10`` == 10.00 USD) because the
+      GBNF ``amount_usd`` branch admits the integer form.
+    - ``fee_target``: optional enum literal ``"fast"|"medium"|"slow"``
+      (omitted ⇒ the handler applies its default); explicit ``null`` is
+      rejected — omission is expressed by leaving the key out, mirroring
+      ``limit``/``branch``.
+    """
+
+    recipient: str = Field(min_length=MIN_RECIPIENT_CHARS, max_length=MAX_RECIPIENT_CHARS)
+    amount_sats: int | None = Field(default=None, ge=MIN_AMOUNT_SATS, le=MAX_AMOUNT_SATS)
+    amount_usd: float | None = Field(default=None, ge=MIN_AMOUNT_USD, le=MAX_AMOUNT_USD)
+    fee_target: Literal["fast", "medium", "slow"] | None = None
+
+    @field_validator("amount_sats", mode="before")
+    @classmethod
+    def _amount_sats_must_be_true_int(cls, value: object) -> object:
+        """Close pydantic's lax coercions for ``amount_sats`` (see ``limit``)."""
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        raise ValueError("amount_sats must be an integer when present")
+
+    @field_validator("amount_usd", mode="before")
+    @classmethod
+    def _amount_usd_must_be_true_number(cls, value: object) -> object:
+        """Strict-float variant of the strict-int pattern (untrusted input).
+
+        Lax mode would accept ``"10.5"`` (string) and ``True`` (bool) as
+        numbers; the contract admits only true JSON numbers. ``int`` is
+        accepted (JSON has one number type; the grammar's ``amount_usd``
+        branch admits the integer form and pydantic widens it to float).
+        Non-finite floats are rejected: Python's ``json`` accepts the
+        ``NaN``/``Infinity`` extensions, and an infinite/NaN USD amount must
+        never reach money logic. Raises ``ValueError`` because pydantic
+        ``mode="before"`` validators must raise ``ValueError``/
+        ``AssertionError`` for the failure to surface as a field error.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("amount_usd must be a number when present")  # noqa: TRY004 — pydantic mode="before" validators must raise ValueError (see _v_must_be_zero_int)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("amount_usd must be a finite number when present")
+        return value
+
+    @field_validator("fee_target", mode="before")
+    @classmethod
+    def _fee_target_must_be_present_when_not_omitted(cls, value: object) -> object:
+        """Reject explicit ``null`` for ``fee_target`` (see ``limit``).
+
+        Omission is expressed by leaving the key out entirely; ``null`` is
+        neither omitted nor an enum literal.
+        """
+        if value is None:
+            raise ValueError("fee_target must be 'fast', 'medium', or 'slow' when present")
+        return value
+
+    @model_validator(mode="after")
+    def _exactly_one_amount(self) -> CreateTxParams:
+        """Enforce the amount XOR at the schema layer (layer 3 re-checks)."""
+        if (self.amount_sats is None) == (self.amount_usd is None):
+            raise ValueError("exactly one of amount_sats or amount_usd must be present")
+        return self
+
+
+class ConfirmTxParams(BaseParams):
+    """Params for ``confirm_tx``: a reference to the pending transaction.
+
+    ``tx_ref``: REQUIRED string, 1..64 characters, identifying the pending
+    transaction the model is confirming (the reference is quoted verbatim
+    from the confirmation card the flow produced). Only the shape is
+    validated here; the flow (:mod:`localwallet.tx.flow`) matches the
+    reference against its dispatcher-owned state — a schema-valid ``tx_ref``
+    that does not name the pending transaction is refused there, and the
+    same-turn user-utterance confirm gate must ALSO have said CONFIRM
+    (ADR-0013: an LLM "yes" never counts as user confirmation).
+    """
+
+    tx_ref: str = Field(min_length=1, max_length=MAX_TX_REF_CHARS)
+
+
 #: Frozen mapping intent name → params model — THE closed world. Intents
 #: outside this registry do not exist: the schema layer rejects them and
 #: the dispatcher refuses them (defense in depth).
@@ -250,6 +421,8 @@ INTENT_REGISTRY: Mapping[IntentName, type[BaseParams]] = MappingProxyType(
         IntentName.GET_HISTORY: GetHistoryParams,
         IntentName.GET_UTXOS: GetUtxosParams,
         IntentName.NEW_ADDRESS: NewAddressParams,
+        IntentName.CREATE_TX: CreateTxParams,
+        IntentName.CONFIRM_TX: ConfirmTxParams,
     }
 )
 
@@ -272,6 +445,8 @@ class Envelope(BaseModel):
         | GetHistoryParams
         | GetUtxosParams
         | NewAddressParams
+        | CreateTxParams
+        | ConfirmTxParams
     )
 
     @model_validator(mode="before")
@@ -286,7 +461,11 @@ class Envelope(BaseModel):
         pairing cross-check below would then reject a perfectly valid
         envelope. Instead, this validator looks up the registry entry for
         the declared intent and validates ``params`` against exactly that
-        model, injecting the instance so the union accepts it as-is.
+        model, injecting the instance so the union accepts it as-is. The
+        Phase 2 intents (``create_tx``, ``confirm_tx``) have required keys,
+        so pydantic could disambiguate them on its own — routing them
+        through the same registry lookup keeps ONE binding path for every
+        intent (and keeps the value-free error rendering below uniform).
 
         Malformed params surface as a single value-free failure: the inner
         pydantic error is re-rendered with ``include_input=False`` and

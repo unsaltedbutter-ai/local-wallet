@@ -180,10 +180,11 @@ class TestSystemPrompt:
         for intent in IntentName:
             assert intent.value in prompt
 
-    def test_contains_all_six_intent_names(self) -> None:
+    def test_contains_all_eight_intent_names(self) -> None:
         # Explicit pin (not just enum iteration): the Phase 1 v0 extension
-        # added get_history / get_utxos / new_address — grammar, schema and
-        # prompt must move together (ADR-0002 cross-reference rule).
+        # added get_history / get_utxos / new_address and the Phase 2 v0
+        # extension added create_tx / confirm_tx — grammar, schema and
+        # prompt must move together (ADR-0002/0013 cross-reference rule).
         prompt = build_system_prompt()
         for name in (
             "respond",
@@ -192,6 +193,8 @@ class TestSystemPrompt:
             "get_history",
             "get_utxos",
             "new_address",
+            "create_tx",
+            "confirm_tx",
         ):
             assert name in prompt
 

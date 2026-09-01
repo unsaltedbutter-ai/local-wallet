@@ -64,10 +64,21 @@ VALID_ENVELOPES: dict[str, dict[str, object]] = {
     "get_history": {"v": 0, "intent": "get_history", "params": {"limit": 5}},
     "get_utxos": {"v": 0, "intent": "get_utxos", "params": {}},
     "new_address": {"v": 0, "intent": "new_address", "params": {"branch": 1}},
+    "create_tx": {
+        "v": 0,
+        "intent": "create_tx",
+        "params": {
+            "recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            "amount_sats": 250000,
+            "fee_target": "fast",
+        },
+    },
+    "confirm_tx": {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "3f2a9c"}},
 }
 
 #: Strict-key-order JSON documents matching the grammar, one per intent
-#: plus the empty-params branch of the Phase 1 optional-key intents.
+#: plus the empty-params branch of the Phase 1 optional-key intents and the
+#: amount_usd branch of create_tx (Phase 2).
 VALID_JSON = [
     '{"v":0,"intent":"respond","params":{"text":"hi"}}',
     '{"v":0,"intent":"clarify","params":{"question":"how fast?"}}',
@@ -77,6 +88,8 @@ VALID_JSON = [
     '{"v":0,"intent":"get_utxos","params":{}}',
     '{"v":0,"intent":"new_address","params":{}}',
     '{"v":0,"intent":"new_address","params":{"branch":0}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_usd":10.5}}',
+    '{"v":0,"intent":"confirm_tx","params":{"tx_ref":"3f2a9c"}}',
 ]
 
 
@@ -244,6 +257,74 @@ def _fuzz_limit_bool(rng: random.Random) -> object:
     return {"v": 0, "intent": "get_history", "params": {"limit": True}}
 
 
+# ------------------------------------------------- Phase 2 near-misses
+# TCK-P2-003: close the schema for the send-flow intents — the amount XOR,
+# the closed fee_target enum, and hostile tx_ref shapes.
+
+def _fuzz_create_tx_both_amounts(rng: random.Random) -> object:
+    # exactly one of amount_sats / amount_usd (XOR); both is invalid.
+    return {
+        "v": 0,
+        "intent": "create_tx",
+        "params": {
+            "recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            "amount_sats": 1000,
+            "amount_usd": 10.5,
+        },
+    }
+
+
+def _fuzz_create_tx_neither_amount(rng: random.Random) -> object:
+    # recipient alone is not a valid create_tx body (XOR violated).
+    return {
+        "v": 0,
+        "intent": "create_tx",
+        "params": {"recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"},
+    }
+
+
+def _fuzz_create_tx_unknown_fee_target(rng: random.Random) -> object:
+    # fee_target is the closed literal enum fast|medium|slow.
+    return {
+        "v": 0,
+        "intent": "create_tx",
+        "params": {
+            "recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            "amount_sats": 1000,
+            "fee_target": "urgent",
+        },
+    }
+
+
+def _fuzz_create_tx_bad_recipient(rng: random.Random) -> object:
+    # mainnet-looking recipient: schema-valid shape, rules-invalid meaning.
+    return {
+        "v": 0,
+        "intent": "create_tx",
+        "params": {"recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "amount_sats": 1000},
+    }
+
+
+def _fuzz_create_tx_bool_amount(rng: random.Random) -> object:
+    # ``True`` is not a JSON integer for amount_sats (strict-int pattern).
+    return {
+        "v": 0,
+        "intent": "create_tx",
+        "params": {"recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "amount_sats": True},
+    }
+
+
+def _fuzz_tx_ref_control_chars(rng: random.Random) -> object:
+    # tx_ref must be printable: embedded control characters are refused.
+    return {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "ab\x00cd"}}
+
+
+def _fuzz_confirm_tx_decision_key(rng: random.Random) -> object:
+    # inline "decision" params are rejected: the confirm gate is app code,
+    # never model-emitted params (ADR-0013).
+    return {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "abc", "decision": "yes"}}
+
+
 _CATEGORIES = [
     _fuzz_truncated,
     _fuzz_bytes,
@@ -264,6 +345,13 @@ _CATEGORIES = [
     _fuzz_branch_array,
     _fuzz_limit_out_of_range,
     _fuzz_limit_bool,
+    _fuzz_create_tx_both_amounts,
+    _fuzz_create_tx_neither_amount,
+    _fuzz_create_tx_unknown_fee_target,
+    _fuzz_create_tx_bad_recipient,
+    _fuzz_create_tx_bool_amount,
+    _fuzz_tx_ref_control_chars,
+    _fuzz_confirm_tx_decision_key,
 ]
 
 
@@ -331,6 +419,14 @@ def test_new_intent_near_misses_are_cleanly_rejected():
         _fuzz_branch_array,
         _fuzz_limit_out_of_range,
         _fuzz_limit_bool,
+        # Phase 2 (TCK-P2-003): send-flow near-misses
+        _fuzz_create_tx_both_amounts,
+        _fuzz_create_tx_neither_amount,
+        _fuzz_create_tx_unknown_fee_target,
+        _fuzz_create_tx_bad_recipient,
+        _fuzz_create_tx_bool_amount,
+        _fuzz_tx_ref_control_chars,
+        _fuzz_confirm_tx_decision_key,
     ]
     for fn in near_misses:
         table = CountingTable()

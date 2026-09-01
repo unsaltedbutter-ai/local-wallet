@@ -13,7 +13,8 @@ the model's side of the closed intent protocol (PROJECT.md §7.1, §8):
 4. **No-secrets rule** — seed phrases / xprvs are refused with the
    watch-only explanation and never repeated (PROJECT.md §9).
 5. **Few-shot examples** — user text → envelope JSON for ``respond``,
-   ``clarify`` (ambiguous amount), ``get_balance``, and ``new_address``.
+   ``clarify`` (ambiguous amount), ``get_balance``, ``new_address``, and
+   ``create_tx`` (Phase 2 v0 extension; ADR-0002/0013 lockstep).
 
 The prompt is kept compact on purpose: v0 runs with a ≤8K context budget
 (ADR-0006), and this text is paid for on every turn.
@@ -47,9 +48,11 @@ CLOSED INTENT LIST (no other intent exists; unknown intents are invalid)
 for explanations and for narrating FACTS results to the user.
 - clarify: ask the user one question; params {"question": "..."} — prefer \
 this when the request is ambiguous or missing a required detail (unclear \
-amount, missing recipient). Sending funds is NOT available yet: for send \
-requests, clarify is the correct intent (amounts/recipients cannot be \
-acted on in this phase).
+amount, missing recipient, no fee preference). For send requests, clarify \
+is correct whenever the recipient or amount is missing or ambiguous — \
+never guess them. Actually moving funds is not available yet: create_tx \
+only prepares an unsigned transaction; signing and broadcast happen later \
+and need the user's hardware wallet.
 - get_balance: look up the wallet balance; params {} — when the user asks \
 what they have.
 - get_history: show recent wallet transactions; params {} or \
@@ -59,6 +62,16 @@ asks what is spendable.
 - new_address: allocate a fresh receive address; params {} — when the user \
 asks for a new receiving address. Never invent an address: emit the intent \
 and quote the address from the tool result afterwards.
+- create_tx: start a send of testnet bitcoin; params {"recipient": "<testnet \
+bech32 address>", "amount_sats": <sats integer> OR "amount_usd": <USD \
+number>, optional "fee_target": "fast"|"medium"|"slow"} — when the user \
+asks to send and BOTH recipient and amount are present. Copy the recipient \
+VERBATIM from the user's message. Exactly one amount form, never both.
+- confirm_tx: pass the user's explicit confirmation of the pending \
+transaction to the flow; params {"tx_ref": "<tx_ref quoted VERBATIM from \
+the confirmation card>"} — ONLY in the same turn where the user explicitly \
+confirms (e.g. "yes", "confirm it"). A positive-sounding earlier message \
+is never a confirmation; when unsure, ask again.
 
 FACTS AND VERBATIM RULE
 - Addresses, amounts, and balances are provided in the FACTS block. Copy \
@@ -85,6 +98,10 @@ envelope: {"v": 0, "intent": "get_balance", "params": {}}
 
 user: give me a new address
 envelope: {"v": 0, "intent": "new_address", "params": {}}
+
+user: send 250000 sats to tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
+envelope: {"v": 0, "intent": "create_tx", "params": {"recipient": \
+"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "amount_sats": 250000}}
 """
 
 
@@ -92,10 +109,10 @@ def build_system_prompt() -> str:
     """Return the system prompt encoding the output contract.
 
     The prompt fixes: exactly one envelope per turn with key order
-    ``v, intent, params``; the closed intent list (six intents as of the
-    Phase 1 v0 extension) with usage guidance; the quote-verbatim rule for
-    FACTS values; the no-secrets (watch-only) rule; and four few-shot
-    exchanges (respond / clarify / get_balance / new_address).
+    ``v, intent, params``; the closed intent list (eight intents as of the
+    Phase 2 v0 extension) with usage guidance; the quote-verbatim rule for
+    FACTS values; the no-secrets (watch-only) rule; and five few-shot
+    exchanges (respond / clarify / get_balance / new_address / create_tx).
 
     Intentionally parameter-free: intent membership and the wire format
     are owned by the protocol subsystem and the GBNF grammar — this text

@@ -29,6 +29,8 @@ from localwallet.protocol import (
     MAX_TEXT_CHARS,
     MAX_VALIDATION_RETRIES,
     ClarifyParams,
+    ConfirmTxParams,
+    CreateTxParams,
     DispatchError,
     Envelope,
     EnvelopeValidationError,
@@ -45,9 +47,20 @@ from localwallet.protocol import (
     handle_raw,
     validate_payload,
 )
-from localwallet.protocol.envelope import _MAX_FAILURE_CHARS
+from localwallet.protocol.envelope import (
+    _MAX_FAILURE_CHARS,
+    MAX_AMOUNT_SATS,
+    MAX_AMOUNT_USD,
+    MAX_TX_REF_CHARS,
+    MIN_AMOUNT_SATS,
+    MIN_AMOUNT_USD,
+)
 
 # ---------------------------------------------------------------- helpers
+
+#: A schema- and rules-valid testnet P2WPKH address (BIP173 testnet vector
+#: for pubkey hash 751e76e8...). Used only as a well-formed fixture value.
+TESTNET_P2WPKH = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
 
 ACCEPT_CASES = {
     "respond": {"v": 0, "intent": "respond", "params": {"text": "hello there"}},
@@ -60,6 +73,13 @@ ACCEPT_CASES = {
     "get_utxos": {"v": 0, "intent": "get_utxos", "params": {}},
     "new_address": {"v": 0, "intent": "new_address", "params": {}},
     "new_address_branch": {"v": 0, "intent": "new_address", "params": {"branch": 0}},
+    # Phase 2 v0 extension (ADR-0013): the send-flow entry + confirm step.
+    "create_tx": {
+        "v": 0,
+        "intent": "create_tx",
+        "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 250000},
+    },
+    "confirm_tx": {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "3f2a9c"}},
 }
 
 PARAMS_TYPES = {
@@ -69,6 +89,8 @@ PARAMS_TYPES = {
     IntentName.GET_HISTORY: GetHistoryParams,
     IntentName.GET_UTXOS: GetUtxosParams,
     IntentName.NEW_ADDRESS: NewAddressParams,
+    IntentName.CREATE_TX: CreateTxParams,
+    IntentName.CONFIRM_TX: ConfirmTxParams,
 }
 
 HANDLER_RESULTS = {
@@ -78,6 +100,8 @@ HANDLER_RESULTS = {
     IntentName.GET_HISTORY: {"records": 0},
     IntentName.GET_UTXOS: {"outputs": 0},
     IntentName.NEW_ADDRESS: {"allocated": 0},
+    IntentName.CREATE_TX: {"staged": True},
+    IntentName.CONFIRM_TX: {"confirmed": True},
 }
 
 
@@ -137,13 +161,15 @@ def test_intent_enum_is_the_closed_world():
         "get_history",
         "get_utxos",
         "new_address",
+        "create_tx",
+        "confirm_tx",
     }
-    assert len(IntentName) == 6
+    assert len(IntentName) == 8
 
 
 def test_intent_registry_is_frozen_and_complete():
     assert set(INTENT_REGISTRY.keys()) == set(IntentName)
-    assert len(INTENT_REGISTRY) == 6
+    assert len(INTENT_REGISTRY) == 8
     for intent, model in INTENT_REGISTRY.items():
         assert model is PARAMS_TYPES[intent]
     # frozen mapping: mutation is refused
@@ -156,7 +182,7 @@ def test_intent_registry_is_frozen_and_complete():
 def test_business_rules_cover_every_intent():
     assert set(BUSINESS_RULES.keys()) == set(IntentName)
     # explicit count: registry completeness is pinned, not incidental
-    assert len(BUSINESS_RULES) == 6
+    assert len(BUSINESS_RULES) == 8
     for intent in IntentName:
         assert callable(BUSINESS_RULES[intent])
     # frozen mapping: mutation is refused (symmetry with INTENT_REGISTRY)
@@ -289,6 +315,329 @@ def test_get_utxos_rejects_any_params_key():
         expect_rejected({"v": 0, "intent": "get_utxos", "params": params})
 
 
+# ------------------------------- Phase 2 v0 extension: create_tx / confirm_tx
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"recipient": TESTNET_P2WPKH, "amount_sats": 546},
+        {"recipient": TESTNET_P2WPKH, "amount_sats": 250_000, "fee_target": "fast"},
+        {"recipient": TESTNET_P2WPKH, "amount_sats": 250_000, "fee_target": "medium"},
+        {"recipient": TESTNET_P2WPKH, "amount_sats": 250_000, "fee_target": "slow"},
+        {"recipient": TESTNET_P2WPKH, "amount_usd": 100.0},
+        {"recipient": TESTNET_P2WPKH, "amount_usd": 10},  # integer JSON number
+        {"recipient": TESTNET_P2WPKH, "amount_usd": 0.01, "fee_target": "slow"},
+    ],
+    ids=["sats-min", "sats-fast", "sats-medium", "sats-slow", "usd-float", "usd-int-json", "usd-min-fee"],
+)
+def test_accept_create_tx_param_combinations(params: dict):
+    envelope = validate_payload({"v": 0, "intent": "create_tx", "params": params})
+    assert isinstance(envelope.params, CreateTxParams)
+    # wire fidelity: None-valued optionals are dropped, so the dump is
+    # exactly the grammar's accepted shape (int amount_usd dumps as the
+    # equal float — JSON has one number type)
+    assert envelope.model_dump()["params"] == params
+
+
+def test_accept_create_tx_amount_boundaries():
+    """Schema bounds: sats 546..21_000_000_000_000_000, usd 0.01..1_000_000."""
+    ok_sats_hi = validate_payload(
+        {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": MAX_AMOUNT_SATS}}
+    )
+    assert ok_sats_hi.params.amount_sats == MAX_AMOUNT_SATS
+    assert MIN_AMOUNT_SATS == 546
+    ok_usd_hi = validate_payload(
+        {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": MAX_AMOUNT_USD}}
+    )
+    assert ok_usd_hi.params.amount_usd == MAX_AMOUNT_USD
+    assert MIN_AMOUNT_USD == 0.01
+    ok_usd_int = validate_payload(
+        {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": 1_000_000}}
+    )
+    assert ok_usd_int.params.amount_usd == 1_000_000.0
+
+
+def test_accept_create_tx_exponent_json_is_schema_legal():
+    """JSON '1e2' is a valid JSON number for amount_usd at the schema layer.
+
+    The GBNF grammar conservatively rejects exponent notation (see the
+    grammar conformance matrix); the narrowing direction only restricts
+    what the grammar-constrained model can emit — the schema remains the
+    wider authority for non-grammar producers.
+    """
+    envelope = validate_payload(
+        f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{TESTNET_P2WPKH}","amount_usd":1e2}}}}'
+    )
+    assert envelope.params.amount_usd == 100.0
+
+
+def test_create_tx_hostile_json_numbers_rejected_cleanly():
+    """Hostile JSON number extensions for amount_usd are clean rejections.
+
+    Python's ``json`` accepts the ``NaN``/``Infinity`` extensions and
+    arbitrarily large integer literals. None may reach money logic, none may
+    escape as a raw ``OverflowError``/exception (handle_raw never raises),
+    and none may be echoed into the value-free failure text (PROJECT.md §5.5
+    fail-closed, §7.8 value-free). Pins the literal JSON forms exactly as a
+    hostile model could emit them.
+    """
+    huge = "9" * 400
+    cases = {
+        "nan": (
+            f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{TESTNET_P2WPKH}",'
+            f'"amount_usd":NaN}}}}'
+        ),
+        "infinity": (
+            f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{TESTNET_P2WPKH}",'
+            f'"amount_usd":Infinity}}}}'
+        ),
+        "huge-int-literal": (
+            f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{TESTNET_P2WPKH}",'
+            f'"amount_usd":{huge}}}}}'
+        ),
+    }
+    table, _ = make_table()
+    for raw in cases.values():
+        exc = expect_rejected(raw)
+        joined = "; ".join(exc.failures)
+        assert "amount_usd" in joined
+        # value-free: the literal number text never appears in a failure
+        assert "NaN" not in joined
+        assert "Infinity" not in joined
+        assert huge not in joined
+        # handle_raw never raises: it surfaces a structured Outcome
+        outcome = handle_raw(raw, table)
+        assert outcome.status in (OutcomeStatus.NEEDS_RETRY, OutcomeStatus.REJECTED)
+        assert outcome.error is not None
+        assert outcome.error.error.code is ErrorCode.INVALID_ENVELOPE
+        assert "NaN" not in outcome.error.error.detail
+        assert huge not in outcome.error.error.detail
+
+
+def test_accept_create_tx_recipient_length_bounds():
+    ok_min = validate_payload(
+        {"v": 0, "intent": "create_tx", "params": {"recipient": "x" * 14, "amount_sats": 546}}
+    )
+    assert ok_min.params.recipient == "x" * 14
+    ok_max = validate_payload(
+        {"v": 0, "intent": "create_tx", "params": {"recipient": "x" * 100, "amount_sats": 546}}
+    )
+    assert ok_max.params.recipient == "x" * 100
+
+
+def test_accept_confirm_tx_tx_ref_bounds():
+    ok_min = validate_payload({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "a"}})
+    assert ok_min.params.tx_ref == "a"
+    ok_max = validate_payload(
+        {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "x" * MAX_TX_REF_CHARS}}
+    )
+    assert ok_max.params.tx_ref == "x" * MAX_TX_REF_CHARS
+    assert MAX_TX_REF_CHARS == 64
+
+
+def test_create_tx_amount_xor_is_layered():
+    """The XOR is enforced at the schema layer AND re-checked at layer 3."""
+    # both/neither rejected at the schema layer (see REJECT_MATRIX); here:
+    # the layer-3 re-check catches validation-skipping constructors.
+    both = CreateTxParams.model_construct(
+        recipient=TESTNET_P2WPKH, amount_sats=546, amount_usd=1.0, fee_target=None
+    )
+    neither = CreateTxParams.model_construct(
+        recipient=TESTNET_P2WPKH, amount_sats=None, amount_usd=None, fee_target=None
+    )
+    for bad in (both, neither):
+        failures = BUSINESS_RULES[IntentName.CREATE_TX](bad)
+        assert failures == ["params must contain exactly one of amount_sats or amount_usd"]
+
+
+def test_create_tx_business_rule_amount_bounds_bypass():
+    """Layer-3 amount bounds re-check catches a validation-skipping bypass.
+
+    Out-of-range amounts are unreachable via ``validate_payload`` (the schema
+    bounds them); ``model_construct`` simulates a validation-skipping
+    constructor to prove the rule holds at layer 3, mirroring the
+    ``get_history``/``new_address`` bypass pattern. ``bool`` is rejected too
+    (True/False pass the range comparisons as 1/0, and False equals 0.0 for
+    the USD bound).
+    """
+    bounds = {
+        "sats-below-min": ({"amount_sats": 1, "amount_usd": None}, "amount_sats"),
+        "sats-over-max": (
+            {"amount_sats": MAX_AMOUNT_SATS + 1, "amount_usd": None},
+            "amount_sats",
+        ),
+        "sats-bool": ({"amount_sats": True, "amount_usd": None}, "amount_sats"),
+        "usd-below-min": ({"amount_sats": None, "amount_usd": 0.001}, "amount_usd"),
+        "usd-over-max": (
+            {"amount_sats": None, "amount_usd": MAX_AMOUNT_USD + 1},
+            "amount_usd",
+        ),
+        "usd-bool": ({"amount_sats": None, "amount_usd": False}, "amount_usd"),
+    }
+    for name, (amounts, field) in bounds.items():
+        bypass = CreateTxParams.model_construct(
+            recipient=TESTNET_P2WPKH, fee_target=None, **amounts
+        )
+        failures = BUSINESS_RULES[IntentName.CREATE_TX](bypass)
+        assert len(failures) == 1, name
+        assert field in failures[0], name
+    # an in-range bypass still validates (XOR + recipient remain the checks)
+    ok = CreateTxParams.model_construct(
+        recipient=TESTNET_P2WPKH, amount_sats=250_000, amount_usd=None, fee_target=None
+    )
+    assert BUSINESS_RULES[IntentName.CREATE_TX](ok) == []
+
+
+def test_business_rule_create_tx_recipient_matrix():
+    """Layer-3 recipient semantics: testnet witness-v0 P2WPKH only.
+
+    Each failure mode has a specific, value-free string; the address value
+    (and any prefix of it) never appears in a failure.
+    """
+    from embit import bech32
+
+    mainnet = bech32.encode("bc", 0, bytes.fromhex("751e76e8199196d454941c45d1b3a323f1433bd6"))
+    taproot_v1 = bech32.encode("tb", 1, b"\x11" * 32)
+    p2wsh_v0 = bech32.encode("tb", 0, b"\x22" * 32)
+
+    def rule_for(recipient: str) -> list[str]:
+        env = validate_payload(
+            {"v": 0, "intent": "create_tx", "params": {"recipient": recipient, "amount_sats": 546}}
+        )
+        return BUSINESS_RULES[IntentName.CREATE_TX](env.params)
+
+    assert rule_for(TESTNET_P2WPKH) == []
+    # uppercase is BIP173-legal (all-upper form); the decoder decides
+    assert rule_for(TESTNET_P2WPKH.upper()) == []
+
+    assert rule_for(mainnet) == [
+        "recipient is not a testnet bech32 address (wrong network prefix)"
+    ]
+    assert rule_for(taproot_v1) == [
+        "recipient must be a witness version 0 address (taproot v1 and later are not supported)"
+    ]
+    assert rule_for(p2wsh_v0) == [
+        "recipient must be a P2WPKH address (witness v0 with a 20-byte program)"
+    ]
+    for bad in ("not-an-address", TESTNET_P2WPKH[:-1] + "q", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzSx"):
+        failures = rule_for(bad)
+        assert failures == ["recipient is not a valid testnet bech32 address"]
+
+    # strings below the schema's 14-char floor never reach the rule via
+    # validate_payload; a validation-skipping constructor must still be
+    # refused here (the decoder is the only authority on bech32 validity)
+    for short in ("", "tb1q", "x" * 13):
+        bypass = CreateTxParams.model_construct(
+            recipient=short, amount_sats=546, amount_usd=None, fee_target=None
+        )
+        assert BUSINESS_RULES[IntentName.CREATE_TX](bypass) == [
+            "recipient is not a valid testnet bech32 address"
+        ]
+
+    # value-free: the address itself is never echoed (checked for a
+    # representative long/short/valid-shaped address)
+    for addr in (TESTNET_P2WPKH, mainnet, taproot_v1, p2wsh_v0):
+        joined = "; ".join(rule_for(addr))
+        assert addr not in joined
+
+
+@pytest.mark.parametrize(
+    ("tx_ref", "expect_failures"),
+    [
+        ("abc123", False),
+        ("3f2a9c1e", False),
+        ("x" * MAX_TX_REF_CHARS, False),
+        ("ok!", False),
+        ("   ", True),
+        ("a\x00b", True),
+        ("line\nbreak", True),
+        ("\t", True),
+    ],
+    ids=["hex", "hex2", "max-len", "printable-punct", "blank", "nul", "newline", "tab"],
+)
+def test_business_rule_confirm_tx_shape_only(tx_ref: str, expect_failures: bool):
+    """``confirm_tx`` rules check SHAPE only (non-empty, printable).
+
+    Content matching against the pending transaction is the flow's job
+    (``localwallet.tx.flow``) — never the rules'.
+    """
+    env = validate_payload({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": tx_ref}})
+    failures = BUSINESS_RULES[IntentName.CONFIRM_TX](env.params)
+    assert bool(failures) is expect_failures
+    assert all("tx_ref" in f for f in failures)
+
+
+def test_business_rule_confirm_tx_empty_bypass():
+    """The empty string fails the schema floor; a bypassed constructor is
+    still refused by the shape rule (defense in depth)."""
+    bypass = ConfirmTxParams.model_construct(tx_ref="")
+    assert BUSINESS_RULES[IntentName.CONFIRM_TX](bypass) == [
+        "params.tx_ref must be a non-empty transaction reference"
+    ]
+
+
+def test_create_tx_business_rule_failures_flow_through_handle_raw():
+    """A rules-invalid create_tx surfaces needs_retry with value-free text."""
+    table, _ = make_table()
+    raw = {"v": 0, "intent": "create_tx", "params": {"recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "amount_sats": 546}}
+    outcome = handle_raw(raw, table)
+    assert outcome.status is OutcomeStatus.NEEDS_RETRY
+    assert any("wrong network prefix" in f for f in outcome.failures)
+    # the address is not echoed into the error envelope detail
+    assert outcome.error is not None
+    assert "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" not in outcome.error.error.detail
+
+
+def test_new_intent_binding_validator_renders_hostile_key_value_free_create_tx():
+    """Hostile extra key on create_tx stays value-free via the binding path.
+
+    Same guarantee as the get_history variant: the registry-binding
+    validator re-renders the inner pydantic error with include_input=False
+    and value-free locations for the Phase 2 intents too.
+    """
+    hostile_key = ("\x00\x1f\n\t evil " * 20)[:200] + "SENTINEL-HOSTILE-KEY"
+    raw = {
+        "v": 0,
+        "intent": "create_tx",
+        "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, hostile_key: "value"},
+    }
+    exc = expect_rejected(raw)
+    joined = "; ".join(exc.failures)
+    assert hostile_key not in joined
+    assert "SENTINEL-HOSTILE-KEY" not in joined
+    assert "\x00" not in joined and "\n" not in joined
+    assert "<key>" in joined
+
+    table, _ = make_table()
+    outcome = handle_raw(raw, table)
+    assert outcome.status is OutcomeStatus.NEEDS_RETRY
+    assert outcome.error is not None
+    assert "SENTINEL-HOSTILE-KEY" not in outcome.error.error.detail
+    assert "<key>" in outcome.error.error.detail
+
+
+def test_confirm_tx_business_rule_bypass_shape():
+    """Control characters in tx_ref are caught even by a bypassed constructor."""
+    bypass = ConfirmTxParams.model_construct(tx_ref="a\x00b")
+    failures = BUSINESS_RULES[IntentName.CONFIRM_TX](bypass)
+    assert failures == ["params.tx_ref must contain only printable characters"]
+
+
+def test_phase2_intents_fail_closed_without_handlers():
+    """ADR-0013 consequence: until TCK-P2-004 wires handlers, a fully valid
+    create_tx/confirm_tx envelope dispatches to dispatch_error — never a
+    silent no-op, never an action."""
+    table, _ = make_table()
+    del table[IntentName.CREATE_TX]
+    del table[IntentName.CONFIRM_TX]
+    for key in ("create_tx", "confirm_tx"):
+        outcome = handle_raw(ACCEPT_CASES[key], table)
+        assert outcome.status is OutcomeStatus.REJECTED
+        assert outcome.error is not None
+        assert outcome.error.error.code is ErrorCode.DISPATCH_ERROR
+        assert "no handler registered" in outcome.error.error.detail
+
+
 def test_envelope_is_frozen():
     envelope = validate_payload(ACCEPT_CASES["respond"])
     with pytest.raises(PydanticValidationError):
@@ -351,6 +700,40 @@ REJECT_MATRIX = [
     ("new_address_branch_bool", {"v": 0, "intent": "new_address", "params": {"branch": True}}),
     ("new_address_limit_key", {"v": 0, "intent": "new_address", "params": {"limit": 5}}),
     ("new_address_extra_key", {"v": 0, "intent": "new_address", "params": {"count": 3}}),
+    # Phase 2 v0 extension: create_tx / confirm_tx rejects (schema layer)
+    ("create_tx_both_amounts", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "amount_usd": 1.0}}),
+    ("create_tx_neither_amount", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH}}),
+    ("create_tx_recipient_short", {"v": 0, "intent": "create_tx", "params": {"recipient": "x" * 13, "amount_sats": 546}}),
+    ("create_tx_recipient_long", {"v": 0, "intent": "create_tx", "params": {"recipient": "x" * 101, "amount_sats": 546}}),
+    ("create_tx_recipient_not_string", {"v": 0, "intent": "create_tx", "params": {"recipient": 42, "amount_sats": 546}}),
+    ("create_tx_recipient_bool", {"v": 0, "intent": "create_tx", "params": {"recipient": True, "amount_sats": 546}}),
+    ("create_tx_sats_545", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 545}}),
+    ("create_tx_sats_negative", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": -5}}),
+    ("create_tx_sats_over_max", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": MAX_AMOUNT_SATS + 1}}),
+    ("create_tx_sats_string", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": "546"}}),
+    ("create_tx_sats_bool", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": True}}),
+    ("create_tx_sats_float", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546.0}}),
+    ("create_tx_sats_null", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": None}}),
+    ("create_tx_usd_009", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": 0.009}}),
+    ("create_tx_usd_zero", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": 0}}),
+    ("create_tx_usd_negative", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": -1.0}}),
+    ("create_tx_usd_over_max", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": 1_000_000.01}}),
+    ("create_tx_usd_string", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": "10.5"}}),
+    ("create_tx_usd_bool", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": False}}),
+    ("create_tx_usd_null", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": None}}),
+    ("create_tx_fee_target_invalid", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "fee_target": "urgent"}}),
+    ("create_tx_fee_target_case", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "fee_target": "FAST"}}),
+    ("create_tx_fee_target_number", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "fee_target": 1}}),
+    ("create_tx_fee_target_null", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "fee_target": None}}),
+    ("create_tx_extra_key", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "memo": "hi"}}),
+    ("create_tx_wrong_intent_key", {"v": 0, "intent": "create_tx", "params": {"tx_ref": "abc", "amount_sats": 546}}),
+    ("confirm_tx_empty", {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": ""}}),
+    ("confirm_tx_overlong", {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "x" * 65}}),
+    ("confirm_tx_not_string", {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": 7}}),
+    ("confirm_tx_null", {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": None}}),
+    ("confirm_tx_extra_key", {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "abc", "decision": "yes"}}),
+    ("confirm_tx_missing", {"v": 0, "intent": "confirm_tx", "params": {}}),
+    ("confirm_tx_create_tx_keys", {"v": 0, "intent": "confirm_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546}}),
     # raw JSON documents that are not envelopes
     ("invalid_json", "{oops"),
     ("json_array", "[1, 2]"),
@@ -503,8 +886,19 @@ def test_invalid_json_yields_error_envelope_not_raw_exception():
         IntentName.GET_HISTORY,
         IntentName.GET_UTXOS,
         IntentName.NEW_ADDRESS,
+        IntentName.CREATE_TX,
+        IntentName.CONFIRM_TX,
     ],
-    ids=["respond", "clarify", "get_balance", "get_history", "get_utxos", "new_address"],
+    ids=[
+        "respond",
+        "clarify",
+        "get_balance",
+        "get_history",
+        "get_utxos",
+        "new_address",
+        "create_tx",
+        "confirm_tx",
+    ],
 )
 def test_dispatch_routes_each_intent_to_its_handler(intent: IntentName):
     recorded: list[Envelope] = []
@@ -579,8 +973,19 @@ def test_dispatch_handler_exception_surfaces_not_swallowed():
         IntentName.GET_HISTORY,
         IntentName.GET_UTXOS,
         IntentName.NEW_ADDRESS,
+        IntentName.CREATE_TX,
+        IntentName.CONFIRM_TX,
     ],
-    ids=["respond", "clarify", "get_balance", "get_history", "get_utxos", "new_address"],
+    ids=[
+        "respond",
+        "clarify",
+        "get_balance",
+        "get_history",
+        "get_utxos",
+        "new_address",
+        "create_tx",
+        "confirm_tx",
+    ],
 )
 def test_handle_raw_ok_path_per_intent(intent: IntentName):
     recorded: list[Envelope] = []

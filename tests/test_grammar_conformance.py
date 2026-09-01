@@ -354,13 +354,15 @@ def matcher() -> GbnfMatcher:
 # --------------------------------------------------------------- drift pin
 
 ACCEPT = [
-    # one valid envelope per intent (6)
+    # one valid envelope per intent (8)
     '{"v":0,"intent":"respond","params":{"text":"hi"}}',
     '{"v":0,"intent":"clarify","params":{"question":"how fast?"}}',
     '{"v":0,"intent":"get_balance","params":{}}',
     '{"v":0,"intent":"get_history","params":{}}',
     '{"v":0,"intent":"get_utxos","params":{}}',
     '{"v":0,"intent":"new_address","params":{}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000}}',
+    '{"v":0,"intent":"confirm_tx","params":{"tx_ref":"3f2a9c"}}',
     # both optional-params variants
     '{"v":0,"intent":"get_history","params":{"limit":20}}',
     '{"v":0,"intent":"new_address","params":{"branch":1}}',
@@ -371,6 +373,23 @@ ACCEPT = [
     # limit boundary 100 and grammar-legal 999 (schema rejects >100 later)
     '{"v":0,"intent":"get_history","params":{"limit":100}}',
     '{"v":0,"intent":"get_history","params":{"limit":999}}',
+    # ---- Phase 2 (TCK-P2-003): create_tx amount-pair alternation variants
+    # amount_sats with optional fee_target tail (each enum literal)
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":546,"fee_target":"fast"}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":546,"fee_target":"medium"}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":546,"fee_target":"slow"}}',
+    # amount_usd: decimal and integer forms (JSON has one number type; the
+    # schema widens "10" to 10.0 USD)
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_usd":10.5}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_usd":10}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_usd":0.01,"fee_target":"fast"}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_usd":100.0}}',
+    # grammar-legal values the schema later bounds: "0" sats (schema floor
+    # is 546) and a 16-digit sats amount
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":0}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":9999999999999999}}',
+    # whitespace around every token still accepted
+    '{\n "v" : 0 ,\n "intent" : "create_tx" ,\n "params" : { "recipient" : "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx" , "amount_usd" : 1.5 , "fee_target" : "medium" }\n}',
 ]
 
 REJECT = [
@@ -408,6 +427,43 @@ REJECT = [
     '{"v":0,"intent":"respond","params":{"text":"hi',
     "malformed JSON truncation: mid-envelope",
     '{"v":0,"intent":"respond"',
+    # ---- Phase 2 (TCK-P2-003): create_tx / confirm_tx drift pins
+    "create_tx BOTH amounts (amount_pair alternation makes this syntactically impossible)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"amount_usd":10}}',
+    "create_tx missing recipient (recipient is a required first key)",
+    '{"v":0,"intent":"create_tx","params":{"amount_sats":1000}}',
+    "create_tx wrong key order (amount before recipient)",
+    '{"v":0,"intent":"create_tx","params":{"amount_sats":1000,"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"}}',
+    "create_tx wrong key order (fee_target before the amount)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","fee_target":"fast","amount_sats":1000}}',
+    "create_tx fee_target with neither amount (tail requires an amount first)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","fee_target":"fast"}}',
+    "create_tx amount_usd exponent notation (conservative grammar narrowing; schema would accept 1e2)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_usd":1e2}}',
+    "create_tx amount_usd trailing point without fraction digits",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_usd":10.}}',
+    "create_tx amount_usd point without integer part",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_usd":.5}}',
+    "create_tx amount_sats leading zeros",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":01000}}',
+    "create_tx amount_sats 17 digits (16-digit syntactic cap; schema ceiling is semantic)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":21000000000000000}}',
+    "create_tx negative amount (no sign in the number rules)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":-5}}',
+    "create_tx unknown fee_target literal",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_target":"urgent"}}',
+    "create_tx fee_target case-sensitive literal",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_target":"FAST"}}',
+    "create_tx params extra key",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"memo":"x"}}',
+    "create_tx null amount",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":null}}',
+    "confirm_tx params extra key (decision params rejected: gate is app code, ADR-0013)",
+    '{"v":0,"intent":"confirm_tx","params":{"tx_ref":"abc","decision":"yes"}}',
+    "confirm_tx missing tx_ref",
+    '{"v":0,"intent":"confirm_tx","params":{}}',
+    "confirm_tx with create_tx keys (intent->params coupling)",
+    '{"v":0,"intent":"confirm_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000}}',
 ]
 
 
@@ -445,6 +501,34 @@ def test_grammar_parses_without_unsupported_constructs(matcher: GbnfMatcher):
         "new_address",
         "params_new_address",
         "branch_digit",
+        "create_tx",
+        "params_create_tx",
+        "recipient_kv",
+        "amount_pair",
+        "amount_sats_kv",
+        "amount_usd_kv",
+        "create_tx_tail",
+        "fee_target_kv",
+        "fee_target",
+        "sats_int",
+        "usd_num",
+        "confirm_tx",
         "string",
         "ws",
     }
+
+
+def test_grammar_intent_branches_cover_the_closed_enum(matcher: GbnfMatcher):
+    """Every closed intent name appears as an alternation of intent_body."""
+    text = _GRAMMAR.read_text(encoding="utf-8")
+    for intent in (
+        "respond",
+        "clarify",
+        "get_balance",
+        "get_history",
+        "get_utxos",
+        "new_address",
+        "create_tx",
+        "confirm_tx",
+    ):
+        assert f'"{intent}"' in text
