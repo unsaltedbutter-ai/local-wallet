@@ -70,16 +70,21 @@ def _rule_get_balance(params: BaseParams) -> list[str]:
 
 
 def _rule_get_history(params: BaseParams) -> list[str]:
-    """``get_history``: limit, when present, must lie in the 1..100 range.
+    """``get_history``: limit, when present, must be a true int in 1..100.
 
-    The schema layer already bounds ``limit`` identically; this is the
-    layer-3 re-check (defense in depth), reachable only via a constructor
-    that skipped validation.
+    The schema layer already bounds ``limit`` identically (and rejects
+    bools); this is the layer-3 re-check (defense in depth), reachable via
+    a constructor that skipped validation. ``bool`` is rejected explicitly
+    because ``True``/``False`` pass the ``1 <= x <= 100`` comparison as the
+    ints 1/0 — the layer-2 schema already refuses them, so layer 3 must
+    agree (bool is not a JSON integer).
     """
     if not isinstance(params, GetHistoryParams):
         return ["internal: 'get_history' params failed the type check"]
-    if params.limit is not None and not 1 <= params.limit <= 100:
-        return ["params.limit must be between 1 and 100 when present"]
+    if isinstance(params.limit, bool) or (
+        params.limit is not None and not 1 <= params.limit <= 100
+    ):
+        return ["params.limit must be an integer between 1 and 100 when present"]
     return []
 
 
@@ -91,15 +96,19 @@ def _rule_get_utxos(params: BaseParams) -> list[str]:
 
 
 def _rule_new_address(params: BaseParams) -> list[str]:
-    """``new_address``: branch, when present, must be 0 (receive) or 1 (change).
+    """``new_address``: branch, when present, must be the true int 0 or 1.
 
     Same layer-3 re-check pattern as ``get_history``: the schema bounds
-    ``branch`` to {0, 1} already.
+    ``branch`` to {0, 1} (and rejects bools) already. ``bool`` is rejected
+    explicitly here too — ``False``/``True`` equal the ints 0/1, so a
+    validation-skipping constructor would otherwise let them through.
     """
     if not isinstance(params, NewAddressParams):
         return ["internal: 'new_address' params failed the type check"]
-    if params.branch is not None and params.branch not in (0, 1):
-        return ["params.branch must be 0 or 1 when present"]
+    if isinstance(params.branch, bool) or (
+        params.branch is not None and params.branch not in (0, 1)
+    ):
+        return ["params.branch must be the integer 0 or 1 when present"]
     return []
 
 

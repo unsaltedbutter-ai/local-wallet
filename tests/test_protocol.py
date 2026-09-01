@@ -431,6 +431,40 @@ def test_extra_key_names_are_rendered_value_free():
     assert "<key>" in joined
 
 
+def test_new_intent_binding_validator_renders_hostile_extra_key_value_free():
+    """Hostile extra key on a NEW intent stays value-free via the binder.
+
+    ``get_history``'s params route through the registry-binding validator
+    (:func:`_bind_params_to_intent`), which re-renders the inner pydantic
+    error with ``include_input=False`` and value-free locations when the
+    params fail to bind. A 200-char, control-character-laden extra key name
+    chosen by an untrusted payload must surface only as the literal
+    ``<key>`` — never as its raw bytes — in the failure text and the
+    resulting error envelope.
+    """
+    hostile_key = ("\x00\x1f\n\t evil " * 20)[:200] + "SENTINEL-HOSTILE-KEY"
+
+    raw = {
+        "v": 0,
+        "intent": "get_history",
+        "params": {"limit": 5, hostile_key: "value"},
+    }
+    exc = expect_rejected(raw)
+    joined = "; ".join(exc.failures)
+    assert hostile_key not in joined
+    assert "SENTINEL-HOSTILE-KEY" not in joined
+    assert "\x00" not in joined and "\n" not in joined
+    assert "<key>" in joined
+
+    # the same value-free guarantee holds through handle_raw → error envelope
+    table, _ = make_table()
+    outcome = handle_raw(raw, table)
+    assert outcome.status is OutcomeStatus.NEEDS_RETRY
+    assert outcome.error is not None
+    assert "SENTINEL-HOSTILE-KEY" not in outcome.error.error.detail
+    assert "<key>" in outcome.error.error.detail
+
+
 def test_joined_failure_text_is_capped():
     """The '; '-joined failure text is capped with a trailing '…' marker."""
     raw = {
@@ -658,6 +692,11 @@ def test_outcome_is_frozen():
         # simulates a validation-skipping bypass to prove the rule holds
         (IntentName.GET_HISTORY, GetHistoryParams.model_construct(limit=0), True),
         (IntentName.GET_HISTORY, GetHistoryParams.model_construct(limit=101), True),
+        # bool is not a JSON integer: True/False pass the range comparison
+        # as the ints 1/0, so layer 3 must reject them explicitly (layer 2
+        # already refuses them via the mode='before' validator)
+        (IntentName.GET_HISTORY, GetHistoryParams.model_construct(limit=True), True),
+        (IntentName.GET_HISTORY, GetHistoryParams.model_construct(limit=False), True),
         (IntentName.GET_UTXOS, GetUtxosParams(), False),
         # new_address: optional branch re-checked against {0, 1} (layer 3)
         (IntentName.NEW_ADDRESS, NewAddressParams(), False),
@@ -665,6 +704,9 @@ def test_outcome_is_frozen():
         (IntentName.NEW_ADDRESS, NewAddressParams(branch=1), False),
         (IntentName.NEW_ADDRESS, NewAddressParams.model_construct(branch=2), True),
         (IntentName.NEW_ADDRESS, NewAddressParams.model_construct(branch=-1), True),
+        # bool bypass: False/True equal the ints 0/1 in the membership check
+        (IntentName.NEW_ADDRESS, NewAddressParams.model_construct(branch=True), True),
+        (IntentName.NEW_ADDRESS, NewAddressParams.model_construct(branch=False), True),
     ],
     ids=[
         "respond-ok",
@@ -677,12 +719,16 @@ def test_outcome_is_frozen():
         "get_history-limit-max",
         "get_history-limit-zero",
         "get_history-limit-over",
+        "get_history-limit-bool-true",
+        "get_history-limit-bool-false",
         "get_utxos-ok",
         "new_address-omitted",
         "new_address-branch-receive",
         "new_address-branch-change",
         "new_address-branch-two",
         "new_address-branch-negative",
+        "new_address-branch-bool-true",
+        "new_address-branch-bool-false",
     ],
 )
 def test_business_rules_layer(

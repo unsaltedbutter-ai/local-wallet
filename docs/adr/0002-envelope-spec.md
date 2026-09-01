@@ -29,6 +29,7 @@ syntactically impossible before validation (§5.4).
 {"v": 0, "intent": <enum>, "params": {...}}
   - "v": integer, must be exactly 0.
   - "intent": one of "respond" | "clarify" | "get_balance" (closed enum).
+    (extended to six intents in Phase 1 — see "v0 extensions" below)
   - "params": REQUIRED object.
     - respond → {"text": string, 1..4000 chars}
     - clarify → {"question": string, 1..1000 chars}
