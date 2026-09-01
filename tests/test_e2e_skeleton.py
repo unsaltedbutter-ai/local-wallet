@@ -26,6 +26,7 @@ pyproject changes).
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -42,16 +43,18 @@ if str(_SRC) not in sys.path:
 
 import localwallet.app as app_module
 from localwallet.agent.loop import AgentLoop, AgentTurnStatus
+from localwallet.agent.runtime import GenerateFn
 from localwallet.app import (
     AUTO_SCAN_ENV_VAR,
     OUT_OF_WINDOW_NOTICE,
     PRIVACY_INDICATOR,
     ZPUB_ENV_VAR,
+    SendSession,
     build_dispatch_table,
     run,
     stub_generate,
 )
-from localwallet.chain import EsploraClient
+from localwallet.chain import EsploraClient, PriceOracle
 from localwallet.protocol import Envelope, IntentName, validate_payload
 from localwallet.store import (
     AddressRecord,
@@ -59,6 +62,7 @@ from localwallet.store import (
     TxRecord,
     UtxoRecord,
 )
+from localwallet.tx.flow import GateDecision, TxFlow, TxFlowStatus
 from localwallet.wallet import GAP_LIMIT_SETTING, scan_wallet
 from localwallet.wallet.derivation import derive_addresses, derive_receive_addresses
 from localwallet.wallet.descriptor import (
@@ -490,6 +494,52 @@ def test_stub_generate_emits_respond_otherwise() -> None:
     envelope = validate_payload(stub_generate(prompt, "root ::= ..."))
     assert envelope.intent is IntentName.RESPOND
     assert isinstance(envelope.params.text, str) and envelope.params.text.strip()
+
+
+# ------------------------------------------------ stub model: send phrases
+
+
+def test_stub_generate_send_phrase_emits_create_tx_with_extracted_fields() -> None:
+    """'send 60000 sats to <tb1…>' → create_tx with the tb1 token and the
+    sats figure extracted verbatim from the user turn (canned dev model)."""
+    prompt = f"SYSTEM...\n\nuser: send 60000 sats to {SEND_RECIPIENT}\n\nenvelope:"
+    envelope = validate_payload(stub_generate(prompt, None))
+    assert envelope.intent is IntentName.CREATE_TX
+    assert envelope.params.recipient == SEND_RECIPIENT
+    assert envelope.params.amount_sats == 60_000
+    assert envelope.params.amount_usd is None
+    assert envelope.params.fee_target is None
+
+
+def test_stub_generate_send_usd_phrase_emits_amount_usd() -> None:
+    prompt = f"SYSTEM...\n\nuser: send $12.50 to {SEND_RECIPIENT} please\n\nenvelope:"
+    envelope = validate_payload(stub_generate(prompt, None))
+    assert envelope.intent is IntentName.CREATE_TX
+    assert envelope.params.amount_usd == 12.5
+    assert envelope.params.amount_sats is None
+
+
+def test_stub_generate_send_falls_back_to_fixture_recipient_and_amount() -> None:
+    """No parsable amount/usable tb1 token → canned fixture recipient
+    (the P0 fixture address) and the canned 10000-sat amount."""
+    prompt = "SYSTEM...\n\nuser: send to tb1\n\nenvelope:"
+    envelope = validate_payload(stub_generate(prompt, None))
+    assert envelope.intent is IntentName.CREATE_TX
+    assert envelope.params.recipient == app_module._STUB_RECIPIENT
+    assert envelope.params.amount_sats == 10_000
+    # The canned recipient IS the P0 fixture address (valid testnet P2WPKH).
+    assert app_module._STUB_RECIPIENT == derive_fixture_addresses(1)[0]
+
+
+def test_stub_generate_confirmation_utterance_emits_canned_confirm_tx() -> None:
+    """'yes please' → canned confirm_tx. The placeholder tx_ref
+    deliberately cannot match a real pending reference (the stub cannot
+    see the flow's id factory) — dispatching it exercises the flow's
+    refusal path in dev mode; deterministic tests inject closures."""
+    prompt = "SYSTEM...\n\nuser: yes please\n\nenvelope:"
+    envelope = validate_payload(stub_generate(prompt, None))
+    assert envelope.intent is IntentName.CONFIRM_TX
+    assert envelope.params.tx_ref == "dev-stub-pending-tx"
 
 
 # ------------------------------------------------- config: store_path env
@@ -1529,6 +1579,698 @@ def test_startup_chain_down_repl_still_starts_and_balance_degrades(
     # The wallet row was still created; the store simply stays empty.
     with Store(store_path) as store:
         assert len(store.list_wallets()) == 1
+
+
+# ----------------------------------------------- send flow (TCK-P2-004)
+#
+# Full destructive-flow pipeline WITHOUT network/model: REPL turns →
+# AgentLoop (fake generate closures quoting the flow's REAL pending
+# tx_ref) → handle_raw validation → allowlist dispatch → create/confirm
+# handlers → store + mock chain (utxos, fees, prices) → TxFlow state
+# machine → confirmation-card narration. The dual-key rule (ADR-0013) is
+# exercised through the real REPL gate wiring (_run_turn), not by
+# calling handlers directly.
+
+
+SEND_FEES_PAYLOAD: Final[dict[str, int]] = {
+    "fastestFee": 3,
+    "halfHourFee": 2,
+    "hourFee": 1,
+    "economyFee": 1,
+    "minimumFee": 1,
+}
+SEND_PRICE_USD: Final[float] = 20_000.0
+
+#: Recipient fixture: branch-0 index 9 of the fixture key — a valid
+#: testnet P2WPKH address OUTSIDE the gap-2 scan window, so the chain
+#: mock never confuses it with a wallet address.
+SEND_RECIPIENT: Final[str] = derive_addresses(_fixture_parsed(), 0, 9, 1)[0].address
+
+#: One confirmed 100_000-sat UTXO at the first receive address: funds a
+#: 60_000-sat send at 2 sat/vB → 1 input, vsize 141, fee 282, change 39718.
+SEND_UTXO: Final[dict[str, Any]] = {
+    "txid": "d" * 64,
+    "vout": 0,
+    "value": 100_000,
+    "status": {"confirmed": True},
+}
+SEND_UTXO_SMALL: Final[dict[str, Any]] = {
+    "txid": "e" * 64,
+    "vout": 0,
+    "value": 10_000,
+    "status": {"confirmed": True},
+}
+
+RESPOND_NOTED_JSON: Final[str] = '{"v": 0, "intent": "respond", "params": {"text": "Noted."}}'
+
+# Expected card numbers for the canonical fixture send (deterministic
+# selection math; fee == vsize × rate asserted independently below).
+SEND_AMOUNT_SATS: Final[int] = 60_000
+SEND_FEE_SATS: Final[int] = 282
+SEND_VSIZE: Final[int] = 141
+SEND_CHANGE_SATS: Final[int] = 39_718
+SEND_USD_CENTS: Final[int] = 1_200  # 60000 sats @ 20000 USD/BTC
+
+
+def _send_chain_handler(
+    recorded: list[httpx.Request],
+    *,
+    utxos_by_addr: dict[str, list[dict[str, Any]]],
+    state: dict[str, Any] | None = None,
+    tip: int = TIP_HEIGHT,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """MockTransport handler for send-flow tests.
+
+    Serves per-address txs (always empty — keeps the scan window at the
+    gap) and utxo payloads, plus ``/v1/fees/recommended`` and
+    ``/v1/prices``. ``state`` is a mutable injection point for the tests:
+    ``state["fees_fail"]`` / ``state["prices_fail"]`` flip those endpoints
+    to 500 mid-test (fee-failure and price-staleness scenarios).
+    """
+    state = state if state is not None else {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorded.append(request)
+        path = request.url.path
+        if path.endswith("/v1/fees/recommended"):
+            if state.get("fees_fail"):
+                return httpx.Response(500, json=None)
+            return httpx.Response(200, json=SEND_FEES_PAYLOAD)
+        if path.endswith("/v1/prices"):
+            if state.get("prices_fail"):
+                return httpx.Response(500, json=None)
+            return httpx.Response(
+                200, json={"time": 1_700_000_000, "USD": state.get("usd", SEND_PRICE_USD)}
+            )
+        if path.endswith("/blocks/tip"):
+            return httpx.Response(200, json=tip)
+        parts = path.rstrip("/").split("/")
+        address, kind = parts[-2], parts[-1]
+        if kind == "txs":
+            return httpx.Response(200, json=[])
+        if kind == "utxo":
+            return httpx.Response(200, json=utxos_by_addr.get(address, []))
+        return httpx.Response(404, json=None)
+
+    return handler
+
+
+def _build_send_table(
+    make_handler: Callable[[list[httpx.Request]], Callable[[httpx.Request], httpx.Response]],
+    *,
+    flow: Any | None = None,
+    make_price_oracle: Callable[[EsploraClient], Any] | None = None,
+    gap_limit: int | None = TEST_GAP,
+) -> tuple[dict[IntentName, Any], Store, Any, EsploraClient, list[httpx.Request], Any, SendSession]:
+    """Send-flow dispatch table: like :func:`_build_table` but returning
+    the shared ``TxFlow``/``SendSession`` pair the handlers own, and
+    accepting a price-oracle factory for oracle-behavior tests."""
+    recorded: list[httpx.Request] = []
+    client = _mock_client(make_handler(recorded))
+    store = Store.memory()
+    wd = WalletDescriptor.from_key(VPUB)
+    wallet = store.create_wallet("default", wd.descriptor)
+    store.set_active_wallet(wallet.id)
+    if gap_limit is not None:
+        store.set_setting(GAP_LIMIT_SETTING, str(gap_limit))
+    tx_flow = flow if flow is not None else TxFlow()
+    session = SendSession()
+    table = build_dispatch_table(
+        store,
+        wallet,
+        wd.parsed,
+        client,
+        lambda: scan_wallet(store, client, wallet),
+        flow=tx_flow,
+        session=session,
+        price_oracle=None if make_price_oracle is None else make_price_oracle(client),
+    )
+    return table, store, wallet, client, recorded, tx_flow, session
+
+
+def _create_tx_envelope_json(params: dict[str, Any] | None = None) -> str:
+    """Canned ``create_tx`` model output.
+
+    ``None`` → the canonical fixture send (60_000 sats to the fixture
+    recipient). A ``params`` dict replaces the amount keys wholesale
+    (merged over the recipient default only) so exactly-one-amount stays
+    intact — e.g. ``{"recipient": ..., "amount_usd": 12}``.
+    """
+    if params is None:
+        body: dict[str, Any] = {"recipient": SEND_RECIPIENT, "amount_sats": SEND_AMOUNT_SATS}
+    else:
+        body = {"recipient": SEND_RECIPIENT, **params}
+    return json.dumps({"v": 0, "intent": "create_tx", "params": body})
+
+
+def _send_generate(flow: Any, plan: list[str], create_params: dict[str, Any] | None = None) -> GenerateFn:
+    """Fake generate_fn for send-flow e2e tests.
+
+    ``plan`` entries: ``"create"`` → the canned create_tx envelope;
+    ``"confirm"`` → a confirm_tx envelope quoting the flow's REAL pending
+    ``tx_ref`` at call time (the stub cannot know it — this closure can);
+    ``"respond"`` → a canned respond; any other string is emitted
+    verbatim (e.g. a hand-written confirm_tx with a bogus ref). Beyond
+    the plan, canned ``respond`` forever.
+    """
+    state = {"n": 0}
+
+    def generate(prompt: str, grammar_text: str | None) -> str:
+        del prompt, grammar_text
+        step = plan[state["n"]] if state["n"] < len(plan) else RESPOND_NOTED_JSON
+        state["n"] += 1
+        if step == "create":
+            return _create_tx_envelope_json(create_params)
+        if step == "confirm":
+            assert flow.pending is not None, "test bug: no pending tx to reference"
+            return json.dumps(
+                {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": flow.pending.tx_ref}}
+            )
+        if step == "respond":
+            return RESPOND_NOTED_JSON
+        return step
+
+    return generate
+
+
+def _run_send_repl(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    handler: Callable[[httpx.Request], httpx.Response],
+    lines: list[str],
+    plan: list[str],
+    *,
+    flow: Any | None = None,
+    create_params: dict[str, Any] | None = None,
+    extra_env: dict[str, str | None] | None = None,
+) -> tuple[int, list[str], Any]:
+    """Run app.run() over the real REPL with the send-flow fixtures.
+
+    Returns ``(exit_code, output_lines, flow)`` — the flow is the very
+    instance the handlers used, so tests assert dispatcher-owned state.
+    """
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    monkeypatch.delenv("LOCALWALLET_MODEL_PATH", raising=False)
+    monkeypatch.delenv("LOCALWALLET_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LOCALWALLET_LLM_MODEL", raising=False)
+    monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "0")
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
+    for name, value in (extra_env or {}).items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
+    tx_flow = flow if flow is not None else TxFlow()
+    generate = _send_generate(tx_flow, plan, create_params)
+    inputs = iter(lines)
+    outputs: list[str] = []
+    code = run(
+        ["--zpub", VPUB],
+        input_fn=lambda _prompt: next(inputs),
+        output_fn=outputs.append,
+        flow=tx_flow,
+        generate_fn=generate,
+    )
+    return code, outputs, tx_flow
+
+
+def _card_refs(outputs: list[str]) -> list[str]:
+    """All ``Ref:`` values shown by confirmation cards, in order."""
+    return [line.split("Ref: ", 1)[1] for line in outputs if line.startswith("Ref: ")]
+
+
+def test_send_flow_happy_path_card_then_dual_key_confirm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """'send 60000 sats …' → card with EXACT selection values → 'yes
+    please' + model confirm_tx (real tx_ref) → Approved + CONFIRMED."""
+    addr0 = derive_fixture_addresses(1)[0]
+    recorded: list[httpx.Request] = []
+    handler = _send_chain_handler(recorded, utxos_by_addr={addr0: [SEND_UTXO]})
+
+    code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "yes please", "exit"],
+        ["create", "confirm"],
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    # Card lines, exact values verbatim from the handler result dict.
+    assert "Pending transaction — review it carefully" in joined
+    assert f"Amount: {SEND_AMOUNT_SATS} sats ($12.00 · rate age 0s)" in joined
+    assert f"To: {SEND_RECIPIENT}" in joined
+    assert f"Fee: {SEND_FEE_SATS} sats (2 sat/vB, medium target)" in joined
+    assert f"Size: {SEND_VSIZE} vB" in joined
+    assert "Inputs: 1" in joined
+    assert f"Change: {SEND_CHANGE_SATS} sats" in joined
+    assert "Expires: ~10 min" in joined
+    # Independent money-math cross-checks of the card figures.
+    assert SEND_FEE_SATS == SEND_VSIZE * 2  # fee == vsize × rate
+    assert SEND_AMOUNT_SATS + SEND_FEE_SATS + SEND_CHANGE_SATS == 100_000
+    # Dual-key confirm: same-turn "yes please" + matching tx_ref.
+    assert (
+        "Approved. The signed-transaction step arrives in Phase 3 — say 'status' later."
+        in joined
+    )
+    assert flow.state is TxFlowStatus.CONFIRMED
+    assert flow.pending is None
+    assert "Not confirmed" not in joined
+    # The chain saw the lazy scan + fees + prices; the PSBT never prints.
+    assert any(r.url.path.endswith("/v1/fees/recommended") for r in recorded)
+    assert any(r.url.path.endswith("/v1/prices") for r in recorded)
+    assert any(r.url.path.endswith("/utxo") for r in recorded)
+    assert "cHNj" not in joined  # no base64 PSBT payload in narration
+
+
+def test_send_flow_handler_result_card_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The create_tx handler result carries exactly the confirmation-card
+    contract fields (plus the rate timestamp), verbatim from the flow."""
+    addr0 = derive_fixture_addresses(1)[0]
+    table, store, wallet, client, _recorded, flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]})
+    )
+    envelope = validate_payload(_create_tx_envelope_json())
+
+    result = table[IntentName.CREATE_TX](envelope)
+
+    assert set(result.keys()) == {
+        "tx_ref",
+        "amount_sats",
+        "recipient",
+        "fee_sats",
+        "fee_rate_sat_vb",
+        "vsize",
+        "change_sats",
+        "inputs_count",
+        "usd_cents",
+        "rate_stale",
+        "rate_age_s",
+        "rate_fetched_at",
+        "fee_target",
+        "expires_in_s",
+    }
+    assert result["recipient"] == SEND_RECIPIENT
+    assert result["fee_sats"] == result["vsize"] * result["fee_rate_sat_vb"]
+    assert result["amount_sats"] == SEND_AMOUNT_SATS
+    assert result["change_sats"] == SEND_CHANGE_SATS
+    assert result["usd_cents"] == SEND_USD_CENTS
+    assert result["rate_stale"] is False
+    assert result["rate_age_s"] == 0
+    assert result["fee_target"] == "medium"  # MEDIUM default when omitted
+    assert result["expires_in_s"] == 600
+    # Flow owns the staged record with identical numbers.
+    pending = flow.pending
+    assert pending is not None
+    assert pending.tx_ref == result["tx_ref"]
+    assert pending.fee_sats == result["fee_sats"]
+    # ADR-0009: the fresh change index was allocated only after the build;
+    # the scan's gap window had prefetched index 1 as 'unused' (kept).
+    assert store.get_derivation(wallet.id, 1).next_index == 1
+    assert [(r.index, r.status) for r in store.get_addresses(wallet.id, 1)] == [
+        (0, "allocated"),
+        (1, "unused"),
+    ]
+    client.close()
+    store.close()
+
+
+def test_send_flow_confirm_direct_with_gate_decision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """confirm_tx handler: CONFIRMED needs the session's same-turn gate
+    decision — present → confirmed dict with the unsigned PSBT; absent →
+    value-free refusal, flow untouched."""
+    addr0 = derive_fixture_addresses(1)[0]
+    table, store, _wallet, client, _recorded, flow, session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]})
+    )
+    create_env = validate_payload(_create_tx_envelope_json())
+    created = table[IntentName.CREATE_TX](create_env)
+    confirm_env = validate_payload(
+        json.dumps({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": created["tx_ref"]}})
+    )
+
+    # Key 2 missing (user never said yes on this turn): refused, CREATED.
+    refused = table[IntentName.CONFIRM_TX](confirm_env)
+    assert refused["error"] == "confirm_refused"
+    assert SEND_RECIPIENT not in str(refused["detail"])  # value-free detail
+    assert str(SEND_AMOUNT_SATS) not in str(refused["detail"])
+    assert flow.state is TxFlowStatus.CREATED
+
+    # Both keys on the same turn: CONFIRMED with the signer handoff.
+    session.gate_decision = GateDecision.CONFIRM
+    confirmed = table[IntentName.CONFIRM_TX](confirm_env)
+    assert confirmed["status"] == "confirmed"
+    assert confirmed["tx_ref"] == created["tx_ref"]
+    assert confirmed["message"] == "ready for signing (Phase 3)"
+    psbt = base64.b64decode(confirmed["psbt_base64"])  # round-trips as base64
+    assert psbt[:5] == b"psbt\xff"  # BIP 174 magic
+    assert flow.state is TxFlowStatus.CONFIRMED
+    client.close()
+    store.close()
+
+
+def test_send_flow_dual_key_model_confirms_user_silent_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """(a) Model emits confirm_tx but the user's same-turn utterance
+    ('whatever') is NOT_A_DECISION → confirm_refused narration, state
+    stays CREATED (the refusal message IS the UX)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler(
+        [], utxos_by_addr={addr0: [SEND_UTXO]}
+    )
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "whatever", "exit"],
+        ["create", "confirm"],
+    )
+    joined = "\n".join(outputs)
+    assert "Not confirmed — confirmation gate not satisfied" in joined
+    assert "the user has not explicitly confirmed this transaction" in joined
+    assert flow.state is TxFlowStatus.CREATED
+    assert "Approved." not in joined
+    # Value-free refusal: the recipient never appears in it.
+    refusal = next(line for line in outputs if line.startswith("Not confirmed"))
+    assert SEND_RECIPIENT not in refusal
+
+
+def test_send_flow_dual_key_user_yes_model_respond_stays_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """(b) User says 'yes' but the model emits respond (no confirm_tx) →
+    no flow transition; guidance line; state stays CREATED."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "yes", "exit"],
+        ["create", "respond"],
+    )
+    joined = "\n".join(outputs)
+    assert "Noted." in joined  # the model's respond passed through
+    assert "The transaction is still pending — say 'confirm'" in joined
+    assert flow.state is TxFlowStatus.CREATED
+    assert flow.pending is not None
+    assert "Approved." not in joined
+
+
+def test_send_flow_deny_cancels_and_allows_new_create(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """'no thanks' while pending → the gate DENY is authoritative: the
+    flow cancels proactively, the cancellation is narrated, and a new
+    create succeeds afterwards (fresh tx_ref)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "no thanks",
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "exit",
+        ],
+        ["create", "respond", "create"],
+    )
+    joined = "\n".join(outputs)
+    assert "Transaction cancelled." in joined
+    refs = _card_refs(outputs)
+    assert len(refs) == 2
+    assert refs[0] != refs[1]  # a fresh pending transaction, new identity
+    assert "already pending" not in joined
+    assert flow.state is TxFlowStatus.CREATED
+
+
+def test_send_flow_expired_pending_refuses_confirm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Injected clock past PENDING_TTL_S: the confirm attempt transitions
+    CREATED → EXPIRED and the refusal names the expiry."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    times = iter([1_000.0, 1_700.0])
+
+    def clock() -> float:
+        return next(times, 1_700.0)
+
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "yes please", "exit"],
+        ["create", "confirm"],
+        flow=TxFlow(clock=clock),
+    )
+    joined = "\n".join(outputs)
+    assert "Not confirmed — pending transaction expired." in joined
+    assert flow.state is TxFlowStatus.EXPIRED
+    assert flow.pending is None
+
+
+def test_send_flow_duplicate_pending_reshows_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """'send …' while a transaction is already pending → tx_pending
+    refusal plus the SAME pending card re-shown (same tx_ref)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "exit",
+        ],
+        ["create", "create"],
+    )
+    joined = "\n".join(outputs)
+    assert "A transaction is already pending — confirm or cancel it first." in joined
+    refs = _card_refs(outputs)
+    assert len(refs) == 2
+    assert refs[0] == refs[1]  # the SAME pending transaction re-shown
+    assert flow.state is TxFlowStatus.CREATED
+
+
+def test_send_flow_insufficient_funds_friendly_line_no_flow_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Amount over balance → friendly needed/available line (user-facing
+    amounts per ADR-0012) and NO pending entry; also proves the lazy
+    scan ran before selection (empty store → chain → still short)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    table, store, wallet, client, recorded, flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO_SMALL]})
+    )
+    # table-level: no cursor → the handler itself must lazy-scan first.
+    assert store.get_sync_state(wallet.id, "last_scan_cursor") is None
+    envelope = validate_payload(_create_tx_envelope_json())
+
+    result = table[IntentName.CREATE_TX](envelope)
+
+    assert result == {
+        "error": "insufficient_funds",
+        "needed_sats": 60_220,  # 60000 + vsize(1-in, no change) 110 × 2
+        "available_sats": 10_000,
+    }
+    assert store.get_sync_state(wallet.id, "last_scan_cursor") is not None
+    assert any(r.url.path.endswith("/utxo") for r in recorded)
+    assert flow.state is TxFlowStatus.IDLE
+    assert flow.pending is None
+    # No allocation happened on the failed selection (nothing to roll
+    # back): the change branch keeps only the scan's 'unused' prefetch.
+    assert store.get_derivation(wallet.id, 1).next_index == 0
+    assert [r.status for r in store.get_addresses(wallet.id, 1)] == ["unused", "unused"]
+
+    outputs: list[str] = []
+    app_module._print_create_tx(result, outputs.append)
+    assert "Insufficient funds: need 60220 sats, have 10000 sats." in outputs
+    client.close()
+    store.close()
+
+
+def test_send_flow_amount_usd_resolves_via_fresh_price(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """USD-denominated send: oracle fresh rate → sats resolved by the
+    oracle's floor policy, card shows sats + USD with rate age."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send $12 to {SEND_RECIPIENT}", "exit"],
+        ["create"],
+        create_params={"recipient": SEND_RECIPIENT, "amount_usd": 12},
+    )
+    joined = "\n".join(outputs)
+    # $12 @ 20000 USD/BTC → exactly 60000 sats → identical card figures.
+    assert f"Amount: {SEND_AMOUNT_SATS} sats ($12.00 · rate age 0s)" in joined
+    assert flow.state is TxFlowStatus.CREATED
+
+
+def test_send_flow_stale_rate_marked_with_age(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Oracle degrade ladder: warm cache past its TTL + failing prices
+    endpoint → fresh() serves the STALE rate; the card marks it with the
+    age, and the send still stages (stale rate still resolves amounts)."""
+    from localwallet.chain import price as price_module
+
+    addr0 = derive_fixture_addresses(1)[0]
+    state: dict[str, Any] = {"prices_fail": False}
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(price_module, "_now", lambda: clock["now"])
+    table, _store, _wallet, client, _recorded, flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]}, state=state),
+        make_price_oracle=lambda client_: PriceOracle(client_, ttl_s=0.000001),
+    )
+    envelope = validate_payload(_create_tx_envelope_json())
+
+    first = table[IntentName.CREATE_TX](envelope)
+    assert first.get("error") is None
+    assert first["rate_stale"] is False
+    assert first["rate_age_s"] == 0
+    fetched_at = first["rate_fetched_at"]
+    assert fetched_at == 1_000.0
+
+    flow.cancel()  # explicit recovery path to stage a second send
+    state["prices_fail"] = True
+    clock["now"] = 2_000.0
+
+    second = table[IntentName.CREATE_TX](envelope)
+    assert second.get("error") is None
+    assert second["rate_stale"] is True
+    assert second["rate_age_s"] == 1_000  # age from the injected clock
+    assert second["rate_fetched_at"] == fetched_at  # same cached rate
+    assert second["usd_cents"] == SEND_USD_CENTS
+    assert flow.state is TxFlowStatus.CREATED
+    client.close()
+
+
+def test_send_flow_price_disabled_usd_path_refuses_without_flow_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Oracle disabled by config + USD amount → price_unavailable handler
+    error, and DO NOT create a flow entry (user retries or gives sats)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    table, _store, _wallet, client, _recorded, flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]}),
+        make_price_oracle=lambda client_: PriceOracle(client_, enabled=False),
+    )
+    envelope = validate_payload(
+        _create_tx_envelope_json({"recipient": SEND_RECIPIENT, "amount_usd": 12})
+    )
+
+    result = table[IntentName.CREATE_TX](envelope)
+
+    assert result["error"] == "price_unavailable"
+    assert "price oracle is disabled by configuration" in str(result["detail"])
+    assert flow.state is TxFlowStatus.IDLE
+    client.close()
+
+
+def test_send_flow_price_disabled_sats_path_still_sends(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """LOCALWALLET_PRICE_ENABLED=0 + sats amount → the send proceeds; the
+    card simply omits the USD segment (display-only sugar)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "exit"],
+        ["create"],
+        extra_env={"LOCALWALLET_PRICE_ENABLED": "0"},
+    )
+    joined = "\n".join(outputs)
+    assert f"Amount: {SEND_AMOUNT_SATS} sats" in joined
+    assert "rate age" not in joined
+    assert f"Fee: {SEND_FEE_SATS} sats (2 sat/vB, medium target)" in joined
+    assert flow.state is TxFlowStatus.CREATED
+
+
+def test_send_flow_ambiguous_gate_guidance_state_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """'yes no' (mixed signals) while pending → guidance asking for an
+    explicit confirm/cancel; the flow is untouched."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "yes no", "exit"],
+        ["create", "respond"],
+    )
+    joined = "\n".join(outputs)
+    assert "That was ambiguous — say 'confirm'" in joined
+    assert "or 'cancel'" in joined
+    assert flow.state is TxFlowStatus.CREATED
+    assert flow.pending is not None
+
+
+def test_send_flow_confirm_refused_tx_ref_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A schema-valid confirm_tx quoting the WRONG ref → value-free
+    refusal naming the mismatch; flow stays CREATED."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    bogus = json.dumps({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "bogus-ref"}})
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "yes please", "exit"],
+        ["create", bogus],
+    )
+    joined = "\n".join(outputs)
+    assert "Not confirmed — tx_ref does not match the pending transaction." in joined
+    assert flow.state is TxFlowStatus.CREATED
+    refusal = next(line for line in outputs if line.startswith("Not confirmed"))
+    assert SEND_RECIPIENT not in refusal  # value-free error contract
+
+
+def test_send_flow_fee_estimate_failure_surfaces_chain_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fees endpoint down → existing chain_unavailable error pattern, and
+    no flow entry (fail closed before any money math)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    state: dict[str, Any] = {"fees_fail": True}
+    table, _store, _wallet, client, _r, flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]}, state=state)
+    )
+    envelope = validate_payload(_create_tx_envelope_json())
+    result = table[IntentName.CREATE_TX](envelope)
+    assert result["error"] == "chain_unavailable"
+    assert result["detail"].strip() != ""
+    assert flow.state is TxFlowStatus.IDLE
+    outputs: list[str] = []
+    app_module._print_create_tx(result, outputs.append)
+    assert "Could not create the transaction — chain unavailable" in outputs[0]
+    client.close()
+    _store.close()
 
 
 # ------------------------------------------------- live-network integration

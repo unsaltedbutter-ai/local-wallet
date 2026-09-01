@@ -1,7 +1,8 @@
 """Application wiring: agent loop → allowlist dispatch → wallet handlers.
 
-Phase 1 wiring (TCK-P1-004). This module only glues existing pieces
-together — it implements no protocol, wallet, or chain logic itself:
+Phase 1 wiring (TCK-P1-004) extended with the Phase 2 send flow
+(TCK-P2-004). This module only glues existing pieces together — it
+implements no protocol, wallet, chain, or tx-engine logic itself:
 
 - :func:`build_dispatch_table` — the allowlist dispatch table (closed
   intent enum → handlers). Every handler reads the SQLite store
@@ -9,8 +10,15 @@ together — it implements no protocol, wallet, or chain logic itself:
   ``get_balance`` sums the cached UTXO snapshot, ``get_history`` /
   ``get_utxos`` project cached rows, ``new_address`` allocates the next
   derivation index (store bookkeeping + pure derivation — never
-  network), and ``respond``/``clarify`` pass the model's text through
-  unchanged.
+  network), ``respond``/``clarify`` pass the model's text through
+  unchanged, and the send flow runs the dispatcher-owned state machine:
+  ``create_tx`` resolves the amount (sats, or USD via the price oracle),
+  estimates the fee, selects coins and builds the unsigned PSBT via the
+  pure tx engine, then stages a :class:`~localwallet.tx.flow.PendingTx`;
+  ``confirm_tx`` moves the flow CREATED → CONFIRMED only under the
+  dual-key rule (ADR-0013): a matching ``tx_ref`` AND a CONFIRM
+  classification of the SAME turn's user utterance by the deterministic
+  :class:`~localwallet.tx.flow.ConfirmGate` — an LLM "yes" never counts.
 - :func:`run` / :func:`main` — CLI wiring: read the watch-only key from
   ``--zpub`` or ``LOCALWALLET_ZPUB``, parse + gate it (testnet-only,
   value-free errors → config-error exit 2), open the store
@@ -18,7 +26,9 @@ together — it implements no protocol, wallet, or chain logic itself:
   create the single wallet profile (descriptor-match guard, ADR-0010),
   pick the model runtime (remote debug bridge → local GGUF →
   ``--stub-llm``), run the startup scan (or ``--rescan``; env opt-out
-  via ``LOCALWALLET_AUTO_SCAN=0``) and the chat REPL.
+  via ``LOCALWALLET_AUTO_SCAN=0``) and the chat REPL. The REPL owns the
+  :class:`TxFlow` / :class:`SendSession` pair and classifies every user
+  utterance against the confirm gate at the top of each turn.
 
 Invariants honored here:
 
@@ -43,10 +53,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from string import punctuation
 from typing import Final
+
+from embit.script import address_to_scriptpubkey
 
 from localwallet.agent.context import sanitize_tool_output
 from localwallet.agent.loop import AgentLoop, AgentTurnResult, AgentTurnStatus
@@ -57,10 +72,20 @@ from localwallet.agent.remote_runtime import (
     debug_notice,
 )
 from localwallet.agent.runtime import MODEL_PATH_ENV_VAR, GenerateFn, ModelRuntime
-from localwallet.chain import ChainError, EsploraClient
+from localwallet.chain import (
+    ChainError,
+    ConfigDisabled,
+    EsploraClient,
+    FeeEstimator,
+    FeeTarget,
+    PriceOracle,
+    PriceUnavailableError,
+)
 from localwallet.config import Settings
 from localwallet.protocol import (
     ClarifyParams,
+    ConfirmTxParams,
+    CreateTxParams,
     DispatchTable,
     Envelope,
     GetHistoryParams,
@@ -71,14 +96,27 @@ from localwallet.protocol import (
 )
 from localwallet.store import (
     ADDRESS_ALLOCATED,
+    BRANCH_CHANGE,
     AddressRecord,
     Store,
     StoreError,
     WalletRecord,
 )
+from localwallet.tx.flow import (
+    PENDING_TTL_S,
+    ConfirmGate,
+    FlowError,
+    GateDecision,
+    TxFlow,
+    TxFlowStatus,
+)
+from localwallet.tx.psbt import PsbtError, PsbtInputSource, build_unsigned_psbt, psbt_to_base64
+from localwallet.tx.selection import InsufficientFundsError, SelectionError, select_coins
 from localwallet.wallet import scan as wallet_scan
 from localwallet.wallet.derivation import BranchDeriver
 from localwallet.wallet.descriptor import (
+    SCRIPT_PURPOSES,
+    TESTNET_COIN_TYPE,
     ParsedKey,
     WalletDescriptor,
     WatchKeyError,
@@ -91,6 +129,7 @@ __all__ = [
     "OUT_OF_WINDOW_NOTICE",
     "PRIVACY_INDICATOR",
     "ZPUB_ENV_VAR",
+    "SendSession",
     "build_dispatch_table",
     "main",
     "run",
@@ -162,6 +201,61 @@ _STUB_NEW_ADDRESS_ENVELOPE: Final[str] = json.dumps(
     {"v": 0, "intent": "new_address", "params": {}}
 )
 
+#: Canned ``create_tx`` recipient for the dev stub (P0 fixture address: the
+#: first receive address of the fixture vpub used throughout the tests).
+#: Deterministic canned data for ``--stub-llm`` only — never a real payee.
+_STUB_RECIPIENT: Final[str] = "tb1q3f0w5yzgvcpp9akt4sfad764dvthz6qzv0xlfh"
+
+#: Fallback canned amount (sats) when the stub cannot parse one from the
+#: user text. Deliberately above the dust bound and below typical fixtures.
+_STUB_FALLBACK_AMOUNT_SATS: Final[int] = 10_000
+
+#: Canned ``confirm_tx`` for the dev stub. The placeholder ``tx_ref``
+#: deliberately does NOT match any real pending reference (the stub cannot
+#: see the flow's id factory): dispatching it demonstrates the flow's
+#: refusal path in dev mode. Deterministic tests inject generate closures
+#: that quote the real pending ``tx_ref`` instead (see tests/test_e2e_skeleton.py).
+_STUB_CONFIRM_TX_ENVELOPE: Final[str] = json.dumps(
+    {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "dev-stub-pending-tx"}}
+)
+
+#: User-facing narration lines for the send flow (TCK-P2-004). Every value
+#: they carry comes verbatim from the handler result dict — the UI computes
+#: nothing (integer division/formatting of result values only, the same
+#: display-truncation class as txid shortening).
+_CARD_HEADER_LINE: Final[str] = (
+    "Pending transaction — review it carefully, then say 'confirm' or 'cancel':"
+)
+_CANCELLED_LINE: Final[str] = "Transaction cancelled."
+_CONFIRMED_LINE: Final[str] = (
+    "Approved. The signed-transaction step arrives in Phase 3 — say 'status' later."
+)
+_GUIDANCE_STILL_PENDING: Final[str] = (
+    "The transaction is still pending — say 'confirm' to approve it or "
+    "'cancel' to discard it."
+)
+_GUIDANCE_AMBIGUOUS: Final[str] = (
+    "That was ambiguous — say 'confirm' to approve the pending transaction "
+    "or 'cancel' to discard it."
+)
+
+
+@dataclass
+class SendSession:
+    """Per-turn send-flow context shared by the REPL and the handlers.
+
+    The REPL classifies the user's utterance against the deterministic
+    confirm gate (:class:`~localwallet.tx.flow.ConfirmGate`) at the top of
+    every turn — BEFORE the model runs — and stores the decision here; the
+    ``confirm_tx`` handler passes it into
+    :meth:`~localwallet.tx.flow.TxFlow.confirm`. That ordering is the
+    dual-key wiring (ADR-0013): the gate decision always describes the
+    SAME turn as the ``confirm_tx`` envelope, and an LLM "yes" can never
+    substitute for it.
+    """
+
+    gate_decision: GateDecision = GateDecision.NOT_A_DECISION
+
 
 def stub_generate(prompt: str, grammar_text: str | None) -> str:
     """Deterministic stub model for ``--stub-llm`` — dev/test mode ONLY.
@@ -176,10 +270,23 @@ def stub_generate(prompt: str, grammar_text: str | None) -> str:
     of the assembled prompt, see ``AgentLoop._build_prompt``) against a
     fixed phrase table — "balance" → ``get_balance``; "history" or
     "transaction" → ``get_history``; "utxo" → ``get_utxos``; "new
-    address" / "address" → ``new_address``; anything else → a canned
-    ``respond``. ``grammar_text`` is accepted for
-    :data:`~localwallet.agent.runtime.GenerateFn` compatibility and
+    address" / "address" → ``new_address``; a send request ("send … to
+    tb1…") → ``create_tx`` (the ``tb1…`` token and the ``<n> sats`` /
+    ``$<n>`` figure are extracted verbatim from the user turn, with the
+    canned fixture recipient / a canned 10000-sat amount as fallbacks);
+    a confirmation utterance ("confirm", "yes", …) → ``confirm_tx``;
+    anything else → a canned ``respond``. ``grammar_text`` is accepted
+    for :data:`~localwallet.agent.runtime.GenerateFn` compatibility and
     ignored.
+
+    Dev-mode caveats (by design, documented): the canned ``confirm_tx``
+    carries a placeholder ``tx_ref`` that cannot match a real pending
+    reference — the flow refuses it, which demonstrates the dual-key
+    refusal path. Deterministic tests do NOT rely on the stub for the
+    happy path; they inject generate closures that quote the flow's real
+    pending ``tx_ref``. Everything the stub extracts from user text is
+    untrusted input like any model output: it flows through the full
+    3-layer validation before any handler runs.
 
     Args:
         prompt: The fully assembled agent prompt.
@@ -191,6 +298,9 @@ def stub_generate(prompt: str, grammar_text: str | None) -> str:
     """
     del grammar_text
     user_turn = prompt.rsplit("user: ", 1)[-1].lower()
+    # The assembled prompt terminates with "\n\nenvelope:"; the utterance
+    # is the first line of the last user segment (REPL input is one line).
+    utterance = user_turn.split("\n")[0].strip()
     if "balance" in user_turn:
         return _STUB_BALANCE_ENVELOPE
     if "history" in user_turn or "transaction" in user_turn:
@@ -199,7 +309,47 @@ def stub_generate(prompt: str, grammar_text: str | None) -> str:
         return _STUB_UTXOS_ENVELOPE
     if "address" in user_turn:
         return _STUB_NEW_ADDRESS_ENVELOPE
+    if "send" in user_turn and "tb1" in user_turn:
+        return _stub_create_tx_envelope(utterance)
+    if (
+        "confirm" in utterance
+        or "approve" in utterance
+        or utterance in ("yes", "y", "yes please", "send it", "do it")
+    ):
+        return _STUB_CONFIRM_TX_ENVELOPE
     return _STUB_RESPOND_ENVELOPE
+
+
+def _stub_create_tx_envelope(user_turn: str) -> str:
+    """Build the stub's canned ``create_tx`` envelope from the user turn.
+
+    Deterministic extraction, dev mode only: the recipient is the first
+    whitespace token starting with ``tb1`` (edge punctuation stripped),
+    falling back to the canned fixture address; the amount is the first
+    ``<n> sats`` figure, else the first ``$<n>`` figure, else the canned
+    sats fallback. The output is an ordinary model-output document — it
+    must pass the same validation as the real model's envelope.
+    """
+    recipient = _STUB_RECIPIENT
+    for token in user_turn.split():
+        candidate = token.strip(punctuation)
+        if candidate.startswith("tb1") and len(candidate) > 3:
+            recipient = candidate
+            break
+
+    params: dict[str, object]
+    sats_match = re.search(r"send\s+(\d+)\s*sats", user_turn)
+    usd_match = re.search(r"\$\s*(\d+(?:\.\d+)?)", user_turn)
+    if sats_match is not None:
+        params = {"recipient": recipient, "amount_sats": int(sats_match.group(1))}
+    elif usd_match is not None:
+        params = {"recipient": recipient, "amount_usd": float(usd_match.group(1))}
+    else:
+        params = {
+            "recipient": recipient,
+            "amount_sats": _STUB_FALLBACK_AMOUNT_SATS,
+        }
+    return json.dumps({"v": 0, "intent": "create_tx", "params": params})
 
 
 def build_dispatch_table(
@@ -208,6 +358,11 @@ def build_dispatch_table(
     parsed: ParsedKey,
     client: EsploraClient,
     scan_fn: Callable[[], object],
+    *,
+    flow: TxFlow | None = None,
+    session: SendSession | None = None,
+    fee_estimator: FeeEstimator | None = None,
+    price_oracle: PriceOracle | None = None,
 ) -> DispatchTable:
     """Build the allowlist dispatch table for the running app.
 
@@ -215,19 +370,33 @@ def build_dispatch_table(
         store: The open persistence layer every handler reads.
         wallet: The active wallet row (ADR-0010: exactly one profile).
         parsed: The wallet's parsed account key (for ``new_address``
-            derivation; public key only).
+            derivation and the send flow's PSBT account fields; public
+            key only).
         client: The chain client — used only by ``scan_fn`` (the lazy
-            first scan inside ``get_balance``); the read handlers never
-            touch it.
+            first scan inside ``get_balance``/``create_tx``) and by the
+            fee/price wrappers below; the read handlers never touch it.
         scan_fn: Zero-argument callable performing one wallet scan
             (``scan_wallet(store, client, wallet)`` in production). Used
-            lazily by ``get_balance`` when the store has no sync cursor.
+            lazily when the store has no sync cursor.
+        flow: The dispatcher-owned send-flow state machine (TCK-P2-004).
+            Defaults to a fresh :class:`TxFlow` with the real clock and
+            uuid id factory; the REPL and tests share ONE instance.
+        session: The per-turn gate-decision carrier (dual-key rule,
+            ADR-0013). Defaults to a fresh :class:`SendSession`.
+        fee_estimator: Fee-rate source for ``create_tx``; defaults to a
+            :class:`FeeEstimator` over ``client``.
+        price_oracle: USD/BTC rate source for ``create_tx``; defaults to
+            a :class:`PriceOracle` over ``client``.
 
     Returns:
         A :class:`~localwallet.protocol.DispatchTable` covering the whole
         closed intent enum.
     """
     wallet_id = wallet.id
+    # One shared flow/session pair: the create and confirm handlers must
+    # see the SAME dispatcher-owned state machine (never two instances).
+    tx_flow = flow if flow is not None else TxFlow()
+    send_session = session if session is not None else SendSession()
     return {
         IntentName.RESPOND: _respond_handler,
         IntentName.CLARIFY: _clarify_handler,
@@ -237,6 +406,16 @@ def build_dispatch_table(
         IntentName.GET_HISTORY: _make_get_history_handler(store, wallet_id),
         IntentName.GET_UTXOS: _make_get_utxos_handler(store, wallet_id),
         IntentName.NEW_ADDRESS: _make_new_address_handler(store, wallet_id, parsed),
+        IntentName.CREATE_TX: _make_create_tx_handler(
+            store,
+            wallet_id,
+            parsed,
+            tx_flow,
+            fee_estimator if fee_estimator is not None else FeeEstimator(client),
+            price_oracle if price_oracle is not None else PriceOracle(client),
+            scan_fn,
+        ),
+        IntentName.CONFIRM_TX: _make_confirm_tx_handler(tx_flow, send_session),
     }
 
 
@@ -450,6 +629,326 @@ def _make_new_address_handler(
     return handler
 
 
+def _tx_pending_result(flow: TxFlow) -> dict[str, object]:
+    """The ``tx_pending`` refusal result, carrying the pending card fields.
+
+    Surfaced when ``create_tx`` arrives while a transaction is already
+    pending (ADR-0013: at most one pending transaction; a stale one is
+    recovered explicitly, never reaped). The pending card is re-shown
+    from the flow's own record so the user can act on it; rate fields
+    are unknown on re-show (``usd_cents=None``) and ``expires_in_s``
+    keeps the card's nominal TTL label.
+    """
+    result: dict[str, object] = {"error": "tx_pending"}
+    pending = flow.pending
+    if pending is not None:
+        result.update(
+            {
+                "tx_ref": pending.tx_ref,
+                "amount_sats": pending.amount_sats,
+                "recipient": pending.recipient,
+                "fee_sats": pending.fee_sats,
+                "fee_rate_sat_vb": pending.fee_rate_sat_vb,
+                "vsize": pending.vsize,
+                "change_sats": pending.change_sats,
+                "inputs_count": pending.inputs_count,
+                "usd_cents": None,
+                "rate_stale": False,
+                "rate_age_s": None,
+                "rate_fetched_at": None,
+                "fee_target": pending.fee_target,
+                "expires_in_s": PENDING_TTL_S,
+            }
+        )
+    return result
+
+
+def _make_create_tx_handler(
+    store: Store,
+    wallet_id: int,
+    parsed: ParsedKey,
+    flow: TxFlow,
+    fee_estimator: FeeEstimator,
+    price_oracle: PriceOracle,
+    scan_fn: Callable[[], object],
+) -> Handler:
+    """Create the ``create_tx`` handler: stage an unsigned pending transaction.
+
+    Pipeline (every step fail-closed; nothing stages unless ALL succeed):
+
+    1. Pending guard: with a transaction already pending the handler
+       refuses with ``{"error": "tx_pending", ...}`` plus the pending
+       card fields (re-shown from the flow) — before any network or
+       store work.
+    2. Amount resolution: ``amount_sats`` is taken direct;
+       ``amount_usd`` requires the price oracle (:meth:`PriceOracle.fresh`).
+       A price failure on the USD path refuses the whole request with
+       ``{"error": "price_unavailable", ...}`` and NO flow entry (the
+       user retries, or gives sats). On the sats path the oracle is
+       consulted best-effort for the card's USD display only — a failure
+       there degrades to ``usd_cents=None`` and never blocks the send.
+       A stale-but-served rate (ADR-0011 ladder) is marked ``rate_stale``
+       with its age; the rate's fetch timestamp is included either way.
+    3. Fee rate: ``fee_target`` maps onto :class:`FeeTarget`; when the
+       model omits it the handler applies **MEDIUM** by default
+       (documented decision, TCK-P2-004: a send with no stated urgency
+       gets the half-hour target, never the cheapest/slowest). A failed
+       fee lookup surfaces as ``chain_unavailable``.
+    4. UTXO snapshot: read from the store; when the wallet has never
+       scanned (no sync cursor) the scan runs once lazily first (same
+       path as ``get_balance``), then the snapshot is re-read.
+    5. Change address: the branch-1 ``next_index`` is DERIVED but NOT
+       allocated while selection/build runs (derive-check-without-
+       allocate). Store allocation (upsert ``allocated`` row →
+       :meth:`Store.allocate` → :meth:`Store.bump_next_index`) happens
+       ONLY after the PSBT build succeeds — so a failed selection/build
+       needs no rollback (nothing was written), and a failed bookkeeping
+       write leaves no pending transaction (the handler returns
+       ``store_error``; a retry re-derives the SAME index because
+       derivation is pure and the bump is the last write). Allocated
+       rows are never removed (ADR-0009); the only split state —
+       allocated row without bump — self-heals on that retry.
+    6. Selection + PSBT: the pure tx engine (:func:`select_coins`,
+       :func:`build_unsigned_psbt`) does all money math; the handler
+       only maps store rows into engine inputs. The change cost passed
+       to selection is computed from the change script's serialized
+       size (``9 + len(script)`` vB), never hardcoded.
+    7. Staging: :meth:`TxFlow.create` stamps the flow-owned ``tx_ref``;
+       the handler returns the confirmation-card dict verbatim from the
+       pending record plus the rate/USD display fields.
+
+    Value discipline: ``InsufficientFundsError`` carries needed/available
+    sats — those are user-facing UI figures (ADR-0012) returned as
+    structured result keys for the narration, never placed in a detail
+    string that could reach a log. All other engine/chain/store error
+    strings are value-free by their layers' contracts.
+    """
+
+    def handler(envelope: Envelope) -> dict[str, object]:
+        params = envelope.params
+        if not isinstance(params, CreateTxParams):
+            return {"error": "internal", "detail": "create_tx params shape mismatch"}
+
+        # 1. Pending guard (before any network/store work).
+        if flow.state is TxFlowStatus.CREATED:
+            return _tx_pending_result(flow)
+
+        # 2. Amount resolution (sats direct; USD via the price oracle).
+        rate = None
+        if params.amount_sats is not None:
+            amount_sats = params.amount_sats
+            try:
+                rate = price_oracle.fresh()
+            except (PriceUnavailableError, ConfigDisabled):
+                rate = None  # display-only sugar on the sats path
+        else:
+            try:
+                rate = price_oracle.fresh()
+            except (PriceUnavailableError, ConfigDisabled) as exc:
+                # Both messages are value-free (no rate/amount echo).
+                return {"error": "price_unavailable", "detail": str(exc)}
+            amount_sats = price_oracle.usd_to_sats(params.amount_usd, rate)
+
+        usd_cents = price_oracle.sats_to_usd(amount_sats, rate) if rate is not None else None
+        rate_stale = rate.stale if rate is not None else False
+        rate_age_s = int(rate.age_s()) if rate is not None else None
+        rate_fetched_at = rate.fetched_at if rate is not None else None
+
+        # 3. Fee rate (MEDIUM default when the model omits fee_target).
+        target = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.MEDIUM
+        try:
+            fee_rate = fee_estimator.estimate(target).sat_per_vb
+        except ChainError as exc:
+            return {"error": "chain_unavailable", "detail": str(exc)}
+
+        # 4. UTXO snapshot with the lazy first scan.
+        try:
+            if store.get_sync_state(wallet_id, wallet_scan.CURSOR_KEY) is None:
+                try:
+                    scan_fn()
+                except (ChainError, wallet_scan.ScanError, WatchKeyError) as exc:
+                    # detail is scrubbed by the chain/scan layers — safe verbatim.
+                    return {"error": "chain_unavailable", "detail": str(exc)}
+            utxos = store.get_utxos_for_wallet(wallet_id)
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+
+        # Recipient output script (layer 3 already proved the address is a
+        # testnet witness-v0 P2WPKH bech32 string; containment anyway).
+        try:
+            recipient_script = bytes(address_to_scriptpubkey(params.recipient).data)
+        except Exception:  # noqa: BLE001 — containment: embit raises varied errors for bad addresses; re-raising would leak the untrusted recipient into error strings
+            return {"error": "internal", "detail": "recipient could not be encoded as a script"}
+
+        # 5. Change candidate: derive, do NOT allocate yet (see docstring).
+        try:
+            change_index = store.get_derivation(wallet_id, BRANCH_CHANGE).next_index
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+        change_address = BranchDeriver(parsed, BRANCH_CHANGE).address(change_index)
+        change_script = bytes(address_to_scriptpubkey(change_address).data)
+
+        # 6. Selection + PSBT via the pure tx engine.
+        try:
+            selection = select_coins(
+                utxos,
+                amount_sats,
+                fee_rate,
+                9 + len(change_script),  # serialized change-output cost in vB
+                recipient_script,
+                change_script=change_script,
+            )
+        except InsufficientFundsError as exc:
+            # needed/available are user-facing UI figures (ADR-0012):
+            # structured keys for narration, never a log-bound detail.
+            return {
+                "error": "insufficient_funds",
+                "needed_sats": exc.needed,
+                "available_sats": exc.available,
+            }
+        except SelectionError as exc:
+            return {"error": "selection_failed", "detail": str(exc)}
+
+        inputs: list[PsbtInputSource] = []
+        try:
+            for utxo in selection.selected:
+                if not utxo.address:
+                    return {
+                        "error": "internal",
+                        "detail": "cached utxo has no address record",
+                    }
+                record = store.get_by_address(utxo.address)
+                if (
+                    record is None
+                    or record.wallet_id != wallet_id
+                    or record.branch not in (0, 1)
+                ):
+                    return {
+                        "error": "internal",
+                        "detail": "cached utxo has no usable derivation record",
+                    }
+                inputs.append(
+                    PsbtInputSource(
+                        txid=utxo.txid,
+                        vout=utxo.vout,
+                        value_sats=utxo.value_sats,
+                        script_pubkey=bytes(address_to_scriptpubkey(utxo.address).data),
+                        branch=record.branch,
+                        index=record.index,
+                    )
+                )
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+
+        purpose = SCRIPT_PURPOSES[parsed.script_type]
+        try:
+            psbt, _meta = build_unsigned_psbt(
+                inputs,
+                [(recipient_script, amount_sats)],
+                change_address if selection.change_sats is not None else None,
+                selection.change_sats,
+                account_key=parsed.hd_key,
+                account_fingerprint=parsed.hd_key.my_fingerprint,
+                account_path=(purpose + 2**31, TESTNET_COIN_TYPE + 2**31, 2**31),
+            )
+            psbt_base64 = psbt_to_base64(psbt)
+        except PsbtError as exc:
+            return {"error": "psbt_failed", "detail": str(exc)}
+
+        # 5 (cont.). Allocation bookkeeping — strictly AFTER the successful
+        # build, strictly BEFORE staging (see docstring for the failure
+        # windows; no rollback path is needed under this ordering).
+        try:
+            store.upsert_batch(
+                [
+                    AddressRecord(
+                        wallet_id=wallet_id,
+                        branch=BRANCH_CHANGE,
+                        index=change_index,
+                        address=change_address,
+                        script_type=parsed.script_type,
+                        status=ADDRESS_ALLOCATED,
+                    )
+                ]
+            )
+            store.allocate(wallet_id, BRANCH_CHANGE, change_index)
+            store.bump_next_index(wallet_id, BRANCH_CHANGE)
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+
+        # 7. Stage the pending transaction (flow owns tx_ref identity).
+        try:
+            pending = flow.create(
+                amount_sats=amount_sats,
+                recipient=params.recipient,
+                fee_rate_sat_vb=fee_rate,
+                fee_sats=selection.fee_sats,
+                psbt_base64=psbt_base64,
+                inputs_count=len(inputs),
+                vsize=selection.estimated_vsize,
+                fee_target=target.value,
+                change_sats=selection.change_sats,
+            )
+        except FlowError:
+            # Unreachable single-threaded after the pending guard; fail
+            # closed with the pending card rather than double-staging.
+            return _tx_pending_result(flow)
+
+        return {
+            "tx_ref": pending.tx_ref,
+            "amount_sats": pending.amount_sats,
+            "recipient": pending.recipient,
+            "fee_sats": pending.fee_sats,
+            "fee_rate_sat_vb": pending.fee_rate_sat_vb,
+            "vsize": pending.vsize,
+            "change_sats": pending.change_sats,
+            "inputs_count": pending.inputs_count,
+            "usd_cents": usd_cents,
+            "rate_stale": rate_stale,
+            "rate_age_s": rate_age_s,
+            "rate_fetched_at": rate_fetched_at,
+            "fee_target": pending.fee_target,
+            "expires_in_s": PENDING_TTL_S,
+        }
+
+    return handler
+
+
+def _make_confirm_tx_handler(flow: TxFlow, session: SendSession) -> Handler:
+    """Create the ``confirm_tx`` handler: CREATED → CONFIRMED under the dual key.
+
+    The flow transition requires BOTH keys (ADR-0013): the model's
+    ``confirm_tx`` envelope with a ``tx_ref`` matching the pending
+    transaction (this handler), AND the CONFIRM classification of the
+    current user turn's utterance — read from :class:`SendSession`,
+    which the REPL fills from the deterministic
+    :class:`~localwallet.tx.flow.ConfirmGate` BEFORE the model runs.
+    Any :class:`~localwallet.tx.flow.FlowError` (no pending tx, expiry,
+    gate not satisfied, ``tx_ref`` mismatch) is refused with
+    ``{"error": "confirm_refused", "detail": <value-free flow message>}``
+    — the refusal message IS the user-facing UX. On success the handler
+    returns the confirmed record incl. the unsigned PSBT (the Phase 3
+    signing handoff); the narration prints no PSBT payload.
+    """
+
+    def handler(envelope: Envelope) -> dict[str, object]:
+        params = envelope.params
+        if not isinstance(params, ConfirmTxParams):
+            return {"error": "internal", "detail": "confirm_tx params shape mismatch"}
+        try:
+            pending = flow.confirm(params.tx_ref, gate_decision=session.gate_decision)
+        except FlowError as exc:
+            return {"error": "confirm_refused", "detail": str(exc)}
+        return {
+            "status": "confirmed",
+            "tx_ref": pending.tx_ref,
+            "psbt_base64": pending.psbt_base64,
+            "message": "ready for signing (Phase 3)",
+        }
+
+    return handler
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Console entry point; delegates to :func:`run`."""
     return run(argv)
@@ -460,6 +959,8 @@ def run(
     *,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
+    flow: TxFlow | None = None,
+    generate_fn: GenerateFn | None = None,
 ) -> int:
     """Wire the application from ``argv``/environment and run the REPL.
 
@@ -472,14 +973,26 @@ def run(
     descriptor, else created (``name="default"``; ADR-0010
     single-wallet). The startup scan (``--rescan`` for the full repair
     scan) populates the cache; ``LOCALWALLET_AUTO_SCAN=0`` skips it —
-    the first balance lookup then scans lazily. Chain/store failures at
-    startup print a scrubbed warning and the REPL still starts; handlers
-    surface store-empty / chain-down states per turn.
+    the first balance/created-tx lookup then scans lazily. Chain/store
+    failures at startup print a scrubbed warning and the REPL still
+    starts; handlers surface store-empty / chain-down states per turn.
+
+    The REPL owns the send-flow state machine: ``flow`` defaults to a
+    :class:`TxFlow` with the real clock and uuid id factory; tests inject
+    a deterministic one (controllable clock for expiry, capturable
+    reference for confirm envelopes) through this seam. ``generate_fn``
+    likewise injects a bare model callable ahead of the env/flag
+    selection (send-flow e2e tests quote the flow's real pending
+    ``tx_ref``, which the canned stub cannot know).
 
     Args:
         argv: CLI arguments (defaults to ``sys.argv[1:]``).
         input_fn: REPL line reader (``input``-compatible; test seam).
         output_fn: REPL/banner writer (``print``-compatible; test seam).
+        flow: The :class:`TxFlow` for the send flow (test seam; a fresh
+            real-clock instance by default).
+        generate_fn: A bare ``generate(prompt, grammar) -> str`` model
+            callable used as-is when provided (test seam).
 
     Returns:
         Process exit code: ``0`` on normal exit (including ``exit``,
@@ -519,7 +1032,11 @@ def run(
         return 2
 
     generate: ModelRuntime | GenerateFn | RemoteOpenAIRuntime
-    if remote_base_url:
+    if generate_fn is not None:
+        # Injected bare model callable (test seam) — used ahead of the
+        # env/flag selection; flows through handle_raw like any runtime.
+        generate = generate_fn
+    elif remote_base_url:
         # ADR-0007 (TEMPORARY debug bridge): selected only via explicit env,
         # with a one-line disclosure that chat text leaves this machine.
         generate = RemoteOpenAIRuntime()
@@ -551,6 +1068,11 @@ def run(
         timeout_s=settings.request_timeout_s,
         max_retries=settings.max_retries,
     )
+    # Fee/price wrappers share the ONE chain client (no second transport);
+    # construction is network-free — they fetch lazily, per their TTLs.
+    fee_estimator = FeeEstimator(client)
+    price_oracle = PriceOracle(client)
+    tx_flow = flow if flow is not None else TxFlow()
 
     output_fn(_BANNER_TITLE)
     output_fn(_BANNER_TESTNET)
@@ -562,17 +1084,22 @@ def run(
     if out_of_window is not None:
         output_fn(out_of_window)
 
+    session = SendSession()
     table = build_dispatch_table(
         store,
         wallet_row,
         parsed,
         client,
         lambda: wallet_scan.scan_wallet(store, client, wallet_row),
+        flow=tx_flow,
+        session=session,
+        fee_estimator=fee_estimator,
+        price_oracle=price_oracle,
     )
     loop = AgentLoop(generate, table)
 
     try:
-        _repl(loop, output_fn, input_fn)
+        _repl(loop, output_fn, input_fn, flow=tx_flow, session=session)
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
     finally:
@@ -720,8 +1247,16 @@ def _repl(
     loop: AgentLoop,
     output_fn: Callable[[str], None],
     input_fn: Callable[[str], str],
+    *,
+    flow: TxFlow,
+    session: SendSession,
 ) -> None:
-    """Read user lines until EOF/exit and print each turn's outcome."""
+    """Read user lines until EOF/exit and print each turn's outcome.
+
+    The flow/session pair is owned by this loop's caller (:func:`run`);
+    every turn runs through :func:`_run_turn` so the confirm gate sees
+    the raw utterance before the model does.
+    """
     while True:
         try:
             line = input_fn("you> ")
@@ -732,7 +1267,57 @@ def _repl(
             continue
         if line.lower() in ("exit", "quit"):
             return
-        _print_turn(loop.run(line, {}), output_fn)
+        _run_turn(loop, flow, session, line, output_fn)
+
+
+def _run_turn(
+    loop: AgentLoop,
+    flow: TxFlow,
+    session: SendSession,
+    line: str,
+    output_fn: Callable[[str], None],
+) -> None:
+    """Run ONE REPL turn: gate classification → agent → flow narration.
+
+    Dual-key wiring (ADR-0013): at the top of the turn — BEFORE the
+    model runs — a live pending transaction puts the user's utterance
+    through :meth:`ConfirmGate.classify` and stores the decision on the
+    session, so the ``confirm_tx`` handler (which runs inside
+    ``loop.run``) consumes a gate decision from the SAME turn.
+
+    - DENY while pending: the gate decision is authoritative — the flow
+      is cancelled proactively (no model cancel intent is waited for)
+      and the cancellation is narrated after the turn's own output.
+    - AMBIGUOUS while pending: the turn proceeds normally and a guidance
+      line asks the user to confirm or cancel explicitly.
+    - CONFIRM while the flow is still CREATED after the turn (the model
+      did not emit ``confirm_tx``): a guidance line — the flow is
+      untouched.
+    - NOT_A_DECISION: normal chat; a pending card simply stays pending.
+    """
+    session.gate_decision = (
+        ConfirmGate.classify(line)
+        if flow.state is TxFlowStatus.CREATED
+        else GateDecision.NOT_A_DECISION
+    )
+    cancelled = False
+    if session.gate_decision is GateDecision.DENY and flow.state is TxFlowStatus.CREATED:
+        flow.cancel()
+        cancelled = True
+    _print_turn(loop.run(line, {}), output_fn)
+    if cancelled:
+        output_fn(sanitize_tool_output(_CANCELLED_LINE))
+        return
+    if flow.state is TxFlowStatus.CREATED:
+        guidance = (
+            _GUIDANCE_AMBIGUOUS
+            if session.gate_decision is GateDecision.AMBIGUOUS
+            else _GUIDANCE_STILL_PENDING
+            if session.gate_decision is GateDecision.CONFIRM
+            else None
+        )
+        if guidance is not None:
+            output_fn(sanitize_tool_output(guidance))
 
 
 def _print_turn(turn: AgentTurnResult, output_fn: Callable[[str], None]) -> None:
@@ -769,6 +1354,10 @@ def _print_turn(turn: AgentTurnResult, output_fn: Callable[[str], None]) -> None
         _print_utxos(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.NEW_ADDRESS:
         _print_new_address(turn.result or {}, output_fn)
+    elif envelope.intent is IntentName.CREATE_TX:
+        _print_create_tx(turn.result or {}, output_fn)
+    elif envelope.intent is IntentName.CONFIRM_TX:
+        _print_confirm_tx(turn.result or {}, output_fn)
     else:  # pragma: no cover — closed intent enum
         output_fn(sanitize_tool_output(_GENERIC_FAILURE))
 
@@ -776,12 +1365,16 @@ def _print_turn(turn: AgentTurnResult, output_fn: Callable[[str], None]) -> None
 def _error_line(result: Mapping[str, object], label: str) -> str:
     """Render a handler ``{"error": ..., "detail": ...}`` result for the UI.
 
-    ``chain_unavailable`` keeps its human wording; other codes print as-is.
-    Details are scrubbed by their layers (value-free of
-    addresses/txids/amounts) and are safe to surface verbatim.
+    ``chain_unavailable`` keeps its human wording; ``price_unavailable``
+    likewise (send-flow narration); other codes print as-is. Details are
+    scrubbed by their layers (value-free of addresses/txids/amounts) and
+    are safe to surface verbatim.
     """
     error = str(result.get("error", "error"))
-    human = "chain unavailable" if error == "chain_unavailable" else error
+    human = {
+        "chain_unavailable": "chain unavailable",
+        "price_unavailable": "price data unavailable",
+    }.get(error, error)
     detail = str(result.get("detail", "")).strip()
     suffix = f" ({detail})" if detail else ""
     return f"{label} — {human}{suffix}"
@@ -873,3 +1466,101 @@ def _print_new_address(result: Mapping[str, object], output_fn: Callable[[str], 
             f"{result.get('address', '')}"
         )
     )
+
+
+def _print_create_tx(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+    """Narrate a ``create_tx`` outcome (TCK-P2-004 confirmation-card UX).
+
+    Success → the confirmation card. ``tx_pending`` → the refusal line
+    plus the pending card re-rendered from the result's own fields.
+    ``insufficient_funds`` → a friendly line built from the structured
+    ``needed_sats``/``available_sats`` keys (user-facing amounts, per
+    ADR-0012 — never a log-bound detail string). Everything else goes
+    through :func:`_error_line` (value-free details).
+    """
+    error = result.get("error")
+    if error == "insufficient_funds":
+        output_fn(
+            sanitize_tool_output(
+                f"Insufficient funds: need {result.get('needed_sats', 0)} sats, "
+                f"have {result.get('available_sats', 0)} sats."
+            )
+        )
+        return
+    if error == "tx_pending":
+        output_fn(
+            sanitize_tool_output(
+                "A transaction is already pending — confirm or cancel it first."
+            )
+        )
+        _print_confirmation_card(result, output_fn)
+        return
+    if error is not None:
+        output_fn(sanitize_tool_output(_error_line(result, "Could not create the transaction")))
+        return
+    output_fn(sanitize_tool_output(_CARD_HEADER_LINE))
+    _print_confirmation_card(result, output_fn)
+
+
+def _print_confirmation_card(
+    result: Mapping[str, object], output_fn: Callable[[str], None]
+) -> None:
+    """Render the pending-transaction confirmation card.
+
+    Every value is verbatim from the handler result dict — the renderer
+    only formats (USD cents → dollars, TTL seconds → minutes, the same
+    display-only class as txid truncation). The recipient is quoted ONLY
+    from ``result["recipient"]`` (tool-output verbatim rule); the USD
+    segment appears only when the handler supplied ``usd_cents``, with
+    the rate age and the stale marker when present.
+    """
+    amount_line = f"Amount: {result.get('amount_sats', 0)} sats"
+    usd_cents = result.get("usd_cents")
+    if isinstance(usd_cents, int):
+        amount_line += f" (${usd_cents // 100}.{usd_cents % 100:02d}"
+        rate_age = result.get("rate_age_s")
+        if rate_age is not None:
+            amount_line += f" · rate age {rate_age}s"
+        if result.get("rate_stale"):
+            amount_line += " · stale"
+        amount_line += ")"
+    output_fn(sanitize_tool_output(amount_line))
+    output_fn(sanitize_tool_output(f"To: {result.get('recipient', '')}"))
+    output_fn(
+        sanitize_tool_output(
+            f"Fee: {result.get('fee_sats', 0)} sats "
+            f"({result.get('fee_rate_sat_vb', 0)} sat/vB, {result.get('fee_target', '')} target)"
+        )
+    )
+    output_fn(sanitize_tool_output(f"Size: {result.get('vsize', 0)} vB"))
+    output_fn(sanitize_tool_output(f"Inputs: {result.get('inputs_count', 0)}"))
+    change = result.get("change_sats")
+    change_label = f"Change: {change} sats" if change is not None else "Change: none"
+    output_fn(sanitize_tool_output(change_label))
+    expires_in_s = result.get("expires_in_s", 0)
+    output_fn(sanitize_tool_output(f"Expires: ~{int(expires_in_s) // 60} min"))
+    output_fn(sanitize_tool_output(f"Ref: {result.get('tx_ref', '')}"))
+
+
+def _print_confirm_tx(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+    """Narrate a ``confirm_tx`` outcome.
+
+    A refusal is the UX: the flow's own value-free message is surfaced
+    verbatim ("pending transaction expired", "confirmation gate not
+    satisfied…", "tx_ref does not match…"). A confirmed flow prints the
+    Phase 3 handoff note. The PSBT payload from the result is never
+    printed.
+    """
+    error = result.get("error")
+    if error == "confirm_refused":
+        detail = str(result.get("detail", "")).strip()
+        message = f"Not confirmed — {detail}." if detail else "Not confirmed."
+        output_fn(sanitize_tool_output(message))
+        return
+    if error is not None:
+        output_fn(sanitize_tool_output(_error_line(result, "Could not confirm the transaction")))
+        return
+    if result.get("status") == "confirmed":
+        output_fn(sanitize_tool_output(_CONFIRMED_LINE))
+        return
+    output_fn(sanitize_tool_output(_GENERIC_FAILURE))  # pragma: no cover — handler-shaped
