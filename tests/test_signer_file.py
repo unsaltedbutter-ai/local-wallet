@@ -1,0 +1,337 @@
+"""FilePsbtSigner tests (TCK-P3-001, ADR-0014).
+
+Covers: export → simulate signing (embit-sign with the BIP32 test-vector
+key IN TESTS ONLY) → import round-trip; checksum verify / mismatch refuse;
+garbage input; unsigned-PSBT refusal (no signatures); overwrite refusal
+(different content); idempotent same-content export; filename sanitization;
+``list_pending_exports``; value-free error assertions.
+
+Signing uses the public BIP32 test-vector seed — throwaway fixture material
+only, never real funds, watch-only app (same convention as test_tx_psbt.py).
+"""
+
+import hashlib
+from io import BytesIO
+from pathlib import Path
+
+import pytest
+from embit import bip32, ec, script
+from embit.networks import NETWORKS
+from embit.psbt import PSBT
+
+from localwallet.signer import ExportedFiles, FilePsbtSigner, SignedResult, SignerError
+from localwallet.tx.psbt import (
+    PsbtInputSource,
+    build_unsigned_psbt,
+    psbt_to_base64,
+)
+
+# Public BIP32 test vector 1 seed — throwaway fixture material only.
+SEED = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+ACCOUNT_PATH = (84 + 2**31, 1 + 2**31, 2**31)
+
+
+def account_key() -> bip32.HDKey:
+    return bip32.HDKey.from_seed(SEED).derive(list(ACCOUNT_PATH)).to_public()
+
+
+def fingerprint() -> bytes:
+    return account_key().my_fingerprint
+
+
+def spk(branch: int, index: int) -> bytes:
+    key = account_key().derive([branch, index]).key
+    return script.p2wpkh(key).data
+
+
+def change_address() -> str:
+    key = account_key().derive([1, 7]).key
+    return script.p2wpkh(key).address(NETWORKS["test"])
+
+
+def build_unsigned() -> PSBT:
+    """A single-input unsigned PSBT via the real tx engine API."""
+    src = PsbtInputSource(
+        txid="ab" * 32,
+        vout=0,
+        value_sats=200_000,
+        script_pubkey=spk(0, 3),
+        branch=0,
+        index=3,
+    )
+    psbt, _meta = build_unsigned_psbt(
+        [src],
+        [(spk(0, 99), 60_000)],
+        change_address(),
+        139_718,
+        account_key=account_key(),
+        account_fingerprint=fingerprint(),
+        account_path=ACCOUNT_PATH,
+    )
+    return psbt
+
+
+def sign_psbt(psbt: PSBT) -> str:
+    """embit-sign the PSBT with the test-vector key (tests only)."""
+    privkey = bip32.HDKey.from_seed(SEED).derive(list(ACCOUNT_PATH) + [0, 3]).key
+    digest = psbt.tx.sighash_segwit(0, script.Script(spk(0, 3)), 200_000)
+    stream = BytesIO()
+    ec.Signature.write_to(privkey.sign(digest), stream)
+    psbt.inputs[0].partial_sigs[privkey.get_public_key()] = stream.getvalue() + b"\x01"
+    return psbt.to_base64()
+
+
+def make_signed_file(directory: Path, name: str, sidecar: bool = True) -> Path:
+    """Write a signed PSBT file (with optional sidecar) directly to a folder."""
+    signed_b64 = sign_psbt(build_unsigned())
+    path = directory / name
+    path.write_text(signed_b64 + "\n", encoding="utf-8")
+    if sidecar:
+        side = directory / (name + ".sha256")
+        side.write_text(hashlib.sha256(path.read_bytes()).hexdigest() + "\n", encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def folder(tmp_path: Path) -> Path:
+    return tmp_path / "transfer"
+
+
+@pytest.fixture
+def signer(folder: Path) -> FilePsbtSigner:
+    return FilePsbtSigner(folder)
+
+
+class TestExport:
+    def test_exports_unsigned_and_sidecar(self, signer: FilePsbtSigner, folder: Path):
+        b64 = psbt_to_base64(build_unsigned())
+        files = signer.export_unsigned(b64, "abc12345")
+        assert isinstance(files, ExportedFiles)
+        assert files.unsigned_path == folder / "localwallet-unsigned-abc12345.psbt.b64"
+        assert (
+            files.checksum_path
+            == folder / "localwallet-unsigned-abc12345.psbt.b64.sha256"
+        )
+        written = files.unsigned_path.read_text(encoding="utf-8")
+        assert written.strip() == b64
+        digest = files.checksum_path.read_text(encoding="utf-8").strip()
+        assert digest == hashlib.sha256(written.encode()).hexdigest()
+
+    def test_creates_directory_if_missing(self, tmp_path: Path):
+        target = tmp_path / "does" / "not" / "exist"
+        assert not target.exists()
+        s = FilePsbtSigner(target)
+        assert target.is_dir()
+        s.export_unsigned(psbt_to_base64(build_unsigned()), "abc12345")
+        assert (target / "localwallet-unsigned-abc12345.psbt.b64").exists()
+
+    def test_idempotent_same_content(self, signer: FilePsbtSigner):
+        b64 = psbt_to_base64(build_unsigned())
+        first = signer.export_unsigned(b64, "abc12345")
+        second = signer.export_unsigned(b64, "abc12345")  # no raise
+        assert second.unsigned_path == first.unsigned_path
+        assert second.unsigned_path.read_text(encoding="utf-8").strip() == b64
+
+    def test_overwrite_different_content_refused(self, signer: FilePsbtSigner):
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), "abc12345")
+        other = psbt_to_base64(build_unsigned())  # byte-identical for same build...
+        # ...so force a genuinely different body by signing (adds sigs).
+        signed = sign_psbt(build_unsigned())
+        assert signed != other
+        with pytest.raises(SignerError) as exc:
+            signer.export_unsigned(signed, "abc12345")
+        assert "different content" in str(exc.value)
+
+    def test_empty_psbt_refused(self, signer: FilePsbtSigner):
+        with pytest.raises(SignerError):
+            signer.export_unsigned("   ", "abc12345")
+
+    def test_signed_file_collision_refused(self, signer: FilePsbtSigner, folder: Path):
+        # Pre-place a signed file for the same reference.
+        make_signed_file(folder, "localwallet-signed-abc12345.psbt.b64", sidecar=False)
+        with pytest.raises(SignerError) as exc:
+            signer.export_unsigned(psbt_to_base64(build_unsigned()), "abc12345")
+        assert "collide" in str(exc.value)
+
+
+class TestFilenameSanitization:
+    def test_hex_alnum_kept_and_truncated(self, signer: FilePsbtSigner, folder: Path):
+        # 12-char alnum ref is truncated to 8.
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), "abcdef012345")
+        assert (folder / "localwallet-unsigned-abcdef01.psbt.b64").exists()
+
+    def test_hostile_ref_is_hashed(self, signer: FilePsbtSigner, folder: Path):
+        # Slashes and path separators must be neutralized (hashed), never
+        # injected into the filename.
+        ref = "../../etc/passwd"
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), ref)
+        digest = hashlib.sha256(ref.encode()).hexdigest()[:8]
+        assert (folder / f"localwallet-unsigned-{digest}.psbt.b64").exists()
+        # No directory traversal happened.
+        assert not (folder / ".." / "localwallet-unsigned-").exists()
+        assert not (folder.parent / "etc").exists()
+
+    def test_empty_ref_is_hashed(self, signer: FilePsbtSigner, folder: Path):
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), "")
+        digest = hashlib.sha256(b"").hexdigest()[:8]
+        assert (folder / f"localwallet-unsigned-{digest}.psbt.b64").exists()
+
+
+class TestImportRoundTrip:
+    def test_round_trip_with_sidecar(self, signer: FilePsbtSigner, folder: Path):
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), "abc12345")
+        signed_path = make_signed_file(folder, "localwallet-signed-abc12345.psbt.b64")
+        result = signer.import_signed(signed_path, expected_tx_ref="abc12345")
+        assert isinstance(result, SignedResult)
+        assert result.signer_name == "file"
+        assert result.checksum_verified is True
+        # Normalized b64 re-parses and matches the signed tx.
+        parsed = PSBT.from_base64(result.psbt_base64)
+        assert len(parsed.inputs) == 1
+        assert len(parsed.inputs[0].partial_sigs) == 1
+
+    def test_round_trip_without_sidecar_allowed(self, signer: FilePsbtSigner, folder: Path):
+        signed_path = make_signed_file(
+            folder, "localwallet-signed-abc12345.psbt.b64", sidecar=False
+        )
+        result = signer.import_signed(signed_path, expected_tx_ref="abc12345")
+        assert result.checksum_verified is False
+        assert result.signer_name == "file"
+
+    def test_no_expected_ref_ok(self, signer: FilePsbtSigner, folder: Path):
+        signed_path = make_signed_file(folder, "localwallet-signed-abc12345.psbt.b64")
+        result = signer.import_signed(signed_path)
+        assert result.checksum_verified is True
+
+    def test_reference_mismatch_refused(self, signer: FilePsbtSigner, folder: Path):
+        signed_path = make_signed_file(folder, "localwallet-signed-abc12345.psbt.b64")
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(signed_path, expected_tx_ref="zzzz9999")
+        assert "does not match the expected transaction" in str(exc.value)
+
+    def test_import_of_exported_unsigned_refused(self, signer: FilePsbtSigner, folder: Path):
+        # Importing the unsigned file itself must be refused (no sigs).
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), "abc12345")
+        unsigned = folder / "localwallet-unsigned-abc12345.psbt.b64"
+        # Copy to a signed-convention name but keep unsigned content.
+        signed_path = folder / "localwallet-signed-abc12345.psbt.b64"
+        signed_path.write_bytes(unsigned.read_bytes())
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(signed_path)
+        assert "no signatures" in str(exc.value)
+
+
+class TestImportRefusals:
+    def test_wrong_filename_convention_refused(self, signer: FilePsbtSigner, folder: Path):
+        signed_path = make_signed_file(folder, "unsigned-signed.psbt.b64")
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(signed_path)
+        assert "localwallet-signed-*.psbt.b64" in str(exc.value)  # names the CONVENTION
+
+    def test_garbage_file_refused(self, signer: FilePsbtSigner, folder: Path):
+        path = folder / "localwallet-signed-abc12345.psbt.b64"
+        path.write_text("this is not base64 at all !!!", encoding="utf-8")
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(path)
+        assert "not valid base64" in str(exc.value)
+
+    def test_non_psbt_base64_refused(self, signer: FilePsbtSigner, folder: Path):
+        path = folder / "localwallet-signed-abc12345.psbt.b64"
+        path.write_text("aGVsbG8gd29ybGQ=", encoding="utf-8")  # "hello world"
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(path)
+        assert "not a PSBT" in str(exc.value)
+
+    def test_empty_file_refused(self, signer: FilePsbtSigner, folder: Path):
+        path = folder / "localwallet-signed-abc12345.psbt.b64"
+        path.write_text("", encoding="utf-8")
+        with pytest.raises(SignerError):
+            signer.import_signed(path)
+
+    def test_checksum_mismatch_refused(self, signer: FilePsbtSigner, folder: Path):
+        path = make_signed_file(folder, "localwallet-signed-abc12345.psbt.b64")
+        side = folder / "localwallet-signed-abc12345.psbt.b64.sha256"
+        side.write_text("0" * 64 + "\n", encoding="utf-8")  # wrong digest
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(path)
+        assert "checksum mismatch" in str(exc.value)
+
+    def test_corrupted_file_with_sidecar_refused(self, signer: FilePsbtSigner, folder: Path):
+        # Sidecar matches nothing after a bit flip → fail closed.
+        path = make_signed_file(folder, "localwallet-signed-abc12345.psbt.b64")
+        data = bytearray(path.read_bytes())
+        data[0] ^= 0xFF
+        path.write_bytes(bytes(data))
+        with pytest.raises(SignerError):
+            signer.import_signed(path)
+
+
+class TestValueFreeErrors:
+    def test_errors_never_echo_content(self, signer: FilePsbtSigner, folder: Path):
+        # Exercise refusal paths and assert messages contain no PSBT base64,
+        # no hex digests beyond expected phrases, and no folder path.
+        b64 = psbt_to_base64(build_unsigned())
+        signed = sign_psbt(build_unsigned())
+
+        cases = []
+
+        # overwrite-different
+        signer.export_unsigned(b64, "abc12345")
+        try:
+            signer.export_unsigned(signed, "abc12345")
+        except SignerError as e:
+            cases.append(str(e))
+
+        # wrong convention
+        p = folder / "wrong.psbt.b64"
+        p.write_text("AAAA", encoding="utf-8")
+        try:
+            signer.import_signed(p)
+        except SignerError as e:
+            cases.append(str(e))
+
+        # garbage base64
+        g = folder / "localwallet-signed-abc12345.psbt.b64"
+        g.write_text("###not base64###", encoding="utf-8")
+        try:
+            signer.import_signed(g)
+        except SignerError as e:
+            cases.append(str(e))
+
+        assert cases, "expected refusal messages"
+        for msg in cases:
+            # Value-free: no PSBT body, no hex digest strings of content,
+            # and the absolute folder path never leaks.
+            assert b64 not in msg
+            assert str(folder) not in msg
+            assert "000102030405060708090a0b0c0d0e0f" not in msg
+
+    def test_export_error_is_value_free(self, signer: FilePsbtSigner):
+        with pytest.raises(SignerError) as exc:
+            signer.export_unsigned("", "abc12345")
+        assert "transfer" not in str(exc.value)
+
+
+class TestListPendingExports:
+    def test_lists_unsigned_only(self, signer: FilePsbtSigner, folder: Path):
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), "abc12345")
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), "def45678")
+        # A signed file and a foreign file must not appear.
+        make_signed_file(folder, "localwallet-signed-abc12345.psbt.b64")
+        (folder / "unrelated.txt").write_text("x", encoding="utf-8")
+
+        pending = signer.list_pending_exports()
+        assert len(pending) == 2
+        names = [p.name for p in pending]
+        assert "localwallet-unsigned-abc12345.psbt.b64" in names
+        assert "localwallet-unsigned-def45678.psbt.b64" in names
+        assert not any(n.startswith("localwallet-signed-") for n in names)
+
+    def test_empty_when_nothing_exported(self, signer: FilePsbtSigner):
+        assert signer.list_pending_exports() == []
+
+    def test_sorted_deterministic(self, signer: FilePsbtSigner, folder: Path):
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), "zzz99999")
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), "aaa11111")
+        names = [p.name for p in signer.list_pending_exports()]
+        assert names == sorted(names)
