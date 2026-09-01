@@ -42,7 +42,7 @@ from localwallet.agent.runtime import (
     ModelRuntimeError,
     load_grammar_text,
 )
-from localwallet.protocol import IntentName
+from localwallet.protocol import IntentName, validate_payload
 
 # ----------------------------------------------------- environment probing
 
@@ -180,6 +180,21 @@ class TestSystemPrompt:
         for intent in IntentName:
             assert intent.value in prompt
 
+    def test_contains_all_six_intent_names(self) -> None:
+        # Explicit pin (not just enum iteration): the Phase 1 v0 extension
+        # added get_history / get_utxos / new_address — grammar, schema and
+        # prompt must move together (ADR-0002 cross-reference rule).
+        prompt = build_system_prompt()
+        for name in (
+            "respond",
+            "clarify",
+            "get_balance",
+            "get_history",
+            "get_utxos",
+            "new_address",
+        ):
+            assert name in prompt
+
     def test_contains_output_contract_key_order(self) -> None:
         prompt = build_system_prompt()
         assert "v, intent, params" in prompt
@@ -201,10 +216,42 @@ class TestSystemPrompt:
         assert '"intent": "respond"' in prompt
         assert '"intent": "clarify"' in prompt
         assert '"intent": "get_balance"' in prompt
+        assert '"intent": "new_address"' in prompt
 
     def test_clarify_example_is_ambiguous_amount(self) -> None:
         prompt = build_system_prompt()
         assert "send 20 to my brother" in prompt
+
+    def test_clarify_guidance_covers_phase1_send_unavailability(self) -> None:
+        # Send is not an intent in Phase 1: the prompt must tell the model
+        # that clarify is correct for send requests.
+        prompt = build_system_prompt().lower()
+        assert "not available yet" in prompt
+        assert "send requests" in prompt
+
+    def test_every_few_shot_envelope_is_a_valid_envelope(self) -> None:
+        """Few-shots are contract examples: each must validate end-to-end.
+
+        Pins the prompt to the protocol: if a prompt example drifts from
+        the schema (or the GBNF strict key order v, intent, params), this
+        fails — the prompt and the grammar/schema must move together.
+        """
+        prompt = build_system_prompt()
+        examples = [
+            line[len("envelope: "):]
+            for line in prompt.splitlines()
+            if line.startswith("envelope: ")
+        ]
+        assert len(examples) >= 4, "expected the four contract few-shots"
+        seen_intents: set[str] = set()
+        for raw in examples:
+            envelope = validate_payload(raw)  # verbatim prompt text
+            seen_intents.add(envelope.intent.value)
+        assert {"respond", "clarify", "get_balance", "new_address"} <= seen_intents
+
+    def test_new_address_few_shot_matches_grammar_key_order(self) -> None:
+        prompt = build_system_prompt()
+        assert 'envelope: {"v": 0, "intent": "new_address", "params": {}}' in prompt
 
     def test_prompt_is_compact_for_8k_context_budget(self) -> None:
         # ADR-0006: v0 context budget is 8K tokens; the static system prompt

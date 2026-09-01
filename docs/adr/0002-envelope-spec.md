@@ -159,3 +159,34 @@ errors`).
   and surfaced the same way, never swallowed, never fatal to the chat loop.
 - `get_balance` params are `{}` today; future opts (depth, confirmation
   target) extend that object behind the same closed-world rules.
+
+## v0 extensions (2026-08, Phase 1 — ticket TCK-P1-003)
+
+Phase 1 extended the closed intent enum with three wallet-read /
+wallet-state intents: `get_history`, `get_utxos`, `new_address`. This is a
+**backward-compatible extension of v0, not a version bump**:
+
+- Old envelopes remain valid unchanged and `v` stays `0`. Per the bump
+  policy in §2, a version bump is reserved for breaking changes (dual-accept
+  window, eval-gated cutover); adding enum members and optional params keys
+  only widens the accepted set — no previously-valid envelope is invalidated.
+- Final params contract:
+  - `get_history` → `{}` or `{"limit": int, 1..100}`; omitted `limit` means
+    the handler applies its default of 20. Grammar-side syntactic bound is
+    1..999 (1–3 digits, no leading zero); the schema layer is the authority
+    for 1..100.
+  - `get_utxos` → `{}` exactly (same reserved-for-future-opts shape as
+    `get_balance`).
+  - `new_address` → `{}` or `{"branch": 0|1}`; 0 = receive chain (the
+    default the handler applies when omitted), 1 = change chain (rarely
+    user-requested, but allowed and documented).
+- Grammar, schema, and system prompt moved in lockstep per the
+  cross-reference rule: new grammar branches in
+  `agent/grammar/envelope.gbnf` (optional keys via whole-object
+  alternation, strict key order preserved), params models +
+  `INTENT_REGISTRY` in `protocol/envelope.py`, layer-3 rules in
+  `protocol/intents.py`, and the prompt intent list + one new few-shot in
+  `agent/prompt.py`.
+- Handlers and golden eval fixtures land in TCK-P1-004 / TCK-P1-005; until
+  then a valid new-intent envelope surfaces `dispatch_error` ("no handler
+  registered"), which is the intended fail-closed behavior.

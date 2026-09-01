@@ -27,7 +27,10 @@ from localwallet.protocol.envelope import (
     BaseParams,
     ClarifyParams,
     GetBalanceParams,
+    GetHistoryParams,
+    GetUtxosParams,
     IntentName,
+    NewAddressParams,
     RespondParams,
 )
 
@@ -66,6 +69,40 @@ def _rule_get_balance(params: BaseParams) -> list[str]:
     return []
 
 
+def _rule_get_history(params: BaseParams) -> list[str]:
+    """``get_history``: limit, when present, must lie in the 1..100 range.
+
+    The schema layer already bounds ``limit`` identically; this is the
+    layer-3 re-check (defense in depth), reachable only via a constructor
+    that skipped validation.
+    """
+    if not isinstance(params, GetHistoryParams):
+        return ["internal: 'get_history' params failed the type check"]
+    if params.limit is not None and not 1 <= params.limit <= 100:
+        return ["params.limit must be between 1 and 100 when present"]
+    return []
+
+
+def _rule_get_utxos(params: BaseParams) -> list[str]:
+    """``get_utxos``: no meaning-level rules yet (registry completeness only)."""
+    if not isinstance(params, GetUtxosParams):
+        return ["internal: 'get_utxos' params failed the type check"]
+    return []
+
+
+def _rule_new_address(params: BaseParams) -> list[str]:
+    """``new_address``: branch, when present, must be 0 (receive) or 1 (change).
+
+    Same layer-3 re-check pattern as ``get_history``: the schema bounds
+    ``branch`` to {0, 1} already.
+    """
+    if not isinstance(params, NewAddressParams):
+        return ["internal: 'new_address' params failed the type check"]
+    if params.branch is not None and params.branch not in (0, 1):
+        return ["params.branch must be 0 or 1 when present"]
+    return []
+
+
 #: Layer-3 business rules, per intent. Values are pure functions from the
 #: validated params model to a list of error strings (empty list == valid).
 #: Frozen (``MappingProxyType``) for symmetry with the frozen
@@ -75,5 +112,8 @@ BUSINESS_RULES: Mapping[IntentName, BusinessRule] = MappingProxyType(
         IntentName.RESPOND: _rule_respond,
         IntentName.CLARIFY: _rule_clarify,
         IntentName.GET_BALANCE: _rule_get_balance,
+        IntentName.GET_HISTORY: _rule_get_history,
+        IntentName.GET_UTXOS: _rule_get_utxos,
+        IntentName.NEW_ADDRESS: _rule_new_address,
     }
 )

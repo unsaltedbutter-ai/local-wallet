@@ -13,7 +13,7 @@ the model's side of the closed intent protocol (PROJECT.md §7.1, §8):
 4. **No-secrets rule** — seed phrases / xprvs are refused with the
    watch-only explanation and never repeated (PROJECT.md §9).
 5. **Few-shot examples** — user text → envelope JSON for ``respond``,
-   ``clarify`` (ambiguous amount), and ``get_balance``.
+   ``clarify`` (ambiguous amount), ``get_balance``, and ``new_address``.
 
 The prompt is kept compact on purpose: v0 runs with a ≤8K context budget
 (ADR-0006), and this text is paid for on every turn.
@@ -47,9 +47,18 @@ CLOSED INTENT LIST (no other intent exists; unknown intents are invalid)
 for explanations and for narrating FACTS results to the user.
 - clarify: ask the user one question; params {"question": "..."} — prefer \
 this when the request is ambiguous or missing a required detail (unclear \
-amount, missing recipient).
+amount, missing recipient). Sending funds is NOT available yet: for send \
+requests, clarify is the correct intent (amounts/recipients cannot be \
+acted on in this phase).
 - get_balance: look up the wallet balance; params {} — when the user asks \
 what they have.
+- get_history: show recent wallet transactions; params {} or \
+{"limit": 1-100} — when the user asks what happened recently.
+- get_utxos: show the wallet's unspent outputs; params {} — when the user \
+asks what is spendable.
+- new_address: allocate a fresh receive address; params {} — when the user \
+asks for a new receiving address. Never invent an address: emit the intent \
+and quote the address from the tool result afterwards.
 
 FACTS AND VERBATIM RULE
 - Addresses, amounts, and balances are provided in the FACTS block. Copy \
@@ -74,6 +83,9 @@ envelope: {"v": 0, "intent": "clarify", "params": {"question": "20 what \
 
 user: how much do I have?
 envelope: {"v": 0, "intent": "get_balance", "params": {}}
+
+user: give me a new address
+envelope: {"v": 0, "intent": "new_address", "params": {}}
 """
 
 
@@ -81,9 +93,10 @@ def build_system_prompt() -> str:
     """Return the system prompt encoding the output contract.
 
     The prompt fixes: exactly one envelope per turn with key order
-    ``v, intent, params``; the closed intent list with usage guidance;
-    the quote-verbatim rule for FACTS values; the no-secrets (watch-only)
-    rule; and three few-shot exchanges (respond / clarify / get_balance).
+    ``v, intent, params``; the closed intent list (six intents as of the
+    Phase 1 v0 extension) with usage guidance; the quote-verbatim rule for
+    FACTS values; the no-secrets (watch-only) rule; and four few-shot
+    exchanges (respond / clarify / get_balance / new_address).
 
     Intentionally parameter-free: intent membership and the wire format
     are owned by the protocol subsystem and the GBNF grammar — this text

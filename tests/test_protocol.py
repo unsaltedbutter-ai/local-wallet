@@ -1,10 +1,11 @@
-"""Tests for the protocol core (TCK-P0-002).
+"""Tests for the protocol core (TCK-P0-002, extended by TCK-P1-003).
 
-Covers the canonical envelope contract v0: accept/reject matrices, the
-closed intent registry, business-rule layer invocation, the allowlist
-dispatcher (including defense-in-depth and handler-exception surfacing),
-the handle_raw retry policy (exactly one re-prompt before escalation),
-and the system→UI error envelope shape.
+Covers the canonical envelope contract v0 (including the Phase 1 v0
+extension with get_history / get_utxos / new_address): accept/reject
+matrices, the closed intent registry, business-rule layer invocation, the
+allowlist dispatcher (including defense-in-depth and handler-exception
+surfacing), the handle_raw retry policy (exactly one re-prompt before
+escalation), and the system→UI error envelope shape.
 """
 
 import json
@@ -34,7 +35,10 @@ from localwallet.protocol import (
     ErrorCode,
     ErrorEnvelope,
     GetBalanceParams,
+    GetHistoryParams,
+    GetUtxosParams,
     IntentName,
+    NewAddressParams,
     OutcomeStatus,
     RespondParams,
     dispatch,
@@ -49,18 +53,31 @@ ACCEPT_CASES = {
     "respond": {"v": 0, "intent": "respond", "params": {"text": "hello there"}},
     "clarify": {"v": 0, "intent": "clarify", "params": {"question": "how fast?"}},
     "get_balance": {"v": 0, "intent": "get_balance", "params": {}},
+    # Phase 1 v0 extension (ADR-0002): three new intents. Both grammar
+    # branches (empty params / optional key) are represented.
+    "get_history": {"v": 0, "intent": "get_history", "params": {}},
+    "get_history_limit": {"v": 0, "intent": "get_history", "params": {"limit": 20}},
+    "get_utxos": {"v": 0, "intent": "get_utxos", "params": {}},
+    "new_address": {"v": 0, "intent": "new_address", "params": {}},
+    "new_address_branch": {"v": 0, "intent": "new_address", "params": {"branch": 0}},
 }
 
 PARAMS_TYPES = {
     IntentName.RESPOND: RespondParams,
     IntentName.CLARIFY: ClarifyParams,
     IntentName.GET_BALANCE: GetBalanceParams,
+    IntentName.GET_HISTORY: GetHistoryParams,
+    IntentName.GET_UTXOS: GetUtxosParams,
+    IntentName.NEW_ADDRESS: NewAddressParams,
 }
 
 HANDLER_RESULTS = {
     IntentName.RESPOND: {"narrated": True},
     IntentName.CLARIFY: {"asked": True},
     IntentName.GET_BALANCE: {"confirmed_sat": 0, "unconfirmed_sat": 0},
+    IntentName.GET_HISTORY: {"records": 0},
+    IntentName.GET_UTXOS: {"outputs": 0},
+    IntentName.NEW_ADDRESS: {"allocated": 0},
 }
 
 
@@ -113,12 +130,20 @@ def test_policy_constants():
 # ----------------------------------------------------------- intent registry
 
 def test_intent_enum_is_the_closed_world():
-    assert {m.value for m in IntentName} == {"respond", "clarify", "get_balance"}
-    assert len(IntentName) == 3
+    assert {m.value for m in IntentName} == {
+        "respond",
+        "clarify",
+        "get_balance",
+        "get_history",
+        "get_utxos",
+        "new_address",
+    }
+    assert len(IntentName) == 6
 
 
 def test_intent_registry_is_frozen_and_complete():
     assert set(INTENT_REGISTRY.keys()) == set(IntentName)
+    assert len(INTENT_REGISTRY) == 6
     for intent, model in INTENT_REGISTRY.items():
         assert model is PARAMS_TYPES[intent]
     # frozen mapping: mutation is refused
@@ -130,6 +155,10 @@ def test_intent_registry_is_frozen_and_complete():
 
 def test_business_rules_cover_every_intent():
     assert set(BUSINESS_RULES.keys()) == set(IntentName)
+    # explicit count: registry completeness is pinned, not incidental
+    assert len(BUSINESS_RULES) == 6
+    for intent in IntentName:
+        assert callable(BUSINESS_RULES[intent])
     # frozen mapping: mutation is refused (symmetry with INTENT_REGISTRY)
     with pytest.raises(TypeError):
         BUSINESS_RULES[IntentName.RESPOND] = _rule_stub  # type: ignore[index]
@@ -146,7 +175,7 @@ def test_accept_matrix_one_valid_envelope_per_intent(intent: str, payload: dict)
     envelope = validate_payload(payload)
     assert isinstance(envelope, Envelope)
     assert envelope.v == 0
-    assert envelope.intent == IntentName(intent)
+    assert envelope.intent == IntentName(payload["intent"])
     assert isinstance(envelope.params, PARAMS_TYPES[envelope.intent])
     assert envelope.model_dump() == payload
 
@@ -182,6 +211,82 @@ def test_get_balance_params_is_exactly_empty():
     envelope = validate_payload(ACCEPT_CASES["get_balance"])
     assert envelope.params.model_dump() == {}
     assert isinstance(envelope.params, GetBalanceParams)
+
+
+# --------------------------------- Phase 1 v0 extension: new-intent shapes
+
+@pytest.mark.parametrize("limit", [1, 50, 100], ids=["min", "mid", "max"])
+def test_accept_get_history_limit_business_range(limit: int):
+    envelope = validate_payload(
+        {"v": 0, "intent": "get_history", "params": {"limit": limit}}
+    )
+    assert isinstance(envelope.params, GetHistoryParams)
+    assert envelope.params.limit == limit
+
+
+def test_accept_get_history_empty_params_is_the_normal_case():
+    """Omitted limit ⇒ handler applies default 20; {} is a valid body."""
+    envelope = validate_payload(ACCEPT_CASES["get_history"])
+    assert isinstance(envelope.params, GetHistoryParams)
+    assert envelope.params.limit is None
+    # wire fidelity: the dump is EXACTLY the grammar's empty-params branch
+    assert envelope.model_dump() == ACCEPT_CASES["get_history"]
+
+
+def test_accept_get_utxos_params_is_exactly_empty():
+    envelope = validate_payload(ACCEPT_CASES["get_utxos"])
+    assert envelope.params.model_dump() == {}
+    assert isinstance(envelope.params, GetUtxosParams)
+
+
+@pytest.mark.parametrize("branch", [0, 1], ids=["receive", "change"])
+def test_accept_new_address_branch_values(branch: int):
+    envelope = validate_payload(
+        {"v": 0, "intent": "new_address", "params": {"branch": branch}}
+    )
+    assert isinstance(envelope.params, NewAddressParams)
+    assert envelope.params.branch == branch
+
+
+def test_accept_new_address_empty_params_defaults_to_receive():
+    envelope = validate_payload(ACCEPT_CASES["new_address"])
+    assert isinstance(envelope.params, NewAddressParams)
+    assert envelope.params.branch is None  # handler applies 0 (receive)
+    assert envelope.model_dump() == ACCEPT_CASES["new_address"]
+
+
+def test_get_history_limit_schema_bounds_mirror_grammar():
+    """Schema layer is the 1..100 authority; grammar is 1..999 syntactic.
+
+    Mirrors the GBNF ``limit_int ::= [1-9] [0-9]? [0-9]?`` branch at schema
+    level: grammar-legal values beyond the business bound (101, 999) are
+    rejected here; 1000 is illegal at both layers.
+    """
+    for limit in (1, 100):
+        assert validate_payload(
+            {"v": 0, "intent": "get_history", "params": {"limit": limit}}
+        ).params.limit == limit
+    for limit in (0, 101, 999, 1000, -1):
+        expect_rejected({"v": 0, "intent": "get_history", "params": {"limit": limit}})
+
+
+def test_get_history_limit_rejects_lax_coercions():
+    """pydantic lax mode would coerce '20'/True; the contract admits only
+    true JSON integers (mode='before' validator closes this off)."""
+    for bad in ("20", True, False, 20.0, [20], {"limit": 20}):
+        expect_rejected({"v": 0, "intent": "get_history", "params": {"limit": bad}})
+
+
+def test_new_address_branch_rejects_lax_coercions_and_out_of_range():
+    for bad in (2, -1, "0", "1", True, False, 1.0, [0]):
+        expect_rejected({"v": 0, "intent": "new_address", "params": {"branch": bad}})
+
+
+def test_get_utxos_rejects_any_params_key():
+    """get_utxos is {} exactly — keys that belong to other intents
+    (limit/branch) or reserved-looking opts are all rejected."""
+    for params in ({"limit": 5}, {"branch": 0}, {"verbose": True}, {"address": "x"}):
+        expect_rejected({"v": 0, "intent": "get_utxos", "params": params})
 
 
 def test_envelope_is_frozen():
@@ -229,6 +334,23 @@ REJECT_MATRIX = [
     # emptiness (schema level)
     ("text_empty", {"v": 0, "intent": "respond", "params": {"text": ""}}),
     ("question_empty", {"v": 0, "intent": "clarify", "params": {"question": ""}}),
+    # Phase 1 v0 extension: new-intent rejects
+    ("history_limit_zero", {"v": 0, "intent": "get_history", "params": {"limit": 0}}),
+    ("history_limit_101", {"v": 0, "intent": "get_history", "params": {"limit": 101}}),
+    ("history_limit_string", {"v": 0, "intent": "get_history", "params": {"limit": "20"}}),
+    ("history_limit_bool", {"v": 0, "intent": "get_history", "params": {"limit": True}}),
+    ("history_limit_null", {"v": 0, "intent": "get_history", "params": {"limit": None}}),
+    ("history_extra_key", {"v": 0, "intent": "get_history", "params": {"limit": 5, "since": 1}}),
+    ("history_branch_key", {"v": 0, "intent": "get_history", "params": {"branch": 0}}),
+    ("utxos_extra_key_verbose", {"v": 0, "intent": "get_utxos", "params": {"verbose": True}}),
+    ("utxos_limit_key", {"v": 0, "intent": "get_utxos", "params": {"limit": 5}}),
+    ("utxos_branch_key", {"v": 0, "intent": "get_utxos", "params": {"branch": 1}}),
+    ("new_address_branch_two", {"v": 0, "intent": "new_address", "params": {"branch": 2}}),
+    ("new_address_branch_negative", {"v": 0, "intent": "new_address", "params": {"branch": -1}}),
+    ("new_address_branch_string", {"v": 0, "intent": "new_address", "params": {"branch": "0"}}),
+    ("new_address_branch_bool", {"v": 0, "intent": "new_address", "params": {"branch": True}}),
+    ("new_address_limit_key", {"v": 0, "intent": "new_address", "params": {"limit": 5}}),
+    ("new_address_extra_key", {"v": 0, "intent": "new_address", "params": {"count": 3}}),
     # raw JSON documents that are not envelopes
     ("invalid_json", "{oops"),
     ("json_array", "[1, 2]"),
@@ -340,8 +462,15 @@ def test_invalid_json_yields_error_envelope_not_raw_exception():
 
 @pytest.mark.parametrize(
     "intent",
-    [IntentName.RESPOND, IntentName.CLARIFY, IntentName.GET_BALANCE],
-    ids=["respond", "clarify", "get_balance"],
+    [
+        IntentName.RESPOND,
+        IntentName.CLARIFY,
+        IntentName.GET_BALANCE,
+        IntentName.GET_HISTORY,
+        IntentName.GET_UTXOS,
+        IntentName.NEW_ADDRESS,
+    ],
+    ids=["respond", "clarify", "get_balance", "get_history", "get_utxos", "new_address"],
 )
 def test_dispatch_routes_each_intent_to_its_handler(intent: IntentName):
     recorded: list[Envelope] = []
@@ -409,8 +538,15 @@ def test_dispatch_handler_exception_surfaces_not_swallowed():
 
 @pytest.mark.parametrize(
     "intent",
-    [IntentName.RESPOND, IntentName.CLARIFY, IntentName.GET_BALANCE],
-    ids=["respond", "clarify", "get_balance"],
+    [
+        IntentName.RESPOND,
+        IntentName.CLARIFY,
+        IntentName.GET_BALANCE,
+        IntentName.GET_HISTORY,
+        IntentName.GET_UTXOS,
+        IntentName.NEW_ADDRESS,
+    ],
+    ids=["respond", "clarify", "get_balance", "get_history", "get_utxos", "new_address"],
 )
 def test_handle_raw_ok_path_per_intent(intent: IntentName):
     recorded: list[Envelope] = []
@@ -514,8 +650,40 @@ def test_outcome_is_frozen():
         (IntentName.CLARIFY, ClarifyParams(question="urgent?"), False),
         (IntentName.CLARIFY, ClarifyParams(question="\t"), True),
         (IntentName.GET_BALANCE, GetBalanceParams(), False),
+        # get_history: optional limit re-checked at 1..100 (layer 3)
+        (IntentName.GET_HISTORY, GetHistoryParams(), False),
+        (IntentName.GET_HISTORY, GetHistoryParams(limit=1), False),
+        (IntentName.GET_HISTORY, GetHistoryParams(limit=100), False),
+        # out-of-range is unreachable via the schema; model_construct
+        # simulates a validation-skipping bypass to prove the rule holds
+        (IntentName.GET_HISTORY, GetHistoryParams.model_construct(limit=0), True),
+        (IntentName.GET_HISTORY, GetHistoryParams.model_construct(limit=101), True),
+        (IntentName.GET_UTXOS, GetUtxosParams(), False),
+        # new_address: optional branch re-checked against {0, 1} (layer 3)
+        (IntentName.NEW_ADDRESS, NewAddressParams(), False),
+        (IntentName.NEW_ADDRESS, NewAddressParams(branch=0), False),
+        (IntentName.NEW_ADDRESS, NewAddressParams(branch=1), False),
+        (IntentName.NEW_ADDRESS, NewAddressParams.model_construct(branch=2), True),
+        (IntentName.NEW_ADDRESS, NewAddressParams.model_construct(branch=-1), True),
     ],
-    ids=["respond-ok", "respond-blank", "clarify-ok", "clarify-blank", "get_balance-ok"],
+    ids=[
+        "respond-ok",
+        "respond-blank",
+        "clarify-ok",
+        "clarify-blank",
+        "get_balance-ok",
+        "get_history-omitted",
+        "get_history-limit-min",
+        "get_history-limit-max",
+        "get_history-limit-zero",
+        "get_history-limit-over",
+        "get_utxos-ok",
+        "new_address-omitted",
+        "new_address-branch-receive",
+        "new_address-branch-change",
+        "new_address-branch-two",
+        "new_address-branch-negative",
+    ],
 )
 def test_business_rules_layer(
     intent: IntentName, params: object, expect_failures: bool
@@ -523,6 +691,9 @@ def test_business_rules_layer(
     failures = BUSINESS_RULES[intent](params)  # type: ignore[arg-type]
     assert bool(failures) is expect_failures
     assert all(isinstance(f, str) for f in failures)
+    # rules are pure: same input, same output
+    again = BUSINESS_RULES[intent](params)  # type: ignore[arg-type]
+    assert again == failures
 
 
 # ------------------------------------------------------------- error envelope

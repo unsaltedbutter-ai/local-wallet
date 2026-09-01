@@ -18,12 +18,14 @@ Three suites:
 2. **Grammar/schema conformance spot-check**: canned VALID envelopes (one
    per intent, keys in the strict GBNF order ``v, intent, params``) pass
    ``validate_payload`` — guarding grammar↔schema agreement for the happy
-   shapes.
+   shapes, including the Phase 1 optional-key branches (``get_history``
+   with ``limit``, ``new_address`` with ``branch``) and their empty-params
+   branches in strict key-order JSON form.
 
 3. **Deterministic confirm-bypass precedent**: bare ``yes``/``confirm``/
-   ``ok`` utterances must never dispatch to an action intent (with P0's set
-   they fail JSON parsing → needs_retry/rejected; pinned: GET_BALANCE
-   dispatch count is 0).
+   ``ok`` utterances must never dispatch to an action intent (they fail
+   JSON parsing → needs_retry/rejected; pinned: every intent's dispatch
+   count is 0, including the Phase 1 data-fetching intents).
 
 Kept deterministic, no randomness seeded from time, no network, no pytest
 dependency beyond the framework. Runtime well under 5s.
@@ -52,18 +54,29 @@ from localwallet.protocol import (
 # ------------------------------------------------------------------ helpers
 
 #: Canonical valid envelopes, one per intent, keys in strict GBNF order
-#: (v, intent, params) — see agent/grammar/envelope.gbnf.
+#: (v, intent, params) — see agent/grammar/envelope.gbnf. For the Phase 1
+#: intents the optional-key grammar branch is exercised here; the
+#: empty-params branch is covered by VALID_JSON below.
 VALID_ENVELOPES: dict[str, dict[str, object]] = {
     "respond": {"v": 0, "intent": "respond", "params": {"text": "hi"}},
     "clarify": {"v": 0, "intent": "clarify", "params": {"question": "how fast?"}},
     "get_balance": {"v": 0, "intent": "get_balance", "params": {}},
+    "get_history": {"v": 0, "intent": "get_history", "params": {"limit": 5}},
+    "get_utxos": {"v": 0, "intent": "get_utxos", "params": {}},
+    "new_address": {"v": 0, "intent": "new_address", "params": {"branch": 1}},
 }
 
-#: Strict-key-order JSON documents matching the grammar, one per intent.
+#: Strict-key-order JSON documents matching the grammar, one per intent
+#: plus the empty-params branch of the Phase 1 optional-key intents.
 VALID_JSON = [
     '{"v":0,"intent":"respond","params":{"text":"hi"}}',
     '{"v":0,"intent":"clarify","params":{"question":"how fast?"}}',
     '{"v":0,"intent":"get_balance","params":{}}',
+    '{"v":0,"intent":"get_history","params":{}}',
+    '{"v":0,"intent":"get_history","params":{"limit":7}}',
+    '{"v":0,"intent":"get_utxos","params":{}}',
+    '{"v":0,"intent":"new_address","params":{}}',
+    '{"v":0,"intent":"new_address","params":{"branch":0}}',
 ]
 
 
@@ -280,9 +293,8 @@ def test_confirm_bypass_never_dispatches_an_action():
             OutcomeStatus.NEEDS_RETRY,
             OutcomeStatus.REJECTED,
         )
-    # Pin: no envelope was ever produced and GET_BALANCE (the only
-    # data-fetching action intent in P0) was never dispatched.
+    # Pin: no envelope was ever produced and no intent was ever dispatched —
+    # including the Phase 1 data-fetching intents (closed enum, six members).
     assert table.envelopes == []
-    assert table.counts[IntentName.GET_BALANCE] == 0
-    assert table.counts[IntentName.RESPOND] == 0
-    assert table.counts[IntentName.CLARIFY] == 0
+    for intent in IntentName:
+        assert table.counts[intent] == 0
