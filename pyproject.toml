@@ -9,7 +9,7 @@ description = "Local-first testnet Bitcoin wallet driven by a grammar-constraine
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.7",
-    "embit",
+    "embit==0.8.0",
     "httpx>=0.27",
     "llama-cpp-python>=0.3",
 ]
