@@ -10,9 +10,6 @@ Public surface:
   derivation.
 - :mod:`localwallet.wallet.scan` — gap-limited chain scan, UTXO
   snapshot, history cache, and full rescan, persisted via the store.
-
-``wallet.zpub_stub`` remains only as a deprecated Phase 0 compatibility
-shim (remove in TCK-P1-004).
 """
 
 from localwallet.wallet.derivation import (

@@ -1,10 +1,17 @@
-"""End-to-end skeleton tests (TCK-P0-006).
+"""End-to-end tests (TCK-P0-006 skeleton + TCK-P1-004 wallet wiring).
 
 Full pipeline WITHOUT network or model:
 
-    user text → AgentLoop (stub generate_fn) → handle_raw validation →
-    allowlist dispatch → get_balance handler → EsploraClient over
-    httpx.MockTransport (fixture UTXOs) → result dict → CLI printing.
+    user text → AgentLoop (stub/scripted generate_fn) → handle_raw
+    validation → allowlist dispatch → store-backed handlers →
+    EsploraClient over httpx.MockTransport (via wallet scan) → result
+    dict → CLI printing.
+
+Phase 1 shape: the app persists to a real SQLite store (tmp file via
+``LOCALWALLET_STORE_PATH``), the startup/lazy scan populates it through
+the gap-limited scanner, and every handler reads the store. Addresses in
+results/narration are verbatim from store/tool output; nothing else
+prints values.
 
 Key fixtures are real SLIP-132 keys derived deterministically via embit
 from a fixed seed; the hardcoded constants below are re-derived in
@@ -19,6 +26,7 @@ pyproject changes).
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from collections.abc import Callable
@@ -35,7 +43,8 @@ if str(_SRC) not in sys.path:
 import localwallet.app as app_module
 from localwallet.agent.loop import AgentLoop, AgentTurnStatus
 from localwallet.app import (
-    DEFAULT_SCAN_COUNT,
+    AUTO_SCAN_ENV_VAR,
+    OUT_OF_WINDOW_NOTICE,
     PRIVACY_INDICATOR,
     ZPUB_ENV_VAR,
     build_dispatch_table,
@@ -43,12 +52,20 @@ from localwallet.app import (
     stub_generate,
 )
 from localwallet.chain import EsploraClient
-from localwallet.chain import esplora as esplora_module
 from localwallet.protocol import Envelope, IntentName, validate_payload
-from localwallet.wallet.zpub_stub import (
+from localwallet.store import (
+    AddressRecord,
+    Store,
+    TxRecord,
+    UtxoRecord,
+)
+from localwallet.wallet import GAP_LIMIT_SETTING, scan_wallet
+from localwallet.wallet.derivation import derive_addresses, derive_receive_addresses
+from localwallet.wallet.descriptor import (
     ParsedKey,
+    WalletDescriptor,
     WatchKeyError,
-    derive_receive_addresses,
+    parse_wallet_key,
     parse_watch_key,
 )
 
@@ -83,7 +100,7 @@ XPRV: Final[str] = (
 # Corrupted-checksum variant of the fixture vpub (last char replaced).
 CORRUPT_VPUB: Final[str] = VPUB[:-1] + ("1" if VPUB[-1] != "1" else "2")
 
-# Fixture UTXOs served by the MockTransport chain.
+# Fixture UTXOs served by the MockTransport chain (branch 0, indices 0/1).
 UTXOS_ADDR0: Final[list[dict[str, Any]]] = [
     {"txid": "a" * 64, "vout": 0, "value": 50_000, "status": {"confirmed": True}},
     {"txid": "b" * 64, "vout": 1, "value": 12_345, "status": {"confirmed": False}},
@@ -97,8 +114,21 @@ EXPECTED_UNCONFIRMED: Final[int] = 12_345
 EXPECTED_TOTAL: Final[int] = EXPECTED_CONFIRMED + EXPECTED_UNCONFIRMED
 TIP_HEIGHT: Final[int] = 870_000
 
+# Small gap for store-backed tests: window = [0, 1] per branch when no
+# transactions are observed (2 consecutive unused addresses).
+TEST_GAP: Final[int] = 2
+
 GET_BALANCE_JSON: Final[str] = '{"v": 0, "intent": "get_balance", "params": {}}'
+GET_HISTORY_LIMIT_JSON: Final[str] = (
+    '{"v": 0, "intent": "get_history", "params": {"limit": 5}}'
+)
+NEW_ADDRESS_JSON: Final[str] = '{"v": 0, "intent": "new_address", "params": {}}'
+NEW_ADDRESS_CHANGE_JSON: Final[str] = (
+    '{"v": 0, "intent": "new_address", "params": {"branch": 1}}'
+)
 GARBAGE: Final[str] = "this is not json at all <<<>>>"
+
+_EXTERNAL: Final[str] = "tb1qexternalsenderaddressnotpartofthewallet000000"
 
 
 def _rederive_fixture_key(purpose: int, coin: int, prv_version: bytes, pub_version: bytes) -> str:
@@ -127,9 +157,46 @@ def _expected_addresses(count: int, branch: int = 0) -> list[str]:
     ]
 
 
-def derive_fixture_addresses(count: int = DEFAULT_SCAN_COUNT) -> list[str]:
+def _fixture_parsed() -> ParsedKey:
+    """The fixture wallet's parsed key through the wallet-engine gate."""
+    return WalletDescriptor.from_key(VPUB).parsed
+
+
+def derive_fixture_addresses(count: int = 5, branch: int = 0) -> list[str]:
     """Addresses for the fixture wallet through the module under test."""
-    return derive_receive_addresses(parse_watch_key(VPUB), count)
+    return [d.address for d in derive_addresses(_fixture_parsed(), branch, 0, count)]
+
+
+def _tx_entry(
+    txid: str,
+    *,
+    vout_addresses: tuple[str, ...] = (),
+    fee: int | None = 1000,
+    confirmed: bool = True,
+    height: int | None = 800_000,
+    block_time: int | None = 1_700_000_000,
+) -> dict[str, Any]:
+    """Build an Esplora address-txs entry (mirrors the scan fixtures)."""
+    entry: dict[str, Any] = {
+        "txid": txid,
+        "version": 1,
+        "locktime": 0,
+        "vin": [{"prevout": {"scriptpubkey_address": _EXTERNAL, "value": 100_000}}],
+        "vout": [
+            {"scriptpubkey_address": a, "value": 90_000} for a in vout_addresses
+        ],
+        "size": 222,
+        "weight": 564,
+        "status": {"confirmed": confirmed},
+    }
+    if fee is not None:
+        entry["fee"] = fee
+    if confirmed:
+        if height is not None:
+            entry["status"]["block_height"] = height
+        if block_time is not None:
+            entry["status"]["block_time"] = block_time
+    return entry
 
 
 class ScriptedGenerate:
@@ -146,30 +213,57 @@ class ScriptedGenerate:
         return GARBAGE
 
 
-def _utxo_handler(
-    utxos_by_addr: dict[str, list[dict[str, Any]]],
+def _scan_handler(
     recorded: list[httpx.Request],
     *,
+    txs_by_addr: dict[str, list[dict[str, Any]]] | None = None,
+    utxos_by_addr: dict[str, list[dict[str, Any]]] | None = None,
     tip: int | list[dict[str, Any]] = TIP_HEIGHT,
-    utxo_status: int = 200,
     tip_status: int = 200,
+    txs_status: int = 200,
+    utxo_status: int = 200,
 ) -> Callable[[httpx.Request], httpx.Response]:
-    """MockTransport handler serving fixture UTXOs and a tip height."""
+    """MockTransport handler serving per-address txs/utxo payloads + tip."""
+
+    txs_by_addr = txs_by_addr or {}
+    utxos_by_addr = utxos_by_addr or {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         recorded.append(request)
         path = request.url.path
         if path.endswith("/blocks/tip"):
-            return httpx.Response(tip_status, json=tip)
-        if path.endswith("/utxo"):
-            for addr, payload in utxos_by_addr.items():
-                if path.endswith(f"/address/{addr}/utxo"):
-                    return httpx.Response(200, json=payload)
-            # Unlisted address (or a forced failure mode): serve utxo_status.
-            return httpx.Response(utxo_status, json=[] if utxo_status == 200 else None)
-        return httpx.Response(200, json=[])
+            return httpx.Response(tip_status, json=tip if tip_status == 200 else None)
+        parts = path.rstrip("/").split("/")
+        address, kind = parts[-2], parts[-1]
+        if kind == "txs":
+            if txs_status != 200:
+                return httpx.Response(txs_status, json=None)
+            return httpx.Response(200, json=txs_by_addr.get(address, []))
+        if kind == "utxo":
+            if utxo_status != 200:
+                return httpx.Response(utxo_status, json=None)
+            return httpx.Response(200, json=utxos_by_addr.get(address, []))
+        return httpx.Response(404, json=None)
 
     return handler
+
+
+def _utxo_handler(
+    utxos_by_addr: dict[str, list[dict[str, Any]]],
+    recorded: list[httpx.Request],
+    *,
+    tip: int | list[dict[str, Any]] = TIP_HEIGHT,
+    tip_status: int = 200,
+    utxo_status: int = 200,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Backwards-compatible alias over :func:`_scan_handler` (utxos only)."""
+    return _scan_handler(
+        recorded,
+        utxos_by_addr=utxos_by_addr,
+        tip=tip,
+        tip_status=tip_status,
+        utxo_status=utxo_status,
+    )
 
 
 def _mock_client(
@@ -185,13 +279,31 @@ def _mock_client(
 
 
 def _build_table(
-    handler: Callable[[httpx.Request], httpx.Response],
-) -> tuple[dict[IntentName, Any], list[str]]:
-    """Dispatch table + fixture addresses wired to a mock-transport client."""
-    addresses = derive_fixture_addresses()
-    client = _mock_client(handler)
-    table = build_dispatch_table(client, addresses, client.get_tip_height)
-    return table, addresses
+    make_handler: Callable[[list[httpx.Request]], Callable[[httpx.Request], httpx.Response]],
+    *,
+    gap_limit: int | None = TEST_GAP,
+) -> tuple[dict[IntentName, Any], Store, Any, EsploraClient, list[httpx.Request]]:
+    """Store-backed dispatch table wired to a mock-transport client.
+
+    ``make_handler`` receives the recorded-request list and returns the
+    MockTransport handler (``_scan_handler`` fits directly). Returns
+    ``(table, store, wallet, client, recorded)``. The store is in-memory
+    with the fixture wallet row; ``gap_limit`` seeds the ``gap_limit``
+    setting so scan windows stay small and request counts deterministic
+    (``None`` leaves the default gap of 20).
+    """
+    recorded: list[httpx.Request] = []
+    client = _mock_client(make_handler(recorded))
+    store = Store.memory()
+    wd = WalletDescriptor.from_key(VPUB)
+    wallet = store.create_wallet("default", wd.descriptor)
+    store.set_active_wallet(wallet.id)
+    if gap_limit is not None:
+        store.set_setting(GAP_LIMIT_SETTING, str(gap_limit))
+    table = build_dispatch_table(
+        store, wallet, wd.parsed, client, lambda: scan_wallet(store, client, wallet)
+    )
+    return table, store, wallet, client, recorded
 
 
 # ------------------------------------------------------------ key fixtures
@@ -269,7 +381,7 @@ def test_vpub_derives_deterministic_tb1_addresses_matching_descriptor() -> None:
     # Deterministic and prefix-stable across calls and counts.
     assert derive_receive_addresses(parsed, count=5) == addresses
     assert derive_receive_addresses(parsed, count=3) == addresses[:3]
-    assert len(addresses) == DEFAULT_SCAN_COUNT
+    assert len(addresses) == 5
 
 
 def test_change_branch_derivation_differs_from_receive() -> None:
@@ -325,19 +437,52 @@ def test_mainnet_zpub_refused_by_testnet_gate() -> None:
     assert MAINNET_ZPUB not in message  # key never echoed
 
 
+def test_parse_wallet_key_enforces_testnet_gate_at_parse() -> None:
+    """Phase 1 gate: parse_wallet_key refuses mainnet keys outright."""
+    with pytest.raises(WatchKeyError) as excinfo:
+        parse_wallet_key(MAINNET_ZPUB)
+    message = str(excinfo.value)
+    assert "testnet-only" in message
+    assert MAINNET_ZPUB not in message  # key never echoed
+    # Testnet keys pass.
+    assert parse_wallet_key(VPUB).network == "testnet"
+
+
 def test_testnet_keys_pass_the_gate() -> None:
     for key in (VPUB, UPUB, TPUB):
         addresses = derive_receive_addresses(parse_watch_key(key), count=2)
         assert len(addresses) == 2
 
 
+def test_wallet_descriptor_is_canonical_and_checksummed() -> None:
+    wd = WalletDescriptor.from_key(VPUB)
+    assert wd.descriptor.startswith("wpkh([")
+    assert "#" in wd.descriptor
+    # Round-trip: rebuilt from the stored string, identical canonical form.
+    rebuilt = WalletDescriptor.from_descriptor_string(wd.descriptor)
+    assert rebuilt.descriptor == wd.descriptor
+
+
 # ------------------------------------------------------- stub model routing
 
 
-def test_stub_generate_emits_get_balance_for_balance_input() -> None:
-    prompt = "SYSTEM...\n\nuser: What's my balance?\n\nenvelope:"
+@pytest.mark.parametrize(
+    ("statement", "expected_intent"),
+    [
+        ("What's my balance?", IntentName.GET_BALANCE),
+        ("show my recent transactions", IntentName.GET_HISTORY),
+        ("what is my transaction history?", IntentName.GET_HISTORY),
+        ("show my utxos", IntentName.GET_UTXOS),
+        ("give me a new address", IntentName.NEW_ADDRESS),
+        ("hello there", IntentName.RESPOND),
+    ],
+)
+def test_stub_generate_routes_wallet_phrases(
+    statement: str, expected_intent: IntentName
+) -> None:
+    prompt = f"SYSTEM...\n\nuser: {statement}\n\nenvelope:"
     envelope = validate_payload(stub_generate(prompt, None))
-    assert envelope.intent is IntentName.GET_BALANCE
+    assert envelope.intent is expected_intent
 
 
 def test_stub_generate_emits_respond_otherwise() -> None:
@@ -347,23 +492,31 @@ def test_stub_generate_emits_respond_otherwise() -> None:
     assert isinstance(envelope.params.text, str) and envelope.params.text.strip()
 
 
-# ------------------------------------------------------- e2e: loop → chain
+# ------------------------------------------------- config: store_path env
 
 
-def test_balance_end_to_end_agent_to_dispatcher_to_chain() -> None:
-    """'What's my balance?' flows: stub model → envelope validation →
-    allowlist dispatch → get_balance handler → mock chain → totals."""
-    recorded: list[httpx.Request] = []
-    addresses = derive_fixture_addresses()
-    handler = _utxo_handler(
-        {addresses[0]: UTXOS_ADDR0, addresses[1]: UTXOS_ADDR1}, recorded
+def test_settings_store_path_env_and_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", "/tmp/lw-test/store.db")
+    assert app_module.Settings.from_env().store_path == "/tmp/lw-test/store.db"
+    monkeypatch.delenv("LOCALWALLET_STORE_PATH", raising=False)
+    assert app_module.Settings.from_env().store_path == "localwallet.db"
+
+
+# ------------------------------------------------------- e2e: loop → store
+
+
+def test_balance_end_to_end_agent_to_dispatcher_to_scan_to_store() -> None:
+    """'What's my balance?' flows: scripted model → envelope validation →
+    allowlist dispatch → get_balance handler → lazy scan (mock chain) →
+    store → totals."""
+    addr0, addr1 = derive_fixture_addresses(2)
+    change0, change1 = derive_fixture_addresses(2, branch=1)
+    table, store, wallet, client, recorded = _build_table(
+        lambda rec: _scan_handler(rec, utxos_by_addr={addr0: UTXOS_ADDR0, addr1: UTXOS_ADDR1})
     )
-    client = _mock_client(handler)
-    table = build_dispatch_table(client, addresses, client.get_tip_height)
 
     gen = ScriptedGenerate([GET_BALANCE_JSON])
-    loop = AgentLoop(gen, table)
-    turn = loop.run("What's my balance?", {})
+    turn = AgentLoop(gen, table).run("What's my balance?", {})
 
     assert turn.status is AgentTurnStatus.OK
     assert turn.envelope is not None
@@ -373,39 +526,69 @@ def test_balance_end_to_end_agent_to_dispatcher_to_chain() -> None:
         "confirmed_sats": EXPECTED_CONFIRMED,
         "unconfirmed_sats": EXPECTED_UNCONFIRMED,
         "total_sats": EXPECTED_TOTAL,
-        "addresses_scanned": 5,
+        "addresses_scanned": 2,  # addresses WITH utxos (ticket contract)
         "tip_height": TIP_HEIGHT,
     }
-    # The handler really hit the chain adapter: one UTXO request per
-    # derived address (sequential) plus one tip request.
-    utxo_paths = [r.url.path for r in recorded if r.url.path.endswith("/utxo")]
-    assert utxo_paths == [
-        f"/testnet4/api/address/{addr}/utxo" for addr in addresses
-    ]
+    # The lazy scan really hit the chain adapter: one txs + one utxo call
+    # per window address (gap 2 → 2 per branch) plus one tip request.
+    utxo_paths = {r.url.path for r in recorded if r.url.path.endswith("/utxo")}
+    assert utxo_paths == {
+        f"/testnet4/api/address/{a}/utxo"
+        for a in (addr0, addr1, change0, change1)
+    }
     assert any(r.url.path.endswith("/blocks/tip") for r in recorded)
-    # The stub model received the real envelope grammar via the seam.
+    # The scripted model received the real envelope grammar via the seam.
     assert "root ::=" in (gen.calls[0][1] or "")
+    # The scan populated the store (single wallet row, UTXO snapshot).
+    assert len(store.list_wallets()) == 1
+    assert len(store.get_utxos_for_wallet(wallet.id)) == 3
+    client.close()
+    store.close()
+
+
+def test_second_balance_read_hits_store_only() -> None:
+    """After one scan, later balance reads come from the cache: no new
+    chain requests."""
+    addr0, addr1 = derive_fixture_addresses(2)
+    table, store, _wallet, client, recorded = _build_table(
+        lambda rec: _scan_handler(rec, utxos_by_addr={addr0: UTXOS_ADDR0, addr1: UTXOS_ADDR1})
+    )
+    loop = AgentLoop(ScriptedGenerate([GET_BALANCE_JSON, GET_BALANCE_JSON]), table)
+
+    first = loop.run("What's my balance?", {})
+    assert first.result is not None and "error" not in first.result
+    after_first = len(recorded)
+    second = loop.run("and now?", {})
+    assert second.result is not None and "error" not in second.result
+    assert second.result["total_sats"] == EXPECTED_TOTAL
+    assert len(recorded) == after_first  # no chain I/O on the cached read
+    client.close()
+    store.close()
 
 
 def test_respond_intent_passthrough_through_the_real_table() -> None:
     recorded: list[httpx.Request] = []
-    table, _ = _build_table(_utxo_handler({}, recorded))
+    table, store, _wallet, client, recorded = _build_table(_scan_handler)
     respond_json = '{"v": 0, "intent": "respond", "params": {"text": "Hello!"}}'
     turn = AgentLoop(ScriptedGenerate([respond_json]), table).run("hi", {})
     assert turn.status is AgentTurnStatus.OK
     assert turn.result == {"text": "Hello!"}
     assert recorded == []  # no chain I/O for a respond turn
+    client.close()
+    store.close()
 
 
 def test_clarify_intent_passthrough_through_the_real_table() -> None:
     recorded: list[httpx.Request] = []
-    table, _ = _build_table(_utxo_handler({}, recorded))
+    table, store, _wallet, client, recorded = _build_table(_scan_handler)
     clarify_json = '{"v": 0, "intent": "clarify", "params": {"question": "How much?"}}'
     turn = AgentLoop(ScriptedGenerate([clarify_json]), table).run("send", {})
     assert turn.status is AgentTurnStatus.OK
     assert turn.result == {"question": "How much?"}
     assert turn.user_message == "How much?"  # model-emitted clarify surfaces
     assert recorded == []
+    client.close()
+    store.close()
 
 
 @pytest.mark.parametrize(
@@ -425,7 +608,7 @@ def test_malformed_model_output_takes_clean_reject_path(bad_output: str) -> None
     """AC #2 support: malformed/nonsense model output is rejected cleanly —
     exactly one re-prompt, then a synthesized clarify; never a dispatch."""
     recorded: list[httpx.Request] = []
-    table, _ = _build_table(_utxo_handler({}, recorded))
+    table, store, _wallet, client, recorded = _build_table(_scan_handler)
     gen = ScriptedGenerate([bad_output])  # then GARBAGE forever
     loop = AgentLoop(gen, table)
 
@@ -438,19 +621,231 @@ def test_malformed_model_output_takes_clean_reject_path(bad_output: str) -> None
     assert len(gen.calls) == 2  # one retry, then escalate
     assert "RETRY NOTE" in gen.calls[1][0]
     assert recorded == []  # nothing reached the chain layer
+    client.close()
+    store.close()
+
+
+# ------------------------------------------------------- new_address flow
+
+
+def test_new_address_allocates_bumps_and_needs_no_network() -> None:
+    """'give me a new address': derivation from the parsed key, store
+    allocation bookkeeping, next call → NEXT index. No chain I/O."""
+    recorded: list[httpx.Request] = []
+    table, store, wallet, client, recorded = _build_table(_scan_handler)
+    loop = AgentLoop(
+        ScriptedGenerate([NEW_ADDRESS_JSON, NEW_ADDRESS_CHANGE_JSON]), table
+    )
+
+    first = loop.run("give me a new address", {})
+    assert first.status is AgentTurnStatus.OK
+    expected_receive = derive_addresses(_fixture_parsed(), 0, 0, 1)[0].address
+    assert first.result == {"address": expected_receive, "branch": 0, "index": 0}
+
+    second = loop.run("and a change address", {})
+    assert second.status is AgentTurnStatus.OK
+    expected_change = derive_addresses(_fixture_parsed(), 1, 0, 1)[0].address
+    assert second.result == {"address": expected_change, "branch": 1, "index": 0}
+
+    # Allocation consumed exactly one index per branch in the store.
+    assert store.get_derivation(wallet.id, 0).next_index == 1
+    assert store.get_derivation(wallet.id, 1).next_index == 1
+    rows0 = store.get_addresses(wallet.id, 0)
+    assert [(r.index, r.status) for r in rows0] == [(0, "allocated")]
+    rows1 = store.get_addresses(wallet.id, 1)
+    assert [(r.index, r.status) for r in rows1] == [(0, "allocated")]
+    # Allocation must NOT require the network: zero chain requests.
+    assert recorded == []
+    client.close()
+    store.close()
+
+
+def test_new_address_derivation_is_pure_same_index_same_address() -> None:
+    """Idempotency contract: re-deriving the same index returns the same
+    address (allocation bookkeeping lives in the store, derivation is a
+    pure function)."""
+    parsed = _fixture_parsed()
+    table, store, wallet, client, _recorded = _build_table(_scan_handler)
+    handler = table[IntentName.NEW_ADDRESS]
+    envelope: Envelope = validate_payload(NEW_ADDRESS_JSON)
+    first = handler(envelope)
+    assert first == {
+        "address": derive_addresses(parsed, 0, 0, 1)[0].address,
+        "branch": 0,
+        "index": 0,
+    }
+    # Direct re-derivation of the consumed index (no allocation): identical.
+    assert derive_addresses(parsed, 0, 0, 1)[0].address == first["address"]
+    # A second allocation consumes the NEXT index — never the same one.
+    second = handler(envelope)
+    assert second["index"] == 1 and second["address"] != first["address"]
+    assert store.get_derivation(wallet.id, 0).next_index == 2
+    client.close()
+    store.close()
+
+
+# --------------------------------------------------------- get_history flow
+
+
+def _seed_txs(store: Store, wallet_id: int) -> list[TxRecord]:
+    """25 confirmed txs (heights 800000..800024) + 1 unconfirmed."""
+    records = [
+        TxRecord(
+            wallet_id=wallet_id,
+            txid=f"{i:02x}" * 32,
+            height=800_000 + i,
+            block_time=1_700_000_000 + i * 600,
+            fee_sats=1000 + i,
+            direction="in" if i % 2 == 0 else "out",
+            raw_summary=None,
+        )
+        for i in range(25)
+    ]
+    records.append(
+        TxRecord(
+            wallet_id=wallet_id,
+            txid="ee" * 32,
+            height=None,
+            block_time=None,
+            fee_sats=None,
+            direction="out",
+            raw_summary=None,
+        )
+    )
+    store.upsert_txs(records)
+    return records
+
+
+def test_history_limit_param_and_ordering() -> None:
+    """limit=5 over 26 cached txs → 5 shown, height DESC, unconfirmed first."""
+    table, store, wallet, client, _recorded = _build_table(_scan_handler)
+    seeded = _seed_txs(store, wallet.id)
+
+    turn = AgentLoop(ScriptedGenerate([GET_HISTORY_LIMIT_JSON]), table).run(
+        "show my recent transactions", {}
+    )
+    assert turn.status is AgentTurnStatus.OK
+    assert turn.result is not None
+    assert turn.result["shown"] == 5
+    txs = turn.result["transactions"]
+    assert len(txs) == 5
+    # Newest first: the unconfirmed tx, then descending block heights.
+    assert [t["height"] for t in txs] == [None, 800_024, 800_023, 800_022, 800_021]
+    assert [t["txid"] for t in txs] == [
+        "ee" * 32,
+        f"{24:02x}" * 32,
+        f"{23:02x}" * 32,
+        f"{22:02x}" * 32,
+        f"{21:02x}" * 32,
+    ]
+    assert all(set(t) == {"txid", "height", "direction", "fee_sats", "block_time"} for t in txs)
+    assert len(seeded) == 26
+    client.close()
+    store.close()
+
+
+def test_history_default_limit_is_20_without_params() -> None:
+    table, store, wallet, client, _recorded = _build_table(_scan_handler)
+    _seed_txs(store, wallet.id)
+    turn = AgentLoop(
+        ScriptedGenerate(['{"v": 0, "intent": "get_history", "params": {}}']), table
+    ).run("history", {})
+    assert turn.result is not None
+    assert turn.result["shown"] == 20
+    client.close()
+    store.close()
+
+
+def test_history_narration_lines_are_address_free() -> None:
+    table, store, wallet, client, _recorded = _build_table(_scan_handler)
+    _seed_txs(store, wallet.id)
+    turn = AgentLoop(ScriptedGenerate([GET_HISTORY_LIMIT_JSON]), table).run(
+        "show my recent transactions", {}
+    )
+    outputs: list[str] = []
+    app_module._print_turn(turn, outputs.append)
+    joined = "\n".join(outputs)
+    lines = [line for line in outputs if line.startswith("tx ")]
+    assert len(lines) == 5
+    unconfirmed = "ee" * 32
+    assert f"tx {unconfirmed[:12]}… out unconfirmed" in joined
+    top_confirmed = f"{24:02x}" * 32
+    assert f"tx {top_confirmed[:12]}… in 800024" in joined
+    # P1 narration contract: no addresses in history output.
+    for addr in derive_fixture_addresses(3):
+        assert addr not in joined
+    client.close()
+    store.close()
+
+
+def test_history_empty_store_prints_no_transactions() -> None:
+    table, store, _wallet, client, _recorded = _build_table(_scan_handler)
+    turn = AgentLoop(
+        ScriptedGenerate(['{"v": 0, "intent": "get_history", "params": {}}']), table
+    ).run("history", {})
+    outputs: list[str] = []
+    app_module._print_turn(turn, outputs.append)
+    assert "No transactions found." in outputs
+    client.close()
+    store.close()
+
+
+# ---------------------------------------------------------- get_utxos flow
+
+
+def test_utxos_narration_quotes_addresses_verbatim() -> None:
+    addr0, addr1 = derive_fixture_addresses(2)
+    table, store, wallet, client, _recorded = _build_table(_scan_handler)
+    store.replace_utxos_for_wallet(
+        wallet.id,
+        [
+            UtxoRecord(
+                wallet_id=wallet.id, txid="a" * 64, vout=0, address=addr0,
+                value_sats=50_000, confirmed=1, height=800_000,
+            ),
+            UtxoRecord(
+                wallet_id=wallet.id, txid="b" * 64, vout=1, address=addr1,
+                value_sats=12_345, confirmed=0, height=None,
+            ),
+        ],
+    )
+    turn = AgentLoop(ScriptedGenerate(['{"v": 0, "intent": "get_utxos", "params": {}}']), table).run(
+        "show my utxos", {}
+    )
+    assert turn.status is AgentTurnStatus.OK
+    assert turn.result is not None
+    assert turn.result["count"] == 2
+    outputs: list[str] = []
+    app_module._print_turn(turn, outputs.append)
+    joined = "\n".join(outputs)
+    # Addresses verbatim from the store (tool output) — quote-verbatim rule.
+    assert addr0 in joined and addr1 in joined
+    assert "50000 sats · confirmed" in joined
+    assert "12345 sats · unconfirmed" in joined
+    client.close()
+    store.close()
+
+
+def test_utxos_empty_store_prints_no_unspent_outputs() -> None:
+    table, store, _wallet, client, _recorded = _build_table(_scan_handler)
+    turn = AgentLoop(ScriptedGenerate(['{"v": 0, "intent": "get_utxos", "params": {}}']), table).run(
+        "show my utxos", {}
+    )
+    outputs: list[str] = []
+    app_module._print_turn(turn, outputs.append)
+    assert "No unspent outputs." in outputs
+    client.close()
+    store.close()
 
 
 # ------------------------------------------------------- chain-error path
 
 
 def test_handler_chain_error_surfaces_as_result_without_raising() -> None:
-    recorded: list[httpx.Request] = []
-    addresses = derive_fixture_addresses()
-    handler = _utxo_handler(
-        {addresses[0]: UTXOS_ADDR0}, recorded, utxo_status=500
+    addr0, _addr1 = derive_fixture_addresses(2)
+    table, store, _wallet, client, _recorded = _build_table(
+        lambda rec: _scan_handler(rec, utxo_status=500)
     )
-    client = _mock_client(handler, max_retries=0)  # 500 fails immediately
-    table = build_dispatch_table(client, addresses, client.get_tip_height)
 
     envelope: Envelope = validate_payload(GET_BALANCE_JSON)
     result = table[IntentName.GET_BALANCE](envelope)  # direct call: no raise
@@ -459,14 +854,24 @@ def test_handler_chain_error_surfaces_as_result_without_raising() -> None:
     detail = str(result["detail"])
     assert detail.strip() != ""
     # Scrubbing invariant: no address material in the surfaced detail.
-    assert all(addr not in detail for addr in addresses)
+    assert addr0 not in detail
     assert set(result.keys()) == {"error", "detail"}
+    # Fail-closed scan: the store was left untouched (no cursor, no utxos).
+    assert store.get_sync_state(_wallet_id(store), "last_scan_cursor") is None
+    client.close()
+    store.close()
+
+
+def _wallet_id(store: Store) -> int:
+    row = store.get_wallet_by_name("default")
+    assert row is not None
+    return row.id
 
 
 def test_chain_error_flows_through_loop_as_ok_with_error_result() -> None:
-    addresses = derive_fixture_addresses()
-    fail_client = _mock_client(_utxo_handler({}, [], utxo_status=503), max_retries=0)
-    table = build_dispatch_table(fail_client, addresses, fail_client.get_tip_height)
+    table, store, _wallet, client, _recorded = _build_table(
+        lambda rec: _scan_handler(rec, utxo_status=503)
+    )
 
     turn = AgentLoop(ScriptedGenerate([GET_BALANCE_JSON]), table).run(
         "What's my balance?", {}
@@ -474,53 +879,85 @@ def test_chain_error_flows_through_loop_as_ok_with_error_result() -> None:
     assert turn.status is AgentTurnStatus.OK  # handler contained the failure
     assert turn.result is not None
     assert turn.result["error"] == "chain_unavailable"
+    client.close()
+    store.close()
 
 
-def test_tip_failure_omits_tip_height_but_keeps_balance() -> None:
-    """Tip lookup failure is non-fatal: balance totals are still returned,
-    with the ``tip_height`` key omitted entirely (status OK)."""
-    recorded: list[httpx.Request] = []
-    addresses = derive_fixture_addresses()
-    handler = _utxo_handler(
-        {addresses[0]: UTXOS_ADDR0, addresses[1]: UTXOS_ADDR1},
-        recorded,
-        tip_status=500,
+def test_tip_failure_fails_the_scan_cleanly_store_untouched() -> None:
+    """Phase 1 semantics: the tip is fetched inside the scan, so a tip
+    failure aborts the scan (fail closed) and surfaces as
+    chain_unavailable — the store is left untouched."""
+    table, store, wallet, client, _recorded = _build_table(
+        lambda rec: _scan_handler(rec, tip_status=500)
     )
-    client = _mock_client(handler, max_retries=0)  # 5xx fails immediately
-    table = build_dispatch_table(client, addresses, client.get_tip_height)
 
     turn = AgentLoop(ScriptedGenerate([GET_BALANCE_JSON]), table).run(
         "What's my balance?", {}
     )
     assert turn.status is AgentTurnStatus.OK
     assert turn.result is not None
-    assert "error" not in turn.result
-    assert "tip_height" not in turn.result
-    assert turn.result["confirmed_sats"] == EXPECTED_CONFIRMED
-    assert turn.result["unconfirmed_sats"] == EXPECTED_UNCONFIRMED
-    assert turn.result["total_sats"] == EXPECTED_TOTAL
-    assert turn.result["addresses_scanned"] == len(addresses)
+    assert turn.result["error"] == "chain_unavailable"
+    assert store.get_utxos_for_wallet(wallet.id) == []
+    client.close()
+    store.close()
 
 
 def test_tip_list_shape_yields_correct_tip_height() -> None:
     """A list-shaped tip (mempool.space divergence) yields the max height."""
-    recorded: list[httpx.Request] = []
-    addresses = derive_fixture_addresses()
-    handler = _utxo_handler(
-        {addresses[0]: UTXOS_ADDR0, addresses[1]: UTXOS_ADDR1},
-        recorded,
-        tip=[{"height": 100}, {"height": 870_000}],
+    addr0, addr1 = derive_fixture_addresses(2)
+    table, store, _wallet, client, _recorded = _build_table(
+        lambda rec: _scan_handler(
+            rec,
+            utxos_by_addr={addr0: UTXOS_ADDR0, addr1: UTXOS_ADDR1},
+            tip=[{"height": 100}, {"height": 870_000}],
+        )
     )
-    client = _mock_client(handler)
-    table = build_dispatch_table(client, addresses, client.get_tip_height)
 
     envelope: Envelope = validate_payload(GET_BALANCE_JSON)
     result = table[IntentName.GET_BALANCE](envelope)
     assert result["tip_height"] == 870_000
     assert result["total_sats"] == EXPECTED_TOTAL
+    client.close()
+    store.close()
+
+
+def test_print_balance_omitted_tip_prints_tip_unavailable_not_tip_height_0() -> None:
+    """SR-006 minor 2: a result without tip_height prints 'tip unavailable'
+    — never a fabricated 'tip height 0'."""
+    outputs: list[str] = []
+    app_module._print_balance(
+        {
+            "confirmed_sats": 1,
+            "unconfirmed_sats": 2,
+            "total_sats": 3,
+            "addresses_scanned": 1,
+        },
+        outputs.append,
+    )
+    joined = "\n".join(outputs)
+    assert "tip unavailable" in joined
+    assert "tip height 0" not in joined
 
 
 # --------------------------------------------------------------- CLI wiring
+
+
+def _store_path(tmp_path: Path) -> Path:
+    return tmp_path / "store.db"
+
+
+def _preset_store(path: Path, *, gap_limit: int = TEST_GAP) -> WalletDescriptor:
+    """Pre-create the wallet row (+ gap setting) the app will reuse.
+
+    Exercises the duplicate-descriptor guard on every run: the startup
+    must reuse this row, never create a second one.
+    """
+    wd = WalletDescriptor.from_key(VPUB)
+    with Store(path) as store:
+        wallet = store.create_wallet("default", wd.descriptor)
+        store.set_active_wallet(wallet.id)
+        store.set_setting(GAP_LIMIT_SETTING, str(gap_limit))
+    return wd
 
 
 def _run_captured(
@@ -528,9 +965,17 @@ def _run_captured(
     monkeypatch: pytest.MonkeyPatch,
     handler: Callable[[httpx.Request], httpx.Response],
     lines: list[str],
+    *,
+    store_path: Path | None = None,
+    auto_scan: bool = False,
 ) -> tuple[int, list[str]]:
-    """Run app.run() with stub I/O and a mock-transport chain client."""
+    """Run app.run() with stub I/O, a tmp store, and a mock chain client."""
     monkeypatch.delenv("LOCALWALLET_MODEL_PATH", raising=False)
+    monkeypatch.delenv("LOCALWALLET_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LOCALWALLET_LLM_MODEL", raising=False)
+    if store_path is not None:
+        monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
+    monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "1" if auto_scan else "0")
     monkeypatch.setattr(
         app_module, "EsploraClient", lambda **_: _mock_client(handler)
     )
@@ -544,13 +989,17 @@ def _run_captured(
     return code, outputs
 
 
-def test_repl_end_to_end_with_stub_llm_prints_verbatim_balance(
-    monkeypatch: pytest.MonkeyPatch,
+def test_startup_scan_populates_store_then_balance_reads_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Startup scan (default-on) fills the store; the balance turn reads
+    the cache — and the wallet row was reused, not duplicated."""
+    store_path = _store_path(tmp_path)
+    wd = _preset_store(store_path)
     recorded: list[httpx.Request] = []
-    addresses = derive_fixture_addresses()
-    handler = _utxo_handler(
-        {addresses[0]: UTXOS_ADDR0, addresses[1]: UTXOS_ADDR1}, recorded
+    addr0, addr1 = derive_fixture_addresses(2)
+    handler = _scan_handler(
+        recorded, utxos_by_addr={addr0: UTXOS_ADDR0, addr1: UTXOS_ADDR1}
     )
 
     code, outputs = _run_captured(
@@ -558,6 +1007,8 @@ def test_repl_end_to_end_with_stub_llm_prints_verbatim_balance(
         monkeypatch,
         handler,
         ["What's my balance?", "exit"],
+        store_path=store_path,
+        auto_scan=True,
     )
 
     assert code == 0
@@ -565,6 +1016,8 @@ def test_repl_end_to_end_with_stub_llm_prints_verbatim_balance(
     # Banner: testnet notice + §9 privacy indicator verbatim.
     assert "TESTNET" in joined
     assert PRIVACY_INDICATOR in joined
+    # Startup scan feedback: counts + tip only (no addresses/amounts).
+    assert "Startup scan complete: 3 UTXOs · tip height 870000." in joined
     # Balance line verbatim from the handler result dict.
     assert (
         f"Balance (testnet): {EXPECTED_CONFIRMED} sats (confirmed) "
@@ -574,20 +1027,107 @@ def test_repl_end_to_end_with_stub_llm_prints_verbatim_balance(
     assert f"tip height {TIP_HEIGHT}" in joined
     # Privacy/secret hygiene: the zpub and addresses are never echoed.
     assert VPUB not in joined
-    assert all(addr not in joined for addr in addresses)
-    assert len(recorded) == 6  # 5 utxo scans + 1 tip
+    assert all(addr not in joined for addr in (addr0, addr1))
+    assert wd.descriptor not in joined
+    # 9 requests: 1 tip + (2 txs + 2 utxos) per branch at gap 2.
+    assert len(recorded) == 9
+    # The store holds exactly the pre-seeded wallet row + scanned state.
+    with Store(store_path) as store:
+        rows = store.list_wallets()
+        assert len(rows) == 1
+        assert rows[0].descriptor == wd.descriptor
+        utxos = store.get_utxos_for_wallet(rows[0].id)
+        assert sorted(u.value_sats for u in utxos) == [7_000, 12_345, 50_000]
+        assert store.get_sync_state(rows[0].id, "last_scan_cursor") is not None
 
 
-def test_repl_reads_zpub_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(ZPUB_ENV_VAR, VPUB)
+def test_repl_end_to_end_with_stub_llm_prints_verbatim_balance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
     recorded: list[httpx.Request] = []
-    addresses = derive_fixture_addresses()
-    handler = _utxo_handler(
-        {addresses[0]: UTXOS_ADDR0, addresses[1]: UTXOS_ADDR1}, recorded
+    addr0, addr1 = derive_fixture_addresses(2)
+    handler = _scan_handler(
+        recorded, utxos_by_addr={addr0: UTXOS_ADDR0, addr1: UTXOS_ADDR1}
     )
 
     code, outputs = _run_captured(
-        ["--stub-llm"], monkeypatch, handler, ["What's my balance?", "quit"]
+        ["--stub-llm", "--zpub", VPUB],
+        monkeypatch,
+        handler,
+        ["What's my balance?", "exit"],
+        store_path=store_path,
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    assert "TESTNET" in joined
+    assert PRIVACY_INDICATOR in joined
+    assert (
+        f"Balance (testnet): {EXPECTED_CONFIRMED} sats (confirmed) "
+        f"+ {EXPECTED_UNCONFIRMED} sats (unconfirmed)" in joined
+    )
+    assert f"Total {EXPECTED_TOTAL} sats" in joined
+    assert f"tip height {TIP_HEIGHT}" in joined
+    assert VPUB not in joined
+    assert all(addr not in joined for addr in (addr0, addr1))
+    # Lazy scan only (auto-scan off): 1 tip + 4 txs + 4 utxos.
+    assert len(recorded) == 9
+
+
+def test_auto_scan_opt_out_balance_scans_lazily_on_first_ask(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """LOCALWALLET_AUTO_SCAN=0: no chain I/O at startup; the first balance
+    ask triggers the scan once lazily, then reads the store."""
+    store_path = _store_path(tmp_path)
+    recorded: list[httpx.Request] = []
+    addr0, addr1 = derive_fixture_addresses(2)
+    handler = _scan_handler(
+        recorded, utxos_by_addr={addr0: UTXOS_ADDR0, addr1: UTXOS_ADDR1}
+    )
+    monkeypatch.delenv("LOCALWALLET_MODEL_PATH", raising=False)
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
+    monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "0")
+    monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
+    lines = iter(["What's my balance?", "exit"])
+    marks: dict[str, int] = {}
+
+    def read_line(_prompt: str) -> str:
+        value = next(lines)
+        marks[value] = len(recorded)
+        return value
+
+    outputs: list[str] = []
+    code = run(["--stub-llm", "--zpub", VPUB], input_fn=read_line, output_fn=outputs.append)
+
+    assert code == 0
+    assert marks["What's my balance?"] == 0  # startup made zero chain calls
+    assert marks["exit"] > 0  # the balance turn performed the lazy scan
+    joined = "\n".join(outputs)
+    assert "Startup scan complete" not in joined  # startup scan skipped
+    assert (
+        f"Balance (testnet): {EXPECTED_CONFIRMED} sats (confirmed)" in joined
+    )
+    # Fresh-store path: the app created exactly one wallet row itself.
+    with Store(store_path) as store:
+        assert len(store.list_wallets()) == 1
+
+
+def test_repl_reads_zpub_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(ZPUB_ENV_VAR, VPUB)
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    recorded: list[httpx.Request] = []
+    addr0, addr1 = derive_fixture_addresses(2)
+    handler = _scan_handler(
+        recorded, utxos_by_addr={addr0: UTXOS_ADDR0, addr1: UTXOS_ADDR1}
+    )
+
+    code, outputs = _run_captured(
+        ["--stub-llm"], monkeypatch, handler, ["What's my balance?", "quit"],
+        store_path=store_path,
     )
 
     assert code == 0
@@ -596,79 +1136,319 @@ def test_repl_reads_zpub_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert VPUB not in joined  # env-sourced key never echoed either
 
 
-def test_zpub_cli_arg_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Env holds a key the Phase 0 gate would refuse; the CLI arg must win.
+def test_zpub_cli_arg_overrides_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Env holds a key the Phase 1 gate would refuse; the CLI arg must win.
     monkeypatch.setenv(ZPUB_ENV_VAR, MAINNET_ZPUB)
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
     recorded: list[httpx.Request] = []
-    handler = _utxo_handler({}, recorded)
+    handler = _scan_handler(recorded)
 
     code, outputs = _run_captured(
         ["--stub-llm", "--zpub", VPUB],
         monkeypatch,
         handler,
         ["exit"],
+        store_path=store_path,
     )
 
     assert code == 0
     assert PRIVACY_INDICATOR in "\n".join(outputs)
 
 
-def test_repl_reports_chain_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(esplora_module, "_sleep_for", lambda _s: None)
-    handler = _utxo_handler({}, [], utxo_status=503)
+def test_repl_reports_chain_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    handler = _scan_handler([], utxo_status=503)
 
     code, outputs = _run_captured(
         ["--stub-llm", "--zpub", VPUB],
         monkeypatch,
         handler,
         ["What's my balance?", "exit"],
+        store_path=store_path,
+        auto_scan=True,
     )
 
     assert code == 0
     joined = "\n".join(outputs)
+    # Startup scan failed → scrubbed warning, but the REPL still started.
+    assert "warning: startup scan failed" in joined
     assert "chain unavailable" in joined
     assert "Balance (testnet):" not in joined
 
 
-def test_repl_omitted_tip_prints_tip_unavailable_not_tip_height_0(
-    monkeypatch: pytest.MonkeyPatch,
+def test_rescan_flag_repairs_stale_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """SR-006 minor 2: when the handler omits tip_height (tip-lookup
-    failure), the CLI prints 'tip unavailable' — never a fabricated
-    'tip height 0'."""
+    """--rescan: re-derives from the key, rebuilds derivation state and
+    replaces the stale UTXO snapshot with chain truth (Phase 1 AC)."""
+    store_path = _store_path(tmp_path)
+    wd = WalletDescriptor.from_key(VPUB)
+    parsed = wd.parsed
+    addr0 = derive_addresses(parsed, 0, 0, 1)[0].address
+    stale_txid = "f" * 64
+    fresh_txid = "ab" * 32
+    with Store(store_path) as store:
+        wallet = store.create_wallet("default", wd.descriptor)
+        store.set_active_wallet(wallet.id)
+        store.set_setting(GAP_LIMIT_SETTING, str(TEST_GAP))
+        # Stale cache: a bogus 1-sat UTXO, zeroed derivation, stale cursor.
+        store.upsert_batch(
+            [
+                AddressRecord(
+                    wallet_id=wallet.id, branch=0, index=0, address=addr0,
+                    script_type="p2wpkh", status="unused",
+                )
+            ]
+        )
+        store.replace_utxos_for_wallet(
+            wallet.id,
+            [
+                UtxoRecord(
+                    wallet_id=wallet.id, txid=stale_txid, vout=0, address=addr0,
+                    value_sats=1, confirmed=1, height=800_000,
+                )
+            ],
+        )
+        store.set_sync_state(wallet.id, "last_scan_cursor", '{"0": 2, "1": 2}')
+
     recorded: list[httpx.Request] = []
-    addresses = derive_fixture_addresses()
-    handler = _utxo_handler(
-        {addresses[0]: UTXOS_ADDR0, addresses[1]: UTXOS_ADDR1},
+    handler = _scan_handler(
         recorded,
-        tip_status=500,  # tip lookup fails → tip_height key omitted
+        txs_by_addr={addr0: [_tx_entry(fresh_txid, vout_addresses=(addr0,))]},
+        utxos_by_addr={
+            addr0: [
+                {
+                    "txid": fresh_txid,
+                    "vout": 0,
+                    "value": 50_000,
+                    "status": {"confirmed": True, "block_height": 800_000},
+                }
+            ]
+        },
     )
+
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", VPUB, "--rescan"],
+        monkeypatch,
+        handler,
+        ["What's my balance?", "exit"],
+        store_path=store_path,
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    # Counts-only summary (no addresses, no amounts).
+    rescan_line = next(line for line in outputs if line.startswith("Rescan complete:"))
+    assert "branch 0: scanned 3, max used 0, next index 1" in rescan_line
+    assert "branch 1: scanned 2, max used -1, next index 0" in rescan_line
+    assert "1 UTXOs · tip height 870000" in rescan_line
+    assert addr0 not in rescan_line and "50000" not in rescan_line
+    # The stale snapshot was replaced wholesale by chain truth; derivation
+    # was recomputed from chain usage (next = max_used + 1).
+    with Store(store_path) as store:
+        wallet_row = store.get_active_wallet()
+        assert wallet_row is not None and wallet_row.id == wallet.id
+        utxos = store.get_utxos_for_wallet(wallet.id)
+        assert [(u.txid[:4], u.value_sats) for u in utxos] == [("abab", 50_000)]
+        deriv = store.get_derivation(wallet.id, 0)
+        assert (deriv.max_used_index, deriv.next_index) == (0, 1)
+    # And the post-rescan balance reads the repaired cache.
+    assert "Balance (testnet): 50000 sats (confirmed) + 0 sats (unconfirmed)" in joined
+    # The out-of-window warning stays cleared: usage stayed inside the window.
+    assert "usage was found beyond your usual address window" not in joined
+
+
+def test_out_of_window_warning_printed_from_sync_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ADR-0009 UI surfacing: a non-empty out_of_window_detected payload in
+    sync_state prints the generic startup warning line."""
+    store_path = _store_path(tmp_path)
+    wd = _preset_store(store_path)
+    with Store(store_path) as store:
+        wallet = store.get_wallet_by_name("default")
+        assert wallet is not None
+        store.set_sync_state(
+            wallet.id,
+            "out_of_window_detected",
+            json.dumps(
+                {
+                    "detected_at": "2026-08-31T00:00:00+00:00",
+                    "branches": {
+                        "0": {"max_used_index": 30, "previous_window_end": 19}
+                    },
+                }
+            ),
+        )
+    recorded: list[httpx.Request] = []
+    handler = _scan_handler(recorded)
 
     code, outputs = _run_captured(
         ["--stub-llm", "--zpub", VPUB],
         monkeypatch,
         handler,
-        ["What's my balance?", "exit"],
+        ["exit"],
+        store_path=store_path,
     )
 
     assert code == 0
     joined = "\n".join(outputs)
-    assert "tip unavailable" in joined
-    assert "tip height 0" not in joined
+    assert OUT_OF_WINDOW_NOTICE in joined
+    assert "usage was found beyond your usual address window" in joined
+    # The warning line is index-free/scrubbed: no addresses, no key material.
+    assert VPUB not in joined and wd.descriptor not in joined
+
+
+def test_out_of_window_warning_absent_without_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    recorded: list[httpx.Request] = []
+    handler = _scan_handler(recorded)
+
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", VPUB],
+        monkeypatch,
+        handler,
+        ["exit"],
+        store_path=store_path,
+    )
+
+    assert code == 0
+    assert "usage was found beyond your usual address window" not in "\n".join(outputs)
+
+
+def test_duplicate_descriptor_startup_reuses_wallet_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Duplicate-descriptor guard: a store already holding the same
+    descriptor is reused — repeated startups never duplicate the row."""
+    store_path = _store_path(tmp_path)
+    wd = _preset_store(store_path)
+    with Store(store_path) as store:
+        existing = store.get_wallet_by_name("default")
+        assert existing is not None
+
+    recorded: list[httpx.Request] = []
+    handler = _scan_handler(recorded)
+    for _ in range(2):
+        code, _outputs = _run_captured(
+            ["--stub-llm", "--zpub", VPUB],
+            monkeypatch,
+            handler,
+            ["exit"],
+            store_path=store_path,
+        )
+        assert code == 0
+
+    with Store(store_path) as store:
+        rows = store.list_wallets()
+        assert len(rows) == 1
+        assert rows[0].id == existing.id
+        assert rows[0].descriptor == wd.descriptor
+        active = store.get_active_wallet()
+        assert active is not None and active.id == existing.id
+
+
+def test_repl_new_address_narration_and_persistence_across_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """'give me a new address' via the REPL: verbatim narration, and the
+    allocation state survives in the store — a second run yields the NEXT
+    index."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    recorded: list[httpx.Request] = []
+    handler = _scan_handler(recorded)
+    parsed = _fixture_parsed()
+    expected0 = derive_addresses(parsed, 0, 0, 1)[0].address
+    expected1 = derive_addresses(parsed, 0, 1, 1)[0].address
+
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", VPUB],
+        monkeypatch,
+        handler,
+        ["give me a new address", "exit"],
+        store_path=store_path,
+    )
+    assert code == 0
+    assert f"Fresh receive address (index 0): {expected0}" in "\n".join(outputs)
+    assert recorded == []  # allocation is network-free
+
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", VPUB],
+        monkeypatch,
+        handler,
+        ["give me a new address", "exit"],
+        store_path=store_path,
+    )
+    assert code == 0
+    assert f"Fresh receive address (index 1): {expected1}" in "\n".join(outputs)
+
+    with Store(store_path) as store:
+        wallet = store.get_wallet_by_name("default")
+        assert wallet is not None
+        assert store.get_derivation(wallet.id, 0).next_index == 2
+        statuses = {r.index: r.status for r in store.get_addresses(wallet.id, 0)}
+        assert statuses == {0: "allocated", 1: "allocated"}
+
+
+def test_repl_history_narration_with_stub_phrase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """'show my recent transactions' through the stub model → get_history
+    (default limit 20) → one narration line per tx, address-free."""
+    store_path = _store_path(tmp_path)
+    wd = _preset_store(store_path)
+    with Store(store_path) as store:
+        wallet = store.get_wallet_by_name("default")
+        assert wallet is not None
+        _seed_txs(store, wallet.id)
+    recorded: list[httpx.Request] = []
+    handler = _scan_handler(recorded)
+
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", VPUB],
+        monkeypatch,
+        handler,
+        ["show my recent transactions", "exit"],
+        store_path=store_path,
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    tx_lines = [line for line in outputs if line.startswith("tx ")]
+    assert len(tx_lines) == 20  # default limit honored
+    # Unconfirmed first, then height DESC.
+    assert tx_lines[0] == f"tx {('ee' * 32)[:12]}… out unconfirmed"
+    assert tx_lines[1] == f"tx {(f'{24:02x}' * 32)[:12]}… in 800024"
+    for addr in derive_fixture_addresses(3):
+        assert addr not in joined
+    assert wd.descriptor not in joined
 
 
 def test_repl_refuses_mainnet_zpub_with_exit_code_2(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    store_path = _store_path(tmp_path)
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", MAINNET_ZPUB], monkeypatch, lambda _req: None, []
+        ["--stub-llm", "--zpub", MAINNET_ZPUB],
+        monkeypatch,
+        lambda _req: None,  # the client factory is never reached
+        [],
+        store_path=store_path,
     )
-    # The client factory is never reached (key parse fails first) — the
-    # dummy handler above would fail loudly if it were.
     assert code == 2
     joined = "\n".join(outputs)
-    assert "Phase 0 is testnet-only" in joined
+    assert "testnet-only" in joined
     assert MAINNET_ZPUB not in joined
+    # Fail-closed before any store side effects for the rejected key.
+    assert not store_path.exists()
 
 
 def test_repl_without_zpub_fails_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -686,7 +1466,7 @@ def test_repl_without_model_or_stub_flag_fails_cleanly(
 ) -> None:
     monkeypatch.delenv("LOCALWALLET_MODEL_PATH", raising=False)
     recorded: list[httpx.Request] = []
-    handler = _utxo_handler({}, recorded)
+    handler = _scan_handler(recorded)
     monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
 
     outputs: list[str] = []
@@ -697,6 +1477,58 @@ def test_repl_without_model_or_stub_flag_fails_cleanly(
     assert "No model configured" in joined
     assert "LOCALWALLET_MODEL_PATH" in joined
     assert "--stub-llm" in joined
+    assert recorded == []  # no chain I/O on the config-error path
+
+
+def test_store_path_into_a_file_fails_cleanly_exit_2(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """OSError on store open (mkdir fails because a path component is a
+    file) is a clean exit-2 config failure with the store-failure message,
+    not a traceback."""
+    blocker = tmp_path / "f"
+    blocker.write_text("not a directory")
+    store_path = blocker / "db.sqlite"
+
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", VPUB],
+        monkeypatch,
+        lambda _req: None,
+        [],
+        store_path=store_path,
+    )
+    assert code == 2
+    joined = "\n".join(outputs)
+    assert "Could not open the wallet store" in joined
+    assert "Traceback" not in joined
+
+
+def test_startup_chain_down_repl_still_starts_and_balance_degrades(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fresh store + unreachable chain: the startup scan warns (scrubbed)
+    and the REPL still starts; the balance handler's lazy scan fails and
+    surfaces the graceful chain_unavailable error path."""
+    store_path = _store_path(tmp_path)
+    handler = _scan_handler([], utxo_status=503)
+
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", VPUB],
+        monkeypatch,
+        handler,
+        ["What's my balance?", "exit"],
+        store_path=store_path,
+        auto_scan=True,
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    assert "warning: startup scan failed" in joined
+    assert "chain unavailable" in joined
+    assert "Balance (testnet):" not in joined
+    # The wallet row was still created; the store simply stays empty.
+    with Store(store_path) as store:
+        assert len(store.list_wallets()) == 1
 
 
 # ------------------------------------------------- live-network integration
@@ -708,27 +1540,46 @@ def test_repl_without_model_or_stub_flag_fails_cleanly(
     reason="live-network test: set LOCALWALLET_E2E_LIVE=1 to include",
 )
 def test_live_testnet4_balance_via_mempool_space() -> None:
-    """Real-network integration: runs the full loop against
-    mempool.space testnet4 with a vpub from LOCALWALLET_E2E_VPUB."""
+    """Real-network integration: the Phase 1 path against mempool.space
+    testnet4 — lazy scan populates the store, balance reads it, and a
+    new_address allocation derives a valid tb1 address at index 0."""
     vpub = os.environ.get("LOCALWALLET_E2E_VPUB", "").strip()
     if not vpub:
         pytest.skip("LOCALWALLET_E2E_VPUB not set")
-    addresses = derive_receive_addresses(parse_watch_key(vpub), DEFAULT_SCAN_COUNT)
+    parsed = parse_wallet_key(vpub)
+    descriptor = WalletDescriptor.from_key(vpub)
     client = EsploraClient()  # defaults: https://mempool.space/testnet4/api
     try:
-        table = build_dispatch_table(client, addresses, client.get_tip_height)
-        loop = AgentLoop(stub_generate, table)
-        turn = loop.run("What's my balance?", {})
+        with Store.memory() as store:
+            wallet = store.create_wallet("default", descriptor.descriptor)
+            store.set_active_wallet(wallet.id)
+            store.set_setting(GAP_LIMIT_SETTING, "3")  # keep the live scan light
+            table = build_dispatch_table(
+                store,
+                wallet,
+                parsed,
+                client,
+                lambda: scan_wallet(store, client, wallet),
+            )
+            loop = AgentLoop(stub_generate, table)
+            balance_turn = loop.run("What's my balance?", {})
+            address_turn = loop.run("give me a new address", {})
     finally:
         client.close()
 
-    assert turn.status is AgentTurnStatus.OK
-    assert turn.result is not None
-    result = turn.result
+    assert balance_turn.status is AgentTurnStatus.OK
+    assert balance_turn.result is not None
+    result = balance_turn.result
     if result.get("error") == "chain_unavailable":
         pytest.fail(f"live chain query failed: {result.get('detail')}")
     assert isinstance(result["confirmed_sats"], int) and result["confirmed_sats"] >= 0
     assert isinstance(result["unconfirmed_sats"], int) and result["unconfirmed_sats"] >= 0
     assert result["total_sats"] == result["confirmed_sats"] + result["unconfirmed_sats"]
-    assert result["addresses_scanned"] == DEFAULT_SCAN_COUNT
+    assert isinstance(result["addresses_scanned"], int) and result["addresses_scanned"] >= 0
     assert isinstance(result["tip_height"], int) and result["tip_height"] > 0
+
+    assert address_turn.status is AgentTurnStatus.OK
+    assert address_turn.result is not None
+    assert address_turn.result["index"] == 0
+    address = address_turn.result["address"]
+    assert isinstance(address, str) and address.startswith("tb1")

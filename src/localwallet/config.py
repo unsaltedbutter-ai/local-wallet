@@ -18,6 +18,7 @@ class Settings:
     request_timeout_s: float = 10.0
     max_retries: int = 3
     network: str = "testnet"
+    store_path: str = "localwallet.db"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -25,7 +26,8 @@ class Settings:
 
         Recognized variables: ``LOCALWALLET_ESPLORA_BASE_URL``,
         ``LOCALWALLET_REQUEST_TIMEOUT_S``, ``LOCALWALLET_MAX_RETRIES``,
-        ``LOCALWALLET_NETWORK``. Unknown variables are ignored.
+        ``LOCALWALLET_NETWORK``, ``LOCALWALLET_STORE_PATH``. Unknown
+        variables are ignored.
         """
         def _coerce(name: str, value: str):
             field = next(f for f in fields(cls) if f.name == name)

@@ -9,10 +9,11 @@ for what the model can do and to probe intents that don't exist yet
 Design constraints (all non-negotiable):
 
 - **Display-only.** One statement → ONE generation → ``handle_raw`` against
-  a pure *stub* dispatch table (``respond``/``clarify``/``get_balance``
-  handlers that just echo ``{"echo": True}``). There is NO real dispatch,
-  NO chain import, and NO persistence anywhere in this file. It probes what
-  the model emits; it never executes anything.
+  a pure *stub* dispatch table — ``respond``/``clarify`` passthrough plus
+  ``get_balance``/``get_history``/``get_utxos``/``new_address`` echo
+  handlers that return ``{"echo": True}`` canned results. There is NO real
+  dispatch, NO chain import, and NO persistence anywhere in this file. It
+  probes what the model emits; it never executes anything.
 - **Local only.** The server binds ``127.0.0.1`` (hardcoded + asserted);
   default port 8086, overridable via ``--port`` and
   ``LOCALWALLET_PLAYGROUND_PORT``.
@@ -95,6 +96,9 @@ STUB_TABLE: Final[dict[IntentName, object]] = {
     IntentName.RESPOND: _stub_handler,
     IntentName.CLARIFY: _stub_handler,
     IntentName.GET_BALANCE: _stub_handler,
+    IntentName.GET_HISTORY: _stub_handler,
+    IntentName.GET_UTXOS: _stub_handler,
+    IntentName.NEW_ADDRESS: _stub_handler,
 }
 
 

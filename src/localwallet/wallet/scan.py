@@ -300,7 +300,7 @@ def _run_scan(
         )
 
         next_index = (
-            max_used_index + 1
+            max(_max_allocated_index(existing) + 1, max_used_index + 1)
             if rebuild
             else max(
                 store.get_derivation(wallet_id, branch).next_index,
@@ -475,6 +475,23 @@ def _summarize_walk(
     used_indices = [i for i in sorted(final_map) if final_map[i] in touched]
     max_used_index = used_indices[-1] if used_indices else -1
     return used_indices, max_used_index, max(final_map)
+
+
+def _max_allocated_index(existing: dict[int, AddressRecord]) -> int:
+    """Highest index already handed out (``allocated``/``used``) for a branch.
+
+    ``existing`` maps index → :class:`~localwallet.store.AddressRecord` for
+    the branch. Only ``allocated``/``used`` rows count: an address allocated
+    at an index above a rescanned window must not be re-issued later, so a
+    rebuild floors the derivation cursor at ``max_allocated_index + 1``.
+    ``unused`` rows (mere window prefetch) are not allocations and do not
+    pin the cursor. Returns ``-1`` when nothing has been handed out.
+    """
+    return max(
+        (index for index, record in existing.items()
+         if record.status in (ADDRESS_ALLOCATED, ADDRESS_USED)),
+        default=-1,
+    )
 
 
 def _scan_utxos(

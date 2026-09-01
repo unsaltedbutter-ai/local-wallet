@@ -126,6 +126,27 @@ def test_api_garbage_raw_verbatim_and_failures(clean_env) -> None:
         stopper.close()
 
 
+def test_api_new_intent_get_history_returns_stub_result(clean_env) -> None:
+    """An intent beyond the original 3-handler stub (get_history) now has a
+    stub echo handler, so the probe reports ``ok`` instead of a reject."""
+    get_history = '{"v": 0, "intent": "get_history", "params": {}}'
+    state = PG.PlaygroundState(generate_fn=lambda p, g: get_history)
+    server, thread, port = _serve(state)
+    stopper = _Stopper(server, thread)
+    try:
+        resp = httpx.post(
+            f"http://127.0.0.1:{port}/api/envelope", json={"text": "my history"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["outcome"]["status"] == "ok"
+        assert body["outcome"]["intent"] == "get_history"
+        assert body["outcome"]["params"] == {}
+        assert body["outcome"]["failures"] == []
+    finally:
+        stopper.close()
+
+
 def test_api_preserves_raw_html_control_chars(clean_env) -> None:
     raw = '{"v": 0, "intent": "respond", "params": {"text": "<b>& \\"quotes\\"\\nESC"}}'
     fake = lambda prompt, grammar: raw
@@ -236,6 +257,18 @@ def test_server_binds_loopback_only(clean_env) -> None:
         stopper.close()
 
 
+def test_stub_table_covers_all_six_intents() -> None:
+    """Every closed-protocol intent maps to a stub echo handler."""
+    assert set(PG.STUB_TABLE) == {
+        PG.IntentName.RESPOND,
+        PG.IntentName.CLARIFY,
+        PG.IntentName.GET_BALANCE,
+        PG.IntentName.GET_HISTORY,
+        PG.IntentName.GET_UTXOS,
+        PG.IntentName.NEW_ADDRESS,
+    }
+
+
 def test_no_chain_import_in_playground_source() -> None:
     """The stub table and file never import the chain module / EsploraClient."""
     import ast
@@ -261,10 +294,32 @@ def test_no_chain_import_in_playground_source() -> None:
 # ------------------------------------------------------------------ golden
 
 
-def test_golden_report_with_fake_runtime(clean_env, capsys: pytest.CaptureFixture[str]) -> None:
-    """Always-get_balance fake: PASS the get_balance fixtures, FAIL the rest."""
+def test_golden_report_with_fake_runtime(
+    clean_env, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Always-get_balance fake: PASS the get_balance fixtures, FAIL the rest.
+
+    Runs against a controlled golden set (the single-intent fixtures
+    ``golden-001..011``) rather than the full suite: the playground's matcher
+    (``tools/envelope_playground.py``) understands only single-intent
+    expectations, while the Phase 1 suite gained ``intent_in`` fixtures
+    (golden-014, golden-019) that belong to ``evals/run_evals.py``'s extended
+    matcher. Restricting to the single-intent set keeps this test faithful
+    and ``tools/`` untouched.
+    """
+    import json as _json
+
+    golden_dir = tmp_path / "golden"
+    golden_dir.mkdir()
+    src_dir = REPO_ROOT / "evals" / "golden"
+    for name in [f"golden-{i:03d}.json" for i in range(1, 12)]:
+        (golden_dir / name).write_text(
+            _json.dumps(_json.loads((src_dir / name).read_text(encoding="utf-8"))),
+            encoding="utf-8",
+        )
+
     fake = lambda prompt, grammar: _GET_BALANCE
-    state = PG.PlaygroundState(generate_fn=fake)
+    state = PG.PlaygroundState(generate_fn=fake, golden_dir=golden_dir)
     score = state.run_golden_report()
     out = capsys.readouterr().out
     lines = [ln for ln in out.splitlines() if ln.strip().startswith("golden-")]

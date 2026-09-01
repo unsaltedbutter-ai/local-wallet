@@ -33,7 +33,13 @@ from embit.bip32 import NETWORKS, HDKey
 from embit.descriptor.checksum import add_checksum
 
 from localwallet.chain import ChainError, EsploraClient
-from localwallet.store import AddressRecord, Store, StoreError, UtxoRecord
+from localwallet.store import (
+    ADDRESS_ALLOCATED,
+    AddressRecord,
+    Store,
+    StoreError,
+    UtxoRecord,
+)
 from localwallet.wallet import (
     DEFAULT_GAP_LIMIT,
     WalletDescriptor,
@@ -398,7 +404,11 @@ def test_rescan_fixes_simulated_stale_cache(store: Store) -> None:
     )
 
     derivation = store.get_derivation(wid, 0)
-    assert (derivation.max_used_index, derivation.next_index) == (3, 4)
+    # max_used_index is recomputed from chain truth (3); next_index is
+    # floored at the highest allocated/used row + 1 (the false 'used' at
+    # index 10 → 11) so a stale/allocated row above the used window is
+    # never re-issued (TCK-P1-004 SR flooring).
+    assert (derivation.max_used_index, derivation.next_index) == (3, 11)
     addresses = store.get_addresses(wid, 0)
     assert [a.address for a in addresses] == truth_addresses  # mapping restored
     statuses = {a.index: a.status for a in addresses}
@@ -411,6 +421,31 @@ def test_rescan_fixes_simulated_stale_cache(store: Store) -> None:
         ("aa" * 32, 50_000),
         ("dd" * 32, 4_000),
     ]
+
+
+def test_rescan_floors_next_index_at_allocated_above_window(store: Store) -> None:
+    """A rebuild must not re-issue addresses allocated beyond the rescanned
+    window (TCK-P1-004 SR): next_index floors at max allocated index + 1.
+
+    Usage at index 3 with the default gap 20 yields a window of [0..23],
+    so pre-allocated rows at 25/26 sit above it; flooring must give 27, not
+    the naive rebuild value of 4 (which could re-issue 25/26 later)."""
+    wid = _wallet_id(store)
+    row = store.get_wallet_by_name("main")
+    store.upsert_batch(
+        [
+            AddressRecord(wid, 0, 25, ADDRS[0][25], "p2wpkh", ADDRESS_ALLOCATED),
+            AddressRecord(wid, 0, 26, ADDRS[0][26], "p2wpkh", ADDRESS_ALLOCATED),
+        ]
+    )
+    truth_txs = _used_at({3: "dd" * 32}, 0)
+    rescan_wallet(
+        store,
+        FakeChain(txs=truth_txs, utxos={}).client(),
+        row,
+    )
+    derivation = store.get_derivation(wid, 0)
+    assert (derivation.max_used_index, derivation.next_index) == (3, 27)
 
 
 # ---------------------------------------------------- history direction + fees

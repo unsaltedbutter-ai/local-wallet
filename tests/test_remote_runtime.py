@@ -398,15 +398,26 @@ TESTNET_VPUB: Final[str] = (
 
 
 def _run_app(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> list[str]:
-    """Run app.run() to a clean 'exit' and return the captured output lines."""
+    """Run app.run() to a clean 'exit' and return the captured output lines.
+
+    Phase 1 app wiring: the app now opens a SQLite store and (by default)
+    scans at startup — point the store at a temp file and opt out of the
+    scan so these runtime-selection tests stay hermetic (no disk side
+    effects in the repo, no chain I/O). Assertions are unchanged.
+    """
+    import tempfile
+
     from localwallet import app
 
-    outputs: list[str] = []
-    code = app.run(
-        argv,
-        input_fn=lambda _prompt: "exit",
-        output_fn=outputs.append,
-    )
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(Path(tmp) / "store.db"))
+        monkeypatch.setenv("LOCALWALLET_AUTO_SCAN", "0")
+        outputs: list[str] = []
+        code = app.run(
+            argv,
+            input_fn=lambda _prompt: "exit",
+            output_fn=outputs.append,
+        )
     assert code == 0
     return outputs
 
