@@ -253,6 +253,18 @@ class TestSystemPrompt:
         prompt = build_system_prompt()
         assert 'envelope: {"v": 0, "intent": "new_address", "params": {}}' in prompt
 
+    def test_respond_few_shot_is_capability_true(self) -> None:
+        # SR finding neutralization (TCK-P1-005): the respond few-shot must
+        # not promise send capability that does not exist in Phase 1; it
+        # narrates only what the app can actually do.
+        prompt = build_system_prompt()
+        assert "show your receiving addresses and balances" in prompt
+        # grammar key order preserved inside the few-shot envelope
+        assert 'envelope: {"v": 0, "intent": "respond", "params": {"text": "I can check' in prompt
+        # no stale "sending funds once your hardware wallet is connected" claim
+        assert "sending funds once your hardware wallet is connected" not in prompt
+        assert "walk you through sending funds" not in prompt
+
     def test_prompt_is_compact_for_8k_context_budget(self) -> None:
         # ADR-0006: v0 context budget is 8K tokens; the static system prompt
         # must stay a small fraction of it (~2 chars/token -> well under 6K).

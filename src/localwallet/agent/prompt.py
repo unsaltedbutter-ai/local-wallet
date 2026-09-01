@@ -74,8 +74,7 @@ hardware wallet.
 EXAMPLES
 user: what can this app do?
 envelope: {"v": 0, "intent": "respond", "params": {"text": "I can check \
-your testnet balance, show receiving addresses, and walk you through \
-sending funds once your hardware wallet is connected."}}
+your testnet balance and show your receiving addresses and balances."}}
 
 user: send 20 to my brother
 envelope: {"v": 0, "intent": "clarify", "params": {"question": "20 what \

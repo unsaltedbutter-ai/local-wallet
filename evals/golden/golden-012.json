@@ -1,0 +1,5 @@
+{
+  "id": "golden-012",
+  "prompt": "show my recent transactions",
+  "expectation": {"intent": "get_history", "params": {}}
+}

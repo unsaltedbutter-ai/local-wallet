@@ -15,12 +15,14 @@ from pathlib import Path
 
 import pytest
 
+from localwallet.agent.loop import AgentTurnResult, AgentTurnStatus
 from localwallet.agent.remote_runtime import (
     LLM_BASE_URL_ENV_VAR,
     LLM_MODEL_ENV_VAR,
     RemoteOpenAIRuntime,
 )
 from localwallet.agent.runtime import MODEL_PATH_ENV_VAR, ModelRuntime
+from localwallet.protocol import validate_payload
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_EVALS_PATH = REPO_ROOT / "evals" / "run_evals.py"
@@ -146,3 +148,122 @@ def test_version_guard_rejects_old_python(
     assert "requires Python 3.12+" in err
     assert "3.11.0" in err
     assert "Hint: python3 -m venv .venv" in err
+
+
+# ------------------------------------------- matcher: intent_in + params_if_*
+
+
+def _result_for(envelope_json: str) -> AgentTurnResult:
+    """A dispatchable agent turn wrapping a validated envelope."""
+    env = validate_payload(envelope_json)
+    return AgentTurnResult(
+        status=AgentTurnStatus.OK,
+        envelope=env,
+        result={"ok": True},
+        user_message=None,
+        turns_used=1,
+    )
+
+
+class TestIntentInMatcher:
+    """Pins the extended matcher: ``intent_in`` sets + ``params_if_<intent>``.
+
+    These drive the golden-014 (out-of-range limit) and golden-019
+    (parallel-intent boundary) fixtures. A matched intent passes when its
+    ``params_if_<intent>`` object (if any) equals the emitted params exactly;
+    an intent listed with no ``params_if_`` is free on params.
+    """
+
+    def test_exact_intent_still_matches(self) -> None:
+        res = _result_for('{"v":0,"intent":"get_history","params":{}}')
+        assert RUN_EVALS._matches_expectation(
+            res, {"intent": "get_history", "params": {}}
+        )
+        assert not RUN_EVALS._matches_expectation(
+            res, {"intent": "get_utxos", "params": {}}
+        )
+
+    def test_intent_in_get_history_hit(self) -> None:
+        res = _result_for('{"v":0,"intent":"get_history","params":{}}')
+        expectation = {"intent_in": ["clarify", "get_history"], "params_if_get_history": {}}
+        assert RUN_EVALS._matches_expectation(res, expectation)
+
+    def test_intent_in_clarify_hit_without_params_if(self) -> None:
+        res = _result_for('{"v":0,"intent":"clarify","params":{"question":"how many?"}}')
+        expectation = {"intent_in": ["clarify", "get_history"], "params_if_get_history": {}}
+        assert RUN_EVALS._matches_expectation(res, expectation)
+
+    def test_intent_in_params_if_exact_hit(self) -> None:
+        res = _result_for('{"v":0,"intent":"get_history","params":{"limit":5}}')
+        expectation = {
+            "intent_in": ["clarify", "get_history"],
+            "params_if_get_history": {"limit": 5},
+        }
+        assert RUN_EVALS._matches_expectation(res, expectation)
+
+    def test_intent_in_params_if_mismatch_is_miss(self) -> None:
+        # Emitting limit=5 violates the params_if_get_history={} expectation:
+        # the contract allows only {} for get_history here (default 20) or a
+        # clarify, not a non-default limit.
+        res = _result_for('{"v":0,"intent":"get_history","params":{"limit":5}}')
+        expectation = {"intent_in": ["clarify", "get_history"], "params_if_get_history": {}}
+        assert not RUN_EVALS._matches_expectation(res, expectation)
+
+    def test_intent_in_miss_when_intent_not_listed(self) -> None:
+        res = _result_for('{"v":0,"intent":"get_balance","params":{}}')
+        expectation = {"intent_in": ["new_address", "clarify"]}
+        assert not RUN_EVALS._matches_expectation(res, expectation)
+
+    def test_intent_in_matches_any_listed_intent(self) -> None:
+        expectation = {"intent_in": ["new_address", "clarify"]}
+        new = _result_for('{"v":0,"intent":"new_address","params":{}}')
+        clarify = _result_for('{"v":0,"intent":"clarify","params":{"question":"which?"}}')
+        assert RUN_EVALS._matches_expectation(new, expectation)
+        assert RUN_EVALS._matches_expectation(clarify, expectation)
+
+    def test_escalated_turn_is_never_a_match(self) -> None:
+        # A clarified/escalated turn has no envelope: it cannot satisfy an
+        # intent_in expectation even when the intent name is in the list.
+        expectation = {"intent_in": ["clarify", "get_history"]}
+        result = AgentTurnResult(
+            status=AgentTurnStatus.CLARIFIED,
+            envelope=None,
+            result=None,
+            user_message="rephrase",
+            turns_used=2,
+        )
+        assert not RUN_EVALS._matches_expectation(result, expectation)
+
+
+class TestParamsIfSchema:
+    """Fixture-mode schema validation of ``intent_in`` + ``params_if_*``."""
+
+    def test_expectation_variants_yield_valid_envelopes(self) -> None:
+        expectation = {"intent_in": ["clarify", "get_history"], "params_if_get_history": {}}
+        variants = list(RUN_EVALS._expectation_variants(expectation))
+        assert [intent for intent, _ in variants] == ["clarify", "get_history"]
+        # Each variant builds a schema-valid envelope (clarify needs a
+        # question; get_history takes the params_if {} object).
+        for intent, params in variants:
+            env = validate_payload({"v": 0, "intent": intent, "params": params})
+            assert env.intent.value == intent
+
+    def test_intent_in_without_params_if_uses_representative_params(self) -> None:
+        expectation = {"intent_in": ["new_address", "clarify"]}
+        variants = dict(RUN_EVALS._expectation_variants(expectation))
+        assert variants["new_address"] == {}
+        assert "question" in variants["clarify"]
+        for intent, params in variants.items():
+            validate_payload({"v": 0, "intent": intent, "params": params})
+
+    def test_malformed_intent_in_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            list(RUN_EVALS._expectation_variants({"intent_in": []}))
+        with pytest.raises(ValueError):
+            list(RUN_EVALS._expectation_variants({"intent_in": ["not_an_intent"]}))
+        with pytest.raises(ValueError):
+            list(
+                RUN_EVALS._expectation_variants(
+                    {"intent_in": ["get_history"], "params_if_get_history": [1]}
+                )
+            )

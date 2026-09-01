@@ -1,0 +1,5 @@
+{
+  "id": "golden-019",
+  "prompt": "new address and also what's my balance?",
+  "expectation": {"intent_in": ["new_address", "clarify"]}
+}

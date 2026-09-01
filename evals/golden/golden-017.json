@@ -1,0 +1,5 @@
+{
+  "id": "golden-017",
+  "prompt": "make me a new change address",
+  "expectation": {"intent": "new_address", "params": {"branch": 1}}
+}

@@ -203,6 +203,47 @@ def _fuzz_hostile_extra(rng: random.Random) -> object:
     return base
 
 
+# --------------------------------------------------- new-intent near-misses
+# Phase 1 (TCK-P1-005): close the schema for the new-intent params — wrong
+# keys on the wrong intent, hostile value types, and out-of-range values must
+# all be cleanly rejected (closed world: extra="forbid", true-int + range
+# constraints in envelope.py).
+
+def _fuzz_get_history_with_branch(rng: random.Random) -> object:
+    # ``branch`` belongs to new_address, not get_history (extra key -> forbid).
+    return {"v": 0, "intent": "get_history", "params": {"branch": 1}}
+
+
+def _fuzz_get_utxos_with_limit(rng: random.Random) -> object:
+    # ``limit`` belongs to get_history; get_utxos accepts only {} (forbid).
+    return {"v": 0, "intent": "get_utxos", "params": {"limit": 5}}
+
+
+def _fuzz_new_address_with_limit(rng: random.Random) -> object:
+    # ``limit`` belongs to get_history; new_address accepts only branch (forbid).
+    return {"v": 0, "intent": "new_address", "params": {"limit": 5}}
+
+
+def _fuzz_limit_nested_object(rng: random.Random) -> object:
+    # ``limit`` must be an integer, not an object.
+    return {"v": 0, "intent": "get_history", "params": {"limit": {"x": 1}}}
+
+
+def _fuzz_branch_array(rng: random.Random) -> object:
+    # ``branch`` must be the integer 0 or 1, not an array.
+    return {"v": 0, "intent": "new_address", "params": {"branch": [0]}}
+
+
+def _fuzz_limit_out_of_range(rng: random.Random) -> object:
+    # Schema-reject range: business range is 1..100 (grammar bound is 999).
+    return {"v": 0, "intent": "get_history", "params": {"limit": 101}}
+
+
+def _fuzz_limit_bool(rng: random.Random) -> object:
+    # ``True`` is not a JSON integer (closed coercion: bool != int).
+    return {"v": 0, "intent": "get_history", "params": {"limit": True}}
+
+
 _CATEGORIES = [
     _fuzz_truncated,
     _fuzz_bytes,
@@ -216,6 +257,13 @@ _CATEGORIES = [
     _fuzz_dup_keys,
     _fuzz_bare_utterance,
     _fuzz_hostile_extra,
+    _fuzz_get_history_with_branch,
+    _fuzz_get_utxos_with_limit,
+    _fuzz_new_address_with_limit,
+    _fuzz_limit_nested_object,
+    _fuzz_branch_array,
+    _fuzz_limit_out_of_range,
+    _fuzz_limit_bool,
 ]
 
 
@@ -262,6 +310,43 @@ def test_fuzz_covers_malformed_categories():
     assert len(_fuzz_huge_string(rng)) > 1_000_000
     assert len(_fuzz_deep_nesting(rng)) >= 500
     _ = seen_kinds  # keep future maintainers aware of the coverage mix
+
+
+def test_new_intent_near_misses_are_cleanly_rejected():
+    """Pin the Phase 1 closed world: every new-intent near-miss must be
+    rejected, never dispatch.
+
+    Each case builds a get_history / get_utxos / new_address envelope with a
+    key or value the schema forbids (extra key on the wrong intent, an
+    object/array/bool where an integer is required, or an out-of-range
+    integer). With retry budget remaining they surface as needs_retry; either
+    way no intent is ever dispatched.
+    """
+    rng = random.Random(42)
+    near_misses = [
+        _fuzz_get_history_with_branch,
+        _fuzz_get_utxos_with_limit,
+        _fuzz_new_address_with_limit,
+        _fuzz_limit_nested_object,
+        _fuzz_branch_array,
+        _fuzz_limit_out_of_range,
+        _fuzz_limit_bool,
+    ]
+    for fn in near_misses:
+        table = CountingTable()
+        outcome = handle_raw(fn(rng), table.table())
+        assert outcome.status in (
+            OutcomeStatus.NEEDS_RETRY,
+            OutcomeStatus.REJECTED,
+        ), f"{fn.__name__} must not dispatch"
+        assert outcome.envelope is None or outcome.status is not OutcomeStatus.OK
+        for intent in IntentName:
+            assert table.counts[intent] == 0, f"{fn.__name__} illegally dispatched {intent}"
+        assert table.envelopes == []
+    # Boundary sanity: 100 is schema-valid (see VALID_JSON) while 101 above
+    # is rejected — the 1..100 business range is a genuine schema constraint.
+    env = validate_payload({"v": 0, "intent": "get_history", "params": {"limit": 100}})
+    assert env.params.limit == 100
 
 
 # ------------------------------------------------- test 2: grammar/schema conformance

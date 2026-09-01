@@ -1,0 +1,5 @@
+{
+  "id": "golden-016",
+  "prompt": "give me a fresh address to receive sats",
+  "expectation": {"intent": "new_address", "params": {}}
+}

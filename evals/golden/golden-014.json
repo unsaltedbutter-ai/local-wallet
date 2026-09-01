@@ -1,0 +1,8 @@
+{
+  "id": "golden-014",
+  "prompt": "show me the last 200 transactions",
+  "expectation": {
+    "intent_in": ["clarify", "get_history"],
+    "params_if_get_history": {}
+  }
+}

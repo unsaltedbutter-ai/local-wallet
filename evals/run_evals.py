@@ -100,6 +100,10 @@ _ENFORCE_PHASE6_GATE = False
 #: Placeholder used only to schema-validate predicate expectations.
 _PLACEHOLDER_TEXT = "fixture-validated placeholder"
 
+#: Sentinel meaning "free text must be non-empty" for a params expectation
+#: (backed by the ``text_nonempty`` / ``question_nonempty`` predicates).
+_PARAMS_NONEMPTY = object()
+
 
 class _StubTable:
     """Dispatch table that records dispatches and returns a fixed result.
@@ -131,15 +135,53 @@ def _load_cases(directory: Path) -> list[dict[str, object]]:
     return cases
 
 
-def _expectation_envelope(expectation: object) -> dict[str, object]:
-    """Build a concrete envelope dict from an exact or predicate expectation.
+def _representative_params(intent: str) -> dict[str, object]:
+    """Concrete, schema-valid params for an intent with no params expectation.
+
+    Used to schema-validate every intent listed by an ``intent_in``
+    expectation (each must be expressible as a valid envelope, not just a
+    known name). Content-bearing intents get a placeholder value; the
+    wallet-read intents accept the empty object.
+    """
+    if intent == "respond":
+        return {"text": _PLACEHOLDER_TEXT}
+    if intent == "clarify":
+        return {"question": _PLACEHOLDER_TEXT}
+    return {}
+
+
+def _expectation_variants(expectation: object):
+    """Yield ``(intent, validate_params)`` for each intent variant a
+    golden expectation permits, in declaration order.
+
+    ``validate_params`` is a concrete, schema-valid params dict used to
+    build the envelope validated in fixture mode. For an exact expectation
+    it is the ``params`` object or a predicate placeholder; for an
+    ``intent_in`` expectation it is the matching ``params_if_<intent>``
+    object when present, else :func:`_representative_params`.
 
     Raises:
         ValueError: the expectation is malformed (unknown intent, missing
-            params/predicate, or a predicate on the wrong intent).
+            params/predicate, non-empty ``intent_in`` of unknown intents,
+            or a non-object ``params_if_*``).
+        TypeError: the expectation is not an object.
     """
     if not isinstance(expectation, dict):
         raise TypeError(f"expectation must be an object, got {type(expectation).__name__}")
+
+    intents = expectation.get("intent_in")
+    if intents is not None:
+        if not isinstance(intents, list) or not intents:
+            raise ValueError("expectation 'intent_in' must be a non-empty list of intents")
+        for intent in intents:
+            if not isinstance(intent, str) or intent not in {m.value for m in IntentName}:
+                raise ValueError(f"expectation intent {intent!r} is not in the closed intent set")
+            params_if = expectation.get(f"params_if_{intent}")
+            if params_if is not None and not isinstance(params_if, dict):
+                raise ValueError(f"params_if_{intent} must be an object")
+            yield intent, (params_if if params_if is not None else _representative_params(intent))
+        return
+
     intent = expectation.get("intent")
     if not isinstance(intent, str) or intent not in {m.value for m in IntentName}:
         raise ValueError(f"expectation intent {intent!r} is not in the closed intent set")
@@ -148,30 +190,65 @@ def _expectation_envelope(expectation: object) -> dict[str, object]:
     if params is not None:
         if not isinstance(params, dict):
             raise ValueError(f"expectation params must be an object, got {type(params).__name__}")
-        return {"v": 0, "intent": intent, "params": params}
-
+        yield intent, params
+        return
     if expectation.get("text_nonempty") is True:
         if intent != "respond":
             raise ValueError("text_nonempty predicate is only valid for intent 'respond'")
-        return {"v": 0, "intent": intent, "params": {"text": _PLACEHOLDER_TEXT}}
+        yield intent, {"text": _PLACEHOLDER_TEXT}
+        return
     if expectation.get("question_nonempty") is True:
         if intent != "clarify":
             raise ValueError("question_nonempty predicate is only valid for intent 'clarify'")
-        return {"v": 0, "intent": intent, "params": {"question": _PLACEHOLDER_TEXT}}
+        yield intent, {"question": _PLACEHOLDER_TEXT}
+        return
 
-    raise ValueError("expectation must carry 'params' or a recognized predicate")
+    raise ValueError(
+        "expectation must carry 'params', a recognized predicate, or an 'intent_in' list"
+    )
 
 
-def _params_ok(expectation: dict[str, object], params: dict[str, object]) -> bool:
-    """Structural check of a validated envelope's params vs the expectation."""
-    exact = expectation.get("params")
-    if exact is not None:
-        return params == exact
-    if expectation.get("text_nonempty") is True:
-        return bool(str(params.get("text", "")).strip())
-    if expectation.get("question_nonempty") is True:
-        return bool(str(params.get("question", "")).strip())
-    return False
+def _allowed_intents(expectation: dict[str, object]) -> list[str]:
+    """The intents a golden expectation permits, in declaration order."""
+    intents = expectation.get("intent_in")
+    if isinstance(intents, list):
+        return [i for i in intents if isinstance(i, str)]
+    intent = expectation.get("intent")
+    return [intent] if isinstance(intent, str) else []
+
+
+def _params_expectation(expectation: dict[str, object], intent: str) -> object:
+    """The params expectation for a *matched* intent, or ``None`` if free.
+
+    Returns an exact params dict (from ``params`` / ``params_if_<intent>``)
+    or the :data:`_PARAMS_NONEMPTY` sentinel for a nonempty text/question
+    predicate. ``None`` means the matched intent carries no params
+    constraint.
+    """
+    if "intent_in" in expectation:
+        return expectation.get(f"params_if_{intent}")
+    if "params" in expectation:
+        return expectation["params"]
+    if expectation.get("text_nonempty") is True or expectation.get("question_nonempty") is True:
+        return _PARAMS_NONEMPTY
+    return None
+
+
+def _params_ok(spec: object, intent: str, params: dict[str, object]) -> bool:
+    """Whether validated params satisfy a matched intent's params expectation.
+
+    ``spec`` comes from :func:`_params_expectation`: ``None`` (free), an
+    exact params dict, or the :data:`_PARAMS_NONEMPTY` sentinel.
+    """
+    if spec is None:
+        return True
+    if spec is _PARAMS_NONEMPTY:
+        if intent == "respond":
+            return bool(str(params.get("text", "")).strip())
+        if intent == "clarify":
+            return bool(str(params.get("question", "")).strip())
+        return False
+    return params == spec
 
 
 # ------------------------------------------------------------- fixture mode
@@ -187,20 +264,24 @@ def _run_fixture_mode(cases: list[dict[str, object]]) -> int:
         case_id = case.get("id", "<no-id>")
         expectation = case.get("expectation")
         try:
-            envelope_dict = _expectation_envelope(expectation)
+            variants = list(_expectation_variants(expectation))
         except (ValueError, TypeError) as exc:
             failures.append(f"{case_id}: malformed expectation: {exc}")
             continue
-        outcome = handle_raw(envelope_dict, table.table())
-        if outcome.status is not OutcomeStatus.OK:
-            failures.append(
-                f"{case_id}: expectation envelope did not validate "
-                f"(status={outcome.status.value})"
-            )
-            continue
-        env = outcome.envelope
-        if not _params_ok(expectation, env.params.model_dump()):
-            failures.append(f"{case_id}: params did not match expectation")
+        for intent, validate_params in variants:
+            envelope_dict = {"v": 0, "intent": intent, "params": validate_params}
+            outcome = handle_raw(envelope_dict, table.table())
+            if outcome.status is not OutcomeStatus.OK:
+                failures.append(
+                    f"{case_id}: expectation envelope for intent {intent!r} did not "
+                    f"validate (status={outcome.status.value})"
+                )
+                continue
+            env = outcome.envelope
+            if not _params_ok(validate_params, intent, env.params.model_dump()):
+                failures.append(
+                    f"{case_id}: params for intent {intent!r} did not match expectation"
+                )
 
     for line in failures:
         print(f"  FAIL  {line}")
@@ -223,14 +304,21 @@ def _matches_expectation(result, expectation: dict[str, object]) -> bool:
     Only a model-emitted envelope (a dispatchable outcome) can satisfy an
     intent expectation; an escalated ``clarified`` or infrastructure
     ``failed`` turn yields no envelope and is a miss.
+
+    Supports exact ``intent`` expectations and ``intent_in`` lists; when a
+    matched intent carries a params expectation (``params`` or
+    ``params_if_<intent>``), the emitted params must match it exactly (or
+    the free text must be non-empty for the nonempty predicates).
     """
     from localwallet.agent.loop import AgentTurnStatus
 
     if result.status is not AgentTurnStatus.OK or result.envelope is None:
         return False
-    if result.envelope.intent.value != expectation["intent"]:
+    intent = result.envelope.intent.value
+    if intent not in _allowed_intents(expectation):
         return False
-    return _params_ok(expectation, result.envelope.params.model_dump())
+    spec = _params_expectation(expectation, intent)
+    return _params_ok(spec, intent, result.envelope.params.model_dump())
 
 
 def select_runtime(

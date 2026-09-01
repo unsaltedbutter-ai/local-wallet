@@ -1,0 +1,5 @@
+{
+  "id": "golden-018",
+  "prompt": "send 100 sats to tb1q3f0w5yzgvcpp9akt4sfad764dvthz6qzv0xlfh",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}
