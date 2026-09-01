@@ -298,6 +298,27 @@ class EsploraClient:
             raise ChainError(f"{_KIND_TIP_HEIGHT} response was a negative integer")
         return parsed
 
+    def get_json(self, path: str, kind: str) -> Any:
+        """Public GET + retry + parse for any path on this client.
+
+        Generalized entry point so sibling adapters (fees, price) reuse the
+        same transport, retry policy, and fail-closed parse without creating
+        a second ``httpx.Client``. ``path`` must be a ``/``-rooted URL path
+        (e.g. ``"/v1/fees/recommended"``); ``kind`` is the log-scrubbed
+        endpoint name used in error messages instead of the URL.
+
+        Retry/error behaviour matches :meth:`_request_json`: connection
+        errors, timeouts, 429 and 5xx are retried with bounded backoff; all
+        other non-2xx statuses, retry exhaustion, and malformed JSON raise
+        :class:`ChainError` carrying only the kind/status (no URLs).
+
+        Raises:
+            ChainError: If ``path`` is malformed or the request/parse fails.
+        """
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ChainError("invalid request path")
+        return self._request_json(kind, path)
+
     def _request_json(self, kind: str, path: str) -> Any:
         """GET ``{base}{path}`` under the retry policy; return parsed JSON.
 

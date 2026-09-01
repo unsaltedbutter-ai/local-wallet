@@ -12,11 +12,25 @@ from localwallet.chain.esplora import (
     EsploraClient,
     balance_from_utxos,
 )
+from localwallet.chain.fees import FeeEstimate, FeeEstimator, FeeTarget
+from localwallet.chain.price import (
+    ConfigDisabled,
+    PriceOracle,
+    PriceUnavailableError,
+    Rate,
+)
 
 __all__ = [
     "Balance",
     "ChainConfig",
     "ChainError",
+    "ConfigDisabled",
     "EsploraClient",
+    "FeeEstimate",
+    "FeeEstimator",
+    "FeeTarget",
+    "PriceOracle",
+    "PriceUnavailableError",
+    "Rate",
     "balance_from_utxos",
 ]
