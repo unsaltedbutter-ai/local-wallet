@@ -28,8 +28,8 @@ the caller to handle, with scrubbed messages.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -88,6 +88,53 @@ def _wrap_integrity(exc: sqlite3.IntegrityError) -> StoreIntegrityError:
 def _wrap(exc: sqlite3.Error) -> StoreError:
     """Convert any other sqlite error into a value-free StoreError."""
     return StoreError("store operation failed")
+
+
+# ----------------------------------------------------------------- shared SQL
+#
+# Single source of truth for the write paths shared by the public accessors
+# and :meth:`Store.persist_scan_result` (the composite atomic scan persist).
+# Statements never embed values in their text — all values are bound params.
+
+_ADDRESS_UPSERT_SQL = (
+    "INSERT INTO addresses (wallet_id, branch, `index`, address, script_type, status) "
+    "VALUES (?, ?, ?, ?, ?, ?) "
+    "ON CONFLICT(wallet_id, branch, `index`) DO UPDATE SET "
+    "address = excluded.address, "
+    "script_type = excluded.script_type, "
+    "status = excluded.status"
+)
+
+_DERIVATION_UPSERT_SQL = (
+    "INSERT INTO derivation (wallet_id, branch, max_used_index, next_index) "
+    "VALUES (?, ?, ?, ?) "
+    "ON CONFLICT(wallet_id, branch) DO UPDATE SET "
+    "max_used_index = excluded.max_used_index, "
+    "next_index = excluded.next_index"
+)
+
+_UTXO_INSERT_SQL = (
+    "INSERT INTO utxos "
+    "(wallet_id, txid, vout, address, value_sats, confirmed, height) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?)"
+)
+
+_TX_UPSERT_SQL = (
+    "INSERT INTO transactions "
+    "(wallet_id, txid, height, block_time, fee_sats, direction, raw_summary) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+    "ON CONFLICT(wallet_id, txid) DO UPDATE SET "
+    "height = excluded.height, "
+    "block_time = excluded.block_time, "
+    "fee_sats = excluded.fee_sats, "
+    "direction = excluded.direction, "
+    "raw_summary = excluded.raw_summary"
+)
+
+_SYNC_STATE_UPSERT_SQL = (
+    "INSERT INTO sync_state (wallet_id, key, value) VALUES (?, ?, ?) "
+    "ON CONFLICT(wallet_id, key) DO UPDATE SET value = excluded.value"
+)
 
 
 class Store(AbstractContextManager["Store"]):
@@ -243,6 +290,81 @@ class Store(AbstractContextManager["Store"]):
         """
         return self._conn
 
+    def _rollback_quietly(self) -> None:
+        """Best-effort ``ROLLBACK`` (never masks the failure being handled)."""
+        if self._conn.in_transaction:
+            try:
+                self._conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass  # best effort: the in-flight failure propagates regardless
+
+    @contextmanager
+    def _atomic(self) -> Iterator[None]:
+        """Run a block inside ONE explicit SQLite transaction (all-or-nothing).
+
+        ``BEGIN IMMEDIATE`` opens the transaction (failing before any write,
+        with the usual value-free wrapping); the block's writes commit
+        together on success. Any exception — sqlite or otherwise — rolls the
+        whole transaction back before propagating, leaving the database
+        exactly as it was. sqlite failures surface as value-free
+        :class:`StoreError`/:class:`StoreIntegrityError`; non-sqlite
+        exceptions roll back and propagate unchanged (they indicate caller
+        bugs, not store failures). Not nested — compose multiple writes by
+        calling the shared ``_*_rows`` helpers inside a single block.
+        """
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.IntegrityError as exc:
+            raise _wrap_integrity(exc) from exc
+        except sqlite3.Error as exc:
+            raise _wrap(exc) from exc
+        try:
+            yield
+            conn.execute("COMMIT")
+        except sqlite3.IntegrityError as exc:
+            self._rollback_quietly()
+            raise _wrap_integrity(exc) from exc
+        except sqlite3.Error as exc:
+            self._rollback_quietly()
+            raise _wrap(exc) from exc
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    # ------------------------- shared write bodies (no transaction of their own)
+
+    def _upsert_address_rows(self, records: Sequence[AddressRecord]) -> None:
+        """Address upserts; the caller owns the surrounding transaction."""
+        if records:
+            self._conn.executemany(_ADDRESS_UPSERT_SQL, [r.to_row() for r in records])
+
+    def _upsert_derivation_states(self, states: Sequence[DerivationRecord]) -> None:
+        """Derivation upserts; the caller owns the surrounding transaction."""
+        if states:
+            self._conn.executemany(_DERIVATION_UPSERT_SQL, [s.to_row() for s in states])
+
+    def _replace_utxo_rows(self, wallet_id: int, records: Sequence[UtxoRecord]) -> None:
+        """UTXO snapshot replace (DELETE + INSERT); the caller owns the transaction."""
+        self._conn.execute("DELETE FROM utxos WHERE wallet_id = ?", (wallet_id,))
+        if records:
+            self._conn.executemany(_UTXO_INSERT_SQL, [r.to_row() for r in records])
+
+    def _upsert_tx_rows(self, records: Sequence[TxRecord]) -> None:
+        """Transaction upserts; the caller owns the surrounding transaction."""
+        if records:
+            self._conn.executemany(_TX_UPSERT_SQL, [r.to_row() for r in records])
+
+    def _write_sync_state_entries(
+        self, wallet_id: int, entries: Mapping[str, str]
+    ) -> None:
+        """sync_state upserts; the caller owns the surrounding transaction."""
+        if entries:
+            self._conn.executemany(
+                _SYNC_STATE_UPSERT_SQL,
+                [(wallet_id, key, value) for key, value in entries.items()],
+            )
+
     # -------------------------------------------------------------- wallets
 
     def create_wallet(self, name: str, descriptor: str) -> WalletRecord:
@@ -351,24 +473,11 @@ class Store(AbstractContextManager["Store"]):
     # ------------------------------------------------------------ addresses
 
     def upsert_batch(self, records: Sequence[AddressRecord]) -> None:
-        """Insert or update a batch of address records (idempotent)."""
+        """Insert or update a batch of address records (idempotent, atomic)."""
         if not records:
             return
-        try:
-            with self._transaction():
-                self._conn.executemany(
-                    "INSERT INTO addresses (wallet_id, branch, `index`, address, script_type, status) "
-                    "VALUES (?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(wallet_id, branch, `index`) DO UPDATE SET "
-                    "address = excluded.address, "
-                    "script_type = excluded.script_type, "
-                    "status = excluded.status",
-                    [r.to_row() for r in records],
-                )
-        except sqlite3.IntegrityError as exc:
-            raise _wrap_integrity(exc) from exc
-        except sqlite3.Error as exc:
-            raise _wrap(exc) from exc
+        with self._atomic():
+            self._upsert_address_rows(records)
 
     def mark_used(self, wallet_id: int, branch: int, index: int) -> None:
         """Transition an address's status to 'used' (must not be 'allocated')."""
@@ -439,22 +548,8 @@ class Store(AbstractContextManager["Store"]):
         whole, never partially.
         """
         rows = list(records)
-        try:
-            with self._transaction():
-                self._conn.execute(
-                    "DELETE FROM utxos WHERE wallet_id = ?", (wallet_id,)
-                )
-                if rows:
-                    self._conn.executemany(
-                        "INSERT INTO utxos "
-                        "(wallet_id, txid, vout, address, value_sats, confirmed, height) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        [r.to_row() for r in rows],
-                    )
-        except sqlite3.IntegrityError as exc:
-            raise _wrap_integrity(exc) from exc
-        except sqlite3.Error as exc:
-            raise _wrap(exc) from exc
+        with self._atomic():
+            self._replace_utxo_rows(wallet_id, rows)
 
     def get_utxos_for_wallet(self, wallet_id: int) -> list[UtxoRecord]:
         rows = self._conn.execute(
@@ -469,24 +564,8 @@ class Store(AbstractContextManager["Store"]):
         """Insert or update transaction records (update-in-place on conflict)."""
         if not records:
             return
-        try:
-            with self._transaction():
-                self._conn.executemany(
-                    "INSERT INTO transactions "
-                    "(wallet_id, txid, height, block_time, fee_sats, direction, raw_summary) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(wallet_id, txid) DO UPDATE SET "
-                    "height = excluded.height, "
-                    "block_time = excluded.block_time, "
-                    "fee_sats = excluded.fee_sats, "
-                    "direction = excluded.direction, "
-                    "raw_summary = excluded.raw_summary",
-                    [r.to_row() for r in records],
-                )
-        except sqlite3.IntegrityError as exc:
-            raise _wrap_integrity(exc) from exc
-        except sqlite3.Error as exc:
-            raise _wrap(exc) from exc
+        with self._atomic():
+            self._upsert_tx_rows(records)
 
     def get_txs_for_wallet(self, wallet_id: int) -> list[TxRecord]:
         rows = self._conn.execute(
@@ -505,17 +584,48 @@ class Store(AbstractContextManager["Store"]):
         return row["value"] if row is not None else None
 
     def set_sync_state(self, wallet_id: int, key: str, value: str) -> None:
-        try:
-            with self._transaction():
-                self._conn.execute(
-                    "INSERT INTO sync_state (wallet_id, key, value) VALUES (?, ?, ?) "
-                    "ON CONFLICT(wallet_id, key) DO UPDATE SET value = excluded.value",
-                    (wallet_id, key, value),
-                )
-        except sqlite3.IntegrityError as exc:
-            raise _wrap_integrity(exc) from exc
-        except sqlite3.Error as exc:
-            raise _wrap(exc) from exc
+        with self._atomic():
+            self._write_sync_state_entries(wallet_id, {key: value})
+
+    # -------------------------------------------------- composite scan persist
+
+    def persist_scan_result(
+        self,
+        wallet_id: int,
+        *,
+        address_rows: Sequence[AddressRecord],
+        derivation_states: Sequence[DerivationRecord],
+        utxo_snapshot: Iterable[UtxoRecord],
+        tx_rows: Sequence[TxRecord],
+        sync_state_updates: Mapping[str, str],
+    ) -> None:
+        """Persist one completed chain scan in a SINGLE SQLite transaction.
+
+        The whole write-set of a scan — address statuses, per-branch
+        derivation state, the wallet-wide UTXO snapshot (full replace),
+        transaction history, and the sync-state updates (including the
+        every-scan ``out_of_window_detected`` write, whose empty payload
+        clears a stale warning) — commits together or not at all: a crash
+        or failure mid-write can never desync address statuses from the
+        derivation cursor or the sync state.
+
+        On any failure the transaction is rolled back and the database is
+        left exactly as it was. sqlite failures raise value-free
+        :class:`StoreIntegrityError` (constraint violations) or
+        :class:`StoreError`; any other exception rolls back and propagates
+        unchanged (a caller bug, not a store failure). ``wallet_id`` must
+        reference an existing wallet (FK-enforced). Statement order inside
+        the transaction: addresses, derivation, UTXO replace, transactions,
+        sync state — no order dependencies exist (every row references only
+        the pre-existing wallet row).
+        """
+        snapshot = list(utxo_snapshot)
+        with self._atomic():
+            self._upsert_address_rows(address_rows)
+            self._upsert_derivation_states(derivation_states)
+            self._replace_utxo_rows(wallet_id, snapshot)
+            self._upsert_tx_rows(tx_rows)
+            self._write_sync_state_entries(wallet_id, sync_state_updates)
 
     # ------------------------------------------------------------- settings
 

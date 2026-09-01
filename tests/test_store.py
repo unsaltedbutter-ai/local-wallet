@@ -4,7 +4,9 @@ Covers: init/reopen + versioned migration (fail-closed on newer schema), WAL
 and foreign-key enforcement, wallet CRUD + active-wallet selection, derivation
 state, address upserts/status transitions, UTXO snapshot replace semantics,
 transaction upserts, sync_state/settings round-trips, value-free error
-messages, and a concurrent-connections smoke test on a file DB.
+messages, a concurrent-connections smoke test on a file DB, and the composite
+atomic scan persist (``persist_scan_result``: exactly one transaction,
+all-or-nothing rollback on mid-write failure, clean retry).
 """
 
 import sqlite3
@@ -309,3 +311,193 @@ def test_concurrent_connections_on_file_db(tmp_path):
             for conn in (s1, s2):
                 busy = conn._conn.execute("PRAGMA busy_timeout").fetchone()[0]
                 assert busy == BUSY_TIMEOUT_MS
+
+
+# -------------------------------------------------- composite scan persist
+#
+# persist_scan_result (TCK-P1-002 security review, atomic-persist finding):
+# the whole scan write-set must land in ONE SQLite transaction — success
+# persists everything, any mid-write failure leaves the pre-state exactly
+# intact, and a clean retry afterwards works.
+
+
+def _scan_payloads(wid):
+    """A representative scan write-set (all five payload groups)."""
+    address_rows = [
+        _addr(wid, 0, 0, "tb1qaddr0", status="used"),
+        _addr(wid, 0, 1, "tb1qaddr1"),
+        _addr(wid, 1, 0, "tb1qchange0"),
+    ]
+    derivation_states = [
+        DerivationRecord(wid, 0, 0, 1),
+        DerivationRecord(wid, 1, -1, 0),
+    ]
+    utxo_snapshot = [_utxo(wid, "aa" * 32, 0, "tb1qaddr0", 50_000, 1, 10)]
+    tx_rows = [TxRecord(wid, "aa" * 32, 10, 1_700_000_000, 500, "in", None)]
+    sync_state_updates = {
+        "last_scan_cursor": '{"0": 24, "1": 20}',
+        "last_tip_height": "870000",
+        "last_scan_at": "2026-08-31T00:00:00+00:00",
+        "out_of_window_detected": '{"detected_at": null, "branches": {}}',
+    }
+    return address_rows, derivation_states, utxo_snapshot, tx_rows, sync_state_updates
+
+
+def _persist_scan(store, wid, payloads):
+    address_rows, derivation_states, utxo_snapshot, tx_rows, sync = payloads
+    store.persist_scan_result(
+        wid,
+        address_rows=address_rows,
+        derivation_states=derivation_states,
+        utxo_snapshot=utxo_snapshot,
+        tx_rows=tx_rows,
+        sync_state_updates=sync,
+    )
+
+
+def test_persist_scan_result_success_persists_everything():
+    with Store.memory() as store:
+        wid = store.create_wallet("main", DESCRIPTOR).id
+        # Stale prior state that the composite write must fully replace.
+        store.replace_utxos_for_wallet(
+            wid, [_utxo(wid, "ff" * 32, 9, "tb1qold", 111, 1, 5)]
+        )
+        store.update_derivation(wid, 0, max_used_index=99, next_index=99)
+        store.set_sync_state(wid, "last_scan_cursor", "stale")
+
+        _persist_scan(store, wid, _scan_payloads(wid))
+
+        addresses0 = {a.index: a for a in store.get_addresses(wid, 0)}
+        assert addresses0[0].address == "tb1qaddr0"
+        assert addresses0[0].status == "used"
+        assert addresses0[1].status == "unused"
+        assert store.get_by_address("tb1qchange0") is not None
+        d0, d1 = store.get_derivation(wid, 0), store.get_derivation(wid, 1)
+        assert (d0.max_used_index, d0.next_index) == (0, 1)  # replaced, not stale
+        assert (d1.max_used_index, d1.next_index) == (-1, 0)
+        assert [(u.txid, u.value_sats) for u in store.get_utxos_for_wallet(wid)] == [
+            ("aa" * 32, 50_000)
+        ]  # old ff… utxo gone (snapshot replace)
+        assert [(t.txid, t.direction) for t in store.get_txs_for_wallet(wid)] == [
+            ("aa" * 32, "in")
+        ]
+        assert store.get_sync_state(wid, "last_scan_cursor") == '{"0": 24, "1": 20}'
+        assert store.get_sync_state(wid, "last_tip_height") == "870000"
+        assert store.get_sync_state(wid, "last_scan_at") == "2026-08-31T00:00:00+00:00"
+        assert store.get_sync_state(wid, "out_of_window_detected") == (
+            '{"detected_at": null, "branches": {}}'
+        )
+
+
+def test_persist_scan_result_uses_exactly_one_transaction():
+    """The composite call issues exactly one BEGIN and one COMMIT — all
+    writes share a single transaction (no per-table autocommit commits)."""
+    with Store.memory() as store:
+        wid = store.create_wallet("main", DESCRIPTOR).id
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            _persist_scan(store, wid, _scan_payloads(wid))
+        finally:
+            store._conn.set_trace_callback(None)
+        begins = [s for s in statements if s.upper().startswith("BEGIN")]
+        commits = [s for s in statements if s.upper().startswith("COMMIT")]
+        rollbacks = [s for s in statements if s.upper().startswith("ROLLBACK")]
+        assert len(begins) == 1
+        assert len(commits) == 1
+        assert rollbacks == []
+
+
+def test_persist_scan_result_failure_mid_write_persists_nothing_then_retries(
+    monkeypatch,
+):
+    """Forced failure after some in-transaction writes: NOTHING persists —
+    old utxos still there, derivation and sync_state unchanged — and a
+    clean retry afterwards lands everything."""
+    with Store.memory() as store:
+        wid = store.create_wallet("main", DESCRIPTOR).id
+        store.upsert_batch([_addr(wid, 0, 0, "tb1qoldaddr", status="used")])
+        store.update_derivation(wid, 0, max_used_index=7, next_index=8)
+        store.replace_utxos_for_wallet(
+            wid, [_utxo(wid, "ee" * 32, 0, "tb1qoldaddr", 42, 1, 3)]
+        )
+        store.set_sync_state(wid, "last_scan_cursor", "old-cursor")
+        store.set_sync_state(wid, "last_scan_at", "old-timestamp")
+        pre_addresses0 = store.get_addresses(wid, 0)
+        pre_derivation0 = store.get_derivation(wid, 0)
+        pre_utxos = store.get_utxos_for_wallet(wid)
+        pre_txs = store.get_txs_for_wallet(wid)
+        pre_cursor = store.get_sync_state(wid, "last_scan_cursor")
+        pre_scan_at = store.get_sync_state(wid, "last_scan_at")
+
+        def _explode(wallet_id: int, records: object) -> None:
+            raise RuntimeError("forced persist failure")
+
+        # Fails mid-transaction: the address/derivation writes already
+        # executed (and the utxo DELETE is about to) — all must be undone.
+        monkeypatch.setattr(store, "_replace_utxo_rows", _explode)
+        with pytest.raises(RuntimeError, match="forced persist failure"):
+            _persist_scan(store, wid, _scan_payloads(wid))
+
+        assert store.get_addresses(wid, 0) == pre_addresses0
+        assert store.get_addresses(wid, 1) == []
+        assert store.get_derivation(wid, 0) == pre_derivation0
+        assert (pre_derivation0.max_used_index, pre_derivation0.next_index) == (7, 8)
+        assert store.get_utxos_for_wallet(wid) == pre_utxos
+        assert store.get_txs_for_wallet(wid) == pre_txs == []
+        assert store.get_sync_state(wid, "last_scan_cursor") == pre_cursor
+        assert store.get_sync_state(wid, "last_scan_at") == pre_scan_at
+
+        # Clean retry (patch removed): everything lands in one go.
+        monkeypatch.undo()
+        _persist_scan(store, wid, _scan_payloads(wid))
+        assert [(u.txid, u.value_sats) for u in store.get_utxos_for_wallet(wid)] == [
+            ("aa" * 32, 50_000)
+        ]
+        assert (store.get_derivation(wid, 0).max_used_index,
+                store.get_derivation(wid, 0).next_index) == (0, 1)
+        assert store.get_sync_state(wid, "last_scan_cursor") == '{"0": 24, "1": 20}'
+        assert [a.address for a in store.get_addresses(wid, 0)] == [
+            "tb1qaddr0",
+            "tb1qaddr1",
+        ]
+
+
+def test_persist_scan_result_integrity_failure_rolls_back_delete_and_writes():
+    """A real constraint violation (duplicate txid/vout inside the snapshot)
+    fires after the UTXO DELETE and the address/derivation writes — the
+    rollback restores all of it, and the message stays value-free."""
+    with Store.memory() as store:
+        wid = store.create_wallet("main", DESCRIPTOR).id
+        store.upsert_batch([_addr(wid, 0, 0, "tb1qoldaddr", status="used")])
+        store.update_derivation(wid, 0, max_used_index=3, next_index=4)
+        old_utxos = [_utxo(wid, "dd" * 32, 0, "tb1qoldaddr", 7, 1, 2)]
+        store.replace_utxos_for_wallet(wid, old_utxos)
+        store.set_sync_state(wid, "last_scan_cursor", "old-cursor")
+
+        address_rows, derivation_states, _, tx_rows, sync = _scan_payloads(wid)
+        duplicate_snapshot = [
+            _utxo(wid, "aa" * 32, 0, "tb1qaddr0", 50_000, 1, 10),
+            _utxo(wid, "aa" * 32, 0, "tb1qaddr0", 50_000, 1, 10),
+        ]
+        with pytest.raises(StoreIntegrityError) as excinfo:
+            store.persist_scan_result(
+                wid,
+                address_rows=address_rows,
+                derivation_states=derivation_states,
+                utxo_snapshot=duplicate_snapshot,
+                tx_rows=tx_rows,
+                sync_state_updates=sync,
+            )
+        assert excinfo.value.__cause__ is not None  # chaining preserved
+        message = str(excinfo.value)
+        assert "tb1qaddr0" not in message and "tb1qoldaddr" not in message
+
+        # Pre-state exactly intact (incl. the utxo DELETE that was undone).
+        assert [a.address for a in store.get_addresses(wid, 0)] == ["tb1qoldaddr"]
+        assert store.get_addresses(wid, 1) == []
+        assert store.get_derivation(wid, 0) == DerivationRecord(wid, 0, 3, 4)
+        assert store.get_utxos_for_wallet(wid) == old_utxos
+        assert store.get_txs_for_wallet(wid) == []
+        assert store.get_sync_state(wid, "last_scan_cursor") == "old-cursor"
+        assert store.get_sync_state(wid, "last_scan_at") is None

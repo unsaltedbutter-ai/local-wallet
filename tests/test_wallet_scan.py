@@ -1,0 +1,657 @@
+"""Tests for the gap-limited scan and cache orchestration (TCK-P1-002).
+
+All chain interaction runs over ``httpx.MockTransport`` — no real network.
+Covers: the happy-path window (usage at index 3 → stop at 23 with the
+default gap of 20) and full store state, request ordering (sequential,
+branch 0 before branch 1, indices ascending), gap configurability via the
+``gap_limit`` setting (deep usage at index 25 missed with 20 / caught with
+30, out-of-window warning persisted), UTXO snapshot replacement, rescan
+fixing a simulated stale cache (Phase 1 AC), transaction direction
+(in/out/self) with dedup and nullable fee, fail-closed behavior on
+malformed chain payloads (store untouched), the atomic persist phase
+(a store failure mid-persist rolls back the entire scan write and leaves
+the prior state intact), sync-state round-trips, and
+the wallet-input/testnet-gate surface.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Final
+
+import httpx
+import pytest
+
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from embit.bip32 import NETWORKS, HDKey
+from embit.descriptor.checksum import add_checksum
+
+from localwallet.chain import ChainError, EsploraClient
+from localwallet.store import AddressRecord, Store, StoreError, UtxoRecord
+from localwallet.wallet import (
+    DEFAULT_GAP_LIMIT,
+    WalletDescriptor,
+    derive_addresses,
+    parse_watch_key,
+    rescan_wallet,
+    scan_wallet,
+)
+from localwallet.wallet.descriptor import WatchKeyError
+from localwallet.wallet.scan import ScanError
+
+FIXTURE_SEED: Final = b"local-wallet phase 1 scan test seed (not a real wallet)"
+TIP: Final = 870_000
+_EXTERNAL: Final = "tb1qexternalsenderaddressnotpartofthewallet000000"
+
+
+def _fixture_vpub() -> str:
+    root = HDKey.from_seed(FIXTURE_SEED, version=NETWORKS["test"]["zprv"])
+    account = root.derive([84 + 2**31, 1 + 2**31, 0])
+    return account.to_public().to_base58(version=NETWORKS["test"]["zpub"])
+
+
+VPUB: Final = _fixture_vpub()
+WD: Final = WalletDescriptor.from_key(VPUB)
+PARSED: Final = WD.parsed
+# Window addresses for both branches, indices 0..59.
+ADDRS: Final[dict[int, list[str]]] = {
+    branch: [d.address for d in derive_addresses(PARSED, branch, 0, 60)]
+    for branch in (0, 1)
+}
+
+
+def tx_entry(
+    txid: str,
+    *,
+    vin_addresses: tuple[str, ...] = (_EXTERNAL,),
+    vout_addresses: tuple[str, ...] = (),
+    fee: int | None = 1000,
+    confirmed: bool = True,
+    height: int | None = 800_000,
+    block_time: int | None = 1_700_000_000,
+) -> dict[str, Any]:
+    """Build an Esplora address-txs entry."""
+    entry: dict[str, Any] = {
+        "txid": txid,
+        "version": 1,
+        "locktime": 0,
+        "vin": [
+            {"prevout": {"scriptpubkey_address": a, "value": 100_000}}
+            for a in vin_addresses
+        ],
+        "vout": [
+            {"scriptpubkey_address": a, "value": 90_000} for a in vout_addresses
+        ],
+        "size": 222,
+        "weight": 564,
+        "status": {"confirmed": confirmed},
+    }
+    if fee is not None:
+        entry["fee"] = fee
+    if confirmed:
+        if height is not None:
+            entry["status"]["block_height"] = height
+        if block_time is not None:
+            entry["status"]["block_time"] = block_time
+    return entry
+
+
+def utxo_entry(
+    txid: str, vout: int, value: int, *, confirmed: bool = True, height: int = 800_000
+) -> dict[str, Any]:
+    status: dict[str, Any] = {"confirmed": confirmed}
+    if confirmed:
+        status["block_height"] = height
+    return {"txid": txid, "vout": vout, "value": value, "status": status}
+
+
+class FakeChain:
+    """Scripted Esplora backend over MockTransport; records request order."""
+
+    def __init__(
+        self,
+        *,
+        txs: dict[str, list[dict[str, Any]]] | None = None,
+        utxos: dict[str, list[dict[str, Any]]] | None = None,
+        tip: int | list[dict[str, Any]] = TIP,
+        fail: dict[str, int] | None = None,
+    ) -> None:
+        self.txs = txs or {}
+        self.utxos = utxos or {}
+        self.tip = tip
+        self.fail = fail or {}
+        self.requests: list[tuple[str, str | None]] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/blocks/tip"):
+            self.requests.append(("tip", None))
+            status = self.fail.get("tip", 200)
+            return httpx.Response(status, json=self.tip if status == 200 else None)
+        parts = path.rstrip("/").split("/")
+        address, kind = parts[-2], parts[-1]
+        self.requests.append((kind, address))
+        status = self.fail.get(kind, 200)
+        if status != 200:
+            return httpx.Response(status, json=None)
+        if kind == "txs":
+            return httpx.Response(200, json=self.txs.get(address, []))
+        if kind == "utxo":
+            return httpx.Response(200, json=self.utxos.get(address, []))
+        return httpx.Response(404, json=None)
+
+    def client(self) -> EsploraClient:
+        return EsploraClient(
+            base_url="https://mempool.space/testnet4/api",
+            timeout_s=5.0,
+            max_retries=0,
+            transport=httpx.MockTransport(self.handler),
+        )
+
+
+@pytest.fixture()
+def store() -> Store:
+    with Store.memory() as s:
+        wallet = s.create_wallet("main", WD.descriptor)
+        s.set_active_wallet(wallet.id)
+        yield s
+
+
+def _wallet_id(s: Store) -> int:
+    return s.get_wallet_by_name("main").id  # type: ignore[union-attr]
+
+
+def _used_at(indices: dict[int, str], branch: int) -> dict[str, list[dict[str, Any]]]:
+    """Txs marking the given {index: txid} of ``branch`` as used."""
+    return {
+        ADDRS[branch][index]: [tx_entry(txid, vout_addresses=(ADDRS[branch][index],))]
+        for index, txid in indices.items()
+    }
+
+
+# ------------------------------------------------------------------ happy path
+
+
+def test_happy_scan_window_and_store_state(store: Store) -> None:
+    """Usage at indices 0..3 → the walk stops at 23 with the default gap;
+    derivation state, address statuses, UTXO snapshot and history land."""
+    wid = _wallet_id(store)
+    chain = FakeChain(
+        txs=_used_at({0: "aa" * 32, 1: "bb" * 32, 2: "cc" * 32, 3: "dd" * 32}, 0),
+        utxos={
+            ADDRS[0][0]: [utxo_entry("aa" * 32, 0, 50_000)],
+            ADDRS[0][2]: [utxo_entry("cc" * 32, 1, 12_345, confirmed=False)],
+        },
+    )
+    summary = scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+
+    b0, b1 = summary.branches[0], summary.branches[1]
+    assert (b0.scanned, b0.window_last_index, b0.max_used_index) == (24, 23, 3)
+    assert b0.used_indices == (0, 1, 2, 3)
+    assert (b1.scanned, b1.window_last_index, b1.max_used_index) == (20, 19, -1)
+    assert summary.gap_limit == DEFAULT_GAP_LIMIT == 20
+    assert summary.tip_height == TIP
+    assert summary.utxo_count == 2
+    assert summary.utxo_value_sats == 50_000 + 12_345
+    assert summary.out_of_window == {}  # first scan: no previous window
+
+    derivation0 = store.get_derivation(wid, 0)
+    assert (derivation0.max_used_index, derivation0.next_index) == (3, 4)
+    derivation1 = store.get_derivation(wid, 1)
+    assert (derivation1.max_used_index, derivation1.next_index) == (-1, 0)
+
+    addresses0 = store.get_addresses(wid, 0)
+    assert [a.index for a in addresses0] == list(range(24))
+    assert [a.address for a in addresses0] == ADDRS[0][:24]
+    assert [a.status for a in addresses0] == ["used"] * 4 + ["unused"] * 20
+    assert [a.index for a in store.get_addresses(wid, 1)] == list(range(20))
+
+    utxos = store.get_utxos_for_wallet(wid)
+    assert [(u.txid, u.vout, u.value_sats, u.confirmed) for u in utxos] == [
+        ("aa" * 32, 0, 50_000, 1),
+        ("cc" * 32, 1, 12_345, 0),
+    ]
+    assert all(u.address in {ADDRS[0][0], ADDRS[0][2]} for u in utxos)
+    txs = store.get_txs_for_wallet(wid)
+    assert [t.txid for t in txs] == sorted(["aa" * 32, "bb" * 32, "cc" * 32, "dd" * 32])
+    assert all(t.direction == "in" for t in txs)
+
+
+def test_happy_scan_request_ordering_is_sequential_and_deterministic(
+    store: Store,
+) -> None:
+    """Branch 0 before branch 1, indices ascending, txs before utxos per
+    branch, tip first — exactly one txs + one utxo call per window address."""
+    chain = FakeChain(txs=_used_at({2: "cc" * 32}, 0))
+    scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+
+    assert chain.requests[0] == ("tip", None)
+    expected = [
+        ("tip", None),
+        *[("txs", ADDRS[0][i]) for i in range(23)],  # window 0..22 (2 + gap 20)
+        *[("utxo", ADDRS[0][i]) for i in range(23)],
+        *[("txs", ADDRS[1][i]) for i in range(20)],
+        *[("utxo", ADDRS[1][i]) for i in range(20)],
+    ]
+    assert chain.requests == expected
+
+
+# ------------------------------------------------------- gap policy / R3 warn
+
+
+def test_deep_usage_missed_with_default_gap_caught_via_settings(
+    store: Store,
+) -> None:
+    """Used at index 25: invisible with gap 20 (R3), found after widening
+    the configured gap to 30 and rescanning; the beyond-window usage is
+    persisted as a warning (ADR-0009), never silently swallowed."""
+    wid = _wallet_id(store)
+    deep_txs = _used_at({25: "ee" * 32}, 0)
+    chain = FakeChain(txs=deep_txs, utxos={})
+    row = store.get_wallet_by_name("main")
+
+    first = scan_wallet(store, chain.client(), row)
+    assert first.branches[0].window_last_index == 19  # 0..19, gap 20 exhausted
+    assert first.branches[0].max_used_index == -1
+    assert [a.index for a in store.get_addresses(wid, 0)] == list(range(20))
+    assert store.get_sync_state(wid, "last_scan_cursor") == json.dumps(
+        {"0": 20, "1": 20}, sort_keys=True
+    )
+
+    store.set_setting("gap_limit", "30")
+    chain30 = FakeChain(txs=deep_txs, utxos={ADDRS[0][25]: [utxo_entry("ee" * 32, 0, 1000)]})
+    second = rescan_wallet(store, chain30.client(), row)
+
+    b0 = second.branches[0]
+    assert (b0.window_last_index, b0.max_used_index, b0.next_index) == (55, 25, 26)
+    assert [a.index for a in store.get_addresses(wid, 0)] == list(range(56))
+    assert second.out_of_window == {
+        "0": {"max_used_index": 25, "previous_window_end": 19}
+    }
+    persisted = json.loads(store.get_sync_state(wid, "out_of_window_detected"))
+    assert persisted["detected_at"] is not None
+    assert persisted["branches"] == second.out_of_window
+    assert store.get_setting("gap_limit") == "30"  # scan honored the setting
+    assert second.gap_limit == 30
+
+
+def test_gap_limit_argument_overrides_setting(store: Store) -> None:
+    chain = FakeChain()
+    row = store.get_wallet_by_name("main")
+    store.set_setting("gap_limit", "40")
+    summary = scan_wallet(store, chain.client(), row, gap_limit=5)
+    assert summary.gap_limit == 5
+    assert summary.branches[0].window_last_index == 4  # 0..4, empty wallet
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [("abc", "valid integer"), ("30.5", "valid integer"), ("0", "between"), ("1001", "between")],
+)
+def test_malformed_gap_setting_fails_closed(store: Store, raw: str, match: str) -> None:
+    store.set_setting("gap_limit", raw)
+    chain = FakeChain()
+    with pytest.raises(ScanError, match=match):
+        scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+    assert store.get_addresses(_wallet_id(store), 0) == []  # store untouched
+
+
+@pytest.mark.parametrize("bad", [0, -5, True, "20", 2.5, 1001])
+def test_gap_argument_validation(bad: object, store: Store) -> None:
+    chain = FakeChain()
+    with pytest.raises(ScanError):
+        scan_wallet(store, chain.client(), store.get_wallet_by_name("main"), gap_limit=bad)  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------- UTXO snapshot
+
+
+def test_utxo_snapshot_replaces_stale_cache(store: Store) -> None:
+    wid = _wallet_id(store)
+    junk = [
+        UtxoRecord(wid, "f" * 64, 0, "tb1qjunk", 999, 1, 10),
+        UtxoRecord(wid, "e" * 64, 3, None, 1, 0, None),
+    ]
+    store.replace_utxos_for_wallet(wid, junk)
+    chain = FakeChain(
+        utxos={
+            ADDRS[0][0]: [
+                utxo_entry("aa" * 32, 0, 50_000),
+                utxo_entry("bb" * 32, 1, 7_000, confirmed=False),
+            ],
+            ADDRS[0][7]: [utxo_entry("dd" * 32, 0, 1_000)],
+        },
+    )
+    scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+    got = store.get_utxos_for_wallet(wid)
+    assert [(u.txid, u.vout, u.value_sats, u.confirmed, u.address) for u in got] == [
+        ("aa" * 32, 0, 50_000, 1, ADDRS[0][0]),
+        ("bb" * 32, 1, 7_000, 0, ADDRS[0][0]),
+        ("dd" * 32, 0, 1_000, 1, ADDRS[0][7]),
+    ]
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {"txid": "aa" * 32, "vout": 0},  # value missing
+        {"txid": "aa" * 32, "vout": -1, "value": 5, "status": {"confirmed": True}},
+        {"txid": "aa" * 32, "vout": 0, "value": 5},  # status missing
+        {"txid": "aa" * 32, "vout": 0, "value": 5, "status": {"confirmed": "yes"}},
+        {"txid": "aa" * 32, "vout": 0, "value": 5,
+         "status": {"confirmed": True, "block_height": "x"}},
+        {"txid": "short", "vout": 0, "value": 5, "status": {"confirmed": True}},
+        {"txid": "zz" * 32, "vout": 0, "value": 5, "status": {"confirmed": True}},
+    ],
+)
+def test_malformed_utxo_payload_fails_closed_and_keeps_old_snapshot(
+    store: Store, broken: dict[str, Any]
+) -> None:
+    wid = _wallet_id(store)
+    junk = [UtxoRecord(wid, "f" * 64, 0, "tb1qjunk", 999, 1, 10)]
+    store.replace_utxos_for_wallet(wid, junk)
+    chain = FakeChain(utxos={ADDRS[0][0]: [broken]})
+    with pytest.raises(ScanError):
+        scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+    assert store.get_utxos_for_wallet(wid) == junk  # snapshot untouched
+    assert store.get_sync_state(wid, "last_scan_at") is None
+
+
+# --------------------------------------------------------- rescan / stale cache
+
+
+def test_rescan_fixes_simulated_stale_cache(store: Store) -> None:
+    """Phase 1 AC: rescan repairs derivation state, address mappings and
+    the UTXO snapshot from chain truth, preserving 'allocated' flags."""
+    wid = _wallet_id(store)
+    row = store.get_wallet_by_name("main")
+    truth_txs = _used_at({0: "aa" * 32, 3: "dd" * 32}, 0)
+    truth_utxos = {
+        ADDRS[0][0]: [utxo_entry("aa" * 32, 0, 50_000)],
+        ADDRS[0][3]: [utxo_entry("dd" * 32, 0, 4_000)],
+    }
+    scan_wallet(store, FakeChain(txs=truth_txs, utxos=truth_utxos).client(), row)
+    truth_addresses = [a.address for a in store.get_addresses(wid, 0)]
+
+    # --- corrupt the cache in every cacheable dimension
+    store.replace_utxos_for_wallet(
+        wid, [UtxoRecord(wid, "f" * 64, 9, "tb1qjunk", 123_456, 1, 5)]
+    )
+    store.update_derivation(wid, 0, max_used_index=99, next_index=99)
+    stale = "tb1qstalerowthatneverexistedonchain000000000000"
+    store.upsert_batch(
+        [AddressRecord(wid, 0, 1, stale, "p2wpkh", "used")]  # wrong mapping
+    )
+    store.mark_used(wid, 0, 10)  # false 'used'
+    store.allocate(wid, 0, 4)  # user-facing flag to preserve
+
+    rescan_wallet(
+        store,
+        FakeChain(txs=truth_txs, utxos=truth_utxos).client(),
+        row,
+    )
+
+    derivation = store.get_derivation(wid, 0)
+    assert (derivation.max_used_index, derivation.next_index) == (3, 4)
+    addresses = store.get_addresses(wid, 0)
+    assert [a.address for a in addresses] == truth_addresses  # mapping restored
+    statuses = {a.index: a.status for a in addresses}
+    assert statuses[1] == "unused"  # false 'used' recomputed
+    assert statuses[10] == "unused"
+    assert statuses[4] == "allocated"  # allocation flag preserved by string
+    assert statuses[0] == "used" and statuses[3] == "used"
+    assert store.get_by_address(stale) is None
+    assert [(u.txid, u.value_sats) for u in store.get_utxos_for_wallet(wid)] == [
+        ("aa" * 32, 50_000),
+        ("dd" * 32, 4_000),
+    ]
+
+
+# ---------------------------------------------------- history direction + fees
+
+
+def test_tx_direction_in_out_self_with_dedup_and_nullable_fee(
+    store: Store,
+) -> None:
+    wid = _wallet_id(store)
+    tx_in = tx_entry("11" * 32, vout_addresses=(ADDRS[0][0],), fee=None)
+    tx_out = tx_entry(
+        "22" * 32, vin_addresses=(ADDRS[0][1],), vout_addresses=(_EXTERNAL,), fee=500
+    )
+    tx_self = tx_entry(
+        "33" * 32,
+        vin_addresses=(ADDRS[0][2],),
+        vout_addresses=(ADDRS[1][0], _EXTERNAL),
+        fee=250,
+        confirmed=False,
+        height=None,
+        block_time=None,
+    )
+    chain = FakeChain(
+        txs={
+            # tx_in is seen from two of our addresses: must dedup to one row.
+            ADDRS[0][0]: [tx_in],
+            ADDRS[0][1]: [tx_in, tx_out],
+            ADDRS[0][2]: [tx_self],
+            ADDRS[1][0]: [tx_self],
+        },
+    )
+    scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+
+    txs = {t.txid: t for t in store.get_txs_for_wallet(wid)}
+    assert set(txs) == {"11" * 32, "22" * 32, "33" * 32}
+    assert txs["11" * 32].direction == "in"
+    assert txs["11" * 32].fee_sats is None  # missing fee tolerated, not fabricated
+    assert (txs["11" * 32].height, txs["11" * 32].block_time) == (800_000, 1_700_000_000)
+    assert txs["22" * 32].direction == "out"
+    assert txs["22" * 32].fee_sats == 500
+    assert txs["33" * 32].direction == "self"  # spends ours, pays our change
+    assert txs["33" * 32].fee_sats == 250
+    assert (txs["33" * 32].height, txs["33" * 32].block_time) == (None, None)
+
+
+# ------------------------------------------------------- fail-closed payloads
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {},  # everything missing
+        {"txid": "aa" * 32},  # status missing
+        {"txid": "aa" * 32, "status": {}},  # confirmed missing
+        {"txid": "aa" * 32, "status": {"confirmed": "yes"}},
+        {"txid": "short", "status": {"confirmed": True}},
+        {"txid": "zz" * 32, "status": {"confirmed": True}},  # not hex
+        {"txid": "aa" * 32, "status": {"confirmed": True, "block_height": "x"}},
+        {"txid": "aa" * 32, "status": {"confirmed": True, "block_time": -5}},
+        {"txid": "aa" * 32, "status": {"confirmed": True}, "fee": -1},
+        {"txid": "aa" * 32, "status": {"confirmed": True}, "fee": True},
+        {"txid": "aa" * 32, "status": {"confirmed": True}, "vin": "notalist"},
+        {"txid": "aa" * 32, "status": {"confirmed": True}, "vout": [3]},
+        {"txid": "aa" * 32, "status": {"confirmed": True}, "vin": [{"prevout": 5}]},
+        {
+            "txid": "aa" * 32,
+            "status": {"confirmed": True},
+            "vin": [{"prevout": {"scriptpubkey_address": 7}}],
+        },
+    ],
+)
+def test_malformed_tx_payload_fails_closed_store_untouched(
+    store: Store, broken: dict[str, Any]
+) -> None:
+    wid = _wallet_id(store)
+    chain = FakeChain(txs={ADDRS[0][0]: [broken]})
+    with pytest.raises(ScanError):
+        scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+    # Nothing persisted: no addresses, no derivation progress, no cursors.
+    assert store.get_addresses(wid, 0) == []
+    assert store.get_addresses(wid, 1) == []
+    assert store.get_derivation(wid, 0).max_used_index == -1
+    assert store.get_utxos_for_wallet(wid) == []
+    assert store.get_txs_for_wallet(wid) == []
+    assert store.get_sync_state(wid, "last_scan_at") is None
+
+
+def test_chain_transport_failure_leaves_store_untouched(store: Store) -> None:
+    wid = _wallet_id(store)
+    chain = FakeChain(fail={"tip": 500})
+    with pytest.raises(ChainError):
+        scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+    assert store.get_addresses(wid, 0) == []
+    assert store.get_sync_state(wid, "last_scan_at") is None
+
+
+def test_txs_transport_failure_leaves_store_untouched(store: Store) -> None:
+    chain = FakeChain(fail={"txs": 503})
+    with pytest.raises(ChainError):
+        scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+    assert store.get_sync_state(_wallet_id(store), "last_tip_height") is None
+
+
+# ------------------------------------------------------------- sync_state I/O
+
+
+def test_sync_state_round_trip(store: Store) -> None:
+    wid = _wallet_id(store)
+    chain = FakeChain(txs=_used_at({2: "cc" * 32}, 0))
+    summary = scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+
+    cursor = json.loads(store.get_sync_state(wid, "last_scan_cursor"))
+    assert cursor == {"0": 23, "1": 20}  # stop index + 1 per branch
+    assert store.get_sync_state(wid, "last_tip_height") == str(TIP)
+    scanned_at = store.get_sync_state(wid, "last_scan_at")
+    assert datetime.fromisoformat(scanned_at) == datetime.fromisoformat(
+        summary.scanned_at
+    )
+    oow = json.loads(store.get_sync_state(wid, "out_of_window_detected"))
+    assert oow == {"detected_at": None, "branches": {}}
+
+
+def test_rescan_clears_stale_out_of_window_warning(store: Store) -> None:
+    """A warning clears once the window covers the observed usage."""
+    wid = _wallet_id(store)
+    row = store.get_wallet_by_name("main")
+    deep_txs = _used_at({25: "ee" * 32}, 0)
+    scan_wallet(store, FakeChain().client(), row)  # window 0..19, cursor 20
+    store.set_setting("gap_limit", "30")
+    rescan_wallet(store, FakeChain(txs=deep_txs).client(), row)  # flags index 25
+    assert store.get_sync_state(wid, "out_of_window_detected") is not None
+    rescan_wallet(store, FakeChain(txs=deep_txs).client(), row)  # now in-window
+    cleared = json.loads(store.get_sync_state(wid, "out_of_window_detected"))
+    assert cleared == {"detected_at": None, "branches": {}}
+
+
+# -------------------------------------------------- atomic persist (SR P1-002)
+
+
+def test_store_failure_during_persist_leaves_entire_prior_state_intact(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The persist phase is one atomic store transaction (security review
+    TCK-P1-002): a store failure mid-persist rolls back the ENTIRE scan
+    write — address statuses, derivation cursor, UTXO snapshot, history
+    and sync state all stay at their prior values — and surfaces as the
+    store's value-free StoreError (deliberately not wrapped in ScanError;
+    see scan_wallet's Raises contract). A clean retry afterwards succeeds."""
+    wid = _wallet_id(store)
+    row = store.get_wallet_by_name("main")
+    scan_wallet(store, FakeChain(txs=_used_at({0: "aa" * 32}, 0)).client(), row)
+
+    # Snapshot the entire prior state, dimension by dimension.
+    prior = {
+        "addresses0": store.get_addresses(wid, 0),
+        "addresses1": store.get_addresses(wid, 1),
+        "derivation0": store.get_derivation(wid, 0),
+        "derivation1": store.get_derivation(wid, 1),
+        "utxos": store.get_utxos_for_wallet(wid),
+        "txs": store.get_txs_for_wallet(wid),
+        "cursor": store.get_sync_state(wid, "last_scan_cursor"),
+        "tip": store.get_sync_state(wid, "last_tip_height"),
+        "scan_at": store.get_sync_state(wid, "last_scan_at"),
+        "oow": store.get_sync_state(wid, "out_of_window_detected"),
+    }
+
+    def _explode(wallet_id: int, records: object) -> None:
+        raise StoreError("store operation failed")
+
+    # Fails mid-transaction: address + derivation writes already executed.
+    monkeypatch.setattr(store, "_replace_utxo_rows", _explode)
+    with pytest.raises(StoreError) as excinfo:
+        scan_wallet(
+            store, FakeChain(txs=_used_at({1: "bb" * 32}, 0)).client(), row
+        )
+    message = str(excinfo.value)
+    for record in prior["addresses0"]:
+        assert record.address not in message  # value-free
+    assert "bb" * 32 not in message
+
+    # ENTIRE prior state intact — nothing from the failed scan leaked.
+    assert store.get_addresses(wid, 0) == prior["addresses0"]
+    assert store.get_addresses(wid, 1) == prior["addresses1"]
+    assert store.get_derivation(wid, 0) == prior["derivation0"]
+    assert store.get_derivation(wid, 1) == prior["derivation1"]
+    assert store.get_utxos_for_wallet(wid) == prior["utxos"]
+    assert store.get_txs_for_wallet(wid) == prior["txs"]
+    assert store.get_sync_state(wid, "last_scan_cursor") == prior["cursor"]
+    assert store.get_sync_state(wid, "last_tip_height") == prior["tip"]
+    assert store.get_sync_state(wid, "last_scan_at") == prior["scan_at"]
+    assert store.get_sync_state(wid, "out_of_window_detected") == prior["oow"]
+
+    # Recovery: a clean retry persists normally.
+    monkeypatch.undo()
+    summary = scan_wallet(
+        store, FakeChain(txs=_used_at({1: "bb" * 32}, 0)).client(), row
+    )
+    assert summary.branches[0].max_used_index == 1
+    statuses = [a.status for a in store.get_addresses(wid, 0)]
+    assert statuses == ["unused", "used"] + ["unused"] * 20
+
+
+# ------------------------------------------------------------- wallet inputs
+
+
+def test_scan_accepts_descriptor_object_and_rejects_unknown(store: Store) -> None:
+    row = store.get_wallet_by_name("main")
+    chain = FakeChain(txs=_used_at({1: "bb" * 32}, 0))
+    summary = scan_wallet(store, chain.client(), WD)
+    assert summary.wallet_id == row.id
+    assert summary.branches[0].max_used_index == 1
+
+    other = WalletDescriptor.from_key(
+        # a different fixture wallet not present in the store
+        _fixture_vpub_other()
+    )
+    with pytest.raises(ScanError, match="no stored wallet"):
+        scan_wallet(store, FakeChain().client(), other)
+    with pytest.raises(ScanError, match="wallet must be"):
+        scan_wallet(store, FakeChain().client(), WD.descriptor)  # type: ignore[arg-type]
+
+
+def _fixture_vpub_other() -> str:
+    root = HDKey.from_seed(FIXTURE_SEED + b"other", version=NETWORKS["test"]["zprv"])
+    account = root.derive([84 + 2**31, 1 + 2**31, 0])
+    return account.to_public().to_base58(version=NETWORKS["test"]["zpub"])
+
+
+def test_scan_refuses_mainnet_wallet_descriptor(store: Store) -> None:
+    """The testnet gate holds for stored wallets too (parse-time enforcement)."""
+    hd = parse_watch_key(_fixture_mainnet_zpub()).hd_key
+    mainnet_descriptor = add_checksum(
+        f"wpkh([{hd.my_fingerprint.hex()}/84'/1'/0']{_fixture_mainnet_zpub()}/{{0,1}}/*)"
+    )
+    store.create_wallet("mainnet", mainnet_descriptor)
+    row = store.get_wallet_by_name("mainnet")
+    with pytest.raises(WatchKeyError, match="testnet-only"):
+        scan_wallet(store, FakeChain().client(), row)
+
+
+def _fixture_mainnet_zpub() -> str:
+    root = HDKey.from_seed(FIXTURE_SEED + b"main", version=NETWORKS["main"]["zprv"])
+    account = root.derive([84 + 2**31, 0 + 2**31, 0])
+    return account.to_public().to_base58(version=NETWORKS["main"]["zpub"])
