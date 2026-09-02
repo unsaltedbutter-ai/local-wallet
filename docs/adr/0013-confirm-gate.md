@@ -160,3 +160,24 @@ concern; gate enforcement is structural.
   `create_tx`/`confirm_tx` and re-adjudication of golden-018 (send-request
   phrasing) land in TCK-P2-005 immediately after handler wiring (TCK-P2-004);
   the P2-005 eval run is the merge gate for this protocol+prompt change.
+
+## Amendment (2026-09, Phase 3 — ticket TCK-P3-004): SIGNED / BROADCAST
+
+Phase 3 extended the flow past `CONFIRMED` with `SIGNED` and terminal
+`BROADCAST` (TCK-P3-004), behind the same dispatcher-owned discipline:
+`sign`/`broadcast` require the flow in the immediately preceding state with
+a matching `tx_ref` quoted from the model's `sign_tx`/`broadcast_tx`
+envelope — no skip paths, broadcast only from `SIGNED`. No additional
+utterance gate exists at the flow level for signing, deliberately: the
+DEVICE interaction IS the user action (the hardware-wallet screen is the
+trust anchor, PROJECT.md §9 — the user physically approves the exact
+transaction on the device), so an LLM-relayed "the user approved" carries
+no decision weight there; what signing structurally requires is the
+`CONFIRMED` state, the matching `tx_ref`, and — before broadcast —
+completed deterministic signed-PSBT re-validation at handler level
+(`tx/revalidate.py`, TCK-P3-005 wiring): a mismatch is a hard stop that
+never reaches the broadcast transition. `cancel` remains CREATED-only:
+signed means committed to signing; recovery past signing is a fresh flow,
+never a silent rewind. Eval fixtures for the three new intents
+(`sign_tx`/`broadcast_tx`/`tx_status`) land with TCK-P3-006 per the
+AGENTS.md eval-ship obligation.

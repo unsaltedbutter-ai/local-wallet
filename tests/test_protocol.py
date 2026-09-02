@@ -1,7 +1,8 @@
-"""Tests for the protocol core (TCK-P0-002, extended by TCK-P1-003).
+"""Tests for the protocol core (TCK-P0-002, extended by TCK-P1-003/P2-003/P3-004).
 
 Covers the canonical envelope contract v0 (including the Phase 1 v0
-extension with get_history / get_utxos / new_address): accept/reject
+extension with get_history / get_utxos / new_address and the Phase 3 v0
+extension with sign_tx / broadcast_tx / tx_status): accept/reject
 matrices, the closed intent registry, business-rule layer invocation, the
 allowlist dispatcher (including defense-in-depth and handler-exception
 surfacing), the handle_raw retry policy (exactly one re-prompt before
@@ -28,6 +29,7 @@ from localwallet.protocol import (
     MAX_QUESTION_CHARS,
     MAX_TEXT_CHARS,
     MAX_VALIDATION_RETRIES,
+    BroadcastTxParams,
     ClarifyParams,
     ConfirmTxParams,
     CreateTxParams,
@@ -43,6 +45,8 @@ from localwallet.protocol import (
     NewAddressParams,
     OutcomeStatus,
     RespondParams,
+    SignTxParams,
+    TxStatusParams,
     dispatch,
     handle_raw,
     validate_payload,
@@ -54,6 +58,8 @@ from localwallet.protocol.envelope import (
     MAX_TX_REF_CHARS,
     MIN_AMOUNT_SATS,
     MIN_AMOUNT_USD,
+    SIGNER_CHOICES,
+    TXID_LENGTH_CHARS,
 )
 
 # ---------------------------------------------------------------- helpers
@@ -80,6 +86,13 @@ ACCEPT_CASES = {
         "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 250000},
     },
     "confirm_tx": {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "3f2a9c"}},
+    # Phase 3 v0 extension (ADR-0002/0013 amendment): signer handoff,
+    # broadcast, and status lookup. The default sign_tx body omits the
+    # optional signer tail (handler default applies).
+    "sign_tx": {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "3f2a9c"}},
+    "sign_tx_signer": {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "3f2a9c", "signer": "file"}},
+    "broadcast_tx": {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "3f2a9c"}},
+    "tx_status": {"v": 0, "intent": "tx_status", "params": {"txid": "a" * 64}},
 }
 
 PARAMS_TYPES = {
@@ -91,6 +104,9 @@ PARAMS_TYPES = {
     IntentName.NEW_ADDRESS: NewAddressParams,
     IntentName.CREATE_TX: CreateTxParams,
     IntentName.CONFIRM_TX: ConfirmTxParams,
+    IntentName.SIGN_TX: SignTxParams,
+    IntentName.BROADCAST_TX: BroadcastTxParams,
+    IntentName.TX_STATUS: TxStatusParams,
 }
 
 HANDLER_RESULTS = {
@@ -102,6 +118,9 @@ HANDLER_RESULTS = {
     IntentName.NEW_ADDRESS: {"allocated": 0},
     IntentName.CREATE_TX: {"staged": True},
     IntentName.CONFIRM_TX: {"confirmed": True},
+    IntentName.SIGN_TX: {"signed": True},
+    IntentName.BROADCAST_TX: {"broadcast": True},
+    IntentName.TX_STATUS: {"status": True},
 }
 
 
@@ -163,13 +182,18 @@ def test_intent_enum_is_the_closed_world():
         "new_address",
         "create_tx",
         "confirm_tx",
+        "sign_tx",
+        "broadcast_tx",
+        "tx_status",
     }
-    assert len(IntentName) == 8
+    assert len(IntentName) == 11
 
 
 def test_intent_registry_is_frozen_and_complete():
     assert set(INTENT_REGISTRY.keys()) == set(IntentName)
-    assert len(INTENT_REGISTRY) == 8
+    # explicit count: registry completeness is pinned, not incidental
+    # (Phase 3 v0 extension: 8 → 11)
+    assert len(INTENT_REGISTRY) == 11
     for intent, model in INTENT_REGISTRY.items():
         assert model is PARAMS_TYPES[intent]
     # frozen mapping: mutation is refused
@@ -182,7 +206,7 @@ def test_intent_registry_is_frozen_and_complete():
 def test_business_rules_cover_every_intent():
     assert set(BUSINESS_RULES.keys()) == set(IntentName)
     # explicit count: registry completeness is pinned, not incidental
-    assert len(BUSINESS_RULES) == 8
+    assert len(BUSINESS_RULES) == 11
     for intent in IntentName:
         assert callable(BUSINESS_RULES[intent])
     # frozen mapping: mutation is refused (symmetry with INTENT_REGISTRY)
@@ -623,6 +647,162 @@ def test_confirm_tx_business_rule_bypass_shape():
     assert failures == ["params.tx_ref must contain only printable characters"]
 
 
+# ------------------------------- Phase 3 v0 extension: sign/broadcast/status
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"tx_ref": "3f2a9c"},
+        {"tx_ref": "3f2a9c", "signer": "file"},
+        {"tx_ref": "3f2a9c", "signer": "hwi"},
+    ],
+    ids=["ref-only", "signer-file", "signer-hwi"],
+)
+def test_accept_sign_tx_param_combinations(params: dict):
+    envelope = validate_payload({"v": 0, "intent": "sign_tx", "params": params})
+    assert isinstance(envelope.params, SignTxParams)
+    # wire fidelity: omitted signer dumps without the key (grammar's
+    # no-tail branch); None never serializes as null
+    assert envelope.model_dump()["params"] == params
+    if "signer" not in params:
+        assert envelope.params.signer is None  # handler default applies
+
+
+def test_accept_sign_tx_tx_ref_bounds():
+    ok_min = validate_payload({"v": 0, "intent": "sign_tx", "params": {"tx_ref": "a"}})
+    assert ok_min.params.tx_ref == "a"
+    ok_max = validate_payload(
+        {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "x" * MAX_TX_REF_CHARS}}
+    )
+    assert ok_max.params.tx_ref == "x" * MAX_TX_REF_CHARS
+
+
+def test_sign_tx_signer_is_the_closed_enum():
+    assert SIGNER_CHOICES == ("file", "hwi")
+    for bad in ("ledger", "FILE", "Hwi", 1, True, ["file"], {"signer": "file"}):
+        expect_rejected({"v": 0, "intent": "sign_tx", "params": {"tx_ref": "abc", "signer": bad}})
+    # explicit null is rejected too — omission is expressed by leaving the key out
+    expect_rejected({"v": 0, "intent": "sign_tx", "params": {"tx_ref": "abc", "signer": None}})
+
+
+def test_accept_broadcast_tx_and_ref_bounds():
+    ok = validate_payload({"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "3f2a9c"}})
+    assert isinstance(ok.params, BroadcastTxParams)
+    ok_min = validate_payload({"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "a"}})
+    assert ok_min.params.tx_ref == "a"
+    ok_max = validate_payload(
+        {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "x" * MAX_TX_REF_CHARS}}
+    )
+    assert ok_max.params.tx_ref == "x" * MAX_TX_REF_CHARS
+
+
+def test_accept_tx_status_txid_and_constants():
+    ok = validate_payload({"v": 0, "intent": "tx_status", "params": {"txid": "b" * 64}})
+    assert isinstance(ok.params, TxStatusParams)
+    assert ok.params.txid == "b" * 64
+    assert TXID_LENGTH_CHARS == 64
+
+
+@pytest.mark.parametrize(
+    ("txid", "expect_failures"),
+    [
+        ("a" * 64, False),
+        ("0123456789abcdef" * 4, False),
+        # DECIDE (documented in ADR-0002 Phase 3): lowercase-only strict —
+        # uppercase hex is rejected, never silently normalized.
+        ("A" * 64, True),
+        ("a" * 32 + "B" * 32, True),
+        ("a" * 63, True),
+        ("a" * 65, True),
+        ("", True),
+        (" " * 64, True),
+        ("g" * 64, True),
+        ("../" + "a" * 61, True),
+        ("a" * 64 + " ", True),
+        ("a" * 32 + "/" + "a" * 31, True),
+        ("á" * 64, True),
+        ("a" * 20 + ";" * 44, True),
+    ],
+    ids=[
+        "valid", "valid-mixed-digits", "uppercase", "mixed-case", "short-63",
+        "long-65", "empty", "spaces", "non-hex", "traversal", "trailing-ws",
+        "slash", "unicode", "semicolons",
+    ],
+)
+def test_business_rule_tx_status_charset(txid: str, expect_failures: bool):
+    """``tx_status`` rules: EXACTLY 64 lowercase hex — the URL-path guard.
+
+    The txid is user/model-supplied data interpolated into a request path
+    by the chain layer; the strict charset check is the injection guard
+    (fail closed, value-free: the txid itself is never echoed).
+    """
+    env = validate_payload({"v": 0, "intent": "tx_status", "params": {"txid": txid}})
+    failures = BUSINESS_RULES[IntentName.TX_STATUS](env.params)
+    assert bool(failures) is expect_failures
+    for failure in failures:
+        assert failure == "params.txid must be exactly 64 lowercase hexadecimal characters"
+        if txid:  # value-free (the empty string is vacuously "in" anything)
+            assert txid not in failure
+
+
+def test_business_rule_tx_status_bypass_and_error_path():
+    """The charset rule also holds for validation-skipping constructors and
+    surfaces value-free through handle_raw."""
+    for bad in ("A" * 64, "a" * 63, "", "../etc/passwd".ljust(64, "a")):
+        bypass = TxStatusParams.model_construct(txid=bad)
+        assert BUSINESS_RULES[IntentName.TX_STATUS](bypass) == [
+            "params.txid must be exactly 64 lowercase hexadecimal characters"
+        ]
+        table, _ = make_table()
+        outcome = handle_raw(
+            {"v": 0, "intent": "tx_status", "params": {"txid": bad}}, table
+        )
+        assert outcome.status is OutcomeStatus.NEEDS_RETRY
+        assert outcome.error is not None
+        if bad:  # value-free end to end (empty string is vacuously present)
+            assert bad not in outcome.error.error.detail
+
+
+@pytest.mark.parametrize(
+    ("tx_ref", "expect_failures"),
+    [
+        ("abc123", False),
+        ("   ", True),
+        ("a\x00b", True),
+        ("line\nbreak", True),
+    ],
+    ids=["hex", "blank", "nul", "newline"],
+)
+@pytest.mark.parametrize("intent", [IntentName.SIGN_TX, IntentName.BROADCAST_TX])
+def test_business_rule_sign_broadcast_tx_ref_shape(intent: IntentName, tx_ref: str, expect_failures: bool):
+    """sign_tx/broadcast_tx rules check tx_ref SHAPE only (as confirm_tx).
+
+    Content matching is the flow's job; the signer enum is layer 2.
+    """
+    params_model = SignTxParams if intent is IntentName.SIGN_TX else BroadcastTxParams
+    env = validate_payload({"v": 0, "intent": intent.value, "params": {"tx_ref": tx_ref}})
+    assert isinstance(env.params, params_model)
+    failures = BUSINESS_RULES[intent](env.params)
+    assert bool(failures) is expect_failures
+    assert all("tx_ref" in f for f in failures)
+
+
+def test_business_rule_sign_broadcast_bypass_shape():
+    """Empty/control-char tx_refs are caught even by bypassed constructors."""
+    for intent, params_model, name in (
+        (IntentName.SIGN_TX, SignTxParams, "sign_tx"),
+        (IntentName.BROADCAST_TX, BroadcastTxParams, "broadcast_tx"),
+    ):
+        empty = params_model.model_construct(tx_ref="")
+        assert BUSINESS_RULES[intent](empty) == [
+            "params.tx_ref must be a non-empty transaction reference"
+        ], name
+        nul = params_model.model_construct(tx_ref="a\x00b")
+        assert BUSINESS_RULES[intent](nul) == [
+            "params.tx_ref must contain only printable characters"
+        ], name
+
+
 def test_phase2_intents_fail_closed_without_handlers():
     """ADR-0013 consequence: until TCK-P2-004 wires handlers, a fully valid
     create_tx/confirm_tx envelope dispatches to dispatch_error — never a
@@ -631,6 +811,22 @@ def test_phase2_intents_fail_closed_without_handlers():
     del table[IntentName.CREATE_TX]
     del table[IntentName.CONFIRM_TX]
     for key in ("create_tx", "confirm_tx"):
+        outcome = handle_raw(ACCEPT_CASES[key], table)
+        assert outcome.status is OutcomeStatus.REJECTED
+        assert outcome.error is not None
+        assert outcome.error.error.code is ErrorCode.DISPATCH_ERROR
+        assert "no handler registered" in outcome.error.error.detail
+
+
+def test_phase3_intents_fail_closed_without_handlers():
+    """ADR-0002 Phase 3 consequence: until TCK-P3-005 wires handlers, a
+    fully valid sign_tx/broadcast_tx/tx_status envelope dispatches to
+    dispatch_error — never a silent no-op, never a network call."""
+    table, _ = make_table()
+    del table[IntentName.SIGN_TX]
+    del table[IntentName.BROADCAST_TX]
+    del table[IntentName.TX_STATUS]
+    for key in ("sign_tx", "broadcast_tx", "tx_status"):
         outcome = handle_raw(ACCEPT_CASES[key], table)
         assert outcome.status is OutcomeStatus.REJECTED
         assert outcome.error is not None
@@ -734,6 +930,34 @@ REJECT_MATRIX = [
     ("confirm_tx_extra_key", {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "abc", "decision": "yes"}}),
     ("confirm_tx_missing", {"v": 0, "intent": "confirm_tx", "params": {}}),
     ("confirm_tx_create_tx_keys", {"v": 0, "intent": "confirm_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546}}),
+    # Phase 3 v0 extension: sign_tx / broadcast_tx / tx_status rejects (schema layer)
+    ("sign_tx_empty", {"v": 0, "intent": "sign_tx", "params": {"tx_ref": ""}}),
+    ("sign_tx_overlong", {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "x" * 65}}),
+    ("sign_tx_not_string", {"v": 0, "intent": "sign_tx", "params": {"tx_ref": 7}}),
+    ("sign_tx_null", {"v": 0, "intent": "sign_tx", "params": {"tx_ref": None}}),
+    ("sign_tx_missing", {"v": 0, "intent": "sign_tx", "params": {}}),
+    ("sign_tx_extra_key", {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "abc", "device": "ledger"}}),
+    ("sign_tx_signer_invalid", {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "abc", "signer": "ledger"}}),
+    ("sign_tx_signer_case", {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "abc", "signer": "FILE"}}),
+    ("sign_tx_signer_number", {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "abc", "signer": 1}}),
+    ("sign_tx_signer_null", {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "abc", "signer": None}}),
+    ("sign_tx_wrong_intent_key", {"v": 0, "intent": "sign_tx", "params": {"txid": "a" * 64}}),
+    ("broadcast_tx_empty", {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": ""}}),
+    ("broadcast_tx_overlong", {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "x" * 65}}),
+    ("broadcast_tx_not_string", {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": 7}}),
+    ("broadcast_tx_null", {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": None}}),
+    ("broadcast_tx_missing", {"v": 0, "intent": "broadcast_tx", "params": {}}),
+    ("broadcast_tx_extra_key", {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "abc", "signed": True}}),
+    ("broadcast_tx_signer_key", {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "abc", "signer": "hwi"}}),
+    ("broadcast_tx_wrong_intent_key", {"v": 0, "intent": "broadcast_tx", "params": {"txid": "a" * 64}}),
+    # txid charset (uppercase/63/65/empty) is the LAYER-3 rule's job — the
+    # schema admits any string; see test_business_rule_tx_status_charset.
+    ("tx_status_not_string", {"v": 0, "intent": "tx_status", "params": {"txid": 7}}),
+    ("tx_status_bool", {"v": 0, "intent": "tx_status", "params": {"txid": True}}),
+    ("tx_status_null", {"v": 0, "intent": "tx_status", "params": {"txid": None}}),
+    ("tx_status_missing", {"v": 0, "intent": "tx_status", "params": {}}),
+    ("tx_status_extra_key", {"v": 0, "intent": "tx_status", "params": {"txid": "a" * 64, "verbose": True}}),
+    ("tx_status_wrong_intent_key", {"v": 0, "intent": "tx_status", "params": {"tx_ref": "abc"}}),
     # raw JSON documents that are not envelopes
     ("invalid_json", "{oops"),
     ("json_array", "[1, 2]"),
@@ -888,6 +1112,9 @@ def test_invalid_json_yields_error_envelope_not_raw_exception():
         IntentName.NEW_ADDRESS,
         IntentName.CREATE_TX,
         IntentName.CONFIRM_TX,
+        IntentName.SIGN_TX,
+        IntentName.BROADCAST_TX,
+        IntentName.TX_STATUS,
     ],
     ids=[
         "respond",
@@ -898,6 +1125,9 @@ def test_invalid_json_yields_error_envelope_not_raw_exception():
         "new_address",
         "create_tx",
         "confirm_tx",
+        "sign_tx",
+        "broadcast_tx",
+        "tx_status",
     ],
 )
 def test_dispatch_routes_each_intent_to_its_handler(intent: IntentName):
@@ -975,6 +1205,9 @@ def test_dispatch_handler_exception_surfaces_not_swallowed():
         IntentName.NEW_ADDRESS,
         IntentName.CREATE_TX,
         IntentName.CONFIRM_TX,
+        IntentName.SIGN_TX,
+        IntentName.BROADCAST_TX,
+        IntentName.TX_STATUS,
     ],
     ids=[
         "respond",
@@ -985,6 +1218,9 @@ def test_dispatch_handler_exception_surfaces_not_swallowed():
         "new_address",
         "create_tx",
         "confirm_tx",
+        "sign_tx",
+        "broadcast_tx",
+        "tx_status",
     ],
 )
 def test_handle_raw_ok_path_per_intent(intent: IntentName):

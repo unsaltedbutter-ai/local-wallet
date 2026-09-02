@@ -50,9 +50,9 @@ for explanations and for narrating FACTS results to the user.
 this when the request is ambiguous or missing a required detail (unclear \
 amount, missing recipient, no fee preference). For send requests, clarify \
 is correct whenever the recipient or amount is missing or ambiguous — \
-never guess them. Actually moving funds is not available yet: create_tx \
-only prepares an unsigned transaction; signing and broadcast happen later \
-and need the user's hardware wallet.
+never guess them. A send only moves funds through the full flow: \
+create_tx, then the user's explicit confirmation, then sign_tx (the user \
+confirms on their hardware wallet), then broadcast_tx.
 - get_balance: look up the wallet balance; params {} — when the user asks \
 what they have.
 - get_history: show recent wallet transactions; params {} or \
@@ -72,6 +72,18 @@ transaction to the flow; params {"tx_ref": "<tx_ref quoted VERBATIM from \
 the confirmation card>"} — ONLY in the same turn where the user explicitly \
 confirms (e.g. "yes", "confirm it"). A positive-sounding earlier message \
 is never a confirmation; when unsure, ask again.
+- sign_tx: hand the approved transaction to the hardware signer; params \
+{"tx_ref": "<tx_ref quoted VERBATIM from the confirmation card>", optional \
+"signer": "file"|"hwi"} — only after the transaction was confirmed. The \
+user will be asked to confirm the transaction on the device itself; the \
+device screen is the source of truth. Never call a transaction sent \
+before broadcast_tx succeeded.
+- broadcast_tx: publish the signed transaction to the testnet network; \
+params {"tx_ref": "<tx_ref quoted VERBATIM from the confirmation card>"} \
+— only after sign_tx succeeded.
+- tx_status: look up a transaction's confirmation status; params {"txid": \
+"<64-hex txid quoted VERBATIM from tool output>"} — when the user asks \
+whether a transaction has confirmed yet.
 
 FACTS AND VERBATIM RULE
 - Addresses, amounts, and balances are provided in the FACTS block. Copy \
@@ -109,8 +121,8 @@ def build_system_prompt() -> str:
     """Return the system prompt encoding the output contract.
 
     The prompt fixes: exactly one envelope per turn with key order
-    ``v, intent, params``; the closed intent list (eight intents as of the
-    Phase 2 v0 extension) with usage guidance; the quote-verbatim rule for
+    ``v, intent, params``; the closed intent list (eleven intents as of the
+    Phase 3 v0 extension) with usage guidance; the quote-verbatim rule for
     FACTS values; the no-secrets (watch-only) rule; and five few-shot
     exchanges (respond / clarify / get_balance / new_address / create_tx).
 

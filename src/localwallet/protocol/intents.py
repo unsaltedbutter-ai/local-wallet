@@ -11,9 +11,12 @@ and :data:`INTENT_REGISTRY`, re-exported here); this module is layer 3 —
 ``(params_model) -> list[str]``. Pydantic already bounds types and lengths;
 business rules re-check meaning-level properties (non-blank text; for
 ``create_tx``: the recipient is a valid testnet witness-v0 P2WPKH bech32
-address per ADR-0008 and the amount XOR; for ``confirm_tx``: the ``tx_ref``
-shape) and return error strings for the dispatcher to surface. An empty
-list means valid.
+address per ADR-0008 and the amount XOR; for ``confirm_tx``/``sign_tx``/
+``broadcast_tx``: the ``tx_ref`` shape; for ``tx_status``: the ``txid`` is
+EXACTLY 64 lowercase hex characters — the strict charset check that guards
+the URL path this user/model-supplied value is interpolated into) and
+return error strings for the dispatcher to surface. An empty list means
+valid.
 
 Adding rules never widens the model's freedom: rules only reject, they
 never transform or execute.
@@ -42,7 +45,9 @@ from localwallet.protocol.envelope import (
     MAX_AMOUNT_USD,
     MIN_AMOUNT_SATS,
     MIN_AMOUNT_USD,
+    TXID_LENGTH_CHARS,
     BaseParams,
+    BroadcastTxParams,
     ClarifyParams,
     ConfirmTxParams,
     CreateTxParams,
@@ -52,6 +57,8 @@ from localwallet.protocol.envelope import (
     IntentName,
     NewAddressParams,
     RespondParams,
+    SignTxParams,
+    TxStatusParams,
 )
 
 __all__ = [
@@ -206,22 +213,82 @@ def _rule_create_tx(params: BaseParams) -> list[str]:
     return _recipient_rule_failure(params)
 
 
-def _rule_confirm_tx(params: BaseParams) -> list[str]:
-    """``confirm_tx``: ``tx_ref`` shape only — never content matching.
+def _tx_ref_shape_failures(field: str, value: str) -> list[str]:
+    """Shared ``tx_ref`` shape rule (confirm_tx / sign_tx / broadcast_tx).
 
     The reference must be non-empty (after stripping whitespace) and
-    printable (no control characters). Whether it names the actual pending
-    transaction is decided by the dispatcher-owned flow
-    (:mod:`localwallet.tx.flow`), not by rules — and even a matching
-    reference only moves the flow when the same-turn user utterance passed
-    the deterministic confirm gate (ADR-0013).
+    printable (no control characters). Whether it names the actual
+    pending/confirmed/signed transaction is decided by the dispatcher-owned
+    flow (:mod:`localwallet.tx.flow`), not by rules — and for ``confirm_tx``
+    even a matching reference only moves the flow when the same-turn user
+    utterance passed the deterministic confirm gate (ADR-0013).
     """
+    if not value.strip():
+        return [f"params.{field} must be a non-empty transaction reference"]
+    if not value.isprintable():
+        return [f"params.{field} must contain only printable characters"]
+    return []
+
+
+def _rule_confirm_tx(params: BaseParams) -> list[str]:
+    """``confirm_tx``: ``tx_ref`` shape only — never content matching."""
     if not isinstance(params, ConfirmTxParams):
         return ["internal: 'confirm_tx' params failed the type check"]
-    if not params.tx_ref.strip():
-        return ["params.tx_ref must be a non-empty transaction reference"]
-    if not params.tx_ref.isprintable():
-        return ["params.tx_ref must contain only printable characters"]
+    return _tx_ref_shape_failures("tx_ref", params.tx_ref)
+
+
+def _rule_sign_tx(params: BaseParams) -> list[str]:
+    """``sign_tx``: ``tx_ref`` shape only (same convention as confirm_tx).
+
+    ``signer`` needs no rule here: it is enum-validated at layer 2, and
+    omission means the handler applies its default signer policy. The flow
+    (:mod:`localwallet.tx.flow`) refuses the transition unless the state is
+    CONFIRMED with a matching ``tx_ref``; the device interaction itself is
+    the user action (trust anchor: the hardware wallet screen, §9).
+    """
+    if not isinstance(params, SignTxParams):
+        return ["internal: 'sign_tx' params failed the type check"]
+    return _tx_ref_shape_failures("tx_ref", params.tx_ref)
+
+
+def _rule_broadcast_tx(params: BaseParams) -> list[str]:
+    """``broadcast_tx``: ``tx_ref`` shape only (same convention as confirm_tx).
+
+    The flow refuses broadcast unless the state is SIGNED with a matching
+    ``tx_ref``, and the handler must additionally have completed signed-PSBT
+    re-validation (:mod:`localwallet.tx.revalidate`) — those gates are the
+    broadcast discipline (ADR-0013); rules check shape only.
+    """
+    if not isinstance(params, BroadcastTxParams):
+        return ["internal: 'broadcast_tx' params failed the type check"]
+    return _tx_ref_shape_failures("tx_ref", params.tx_ref)
+
+
+#: The strict lowercase-hex charset of a transaction id (no uppercase: the
+#: contract is lowercase-only so a txid quoted by the model can be compared
+#: verbatim and interpolated into request paths without normalization).
+_TXID_CHARSET: frozenset[str] = frozenset("0123456789abcdef")
+
+
+def _rule_tx_status(params: BaseParams) -> list[str]:
+    """``tx_status``: ``txid`` must be EXACTLY 64 lowercase hex characters.
+
+    Strict charset check, fail closed: this user/model-supplied value is
+    interpolated into a request URL path by the chain layer
+    (``localwallet.chain.esplora.get_tx_status``), so the charset check IS
+    the injection guard — uppercase hex, whitespace, ``../`` traversal
+    fragments, unicode, and wrong lengths are all rejected here, before any
+    URL is ever constructed. The GBNF ``hex_txid`` rule pins the identical
+    shape at decode time; this layer is the authority for non-grammar
+    producers. Value-free failures: the txid itself is never echoed.
+    """
+    if not isinstance(params, TxStatusParams):
+        return ["internal: 'tx_status' params failed the type check"]
+    txid = params.txid
+    if len(txid) != TXID_LENGTH_CHARS or not set(txid) <= _TXID_CHARSET:
+        return [
+            "params.txid must be exactly 64 lowercase hexadecimal characters"
+        ]
     return []
 
 
@@ -239,5 +306,8 @@ BUSINESS_RULES: Mapping[IntentName, BusinessRule] = MappingProxyType(
         IntentName.NEW_ADDRESS: _rule_new_address,
         IntentName.CREATE_TX: _rule_create_tx,
         IntentName.CONFIRM_TX: _rule_confirm_tx,
+        IntentName.SIGN_TX: _rule_sign_tx,
+        IntentName.BROADCAST_TX: _rule_broadcast_tx,
+        IntentName.TX_STATUS: _rule_tx_status,
     }
 )

@@ -1,16 +1,23 @@
 """Tests for the dispatcher-owned send-flow state machine and confirm gate
-(TCK-P2-003 — the destructive-flow safety core, ADR-0013).
+(TCK-P2-003 — the destructive-flow safety core, ADR-0013; Phase 3 SIGNED/
+BROADCAST extension TCK-P3-004).
 
 The suite pins:
 
 1. **Flow transitions** — the full table from the flow module docstring:
    happy path IDLE→CREATED→CONFIRMED, create-while-pending refusal, wrong
    ``tx_ref`` refusal, cancel/reset/expiry transitions, and re-entry from
-   every terminal state.
+   every terminal state; plus the Phase 3 extension CONFIRMED→SIGNED→
+   BROADCAST (matching-``tx_ref`` only, no skip paths — broadcast from
+   CONFIRMED is refused, re-sign after SIGNED is refused, re-broadcast
+   after BROADCAST is refused) and the exhaustive state×transition table.
 2. **The core invariant** — ``confirm`` is refused when the same-turn gate
    decision is not CONFIRM, even with a matching ``tx_ref`` and a fresh
    pending transaction: an LLM "yes" never counts as user confirmation
    (PROJECT.md §8.6). Tested prominently and per non-confirm decision.
+   Signing deliberately has NO utterance gate: the device interaction IS
+   the user action (§9 trust anchor) — the flow still demands the
+   CONFIRMED state plus a matching ``tx_ref``.
 3. **Deterministic gate classification** — every whitelist entry, multi-
    token utterances, mixed signals → AMBIGUOUS, chat sentences →
    NOT_A_DECISION, case/punctuation insensitivity, and property tests
@@ -39,6 +46,7 @@ from localwallet.tx.flow import (
     FlowError,
     GateDecision,
     PendingTx,
+    SignedTx,
     TxFlow,
     TxFlowStatus,
 )
@@ -287,6 +295,326 @@ def test_reset_from_idle_is_a_noop_and_from_created_is_refused():
     with pytest.raises(FlowError, match="already pending"):
         flow.reset()
     assert flow.state is TxFlowStatus.CREATED, "reset must not abandon a live pending"
+
+
+# --------------------------------------------- Phase 3: SIGNED / BROADCAST
+
+SIGNED_PSBT = "cHNidP8BAFICAAAAAane-signed-payload"
+
+
+def drive_to_confirmed(flow: TxFlow) -> PendingTx:
+    """Stage + dual-key confirm; returns the confirmed record."""
+    pending = stage(flow)
+    return flow.confirm(pending.tx_ref, gate_decision=GateDecision.CONFIRM, at=T0 + 5)
+
+
+def drive_to_signed(flow: TxFlow) -> SignedTx:
+    """Stage + confirm + mark_signed; returns the signed record."""
+    drive_to_confirmed(flow)
+    return flow.mark_signed("ref-1", SIGNED_PSBT)
+
+
+def test_full_lifecycle_idle_created_confirmed_signed_broadcast():
+    flow, _ = make_flow()
+    pending = drive_to_confirmed(flow)
+    assert flow.state is TxFlowStatus.CONFIRMED
+    assert flow.confirmed is pending, "CONFIRMED holds the approved tx"
+
+    signed = flow.mark_signed(pending.tx_ref, SIGNED_PSBT)
+    assert flow.state is TxFlowStatus.SIGNED
+    assert flow.signed is signed
+    assert signed.tx_ref == pending.tx_ref
+    assert signed.psbt_base64 == SIGNED_PSBT
+    assert flow.confirmed is pending, "the approved record is retained for re-validation"
+
+    txid = "a" * 64
+    recorded = flow.broadcast(pending.tx_ref, txid)
+    assert flow.state is TxFlowStatus.BROADCAST
+    assert recorded == txid
+    assert flow.txid == txid
+    assert flow.confirmed is pending and flow.signed is signed
+    # BROADCAST is terminal → reset → IDLE, records cleared, fresh flow works
+    flow.reset()
+    assert flow.state is TxFlowStatus.IDLE
+    assert flow.confirmed is None and flow.signed is None and flow.txid is None
+    assert stage(flow).tx_ref == "ref-2"
+
+
+def test_mark_signed_from_created_is_refused_no_skip_path():
+    """Signing requires CONFIRMED: the CREATED state cannot skip the gate."""
+    flow, _ = make_flow()
+    pending = stage(flow)
+    with pytest.raises(FlowError, match="no confirmed transaction"):
+        flow.mark_signed(pending.tx_ref, SIGNED_PSBT)
+    assert flow.state is TxFlowStatus.CREATED
+    assert flow.pending is pending
+    assert flow.signed is None
+
+
+def test_mark_signed_wrong_tx_ref_refused_state_unchanged():
+    flow, _ = make_flow()
+    drive_to_confirmed(flow)
+    with pytest.raises(FlowError, match="does not match"):
+        flow.mark_signed("ref-999", SIGNED_PSBT)
+    assert flow.state is TxFlowStatus.CONFIRMED
+    assert flow.signed is None
+
+
+def test_mark_signed_value_hygiene():
+    flow, _ = make_flow()
+    drive_to_confirmed(flow)
+    for bad_psbt in ("", None, 123):
+        with pytest.raises(FlowError, match="non-empty string"):
+            flow.mark_signed("ref-1", bad_psbt)  # type: ignore[arg-type]
+    assert flow.state is TxFlowStatus.CONFIRMED
+
+
+def test_re_sign_after_signed_is_refused():
+    """A signed record is immutable state: re-signing is refused."""
+    flow, _ = make_flow()
+    drive_to_signed(flow)
+    with pytest.raises(FlowError, match="no confirmed transaction"):
+        flow.mark_signed("ref-1", "cHNidP8-resigned")
+    assert flow.state is TxFlowStatus.SIGNED
+    assert flow.signed.psbt_base64 == SIGNED_PSBT, "the original record is untouched"
+
+
+def test_mark_signed_from_non_confirmed_states_is_refused():
+    # IDLE
+    flow, _ = make_flow()
+    with pytest.raises(FlowError, match="no confirmed transaction"):
+        flow.mark_signed("ref-1", SIGNED_PSBT)
+    # CANCELLED
+    flow2, _ = make_flow()
+    stage(flow2)
+    flow2.cancel()
+    with pytest.raises(FlowError, match="no confirmed transaction"):
+        flow2.mark_signed("ref-1", SIGNED_PSBT)
+    # EXPIRED
+    flow3, _ = make_flow()
+    stage(flow3)
+    with pytest.raises(FlowError, match="expired"):
+        flow3.confirm("ref-1", gate_decision=GateDecision.CONFIRM, at=T0 + PENDING_TTL_S + 1)
+    with pytest.raises(FlowError, match="no confirmed transaction"):
+        flow3.mark_signed("ref-1", SIGNED_PSBT)
+
+
+def test_broadcast_from_confirmed_is_refused_no_skip_path():
+    """THE no-skip invariant: broadcast from CONFIRMED is refused — an
+    un-signed (hence un-revalidated) transaction must never reach the
+    network; there is no path past the SIGNED state."""
+    flow, _ = make_flow()
+    pending = drive_to_confirmed(flow)
+    with pytest.raises(FlowError, match="no signed transaction"):
+        flow.broadcast(pending.tx_ref, "a" * 64)
+    assert flow.state is TxFlowStatus.CONFIRMED
+    assert flow.txid is None
+
+
+def test_broadcast_wrong_tx_ref_and_value_hygiene_refused():
+    flow, _ = make_flow()
+    drive_to_signed(flow)
+    with pytest.raises(FlowError, match="does not match"):
+        flow.broadcast("ref-999", "a" * 64)
+    for bad_txid in ("", None, 7):
+        with pytest.raises(FlowError, match="non-empty string"):
+            flow.broadcast("ref-1", bad_txid)  # type: ignore[arg-type]
+    assert flow.state is TxFlowStatus.SIGNED
+    assert flow.txid is None
+
+
+def test_re_broadcast_after_broadcast_is_refused():
+    flow, _ = make_flow()
+    drive_to_signed(flow)
+    flow.broadcast("ref-1", "a" * 64)
+    with pytest.raises(FlowError, match="no signed transaction"):
+        flow.broadcast("ref-1", "b" * 64)
+    assert flow.state is TxFlowStatus.BROADCAST
+    assert flow.txid == "a" * 64, "the recorded txid is untouched"
+
+
+def test_broadcast_from_non_signed_states_is_refused():
+    # IDLE
+    flow, _ = make_flow()
+    with pytest.raises(FlowError, match="no signed transaction"):
+        flow.broadcast("ref-1", "a" * 64)
+    # CREATED
+    flow2, _ = make_flow()
+    stage(flow2)
+    with pytest.raises(FlowError, match="no signed transaction"):
+        flow2.broadcast("ref-1", "a" * 64)
+
+
+def test_cancel_after_confirm_is_refused_signed_means_committed():
+    """cancel stays CREATED-only: past CONFIRMED the user's decision is
+    committed, and signed means committed to signing — no chat-level undo."""
+    flow, _ = make_flow()
+    drive_to_confirmed(flow)
+    with pytest.raises(FlowError, match="no pending transaction"):
+        flow.cancel()
+    assert flow.state is TxFlowStatus.CONFIRMED
+    flow.mark_signed("ref-1", SIGNED_PSBT)
+    with pytest.raises(FlowError, match="no pending transaction"):
+        flow.cancel()
+    assert flow.state is TxFlowStatus.SIGNED
+
+
+def test_reset_from_signed_and_broadcast_returns_to_idle():
+    # SIGNED → reset
+    flow, _ = make_flow()
+    drive_to_signed(flow)
+    flow.reset()
+    assert flow.state is TxFlowStatus.IDLE
+    assert flow.confirmed is None and flow.signed is None and flow.txid is None
+    # BROADCAST → reset
+    flow2, _ = make_flow()
+    drive_to_signed(flow2)
+    flow2.broadcast("ref-1", "a" * 64)
+    flow2.reset()
+    assert flow2.state is TxFlowStatus.IDLE
+
+
+def test_create_from_live_record_states_is_refused():
+    """A second flow must never silently abandon a live record: create is
+    refused from CONFIRMED/SIGNED/BROADCAST (explicit reset is the path)."""
+    for setup in (drive_to_confirmed, drive_to_signed):
+        flow, _ = make_flow()
+        setup(flow)
+        with pytest.raises(FlowError, match="already in flight"):
+            stage(flow)
+    flow3, _ = make_flow()
+    drive_to_signed(flow3)
+    flow3.broadcast("ref-1", "a" * 64)
+    with pytest.raises(FlowError, match="already in flight"):
+        stage(flow3)
+    # explicit reset frees the flow
+    flow3.reset()
+    stage(flow3)
+    assert flow3.state is TxFlowStatus.CREATED
+
+
+def test_signed_record_is_frozen():
+    flow, _ = make_flow()
+    signed = drive_to_signed(flow)
+    with pytest.raises(AttributeError):
+        signed.psbt_base64 = "tampered"  # type: ignore[misc]
+
+
+def test_signed_broadcast_errors_never_echo_refs_or_values():
+    """Phase 3 refusal messages are value-free: no tx_ref, no PSBT, no txid.
+
+    The flow's txid check is value hygiene only (non-empty string) — the
+    charset authority is the chain layer, which re-validates the broadcast
+    response as 64 lowercase hex before the flow ever sees it.
+    """
+    flow, _ = make_flow()
+    drive_to_confirmed(flow)
+    secret_ref = "DEADBEEF-SENTINEL-REF"
+    with pytest.raises(FlowError) as wrong:
+        flow.mark_signed(secret_ref, SIGNED_PSBT)
+    assert secret_ref not in str(wrong.value)
+    assert SIGNED_PSBT not in str(wrong.value)
+    flow.mark_signed("ref-1", SIGNED_PSBT)
+    # wrong ref at broadcast: refused, ref never echoed
+    with pytest.raises(FlowError) as bad_state:
+        flow.broadcast(secret_ref, "a" * 64)
+    assert secret_ref not in str(bad_state.value)
+    # a hostile txid *value* cannot leak via a state refusal either
+    with pytest.raises(FlowError) as bad_state2:
+        flow.broadcast(secret_ref, "DEADBEEF-SENTINEL-TXID")
+    assert "DEADBEEF-SENTINEL-TXID" not in str(bad_state2.value)
+    # success records the chain-reported txid verbatim
+    recorded = flow.broadcast("ref-1", "a" * 64)
+    assert recorded == "a" * 64
+    assert flow.txid == "a" * 64
+
+
+def test_flow_state_table_exhaustive():
+    """Every state × every Phase-3-relevant transition, pinned to the
+    docstring table (allowed → new state; refused → FlowError, unchanged).
+
+    States are reached deterministically; each cell asserts the allowed
+    transition's exact result state or the refusal's state preservation.
+    """
+    TXID = "a" * 64
+
+    def fresh(state: TxFlowStatus) -> TxFlow:
+        flow, _ = make_flow()
+        if state is TxFlowStatus.CREATED:
+            stage(flow)
+        elif state is TxFlowStatus.CONFIRMED:
+            drive_to_confirmed(flow)
+        elif state is TxFlowStatus.SIGNED:
+            drive_to_signed(flow)
+        elif state is TxFlowStatus.BROADCAST:
+            drive_to_signed(flow)
+            flow.broadcast("ref-1", TXID)
+        elif state is TxFlowStatus.CANCELLED:
+            stage(flow)
+            flow.cancel()
+        elif state is TxFlowStatus.EXPIRED:
+            stage(flow)
+            with pytest.raises(FlowError):
+                flow.confirm("ref-1", gate_decision=GateDecision.CONFIRM, at=T0 + PENDING_TTL_S + 1)
+        assert flow.state is state
+        return flow
+
+    allowed_create = {TxFlowStatus.IDLE, TxFlowStatus.CANCELLED, TxFlowStatus.EXPIRED}
+    for state in TxFlowStatus:
+        # create
+        flow = fresh(state)
+        if state in allowed_create:
+            stage(flow)
+            assert flow.state is TxFlowStatus.CREATED
+        else:
+            with pytest.raises(FlowError):
+                stage(flow)
+            assert flow.state is state
+        # confirm (needs CREATED)
+        flow = fresh(state)
+        if state is TxFlowStatus.CREATED:
+            flow.confirm("ref-1", gate_decision=GateDecision.CONFIRM, at=T0 + 1)
+            assert flow.state is TxFlowStatus.CONFIRMED
+        else:
+            with pytest.raises(FlowError):
+                flow.confirm("ref-1", gate_decision=GateDecision.CONFIRM, at=T0 + 1)
+            assert flow.state is state
+        # mark_signed (needs CONFIRMED)
+        flow = fresh(state)
+        if state is TxFlowStatus.CONFIRMED:
+            flow.mark_signed("ref-1", SIGNED_PSBT)
+            assert flow.state is TxFlowStatus.SIGNED
+        else:
+            with pytest.raises(FlowError):
+                flow.mark_signed("ref-1", SIGNED_PSBT)
+            assert flow.state is state
+        # broadcast (needs SIGNED)
+        flow = fresh(state)
+        if state is TxFlowStatus.SIGNED:
+            flow.broadcast("ref-1", TXID)
+            assert flow.state is TxFlowStatus.BROADCAST
+        else:
+            with pytest.raises(FlowError):
+                flow.broadcast("ref-1", TXID)
+            assert flow.state is state
+        # cancel (needs CREATED)
+        flow = fresh(state)
+        if state is TxFlowStatus.CREATED:
+            flow.cancel()
+            assert flow.state is TxFlowStatus.CANCELLED
+        else:
+            with pytest.raises(FlowError):
+                flow.cancel()
+            assert flow.state is state
+        # reset (everywhere but CREATED)
+        flow = fresh(state)
+        if state is TxFlowStatus.CREATED:
+            with pytest.raises(FlowError):
+                flow.reset()
+            assert flow.state is TxFlowStatus.CREATED
+        else:
+            flow.reset()
+            assert flow.state is TxFlowStatus.IDLE
 
 
 def test_flow_error_is_a_tx_engine_error():

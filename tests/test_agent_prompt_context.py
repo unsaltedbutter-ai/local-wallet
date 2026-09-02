@@ -180,11 +180,12 @@ class TestSystemPrompt:
         for intent in IntentName:
             assert intent.value in prompt
 
-    def test_contains_all_eight_intent_names(self) -> None:
+    def test_contains_all_eleven_intent_names(self) -> None:
         # Explicit pin (not just enum iteration): the Phase 1 v0 extension
-        # added get_history / get_utxos / new_address and the Phase 2 v0
-        # extension added create_tx / confirm_tx — grammar, schema and
-        # prompt must move together (ADR-0002/0013 cross-reference rule).
+        # added get_history / get_utxos / new_address, the Phase 2 v0
+        # extension added create_tx / confirm_tx, and the Phase 3 v0
+        # extension added sign_tx / broadcast_tx / tx_status — grammar,
+        # schema and prompt must move together (ADR-0002/0013 lockstep).
         prompt = build_system_prompt()
         for name in (
             "respond",
@@ -195,6 +196,9 @@ class TestSystemPrompt:
             "new_address",
             "create_tx",
             "confirm_tx",
+            "sign_tx",
+            "broadcast_tx",
+            "tx_status",
         ):
             assert name in prompt
 
@@ -225,12 +229,17 @@ class TestSystemPrompt:
         prompt = build_system_prompt()
         assert "send 20 to my brother" in prompt
 
-    def test_clarify_guidance_covers_phase1_send_unavailability(self) -> None:
-        # Send is not an intent in Phase 1: the prompt must tell the model
-        # that clarify is correct for send requests.
+    def test_clarify_guidance_covers_send_flow_truthfully(self) -> None:
+        # The prompt must tell the model that clarify is correct for send
+        # requests — and (Phase 3, TCK-P3-004) describe the destructive
+        # lifecycle TRUTHFULLY: funds move only through the full flow
+        # (create → explicit user confirmation → sign on the hardware
+        # wallet → broadcast), never by the model's say-so.
         prompt = build_system_prompt().lower()
-        assert "not available yet" in prompt
         assert "send requests" in prompt
+        assert "create_tx, then the user's explicit confirmation" in prompt
+        assert "sign_tx" in prompt
+        assert "broadcast_tx" in prompt
 
     def test_every_few_shot_envelope_is_a_valid_envelope(self) -> None:
         """Few-shots are contract examples: each must validate end-to-end.

@@ -224,3 +224,49 @@ bump**:
 - Handler wiring and golden eval fixtures land in TCK-P2-004 / TCK-P2-005;
   until then a valid new-intent envelope surfaces `dispatch_error` ("no
   handler registered"), which is the intended fail-closed behavior.
+
+## v0 extensions (2026-09, Phase 3 — ticket TCK-P3-004)
+
+Phase 3 extended the closed intent enum with the remaining send-flow steps
+plus the status lookup (ADR-0013 flow extension): `sign_tx`,
+`broadcast_tx`, `tx_status` — registry of ELEVEN. This is a
+**backward-compatible extension of v0, not a version bump** (same bump-policy
+reasoning as the Phase 1/2 extensions: adding enum members and
+required/optional-key params shapes only widens the accepted set, `v` stays
+`0`, no previously-valid envelope is invalidated):
+
+- Final params contract:
+  - `sign_tx` → `{"tx_ref": str, 1..64}` plus optional
+    `{"signer": "file"|"hwi"}` (closed enum; omitted ⇒ the handler applies
+    its default signer policy — the signer choice beyond this enum is a
+    handler/app decision, never model-chosen; explicit `null` is rejected).
+    The device interaction IS the user action: the hardware-wallet screen
+    is the trust anchor (PROJECT.md §9), so no chat-utterance gate exists
+    at the flow level for signing.
+  - `broadcast_tx` → `{"tx_ref": str, 1..64}` — references the SIGNED flow
+    record; the flow refuses broadcast unless the state is `SIGNED` with a
+    matching reference, and the handler must have completed signed-PSBT
+    re-validation (`tx/revalidate.py`) before the chain call — a mismatch
+    is a hard stop.
+  - `tx_status` → `{"txid": str}` — schema layer admits any string; the
+    layer-3 business rule enforces EXACTLY 64 LOWERCASE hex characters
+    (strict charset, fail closed, lowercase-only by decision: quoted txids
+    stay verbatim-comparable and URL-safe without normalization). This
+    user/model-supplied value is interpolated into a request URL path, so
+    the charset check IS the injection guard; the GBNF grammar pins the
+    identical shape at decode time (`hex_txid ::= [0-9a-f]{64}`).
+- Grammar, schema, system prompt, and the flow moved in lockstep per the
+  cross-reference rule: new grammar branches in
+  `agent/grammar/envelope.gbnf` (signer enum tail optional via whole-tail
+  alternation, strict key order preserved; `hex_txid` bounded-repetition
+  character class), params models + `INTENT_REGISTRY` in
+  `protocol/envelope.py`, layer-3 rules in `protocol/intents.py`, the
+  prompt intent list in `agent/prompt.py`, and the `SIGNED`/`BROADCAST`
+  flow states in `tx/flow.py` (ADR-0013 amendment: dispatcher-owned
+  transitions, matching `tx_ref` from the immediately preceding state, no
+  skip paths — broadcast only from `SIGNED`).
+- Handler wiring and the full lifecycle land in TCK-P3-005; until then a
+  valid new-intent envelope surfaces `dispatch_error` ("no handler
+  registered"), which is the intended fail-closed behavior. Golden/redteam
+  eval fixtures for the new intents land with TCK-P3-006 (the eval-ship
+  obligation is recorded, not discharged, by this ticket).

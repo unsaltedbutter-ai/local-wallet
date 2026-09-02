@@ -1,4 +1,5 @@
-"""Dispatcher-owned send-flow state machine and confirm gate (TCK-P2-003).
+"""Dispatcher-owned send-flow state machine and confirm gate (TCK-P2-003,
+Phase 3 extension TCK-P3-004).
 
 The destructive send flow is a state machine, not model improvisation
 (PROJECT.md §8 invariant 6): the states and every transition live HERE, in
@@ -13,14 +14,19 @@ are injected: ``clock`` (monotonic-enough wall time as epoch seconds) and
 
 States and the transition table (``TxFlowStatus``)::
 
-    IDLE ──create──> CREATED ──confirm(ok)──> CONFIRMED ──reset──> IDLE
-                      │  │  └─confirm(expired)──> EXPIRED ──reset──> IDLE
-                      │  └────cancel────────────> CANCELLED ─reset──> IDLE
-                      └────create──> refused (FlowError, state unchanged)
+    IDLE ──create──> CREATED ──confirm(ok)──> CONFIRMED ──mark_signed──> SIGNED ──broadcast──> BROADCAST
+                       │  │  └─confirm(expired)──> EXPIRED ──reset──> IDLE
+                       │  └────cancel────────────> CANCELLED ─reset──> IDLE
+                       └────create──> refused (FlowError, state unchanged)
     IDLE/CANCELLED/EXPIRED ──create──> CREATED
     CREATED ──reset──> refused (confirm or cancel first — explicit, not janitor)
     IDLE ──reset──> IDLE (no-op)
     IDLE/CONFIRMED/CANCELLED/EXPIRED ──confirm/cancel──> refused (FlowError)
+    CONFIRMED/SIGNED/BROADCAST ──reset──> IDLE (terminal → empty)
+    CONFIRMED ──mark_signed──> SIGNED (requires matching tx_ref)
+    SIGNED ──broadcast──> BROADCAST (requires matching tx_ref; records txid)
+    sign from CREATED/SIGNED/IDLE/... ──> refused (FlowError, state unchanged)
+    broadcast from CONFIRMED/IDLE/BROADCAST/... ──> refused (FlowError)
 
 One pending transaction at a time: ``create`` from CREATED is refused
 (value-free FlowError), so two destructive flows can never interleave.
@@ -40,6 +46,31 @@ The caller (app layer, TCK-P2-004) passes the gate decision for the current
 turn into :meth:`TxFlow.confirm`; the flow refuses when the decision is not
 ``CONFIRM`` even with a matching ``tx_ref``. The classifier is deterministic
 app code — the user-utterance decision is never delegated to the model.
+
+PHASE 3 EXTENSION (SIGNED / BROADCAST, TCK-P3-004 — ADR-0013 amendment):
+the same dispatcher-owned discipline extends past CONFIRMED —
+
+- :meth:`TxFlow.mark_signed` moves CONFIRMED → SIGNED and requires a
+  matching ``tx_ref`` (the model's ``sign_tx`` envelope proposes; the flow
+  disposes). DELIBERATE DESIGN — no utterance gate at the flow level for
+  signing: the DEVICE interaction IS the user action. Per PROJECT.md §9
+  the hardware-wallet screen is the trust anchor — the user physically
+  approves the exact transaction on the device, which no chat utterance
+  can strengthen. What signing still requires structurally: the flow in
+  CONFIRMED plus a matching ``tx_ref`` (intent routing cannot skip or
+  reorder steps), and deterministic re-validation of the signed PSBT
+  against the intended transaction in the HANDLER (TCK-P3-005,
+  :mod:`localwallet.tx.revalidate`) — the flow only records state, it
+  never parses or verifies PSBT bytes.
+- :meth:`TxFlow.broadcast` moves SIGNED → BROADCAST, requires a matching
+  ``tx_ref``, and records the chain-reported txid. Broadcast additionally
+  requires completed signed-PSBT re-validation at the handler level (the
+  flow cannot check this itself — it is a precondition of the P3-005
+  wiring, enforced before :meth:`broadcast` may be called).
+- ``cancel`` is NOT available once CONFIRMED: confirmation committed the
+  user's decision, and a signed transaction is committed to signing —
+  there is no chat-level undo past that point (the signed transaction
+  simply is not broadcast if something fails; recovery is a fresh flow).
 
 :func:`ConfirmGate.classify` is a conservative, whitelist-exact classifier:
 
@@ -97,6 +128,7 @@ __all__ = [
     "FlowError",
     "GateDecision",
     "PendingTx",
+    "SignedTx",
     "TxFlow",
     "TxFlowStatus",
 ]
@@ -118,14 +150,24 @@ class FlowError(TxEngineError):
 class TxFlowStatus(StrEnum):
     """States of the dispatcher-owned send flow.
 
-    ``CREATED`` is the only live state; ``CONFIRMED``, ``CANCELLED`` and
-    ``EXPIRED`` are terminal (leftable only via :meth:`TxFlow.reset` to
-    ``IDLE``); ``IDLE`` is the empty state.
+    ``CREATED`` and ``CONFIRMED`` are the live destructive states
+    (``CREATED`` awaits the dual-key confirm; ``CONFIRMED`` awaits the
+    signed PSBT from the device handoff); ``SIGNED`` awaits broadcast.
+    ``CANCELLED``, ``EXPIRED`` and ``BROADCAST`` are terminal (leftable
+    only via :meth:`TxFlow.reset` to ``IDLE``); ``IDLE`` is the empty
+    state.
+
+    Phase 3 (TCK-P3-004, ADR-0013 amendment): ``SIGNED`` and ``BROADCAST``
+    extend the machine behind the same gate — transitions only via
+    matching ``tx_ref`` from the immediately preceding state, no skip
+    paths (broadcast ONLY from SIGNED).
     """
 
     IDLE = "idle"
     CREATED = "created"
     CONFIRMED = "confirmed"
+    SIGNED = "signed"
+    BROADCAST = "broadcast"
     CANCELLED = "cancelled"
     EXPIRED = "expired"
 
@@ -162,6 +204,29 @@ class PendingTx:
     psbt_base64: str
     inputs_count: int
     vsize: int
+
+
+@dataclass(frozen=True, slots=True)
+class SignedTx:
+    """The signed-PSBT record produced by a completed device handoff.
+
+    Built by :meth:`TxFlow.mark_signed` from the CONFIRMED record:
+
+    - ``tx_ref`` — the confirmed transaction's reference (the flow refuses
+      a mismatched one; the value is carried for audit symmetry).
+    - ``psbt_base64`` — the signed PSBT exactly as the signer gateway
+      returned it. The flow performs NO parsing or verification here
+      (deterministic re-validation against the intended transaction is
+      the handler-level broadcast gate, TCK-P3-005 /
+      :mod:`localwallet.tx.revalidate`); the record is immutable so what
+      was re-validated is exactly what gets broadcast.
+
+    Frozen for the same reason as :class:`PendingTx`: the broadcast step
+    must see byte-for-byte what the device returned.
+    """
+
+    tx_ref: str
+    psbt_base64: str
 
 
 class GateDecision(StrEnum):
@@ -286,6 +351,9 @@ class TxFlow:
         self._clock = clock if clock is not None else time.time
         self._state: TxFlowStatus = TxFlowStatus.IDLE
         self._pending: PendingTx | None = None
+        self._confirmed: PendingTx | None = None
+        self._signed: SignedTx | None = None
+        self._txid: str | None = None
 
     # ------------------------------------------------------------- views
 
@@ -298,6 +366,27 @@ class TxFlow:
     def pending(self) -> PendingTx | None:
         """The staged pending transaction, or ``None`` outside ``CREATED``."""
         return self._pending
+
+    @property
+    def confirmed(self) -> PendingTx | None:
+        """The approved transaction, or ``None`` before ``CONFIRMED``.
+
+        Retained through ``CONFIRMED``, ``SIGNED`` and ``BROADCAST``: the
+        signer handoff and the broadcast-time re-validation (TCK-P3-005)
+        both build their intent from the exact record the user confirmed.
+        Cleared only when the flow returns to ``IDLE``/``CREATED``.
+        """
+        return self._confirmed
+
+    @property
+    def signed(self) -> SignedTx | None:
+        """The signed-PSBT record, or ``None`` before ``SIGNED``."""
+        return self._signed
+
+    @property
+    def txid(self) -> str | None:
+        """The chain-reported transaction id, or ``None`` before ``BROADCAST``."""
+        return self._txid
 
     # ------------------------------------------------------- transitions
 
@@ -323,13 +412,21 @@ class TxFlow:
         immutable record.
 
         Raises:
-            FlowError: a transaction is already pending (state CREATED) —
-                value-free message; confirm or cancel it first. A stale
-                pending is NOT auto-reaped here: confirm it (reports
-                expiry) or cancel it explicitly.
+            FlowError: a transaction is already in flight — value-free
+                message. From CREATED: confirm or cancel it first. From
+                CONFIRMED/SIGNED/BROADCAST the approved/signed record is
+                still live: starting a second flow here would silently
+                abandon it (the silent step the machine exists to prevent)
+                — finish the lifecycle or :meth:`reset` explicitly first.
+                A stale pending is NOT auto-reaped here: confirm it
+                (reports expiry) or cancel it explicitly.
         """
-        if self._state is TxFlowStatus.CREATED:
-            raise FlowError("a transaction is already pending — confirm or cancel it first")
+        if self._state not in (TxFlowStatus.IDLE, TxFlowStatus.CANCELLED, TxFlowStatus.EXPIRED):
+            if self._state is TxFlowStatus.CREATED:
+                raise FlowError("a transaction is already pending — confirm or cancel it first")
+            raise FlowError(
+                "a transaction is already in flight — finish or reset the current flow first"
+            )
         pending = PendingTx(
             tx_ref=self._id_factory(),
             created_at=self._clock(),
@@ -345,6 +442,11 @@ class TxFlow:
         )
         self._pending = pending
         self._state = TxFlowStatus.CREATED
+        # A new flow starts from a clean record (invariant: a transition
+        # into a non-terminal state never inherits a previous tx's state).
+        self._confirmed = None
+        self._signed = None
+        self._txid = None
         return pending
 
     def confirm(
@@ -377,7 +479,11 @@ class TxFlow:
 
         Returns:
             The confirmed :class:`PendingTx` (the exact object the user
-            confirmed — the Phase 3 signer handoff starts here).
+            confirmed — the Phase 3 signer handoff starts here). The flow
+            RETAINS it (``TxFlow.confirmed``) through ``CONFIRMED``,
+            ``SIGNED`` and ``BROADCAST``: the signer handoff and the
+            broadcast-time re-validation build their intent from the exact
+            record the user confirmed.
 
         Raises:
             FlowError: on any failed precondition; the state changes only
@@ -400,10 +506,20 @@ class TxFlow:
             raise FlowError("tx_ref does not match the pending transaction")
         self._state = TxFlowStatus.CONFIRMED
         self._pending = None
+        self._confirmed = pending
+        self._signed = None
+        self._txid = None
         return pending
 
     def cancel(self) -> PendingTx:
         """Cancel the pending transaction (CREATED → CANCELLED).
+
+        Deliberately CREATED-only: cancellation is a chat-level decision
+        about a *staged* transaction. Past CONFIRMED the user's decision is
+        committed, and a signed transaction is committed to signing — there
+        is no chat-level undo (``SIGNED``/``BROADCAST`` leave the flow only
+        via :meth:`reset` after the lifecycle ends). Recovery from any
+        failure past signing is a fresh flow, never a silent rewind.
 
         Raises:
             FlowError: no pending transaction to cancel (any state but
@@ -416,13 +532,103 @@ class TxFlow:
         self._state = TxFlowStatus.CANCELLED
         return pending
 
+    def mark_signed(self, tx_ref: str, signed_psbt_base64: str) -> SignedTx:
+        """Record the signed PSBT from the device handoff (CONFIRMED → SIGNED).
+
+        Phase 3 transition (TCK-P3-004, ADR-0013 amendment). Preconditions,
+        in order (every refusal leaves the state unchanged):
+
+        1. state is ``CONFIRMED`` with a retained confirmed record — from
+           any other state (``CREATED``, ``SIGNED`` — re-signing is
+           refused, ``IDLE``, terminal) this is refused;
+        2. ``tx_ref`` matches the confirmed transaction's reference;
+        3. ``signed_psbt_base64`` is a non-empty string (value hygiene
+           only — the flow NEVER parses or verifies PSBT bytes).
+
+        NO utterance gate here, deliberately: the device interaction IS
+        the user action (PROJECT.md §9 — the hardware-wallet screen is the
+        trust anchor; the user physically approves the exact transaction
+        on the device). The structural gates that remain are the matching
+        ``tx_ref`` (intent routing cannot skip or reorder steps) and —
+        downstream, at handler level — deterministic signed-PSBT
+        re-validation before broadcast (TCK-P3-005).
+
+        Args:
+            tx_ref: The reference the model's ``sign_tx`` envelope quoted
+                (must equal the confirmed one).
+            signed_psbt_base64: The signed PSBT exactly as the signer
+                gateway returned it.
+
+        Returns:
+            The immutable :class:`SignedTx` record (also exposed via
+            ``TxFlow.signed``).
+
+        Raises:
+            FlowError: on any failed precondition; value-free messages.
+        """
+        if self._state is not TxFlowStatus.CONFIRMED or self._confirmed is None:
+            raise FlowError("no confirmed transaction to sign")
+        if tx_ref != self._confirmed.tx_ref:
+            raise FlowError("tx_ref does not match the confirmed transaction")
+        if not isinstance(signed_psbt_base64, str) or not signed_psbt_base64:
+            raise FlowError("signed psbt must be a non-empty string")
+        signed = SignedTx(tx_ref=self._confirmed.tx_ref, psbt_base64=signed_psbt_base64)
+        self._signed = signed
+        self._state = TxFlowStatus.SIGNED
+        return signed
+
+    def broadcast(self, tx_ref: str, txid: str) -> str:
+        """Record the broadcast result (SIGNED → BROADCAST, terminal).
+
+        Phase 3 transition (TCK-P3-004, ADR-0013 amendment). Preconditions,
+        in order (every refusal leaves the state unchanged):
+
+        1. state is ``SIGNED`` with a retained signed record — broadcast
+           from ``CONFIRMED`` is refused (an un-revalidated, unsigned
+           transaction must never reach the network; there is NO skip path
+           past the signing state);
+        2. ``tx_ref`` matches the signed record's reference;
+        3. ``txid`` is a non-empty string (value hygiene — the shape
+           authority for a txid is the chain layer, which re-validates the
+           broadcast response as 64 lowercase hex before it can reach
+           here).
+
+        The handler-level duty this transition presupposes: the signed PSBT
+        has already passed deterministic re-validation against the intended
+        transaction (:mod:`localwallet.tx.revalidate`) — a mismatch there
+        is a hard stop that never reaches :meth:`broadcast`.
+
+        Args:
+            tx_ref: The reference the model's ``broadcast_tx`` envelope
+                quoted (must equal the signed one).
+            txid: The transaction id verbatim from the chain layer's
+                broadcast response.
+
+        Returns:
+            The recorded ``txid`` (also exposed via ``TxFlow.txid``).
+
+        Raises:
+            FlowError: on any failed precondition; value-free messages.
+        """
+        if self._state is not TxFlowStatus.SIGNED or self._signed is None:
+            raise FlowError("no signed transaction to broadcast")
+        if tx_ref != self._signed.tx_ref:
+            raise FlowError("tx_ref does not match the signed transaction")
+        if not isinstance(txid, str) or not txid:
+            raise FlowError("txid must be a non-empty string")
+        self._txid = txid
+        self._state = TxFlowStatus.BROADCAST
+        return txid
+
     def reset(self) -> None:
-        """Return a terminal flow to IDLE (CONFIRMED/CANCELLED/EXPIRED → IDLE).
+        """Return a terminal flow to IDLE (CONFIRMED/SIGNED/BROADCAST/
+        CANCELLED/EXPIRED → IDLE).
 
         A no-op from IDLE. From CREATED this is refused — leaving a live
         pending without an explicit confirm/cancel decision would be the
         kind of silent step the flow exists to prevent (use
-        :meth:`cancel`).
+        :meth:`cancel`). All per-transaction records (confirmed, signed,
+        txid) are cleared with the state.
 
         Raises:
             FlowError: state is CREATED.
@@ -431,3 +637,6 @@ class TxFlow:
             raise FlowError("a transaction is already pending — confirm or cancel it first")
         self._state = TxFlowStatus.IDLE
         self._pending = None
+        self._confirmed = None
+        self._signed = None
+        self._txid = None

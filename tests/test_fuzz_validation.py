@@ -74,6 +74,10 @@ VALID_ENVELOPES: dict[str, dict[str, object]] = {
         },
     },
     "confirm_tx": {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "3f2a9c"}},
+    # Phase 3 (TCK-P3-004): signer handoff, broadcast, status lookup.
+    "sign_tx": {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "3f2a9c", "signer": "hwi"}},
+    "broadcast_tx": {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "3f2a9c"}},
+    "tx_status": {"v": 0, "intent": "tx_status", "params": {"txid": "a" * 64}},
 }
 
 #: Strict-key-order JSON documents matching the grammar, one per intent
@@ -90,6 +94,13 @@ VALID_JSON = [
     '{"v":0,"intent":"new_address","params":{"branch":0}}',
     '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_usd":10.5}}',
     '{"v":0,"intent":"confirm_tx","params":{"tx_ref":"3f2a9c"}}',
+    # Phase 3 (TCK-P3-004): strict-key-order docs for the new intents —
+    # sign_tx with the optional signer tail, broadcast_tx, tx_status with
+    # the grammar's 64-lowercase-hex txid.
+    '{"v":0,"intent":"sign_tx","params":{"tx_ref":"3f2a9c"}}',
+    '{"v":0,"intent":"sign_tx","params":{"tx_ref":"3f2a9c","signer":"file"}}',
+    '{"v":0,"intent":"broadcast_tx","params":{"tx_ref":"3f2a9c"}}',
+    '{"v":0,"intent":"tx_status","params":{"txid":"' + "a" * 64 + '"}}',
 ]
 
 
@@ -325,6 +336,48 @@ def _fuzz_confirm_tx_decision_key(rng: random.Random) -> object:
     return {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "abc", "decision": "yes"}}
 
 
+# ------------------------------------------------- Phase 3 near-misses
+# TCK-P3-004: close the schema for sign_tx/broadcast_tx/tx_status — the
+# closed signer enum, hostile txid shapes (the txid reaches a URL path, so
+# ../, spaces, unicode, wrong lengths and uppercase are all refused), and
+# keys that belong to other intents.
+
+def _fuzz_txid_path_traversal(rng: random.Random) -> object:
+    # "../" in a txid: the strict hex charset is the URL-path injection guard.
+    return {"v": 0, "intent": "tx_status", "params": {"txid": "../" + "a" * 61}}
+
+
+def _fuzz_txid_spaces(rng: random.Random) -> object:
+    # whitespace anywhere in the txid is outside [0-9a-f]{64}.
+    return {"v": 0, "intent": "tx_status", "params": {"txid": "a" * 32 + " " + "a" * 31}}
+
+
+def _fuzz_txid_unicode(rng: random.Random) -> object:
+    # non-ASCII txid characters are refused (never normalized, never URL-encoded).
+    return {"v": 0, "intent": "tx_status", "params": {"txid": "á" * 64}}
+
+
+def _fuzz_txid_uppercase(rng: random.Random) -> object:
+    # lowercase-only contract: uppercase hex is rejected, not normalized.
+    return {"v": 0, "intent": "tx_status", "params": {"txid": "A" * 64}}
+
+
+def _fuzz_txid_wrong_length(rng: random.Random) -> object:
+    # 63 or 65 chars are both outside the exact-64 rule.
+    return {"v": 0, "intent": "tx_status", "params": {"txid": "a" * (63 + rng.randrange(2))}}
+
+
+def _fuzz_sign_tx_unknown_signer(rng: random.Random) -> object:
+    # signer is the closed enum file|hwi; anything else (including case
+    # variants and invented device names) is rejected at layer 2.
+    return {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "abc", "signer": "ledger"}}
+
+
+def _fuzz_broadcast_tx_extra_key(rng: random.Random) -> object:
+    # broadcast_tx is {tx_ref} exactly; a signer tail belongs to sign_tx.
+    return {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "abc", "signer": "hwi"}}
+
+
 _CATEGORIES = [
     _fuzz_truncated,
     _fuzz_bytes,
@@ -352,6 +405,13 @@ _CATEGORIES = [
     _fuzz_create_tx_bool_amount,
     _fuzz_tx_ref_control_chars,
     _fuzz_confirm_tx_decision_key,
+    _fuzz_txid_path_traversal,
+    _fuzz_txid_spaces,
+    _fuzz_txid_unicode,
+    _fuzz_txid_uppercase,
+    _fuzz_txid_wrong_length,
+    _fuzz_sign_tx_unknown_signer,
+    _fuzz_broadcast_tx_extra_key,
 ]
 
 
@@ -427,6 +487,14 @@ def test_new_intent_near_misses_are_cleanly_rejected():
         _fuzz_create_tx_bool_amount,
         _fuzz_tx_ref_control_chars,
         _fuzz_confirm_tx_decision_key,
+        # Phase 3 (TCK-P3-004): sign/broadcast/status near-misses
+        _fuzz_txid_path_traversal,
+        _fuzz_txid_spaces,
+        _fuzz_txid_unicode,
+        _fuzz_txid_uppercase,
+        _fuzz_txid_wrong_length,
+        _fuzz_sign_tx_unknown_signer,
+        _fuzz_broadcast_tx_extra_key,
     ]
     for fn in near_misses:
         table = CountingTable()

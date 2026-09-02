@@ -25,6 +25,7 @@ from localwallet.protocol.envelope import (
     MAX_QUESTION_CHARS,
     MAX_TEXT_CHARS,
     BaseParams,
+    BroadcastTxParams,
     ClarifyParams,
     ConfirmTxParams,
     CreateTxParams,
@@ -35,6 +36,8 @@ from localwallet.protocol.envelope import (
     IntentName,
     NewAddressParams,
     RespondParams,
+    SignTxParams,
+    TxStatusParams,
     validate_payload,
 )
 from localwallet.protocol.errors import (
@@ -52,6 +55,7 @@ __all__ = [
     "MAX_TEXT_CHARS",
     "MAX_VALIDATION_RETRIES",
     "BaseParams",
+    "BroadcastTxParams",
     "ClarifyParams",
     "ConfirmTxParams",
     "CreateTxParams",
@@ -70,6 +74,8 @@ __all__ = [
     "Outcome",
     "OutcomeStatus",
     "RespondParams",
+    "SignTxParams",
+    "TxStatusParams",
     "dispatch",
     "handle_raw",
     "validate_payload",

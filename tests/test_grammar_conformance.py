@@ -390,6 +390,18 @@ ACCEPT = [
     '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":9999999999999999}}',
     # whitespace around every token still accepted
     '{\n "v" : 0 ,\n "intent" : "create_tx" ,\n "params" : { "recipient" : "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx" , "amount_usd" : 1.5 , "fee_target" : "medium" }\n}',
+    # ---- Phase 3 (TCK-P3-004): sign_tx / broadcast_tx / tx_status drift pins
+    # sign_tx: bare tx_ref (no signer tail) and each signer enum literal
+    '{"v":0,"intent":"sign_tx","params":{"tx_ref":"3f2a9c"}}',
+    '{"v":0,"intent":"sign_tx","params":{"tx_ref":"3f2a9c","signer":"file"}}',
+    '{"v":0,"intent":"sign_tx","params":{"tx_ref":"3f2a9c","signer":"hwi"}}',
+    # broadcast_tx: tx_ref only (same shape as confirm_tx)
+    '{"v":0,"intent":"broadcast_tx","params":{"tx_ref":"3f2a9c"}}',
+    # tx_status: exactly 64 lowercase hex chars (the hex_txid class)
+    '{"v":0,"intent":"tx_status","params":{"txid":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}',
+    '{"v":0,"intent":"tx_status","params":{"txid":"' + "a" * 64 + '"}}',
+    # whitespace around tokens in the new branches too
+    '{\n "v" : 0 ,\n "intent" : "tx_status" ,\n "params" : { "txid" : "' + "b" * 64 + '" }\n}',
 ]
 
 REJECT = [
@@ -464,6 +476,45 @@ REJECT = [
     '{"v":0,"intent":"confirm_tx","params":{}}',
     "confirm_tx with create_tx keys (intent->params coupling)",
     '{"v":0,"intent":"confirm_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000}}',
+    # ---- Phase 3 (TCK-P3-004): sign_tx / broadcast_tx / tx_status drift pins
+    "sign_tx params extra key (device policy is the handler's decision)",
+    '{"v":0,"intent":"sign_tx","params":{"tx_ref":"abc","device":"ledger"}}',
+    "sign_tx unknown signer literal (closed enum file|hwi)",
+    '{"v":0,"intent":"sign_tx","params":{"tx_ref":"abc","signer":"ledger"}}',
+    "sign_tx signer case-sensitive literal",
+    '{"v":0,"intent":"sign_tx","params":{"tx_ref":"abc","signer":"FILE"}}',
+    "sign_tx signer before tx_ref (strict key order)",
+    '{"v":0,"intent":"sign_tx","params":{"signer":"file","tx_ref":"abc"}}',
+    "sign_tx signer null (omission is expressed by leaving the key out)",
+    '{"v":0,"intent":"sign_tx","params":{"tx_ref":"abc","signer":null}}',
+    "sign_tx missing tx_ref",
+    '{"v":0,"intent":"sign_tx","params":{}}',
+    "broadcast_tx params extra key",
+    '{"v":0,"intent":"broadcast_tx","params":{"tx_ref":"abc","signed":true}}',
+    "broadcast_tx missing tx_ref",
+    '{"v":0,"intent":"broadcast_tx","params":{}}',
+    "broadcast_tx with signer key (broadcast has no signer tail)",
+    '{"v":0,"intent":"broadcast_tx","params":{"tx_ref":"abc","signer":"hwi"}}',
+    "tx_status txid 63 chars (hex_txid is exactly 64)",
+    '{"v":0,"intent":"tx_status","params":{"txid":"' + "a" * 63 + '"}}',
+    "tx_status txid 65 chars",
+    '{"v":0,"intent":"tx_status","params":{"txid":"' + "a" * 65 + '"}}',
+    "tx_status txid uppercase hex (lowercase-only contract, no normalization)",
+    '{"v":0,"intent":"tx_status","params":{"txid":"' + "A" * 64 + '"}}',
+    "tx_status txid non-hex characters",
+    '{"v":0,"intent":"tx_status","params":{"txid":"' + "g" * 64 + '"}}',
+    "tx_status txid path-traversal fragment (charset is the URL guard)",
+    '{"v":0,"intent":"tx_status","params":{"txid":"../' + "a" * 61 + '"}}',
+    "tx_status txid with spaces",
+    '{"v":0,"intent":"tx_status","params":{"txid":"' + "a" * 32 + " " + "a" * 31 + '"}}',
+    "tx_status txid is a JSON string, not an integer",
+    '{"v":0,"intent":"tx_status","params":{"txid":' + "1" * 64 + '}}',
+    "tx_status missing txid",
+    '{"v":0,"intent":"tx_status","params":{}}',
+    "tx_status params extra key",
+    '{"v":0,"intent":"tx_status","params":{"txid":"' + "a" * 64 + '","verbose":true}}',
+    "tx_status with tx_ref key (intent->params coupling)",
+    '{"v":0,"intent":"tx_status","params":{"tx_ref":"abc"}}',
 ]
 
 
@@ -513,6 +564,13 @@ def test_grammar_parses_without_unsupported_constructs(matcher: GbnfMatcher):
         "sats_int",
         "usd_num",
         "confirm_tx",
+        "sign_tx",
+        "params_sign_tx",
+        "sign_tx_tail",
+        "signer_enum",
+        "broadcast_tx",
+        "tx_status",
+        "hex_txid",
         "string",
         "ws",
     }
@@ -530,5 +588,19 @@ def test_grammar_intent_branches_cover_the_closed_enum(matcher: GbnfMatcher):
         "new_address",
         "create_tx",
         "confirm_tx",
+        "sign_tx",
+        "broadcast_tx",
+        "tx_status",
     ):
         assert f'"{intent}"' in text
+
+
+def test_grammar_hex_txid_is_exactly_64_lowercase_hex(matcher: GbnfMatcher):
+    """Pin the hex_txid rule shape: one class, bounded to exactly 64.
+
+    Lowercase-only ([0-9a-f], no A-F) is the documented contract (ADR-0002
+    Phase 3): quoted txids stay verbatim-comparable and URL-safe without
+    normalization; the rule text is pinned so a silent widening fails here.
+    """
+    text = _GRAMMAR.read_text(encoding="utf-8")
+    assert "hex_txid ::= [0-9a-f]{64}" in text

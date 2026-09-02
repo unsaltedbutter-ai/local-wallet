@@ -5,8 +5,8 @@ Canonical envelope contract v0 — the model-emitted wire format::
     {"v": 0, "intent": <closed enum>, "params": {...}}
 
 - ``v``: integer, exactly ``0`` (booleans are not integers for this purpose).
-- ``intent``: closed enum — see :class:`IntentName` (eight members as of the
-  Phase 2 v0 extension; see ``docs/adr/0002-envelope-spec.md`` and
+- ``intent``: closed enum — see :class:`IntentName` (eleven members as of the
+  Phase 3 v0 extension; see ``docs/adr/0002-envelope-spec.md``,
   ``docs/adr/0013-confirm-gate.md``).
 - ``params``: REQUIRED object, shape fixed per intent:
   ``respond`` → ``{"text": str, 1..4000 chars}``;
@@ -24,7 +24,20 @@ Canonical envelope contract v0 — the model-emitted wire format::
   semantic recipient check is a testnet witness-v0 P2WPKH address, layer 3);
   ``confirm_tx`` → ``{"tx_ref": str, 1..64 chars}`` (references the pending
   transaction created by ``create_tx``; content is matched against the
-  dispatcher-owned flow state, not here).
+  dispatcher-owned flow state, not here);
+  ``sign_tx`` → ``{"tx_ref": str, 1..64 chars}`` plus optional
+  ``{"signer": "file"|"hwi"}`` (omitted ⇒ the handler applies its default
+  signer policy; the signer hands the transaction to the hardware device —
+  the device screen, not the model, is the trust anchor);
+  ``broadcast_tx`` → ``{"tx_ref": str, 1..64 chars}`` (references the signed
+  flow record; broadcast itself is refused unless re-validation passed —
+  enforced at the handler/flow level, ADR-0013);
+  ``tx_status`` → ``{"txid": str}`` — the schema layer admits any string;
+  the meaning-level rule (EXACTLY 64 lowercase hex characters, strict
+  charset, fail closed) is layer 3 in :mod:`localwallet.protocol.intents`
+  because this user/model-supplied value is interpolated into a request
+  URL path — the charset check IS the injection guard. The GBNF grammar
+  pins the same 64-lowercase-hex shape at decode time.
 
 Adding enum members and optional params keys is a backward-compatible v0
 extension: previously-valid envelopes remain valid, so ``v`` stays ``0``
@@ -93,6 +106,7 @@ __all__ = [
     "MIN_AMOUNT_USD",
     "MIN_RECIPIENT_CHARS",
     "BaseParams",
+    "BroadcastTxParams",
     "ClarifyParams",
     "ConfirmTxParams",
     "CreateTxParams",
@@ -103,6 +117,8 @@ __all__ = [
     "IntentName",
     "NewAddressParams",
     "RespondParams",
+    "SignTxParams",
+    "TxStatusParams",
     "validate_payload",
 ]
 
@@ -138,8 +154,16 @@ MAX_AMOUNT_SATS: Final[int] = 21_000_000_000_000_000
 MIN_AMOUNT_USD: Final[float] = 0.01
 MAX_AMOUNT_USD: Final[float] = 1_000_000.0
 
-#: Maximum accepted length of ``confirm_tx`` params ``tx_ref`` (characters).
+#: Maximum accepted length of ``confirm_tx`` / ``sign_tx`` / ``broadcast_tx``
+#: params ``tx_ref`` (characters).
 MAX_TX_REF_CHARS: Final[int] = 64
+
+#: The exact length of a Bitcoin transaction id (bytes rendered as hex).
+TXID_LENGTH_CHARS: Final[int] = 64
+
+#: Accepted ``sign_tx`` ``signer`` enum literals (closed set). Omitted means
+#: the handler applies its default signer policy — the schema does not pick.
+SIGNER_CHOICES: Final[tuple[str, ...]] = ("file", "hwi")
 
 #: Schema field names that may appear verbatim in failure locations. Any
 #: other string component of a pydantic ``loc`` is model-controlled content
@@ -159,6 +183,8 @@ _KNOWN_LOC_FIELDS: Final[frozenset[str]] = frozenset(
         "amount_usd",
         "fee_target",
         "tx_ref",
+        "signer",
+        "txid",
         "error",
         "detail",
         "code",
@@ -188,6 +214,16 @@ class IntentName(StrEnum):
     move the flow: the same-turn user utterance must pass the deterministic
     confirm gate (``localwallet.tx.flow``) — an LLM "yes" never counts as
     user confirmation (PROJECT.md §8.6).
+
+    Phase 3 v0 extension (backward-compatible — see
+    ``docs/adr/0002-envelope-spec.md`` and the ADR-0013 amendment):
+    ``sign_tx``, ``broadcast_tx``, and ``tx_status`` join as the remaining
+    steps of the send flow plus its status lookup. Emitting ``sign_tx`` or
+    ``broadcast_tx`` is necessary but NOT sufficient to move the flow: both
+    require the flow in the matching dispatcher-owned state (``CONFIRMED``
+    resp. ``SIGNED``) with a matching ``tx_ref``, and broadcast additionally
+    requires completed signed-PSBT re-validation at the handler level
+    (``localwallet.tx.revalidate``) — a mismatch is a hard stop.
     """
 
     RESPOND = "respond"
@@ -198,6 +234,9 @@ class IntentName(StrEnum):
     NEW_ADDRESS = "new_address"
     CREATE_TX = "create_tx"
     CONFIRM_TX = "confirm_tx"
+    SIGN_TX = "sign_tx"
+    BROADCAST_TX = "broadcast_tx"
+    TX_STATUS = "tx_status"
 
 
 class BaseParams(BaseModel):
@@ -403,6 +442,67 @@ class ConfirmTxParams(BaseParams):
     tx_ref: str = Field(min_length=1, max_length=MAX_TX_REF_CHARS)
 
 
+class SignTxParams(_OmitNoneDump):
+    """Params for ``sign_tx``: hand the approved transaction to the signer.
+
+    ``tx_ref``: REQUIRED string, 1..64 characters, referencing the
+    CONFIRMED flow record — same convention as :class:`ConfirmTxParams`
+    (quoted verbatim from the confirmation card; the flow matches content,
+    this layer checks shape only).
+
+    ``signer``: OPTIONAL enum literal ``"file"|"hwi"``. Omitted ⇒ the
+    handler applies its default signer policy (which signer is used is a
+    handler/app decision, never model-chosen beyond this closed enum);
+    explicit ``null`` is rejected — omission is expressed by leaving the
+    key out entirely, mirroring ``limit``/``branch``/``fee_target``. The
+    device interaction itself is the user action (the trust anchor is the
+    hardware wallet screen, PROJECT.md §9) — no additional utterance gate
+    exists at the flow level for signing; see :mod:`localwallet.tx.flow`.
+    """
+
+    tx_ref: str = Field(min_length=1, max_length=MAX_TX_REF_CHARS)
+    signer: Literal["file", "hwi"] | None = None
+
+    @field_validator("signer", mode="before")
+    @classmethod
+    def _signer_must_be_present_when_not_omitted(cls, value: object) -> object:
+        """Reject explicit ``null`` for ``signer`` (see ``fee_target``)."""
+        if value is None:
+            raise ValueError("signer must be 'file' or 'hwi' when present")
+        return value
+
+
+class BroadcastTxParams(BaseParams):
+    """Params for ``broadcast_tx``: publish the signed transaction.
+
+    ``tx_ref``: REQUIRED string, 1..64 characters, referencing the SIGNED
+    flow record (same convention as :class:`ConfirmTxParams`). Only the
+    shape is validated here; the flow refuses broadcast unless the state is
+    ``SIGNED`` with a matching reference, and the handler must have
+    completed signed-PSBT re-validation (:mod:`localwallet.tx.revalidate`)
+    before calling the chain layer — a mismatch is a hard stop (ADR-0013).
+    """
+
+    tx_ref: str = Field(min_length=1, max_length=MAX_TX_REF_CHARS)
+
+
+class TxStatusParams(BaseParams):
+    """Params for ``tx_status``: look up a transaction's confirmations.
+
+    ``txid``: REQUIRED string. The schema layer deliberately admits any
+    string (coarse transport shape only); the meaning-level rule — EXACTLY
+    64 LOWERCASE hex characters, strict charset, fail closed — is layer 3
+    in :mod:`localwallet.protocol.intents`. The strictness is not stylistic:
+    this user/model-supplied value is interpolated into a request URL path,
+    so the charset check IS the injection guard (anything outside
+    ``[0-9a-f]{64}`` — uppercase, whitespace, ``../``, unicode — is
+    rejected before a URL is ever constructed). The GBNF grammar
+    (``hex_txid``) pins the identical shape at decode time.
+    """
+
+    txid: str
+
+
 #: Frozen mapping intent name → params model — THE closed world. Intents
 #: outside this registry do not exist: the schema layer rejects them and
 #: the dispatcher refuses them (defense in depth).
@@ -423,6 +523,9 @@ INTENT_REGISTRY: Mapping[IntentName, type[BaseParams]] = MappingProxyType(
         IntentName.NEW_ADDRESS: NewAddressParams,
         IntentName.CREATE_TX: CreateTxParams,
         IntentName.CONFIRM_TX: ConfirmTxParams,
+        IntentName.SIGN_TX: SignTxParams,
+        IntentName.BROADCAST_TX: BroadcastTxParams,
+        IntentName.TX_STATUS: TxStatusParams,
     }
 )
 
@@ -447,6 +550,9 @@ class Envelope(BaseModel):
         | NewAddressParams
         | CreateTxParams
         | ConfirmTxParams
+        | SignTxParams
+        | BroadcastTxParams
+        | TxStatusParams
     )
 
     @model_validator(mode="before")
