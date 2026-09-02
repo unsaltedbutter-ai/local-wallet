@@ -387,3 +387,55 @@ class TestListPendingExports:
         signer.export_unsigned(psbt_to_base64(build_unsigned()), "aaa11111")
         names = [p.name for p in signer.list_pending_exports()]
         assert names == sorted(names)
+
+
+class TestContainerSizeCeiling:
+    """Rider R5: the transfer-folder gateway bounds payload size BEFORE
+    decode/parse, so downstream re-validation only ever sees bounded data."""
+
+    def test_export_over_ceiling_refused_before_decode(self, signer: FilePsbtSigner):
+        from localwallet.signer.file import _MAX_PSBT_TEXT_CHARS
+
+        oversized = "cHNj" * (_MAX_PSBT_TEXT_CHARS // 4 + 1)  # > ceiling
+        with pytest.raises(SignerError) as exc:
+            signer.export_unsigned(oversized, "abc12345")
+        assert "maximum container size" in str(exc.value)
+        # Nothing was written toward the device.
+        assert signer.list_pending_exports() == []
+
+    def test_import_over_ceiling_refused_before_decode(self, signer: FilePsbtSigner, folder: Path):
+        from localwallet.signer.file import _MAX_PSBT_TEXT_CHARS
+
+        path = folder / "localwallet-signed-abc12345.psbt.b64"
+        path.write_text("A" * (_MAX_PSBT_TEXT_CHARS + 1) + "\n", encoding="utf-8")
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(path)
+        assert "maximum container size" in str(exc.value)
+
+    def test_at_ceiling_passes_the_size_gate(self, signer: FilePsbtSigner):
+        """Boundary: a payload of EXACTLY the ceiling gets past the size
+        check (it may fail later validation — the size gate itself passed)."""
+        from localwallet.signer.file import _MAX_PSBT_TEXT_CHARS
+
+        at_limit = "cHNj" * (_MAX_PSBT_TEXT_CHARS // 4)  # exactly the ceiling
+        with pytest.raises(SignerError) as exc:
+            signer.export_unsigned(at_limit, "abc12345")
+        assert "maximum container size" not in str(exc.value)
+
+
+class TestSignedImportPath:
+    """The deterministic ADR-0014 signed-filename derivation (TCK-P3-005)."""
+
+    def test_path_matches_import_convention(self, signer: FilePsbtSigner, folder: Path):
+        path = signer.signed_import_path("abcdef012345")
+        assert path == folder / "localwallet-signed-abcdef01.psbt.b64"
+        # A signed file placed at the derived path imports with the ref.
+        make_signed_file(folder, path.name)
+        result = signer.import_signed(path, expected_tx_ref="abcdef012345")
+        assert result.signer_name == "file"
+
+    def test_hostile_ref_is_sanitized(self, signer: FilePsbtSigner, folder: Path):
+        path = signer.signed_import_path("../../etc/passwd")
+        digest = hashlib.sha256(b"../../etc/passwd").hexdigest()[:8]
+        assert path == folder / f"localwallet-signed-{digest}.psbt.b64"
+        assert ".." not in path.name

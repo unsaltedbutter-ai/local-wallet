@@ -26,8 +26,9 @@ Layering and trust (AGENTS.md invariants):
 - **No secrets.** The app is watch-only; keys live on the device. Device
   PINs/passphrases are entered ON the device (or via HWI's own flows). This
   layer never accepts, stores, forwards, or logs a PIN or passphrase: the
-  HWI calls made here always pass ``password=None``. A device that needs
-  unlocking surfaces as :class:`DeviceLockedError` guidance instead.
+  ``password`` parameter is omitted on every HWI call (no secret exists to
+  pass). A device that needs unlocking surfaces as
+  :class:`DeviceLockedError` guidance instead.
 - **No network I/O** (lint-enforced). USB/HID transport is device I/O; the
   only networked module remains ``localwallet.chain``.
 - **Value-free errors.** Messages never echo PSBT content, addresses,
@@ -119,6 +120,10 @@ _MSG_CLIENT_GONE = (
     "The device could not be opened — plug it in and unlock it, then say "
     "'retry'."
 )
+_MSG_REVERIFY = (
+    "Could not re-verify the device fingerprint — unplug, reconnect, "
+    "and retry."
+)
 _MSG_UNEXPECTED = (
     "The device returned an unexpected response — say 'retry' to try again."
 )
@@ -199,6 +204,11 @@ class HwiUsbSigner(Signer):
         self.expected_wallet_fingerprint = expected_wallet_fingerprint.strip().lower()
         self.chain = chain
         self._commands = commands_module
+        # ``True`` when a test fake was injected via the constructor seam,
+        # ``False`` when hwilib is lazily imported (the real path). R1 uses
+        # this to fail closed on a REAL client that lacks the post-open
+        # fingerprint getter while letting injected fakes keep the skip.
+        self._injected = commands_module is not None
 
     @property
     def name(self) -> str:
@@ -242,7 +252,13 @@ class HwiUsbSigner(Signer):
         Returns one :class:`DeviceInfo` per device hwilib can reach;
         devices that could not be read (locked/uninitialized) come back
         with ``fingerprint_hex=None``. Device-side secrets are never
-        involved: HWI is always called with ``password=None``.
+        involved: the ``password`` parameter is omitted on the HWI call
+        (no secret).
+
+        The raw enumeration is shaped INSIDE the mapped error boundary: a
+        non-list result or a non-dict entry surfaces as guidance
+        (:class:`DeviceError`), never as a raw ``AttributeError``/
+        ``TypeError`` from field access.
 
         Raises:
             DeviceError (hierarchy): hwilib-level enumeration failures,
@@ -253,8 +269,12 @@ class HwiUsbSigner(Signer):
             raw_devices = commands.enumerate(password=None)
         except Exception as exc:
             raise self._map_hwi_error(exc) from exc
+        if not isinstance(raw_devices, list):
+            raise DeviceError(_MSG_UNEXPECTED)
         devices: list[DeviceInfo] = []
         for raw in raw_devices:
+            if not isinstance(raw, dict):
+                raise DeviceError(_MSG_UNEXPECTED)
             devices.append(
                 DeviceInfo(
                     type=str(raw.get("type", "device")),
@@ -297,7 +317,14 @@ class HwiUsbSigner(Signer):
         raise DeviceError(_MSG_MULTIPLE)
 
     def _open_matched_client(self, commands: Any) -> tuple[Any, DeviceInfo]:
-        """Fingerprint-gate, then open a client for the matched device."""
+        """Fingerprint-gate, then open a client for the matched device.
+
+        Post-open re-verification (TOCTOU, ADR-0015): hardware can change
+        between enumeration and client open, so the OPEN client is
+        re-queried for its master fingerprint and the match gate is
+        re-applied (:meth:`_reverify_fingerprint`) before any signing or
+        address display happens.
+        """
         device = self._select_device(self.enumerate_devices())
         try:
             client = commands.get_client(
@@ -307,7 +334,55 @@ class HwiUsbSigner(Signer):
             raise self._map_hwi_error(exc) from exc
         if client is None:
             raise DeviceAbsentError(_MSG_CLIENT_GONE)
+        try:
+            self._reverify_fingerprint(client)
+        except Exception:
+            # R2: a post-open re-verification failure (mismatch, locked, or
+            # read error) must not leak the just-opened device handle —
+            # release it before propagating the mapped error.
+            self._close_client(client)
+            raise
         return client, device
+
+    def _reverify_fingerprint(self, client: Any) -> None:
+        """Re-apply the fingerprint match gate on the OPEN client (R1/ADR-0015).
+
+        hwi 3.2.0's ``HardwareWalletClient`` base class exposes
+        ``get_master_fingerprint()`` (verified empirically against the
+        pinned wheel), so the real path always re-checks after open —
+        closing the enumerate→open TOCTOU window: a device swapped in
+        between the two steps cannot sign under this wallet's identity.
+
+        Limitation (honest, R1): only an INJECTED client (test fake, exotic
+        transport) that does NOT expose the getter keeps the skip — the
+        pre-open enumerate gate plus the deterministic signed-PSBT
+        re-validation (:mod:`localwallet.tx.revalidate`) remain its
+        backstops. A REAL hwilib client (hwi 3.2.0 always exposes the
+        getter) lacking it CANNOT be re-verified, so it fails closed
+        (:class:`DeviceError` with reconnect guidance) instead of silently
+        trusting the pre-open enumeration.
+
+        Failure mapping: an unreadable post-open fingerprint (``None``)
+        is locked-device guidance — the right device must not be
+        slandered as a mismatch before it can identify itself (ADR-0015);
+        a DIFFERENT readable fingerprint is the mismatch hard stop; read
+        errors map through the standard hierarchy.
+        """
+        getter = getattr(client, "get_master_fingerprint", None)
+        if not callable(getter):
+            if not self._injected:
+                # Real hwilib path: the getter must exist; without it the
+                # post-open re-check cannot run → fail closed (R1).
+                raise DeviceError(_MSG_REVERIFY)
+            return  # documented limitation: injected test fakes may omit it
+        try:
+            reported = _normalize_fingerprint(getter())
+        except Exception as exc:
+            raise self._map_hwi_error(exc) from exc
+        if reported is None:
+            raise DeviceLockedError(_MSG_LOCKED)
+        if reported != self.expected_wallet_fingerprint:
+            raise DeviceMismatchError(_MSG_MISMATCH)
 
     @staticmethod
     def _close_client(client: Any) -> None:
@@ -344,8 +419,10 @@ class HwiUsbSigner(Signer):
     def sign_unsigned(self, psbt_base64: str) -> SignedResult:
         """Sign a base64 PSBT on the fingerprint-matched device.
 
-        Pipeline: fingerprint gate (ADR-0015) → hwilib ``signtx`` →
-        normalize the device's response to base64 text → :class:`SignedResult`.
+        Pipeline: fingerprint gate (ADR-0015) → client open with POST-OPEN
+        fingerprint re-verification (TOCTOU re-check, ADR-0015) → hwilib
+        ``signtx`` → normalize the device's response to base64 text →
+        :class:`SignedResult`.
         The signed PSBT is returned verbatim for re-validation by
         ``localwallet.tx.revalidate`` — this module performs no output
         validation (layering: the revalidate module owns the gate).
@@ -394,11 +471,20 @@ class HwiUsbSigner(Signer):
 
     @staticmethod
     def _normalize_signed(result: Any) -> str:
-        """Normalize a device signing response to base64 PSBT text."""
+        """Normalize a device signing response to base64 PSBT text.
+
+        All branches fail closed on emptiness: ``{"psbt": b""}`` and a
+        bare empty ``bytes`` are as unexpected as an empty string — a
+        device that reports success but returns no PSBT is an error, not
+        an empty transaction.
+        """
         if isinstance(result, dict):
             result = result.get("psbt")
         if isinstance(result, (bytes, bytearray)):
-            return base64.b64encode(bytes(result)).decode("ascii")
+            raw = bytes(result)
+            if not raw:
+                raise DeviceError(_MSG_UNEXPECTED)
+            return base64.b64encode(raw).decode("ascii")
         if isinstance(result, str) and result.strip():
             return result.strip()
         raise DeviceError(_MSG_UNEXPECTED)

@@ -27,11 +27,13 @@ pyproject changes).
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
 import sys
 from collections.abc import Callable
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Final
 
@@ -541,6 +543,61 @@ def test_stub_generate_confirmation_utterance_emits_canned_confirm_tx() -> None:
     envelope = validate_payload(stub_generate(prompt, None))
     assert envelope.intent is IntentName.CONFIRM_TX
     assert envelope.params.tx_ref == "dev-stub-pending-tx"
+
+
+# ------------------------------------------------ stub model: lifecycle phrases
+
+
+def test_stub_generate_sign_phrase_emits_canned_sign_tx() -> None:
+    prompt = "SYSTEM...\n\nuser: sign it\n\nenvelope:"
+    envelope = validate_payload(stub_generate(prompt, None))
+    assert envelope.intent is IntentName.SIGN_TX
+    assert envelope.params.tx_ref == "dev-stub-pending-tx"  # refusal demo
+
+
+def test_stub_generate_broadcast_phrase_emits_canned_broadcast_tx() -> None:
+    prompt = "SYSTEM...\n\nuser: broadcast it\n\nenvelope:"
+    envelope = validate_payload(stub_generate(prompt, None))
+    assert envelope.intent is IntentName.BROADCAST_TX
+    assert envelope.params.tx_ref == "dev-stub-pending-tx"  # refusal demo
+
+
+def test_stub_generate_status_phrase_emits_tx_status_with_quoted_txid() -> None:
+    """'status of txid <64-hex>' → tx_status quoting the hex token
+    VERBATIM from the user turn; without one, the canned placeholder."""
+    txid = "0123456789abcdef" * 4
+    prompt = f"SYSTEM...\n\nuser: status of txid {txid}\n\nenvelope:"
+    envelope = validate_payload(stub_generate(prompt, None))
+    assert envelope.intent is IntentName.TX_STATUS
+    assert envelope.params.txid == txid
+    fallback = validate_payload(stub_generate("SYSTEM...\n\nuser: status?\n\nenvelope:", None))
+    assert fallback.intent is IntentName.TX_STATUS
+    assert fallback.params.txid == app_module._STUB_TX_STATUS_TXID
+
+
+def test_stub_lifecycle_placeholders_refuse_cleanly_through_repl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Dev-mode refusal demo: with the stub model and NO flow in progress,
+    the canned sign_tx/broadcast_tx placeholders dispatch to value-free
+    refusals (the placeholders cannot match a real flow record)."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    recorded: list[httpx.Request] = []
+    handler = _scan_handler(recorded)
+
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", VPUB],
+        monkeypatch,
+        handler,
+        ["sign it", "broadcast it", "exit"],
+        store_path=store_path,
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    assert "Not signed — no confirmed transaction to sign." in joined
+    assert "Not broadcast — no signed transaction to broadcast." in joined
 
 
 # ------------------------------------------------- config: store_path env
@@ -1624,6 +1681,12 @@ SEND_UTXO_SMALL: Final[dict[str, Any]] = {
 
 RESPOND_NOTED_JSON: Final[str] = '{"v": 0, "intent": "respond", "params": {"text": "Noted."}}'
 
+#: The txid the mock broadcast endpoint reports (64 lowercase hex); the
+#: status endpoint serves the matching confirmed payload for it.
+BROADCAST_TXID: Final[str] = "ee" * 32
+
+GET_HISTORY_JSON: Final[str] = '{"v": 0, "intent": "get_history", "params": {}}'
+
 # Expected card numbers for the canonical fixture send (deterministic
 # selection math; fee == vsize × rate asserted independently below).
 SEND_AMOUNT_SATS: Final[int] = 60_000
@@ -1643,10 +1706,21 @@ def _send_chain_handler(
     """MockTransport handler for send-flow tests.
 
     Serves per-address txs (always empty — keeps the scan window at the
-    gap) and utxo payloads, plus ``/v1/fees/recommended`` and
-    ``/v1/prices``. ``state`` is a mutable injection point for the tests:
-    ``state["fees_fail"]`` / ``state["prices_fail"]`` flip those endpoints
-    to 500 mid-test (fee-failure and price-staleness scenarios).
+    gap) and utxo payloads, plus ``/v1/fees/recommended``,
+    ``/v1/prices``, the Phase 3 broadcast POST (``/tx``) and the tx
+    status GET (``/tx/<txid>/status``). ``state`` is a mutable injection
+    point for the tests:
+
+    - ``state["fees_fail"]`` / ``state["prices_fail"]`` flip those
+      endpoints to 500 mid-test;
+    - ``state["broadcast_fail"]`` flips the broadcast POST to 500;
+    - ``state["broadcast_txid"]`` overrides the txid the POST returns
+      (default ``BROADCAST_TXID``);
+    - ``state["broadcast_posts"]`` records every POST body (single-
+      attempt assertions);
+    - ``state["status_fail"]`` / ``state["status_404"]`` flip the status
+      endpoint to 500 / 404;
+    - ``state["tx_status_payload"]`` overrides the status JSON payload.
     """
     state = state if state is not None else {}
 
@@ -1665,6 +1739,23 @@ def _send_chain_handler(
             )
         if path.endswith("/blocks/tip"):
             return httpx.Response(200, json=tip)
+        if path.endswith("/tx") and request.method == "POST":
+            state.setdefault("broadcast_posts", []).append(request.content.decode("ascii"))
+            if state.get("broadcast_fail"):
+                return httpx.Response(500, text="boom")
+            return httpx.Response(200, text=state.get("broadcast_txid", BROADCAST_TXID))
+        if path.endswith("/status"):
+            if state.get("status_fail"):
+                return httpx.Response(500, json=None)
+            if state.get("status_404"):
+                return httpx.Response(404, json=None)
+            payload = state.get("tx_status_payload")
+            if payload is not None:
+                return httpx.Response(200, json=payload)
+            return httpx.Response(
+                200,
+                json={"confirmed": True, "block_height": 870_001, "block_time": 1_700_000_500},
+            )
         parts = path.rstrip("/").split("/")
         address, kind = parts[-2], parts[-1]
         if kind == "txs":
@@ -1682,10 +1773,14 @@ def _build_send_table(
     flow: Any | None = None,
     make_price_oracle: Callable[[EsploraClient], Any] | None = None,
     gap_limit: int | None = TEST_GAP,
+    signer: Any | None = None,
+    signer_selection: Any | None = None,
 ) -> tuple[dict[IntentName, Any], Store, Any, EsploraClient, list[httpx.Request], Any, SendSession]:
     """Send-flow dispatch table: like :func:`_build_table` but returning
     the shared ``TxFlow``/``SendSession`` pair the handlers own, and
-    accepting a price-oracle factory for oracle-behavior tests."""
+    accepting a price-oracle factory for oracle-behavior tests plus the
+    TCK-P3-005 signer seams (``signer`` object override /
+    ``signer_selection`` config override)."""
     recorded: list[httpx.Request] = []
     client = _mock_client(make_handler(recorded))
     store = Store.memory()
@@ -1705,6 +1800,8 @@ def _build_send_table(
         flow=tx_flow,
         session=session,
         price_oracle=None if make_price_oracle is None else make_price_oracle(client),
+        signer=signer,
+        signer_selection=signer_selection,
     )
     return table, store, wallet, client, recorded, tx_flow, session
 
@@ -1730,6 +1827,8 @@ def _send_generate(flow: Any, plan: list[str], create_params: dict[str, Any] | N
     ``plan`` entries: ``"create"`` → the canned create_tx envelope;
     ``"confirm"`` → a confirm_tx envelope quoting the flow's REAL pending
     ``tx_ref`` at call time (the stub cannot know it — this closure can);
+    ``"sign"`` → sign_tx quoting the confirmed record's ``tx_ref``;
+    ``"broadcast"`` → broadcast_tx quoting the signed record's ``tx_ref``;
     ``"respond"`` → a canned respond; any other string is emitted
     verbatim (e.g. a hand-written confirm_tx with a bogus ref). Beyond
     the plan, canned ``respond`` forever.
@@ -1747,6 +1846,16 @@ def _send_generate(flow: Any, plan: list[str], create_params: dict[str, Any] | N
             return json.dumps(
                 {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": flow.pending.tx_ref}}
             )
+        if step == "sign":
+            assert flow.confirmed is not None, "test bug: no confirmed tx to reference"
+            return json.dumps(
+                {"v": 0, "intent": "sign_tx", "params": {"tx_ref": flow.confirmed.tx_ref}}
+            )
+        if step == "broadcast":
+            assert flow.signed is not None, "test bug: no signed tx to reference"
+            return json.dumps(
+                {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": flow.signed.tx_ref}}
+            )
         if step == "respond":
             return RESPOND_NOTED_JSON
         return step
@@ -1755,17 +1864,25 @@ def _send_generate(flow: Any, plan: list[str], create_params: dict[str, Any] | N
 
 
 class FactsQuotingGenerate:
-    """PRODUCTION-PATH fake model: quotes ``tx_ref`` from the injected FACTS.
+    """PRODUCTION-PATH fake model: quotes values from the injected FACTS.
 
     Unlike :func:`_send_generate` (the old seam, which captures the
     ``TxFlow`` object), this fake NEVER sees the flow — it only sees the
-    assembled prompt, exactly like the real model. On a ``"confirm"``
-    plan step it extracts the ``pending_tx_ref`` line from the prompt's
-    FACTS block and quotes that value VERBATIM in a ``confirm_tx``
-    envelope — precisely what the system prompt instructs the production
-    model to do (quote verbatim from the confirmation context).
-    ``"create"``/``"respond"`` steps behave like the stub's canned
-    envelopes. Every prompt received is recorded for assertions.
+    assembled prompt, exactly like the real model. Plan steps:
+
+    - ``"create"`` → the canned create_tx envelope;
+    - ``"confirm"`` → extracts ``pending_tx_ref`` from the prompt's FACTS
+      block and quotes it VERBATIM in a ``confirm_tx`` envelope;
+    - ``"sign"`` → extracts ``confirmed_tx_ref`` → ``sign_tx``;
+    - ``"broadcast"`` → extracts ``signed_tx_ref`` → ``broadcast_tx``;
+    - ``"status"`` → extracts ``broadcast_txid`` → ``tx_status``;
+    - ``"history"`` → the canned get_history envelope;
+    - ``"respond"`` → a canned respond.
+
+    This is precisely what the system prompt instructs the production
+    model to do (quote verbatim from the FACTS/confirmation context) —
+    the P2-004 lesson extended to the full TCK-P3-005 lifecycle. Every
+    prompt received is recorded for assertions.
     """
 
     def __init__(self, plan: list[str]) -> None:
@@ -1780,12 +1897,27 @@ class FactsQuotingGenerate:
         self._n += 1
         if step == "create":
             return _create_tx_envelope_json()
-        if step == "confirm":
-            match = re.search(r"^pending_tx_ref: (\S+)$", prompt, re.MULTILINE)
-            assert match is not None, "test bug: no pending_tx_ref fact in the prompt"
+        if step in ("confirm", "sign", "broadcast", "status"):
+            key = {
+                "confirm": "pending_tx_ref",
+                "sign": "confirmed_tx_ref",
+                "broadcast": "signed_tx_ref",
+                "status": "broadcast_txid",
+            }[step]
+            match = re.search(rf"^{key}: (\S+)$", prompt, re.MULTILINE)
+            assert match is not None, f"test bug: no {key} fact in the prompt"
+            intent = {
+                "confirm": "confirm_tx",
+                "sign": "sign_tx",
+                "broadcast": "broadcast_tx",
+                "status": "tx_status",
+            }[step]
+            param_key = "txid" if step == "status" else "tx_ref"
             return json.dumps(
-                {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": match.group(1)}}
+                {"v": 0, "intent": intent, "params": {param_key: match.group(1)}}
             )
+        if step == "history":
+            return GET_HISTORY_JSON
         if step == "respond":
             return RESPOND_NOTED_JSON
         return step
@@ -2483,7 +2615,673 @@ def test_send_flow_reshowed_card_shows_remaining_expiry(
     assert flow.state is TxFlowStatus.CREATED
 
 
-# ------------------------------------------------- live-network integration
+# --------------------------------------- send lifecycle (TCK-P3-005)
+#
+# Full sign/broadcast/status lifecycle WITHOUT network or model: REPL
+# turns → AgentLoop (production-path FactsQuotingGenerate quoting refs
+# and the txid from the injected FACTS blocks) → validation → allowlist
+# dispatch → sign handler (file airgap or HWI fake device) → deterministic
+# re-validation → broadcast via the mocked chain → status. The revalidation
+# gate, flow discipline, single-attempt POST policy, §10 narration, and the
+# store history row are all exercised here.
+
+LIFECYCLE_HISTORY_JSON: Final[str] = '{"v": 0, "intent": "get_history", "params": {}}'
+
+
+#: The fixture wallet's TRUE account derivation: ``_rederive_fixture_key``
+#: builds the fixture vpub at ``m/84'/1'/0`` — a NON-hardened account
+#: index. The app's PSBTs record the interim hardened-label convention
+#: ``[84', 1', 0', branch, index]`` (account-key-own-fingerprint origin,
+#: ADR-0009/0010, OQ18 device registration pending); re-validation checks
+#: keys and signatures, never path labels, so the fake device derives the
+#: account node the way the fixture was actually built and uses the
+#: recorded leaf indexes (branch, index) from the PSBT derivation.
+FIXTURE_ACCOUNT_DERIVATION: Final[list[int]] = [84 + 2**31, 1 + 2**31, 0]
+
+
+def _simulate_device_sign(unsigned_b64: str, *, tamper: bool = False) -> str:
+    """Fake hardware device: sign every PSBT input with the fixture key.
+
+    The unsigned PSBT carries per-input BIP32 derivations; the fake device
+    walks from its account node (see :data:`FIXTURE_ACCOUNT_DERIVATION`)
+    along the recorded leaf indexes and signs the consensus BIP-143 digest
+    (``psbt.sighash(i)``) — the same digest the re-validation gate
+    verifies. ``tamper`` bumps the recipient output value by 546 sats
+    AFTER signing (a tampered container for the hard-stop test).
+    """
+    from embit import bip32, ec
+    from embit.psbt import PSBT as _PSBT
+
+    psbt = _PSBT.parse(base64.b64decode(unsigned_b64))
+    account = bip32.HDKey.from_seed(FIXTURE_SEED).derive(FIXTURE_ACCOUNT_DERIVATION)
+    for i, scope in enumerate(psbt.inputs):
+        (pub, derivation), = scope.bip32_derivations.items()
+        priv = account.derive(derivation.derivation[-2:]).key
+        digest = psbt.sighash(i)
+        stream = BytesIO()
+        ec.Signature.write_to(priv.sign(digest), stream)
+        scope.partial_sigs[pub] = stream.getvalue() + b"\x01"
+    if tamper:
+        psbt.outputs[0].value += 546  # recipient value +546 (tamper matrix)
+    return psbt.to_base64()
+
+
+def _extract_signed_tx(psbt_b64: str) -> Any:
+    """Independent extraction (embit finalizer) for test-side cross-checks."""
+    from embit import finalizer as embit_finalizer
+    from embit.psbt import PSBT as _PSBT
+
+    return embit_finalizer.finalize_psbt(_PSBT.parse(base64.b64decode(psbt_b64)))
+
+
+class _FakeDeviceClient:
+    """Fake hwilib client: exposes the post-open fingerprint getter."""
+
+    def __init__(self, fingerprint_hex: str, recorder: dict[str, bool]) -> None:
+        self._fingerprint = bytes.fromhex(fingerprint_hex)
+        self._recorder = recorder
+
+    def get_master_fingerprint(self) -> bytes:
+        return self._fingerprint
+
+    def close(self) -> None:
+        self._recorder["closed"] = True
+
+
+class _FakeDeviceCommands:
+    """hwilib.commands stand-in whose device REALLY signs with the fixture
+    wallet key (enumerate → fingerprint → signtx, hwi 3.2.0 API shape).
+    ``fail_first_sign`` raises a name-mapped locked error on the first
+    signtx (DeviceLockedError mid-flow → guidance → retry works)."""
+
+    class DeviceNotReadyError(Exception): ...  # name-mapped: locked guidance
+
+    def __init__(self, fingerprint_hex: str, *, fail_first_sign: bool = False) -> None:
+        self.fingerprint_hex = fingerprint_hex
+        self.fail_first_sign = fail_first_sign
+        self.sign_calls = 0
+        self.rec: dict[str, bool] = {}
+        self.client = _FakeDeviceClient(fingerprint_hex, self.rec)
+
+    def enumerate(self, password=None):
+        assert password is None, "our layer must never pass host-side secrets"
+        return [
+            {
+                "type": "trezor",
+                "path": "hid:fake",
+                "model": "trezor_t",
+                "fingerprint": self.fingerprint_hex,
+            }
+        ]
+
+    def get_client(self, device_type, device_path, password=None, chain=None):
+        return self.client
+
+    def signtx(self, client, psbt):
+        self.sign_calls += 1
+        if self.fail_first_sign and self.sign_calls == 1:
+            raise _FakeDeviceCommands.DeviceNotReadyError("locked mid-flight")
+        return {"psbt": _simulate_device_sign(psbt)}
+
+
+def test_send_lifecycle_file_signer_full_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """PRODUCTION-PATH full lifecycle with the file signer: send → card →
+    dual-key confirm → sign (export; signed_file_missing) → device places
+    the signed file → sign again (import → revalidate → SIGNED) →
+    broadcast (POST hits the mock) → status quotes broadcast_txid from
+    FACTS → confirmed-at-height narration → history shows the outbound
+    row. The broadcast POST carries exactly the re-validated transaction."""
+    addr0 = derive_fixture_addresses(1)[0]
+    transfer = tmp_path / "transfer"
+    state: dict[str, Any] = {}
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]}, state=state)
+    fake = FactsQuotingGenerate(
+        ["create", "confirm", "sign", "sign", "broadcast", "status", "history"]
+    )
+
+    def before_line() -> None:
+        # Device simulation between the two sign turns (see helper).
+        if transfer.exists():
+            unsigned = sorted(transfer.glob("localwallet-unsigned-*.psbt.b64"))
+            signed_existing = list(transfer.glob("localwallet-signed-*.psbt.b64"))
+            if unsigned and not signed_existing:
+                unsigned_b64 = unsigned[0].read_text(encoding="utf-8").strip()
+                ref8 = unsigned[0].name[len("localwallet-unsigned-") : -len(".psbt.b64")]
+                signed_path = transfer / f"localwallet-signed-{ref8}.psbt.b64"
+                signed_path.write_text(
+                    _simulate_device_sign(unsigned_b64) + "\n", encoding="utf-8"
+                )
+                side = transfer / (signed_path.name + ".sha256")
+                side.write_text(
+                    hashlib.sha256(signed_path.read_bytes()).hexdigest() + "\n",
+                    encoding="utf-8",
+                )
+
+    code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "yes please",
+            "sign it",
+            "sign it again",
+            "broadcast it",
+            "what's the status?",
+            "show my transactions",
+            "exit",
+        ],
+        ["create", "confirm", "sign", "sign", "broadcast", "status", "history"],
+        generate=fake,
+        extra_env={"LOCALWALLET_SIGNER_DIR": str(transfer)},
+        before_line=before_line,
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    # --- sign turn 1: export + file-missing handoff line (§10) ----------
+    assert "Exported to " in joined
+    assert "(say: signed localwallet-signed-" in joined
+    exported = sorted(transfer.glob("localwallet-unsigned-*.psbt.b64"))
+    assert len(exported) == 1
+    assert (transfer / (exported[0].name + ".sha256")).exists()  # ADR-0014 sidecar
+    # --- sign turn 2: import → revalidate → SIGNED ----------------------
+    signed_files = list(transfer.glob("localwallet-signed-*.psbt.b64"))
+    assert len(signed_files) == 1  # the device simulation placed it
+    expected_txid = _extract_signed_tx(
+        signed_files[0].read_text(encoding="utf-8").strip()
+    ).txid().hex()
+    assert (
+        f"Signed and verified ✓ txid {expected_txid}. "
+        f"Ready to broadcast — say 'broadcast'." in joined
+    )
+    # No sidecar note: the simulated device file carries a matching sidecar.
+    assert "integrity not verified" not in joined
+    # --- broadcast: single POST with EXACTLY the re-validated tx --------
+    posts = state["broadcast_posts"]
+    assert len(posts) == 1
+    expected_hex = _extract_signed_tx(flow.signed.psbt_base64).serialize().hex()
+    assert posts[0] == expected_hex
+    assert f"Sent! txid {BROADCAST_TXID} — tracking…" in joined
+    assert flow.state is TxFlowStatus.BROADCAST
+    assert flow.txid == BROADCAST_TXID
+    # --- status: the model quoted broadcast_txid from the FACTS ---------
+    status_prompt = fake.prompts[5]
+    assert f"broadcast_txid: {BROADCAST_TXID}" in status_prompt
+    assert "Confirmed at height 870001." in joined
+    # --- history: the outbound row (store upsert after broadcast) -------
+    assert f"tx {BROADCAST_TXID[:12]}… out unconfirmed" in joined
+    store_path = tmp_path / "store.db"
+    with Store(store_path) as store:
+        wallet_row = store.get_wallet_by_name("default")
+        assert wallet_row is not None
+        rows = store.get_txs_for_wallet(wallet_row.id)
+        assert [(r.txid, r.height, r.direction, r.fee_sats) for r in rows] == [
+            (BROADCAST_TXID, None, "out", SEND_FEE_SATS)
+        ]
+
+
+def test_send_lifecycle_hwi_signer_locked_retry_then_broadcast(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """HWI path with a fake commands module: fingerprint gate (incl. the
+    post-open re-check) → DeviceLockedError mid-flow → §10 guidance line →
+    'retry' → sign → revalidate → broadcast. Flow discipline throughout."""
+    from localwallet.signer.hwi import HwiUsbSigner as RealHwiUsbSigner
+
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    fingerprint = _fixture_parsed().hd_key.my_fingerprint.hex()
+    commands = _FakeDeviceCommands(fingerprint, fail_first_sign=True)
+    monkeypatch.setattr(
+        app_module,
+        "HwiUsbSigner",
+        lambda fp: RealHwiUsbSigner(fp, commands_module=commands),
+    )
+    fake = FactsQuotingGenerate(["create", "confirm", "sign", "sign", "broadcast"])
+
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "yes please",
+            "sign it",
+            "retry",
+            "broadcast it",
+            "exit",
+        ],
+        ["create", "confirm", "sign", "sign", "broadcast"],
+        generate=fake,
+        extra_env={"LOCALWALLET_SIGNER": "hwi"},
+    )
+
+    joined = "\n".join(outputs)
+    # First attempt: the locked device error surfaces its guidance VERBATIM
+    # (code-owned §10 text). The retry: the fake device signs; revalidation
+    # passes; the broadcast completes the lifecycle (end state below).
+    assert "Enter your PIN/passphrase on the device, then say 'retry'." in joined
+    assert "Signed and verified ✓ txid " in joined
+    assert commands.sign_calls == 2  # the locked attempt + the retry
+    assert commands.rec["closed"] is True  # device handle released both times
+    assert f"Sent! txid {BROADCAST_TXID} — tracking…" in joined
+    assert flow.state is TxFlowStatus.BROADCAST
+
+
+def test_send_lifecycle_revalidation_hard_stop_tampered_psbt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The fake device returns a TAMPERED signed PSBT (recipient value
+    +546): revalidation fails → hard stop, flow stays CONFIRMED, and
+    broadcast is refused (no signed record exists to broadcast)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    transfer = tmp_path / "transfer"
+    state: dict[str, Any] = {}
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]}, state=state)
+
+    def before_line() -> None:
+        if transfer.exists():
+            unsigned = sorted(transfer.glob("localwallet-unsigned-*.psbt.b64"))
+            signed_existing = list(transfer.glob("localwallet-signed-*.psbt.b64"))
+            if unsigned and not signed_existing:
+                unsigned_b64 = unsigned[0].read_text(encoding="utf-8").strip()
+                ref8 = unsigned[0].name[len("localwallet-unsigned-") : -len(".psbt.b64")]
+                signed_path = transfer / f"localwallet-signed-{ref8}.psbt.b64"
+                signed_path.write_text(
+                    _simulate_device_sign(unsigned_b64, tamper=True) + "\n",
+                    encoding="utf-8",
+                )
+
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "yes please",
+            "sign it",
+            "sign it again",
+            "broadcast it",
+            "exit",
+        ],
+        [
+            "create",
+            "confirm",
+            "sign",
+            "sign",
+            # A literal broadcast envelope (placeholder ref): the flow is
+            # still CONFIRMED after the hard stop, so the state gate fires.
+            json.dumps(
+                {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "bogus-ref"}}
+            ),
+        ],
+        extra_env={"LOCALWALLET_SIGNER_DIR": str(transfer)},
+        before_line=before_line,
+    )
+
+    joined = "\n".join(outputs)
+    assert (
+        "The signed transaction failed verification "
+        "(extracted transaction output value does not match the intended "
+        "transaction) — nothing was signed or sent; try signing again." in joined
+    )
+    assert flow.state is TxFlowStatus.CONFIRMED  # hard stop: flow untouched
+    assert flow.signed is None
+    # No broadcast path exists from CONFIRMED — and no POST hit the chain.
+    assert "Not broadcast — no signed transaction to broadcast." in joined
+    assert state.get("broadcast_posts", []) == []
+
+
+def test_send_lifecycle_broadcast_5xx_stays_signed_retry_succeeds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Broadcast POST 5xx → broadcast_failed narration, flow STAYS SIGNED;
+    the retry succeeds. Exactly ONE POST per attempt (the chain layer's
+    single-attempt policy — no automatic retry storm)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    transfer = tmp_path / "transfer"
+    state: dict[str, Any] = {"broadcast_fail": True}
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]}, state=state)
+
+    def before_line() -> None:
+        if transfer.exists():
+            unsigned = sorted(transfer.glob("localwallet-unsigned-*.psbt.b64"))
+            signed_existing = list(transfer.glob("localwallet-signed-*.psbt.b64"))
+            if unsigned and not signed_existing:
+                unsigned_b64 = unsigned[0].read_text(encoding="utf-8").strip()
+                ref8 = unsigned[0].name[len("localwallet-unsigned-") : -len(".psbt.b64")]
+                signed_path = transfer / f"localwallet-signed-{ref8}.psbt.b64"
+                signed_path.write_text(
+                    _simulate_device_sign(unsigned_b64) + "\n", encoding="utf-8"
+                )
+        # Fail only the FIRST broadcast POST (single-attempt semantics):
+        # once one POST has happened, re-enable success for the retry.
+        if len(state.get("broadcast_posts", [])) >= 1:
+            state["broadcast_fail"] = False
+
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "yes please",
+            "sign it",
+            "sign it again",
+            "broadcast it",
+            "broadcast it again",
+            "exit",
+        ],
+        ["create", "confirm", "sign", "sign", "broadcast", "broadcast"],
+        extra_env={"LOCALWALLET_SIGNER_DIR": str(transfer)},
+        before_line=before_line,
+    )
+
+    joined = "\n".join(outputs)
+    # First attempt: 500 → scrubbed failure, signed transaction kept (the
+    # retry below only succeeds because the flow STAYED SIGNED).
+    assert (
+        "Broadcast failed (broadcast failed: status 500) — the signed "
+        "transaction is kept; say 'broadcast' to retry." in joined
+    )
+    # Retry (the mock flips to success after the first POST): succeeds;
+    # exactly one POST per attempt in total.
+    assert f"Sent! txid {BROADCAST_TXID} — tracking…" in joined
+    assert flow.state is TxFlowStatus.BROADCAST
+    assert len(state["broadcast_posts"]) == 2  # 1 per attempt, no retries
+
+
+def test_send_lifecycle_signed_file_missing_guidance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """sign_tx with the file signer before the user places the signed
+    file: the §10 handoff line names the export path and the EXPECTED
+    signed filename (deterministic from tx_ref); the unsigned file + its
+    sidecar exist; the flow stays CONFIRMED."""
+    addr0 = derive_fixture_addresses(1)[0]
+    transfer = tmp_path / "transfer"
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "yes please", "sign it", "exit"],
+        ["create", "confirm", "sign"],
+        extra_env={"LOCALWALLET_SIGNER_DIR": str(transfer)},
+    )
+
+    handoff = next(
+        line for line in outputs if line.startswith("Exported to ")
+    )
+    assert "Move it to your SD card, sign on your device" in handoff
+    assert "(say: signed localwallet-signed-" in handoff
+    assert ".psbt.b64)." in handoff
+    # The export really happened (payload + sidecar), nothing signed yet.
+    unsigned = sorted(transfer.glob("localwallet-unsigned-*.psbt.b64"))
+    assert len(unsigned) == 1
+    assert (transfer / (unsigned[0].name + ".sha256")).exists()
+    assert not list(transfer.glob("localwallet-signed-*.psbt.b64"))
+    assert flow.state is TxFlowStatus.CONFIRMED
+
+
+def test_send_lifecycle_unknown_tx_eventual_consistency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Right after broadcast the explorer may not have indexed the
+    transaction: a 404 for the FLOW's broadcast txid → the unknown_tx
+    narration (eventual consistency), while a 404 for any other txid is
+    the ordinary chain-unavailable path."""
+    addr0 = derive_fixture_addresses(1)[0]
+    transfer = tmp_path / "transfer"
+    state: dict[str, Any] = {"status_404": True}
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]}, state=state)
+    fake = FactsQuotingGenerate(["create", "confirm", "sign", "sign", "broadcast", "status"])
+
+    def before_line() -> None:
+        if transfer.exists():
+            unsigned = sorted(transfer.glob("localwallet-unsigned-*.psbt.b64"))
+            signed_existing = list(transfer.glob("localwallet-signed-*.psbt.b64"))
+            if unsigned and not signed_existing:
+                unsigned_b64 = unsigned[0].read_text(encoding="utf-8").strip()
+                ref8 = unsigned[0].name[len("localwallet-unsigned-") : -len(".psbt.b64")]
+                signed_path = transfer / f"localwallet-signed-{ref8}.psbt.b64"
+                signed_path.write_text(
+                    _simulate_device_sign(unsigned_b64) + "\n", encoding="utf-8"
+                )
+
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "yes please",
+            "sign it",
+            "sign it again",
+            "broadcast it",
+            "what's the status?",
+            "exit",
+        ],
+        ["create", "confirm", "sign", "sign", "broadcast", "status"],
+        generate=fake,
+        extra_env={"LOCALWALLET_SIGNER_DIR": str(transfer)},
+        before_line=before_line,
+    )
+
+    assert flow.state is TxFlowStatus.BROADCAST
+    joined = "\n".join(outputs)
+    # The flow's own txid, not yet indexed → the eventual-consistency line.
+    assert (
+        "Transaction not found on the chain yet — it may not be indexed; "
+        "try again in a moment." in joined
+    )
+    # The status turn quoted broadcast_txid from the FACTS (production path).
+    assert f"broadcast_txid: {BROADCAST_TXID}" in fake.prompts[5]
+
+
+def test_send_lifecycle_sign_and_broadcast_gate_refusals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Flow discipline at handler level: sign_tx from CREATED refused;
+    sign_tx with a mismatched ref refused; broadcast_tx from CONFIRMED
+    refused — every refusal value-free and state-preserving."""
+    addr0 = derive_fixture_addresses(1)[0]
+    transfer = tmp_path / "transfer"
+    table, _store, _wallet, client, _recorded, flow, session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]}),
+        signer_selection=app_module.SignerSelection(
+            kind="file", dir_path=transfer, fingerprint_hex="00" * 4
+        ),
+    )
+    created = table[IntentName.CREATE_TX](validate_payload(_create_tx_envelope_json()))
+    tx_ref = created["tx_ref"]
+
+    # sign_tx from CREATED → refused, state unchanged.
+    sign_env = validate_payload(
+        json.dumps({"v": 0, "intent": "sign_tx", "params": {"tx_ref": tx_ref}})
+    )
+    refused = table[IntentName.SIGN_TX](sign_env)
+    assert refused == {
+        "error": "sign_refused",
+        "detail": "no confirmed transaction to sign",
+    }
+    assert flow.state is TxFlowStatus.CREATED
+
+    # broadcast_tx from CREATED → refused.
+    broadcast_env = validate_payload(
+        json.dumps({"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": tx_ref}})
+    )
+    assert table[IntentName.BROADCAST_TX](broadcast_env) == {
+        "error": "broadcast_refused",
+        "detail": "no signed transaction to broadcast",
+    }
+
+    # Confirm, then sign_tx quoting the WRONG ref → refused, CONFIRMED.
+    session.gate_decision = GateDecision.CONFIRM
+    table[IntentName.CONFIRM_TX](
+        validate_payload(
+            json.dumps({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": tx_ref}})
+        )
+    )
+    assert flow.state is TxFlowStatus.CONFIRMED
+    wrong_ref = validate_payload(
+        json.dumps({"v": 0, "intent": "sign_tx", "params": {"tx_ref": "bogus-ref"}})
+    )
+    assert table[IntentName.SIGN_TX](wrong_ref) == {
+        "error": "sign_refused",
+        "detail": "tx_ref does not match the confirmed transaction",
+    }
+    # broadcast_tx from CONFIRMED → refused (no skip path past signing).
+    assert table[IntentName.BROADCAST_TX](broadcast_env) == {
+        "error": "broadcast_refused",
+        "detail": "no signed transaction to broadcast",
+    }
+    assert flow.state is TxFlowStatus.CONFIRMED
+    client.close()
+    _store.close()
+
+
+def test_send_lifecycle_sign_tx_result_contract_and_tamper_value_free(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Table-level sign_tx: the success result carries exactly the
+    contract keys (status/tx_ref/txid from RevalidatedTx/signer_name/
+    checksum_verified), and a tampered import yields a value-free
+    revalidation_failed detail (no PSBT text, no addresses, no amounts)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    transfer = tmp_path / "transfer"
+    table, _store, _wallet, client, _recorded, flow, session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]}),
+        signer_selection=app_module.SignerSelection(
+            kind="file", dir_path=transfer, fingerprint_hex="00" * 4
+        ),
+    )
+    created = table[IntentName.CREATE_TX](validate_payload(_create_tx_envelope_json()))
+    tx_ref = created["tx_ref"]
+    session.gate_decision = GateDecision.CONFIRM
+    table[IntentName.CONFIRM_TX](
+        validate_payload(
+            json.dumps({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": tx_ref}})
+        )
+    )
+    sign_env = validate_payload(
+        json.dumps({"v": 0, "intent": "sign_tx", "params": {"tx_ref": tx_ref}})
+    )
+
+    # First call: export + signed_file_missing.
+    missing = table[IntentName.SIGN_TX](sign_env)
+    assert missing["error"] == "signed_file_missing"
+    assert missing["signed_filename"].startswith("localwallet-signed-")
+    assert missing["signed_filename"].endswith(".psbt.b64")
+
+    # Device places a TAMPERED signed file → value-free hard stop.
+    unsigned_path = transfer / f"localwallet-unsigned-{tx_ref[:8]}.psbt.b64"
+    ref8 = tx_ref[:8]
+    tampered = _simulate_device_sign(
+        unsigned_path.read_text(encoding="utf-8").strip(), tamper=True
+    )
+    (transfer / f"localwallet-signed-{ref8}.psbt.b64").write_text(
+        tampered + "\n", encoding="utf-8"
+    )
+    failed = table[IntentName.SIGN_TX](sign_env)
+    assert failed["error"] == "revalidation_failed"
+    detail = str(failed["detail"])
+    assert detail.strip() != ""
+    for value in (SEND_RECIPIENT, str(SEND_AMOUNT_SATS), tampered[:20]):
+        assert value not in detail
+    assert flow.state is TxFlowStatus.CONFIRMED
+
+    # Replace with an honest signed file → success contract.
+    honest = _simulate_device_sign(unsigned_path.read_text(encoding="utf-8").strip())
+    (transfer / f"localwallet-signed-{ref8}.psbt.b64").write_text(
+        honest + "\n", encoding="utf-8"
+    )
+    (transfer / f"localwallet-signed-{ref8}.psbt.b64.sha256").write_text(
+        hashlib.sha256((transfer / f"localwallet-signed-{ref8}.psbt.b64").read_bytes()).hexdigest()
+        + "\n",
+        encoding="utf-8",
+    )
+    signed = table[IntentName.SIGN_TX](sign_env)
+    assert set(signed.keys()) == {
+        "status",
+        "tx_ref",
+        "txid",
+        "signer_name",
+        "checksum_verified",
+    }
+    assert signed["status"] == "signed"
+    assert signed["tx_ref"] == tx_ref
+    assert signed["signer_name"] == "file"
+    assert signed["checksum_verified"] is True
+    expected_txid = _extract_signed_tx(honest).txid().hex()
+    assert signed["txid"] == expected_txid
+    assert len(signed["txid"]) == 64
+    assert flow.state is TxFlowStatus.SIGNED
+    client.close()
+    _store.close()
+
+
+def test_send_lifecycle_tx_status_unknown_vs_chain_error(tmp_path: Path) -> None:
+    """unknown_tx is reserved for the flow's own broadcast txid (404 =
+    eventual consistency); the same 404 for any other txid is the generic
+    chain_unavailable path."""
+    addr0 = derive_fixture_addresses(1)[0]
+    transfer = tmp_path / "transfer"
+    state: dict[str, Any] = {"status_404": True}
+    table, _store, _wallet, client, _recorded, flow, session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]}, state=state),
+        signer_selection=app_module.SignerSelection(
+            kind="file", dir_path=transfer, fingerprint_hex="00" * 4
+        ),
+    )
+    created = table[IntentName.CREATE_TX](validate_payload(_create_tx_envelope_json()))
+    tx_ref = created["tx_ref"]
+    session.gate_decision = GateDecision.CONFIRM
+    table[IntentName.CONFIRM_TX](
+        validate_payload(
+            json.dumps({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": tx_ref}})
+        )
+    )
+    sign_env = validate_payload(
+        json.dumps({"v": 0, "intent": "sign_tx", "params": {"tx_ref": tx_ref}})
+    )
+    table[IntentName.SIGN_TX](sign_env)  # export + signed_file_missing
+    unsigned_path = transfer / f"localwallet-unsigned-{tx_ref[:8]}.psbt.b64"
+    honest = _simulate_device_sign(unsigned_path.read_text(encoding="utf-8").strip())
+    (transfer / f"localwallet-signed-{tx_ref[:8]}.psbt.b64").write_text(
+        honest + "\n", encoding="utf-8"
+    )
+    table[IntentName.SIGN_TX](sign_env)  # import → revalidate → SIGNED
+    table[IntentName.BROADCAST_TX](
+        validate_payload(
+            json.dumps({"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": tx_ref}})
+        )
+    )
+    assert flow.state is TxFlowStatus.BROADCAST and flow.txid is not None
+
+    status_env = validate_payload(
+        json.dumps({"v": 0, "intent": "tx_status", "params": {"txid": flow.txid}})
+    )
+    assert table[IntentName.TX_STATUS](status_env) == {
+        "error": "unknown_tx",
+        "detail": (
+            "the broadcast transaction is not indexed yet — eventual "
+            "consistency; try again shortly"
+        ),
+    }
+    other_env = validate_payload(
+        json.dumps({"v": 0, "intent": "tx_status", "params": {"txid": "ab" * 32}})
+    )
+    other = table[IntentName.TX_STATUS](other_env)
+    assert other["error"] == "chain_unavailable"
+    assert "status 404" in str(other["detail"])
+    assert flow.txid not in str(other["detail"])  # scrubbed chain detail
+    client.close()
+    _store.close()
 
 
 @pytest.mark.network

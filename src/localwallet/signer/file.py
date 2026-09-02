@@ -14,6 +14,11 @@ Implements the file conventions of ADR-0014 (OQ17):
   + newline). On import a present sidecar MUST match (fail closed); an
   absent sidecar is allowed and reported via ``SignedResult.checksum_verified
   = False`` (ADR-0014).
+- **Container-size ceiling:** export and import both refuse base64 PSBT
+  text over :data:`_MAX_PSBT_TEXT_CHARS` characters — the transfer-folder
+  gateway bounds its payload BEFORE any decode/parse, so downstream
+  consumers (``localwallet.tx.revalidate``) only ever receive bounded
+  data, exactly as revalidate's parse-before-bounds note assumes.
 - **Value-free errors:** messages never echo PSBT content, addresses,
   amounts, or transfer-folder filenames.
 
@@ -53,6 +58,14 @@ _REF_LEN = 8
 #: (ADR-0014: hex/alnum only — nothing outside [0-9A-Za-z]).
 _REF_ALNUM_ASCII = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
+#: Container-size ceiling in characters of base64 PSBT text (TCK-P3-005
+#: rider R5): both directions refuse larger payloads BEFORE decode/parse,
+#: so the re-validation gateway downstream only ever sees bounded data.
+#: 200_000 chars ≈ 150 KB of PSBT — comfortably above anything the v1
+#: send flow builds (Core's 100 KB standard tx weight ceiling) and far
+#: below unbounded transfer-file sizes.
+_MAX_PSBT_TEXT_CHARS = 200_000
+
 #: Signer identifier reported in SignedResult (ADR-0014).
 _SIGNER_NAME = "file"
 
@@ -85,10 +98,13 @@ def _sanitize_tx_ref(tx_ref: str) -> str:
 def _validate_psbt_text(content: str) -> None:
     """Refuse an export payload that is not a well-formed base64 PSBT.
 
-    Strict base64 decode → BIP174 magic prefix → embit parse, run BEFORE any
+    Container-size ceiling first (bounds BEFORE any decode), then strict
+    base64 decode → BIP174 magic prefix → embit parse — all run BEFORE any
     byte is written toward a device (A6): a device must never receive a
     malformed or mislabeled container. Errors are value-free.
     """
+    if len(content) > _MAX_PSBT_TEXT_CHARS:
+        raise SignerError("psbt text exceeds the maximum container size")
     try:
         raw = base64.b64decode(content, validate=True)
     except Exception as exc:  # containment: invalid base64
@@ -150,6 +166,7 @@ class FilePsbtSigner:
 
         Refusals (value-free):
         - a non-string / empty PSBT;
+        - a payload over the container-size ceiling (bounds before decode);
         - a payload that does not decode as base64 PSBT text (validated
           BEFORE any write toward a device);
         - a non-string ``tx_ref``;
@@ -227,7 +244,8 @@ class FilePsbtSigner:
         2. **Checksum sidecar** — if a ``<name>.sha256`` sidecar exists it MUST
            match the file's SHA-256 (mismatch is a hard refusal); an absent
            sidecar is allowed and reported via ``checksum_verified=False``;
-        3. **base64 decode** — the text must be valid base64;
+        3. **base64 decode** — the text must be valid base64, and must not
+           exceed the container-size ceiling (bounds before decode);
         4. **PSBT magic** — the decoded bytes must start with ``b"psbt\\xff"``;
         5. **Structure** — the bytes must parse as an embit PSBT and every
            input must carry a signature (partial sig or final witness); an
@@ -280,13 +298,15 @@ class FilePsbtSigner:
                 raise SignerError("checksum mismatch")  # fail closed, value-free
             checksum_verified = True
 
-        # Text decode (base64 text per ADR-0014), then base64 + PSBT magic.
+        # Text decode (base64 text per ADR-0014), then size + base64 + magic.
         try:
             text = data.decode("utf-8").strip()
         except UnicodeDecodeError as exc:
             raise SignerError("signed file is not valid base64 PSBT text") from exc
         if not text:
             raise SignerError("signed file is empty")
+        if len(text) > _MAX_PSBT_TEXT_CHARS:
+            raise SignerError("signed file exceeds the maximum container size")
         try:
             raw = base64.b64decode(text, validate=True)
         except Exception as exc:  # containment: invalid base64
@@ -313,6 +333,19 @@ class FilePsbtSigner:
         )
 
     # -- helper ---------------------------------------------------------
+
+    def signed_import_path(self, tx_ref: str) -> Path:
+        """The signed-file path the ADR-0014 convention expects for ``tx_ref``.
+
+        Deterministic filename derivation for the app-layer handoff
+        (TCK-P3-005): ``localwallet-signed-<ref>.psbt.b64`` with the SAME
+        sanitized reference prefix :meth:`export_unsigned` used, so the
+        signer directory is scanned by convention — never by user- or
+        model-supplied paths. Pure path computation (no I/O).
+        """
+        if not isinstance(tx_ref, str):
+            raise SignerError("tx_ref must be a string")
+        return self.directory / f"{_SIGNED_PREFIX}{_sanitize_tx_ref(tx_ref)}{_SUFFIX}"
 
     def list_pending_exports(self) -> list[Path]:
         """Return exported unsigned PSBT files still awaiting import.

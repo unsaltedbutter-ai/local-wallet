@@ -11,14 +11,24 @@ implements no protocol, wallet, chain, or tx-engine logic itself:
   ``get_utxos`` project cached rows, ``new_address`` allocates the next
   derivation index (store bookkeeping + pure derivation — never
   network), ``respond``/``clarify`` pass the model's text through
-  unchanged, and the send flow runs the dispatcher-owned state machine:
-  ``create_tx`` resolves the amount (sats, or USD via the price oracle),
-  estimates the fee, selects coins and builds the unsigned PSBT via the
-  pure tx engine, then stages a :class:`~localwallet.tx.flow.PendingTx`;
+  unchanged, and the send flow runs the dispatcher-owned state machine
+  through its full Phase 3 lifecycle (TCK-P3-005): ``create_tx``
+  resolves the amount (sats, or USD via the price oracle), estimates
+  the fee, selects coins and builds the unsigned PSBT via the pure tx
+  engine, then stages a :class:`~localwallet.tx.flow.PendingTx`;
   ``confirm_tx`` moves the flow CREATED → CONFIRMED only under the
   dual-key rule (ADR-0013): a matching ``tx_ref`` AND a CONFIRM
   classification of the SAME turn's user utterance by the deterministic
-  :class:`~localwallet.tx.flow.ConfirmGate` — an LLM "yes" never counts.
+  :class:`~localwallet.tx.flow.ConfirmGate` — an LLM "yes" never counts;
+  ``sign_tx`` hands the approved record to the configured signer (file
+  airgap per ADR-0014, or HWI-USB per ADR-0015) and passes the signed
+  PSBT through deterministic re-validation
+  (:func:`localwallet.tx.revalidate.revalidate_signed_psbt`) before
+  recording it — a mismatch is a hard stop, the flow stays CONFIRMED;
+  ``broadcast_tx`` extracts the raw hex from the re-validated signed
+  PSBT, POSTs it once (the chain layer's single-attempt policy), and
+  records the BROADCAST state plus a history row; ``tx_status`` quotes
+  the explorer's confirmation status for a verbatim txid.
 - :func:`run` / :func:`main` — CLI wiring: read the watch-only key from
   ``--zpub`` or ``LOCALWALLET_ZPUB``, parse + gate it (testnet-only,
   value-free errors → config-error exit 2), open the store
@@ -51,6 +61,7 @@ Invariants honored here:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -58,9 +69,12 @@ import sqlite3
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from string import punctuation
 from typing import Final
 
+from embit import finalizer
+from embit.psbt import PSBT
 from embit.script import address_to_scriptpubkey
 
 from localwallet.agent.context import sanitize_tool_output
@@ -83,6 +97,7 @@ from localwallet.chain import (
 )
 from localwallet.config import Settings
 from localwallet.protocol import (
+    BroadcastTxParams,
     ClarifyParams,
     ConfirmTxParams,
     CreateTxParams,
@@ -93,13 +108,20 @@ from localwallet.protocol import (
     IntentName,
     NewAddressParams,
     RespondParams,
+    SignTxParams,
+    TxStatusParams,
 )
+from localwallet.signer.base import Signer, SignerError
+from localwallet.signer.file import FilePsbtSigner
+from localwallet.signer.hwi import DeviceError, HwiUsbSigner
 from localwallet.store import (
     ADDRESS_ALLOCATED,
     BRANCH_CHANGE,
+    DIR_OUT,
     AddressRecord,
     Store,
     StoreError,
+    TxRecord,
     WalletRecord,
 )
 from localwallet.tx.flow import (
@@ -107,10 +129,22 @@ from localwallet.tx.flow import (
     ConfirmGate,
     FlowError,
     GateDecision,
+    PendingTx,
     TxFlow,
     TxFlowStatus,
 )
-from localwallet.tx.psbt import PsbtError, PsbtInputSource, build_unsigned_psbt, psbt_to_base64
+from localwallet.tx.psbt import (
+    SEQUENCE_RBF_ENABLED,
+    PsbtError,
+    PsbtInputSource,
+    build_unsigned_psbt,
+    psbt_to_base64,
+)
+from localwallet.tx.revalidate import (
+    IntendedTx,
+    TamperedPsbtError,
+    revalidate_signed_psbt,
+)
 from localwallet.tx.selection import InsufficientFundsError, SelectionError, select_coins
 from localwallet.wallet import scan as wallet_scan
 from localwallet.wallet.derivation import BranchDeriver
@@ -126,10 +160,14 @@ from localwallet.wallet.descriptor import (
 __all__ = [
     "AUTO_SCAN_ENV_VAR",
     "DEFAULT_HISTORY_LIMIT",
+    "DEFAULT_SIGNER_DIR",
     "OUT_OF_WINDOW_NOTICE",
     "PRIVACY_INDICATOR",
+    "SIGNER_DIR_ENV_VAR",
+    "SIGNER_ENV_VAR",
     "ZPUB_ENV_VAR",
     "SendSession",
+    "SignerSelection",
     "build_dispatch_table",
     "main",
     "run",
@@ -143,6 +181,25 @@ ZPUB_ENV_VAR: Final[str] = "LOCALWALLET_ZPUB"
 #: Environment variable opting out of the startup scan (``"0"`` disables;
 #: any other value — including unset — keeps the default on).
 AUTO_SCAN_ENV_VAR: Final[str] = "LOCALWALLET_AUTO_SCAN"
+
+#: Environment variable selecting the signing backend (``--signer``
+#: overrides it): ``"file"`` (airgap transfer folder, ADR-0014 — the
+#: default) or ``"hwi"`` (USB hardware wallet via HWI-as-a-library,
+#: ADR-0015). Validated at startup; invalid values are a config error.
+SIGNER_ENV_VAR: Final[str] = "LOCALWALLET_SIGNER"
+
+#: Environment variable pointing the file signer at its transfer folder;
+#: falls back to :data:`DEFAULT_SIGNER_DIR`.
+SIGNER_DIR_ENV_VAR: Final[str] = "LOCALWALLET_SIGNER_DIR"
+
+#: Default transfer folder for the file signer (ADR-0014); created on
+#: demand at the first export.
+DEFAULT_SIGNER_DIR: Final[str] = "./psbt-transfer"
+
+#: The closed signer-kind set (mirrors the protocol's ``signer`` enum).
+SIGNER_KIND_FILE: Final[str] = "file"
+SIGNER_KIND_HWI: Final[str] = "hwi"
+_SIGNER_KINDS: Final[frozenset[str]] = frozenset({SIGNER_KIND_FILE, SIGNER_KIND_HWI})
 
 #: History entries returned when the model omits ``params.limit``
 #: (protocol contract, ADR-0002 v0 extensions).
@@ -219,6 +276,23 @@ _STUB_CONFIRM_TX_ENVELOPE: Final[str] = json.dumps(
     {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "dev-stub-pending-tx"}}
 )
 
+#: Canned Phase 3 lifecycle envelopes for the dev stub (TCK-P3-005): the
+#: ``tx_ref`` placeholders deliberately cannot match a real flow record —
+#: dispatching them demonstrates the sign/broadcast refusal paths. The
+#: ``tx_status`` placeholder IS a shape-valid txid (64 lowercase hex) that
+#: exercises the chain lookup path; deterministic tests inject closures
+#: quoting the flow's real references instead.
+_STUB_SIGN_TX_ENVELOPE: Final[str] = json.dumps(
+    {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "dev-stub-pending-tx"}}
+)
+_STUB_BROADCAST_TX_ENVELOPE: Final[str] = json.dumps(
+    {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "dev-stub-pending-tx"}}
+)
+_STUB_TX_STATUS_TXID: Final[str] = "ab" * 32
+_STUB_TX_STATUS_ENVELOPE: Final[str] = json.dumps(
+    {"v": 0, "intent": "tx_status", "params": {"txid": _STUB_TX_STATUS_TXID}}
+)
+
 #: User-facing narration lines for the send flow (TCK-P2-004). Every value
 #: they carry comes verbatim from the handler result dict — the UI computes
 #: nothing (integer division/formatting of result values only, the same
@@ -257,6 +331,29 @@ class SendSession:
     gate_decision: GateDecision = GateDecision.NOT_A_DECISION
 
 
+@dataclass(frozen=True, slots=True)
+class SignerSelection:
+    """Resolved signing-backend configuration (TCK-P3-005).
+
+    Built once at startup from ``--signer`` / :data:`SIGNER_ENV_VAR` /
+    :data:`SIGNER_DIR_ENV_VAR`:
+
+    - ``kind`` — ``"file"`` (airgap transfer folder, ADR-0014) or
+      ``"hwi"`` (USB hardware wallet, ADR-0015);
+    - ``dir_path`` — the file signer's transfer folder (created on demand
+      at the first export);
+    - ``fingerprint_hex`` — the wallet's expected master-key fingerprint
+      from the parsed wallet key (the descriptor origin fingerprint); the
+      HWI signer's exactly-one-match gate (ADR-0015) is constructed from
+      it — lazily, ONLY when the hwi kind is selected, and per sign
+      attempt (the signer objects are stateless).
+    """
+
+    kind: str
+    dir_path: Path
+    fingerprint_hex: str
+
+
 def stub_generate(prompt: str, grammar_text: str | None) -> str:
     """Deterministic stub model for ``--stub-llm`` — dev/test mode ONLY.
 
@@ -270,23 +367,27 @@ def stub_generate(prompt: str, grammar_text: str | None) -> str:
     of the assembled prompt, see ``AgentLoop._build_prompt``) against a
     fixed phrase table — "balance" → ``get_balance``; "history" or
     "transaction" → ``get_history``; "utxo" → ``get_utxos``; "new
-    address" / "address" → ``new_address``; a send request ("send … to
-    tb1…") → ``create_tx`` (the ``tb1…`` token and the ``<n> sats`` /
-    ``$<n>`` figure are extracted verbatim from the user turn, with the
-    canned fixture recipient / a canned 10000-sat amount as fallbacks);
-    a confirmation utterance ("confirm", "yes", …) → ``confirm_tx``;
-    anything else → a canned ``respond``. ``grammar_text`` is accepted
-    for :data:`~localwallet.agent.runtime.GenerateFn` compatibility and
+    address" / "address" → ``new_address``; "status" → ``tx_status`` (the
+    first 64-hex token in the utterance is extracted verbatim, with the
+    canned placeholder as fallback); "sign" → ``sign_tx``; "broadcast" →
+    ``broadcast_tx``; a send request ("send … to tb1…") → ``create_tx``
+    (the ``tb1…`` token and the ``<n> sats`` / ``$<n>`` figure are
+    extracted verbatim from the user turn, with the canned fixture
+    recipient / a canned 10000-sat amount as fallbacks); a confirmation
+    utterance ("confirm", "yes", …) → ``confirm_tx``; anything else → a
+    canned ``respond``. ``grammar_text`` is accepted for
+    :data:`~localwallet.agent.runtime.GenerateFn` compatibility and
     ignored.
 
-    Dev-mode caveats (by design, documented): the canned ``confirm_tx``
-    carries a placeholder ``tx_ref`` that cannot match a real pending
-    reference — the flow refuses it, which demonstrates the dual-key
-    refusal path. Deterministic tests do NOT rely on the stub for the
-    happy path; they inject generate closures that quote the flow's real
-    pending ``tx_ref``. Everything the stub extracts from user text is
-    untrusted input like any model output: it flows through the full
-    3-layer validation before any handler runs.
+    Dev-mode caveats (by design, documented): the canned
+    ``confirm_tx``/``sign_tx``/``broadcast_tx`` carry placeholder
+    ``tx_ref`` values that cannot match a real flow reference (the stub
+    cannot see the flow's id factory) — the flow refuses them, which
+    demonstrates the refusal paths in dev mode. Deterministic tests do
+    NOT rely on the stub for the happy path; they inject generate
+    closures that quote the flow's real references. Everything the stub
+    extracts from user text is untrusted input like any model output: it
+    flows through the full 3-layer validation before any handler runs.
 
     Args:
         prompt: The fully assembled agent prompt.
@@ -309,6 +410,17 @@ def stub_generate(prompt: str, grammar_text: str | None) -> str:
         return _STUB_UTXOS_ENVELOPE
     if "address" in user_turn:
         return _STUB_NEW_ADDRESS_ENVELOPE
+    if "status" in user_turn:
+        hex_match = re.search(r"\b[0-9a-f]{64}\b", utterance)
+        if hex_match is None:
+            return _STUB_TX_STATUS_ENVELOPE
+        return json.dumps(
+            {"v": 0, "intent": "tx_status", "params": {"txid": hex_match.group(0)}}
+        )
+    if "sign" in user_turn:
+        return _STUB_SIGN_TX_ENVELOPE
+    if "broadcast" in user_turn:
+        return _STUB_BROADCAST_TX_ENVELOPE
     if "send" in user_turn and "tb1" in user_turn:
         return _stub_create_tx_envelope(utterance)
     if (
@@ -363,6 +475,8 @@ def build_dispatch_table(
     session: SendSession | None = None,
     fee_estimator: FeeEstimator | None = None,
     price_oracle: PriceOracle | None = None,
+    signer_selection: SignerSelection | None = None,
+    signer: Signer | FilePsbtSigner | None = None,
 ) -> DispatchTable:
     """Build the allowlist dispatch table for the running app.
 
@@ -370,11 +484,12 @@ def build_dispatch_table(
         store: The open persistence layer every handler reads.
         wallet: The active wallet row (ADR-0010: exactly one profile).
         parsed: The wallet's parsed account key (for ``new_address``
-            derivation and the send flow's PSBT account fields; public
-            key only).
+            derivation, the send flow's PSBT account fields, and the HWI
+            signer's expected fingerprint; public key only).
         client: The chain client — used only by ``scan_fn`` (the lazy
-            first scan inside ``get_balance``/``create_tx``) and by the
-            fee/price wrappers below; the read handlers never touch it.
+            first scan inside ``get_balance``/``create_tx``), by the
+            fee/price wrappers below, and by the ``broadcast_tx`` /
+            ``tx_status`` handlers; the read handlers never touch it.
         scan_fn: Zero-argument callable performing one wallet scan
             (``scan_wallet(store, client, wallet)`` in production). Used
             lazily when the store has no sync cursor.
@@ -387,6 +502,16 @@ def build_dispatch_table(
             :class:`FeeEstimator` over ``client``.
         price_oracle: USD/BTC rate source for ``create_tx``; defaults to
             a :class:`PriceOracle` over ``client``.
+        signer_selection: Signing-backend configuration for
+            ``sign_tx`` (TCK-P3-005). Defaults to the file signer over
+            :data:`SIGNER_DIR_ENV_VAR` / :data:`DEFAULT_SIGNER_DIR` with
+            the ``parsed`` key's fingerprint — the same policy
+            :func:`run` applies explicitly.
+        signer: Signer-object override (test seam): used as-is by the
+            ``sign_tx`` handler for the hwi kind, and for the file kind
+            when it IS a :class:`FilePsbtSigner`. Production passes
+            ``None`` and lets the handler construct from
+            ``signer_selection`` per attempt.
 
     Returns:
         A :class:`~localwallet.protocol.DispatchTable` covering the whole
@@ -397,6 +522,15 @@ def build_dispatch_table(
     # see the SAME dispatcher-owned state machine (never two instances).
     tx_flow = flow if flow is not None else TxFlow()
     send_session = session if session is not None else SendSession()
+    if signer_selection is None:
+        env_kind = os.environ.get(SIGNER_ENV_VAR, "").strip().lower()
+        signer_selection = SignerSelection(
+            kind=env_kind if env_kind in _SIGNER_KINDS else SIGNER_KIND_FILE,
+            dir_path=Path(
+                os.environ.get(SIGNER_DIR_ENV_VAR, "").strip() or DEFAULT_SIGNER_DIR
+            ),
+            fingerprint_hex=parsed.hd_key.my_fingerprint.hex(),
+        )
     return {
         IntentName.RESPOND: _respond_handler,
         IntentName.CLARIFY: _clarify_handler,
@@ -416,6 +550,13 @@ def build_dispatch_table(
             scan_fn,
         ),
         IntentName.CONFIRM_TX: _make_confirm_tx_handler(tx_flow, send_session),
+        IntentName.SIGN_TX: _make_sign_tx_handler(
+            tx_flow, signer_selection, signer, store, wallet_id, parsed
+        ),
+        IntentName.BROADCAST_TX: _make_broadcast_tx_handler(
+            tx_flow, client, store, wallet_id
+        ),
+        IntentName.TX_STATUS: _make_tx_status_handler(client, tx_flow),
     }
 
 
@@ -671,6 +812,49 @@ def _pending_tx_facts(flow: TxFlow) -> dict[str, object]:
         "pending_tx_recipient": pending.recipient,
         "pending_tx_expires_in_s": _pending_remaining_s(flow),
     }
+
+
+def _flow_facts(flow: TxFlow) -> dict[str, object]:
+    """The dispatcher-owned FACTS for the flow's CURRENT state.
+
+    Injected at the top of every REPL turn (before the model runs) so the
+    model can quote the values the NEXT destructive envelope must carry —
+    the machine-readable counterpart of the printed narration, built
+    exclusively from dispatcher-owned records (never from user or model
+    text; the P2-004 lesson, extended to the full lifecycle):
+
+    - ``CREATED`` → the pending card facts (:func:`_pending_tx_facts`) for
+      ``confirm_tx``;
+    - ``CONFIRMED`` → the approved record's ``confirmed_tx_ref`` (plus
+      amount/recipient context) for ``sign_tx``;
+    - ``SIGNED`` → ``signed_tx_ref`` for ``broadcast_tx``;
+    - ``BROADCAST`` → ``broadcast_txid`` (plus ``broadcast_tx_ref``) so a
+      ``tx_status`` envelope can quote the chain-reported id verbatim —
+      REQUIRED for the production path: the model never sees terminal
+      output, so without these facts it could only invent a txid.
+
+    Values reach the prompt through
+    :func:`~localwallet.agent.context.render_facts`, which sanitizes each
+    value (R8); keys are code-controlled by construction.
+    """
+    if flow.state is TxFlowStatus.CREATED:
+        return _pending_tx_facts(flow)
+    confirmed = flow.confirmed
+    if flow.state is TxFlowStatus.CONFIRMED and confirmed is not None:
+        return {
+            "confirmed_tx_ref": confirmed.tx_ref,
+            "confirmed_tx_amount_sats": confirmed.amount_sats,
+            "confirmed_tx_recipient": confirmed.recipient,
+        }
+    signed = flow.signed
+    if flow.state is TxFlowStatus.SIGNED and signed is not None:
+        return {"signed_tx_ref": signed.tx_ref}
+    if flow.state is TxFlowStatus.BROADCAST and flow.txid is not None:
+        facts: dict[str, object] = {"broadcast_txid": flow.txid}
+        if signed is not None:
+            facts["broadcast_tx_ref"] = signed.tx_ref
+        return facts
+    return {}
 
 
 def _tx_pending_result(flow: TxFlow) -> dict[str, object]:
@@ -995,6 +1179,433 @@ def _make_confirm_tx_handler(flow: TxFlow, session: SendSession) -> Handler:
     return handler
 
 
+def _intended_from_confirmed(
+    confirmed: PendingTx, *, parsed: ParsedKey, change_index: int | None
+) -> IntendedTx:
+    """Build the :class:`IntendedTx` from the flow's APPROVED record.
+
+    ``parsed`` is the wallet's account key (threaded from the sign handler)
+    and ``change_index`` the branch-1 child index the change output used
+    (recovered from the store at sign time; ``None`` when the record has no
+    change) — together they let R3 re-derive the change script
+    independently instead of trusting the staged PSBT alone.
+
+    The intent must describe EXACTLY the transaction the user confirmed
+    (ADR-0013 amendment / ``tx/revalidate.py`` contract). Every field
+    comes from the dispatcher-owned ``PendingTx`` the flow retained
+    through ``CONFIRMED`` — never from model or user text:
+
+    - ``expected_recipient_outputs`` — the recipient ``(script, value)``
+      pair: the script re-derived from the approved record's recipient
+      address (layer 3 proved it a testnet P2WPKH bech32 string at
+      create time), the value from ``amount_sats``;
+    - ``expected_change`` — ``(script, value)`` LAST when the record
+      carries change: the script read back from the approved record's own
+      staged PSBT output list (the change ADDRESS is not stored on the
+      record — the built PSBT is the authority; the value must equal
+      ``change_sats``), ``None`` otherwise; R3 additionally re-derives the
+      branch-1 change address from ``parsed`` at ``change_index`` and
+      asserts it equals the PSBT's change script (independent
+      re-derivation — a drift between what we staged and what the deriver
+      would produce fails closed before anything signs);
+    - ``expected_inputs_count`` / ``expected_fee_sats`` — verbatim from
+      the record (the engine computed them at build time);
+    - ``expected_sequence`` — :data:`SEQUENCE_RBF_ENABLED`, the policy
+      value :func:`~localwallet.tx.psbt.build_unsigned_psbt` enforces on
+      every input (ADR-0012);
+    - ``expected_vsize_max`` — the record's build-time vsize estimate
+      PLUS ONE (the signed tx may be a vB shorter than the max-witness
+      estimate, never meaningfully longer — revalidate check 10);
+    - ``tx_ref`` — the record's reference (audit symmetry).
+
+    The staged PSBT is dispatcher-owned state (built by the tx engine at
+    create time and held by the flow since) — parsing it here is reading
+    our own record, not trusting external input; any inconsistency with
+    the record's scalar fields raises, which the caller turns into a
+    value-free internal error (fail closed, nothing signed).
+    """
+    psbt = PSBT.parse(base64.b64decode(confirmed.psbt_base64))
+    outputs = [(bytes(out.script_pubkey.data), out.value) for out in psbt.tx.vout]
+    expected_len = 2 if confirmed.change_sats is not None else 1
+    if len(outputs) != expected_len:
+        raise ValueError("confirmed record output count mismatch")
+    recipient_script = bytes(address_to_scriptpubkey(confirmed.recipient).data)
+    if outputs[0] != (recipient_script, confirmed.amount_sats):
+        raise ValueError("confirmed record recipient output mismatch")
+    change: tuple[bytes, int] | None = None
+    if confirmed.change_sats is not None:
+        if outputs[1][1] != confirmed.change_sats:
+            raise ValueError("confirmed record change output mismatch")
+        # R3 independent re-derivation: the change script staged in the PSBT
+        # must be EXACTLY the branch-1 deriver's address at the recorded
+        # change index — never a silently different script (fail closed,
+        # value-free; the caller turns this into an internal error).
+        if change_index is None:
+            raise ValueError("confirmed record missing change index")
+        change_address = BranchDeriver(parsed, BRANCH_CHANGE).address(change_index)
+        rederived_script = bytes(address_to_scriptpubkey(change_address).data)
+        if outputs[1][0] != rederived_script:
+            raise ValueError("confirmed record change output script mismatch")
+        change = outputs[1]
+    return IntendedTx(
+        expected_recipient_outputs=(outputs[0],),
+        expected_change=change,
+        expected_inputs_count=confirmed.inputs_count,
+        expected_fee_sats=confirmed.fee_sats,
+        expected_sequence=SEQUENCE_RBF_ENABLED,
+        expected_vsize_max=confirmed.vsize + 1,
+        tx_ref=confirmed.tx_ref,
+    )
+
+
+def _extract_signed_tx_hex(psbt_base64: str) -> str:
+    """Finalize the SIGNED PSBT and return the raw transaction hex.
+
+    The same embit extraction the re-validation gate uses
+    (``embit.finalizer.finalize_psbt`` building each input's final
+    witness from the verified partial signatures) — NO re-signing, no
+    mutation: the bytes that passed re-validation are the bytes that get
+    broadcast. The signed record already passed the gate at sign time
+    (``mark_signed`` is reachable only after a revalidation pass), so a
+    failure here is contained as an internal error, never an error string
+    carrying tx material.
+    """
+    psbt = PSBT.parse(base64.b64decode(psbt_base64))
+    tx = finalizer.finalize_psbt(psbt)
+    if tx is None:
+        raise ValueError("signed transaction could not be finalized")
+    return tx.serialize().hex()
+
+
+def _make_sign_tx_handler(
+    flow: TxFlow,
+    selection: SignerSelection,
+    signer_override: Signer | FilePsbtSigner | None,
+    store: Store,
+    wallet_id: int,
+    parsed: ParsedKey,
+) -> Handler:
+    """Create the ``sign_tx`` handler: CONFIRMED record → signer → revalidate.
+
+    Pipeline (every step fail-closed; the flow moves only after ALL
+    succeed — TCK-P3-005 / ADR-0013 amendment):
+
+    1. Flow gate: the flow must be ``CONFIRMED`` with a ``tx_ref``
+       matching the approved record. Refusals surface as
+       ``{"error": "sign_refused", "detail": <value-free>}``; the state
+       is never touched by a refused attempt.
+    2. Intent construction: :func:`_intended_from_confirmed` — the frozen
+       description of the approved transaction the signed result must
+       match exactly.
+    3. Signer dispatch: the app-configured backend (``selection.kind``,
+       from ``--signer`` / :data:`SIGNER_ENV_VAR`) is the default; the
+       model's optional closed-enum ``signer`` param may pick the other
+       kind (handler policy per the protocol contract — the model never
+       touches signer configuration, only the enum choice).
+       - **file** (ADR-0014): the EXPECTED signed file is the
+         deterministic ADR-0014 name derived from the confirmed
+         ``tx_ref`` (``FilePsbtSigner.signed_import_path``); the model's
+         ``sign_tx`` params carry only ``tx_ref``+``signer``, so the
+         filename is handler-derived, never model-supplied. When that
+         file is present it is imported directly (the unsigned export
+         already happened on a previous attempt — the signer refuses a
+         re-export that would collide with a placed signed file);
+         otherwise the unsigned PSBT is exported to the transfer folder
+         (idempotent on retry) and the handler returns
+         ``{"error": "signed_file_missing", ...}`` with the export path
+         and expected filename for narration.
+       - **hwi** (ADR-0015): :class:`HwiUsbSigner` is constructed lazily
+         ONLY when this kind runs (expected fingerprint from the parsed
+         wallet key), and the fingerprint gate + post-open re-check run
+         inside it. A :class:`DeviceError` maps to
+         ``{"error": "device_error", "guidance": <§10 guidance>}`` — the
+         guidance string is code-owned text from the error hierarchy and
+         is narrated verbatim.
+    4. REVALIDATION GATE (non-negotiable):
+       :func:`~localwallet.tx.revalidate.revalidate_signed_psbt` checks
+       the signed PSBT against the intent — outputs in exact order,
+       fee, inputs, sequence, vsize, per-input EC verification. ANY
+       mismatch is a HARD STOP:
+       ``{"error": "revalidation_failed", "detail": <value-free>}`` with
+       the flow untouched (still ``CONFIRMED``) — the user retries the
+       signing step or re-creates the transaction. Nothing signed, and
+       broadcast is unreachable from this state.
+    5. Recording: :meth:`TxFlow.mark_signed` (CONFIRMED → SIGNED) with
+       the signed PSBT exactly as the signer returned it. Success result:
+       ``{"status": "signed", "tx_ref", "txid" (from RevalidatedTx),
+       "signer_name", "checksum_verified"}`` — broadcasting is a separate
+       model intent, never automatic.
+
+    No network I/O: the signer boundary is device/file I/O; the chain is
+    not touched on this path.
+    """
+
+    def handler(envelope: Envelope) -> dict[str, object]:
+        params = envelope.params
+        if not isinstance(params, SignTxParams):
+            return {"error": "internal", "detail": "sign_tx params shape mismatch"}
+
+        # 1. Flow gate (pre-check; the transition happens only on success).
+        confirmed = flow.confirmed
+        if flow.state is not TxFlowStatus.CONFIRMED or confirmed is None:
+            return {"error": "sign_refused", "detail": "no confirmed transaction to sign"}
+        if params.tx_ref != confirmed.tx_ref:
+            return {
+                "error": "sign_refused",
+                "detail": "tx_ref does not match the confirmed transaction",
+            }
+
+        # 2. Intent from the approved record (contained: a record/PSBT
+        # inconsistency is a caller bug — fail closed, value-free).
+        try:
+            # The change index used at create is the branch-1 next_index
+            # advanced by exactly one at staging (ADR-0009 allocation);
+            # recover it for R3's independent re-derivation of the change
+            # script (single-pending-tx invariant keeps it stable here).
+            change_index = None
+            if confirmed.change_sats is not None:
+                change_index = (
+                    store.get_derivation(wallet_id, BRANCH_CHANGE).next_index - 1
+                )
+            intended = _intended_from_confirmed(
+                confirmed, parsed=parsed, change_index=change_index
+            )
+        except Exception:  # noqa: BLE001 — containment: embit parse/consistency errors vary; re-raising could leak record material
+            return {
+                "error": "internal",
+                "detail": "confirmed transaction record is inconsistent with its staged psbt",
+            }
+
+        # 3. Signer dispatch.
+        kind = params.signer if params.signer is not None else selection.kind
+        if kind == SIGNER_KIND_FILE:
+            file_signer = (
+                signer_override
+                if isinstance(signer_override, FilePsbtSigner)
+                else FilePsbtSigner(selection.dir_path)
+            )
+            signed_path = file_signer.signed_import_path(confirmed.tx_ref)
+            if signed_path.exists():
+                # The user placed the signed file: import it (the unsigned
+                # export happened on a previous attempt).
+                try:
+                    signed_result = file_signer.import_signed(
+                        signed_path, expected_tx_ref=confirmed.tx_ref
+                    )
+                except SignerError as exc:
+                    return {"error": "import_failed", "detail": str(exc)}
+            else:
+                try:
+                    exported = file_signer.export_unsigned(
+                        confirmed.psbt_base64, confirmed.tx_ref
+                    )
+                except SignerError as exc:
+                    return {"error": "export_failed", "detail": str(exc)}
+                return {
+                    "error": "signed_file_missing",
+                    "unsigned_path": str(exported.unsigned_path),
+                    "signed_filename": signed_path.name,
+                    "signer_name": file_signer.name,
+                }
+        else:
+            device_signer = (
+                signer_override
+                if signer_override is not None
+                else HwiUsbSigner(selection.fingerprint_hex)
+            )
+            try:
+                signed_result = device_signer.sign_unsigned(confirmed.psbt_base64)
+            except DeviceError as exc:
+                # guidance is code-owned §10 text from the error hierarchy.
+                return {"error": "device_error", "guidance": str(exc)}
+            except SignerError as exc:
+                return {"error": "signer_error", "detail": str(exc)}
+
+        # 4. Revalidation gate — mismatch is a HARD STOP, flow untouched.
+        try:
+            revalidated = revalidate_signed_psbt(signed_result.psbt_base64, intended)
+        except TamperedPsbtError as exc:
+            return {"error": "revalidation_failed", "detail": str(exc)}
+
+        # 5. Record the signed PSBT (CONFIRMED → SIGNED).
+        try:
+            signed = flow.mark_signed(params.tx_ref, signed_result.psbt_base64)
+        except FlowError as exc:  # unreachable single-threaded after the gate
+            return {"error": "sign_refused", "detail": str(exc)}
+
+        return {
+            "status": "signed",
+            "tx_ref": signed.tx_ref,
+            "txid": revalidated.txid,
+            "signer_name": signed_result.signer_name,
+            "checksum_verified": signed_result.checksum_verified,
+        }
+
+    return handler
+
+
+def _make_broadcast_tx_handler(
+    flow: TxFlow,
+    client: EsploraClient,
+    store: Store,
+    wallet_id: int,
+) -> Handler:
+    """Create the ``broadcast_tx`` handler: SIGNED record → Esplora → BROADCAST.
+
+    Pipeline (TCK-P3-005 / ADR-0013 amendment — broadcast ONLY from
+    ``SIGNED``, no skip path past the signing state):
+
+    1. Flow gate: the flow must be ``SIGNED`` with a ``tx_ref`` matching
+       the signed record. Refusals surface as
+       ``{"error": "broadcast_refused", "detail": <value-free>}``. The
+       gate presupposes the handler-level revalidation completed at sign
+       time (``mark_signed`` is reachable only through it) — the immutable
+       :class:`~localwallet.tx.flow.SignedTx` record is byte-for-byte what
+       was re-validated.
+    2. Hex extraction: the SIGNED PSBT is finalized and extracted to raw
+       transaction hex with the same embit finalization the revalidation
+       gate uses (:func:`_extract_signed_tx_hex`) — no re-signing, no
+       mutation.
+    3. Broadcast: ``client.broadcast_tx(tx_hex)`` — a SINGLE-attempt POST
+       (the chain layer's documented no-retry policy: a POST is not
+       idempotent). A :class:`ChainError` (network, 429, 5xx, malformed
+       response) surfaces as
+       ``{"error": "broadcast_failed", "detail": <scrubbed by the chain
+       layer>}`` and the flow STAYS ``SIGNED`` — the signed transaction is
+       kept and the user retries; recovery is a cheap GET (``tx_status``),
+       never a blind re-POST by us.
+    4. Recording: :meth:`TxFlow.broadcast` (SIGNED → BROADCAST, terminal)
+       with the chain-reported txid, then the outbound transaction is
+       upserted into the store's history (``height=None``,
+       ``direction="out"``, the approved record's fee) so ``get_history``
+       shows it immediately. A store failure becomes a value-free
+       ``store_warning`` result key — the BROADCAST state is preserved
+       (the money path succeeded; bookkeeping must not undo it).
+
+    Success result: ``{"status": "broadcast", "txid", "message":
+    "tracking confirmations — ask 'status'"}``.
+    """
+
+    def handler(envelope: Envelope) -> dict[str, object]:
+        params = envelope.params
+        if not isinstance(params, BroadcastTxParams):
+            return {"error": "internal", "detail": "broadcast_tx params shape mismatch"}
+
+        # 1. Flow gate.
+        signed = flow.signed
+        if flow.state is not TxFlowStatus.SIGNED or signed is None:
+            return {"error": "broadcast_refused", "detail": "no signed transaction to broadcast"}
+        if params.tx_ref != signed.tx_ref:
+            return {
+                "error": "broadcast_refused",
+                "detail": "tx_ref does not match the signed transaction",
+            }
+
+        # 2. Extract the broadcast hex from the re-validated signed PSBT.
+        try:
+            tx_hex = _extract_signed_tx_hex(signed.psbt_base64)
+        except Exception:  # noqa: BLE001 — containment: unreachable post-revalidate; never leak tx material into the error
+            return {
+                "error": "internal",
+                "detail": "signed transaction could not be extracted for broadcast",
+            }
+
+        # 3. Single-attempt POST (chain layer owns the no-retry policy).
+        try:
+            txid = client.broadcast_tx(tx_hex)
+        except ChainError as exc:
+            # detail is scrubbed by the chain layer (no txids/tx hex).
+            return {"error": "broadcast_failed", "detail": str(exc)}
+
+        # 4. Record the transition, then the history row.
+        try:
+            flow.broadcast(params.tx_ref, txid)
+        except FlowError as exc:  # unreachable single-threaded after the gate
+            return {"error": "broadcast_refused", "detail": str(exc)}
+
+        result: dict[str, object] = {
+            "status": "broadcast",
+            "txid": txid,
+            "message": "tracking confirmations — ask 'status'",
+        }
+        confirmed = flow.confirmed
+        try:
+            store.upsert_txs(
+                [
+                    TxRecord(
+                        wallet_id=wallet_id,
+                        txid=txid,
+                        height=None,
+                        block_time=None,
+                        fee_sats=confirmed.fee_sats if confirmed is not None else None,
+                        direction=DIR_OUT,
+                        raw_summary=None,
+                    )
+                ]
+            )
+        except (StoreError, sqlite3.Error) as exc:
+            # Bookkeeping must not undo the broadcast: warn, stay BROADCAST.
+            result["store_warning"] = f"could not record the transaction in history ({exc})"
+        return result
+
+    return handler
+
+
+def _make_tx_status_handler(client: EsploraClient, flow: TxFlow) -> Handler:
+    """Create the ``tx_status`` handler: quoted txid → Esplora status.
+
+    The ``txid`` param (layer 3 enforced it to EXACTLY 64 lowercase hex —
+    the injection guard for the URL path) is looked up via
+    ``client.get_tx_status``; the result quotes the response verbatim:
+    ``{"txid", "confirmed", "block_height", "block_time"}``.
+
+    Eventual consistency (documented): a JUST-broadcast transaction is
+    often not indexed by the explorer yet — Esplora answers 404 until it
+    sees the transaction. When the queried txid IS the flow's recorded
+    broadcast txid and the lookup fails with the not-found status, the
+    handler surfaces ``{"error": "unknown_tx", "detail": <value-free>}``
+    instead of a generic chain failure, so the narration can say "not
+    indexed yet — try again shortly". The 404 detection matches the chain
+    layer's documented error-message contract ("status 404"); other
+    chain failures surface as ``{"error": "chain_unavailable",
+    "detail": <scrubbed>}``.
+
+    The model obtains the txid to query from the FACTS block
+    (``broadcast_txid``, :func:`_flow_facts`) — quoted verbatim, never
+    invented.
+    """
+
+    def handler(envelope: Envelope) -> dict[str, object]:
+        params = envelope.params
+        if not isinstance(params, TxStatusParams):
+            return {"error": "internal", "detail": "tx_status params shape mismatch"}
+        try:
+            status = client.get_tx_status(params.txid)
+        except ChainError as exc:
+            detail = str(exc)  # scrubbed by the chain layer (no txids)
+            if (
+                flow.txid is not None
+                and params.txid == flow.txid
+                and "status 404" in detail
+            ):
+                return {
+                    "error": "unknown_tx",
+                    "detail": (
+                        "the broadcast transaction is not indexed yet — eventual "
+                        "consistency; try again shortly"
+                    ),
+                }
+            return {"error": "chain_unavailable", "detail": detail}
+        return {
+            "txid": status.txid,
+            "confirmed": status.confirmed,
+            "block_height": status.block_height,
+            "block_time": status.block_time,
+        }
+
+    return handler
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Console entry point; delegates to :func:`run`."""
     return run(argv)
@@ -1011,7 +1622,12 @@ def run(
     """Wire the application from ``argv``/environment and run the REPL.
 
     Configuration precedence: ``--zpub`` overrides ``LOCALWALLET_ZPUB``;
-    the model runtime is picked as remote debug bridge
+    ``--signer`` overrides ``LOCALWALLET_SIGNER`` for the signing backend
+    (default ``file``; the HWI signer is constructed lazily only when
+    selected, with the expected fingerprint from the parsed wallet key;
+    the file signer's transfer folder comes from
+    ``LOCALWALLET_SIGNER_DIR`` or ``./psbt-transfer``, created on
+    demand); the model runtime is picked as remote debug bridge
     (:data:`~localwallet.agent.remote_runtime.LLM_BASE_URL_ENV_VAR`, ADR-0007,
     with a one-line disclosure), then the real local model
     (:data:`MODEL_PATH_ENV_VAR`), then ``--stub-llm`` dev mode. The
@@ -1065,6 +1681,30 @@ def run(
     except WatchKeyError as exc:
         output_fn(f"Watch key rejected: {exc}")
         return 2
+
+    # Signer selection (TCK-P3-005): --signer overrides LOCALWALLET_SIGNER;
+    # default "file". The HwiUsbSigner object itself is constructed lazily
+    # (per sign attempt, inside the sign_tx handler) ONLY when the hwi kind
+    # is selected — the expected fingerprint comes from the parsed wallet
+    # key. The file signer's transfer folder is created on demand at the
+    # first export. Invalid selections are a startup config error (exit 2).
+    signer_kind = (
+        (args.signer or os.environ.get(SIGNER_ENV_VAR, "")).strip().lower()
+        or SIGNER_KIND_FILE
+    )
+    if signer_kind not in _SIGNER_KINDS:
+        output_fn(
+            f"Invalid signer selection: use --signer file|hwi or set "
+            f"{SIGNER_ENV_VAR}=file|hwi."
+        )
+        return 2
+    signer_selection = SignerSelection(
+        kind=signer_kind,
+        dir_path=Path(
+            os.environ.get(SIGNER_DIR_ENV_VAR, "").strip() or DEFAULT_SIGNER_DIR
+        ),
+        fingerprint_hex=parsed.hd_key.my_fingerprint.hex(),
+    )
 
     # Pre-flight (SR minor): if the remote debug bridge is opted into but no
     # model id resolves, fail at startup (exit 2, mirroring the zpub config
@@ -1144,6 +1784,7 @@ def run(
         session=session,
         fee_estimator=fee_estimator,
         price_oracle=price_oracle,
+        signer_selection=signer_selection,
     )
     loop = AgentLoop(generate, table)
 
@@ -1289,6 +1930,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "GGUF runtime (NOT the acceptance path)"
         ),
     )
+    parser.add_argument(
+        "--signer",
+        choices=sorted(_SIGNER_KINDS),
+        default=None,
+        help=(
+            "signing backend for the send flow: 'file' (airgap transfer "
+            "folder, default) or 'hwi' (USB hardware wallet); overrides "
+            "LOCALWALLET_SIGNER"
+        ),
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -1343,13 +1994,16 @@ def _run_turn(
       did not emit ``confirm_tx``): a guidance line — the flow is
       untouched.
     - NOT_A_DECISION: normal chat; a pending card simply stays pending.
-    - FACTS (TCK-P2-004 SR fix): when the turn starts with a live
-      pending transaction, its machine-readable card (``tx_ref``,
-      amount, recipient, remaining ttl) is injected as the turn's FACTS
-      block — the model quotes ``tx_ref`` from THERE (it never sees the
-      printed card). After a DENY-cancel no pending exists and the
-      facts stay empty; the gate decision above remains the only
-      confirmation authority either way.
+    - FACTS (TCK-P2-004 SR fix, extended to the full lifecycle in
+      TCK-P3-005): the flow's current state is injected as the turn's
+      FACTS block (:func:`_flow_facts`) — the pending card while
+      ``CREATED``, the approved record's reference while ``CONFIRMED``,
+      the signed reference while ``SIGNED``, and the broadcast txid while
+      ``BROADCAST`` — so every destructive/status envelope can quote the
+      dispatcher-owned value verbatim (the model never sees the printed
+      narration). After a DENY-cancel no pending exists and the facts
+      stay empty; the gate decision above remains the only confirmation
+      authority either way.
     """
     session.gate_decision = (
         ConfirmGate.classify(line)
@@ -1360,7 +2014,7 @@ def _run_turn(
     if session.gate_decision is GateDecision.DENY and flow.state is TxFlowStatus.CREATED:
         flow.cancel()
         cancelled = True
-    facts = _pending_tx_facts(flow) if flow.state is TxFlowStatus.CREATED else {}
+    facts = _flow_facts(flow)
     _print_turn(loop.run(line, facts), output_fn)
     if cancelled:
         output_fn(sanitize_tool_output(_CANCELLED_LINE))
@@ -1415,6 +2069,12 @@ def _print_turn(turn: AgentTurnResult, output_fn: Callable[[str], None]) -> None
         _print_create_tx(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.CONFIRM_TX:
         _print_confirm_tx(turn.result or {}, output_fn)
+    elif envelope.intent is IntentName.SIGN_TX:
+        _print_sign_tx(turn.result or {}, output_fn)
+    elif envelope.intent is IntentName.BROADCAST_TX:
+        _print_broadcast_tx(turn.result or {}, output_fn)
+    elif envelope.intent is IntentName.TX_STATUS:
+        _print_tx_status(turn.result or {}, output_fn)
     else:  # pragma: no cover — closed intent enum
         output_fn(sanitize_tool_output(_GENERIC_FAILURE))
 
@@ -1621,3 +2281,143 @@ def _print_confirm_tx(result: Mapping[str, object], output_fn: Callable[[str], N
         output_fn(sanitize_tool_output(_CONFIRMED_LINE))
         return
     output_fn(sanitize_tool_output(_GENERIC_FAILURE))  # pragma: no cover — handler-shaped
+
+
+def _print_sign_tx(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+    """Narrate a ``sign_tx`` outcome (TCK-P3-005 device-handoff UX, §10).
+
+    - ``signed_file_missing`` → the file-path handoff line: the export
+      path and the EXPECTED signed filename, verbatim from the handler
+      result (tool output — the path comes from ``FilePsbtSigner``).
+    - ``device_error`` → the §10 guidance string verbatim (code-owned
+      text from the signer error hierarchy — never model-generated).
+    - ``revalidation_failed`` → the hard-stop line with the value-free
+      detail from the re-validation gate; the tx hex never appears.
+    - ``sign_refused`` / other errors → value-free refusal/failure lines.
+    - success → "Signed and verified ✓ txid <txid>. Ready to broadcast —
+      say 'broadcast'." with the txid verbatim from the re-validated
+      result; the PSBT payload is never printed. For a file-signer import
+      without a checksum sidecar, the ADR-0014 integrity note is added.
+    """
+    error = result.get("error")
+    if error == "signed_file_missing":
+        output_fn(
+            sanitize_tool_output(
+                f"Exported to {result.get('unsigned_path', '')}. Move it to your "
+                f"SD card, sign on your device, then save the signed file back "
+                f"and tell me the path (say: signed {result.get('signed_filename', '')})."
+            )
+        )
+        return
+    if error == "device_error":
+        output_fn(sanitize_tool_output(str(result.get("guidance", "")).strip()))
+        return
+    if error == "revalidation_failed":
+        detail = str(result.get("detail", "")).strip()
+        message = "The signed transaction failed verification"
+        if detail:
+            message += f" ({detail})"
+        message += " — nothing was signed or sent; try signing again."
+        output_fn(sanitize_tool_output(message))
+        return
+    if error == "sign_refused":
+        detail = str(result.get("detail", "")).strip()
+        message = f"Not signed — {detail}." if detail else "Not signed."
+        output_fn(sanitize_tool_output(message))
+        return
+    if error is not None:
+        output_fn(
+            sanitize_tool_output(_error_line(result, "Could not sign the transaction"))
+        )
+        return
+    if result.get("status") == "signed":
+        output_fn(
+            sanitize_tool_output(
+                f"Signed and verified ✓ txid {result.get('txid', '')}. "
+                f"Ready to broadcast — say 'broadcast'."
+            )
+        )
+        if result.get("signer_name") == "file" and not result.get("checksum_verified"):
+            output_fn(
+                sanitize_tool_output(
+                    "Note: the signed file had no checksum sidecar — integrity not verified."
+                )
+            )
+        return
+    output_fn(sanitize_tool_output(_GENERIC_FAILURE))  # pragma: no cover — handler-shaped
+
+
+def _print_broadcast_tx(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+    """Narrate a ``broadcast_tx`` outcome (TCK-P3-005).
+
+    Success → "Sent! txid <txid> — tracking…" with the txid verbatim from
+    the chain response. ``broadcast_failed`` keeps the signed transaction
+    and says so (single-attempt POST policy: retrying is explicit).
+    Refusals and other errors surface value-free; a ``store_warning`` is
+    printed after the success line (bookkeeping failed, broadcast didn't).
+    The tx hex never appears in any line.
+    """
+    error = result.get("error")
+    if error == "broadcast_refused":
+        detail = str(result.get("detail", "")).strip()
+        message = f"Not broadcast — {detail}." if detail else "Not broadcast."
+        output_fn(sanitize_tool_output(message))
+        return
+    if error == "broadcast_failed":
+        detail = str(result.get("detail", "")).strip()
+        message = "Broadcast failed"
+        if detail:
+            message += f" ({detail})"
+        message += " — the signed transaction is kept; say 'broadcast' to retry."
+        output_fn(sanitize_tool_output(message))
+        return
+    if error is not None:
+        output_fn(
+            sanitize_tool_output(
+                _error_line(result, "Could not broadcast the transaction")
+            )
+        )
+        return
+    if result.get("status") == "broadcast":
+        output_fn(
+            sanitize_tool_output(f"Sent! txid {result.get('txid', '')} — tracking…")
+        )
+        warning = result.get("store_warning")
+        if isinstance(warning, str) and warning.strip():
+            output_fn(sanitize_tool_output(f"warning: {warning}"))
+        return
+    output_fn(sanitize_tool_output(_GENERIC_FAILURE))  # pragma: no cover — handler-shaped
+
+
+def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+    """Narrate a ``tx_status`` outcome (TCK-P3-005).
+
+    Confirmed → "Confirmed at height N." (N verbatim from the chain
+    response); unconfirmed → "In mempool (unconfirmed).";
+    ``unknown_tx`` → the eventual-consistency note; other errors surface
+    value-free via :func:`_error_line`.
+    """
+    error = result.get("error")
+    if error == "unknown_tx":
+        output_fn(
+            sanitize_tool_output(
+                "Transaction not found on the chain yet — it may not be indexed; "
+                "try again in a moment."
+            )
+        )
+        return
+    if error is not None:
+        output_fn(
+            sanitize_tool_output(_error_line(result, "Status lookup failed"))
+        )
+        return
+    if result.get("confirmed"):
+        height = result.get("block_height")
+        message = (
+            f"Confirmed at height {height}."
+            if height is not None
+            else "Confirmed."
+        )
+        output_fn(sanitize_tool_output(message))
+        return
+    output_fn(sanitize_tool_output("In mempool (unconfirmed)."))

@@ -2,12 +2,14 @@
 
 Covers: lazy hwilib import (module imports without the wheel; missing wheel
 → HwiUnavailableError); enumerate mapping (hex/bytes fingerprints, unreadable
-devices); the fingerprint trust gate (1 match → sign; 0 devices → absent;
-devices-but-different-fingerprint → mismatch hard stop; unreadable-only →
-locked; 2 matches → refuse); str/bytes sign-result normalization; older-HWI
-bytes-input retry; locked/busy/canceled/unknown error mapping (guidance
-strings asserted, value-free); display_address best-effort mapping;
-SignedResult fields; no-network lint compliance.
+devices) with dict-shaping containment; the fingerprint trust gate (1 match →
+sign; 0 devices → absent; devices-but-different-fingerprint → mismatch hard
+stop; unreadable-only → locked; 2 matches → refuse) plus the POST-OPEN
+re-verification of the open client's fingerprint (TOCTOU, TCK-P3-005 rider
+R1); str/bytes sign-result normalization incl. the empty-bytes refusal
+(rider R2); older-HWI bytes-input retry; locked/busy/canceled/unknown error
+mapping (guidance strings asserted, value-free); display_address best-effort
+mapping; SignedResult fields; no-network lint compliance.
 
 hwilib is faked via the ``commands_module`` constructor seam — the fake
 mirrors the empirically verified hwi 3.2.0 API surface (commands.enumerate /
@@ -101,6 +103,20 @@ class FakeClient:
 
     def close(self) -> None:
         self.recorder["closed"] = True
+
+
+class FakeFingerprintClient(FakeClient):
+    """FakeClient that also exposes the hwi 3.2.0 post-open fingerprint
+    getter (``get_master_fingerprint``) — for the TOCTOU re-check tests."""
+
+    def __init__(self, recorder: dict, fingerprint: object) -> None:
+        super().__init__(recorder)
+        self._fingerprint = fingerprint
+
+    def get_master_fingerprint(self) -> object:
+        if isinstance(self._fingerprint, Exception):
+            raise self._fingerprint
+        return self._fingerprint
 
 
 class FakeCommands:
@@ -414,6 +430,146 @@ def test_client_none_is_absent_error():
 
 
 # --------------------------------------------------------------------------
+# Rider R1: post-open fingerprint re-verification (TOCTOU, ADR-0015)
+# --------------------------------------------------------------------------
+
+
+def test_post_open_fingerprint_match_signs():
+    """The open client re-reports the wallet fingerprint → gate passes and
+    signing proceeds (the real hwi 3.2.0 client always exposes the getter)."""
+    commands = FakeCommands(
+        client=FakeFingerprintClient({}, bytes.fromhex(FP_WALLET)),
+        signtx_result=default_sign_result(),
+    )
+    result = make_signer(commands).sign_unsigned(PSBT_B64)
+    assert result.psbt_base64 == SIGNED_B64
+
+
+def test_post_open_fingerprint_mismatch_is_hard_stop():
+    """A device swapped in between enumerate and open (different fingerprint
+    post-open) NEVER signs — the TOCTOU window is closed."""
+    commands = FakeCommands(
+        client=FakeFingerprintClient({}, bytes.fromhex(FP_OTHER)),
+        signtx_result=default_sign_result(),
+    )
+    with pytest.raises(DeviceMismatchError) as excinfo:
+        make_signer(commands).sign_unsigned(PSBT_B64)
+    assert "does not match this wallet" in str(excinfo.value)
+    assert ("signtx",) not in commands.calls  # hard stop before signing
+
+
+def test_post_open_fingerprint_unreadable_is_locked_guidance():
+    """Post-open None (device locked itself after enumerate) → locked
+    guidance, never a mismatch (ADR-0015: don't slander the right device)."""
+    commands = FakeCommands(
+        client=FakeFingerprintClient({}, None), signtx_result=default_sign_result()
+    )
+    with pytest.raises(DeviceLockedError):
+        make_signer(commands).sign_unsigned(PSBT_B64)
+    assert ("signtx",) not in commands.calls
+
+
+def test_post_open_fingerprint_read_error_maps_to_guidance():
+    commands = FakeCommands(
+        client=FakeFingerprintClient({}, DeviceNotReadyError("locked mid-flight")),
+        signtx_result=default_sign_result(),
+    )
+    with pytest.raises(DeviceLockedError) as excinfo:
+        make_signer(commands).sign_unsigned(PSBT_B64)
+    assert "pin/passphrase" in str(excinfo.value).lower()
+
+
+def test_post_open_recheck_also_gates_display_address():
+    commands = FakeCommands(
+        client=FakeFingerprintClient({}, bytes.fromhex(FP_OTHER)),
+        display_result={"address": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"},
+    )
+    with pytest.raises(DeviceMismatchError):
+        make_signer(commands).display_address("wpkh([a1b2c3d4/84'/1'/0']vpub)")
+
+
+def test_post_open_missing_getter_on_real_path_is_device_error():
+    """R1: a REAL (non-injected) client that lacks get_master_fingerprint
+    fails closed — the post-open re-check cannot run, so the pre-open
+    enumeration is never silently trusted (fail-open by omission closed).
+    The injected-test-fake skip is exercised by the existing happy-path and
+    normalization tests (FakeClient carries no getter)."""
+    commands = FakeCommands(client=FakeClient({}), signtx_result=default_sign_result())
+    signer = make_signer(commands)
+    signer._injected = False  # simulate the real lazy-imported hwilib path
+    with pytest.raises(DeviceError) as excinfo:
+        signer.sign_unsigned(PSBT_B64)
+    assert "re-verify" in str(excinfo.value)
+    assert "reconnect" in str(excinfo.value)
+    assert ("signtx",) not in commands.calls  # hard stop before signing
+
+
+def test_post_open_reverify_failure_closes_client():
+    """R2: when post-open re-verification raises (mismatch), the opened
+    device handle is still released — no handle leak on the mismatch path."""
+    recorder: dict = {}
+    commands = FakeCommands(
+        client=FakeFingerprintClient(recorder, bytes.fromhex(FP_OTHER)),
+        signtx_result=default_sign_result(),
+    )
+    with pytest.raises(DeviceMismatchError):
+        make_signer(commands).sign_unsigned(PSBT_B64)
+    assert recorder["closed"] is True
+    assert ("signtx",) not in commands.calls
+
+
+# --------------------------------------------------------------------------
+# Rider R2: bytes-branch emptiness check in _normalize_signed
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("empty", [b"", bytearray()])
+def test_sign_empty_bytes_result_is_device_error(empty):
+    """``{"psbt": b""}`` and a bare empty bytes response are errors — a
+    device that reports success but returns no PSBT is not an empty tx."""
+    commands = FakeCommands(signtx_result={"psbt": empty})
+    with pytest.raises(DeviceError) as excinfo:
+        make_signer(commands).sign_unsigned(PSBT_B64)
+    assert SIGNED_B64 not in str(excinfo.value)  # value-free
+    commands = FakeCommands(signtx_result=empty)
+    with pytest.raises(DeviceError):
+        make_signer(commands).sign_unsigned(PSBT_B64)
+
+
+# --------------------------------------------------------------------------
+# Rider R3: enumerate dict-shaping inside the mapped error boundary
+# --------------------------------------------------------------------------
+
+
+def test_enumerate_non_list_result_is_device_error():
+    """A non-list enumeration result (e.g. a dict) surfaces as guidance —
+    never a raw AttributeError/TypeError from field access."""
+    commands = FakeCommands()
+    commands.enumerate = lambda password=None: {"unexpected": "shape"}
+    with pytest.raises(DeviceError) as excinfo:
+        make_signer(commands).sign_unsigned(PSBT_B64)
+    assert "unexpected response" in str(excinfo.value).lower()
+
+
+def test_enumerate_non_dict_entry_is_device_error():
+    commands = FakeCommands()
+
+    def bad_shape(password=None):
+        return ["not-a-dict", None]
+
+    commands.enumerate = bad_shape
+    with pytest.raises(DeviceError):
+        make_signer(commands).enumerate_devices()
+
+
+def test_enumerate_non_iterable_result_is_device_error():
+    commands = FakeCommands()
+    commands.enumerate = lambda password=None: 7
+    with pytest.raises(DeviceError):
+        make_signer(commands).enumerate_devices()
+
+
+# --------------------------------------------------------------------------
 # Error mapping (locked / busy / canceled / unknown) — guidance asserted
 # --------------------------------------------------------------------------
 
@@ -478,6 +634,8 @@ def test_all_error_messages_value_free():
             assert FP_WALLET not in message
             assert leaky_fragment not in message
             assert SIGNED_B64 not in message
+        else:
+            pytest.fail("expected a DeviceError from the mapped error boundary")
 
 
 # --------------------------------------------------------------------------
@@ -552,7 +710,8 @@ def test_hwi_signer_lints_network_clean():
 def test_live_hwi_enumerate_no_device_is_absent_error():
     """Real wheel, real HID enumeration, no hardware interaction beyond
     enumerate: with no device plugged in, signing refuses via the absent
-    path (or mismatch if a device happens to be attached)."""
+    path — or mismatch/locked if a device happens to be attached (a locked
+    device cannot prove its fingerprint either way)."""
     signer = HwiUsbSigner(FP_WALLET)  # real lazy import of hwilib.commands
-    with pytest.raises((DeviceAbsentError, DeviceMismatchError)):
+    with pytest.raises((DeviceAbsentError, DeviceMismatchError, DeviceLockedError)):
         signer.sign_unsigned(PSBT_B64)
