@@ -6,6 +6,20 @@ the Esplora API shape served by mempool.space and by self-hosted mempool /
 electrs instances — the Phase 4 backend swap targets this same interface
 (ADR-0003).
 
+Backend selection (Phase 4, TCK-P4-002; ADR-0018): the base URL is resolved
+from :class:`localwallet.config.Settings` in
+:meth:`ChainConfig.from_settings` — the single, unambiguous selection point.
+``Settings.chain_base_url`` (``LOCALWALLET_CHAIN_BASE_URL``) is authoritative
+when set, so flipping the wallet onto the user's own instance is a
+config-only operation and EVERY EsploraClient-mediated call (address
+txs/utxos, tip, fees, price, broadcast) hits the configured instance with
+zero requests to the public default. When it is unset, the legacy
+``Settings.esplora_base_url`` (``LOCALWALLET_ESPLORA_BASE_URL``) is used,
+preserving the ADR-0003 public default. A self-hosted URL must serve
+testnet4 (ADR-0004); the client's path shapes are identical regardless of
+host. A malformed selected URL fails closed with a value-free
+:class:`ValueError` at construction — never a mid-request crash.
+
 Design notes:
 
 - Synchronous ``httpx`` client: one ``httpx.Client`` per ``EsploraClient``
@@ -291,8 +305,10 @@ class EsploraClient:
     invariant). No API keys are used or sent.
 
     Args:
-        base_url: Esplora API root; defaults to the Settings default
-            (``https://mempool.space/testnet4/api``).
+        base_url: Esplora API root; when ``None`` it resolves through the
+            single selection point ``ChainConfig.from_settings`` —
+            ``Settings.chain_base_url`` when set (self-hosted), else the
+            legacy ``Settings.esplora_base_url`` public default (ADR-0018).
         timeout_s: Per-request timeout in seconds; defaults to Settings.
         max_retries: Retries after the initial attempt; defaults to Settings.
         transport: Optional ``httpx.BaseTransport`` injection point (test

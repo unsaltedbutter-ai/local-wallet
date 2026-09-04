@@ -15,6 +15,16 @@ class Settings:
     """Small, explicitly-settable runtime settings."""
 
     esplora_base_url: str = "https://mempool.space/testnet4/api"
+    # THE single chain-backend selection point (Phase 4, TCK-P4-002; ADR-0018).
+    # When set (non-empty), this URL is the authoritative Esplora base for the
+    # WHOLE wallet: every EsploraClient-mediated call (address txs/utxos, tip,
+    # fees, price, broadcast) hits it. When empty (the default), the legacy
+    # ``esplora_base_url`` is used instead — preserving the ADR-0003 public
+    # default and full backward compatibility with LOCALWALLET_ESPLORA_BASE_URL.
+    # The instance must serve testnet4 (ADR-0004 invariant); the client's path
+    # shapes are identical regardless of host. Validation is fail-closed at
+    # client construction (ChainConfig), never mid-request.
+    chain_base_url: str = ""
     request_timeout_s: float = 10.0
     max_retries: int = 3
     network: str = "testnet"
@@ -43,6 +53,7 @@ class Settings:
         """Build a Settings instance, overriding defaults from LOCALWALLET_* env vars.
 
         Recognized variables: ``LOCALWALLET_ESPLORA_BASE_URL``,
+        ``LOCALWALLET_CHAIN_BASE_URL``,
         ``LOCALWALLET_REQUEST_TIMEOUT_S``, ``LOCALWALLET_MAX_RETRIES``,
         ``LOCALWALLET_NETWORK``, ``LOCALWALLET_STORE_PATH``,
         ``LOCALWALLET_PRICE_TTL_S``, ``LOCALWALLET_PRICE_ENABLED``,

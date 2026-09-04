@@ -1753,10 +1753,13 @@ def run(
         return 2
 
     client = EsploraClient(
-        base_url=settings.esplora_base_url,
         timeout_s=settings.request_timeout_s,
         max_retries=settings.max_retries,
     )
+    # base_url is deliberately left as the client default: it resolves through
+    # the single selection point (ChainConfig.from_settings — Settings.chain_base_url
+    # when set, else the legacy esplora_base_url). This construction site must NOT
+    # hardcode a public default that would bypass the Phase 4 backend switch (ADR-0018).
     # Fee/price wrappers share the ONE chain client (no second transport);
     # construction is network-free — they fetch lazily, per their TTLs.
     fee_estimator = FeeEstimator(client)
