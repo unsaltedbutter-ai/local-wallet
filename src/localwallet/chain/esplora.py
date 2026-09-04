@@ -53,7 +53,14 @@ import httpx
 from localwallet.chain.config import ChainConfig
 from localwallet.config import Settings
 
-__all__ = ["Balance", "ChainError", "EsploraClient", "TxStatus", "balance_from_utxos"]
+__all__ = [
+    "Balance",
+    "ChainError",
+    "EsploraClient",
+    "TipBlock",
+    "TxStatus",
+    "balance_from_utxos",
+]
 
 # Keep in sync with the version in pyproject.toml.
 _USER_AGENT = "local-wallet/0.1.0 (watch-only Bitcoin wallet)"
@@ -80,6 +87,7 @@ _MAX_TX_HEX_CHARS = 100_000
 _KIND_ADDRESS_TXS = "address-txs"
 _KIND_ADDRESS_UTXOS = "address-utxos"
 _KIND_TIP_HEIGHT = "tip-height"
+_KIND_TIP_BLOCK = "tip-block"
 _KIND_BROADCAST = "broadcast"
 _KIND_TX_STATUS = "tx-status"
 
@@ -248,6 +256,24 @@ class TxStatus:
     block_time: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class TipBlock:
+    """Chain-tip block info quoted from the explorer (watch narration).
+
+    ``height`` — the tip block's height. ``timestamp`` — the tip block's
+    Unix timestamp in seconds, or ``None`` when the backend did not expose
+    one (e.g. the documented Esplora ``/blocks/tip`` bare-integer shape has
+    no timestamp; the mempool.space block-list shape carries one). A
+    ``None`` timestamp is the *clean unavailable* state — the
+    time-since-block helper reports nothing rather than fabricating a value.
+    Both fields are shape-validated in :meth:`EsploraClient.get_tip_block`
+    before this record exists.
+    """
+
+    height: int
+    timestamp: int | None
+
+
 def _parse_json(response: httpx.Response, kind: str) -> Any:
     """Parse a 2xx response body as JSON; malformed bodies raise ChainError."""
     try:
@@ -397,6 +423,47 @@ class EsploraClient:
         if parsed < 0:
             raise ChainError(f"{_KIND_TIP_HEIGHT} response was a negative integer")
         return parsed
+
+    def get_tip_block(self) -> TipBlock:
+        """Fetch the chain-tip block info (``GET {base}/blocks/tip``).
+
+        The same tolerant parsing spirit as :meth:`get_tip_height` (the
+        mempool.space ``/blocks/tip`` divergence — HANDOFF §5): a bare
+        non-negative integer (the documented Esplora shape) yields a
+        :class:`TipBlock` with that height and ``timestamp=None``; a
+        non-empty list of block objects yields the entry with the maximum
+        ``height``, carrying its ``timestamp`` when present (a malformed or
+        absent ``timestamp`` is the clean ``None`` unavailable state, never
+        a fabricated value). Anything else fails closed as
+        :class:`ChainError` — we never guess a tip or a timestamp.
+        """
+        payload = self._request_json(_KIND_TIP_BLOCK, "/blocks/tip")
+        if isinstance(payload, bool):
+            raise ChainError(f"{_KIND_TIP_BLOCK} response was not an integer or block list")
+        if isinstance(payload, int):
+            if payload < 0:
+                raise ChainError(f"{_KIND_TIP_BLOCK} response was a negative integer")
+            return TipBlock(height=payload, timestamp=None)
+        if isinstance(payload, list):
+            if not payload:
+                raise ChainError(f"{_KIND_TIP_BLOCK} response was an empty block list")
+            best_index = 0
+            best_height = -1
+            for index, entry in enumerate(payload):
+                if not isinstance(entry, dict):
+                    raise ChainError(f"{_KIND_TIP_BLOCK} response block {index} is not an object")
+                height = entry.get("height")
+                if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+                    raise ChainError(f"{_KIND_TIP_BLOCK} response block {index} has invalid 'height'")
+                if height > best_height:
+                    best_height = height
+                    best_index = index
+            entry = payload[best_index]
+            timestamp = entry.get("timestamp")
+            if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+                timestamp = None
+            return TipBlock(height=best_height, timestamp=timestamp)
+        raise ChainError(f"{_KIND_TIP_BLOCK} response was not an integer or block list")
 
     def broadcast_tx(self, tx_hex: str) -> str:
         """Broadcast a signed transaction (``POST {base}/tx``, single attempt).

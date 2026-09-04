@@ -10,6 +10,7 @@ from localwallet.chain.esplora import (
     Balance,
     ChainError,
     EsploraClient,
+    TipBlock,
     balance_from_utxos,
 )
 from localwallet.chain.fees import FeeEstimate, FeeEstimator, FeeTarget
@@ -18,6 +19,12 @@ from localwallet.chain.price import (
     PriceOracle,
     PriceUnavailableError,
     Rate,
+)
+from localwallet.chain.watch import (
+    IncomingEvent,
+    IncomingWatcher,
+    WatchedTx,
+    time_since_last_block,
 )
 
 __all__ = [
@@ -29,8 +36,13 @@ __all__ = [
     "FeeEstimate",
     "FeeEstimator",
     "FeeTarget",
+    "IncomingEvent",
+    "IncomingWatcher",
     "PriceOracle",
     "PriceUnavailableError",
     "Rate",
+    "TipBlock",
+    "WatchedTx",
     "balance_from_utxos",
+    "time_since_last_block",
 ]

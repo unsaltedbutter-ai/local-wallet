@@ -47,6 +47,14 @@ class Settings:
     # Master switch for the node doctor's detection pass. "1" (enabled) by
     # default; set to "0" to skip probing entirely (privacy/perf escape hatch).
     node_detection_enabled: bool = True
+    # --- Background watch (Phase 5, TCK-P5-001) ---
+    # Seconds between ``watch_incoming`` poll cycles. ``0`` disables
+    # background watching entirely (the off-via-zero escape hatch, ADR-0019).
+    # A conservative default (60 s) limits how often the user's addresses are
+    # re-queried against a PUBLIC explorer — the honest-privacy knob
+    # documented in ADR-0019; on the user's own node (``chain_base_url`` set,
+    # ADR-0018) polling is cheap and private either way.
+    watch_interval_s: float = 60.0
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -59,7 +67,8 @@ class Settings:
         ``LOCALWALLET_PRICE_TTL_S``, ``LOCALWALLET_PRICE_ENABLED``,
         ``LOCALWALLET_FEE_CACHE_TTL_S``, ``LOCALWALLET_RPC_COOKIE_PATH``,
         ``LOCALWALLET_RPC_PORT``, ``LOCALWALLET_LOCAL_MEMPOOL_URL``,
-        ``LOCALWALLET_NODE_DETECTION_ENABLED``. Unknown variables are ignored.
+        ``LOCALWALLET_NODE_DETECTION_ENABLED``,
+        ``LOCALWALLET_WATCH_INTERVAL_S``. Unknown variables are ignored.
 
         Boolean fields accept ``0``/``1`` or ``true``/``false``/``yes``/``no``
         (any case); anything else raises :class:`ValueError` (fail closed —

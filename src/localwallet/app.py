@@ -92,8 +92,12 @@ from localwallet.chain import (
     EsploraClient,
     FeeEstimator,
     FeeTarget,
+    IncomingEvent,
+    IncomingWatcher,
     PriceOracle,
     PriceUnavailableError,
+    WatchedTx,
+    time_since_last_block,
 )
 from localwallet.config import Settings
 from localwallet.node import LocalNodeReport, NodeStatus, detect_local_nodes
@@ -120,11 +124,14 @@ from localwallet.signer.hwi import DeviceError, HwiUsbSigner
 from localwallet.store import (
     ADDRESS_ALLOCATED,
     BRANCH_CHANGE,
+    DIR_IN,
     DIR_OUT,
+    DIR_SELF,
     AddressRecord,
     Store,
     StoreError,
     TxRecord,
+    UtxoRecord,
     WalletRecord,
 )
 from localwallet.tx.flow import (
@@ -1771,6 +1778,164 @@ def _make_node_status_handler(
     return handler
 
 
+def _last_block_suffix(client: EsploraClient) -> str | None:
+    """The "last block ~N min ago" narration suffix for ONE drain.
+
+    Computed ONCE per drain (never per event) from the single injected
+    chain client via :func:`time_since_last_block`. Value-free: only the
+    integer minutes are narrated, never the raw timestamp or height. Any
+    failure — a failed tip lookup, a backend with no timestamp, or any
+    unexpected exception — swallows to ``None`` (no suffix, no crash, no
+    extra request re-attempted here); fail-closed.
+    """
+    try:
+        seconds = time_since_last_block(client)
+    except Exception:  # noqa: BLE001 — fail-closed: any failure -> no suffix
+        return None
+    if seconds is None:
+        return None
+    minutes = max(1, round(seconds / 60))
+    return f"last block ~{minutes} min ago"
+
+
+def _narrate_incoming_event(
+    event: IncomingEvent, suffix: str | None = None
+) -> str:
+    """Narrate one ``watch_incoming`` surfacing event (ADR-0019).
+
+    Dispatcher-owned narration from dispatcher-owned facts (P2-004): every
+    value (amount, address, height) is quoted verbatim from the event, which
+    the poller built from tool output — the model is never in this loop, and
+    nothing is generated or "corrected". The short txid is display truncation
+    of tool output (the same class as the history narration). This text is
+    deliberately shown to the USER in the UI — the required exception to the
+    no-addresses/amounts rule; it is never logged.
+
+    ``suffix`` — the value-free "last block ~N min ago" note computed ONCE
+    per drain (:func:`_last_block_suffix`); appended verbatim when present.
+    """
+    short = f"{event.txid[:12]}…"
+    if event.kind == "received":
+        state = "confirmed" if event.confirmed else "in mempool"
+        line = (
+            f"Incoming: received {event.amount_sats} sats at {event.address} "
+            f"({state}, tx {short})."
+        )
+    else:
+        height = event.height
+        height_part = f" (height {height})" if height is not None else ""
+        line = (
+            f"Confirmed: {event.amount_sats} sats at {event.address} "
+            f"now confirmed{height_part} (tx {short})."
+        )
+    if suffix:
+        line = f"{line} · {suffix}"
+    return line
+
+
+def _make_watch_probe(
+    store: Store,
+    wallet_id: int,
+    scan_fn: Callable[[], object],
+) -> Callable[[], list[WatchedTx]]:
+    """Build the production ``watch_incoming`` probe for the current wallet.
+
+    The probe refreshes the chain state through ``scan_fn`` (which in the app
+    wraps :func:`localwallet.wallet.scan.scan_wallet` over the SINGLE
+    config-selected EsploraClient — ADR-0018; a self-hosted poll hits the
+    user's node, never the public API), then reads the wallet's transactions
+    and UTXOs back from the store and shapes them into
+    :class:`WatchedTx` observations for the poller.
+
+    Only *incoming* transactions (scan direction ``in`` or ``self`` — i.e.
+    a watched address received funds) are surfaced. The received address is
+    the watched output with the largest value (verbatim) and the amount is
+    the total received to the wallet's addresses (verbatim tool output);
+    ``confirmed`` is the transaction's height presence.
+
+    Network only via ``scan_fn``/the chain client — this function itself
+    performs no I/O.
+    """
+
+    def probe() -> list[WatchedTx]:
+        scan_fn()
+        txs = store.get_txs_for_wallet(wallet_id)
+        utxos = store.get_utxos_for_wallet(wallet_id)
+        utxo_by_tx: dict[str, list[UtxoRecord]] = {}
+        for utxo in utxos:
+            utxo_by_tx.setdefault(utxo.txid, []).append(utxo)
+        result: list[WatchedTx] = []
+        for tx in txs:
+            if tx.direction not in (DIR_IN, DIR_SELF):
+                continue
+            ours = utxo_by_tx.get(tx.txid, [])
+            if not ours:
+                continue
+            primary = max(ours, key=lambda u: (u.value_sats, u.vout))
+            result.append(
+                WatchedTx(
+                    txid=tx.txid,
+                    incoming=True,
+                    confirmed=tx.height is not None,
+                    height=tx.height,
+                    block_time=tx.block_time,
+                    address=primary.address,
+                    amount_sats=sum(u.value_sats for u in ours),
+                )
+            )
+        return result
+
+    return probe
+
+
+def _drain_watch(
+    watcher: IncomingWatcher | None,
+    output_fn: Callable[[str], None],
+    *,
+    client: EsploraClient | None = None,
+) -> None:
+    """Run one due watch cycle (if any) and narrate its events to the user.
+
+    Single-threaded / tick-driven (ADR-0019): the REPL calls this between
+    turns; ``poll_due`` gates the run on the configured interval so a full
+    poll does not happen on every keystroke. A transient chain/store/scan
+    failure fails open — no events, no crash, no logged value — and the next
+    turn retries.
+
+    Persistent-failure visibility (NOTE-1): when a due poll raises, a short
+    value-free line (``watch: check failed, will retry next cycle``) is
+    surfaced THROTTLED — once per failure streak, tracked on the watcher and
+    reset on the next successful poll — so a persistently broken poll stays
+    visible without spamming every turn. It is never logged.
+
+    Time-since-block narration (NOTE-2): when ``client`` is provided and the
+    drain produced events, the "last block ~N min ago" suffix is computed
+    ONCE per drain via :func:`_last_block_suffix` and appended to each event's
+    narration. Any failure yields no suffix (fail-closed).
+    """
+    if watcher is None:
+        return
+    try:
+        if not watcher.poll_due():
+            return
+        events = watcher.tick()
+        watcher.mark_poll_succeeded()
+        suffix = (
+            _last_block_suffix(client)
+            if (client is not None and events)
+            else None
+        )
+        for event in events:
+            output_fn(sanitize_tool_output(_narrate_incoming_event(event, suffix)))
+    except (ChainError, wallet_scan.ScanError, StoreError, sqlite3.Error, WatchKeyError):
+        # Fail open: a background-poll failure must never interrupt the chat.
+        # NOTE-1: surface a throttled, value-free line ONCE per failure streak
+        # (reset on the next successful poll). Never logged.
+        if watcher.mark_poll_failed():
+            output_fn("watch: check failed, will retry next cycle")
+        return
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Console entry point; delegates to :func:`run`."""
     return run(argv)
@@ -1942,6 +2107,30 @@ def run(
     output_fn(f"Privacy notice: {privacy_indicator(settings)}")
     output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
+    # Background watch (Phase 5, TCK-P5-001; ADR-0019). Single-threaded /
+    # tick-driven: the watcher holds no thread and shares no sqlite object
+    # across threads; the REPL runs a due poll cycle between turns. The
+    # startup line states — in lockstep with the privacy banner — whether
+    # background watching runs against the user's own node or the public API.
+    watcher: IncomingWatcher | None = None
+    if settings.watch_interval_s > 0:
+        watcher = IncomingWatcher(
+            _make_watch_probe(
+                store,
+                wallet_row.id,
+                lambda: wallet_scan.scan_wallet(store, client, wallet_row),
+            ),
+            interval_s=settings.watch_interval_s,
+        )
+        watch_mode = "your own node" if _backend_mode(settings) == "own_node" else "the public API"
+        output_fn(
+            f"Background watch: on — checks up to every "
+            f"{settings.watch_interval_s:g}s against {watch_mode} "
+            f"(LOCALWALLET_WATCH_INTERVAL_S=0 turns it off)."
+        )
+    else:
+        output_fn("Background watch: off.")
+
     _startup_scan(store, client, wallet_row, rescan_requested=args.rescan, output_fn=output_fn)
     out_of_window = _out_of_window_line(store, wallet_row.id)
     if out_of_window is not None:
@@ -1965,7 +2154,7 @@ def run(
     loop = AgentLoop(generate, table)
 
     try:
-        _repl(loop, output_fn, input_fn, flow=tx_flow, session=session)
+        _repl(loop, output_fn, input_fn, flow=tx_flow, session=session, watcher=watcher, client=client)
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
     finally:
@@ -2126,14 +2315,20 @@ def _repl(
     *,
     flow: TxFlow,
     session: SendSession,
+    watcher: IncomingWatcher | None = None,
+    client: EsploraClient | None = None,
 ) -> None:
     """Read user lines until EOF/exit and print each turn's outcome.
 
     The flow/session pair is owned by this loop's caller (:func:`run`);
     every turn runs through :func:`_run_turn` so the confirm gate sees
-    the raw utterance before the model does.
+    the raw utterance before the model does. Between turns the background
+    watch (ADR-0019) is drained: a due poll cycle runs and its events are
+    narrated before the next prompt. ``client`` is forwarded to the drain so
+    each cycle can compute the time-since-block narration suffix (NOTE-2).
     """
     while True:
+        _drain_watch(watcher, output_fn, client=client)
         try:
             line = input_fn("you> ")
         except EOFError:
