@@ -22,6 +22,21 @@ class Settings:
     price_ttl_s: float = 60.0
     price_enabled: bool = True
     fee_cache_ttl_s: float = 30.0
+    # --- Node detection (Phase 4, node/ module; TCK-P4-001) ---
+    # Path to a Bitcoin Core RPC cookie file. Empty string means "use the
+    # per-network default under ~/.bitcoin" (e.g. ~/.bitcoin/testnet4/.cookie).
+    # The cookie CONTENT is a secret and is never logged or echoed.
+    rpc_cookie_path: str = ""
+    # Bitcoin Core JSON-RPC port to probe. Defaults to testnet4 (48332) per
+    # ADR-0004 / Bitcoin Core chainparamsbase.cpp.
+    rpc_port: int = 48332
+    # Self-hosted mempool.space API root on localhost (well-known default
+    # backend port 3006). Detected by the node doctor; full backend wiring
+    # lands in TCK-P4-002.
+    local_mempool_url: str = "http://127.0.0.1:3006"
+    # Master switch for the node doctor's detection pass. "1" (enabled) by
+    # default; set to "0" to skip probing entirely (privacy/perf escape hatch).
+    node_detection_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -31,7 +46,9 @@ class Settings:
         ``LOCALWALLET_REQUEST_TIMEOUT_S``, ``LOCALWALLET_MAX_RETRIES``,
         ``LOCALWALLET_NETWORK``, ``LOCALWALLET_STORE_PATH``,
         ``LOCALWALLET_PRICE_TTL_S``, ``LOCALWALLET_PRICE_ENABLED``,
-        ``LOCALWALLET_FEE_CACHE_TTL_S``. Unknown variables are ignored.
+        ``LOCALWALLET_FEE_CACHE_TTL_S``, ``LOCALWALLET_RPC_COOKIE_PATH``,
+        ``LOCALWALLET_RPC_PORT``, ``LOCALWALLET_LOCAL_MEMPOOL_URL``,
+        ``LOCALWALLET_NODE_DETECTION_ENABLED``. Unknown variables are ignored.
 
         Boolean fields accept ``0``/``1`` or ``true``/``false``/``yes``/``no``
         (any case); anything else raises :class:`ValueError` (fail closed —

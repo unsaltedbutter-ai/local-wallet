@@ -90,3 +90,41 @@ def test_lint_still_flags_network_imports_in_other_agent_files(tmp_path):
 def test_lint_passes_on_real_tree_with_bridge_import():
     """The real remote_runtime.py (which imports httpx) lints clean."""
     assert LINT.check_tree(LINT.SRC_ROOT) == []
+
+
+# ------------------------------------------------- ADR-0016 node/ exception
+
+
+def test_lint_exception_names_exactly_the_node_dir():
+    """The node-doctor exception is exactly the node/ package (ADR-0016)."""
+    assert LINT.NODE_NETWORK_DIRS == ("node",)
+
+
+def test_lint_allows_network_import_inside_node_dir(tmp_path):
+    """Network imports are permitted anywhere under node/ (loopback-only)."""
+    node_dir = tmp_path / "node"
+    node_dir.mkdir()
+    (node_dir / "detect.py").write_text("import httpx\n", encoding="utf-8")
+    (node_dir / "__init__.py").write_text(
+        "from localwallet.node.detect import foo\n", encoding="utf-8"
+    )
+    assert LINT.check_tree(tmp_path) == []
+
+
+def test_lint_does_not_exempt_a_sibling_file_named_node(tmp_path):
+    """The node/ exception is a directory, not a name prefix."""
+    (tmp_path / "node.py").write_text("import httpx\n", encoding="utf-8")
+    (tmp_path / "node_extra.py").write_text("import socket\n", encoding="utf-8")
+    violations = LINT.check_tree(tmp_path)
+    flagged = {v.path.name for v in violations}
+    assert flagged == {"node.py", "node_extra.py"}
+
+
+def test_lint_still_flags_network_imports_in_other_packages(tmp_path):
+    """Unrelated packages stay banned — only chain/, agent/remote_runtime.py,
+    and node/ are exempt."""
+    (tmp_path / "wallet.py").write_text("import httpx\n", encoding="utf-8")
+    (tmp_path / "store.py").write_text("import socket\n", encoding="utf-8")
+    violations = LINT.check_tree(tmp_path)
+    flagged = {v.path.name for v in violations}
+    assert flagged == {"wallet.py", "store.py"}
