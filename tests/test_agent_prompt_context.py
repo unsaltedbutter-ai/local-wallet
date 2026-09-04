@@ -180,12 +180,13 @@ class TestSystemPrompt:
         for intent in IntentName:
             assert intent.value in prompt
 
-    def test_contains_all_eleven_intent_names(self) -> None:
+    def test_contains_all_twelve_intent_names(self) -> None:
         # Explicit pin (not just enum iteration): the Phase 1 v0 extension
         # added get_history / get_utxos / new_address, the Phase 2 v0
-        # extension added create_tx / confirm_tx, and the Phase 3 v0
-        # extension added sign_tx / broadcast_tx / tx_status — grammar,
-        # schema and prompt must move together (ADR-0002/0013 lockstep).
+        # extension added create_tx / confirm_tx, the Phase 3 v0
+        # extension added sign_tx / broadcast_tx / tx_status, and the
+        # Phase 4 v0 extension added node_status — grammar, schema and
+        # prompt must move together (ADR-0002/0013 lockstep).
         prompt = build_system_prompt()
         for name in (
             "respond",
@@ -199,6 +200,7 @@ class TestSystemPrompt:
             "sign_tx",
             "broadcast_tx",
             "tx_status",
+            "node_status",
         ):
             assert name in prompt
 

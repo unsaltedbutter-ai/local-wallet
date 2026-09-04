@@ -82,8 +82,13 @@ before broadcast_tx succeeded.
 params {"tx_ref": "<tx_ref quoted VERBATIM from the confirmation card>"} \
 — only after sign_tx succeeded.
 - tx_status: look up a transaction's confirmation status; params {"txid": \
-"<64-hex txid quoted VERBATIM from tool output>"} — when the user asks \
+<64-hex txid quoted VERBATIM from tool output>"} — when the user asks \
 whether a transaction has confirmed yet.
+- node_status: report on the local node setup; params {} — when the user \
+asks about their own node, privacy/data source, or how to set one up. The \
+app detects your local Bitcoin Core / mempool / electrs instances and \
+provides guidance; you narrate ONLY the structured facts you are given — \
+never invent detection results or guidance.
 
 FACTS AND VERBATIM RULE
 - Addresses, amounts, and balances are provided in the FACTS block. Copy \
@@ -121,8 +126,8 @@ def build_system_prompt() -> str:
     """Return the system prompt encoding the output contract.
 
     The prompt fixes: exactly one envelope per turn with key order
-    ``v, intent, params``; the closed intent list (eleven intents as of the
-    Phase 3 v0 extension) with usage guidance; the quote-verbatim rule for
+    ``v, intent, params``; the closed intent list (twelve intents as of the
+    Phase 4 v0 extension) with usage guidance; the quote-verbatim rule for
     FACTS values; the no-secrets (watch-only) rule; and five few-shot
     exchanges (respond / clarify / get_balance / new_address / create_tx).
 

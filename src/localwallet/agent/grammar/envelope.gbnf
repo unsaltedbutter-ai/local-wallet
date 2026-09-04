@@ -1,13 +1,14 @@
 # envelope.gbnf — v0 intent envelope grammar (llama.cpp GBNF)
 #
 # Constrains model decoding to EXACTLY the canonical envelope contract v0
-# (extended in Phase 1, Phase 2 and Phase 3 — see docs/adr/0002-envelope-spec.md,
-# docs/adr/0013-confirm-gate.md and the ADR-0013 Phase 3 amendment):
+# (extended in Phase 1, Phase 2, Phase 3 and Phase 4 — see
+# docs/adr/0002-envelope-spec.md, docs/adr/0013-confirm-gate.md and the
+# ADR-0013 Phase 3 amendment):
 #
 #   {"v": 0, "intent": <closed enum>, "params": {...}}
 #
 #   v        : integer 0 exactly
-#   intent   : closed enum of the eleven names
+#   intent   : closed enum of the twelve names
 #   params   : required object, whose shape depends on intent:
 #                respond     -> {"text": string}
 #                clarify     -> {"question": string}
@@ -30,6 +31,8 @@
 #                tx_status   -> {"txid": <exactly 64 lowercase hex chars>}
 #                               (the grammar pins the URL-path-safe charset;
 #                                the schema/rule layer re-checks it)
+#                node_status -> {} (the model emits nothing else; the
+#                               dispatcher owns all data)
 #
 # KEY ORDER: STRICT. The model must emit keys in order v, intent, params.
 # This is simpler for a small model and removes any ambiguity in the
@@ -72,7 +75,7 @@ envelope ::= "{" ws "\"v\"" ws ":" ws "0" ws "," ws intent_body
 
 # Each intent branch carries its exact params shape and closes the params
 # object and the envelope. This couples intent -> params at decode time.
-intent_body ::= respond | clarify | get_balance | get_history | get_utxos | new_address | create_tx | confirm_tx | sign_tx | broadcast_tx | tx_status
+intent_body ::= respond | clarify | get_balance | get_history | get_utxos | new_address | create_tx | confirm_tx | sign_tx | broadcast_tx | tx_status | node_status
 
 # intent "respond" -> params {"text": string}
 respond ::=
@@ -208,6 +211,13 @@ tx_status ::=
 # deliberately grammar-rejected: the lowercase-only contract keeps quoted
 # txids verbatim-comparable and URL-safe without normalization.
 hex_txid ::= [0-9a-f]{64}
+
+# intent "node_status" -> params {} (empty object)
+# The model emits nothing else; the dispatcher owns all data (detect +
+# doctor guidance). Any key here is syntactically impossible.
+node_status ::=
+  "\"intent\"" ws ":" ws "\"node_status\"" ws "," ws
+  "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
 
 # Conservative JSON string: any char except quote, backslash, and control
 # chars (\x00-\x1f), OR a valid escape sequence. No raw control characters.

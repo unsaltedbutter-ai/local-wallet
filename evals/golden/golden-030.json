@@ -1,0 +1,5 @@
+{
+  "id": "golden-030",
+  "prompt": "should I be worried about privacy?",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

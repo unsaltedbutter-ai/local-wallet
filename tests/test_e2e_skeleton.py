@@ -49,15 +49,20 @@ from localwallet.agent.loop import AgentLoop, AgentTurnStatus
 from localwallet.agent.runtime import GenerateFn
 from localwallet.app import (
     AUTO_SCAN_ENV_VAR,
+    NODE_STATUS_DETECTION_DISABLED,
     OUT_OF_WINDOW_NOTICE,
     PRIVACY_INDICATOR,
+    PRIVACY_INDICATOR_OWN_NODE,
     ZPUB_ENV_VAR,
     SendSession,
     build_dispatch_table,
+    privacy_indicator,
     run,
     stub_generate,
 )
 from localwallet.chain import EsploraClient, PriceOracle
+from localwallet.node import LocalNodeReport, NodeStatus
+from localwallet.node.detect import CoreHealth, CoreRpcProbe
 from localwallet.protocol import Envelope, IntentName, validate_payload
 from localwallet.store import (
     AddressRecord,
@@ -1264,6 +1269,220 @@ def test_zpub_cli_arg_overrides_env(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert PRIVACY_INDICATOR in "\n".join(outputs)
 
 
+# ------------------------------------------------ node_status (TCK-P4-003)
+
+def _core_ready_report() -> LocalNodeReport:
+    """A LocalNodeReport with a reachable+synced Core and a mempool indexer."""
+    health = CoreHealth(
+        chain="testnet4",
+        blocks=100,
+        headers=100,
+        verification_progress=1.0,
+        initial_block_download=False,
+    )
+    core = (
+        CoreRpcProbe(
+            port=48332, status=NodeStatus.REACHABLE, cookie_present=True, health=health
+        ),
+    )
+    return LocalNodeReport(
+        core=core, mempool=NodeStatus.REACHABLE, electrs=NodeStatus.OFFLINE
+    )
+
+
+def _run_node_repl(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    detect_report: LocalNodeReport | None,
+    chain_base_url: str | None = None,
+    node_detection_enabled: bool = True,
+) -> tuple[int, list[str], list[LocalNodeReport]]:
+    """Run the REPL with an injected (mock-transport) node detection.
+
+    ``detect_report`` None + ``node_detection_enabled=False`` exercises the
+    clean detection-disabled state (no probing). Returns the captured
+    ``(code, outputs, detect_calls)``.
+    """
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    recorded: list[httpx.Request] = []
+    handler = _scan_handler(recorded)
+    monkeypatch.delenv("LOCALWALLET_MODEL_PATH", raising=False)
+    monkeypatch.delenv("LOCALWALLET_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LOCALWALLET_LLM_MODEL", raising=False)
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
+    monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "0")
+    if chain_base_url is None:
+        monkeypatch.delenv("LOCALWALLET_CHAIN_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("LOCALWALLET_CHAIN_BASE_URL", chain_base_url)
+    if node_detection_enabled:
+        monkeypatch.setenv("LOCALWALLET_NODE_DETECTION_ENABLED", "1")
+    else:
+        monkeypatch.setenv("LOCALWALLET_NODE_DETECTION_ENABLED", "0")
+    monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
+
+    detect_calls: list[LocalNodeReport] = []
+
+    def fake_detect() -> LocalNodeReport:
+        assert detect_report is not None
+        detect_calls.append(detect_report)
+        return detect_report
+
+    outputs: list[str] = []
+    lines = iter(["what's my node status?", "exit"])
+    code = run(
+        ["--stub-llm", "--zpub", VPUB],
+        input_fn=lambda _p: next(lines),
+        output_fn=outputs.append,
+        node_detect_fn=fake_detect,
+    )
+    return code, outputs, detect_calls
+
+
+def test_node_status_repl_detects_and_narrates_facts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """'what's my node status?' → detection runs → narration quotes FACTS.
+
+    The injected detection is the P4-001 report (a mocked local-node pass);
+    the narration must come verbatim from the dispatcher-owned FACTS (backend
+    mode, core sync state, indexer reachability, doctor guidance). Public
+    default backend keeps the honest public-API banner and narration.
+    """
+    code, outputs, detect_calls = _run_node_repl(
+        monkeypatch, tmp_path, detect_report=_core_ready_report()
+    )
+
+    assert code == 0
+    assert len(detect_calls) == 1, "detection must have actually run"
+    joined = "\n".join(outputs)
+    # Public default: banner + node_status narration agree on public API.
+    assert PRIVACY_INDICATOR in joined
+    assert "You are querying the public API" in joined
+    # FACTS quoted verbatim: core + indexer + doctor guidance.
+    assert "A Bitcoin Core node is reachable and synced." in joined
+    assert "Indexer reachable: mempool." in joined
+    assert "Doctor: A Bitcoin Core node is ready" in joined
+    assert "Guidance: Add a self-hosted mempool/electrs" in joined
+
+
+def test_node_status_own_node_narration_and_banner_flip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """LOCALWALLET_CHAIN_BASE_URL set ⇒ own-node banner AND narration.
+
+    The indicator flip derives from the same chain-backend selection the
+    client uses (ADR-0018), so banner and node_status narration must both
+    reflect own-node mode and the public wording must be absent.
+    """
+    code, outputs, detect_calls = _run_node_repl(
+        monkeypatch,
+        tmp_path,
+        detect_report=_core_ready_report(),
+        chain_base_url="http://127.0.0.1:3006",
+    )
+
+    assert code == 0
+    assert len(detect_calls) == 1
+    joined = "\n".join(outputs)
+    assert PRIVACY_INDICATOR_OWN_NODE in joined
+    assert PRIVACY_INDICATOR not in joined  # public wording flipped away
+    assert "You are querying your own node" in joined
+    assert "You are querying the public API" not in joined
+
+
+def test_privacy_indicator_function_selects_wording_from_settings() -> None:
+    """The banner helper is a pure function of the backend selection."""
+    from localwallet.config import Settings
+
+    assert privacy_indicator(Settings()) == PRIVACY_INDICATOR
+    own = Settings(chain_base_url="http://127.0.0.1:3006")
+    assert privacy_indicator(own) == PRIVACY_INDICATOR_OWN_NODE
+
+
+def test_node_status_detection_disabled_does_not_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """LOCALWALLET_NODE_DETECTION_ENABLED=0 ⇒ clean disabled state, no probe.
+
+    The injected detection is never called and the narration says detection
+    is disabled instead of fabricating findings.
+    """
+    code, outputs, detect_calls = _run_node_repl(
+        monkeypatch,
+        tmp_path,
+        detect_report=None,
+        node_detection_enabled=False,
+    )
+
+    assert code == 0
+    assert detect_calls == []  # no probing when disabled
+    joined = "\n".join(outputs)
+    assert "Local node detection is disabled" in joined
+    assert "A Bitcoin Core node is reachable" not in joined
+
+
+def test_node_status_handler_facts_shape() -> None:
+    """The handler returns dispatcher-owned FACTS with all narration keys."""
+    from localwallet.app import build_dispatch_table
+
+    recorded: list[httpx.Request] = []
+    client = _mock_client(_scan_handler(recorded))
+    store = Store.memory()
+    wd = WalletDescriptor.from_key(VPUB)
+    wallet = store.create_wallet("default", wd.descriptor)
+    store.set_active_wallet(wallet.id)
+    table = build_dispatch_table(
+        store,
+        wallet,
+        wd.parsed,
+        client,
+        lambda: scan_wallet(store, client, wallet),
+        node_detect_fn=lambda: _core_ready_report(),
+    )
+    envelope = validate_payload({"v": 0, "intent": "node_status", "params": {}})
+    result = table[IntentName.NODE_STATUS](envelope)
+
+    assert result["backend_mode"] == "public_api"
+    assert result["detection_state"] == "ran"
+    assert result["core_reachable"] is True
+    assert result["core_synced"] is True
+    assert result["core_auth_issue"] is False
+    assert result["mempool_reachable"] is True
+    assert result["electrs_reachable"] is False
+    assert result["doctor_state"] == "core_ready"
+    assert result["doctor_headline"] == "A Bitcoin Core node is ready"
+    assert isinstance(result["doctor_next_step"], str) and result["doctor_next_step"]
+
+
+def test_node_status_detection_disabled_facts_state() -> None:
+    """Detection-disabled handler result carries the disabled marker only."""
+    from localwallet.app import build_dispatch_table
+    from localwallet.config import Settings
+
+    client = _mock_client(_scan_handler([]))
+    store = Store.memory()
+    wd = WalletDescriptor.from_key(VPUB)
+    wallet = store.create_wallet("default", wd.descriptor)
+    store.set_active_wallet(wallet.id)
+    table = build_dispatch_table(
+        store,
+        wallet,
+        wd.parsed,
+        client,
+        lambda: scan_wallet(store, client, wallet),
+        settings=Settings(node_detection_enabled=False),
+    )
+    envelope = validate_payload({"v": 0, "intent": "node_status", "params": {}})
+    result = table[IntentName.NODE_STATUS](envelope)
+
+    assert result["detection_state"] == NODE_STATUS_DETECTION_DISABLED
+    assert result["backend_mode"] == "public_api"
+    assert "core_reachable" not in result  # nothing fabricated
+
+
 def test_repl_reports_chain_unavailable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2016,7 +2235,7 @@ def test_send_flow_happy_path_card_then_dual_key_confirm(
     assert SEND_AMOUNT_SATS + SEND_FEE_SATS + SEND_CHANGE_SATS == 100_000
     # Dual-key confirm: same-turn "yes please" + matching tx_ref.
     assert (
-        "Approved. The signed-transaction step arrives in Phase 3 — say 'status' later."
+        "Approved. Next step: sign — reply 'sign' to hand the transaction to your signer."
         in joined
     )
     assert flow.state is TxFlowStatus.CONFIRMED
@@ -2498,7 +2717,7 @@ def test_send_flow_confirm_production_path_quotes_tx_ref_from_facts(
     )
     assert fact_ref == card_ref  # FACTS value == the printed card's ref
     assert "Pending transaction — review it carefully" in joined
-    assert "Approved. The signed-transaction step arrives in Phase 3" in joined
+    assert "Approved. Next step: sign — reply 'sign'" in joined
     assert flow.state is TxFlowStatus.CONFIRMED
     assert flow.pending is None
     assert "Not confirmed" not in joined

@@ -5,8 +5,8 @@ extraction suite (PROJECT.md §7.10).
 
 ## Layout
 
-- `golden/*.json` — one JSON file per golden case (27 cases,
-  `golden-001..golden-027`). Each is `{"id", "prompt", "expectation"}`
+- `golden/*.json` — one JSON file per golden case (30 cases,
+  `golden-001..golden-030`). Each is `{"id", "prompt", "expectation"}`
   where `expectation` is an exact envelope (`{"intent", "params"}`), a
   structural predicate (`{"intent", "text_nonempty"|"question_nonempty"}`),
   or an `intent_in` predicate (`{"intent_in": [..]}` with optional
@@ -84,7 +84,7 @@ becomes a merge gate in Phase 6 (≥95% golden / 100% confirm-gates).
 
 - **Fixture mode** is enforced in CI-able pytest (`tests/test_fuzz_validation.py`
   spot-checks grammar↔schema agreement and the malformed-input invariant) and
-  via `evals/run_evals.py` directly: all 27 golden fixtures and 6 red-team
+  via `evals/run_evals.py` directly: all 30 golden fixtures and 6 red-team
   expectations must validate, exit 0.
 - **Model mode** is manual until the model-download bootstrap lands
   (`models/`); `--model` is informational in P0 (prints the score and the

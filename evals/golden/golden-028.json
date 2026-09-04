@@ -1,0 +1,5 @@
+{
+  "id": "golden-028",
+  "prompt": "what's the status of my node?",
+  "expectation": {"intent": "node_status", "params": {}}
+}

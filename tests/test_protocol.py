@@ -43,6 +43,7 @@ from localwallet.protocol import (
     GetUtxosParams,
     IntentName,
     NewAddressParams,
+    NodeStatusParams,
     OutcomeStatus,
     RespondParams,
     SignTxParams,
@@ -93,6 +94,8 @@ ACCEPT_CASES = {
     "sign_tx_signer": {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "3f2a9c", "signer": "file"}},
     "broadcast_tx": {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "3f2a9c"}},
     "tx_status": {"v": 0, "intent": "tx_status", "params": {"txid": "a" * 64}},
+    # Phase 4 v0 extension (ADR-0002): the advise-only node-doctor intent.
+    "node_status": {"v": 0, "intent": "node_status", "params": {}},
 }
 
 PARAMS_TYPES = {
@@ -107,6 +110,7 @@ PARAMS_TYPES = {
     IntentName.SIGN_TX: SignTxParams,
     IntentName.BROADCAST_TX: BroadcastTxParams,
     IntentName.TX_STATUS: TxStatusParams,
+    IntentName.NODE_STATUS: NodeStatusParams,
 }
 
 HANDLER_RESULTS = {
@@ -121,6 +125,7 @@ HANDLER_RESULTS = {
     IntentName.SIGN_TX: {"signed": True},
     IntentName.BROADCAST_TX: {"broadcast": True},
     IntentName.TX_STATUS: {"status": True},
+    IntentName.NODE_STATUS: {"detected": True},
 }
 
 
@@ -185,15 +190,16 @@ def test_intent_enum_is_the_closed_world():
         "sign_tx",
         "broadcast_tx",
         "tx_status",
+        "node_status",
     }
-    assert len(IntentName) == 11
+    assert len(IntentName) == 12
 
 
 def test_intent_registry_is_frozen_and_complete():
     assert set(INTENT_REGISTRY.keys()) == set(IntentName)
     # explicit count: registry completeness is pinned, not incidental
-    # (Phase 3 v0 extension: 8 → 11)
-    assert len(INTENT_REGISTRY) == 11
+    # (Phase 4 v0 extension: 11 → 12)
+    assert len(INTENT_REGISTRY) == 12
     for intent, model in INTENT_REGISTRY.items():
         assert model is PARAMS_TYPES[intent]
     # frozen mapping: mutation is refused
@@ -206,7 +212,7 @@ def test_intent_registry_is_frozen_and_complete():
 def test_business_rules_cover_every_intent():
     assert set(BUSINESS_RULES.keys()) == set(IntentName)
     # explicit count: registry completeness is pinned, not incidental
-    assert len(BUSINESS_RULES) == 11
+    assert len(BUSINESS_RULES) == 12
     for intent in IntentName:
         assert callable(BUSINESS_RULES[intent])
     # frozen mapping: mutation is refused (symmetry with INTENT_REGISTRY)
@@ -337,6 +343,32 @@ def test_get_utxos_rejects_any_params_key():
     (limit/branch) or reserved-looking opts are all rejected."""
     for params in ({"limit": 5}, {"branch": 0}, {"verbose": True}, {"address": "x"}):
         expect_rejected({"v": 0, "intent": "get_utxos", "params": params})
+
+
+# ------------------------------- Phase 4 v0 extension: node_status
+
+def test_accept_node_status_params_is_exactly_empty():
+    """node_status carries {} exactly — the model emits nothing; the
+    dispatcher owns all data (detect + doctor guidance)."""
+    envelope = validate_payload(ACCEPT_CASES["node_status"])
+    assert isinstance(envelope.params, NodeStatusParams)
+    assert envelope.params.model_dump() == {}
+    assert envelope.model_dump() == ACCEPT_CASES["node_status"]
+
+
+def test_node_status_rejects_any_params_key():
+    """node_status is {} exactly — keys belonging to other intents or
+    reserved-looking opts are all rejected (closed world)."""
+    for params in (
+        {"verbose": True},
+        {"core": True},
+        {"refresh": 1},
+        {"address": "x"},
+        {"txid": "a" * 64},
+    ):
+        expect_rejected({"v": 0, "intent": "node_status", "params": params})
+    # wrong params type / coupling
+    expect_rejected({"v": 0, "intent": "node_status", "params": {"text": "x"}})
 
 
 # ------------------------------- Phase 2 v0 extension: create_tx / confirm_tx
@@ -958,6 +990,11 @@ REJECT_MATRIX = [
     ("tx_status_missing", {"v": 0, "intent": "tx_status", "params": {}}),
     ("tx_status_extra_key", {"v": 0, "intent": "tx_status", "params": {"txid": "a" * 64, "verbose": True}}),
     ("tx_status_wrong_intent_key", {"v": 0, "intent": "tx_status", "params": {"tx_ref": "abc"}}),
+    # Phase 4 v0 extension: node_status rejects (schema layer)
+    ("node_status_extra_key", {"v": 0, "intent": "node_status", "params": {"verbose": True}}),
+    ("node_status_verbose_key", {"v": 0, "intent": "node_status", "params": {"refresh": 1}}),
+    ("node_status_text_key", {"v": 0, "intent": "node_status", "params": {"text": "x"}}),
+    ("node_status_null_params", {"v": 0, "intent": "node_status", "params": None}),
     # raw JSON documents that are not envelopes
     ("invalid_json", "{oops"),
     ("json_array", "[1, 2]"),
@@ -1115,6 +1152,7 @@ def test_invalid_json_yields_error_envelope_not_raw_exception():
         IntentName.SIGN_TX,
         IntentName.BROADCAST_TX,
         IntentName.TX_STATUS,
+        IntentName.NODE_STATUS,
     ],
     ids=[
         "respond",
@@ -1128,6 +1166,7 @@ def test_invalid_json_yields_error_envelope_not_raw_exception():
         "sign_tx",
         "broadcast_tx",
         "tx_status",
+        "node_status",
     ],
 )
 def test_dispatch_routes_each_intent_to_its_handler(intent: IntentName):
@@ -1208,6 +1247,7 @@ def test_dispatch_handler_exception_surfaces_not_swallowed():
         IntentName.SIGN_TX,
         IntentName.BROADCAST_TX,
         IntentName.TX_STATUS,
+        IntentName.NODE_STATUS,
     ],
     ids=[
         "respond",
@@ -1221,6 +1261,7 @@ def test_dispatch_handler_exception_surfaces_not_swallowed():
         "sign_tx",
         "broadcast_tx",
         "tx_status",
+        "node_status",
     ],
 )
 def test_handle_raw_ok_path_per_intent(intent: IntentName):

@@ -1,0 +1,5 @@
+{
+  "id": "golden-029",
+  "prompt": "are my lookups going to a public server or my own node?",
+  "expectation": {"intent": "node_status", "params": {}}
+}

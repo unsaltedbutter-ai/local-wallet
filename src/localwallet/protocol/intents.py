@@ -56,6 +56,7 @@ from localwallet.protocol.envelope import (
     GetUtxosParams,
     IntentName,
     NewAddressParams,
+    NodeStatusParams,
     RespondParams,
     SignTxParams,
     TxStatusParams,
@@ -292,6 +293,18 @@ def _rule_tx_status(params: BaseParams) -> list[str]:
     return []
 
 
+def _rule_node_status(params: BaseParams) -> list[str]:
+    """``node_status``: no meaning-level rules yet (registry completeness only).
+
+    The intent carries empty params and the handler performs no privileged
+    action — detection is advise-only and never runs commands. The rule is
+    the closed-world completeness placeholder, mirroring ``get_utxos``.
+    """
+    if not isinstance(params, NodeStatusParams):
+        return ["internal: 'node_status' params failed the type check"]
+    return []
+
+
 #: Layer-3 business rules, per intent. Values are pure functions from the
 #: validated params model to a list of error strings (empty list == valid).
 #: Frozen (``MappingProxyType``) for symmetry with the frozen
@@ -309,5 +322,6 @@ BUSINESS_RULES: Mapping[IntentName, BusinessRule] = MappingProxyType(
         IntentName.SIGN_TX: _rule_sign_tx,
         IntentName.BROADCAST_TX: _rule_broadcast_tx,
         IntentName.TX_STATUS: _rule_tx_status,
+        IntentName.NODE_STATUS: _rule_node_status,
     }
 )

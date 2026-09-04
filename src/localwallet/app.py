@@ -96,6 +96,8 @@ from localwallet.chain import (
     PriceUnavailableError,
 )
 from localwallet.config import Settings
+from localwallet.node import LocalNodeReport, NodeStatus, detect_local_nodes
+from localwallet.node.doctor import NodeDoctor
 from localwallet.protocol import (
     BroadcastTxParams,
     ClarifyParams,
@@ -107,6 +109,7 @@ from localwallet.protocol import (
     Handler,
     IntentName,
     NewAddressParams,
+    NodeStatusParams,
     RespondParams,
     SignTxParams,
     TxStatusParams,
@@ -161,8 +164,10 @@ __all__ = [
     "AUTO_SCAN_ENV_VAR",
     "DEFAULT_HISTORY_LIMIT",
     "DEFAULT_SIGNER_DIR",
+    "NODE_STATUS_DETECTION_DISABLED",
     "OUT_OF_WINDOW_NOTICE",
     "PRIVACY_INDICATOR",
+    "PRIVACY_INDICATOR_OWN_NODE",
     "SIGNER_DIR_ENV_VAR",
     "SIGNER_ENV_VAR",
     "ZPUB_ENV_VAR",
@@ -170,6 +175,7 @@ __all__ = [
     "SignerSelection",
     "build_dispatch_table",
     "main",
+    "privacy_indicator",
     "run",
     "stub_generate",
 ]
@@ -211,10 +217,39 @@ _NEVER_CONFIRMED: Final[int] = 2**63 - 1
 
 #: The §9 honest privacy indicator, shown verbatim at startup (PROJECT.md
 #: §9 / R7 — never over-claim privacy while querying a public explorer).
+#: This is the PUBLIC-API wording: when the chain backend is the user's own
+#: node (``Settings.chain_base_url`` set, ADR-0018) the banner instead shows
+#: :data:`PRIVACY_INDICATOR_OWN_NODE`, selected by :func:`privacy_indicator`
+#: off the same single selection point the chain client uses.
 PRIVACY_INDICATOR: Final[str] = (
     "Querying public mempool.space — the operator can associate queried "
     "addresses with your IP."
 )
+
+#: The §9 privacy indicator for the self-hosted/own-node backend (ADR-0018:
+#: ``Settings.chain_base_url`` set ⇒ all chain lookups go to the configured
+#: instance, none to the public default).
+PRIVACY_INDICATOR_OWN_NODE: Final[str] = (
+    "Querying your own node — addresses and lookups stay on this machine."
+)
+
+
+def privacy_indicator(settings: Settings) -> str:
+    """Return the §9 privacy banner for the given backend selection.
+
+    The wording is gated on the SAME single selection point the chain
+    client uses (ADR-0018 ``ChainConfig.from_settings``): when
+    ``Settings.chain_base_url`` is set the wallet is on the user's own node
+    and the indicator reflects that; otherwise the honest public-API
+    wording applies. Reading the knob here — rather than re-hardcoding a
+    public default — keeps the banner and the node_status narration from
+    ever diverging from what the client actually uses.
+    """
+    return (
+        PRIVACY_INDICATOR_OWN_NODE
+        if settings.chain_base_url.strip()
+        else PRIVACY_INDICATOR
+    )
 
 #: ADR-0009 UI surfacing for ``sync_state["out_of_window_detected"]``:
 #: printed at startup when the store carries a non-empty warning payload.
@@ -292,6 +327,15 @@ _STUB_TX_STATUS_TXID: Final[str] = "ab" * 32
 _STUB_TX_STATUS_ENVELOPE: Final[str] = json.dumps(
     {"v": 0, "intent": "tx_status", "params": {"txid": _STUB_TX_STATUS_TXID}}
 )
+_STUB_NODE_STATUS_ENVELOPE: Final[str] = json.dumps(
+    {"v": 0, "intent": "node_status", "params": {}}
+)
+
+#: ``node_status`` detection-state literal when node detection is disabled
+#: (``Settings.node_detection_enabled`` false ⇒ clean "detection disabled"
+#: state, no probing — LOCALWALLET_NODE_DETECTION_ENABLED=0). The narration
+#: says so and offers no fabricated findings.
+NODE_STATUS_DETECTION_DISABLED: Final[str] = "disabled"
 
 #: User-facing narration lines for the send flow (TCK-P2-004). Every value
 #: they carry comes verbatim from the handler result dict — the UI computes
@@ -302,7 +346,7 @@ _CARD_HEADER_LINE: Final[str] = (
 )
 _CANCELLED_LINE: Final[str] = "Transaction cancelled."
 _CONFIRMED_LINE: Final[str] = (
-    "Approved. The signed-transaction step arrives in Phase 3 — say 'status' later."
+    "Approved. Next step: sign — reply 'sign' to hand the transaction to your signer."
 )
 _GUIDANCE_STILL_PENDING: Final[str] = (
     "The transaction is still pending — say 'confirm' to approve it or "
@@ -367,7 +411,8 @@ def stub_generate(prompt: str, grammar_text: str | None) -> str:
     of the assembled prompt, see ``AgentLoop._build_prompt``) against a
     fixed phrase table — "balance" → ``get_balance``; "history" or
     "transaction" → ``get_history``; "utxo" → ``get_utxos``; "new
-    address" / "address" → ``new_address``; "status" → ``tx_status`` (the
+    address" / "address" → ``new_address``; "node" or "privacy" →
+    ``node_status``; "status" → ``tx_status`` (the
     first 64-hex token in the utterance is extracted verbatim, with the
     canned placeholder as fallback); "sign" → ``sign_tx``; "broadcast" →
     ``broadcast_tx``; a send request ("send … to tb1…") → ``create_tx``
@@ -410,6 +455,8 @@ def stub_generate(prompt: str, grammar_text: str | None) -> str:
         return _STUB_UTXOS_ENVELOPE
     if "address" in user_turn:
         return _STUB_NEW_ADDRESS_ENVELOPE
+    if "node" in user_turn or "privacy" in user_turn:
+        return _STUB_NODE_STATUS_ENVELOPE
     if "status" in user_turn:
         hex_match = re.search(r"\b[0-9a-f]{64}\b", utterance)
         if hex_match is None:
@@ -477,6 +524,8 @@ def build_dispatch_table(
     price_oracle: PriceOracle | None = None,
     signer_selection: SignerSelection | None = None,
     signer: Signer | FilePsbtSigner | None = None,
+    settings: Settings | None = None,
+    node_detect_fn: Callable[[], LocalNodeReport] | None = None,
 ) -> DispatchTable:
     """Build the allowlist dispatch table for the running app.
 
@@ -512,6 +561,17 @@ def build_dispatch_table(
             when it IS a :class:`FilePsbtSigner`. Production passes
             ``None`` and lets the handler construct from
             ``signer_selection`` per attempt.
+        settings: Runtime settings, consumed by the ``node_status``
+            handler's detection and backend-mode selection. Defaults to
+            :meth:`Settings.from_env`. The handler passes these SAME
+            settings to :func:`localwallet.node.detect_local_nodes`, so
+            detection honors ``LOCALWALLET_NODE_DETECTION_ENABLED`` and the
+            banner/narration backend mode derives from the same source the
+            chain client uses (ADR-0018).
+        node_detect_fn: Zero-argument callable running the local-node
+            detection pass (test seam). Defaults to
+            :func:`detect_local_nodes` over ``settings`` — advise-only,
+            honors ``node_detection_enabled``, bounded latency (P4-001).
 
     Returns:
         A :class:`~localwallet.protocol.DispatchTable` covering the whole
@@ -522,6 +582,7 @@ def build_dispatch_table(
     # see the SAME dispatcher-owned state machine (never two instances).
     tx_flow = flow if flow is not None else TxFlow()
     send_session = session if session is not None else SendSession()
+    app_settings = settings if settings is not None else Settings.from_env()
     if signer_selection is None:
         env_kind = os.environ.get(SIGNER_ENV_VAR, "").strip().lower()
         signer_selection = SignerSelection(
@@ -557,6 +618,10 @@ def build_dispatch_table(
             tx_flow, client, store, wallet_id
         ),
         IntentName.TX_STATUS: _make_tx_status_handler(client, tx_flow),
+        IntentName.NODE_STATUS: _make_node_status_handler(
+            app_settings,
+            node_detect_fn=node_detect_fn,
+        ),
     }
 
 
@@ -1606,6 +1671,106 @@ def _make_tx_status_handler(client: EsploraClient, flow: TxFlow) -> Handler:
     return handler
 
 
+def _backend_mode(settings: Settings) -> str:
+    """The chain-backend privacy mode (``own_node`` | ``public_api``).
+
+    Derived from the SAME single selection point the chain client uses
+    (ADR-0018 ``ChainConfig.from_settings``): the wallet is on the user's
+    own node exactly when ``Settings.chain_base_url`` is set (the knob that
+    feeds the selection); otherwise the public default serves it. The
+    node_status narration mirrors the :func:`privacy_indicator` banner, so
+    the two can never disagree about which backend is actually in use.
+    """
+    return "own_node" if settings.chain_base_url.strip() else "public_api"
+
+
+def _make_node_status_handler(
+    settings: Settings,
+    *,
+    node_detect_fn: Callable[[], LocalNodeReport] | None = None,
+) -> Handler:
+    """Create the ``node_status`` handler: advise-only node doctor FACTS.
+
+    Runs the local-node detection pass (:func:`detect_local_nodes` — P4-001)
+    and the doctor's recommendation selector (:class:`NodeDoctor`), then
+    returns a dispatcher-owned FACTS dict the narration quotes verbatim.
+    Detection is ADVISE-ONLY: it never executes commands, and the narration
+    never includes cookie contents or any credential material — guidance
+    comes only from the doctor's structured content.
+
+    Two clean states never probe:
+
+    - **Detection disabled** (``settings.node_detection_enabled`` false,
+      LOCALWALLET_NODE_DETECTION_ENABLED=0): the result carries
+      ``detection_state="disabled"`` and no findings — no probing, the
+      agent says so.
+    - **Detection unavailable** (defensive; detection is designed never to
+      raise): ``detection_state="unavailable"``, no fabricated findings.
+
+    The result always carries ``backend_mode`` (``own_node``/``public_api``
+    from the chain-backend selection, :func:`_backend_mode`) so the
+    narration can state "querying your own node" vs "public API" in lockstep
+    with the privacy banner.
+    """
+
+    def handler(envelope: Envelope) -> dict[str, object]:
+        params = envelope.params
+        if not isinstance(params, NodeStatusParams):
+            # Unreachable via validated envelopes; fail closed anyway.
+            return {"error": "internal", "detail": "node_status params shape mismatch"}
+        facts: dict[str, object] = {
+            "backend_mode": _backend_mode(settings),
+            "node_detection_enabled": bool(settings.node_detection_enabled),
+        }
+        if not settings.node_detection_enabled:
+            facts["detection_state"] = NODE_STATUS_DETECTION_DISABLED
+            return facts
+        try:
+            report = (
+                node_detect_fn()
+                if node_detect_fn is not None
+                else detect_local_nodes(settings)
+            )
+        except Exception:  # noqa: BLE001 — containment: detection is designed never to raise; a failure must never leak internals into narration
+            facts["detection_state"] = "unavailable"
+            return facts
+
+        core = report.core
+        core_reachable = any(p.status is NodeStatus.REACHABLE for p in core)
+        core_auth_issue = any(p.status is NodeStatus.AUTH_FAILED for p in core)
+        core_synced = any(
+            p.status is NodeStatus.REACHABLE
+            and p.health is not None
+            and p.health.is_synced
+            for p in core
+        )
+        mempool_reachable = report.mempool is NodeStatus.REACHABLE
+        electrs_reachable = report.electrs is NodeStatus.REACHABLE
+        advice = NodeDoctor().recommend(
+            any_core_reachable=core_reachable,
+            core_synced=core_synced,
+            core_auth_issue=core_auth_issue,
+            indexer_reachable=mempool_reachable or electrs_reachable,
+        )
+        facts.update(
+            {
+                "detection_state": "ran",
+                "core_reachable": core_reachable,
+                "core_synced": core_synced,
+                "core_auth_issue": core_auth_issue,
+                "mempool_reachable": mempool_reachable,
+                "electrs_reachable": electrs_reachable,
+                "doctor_state": advice.state.value,
+                "doctor_headline": advice.headline,
+                "doctor_detail": advice.detail,
+                "doctor_next_step": advice.next_step,
+            }
+        )
+        return facts
+
+    return handler
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Console entry point; delegates to :func:`run`."""
     return run(argv)
@@ -1618,6 +1783,7 @@ def run(
     output_fn: Callable[[str], None] = print,
     flow: TxFlow | None = None,
     generate_fn: GenerateFn | None = None,
+    node_detect_fn: Callable[[], LocalNodeReport] | None = None,
 ) -> int:
     """Wire the application from ``argv``/environment and run the REPL.
 
@@ -1658,6 +1824,11 @@ def run(
             real-clock instance by default).
         generate_fn: A bare ``generate(prompt, grammar) -> str`` model
             callable used as-is when provided (test seam).
+        node_detect_fn: A bare zero-argument callable running the local-node
+            detection pass (test seam), forwarded to the ``node_status``
+            handler. Defaults to the real :func:`detect_local_nodes` over
+            the resolved settings (advise-only; honors
+            LOCALWALLET_NODE_DETECTION_ENABLED).
 
     Returns:
         Process exit code: ``0`` on normal exit (including ``exit``,
@@ -1768,7 +1939,7 @@ def run(
 
     output_fn(_BANNER_TITLE)
     output_fn(_BANNER_TESTNET)
-    output_fn(f"Privacy notice: {PRIVACY_INDICATOR}")
+    output_fn(f"Privacy notice: {privacy_indicator(settings)}")
     output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
     _startup_scan(store, client, wallet_row, rescan_requested=args.rescan, output_fn=output_fn)
@@ -1788,6 +1959,8 @@ def run(
         fee_estimator=fee_estimator,
         price_oracle=price_oracle,
         signer_selection=signer_selection,
+        settings=settings,
+        node_detect_fn=node_detect_fn,
     )
     loop = AgentLoop(generate, table)
 
@@ -2078,6 +2251,8 @@ def _print_turn(turn: AgentTurnResult, output_fn: Callable[[str], None]) -> None
         _print_broadcast_tx(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.TX_STATUS:
         _print_tx_status(turn.result or {}, output_fn)
+    elif envelope.intent is IntentName.NODE_STATUS:
+        _print_node_status(turn.result or {}, output_fn)
     else:  # pragma: no cover — closed intent enum
         output_fn(sanitize_tool_output(_GENERIC_FAILURE))
 
@@ -2424,3 +2599,53 @@ def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], No
         output_fn(sanitize_tool_output(message))
         return
     output_fn(sanitize_tool_output("In mempool (unconfirmed)."))
+
+
+def _print_node_status(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+    """Narrate a ``node_status`` outcome from the dispatcher-owned FACTS.
+
+    Every printed value comes verbatim from the handler result dict (the
+    advise-only detection + doctor content) — the UI computes nothing and
+    the narration never includes cookie contents or credential material.
+    """
+    if result.get("error") is not None:
+        output_fn(sanitize_tool_output(_error_line(result, "Node status lookup failed")))
+        return
+    backend = result.get("backend_mode")
+    if backend == "own_node":
+        output_fn(sanitize_tool_output("You are querying your own node — lookups stay on this machine."))
+    else:
+        output_fn(sanitize_tool_output("You are querying the public API — the operator can associate queried addresses with your IP."))
+
+    detection_state = result.get("detection_state")
+    if detection_state == NODE_STATUS_DETECTION_DISABLED:
+        output_fn(sanitize_tool_output("Local node detection is disabled (LOCALWALLET_NODE_DETECTION_ENABLED=0) — nothing was probed."))
+        return
+    if detection_state == "unavailable":
+        output_fn(sanitize_tool_output("Local node detection could not run this time."))
+        return
+
+    core_reachable = bool(result.get("core_reachable"))
+    if core_reachable:
+        if result.get("core_synced"):
+            output_fn(sanitize_tool_output("A Bitcoin Core node is reachable and synced."))
+        else:
+            output_fn(sanitize_tool_output("A Bitcoin Core node is reachable but still syncing."))
+    else:
+        output_fn(sanitize_tool_output("No Bitcoin Core node detected."))
+    indexers = []
+    if result.get("mempool_reachable"):
+        indexers.append("mempool")
+    if result.get("electrs_reachable"):
+        indexers.append("electrs")
+    if indexers:
+        output_fn(sanitize_tool_output(f"Indexer reachable: {', '.join(indexers)}."))
+    else:
+        output_fn(sanitize_tool_output("No local indexer (mempool/electrs) detected."))
+
+    headline = str(result.get("doctor_headline", "")).strip()
+    if headline:
+        output_fn(sanitize_tool_output(f"Doctor: {headline}"))
+    next_step = str(result.get("doctor_next_step", "")).strip()
+    if next_step:
+        output_fn(sanitize_tool_output(f"Guidance: {next_step}"))

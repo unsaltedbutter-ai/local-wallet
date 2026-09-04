@@ -5,8 +5,8 @@ Canonical envelope contract v0 — the model-emitted wire format::
     {"v": 0, "intent": <closed enum>, "params": {...}}
 
 - ``v``: integer, exactly ``0`` (booleans are not integers for this purpose).
-- ``intent``: closed enum — see :class:`IntentName` (eleven members as of the
-  Phase 3 v0 extension; see ``docs/adr/0002-envelope-spec.md``,
+- ``intent``: closed enum — see :class:`IntentName` (twelve members as of
+  the Phase 4 v0 extension; see ``docs/adr/0002-envelope-spec.md``,
   ``docs/adr/0013-confirm-gate.md``).
 - ``params``: REQUIRED object, shape fixed per intent:
   ``respond`` → ``{"text": str, 1..4000 chars}``;
@@ -38,6 +38,9 @@ Canonical envelope contract v0 — the model-emitted wire format::
   because this user/model-supplied value is interpolated into a request
   URL path — the charset check IS the injection guard. The GBNF grammar
   pins the same 64-lowercase-hex shape at decode time.
+  ``node_status`` → ``{}`` exactly — no user-quoted values needed; the
+  handler runs the advise-only node doctor (detect + guidance) and returns
+  the dispatcher-owned FACTS for narration (Phase 4, TCK-P4-003).
 
 Adding enum members and optional params keys is a backward-compatible v0
 extension: previously-valid envelopes remain valid, so ``v`` stays ``0``
@@ -116,6 +119,7 @@ __all__ = [
     "GetUtxosParams",
     "IntentName",
     "NewAddressParams",
+    "NodeStatusParams",
     "RespondParams",
     "SignTxParams",
     "TxStatusParams",
@@ -224,6 +228,13 @@ class IntentName(StrEnum):
     resp. ``SIGNED``) with a matching ``tx_ref``, and broadcast additionally
     requires completed signed-PSBT re-validation at the handler level
     (``localwallet.tx.revalidate``) — a mismatch is a hard stop.
+
+    Phase 4 v0 extension (backward-compatible — see
+    ``docs/adr/0002-envelope-spec.md``): ``node_status`` joins as a
+    read-only intent whose handler runs the advise-only local node doctor
+    (detect + guidance, ``localwallet.node``) and returns dispatcher-owned
+    facts for narration. It carries no user-quoted params — the model emits
+    nothing; the dispatcher owns all data.
     """
 
     RESPOND = "respond"
@@ -237,6 +248,7 @@ class IntentName(StrEnum):
     SIGN_TX = "sign_tx"
     BROADCAST_TX = "broadcast_tx"
     TX_STATUS = "tx_status"
+    NODE_STATUS = "node_status"
 
 
 class BaseParams(BaseModel):
@@ -503,6 +515,16 @@ class TxStatusParams(BaseParams):
     txid: str
 
 
+class NodeStatusParams(BaseParams):
+    """Params for ``node_status``: empty object, reserved for future opts.
+
+    The node doctor needs nothing from the user or the model — detection is
+    entirely dispatcher-owned. The model must emit ``"params": {}`` exactly;
+    any key here is rejected (closed world). Same shape as
+    :class:`GetBalanceParams` / :class:`GetUtxosParams`.
+    """
+
+
 #: Frozen mapping intent name → params model — THE closed world. Intents
 #: outside this registry do not exist: the schema layer rejects them and
 #: the dispatcher refuses them (defense in depth).
@@ -526,6 +548,7 @@ INTENT_REGISTRY: Mapping[IntentName, type[BaseParams]] = MappingProxyType(
         IntentName.SIGN_TX: SignTxParams,
         IntentName.BROADCAST_TX: BroadcastTxParams,
         IntentName.TX_STATUS: TxStatusParams,
+        IntentName.NODE_STATUS: NodeStatusParams,
     }
 )
 
@@ -553,6 +576,7 @@ class Envelope(BaseModel):
         | SignTxParams
         | BroadcastTxParams
         | TxStatusParams
+        | NodeStatusParams
     )
 
     @model_validator(mode="before")
@@ -562,7 +586,8 @@ class Envelope(BaseModel):
 
         pydantic's smart union cannot disambiguate an empty ``params``
         object across the empty-params intents (``get_balance``,
-        ``get_utxos``, ``get_history``, ``new_address`` without keys): it
+        ``get_utxos``, ``get_history``, ``new_address``, ``node_status``
+        without keys): it
         would bind ``{}`` to whichever matching model comes first, and the
         pairing cross-check below would then reject a perfectly valid
         envelope. Instead, this validator looks up the registry entry for

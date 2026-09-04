@@ -402,6 +402,9 @@ ACCEPT = [
     '{"v":0,"intent":"tx_status","params":{"txid":"' + "a" * 64 + '"}}',
     # whitespace around tokens in the new branches too
     '{\n "v" : 0 ,\n "intent" : "tx_status" ,\n "params" : { "txid" : "' + "b" * 64 + '" }\n}',
+    # ---- Phase 4 (TCK-P4-003): node_status drift pin (empty params)
+    '{"v":0,"intent":"node_status","params":{}}',
+    '{\n "v" : 0 ,\n "intent" : "node_status" ,\n "params" : { }\n}',
 ]
 
 REJECT = [
@@ -515,6 +518,13 @@ REJECT = [
     '{"v":0,"intent":"tx_status","params":{"txid":"' + "a" * 64 + '","verbose":true}}',
     "tx_status with tx_ref key (intent->params coupling)",
     '{"v":0,"intent":"tx_status","params":{"tx_ref":"abc"}}',
+    # ---- Phase 4 (TCK-P4-003): node_status drift pins
+    "node_status params extra key (closed world: {} exactly)",
+    '{"v":0,"intent":"node_status","params":{"verbose":true}}',
+    "node_status params text key (intent->params coupling)",
+    '{"v":0,"intent":"node_status","params":{"text":"x"}}',
+    "node_status params refresh key",
+    '{"v":0,"intent":"node_status","params":{"refresh":1}}',
 ]
 
 
@@ -571,6 +581,7 @@ def test_grammar_parses_without_unsupported_constructs(matcher: GbnfMatcher):
         "broadcast_tx",
         "tx_status",
         "hex_txid",
+        "node_status",
         "string",
         "ws",
     }
@@ -591,6 +602,7 @@ def test_grammar_intent_branches_cover_the_closed_enum(matcher: GbnfMatcher):
         "sign_tx",
         "broadcast_tx",
         "tx_status",
+        "node_status",
     ):
         assert f'"{intent}"' in text
 
