@@ -13,6 +13,7 @@ from localwallet.chain.esplora import (
     TipBlock,
     balance_from_utxos,
 )
+from localwallet.chain.eta import EtaEstimate, estimate_eta
 from localwallet.chain.fees import FeeEstimate, FeeEstimator, FeeTarget
 from localwallet.chain.price import (
     ConfigDisabled,
@@ -33,6 +34,7 @@ __all__ = [
     "ChainError",
     "ConfigDisabled",
     "EsploraClient",
+    "EtaEstimate",
     "FeeEstimate",
     "FeeEstimator",
     "FeeTarget",
@@ -44,5 +46,6 @@ __all__ = [
     "TipBlock",
     "WatchedTx",
     "balance_from_utxos",
+    "estimate_eta",
     "time_since_last_block",
 ]

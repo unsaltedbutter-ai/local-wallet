@@ -30,11 +30,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Final
 
 from localwallet.agent.context import render_facts, sanitize_tool_output
 from localwallet.agent.prompt import build_system_prompt
 from localwallet.agent.runtime import GenerateFn, ModelRuntime
+from localwallet.agent.session import (
+    SessionSummary,
+    export_transcript,
+    render_summary,
+)
 from localwallet.protocol import (
     ClarifyParams,
     DispatchTable,
@@ -46,6 +52,8 @@ from localwallet.protocol import (
 
 __all__ = [
     "MAX_HISTORY_TURNS",
+    "MAX_RECENT_TURNS",
+    "MAX_SUMMARY_CHARS",
     "MAX_TURNS_PER_REQUEST",
     "AgentLoop",
     "AgentTurnResult",
@@ -59,9 +67,19 @@ __all__ = [
 #: guarantees termination regardless of protocol settings.
 MAX_TURNS_PER_REQUEST: Final[int] = 6
 
-#: Conversation history cap. Oldest turns are dropped; summarization
-#: replaces this in Phase 5 (PROJECT.md §7.1 / R13).
+#: Recent conversation turns kept VERBATIM. Older turns are folded into a
+#: deterministic, value-free structured summary (R13, ADR-0020) so a long
+#: multi-topic session stays inside the context budget — summarization
+#: replaces plain drop-oldest (Phase 5).
 MAX_HISTORY_TURNS: Final[int] = 20
+
+#: Alias matching the session-module budget name (:mod:`localwallet.agent.session`).
+MAX_RECENT_TURNS: Final[int] = MAX_HISTORY_TURNS
+
+#: Hard cap on the rendered session-summary block, in characters (the
+#: canonical definition lives in :mod:`localwallet.agent.session`; re-exported
+#: here so the loop and its callers share one budget).
+MAX_SUMMARY_CHARS: Final[int] = 400
 
 #: User-facing escalation when the model could not produce a valid
 #: envelope after the allowed retry. Plain string; no model call, and no
@@ -160,6 +178,10 @@ class AgentLoop:
         self._table = table
         self._max_turns = max_turns_per_request
         self._history: list[ConversationTurn] = []
+        #: Deterministic, value-free summary of turns older than the recent
+        #: window (R13, ADR-0020). Built ONLY from dispatcher-owned state
+        #: (intent names + counters) — never model-generated, never persisted.
+        self._summary = SessionSummary()
 
     # ------------------------------------------------------------ history
 
@@ -178,14 +200,64 @@ class AgentLoop:
         self.prune()
 
     def prune(self) -> None:
-        """Cap the history at :data:`MAX_HISTORY_TURNS`, dropping oldest.
+        """Cap the history at :data:`MAX_HISTORY_TURNS`, folding the overflow.
 
-        Hook point for Phase 5: summarization can replace the drop-oldest
-        behavior without touching the loop's prompt assembly.
+        Every turn past the verbatim window is folded into the deterministic
+        :class:`~localwallet.agent.session.SessionSummary` (R13) before it is
+        dropped — the summary retains only the turn's *shape* (intent name +
+        counters), never its values, so nothing sensitive is kept and the
+        context stays bounded for a session of any length.
         """
         excess = len(self._history) - MAX_HISTORY_TURNS
         if excess > 0:
+            for turn in self._history[:excess]:
+                self._summary.fold_turn(turn.envelope_json)
             del self._history[:excess]
+
+    # ------------------------------------------------- session context / transcript
+
+    @property
+    def session_summary(self) -> SessionSummary:
+        """The deterministic, value-free summary of older turns (read-only)."""
+        return self._summary
+
+    def record_event(self, label: str, count: int = 1) -> None:
+        """Record a value-free extra counter into the summary (e.g. watch events).
+
+        ``label`` is code-controlled; ``count`` is an integer. Nothing here
+        retains addresses, amounts, or xpubs.
+        """
+        self._summary.record_extra(label, count)
+
+    def context_prompt(self, user_text: str, facts: Mapping[str, object]) -> str:
+        """Assemble the full prompt for ``user_text`` (public, testable).
+
+        Returns exactly what :meth:`run` would hand to the model for a fresh
+        request: system prompt + FACTS block + (summary + recent history) +
+        the user turn. Deterministic given the current session state — used
+        by tests to assert the context stays within budget.
+        """
+        return self._build_prompt(user_text, facts)
+
+    def scrub(self) -> None:
+        """Clear the in-memory transcript and summary entirely (OQ14 ``/scrub``).
+
+        After this call the session context is empty: no recent turns, no
+        summary, no recorded counters. The model's next prompt carries no
+        history. Deterministic UI feature — never a model intent.
+        """
+        self._history.clear()
+        self._summary = SessionSummary()
+
+    def export_transcript(self, path: str | Path) -> int:
+        """Write a redacted transcript of the current session to ``path``.
+
+        Delegates to :func:`localwallet.agent.session.export_transcript`
+        (the ``/export`` CLI command, OQ14). The written file is value-free:
+        addresses, amounts, xpubs/keys, and cookie paths are redacted. Returns
+        the number of lines written; raises :class:`OSError` on write failure.
+        """
+        return export_transcript(self._summary, self._history, path)
 
     # -------------------------------------------------------------- run
 
@@ -241,21 +313,32 @@ class AgentLoop:
     # --------------------------------------------------------- internals
 
     def _build_prompt(self, user_text: str, facts: Mapping[str, object]) -> str:
-        """Assemble system prompt + FACTS block + history + user turn."""
+        """Assemble system prompt + FACTS block + history + user turn.
+
+        History (R13, ADR-0020): a compact, value-free SESSION SUMMARY of
+        the older turns (if any) followed by the verbatim recent window.
+        Both together keep the injected context bounded regardless of session
+        length — only the recent window and the capped summary are injected.
+        """
         parts: list[str] = [build_system_prompt()]
         facts_block = render_facts(facts)
         if facts_block:
             parts.append(facts_block)
-        if self._history:
-            lines = ["CONVERSATION SO FAR (oldest first):"]
-            for turn in self._history:
-                lines.append(f"user: {sanitize_tool_output(turn.user_text)}")
-                assistant = (
-                    turn.envelope_json
-                    if turn.envelope_json is not None
-                    else _NO_ENVELOPE_PLACEHOLDER
-                )
-                lines.append(f"envelope: {assistant}")
+        summary_block = render_summary(self._summary)
+        if summary_block or self._history:
+            lines: list[str] = []
+            if summary_block:
+                lines.append(summary_block)
+            if self._history:
+                lines.append("CONVERSATION SO FAR (oldest first):")
+                for turn in self._history:
+                    lines.append(f"user: {sanitize_tool_output(turn.user_text)}")
+                    assistant = (
+                        turn.envelope_json
+                        if turn.envelope_json is not None
+                        else _NO_ENVELOPE_PLACEHOLDER
+                    )
+                    lines.append(f"envelope: {assistant}")
             parts.append("\n".join(lines))
         parts.append(f"user: {sanitize_tool_output(user_text)}")
         parts.append("envelope:")

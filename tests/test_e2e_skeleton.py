@@ -2276,6 +2276,9 @@ def test_send_flow_handler_result_card_fields(
         "rate_fetched_at",
         "fee_target",
         "expires_in_s",
+        "eta_blocks",
+        "eta_minutes",
+        "eta_wording",
     }
     assert result["recipient"] == SEND_RECIPIENT
     assert result["fee_sats"] == result["vsize"] * result["fee_rate_sat_vb"]
@@ -2286,6 +2289,10 @@ def test_send_flow_handler_result_card_fields(
     assert result["rate_age_s"] == 0
     assert result["fee_target"] == "medium"  # MEDIUM default when omitted
     assert result["expires_in_s"] == 600
+    # Narration-only ETA (TCK-P5-002): MEDIUM base = 6 blocks × 10 min.
+    assert result["eta_blocks"] == 6
+    assert result["eta_minutes"] == 60
+    assert "estimate only" in result["eta_wording"]
     # Flow owns the staged record with identical numbers.
     pending = flow.pending
     assert pending is not None
@@ -2796,6 +2803,35 @@ def test_send_flow_facts_show_remaining_expiry(
     assert flow.state is TxFlowStatus.CONFIRMED
 
 
+def test_send_flow_eta_reaches_card_and_model_facts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-P5-002 (ETA as FACTS): the confirmation card prints the ETA line
+    and the CREATED-turn FACTS carry the narration-only ETA fact for the
+    model (mock path — no network). The ETA is dispatcher-owned and
+    deterministic: MEDIUM base = 6 blocks × 10 min = ~60 min."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    fake = FactsQuotingGenerate(["create", "respond"])
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "whatever", "exit"],
+        ["create", "respond"],
+        generate=fake,
+    )
+
+    joined = "\n".join(outputs)
+    # The confirmation card carries the ETA line (value-free honest wording).
+    assert "ETA: ~60-70 min — estimate only, not a guarantee" in joined
+    # The CREATED-turn FACTS inject the ETA fact so the model can narrate it
+    # verbatim (the card is terminal output the model never sees).
+    assert "pending_tx_eta_minutes: 60" in fake.prompts[1]
+    assert "pending_tx_eta_wording: ~60-70 min — estimate only, not a guarantee" in fake.prompts[1]
+    assert flow.state is TxFlowStatus.CREATED
+
+
 def test_send_flow_reshowed_card_shows_remaining_expiry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2832,6 +2868,70 @@ def test_send_flow_reshowed_card_shows_remaining_expiry(
     assert "Expires: ~10 min" in joined
     assert "Expires: ~1 min" in joined
     assert flow.state is TxFlowStatus.CREATED
+
+
+def test_repl_transcript_export_scrub_commands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """OQ14 (TCK-P5-002): the transcript CLI commands (``/export``, ``/scrub``,
+    ``/help``) are deterministic UI features plumbed through the REPL
+    ``input_fn`` seam — no protocol/model change. The export file is
+    value-free (no addresses)."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    handler = _scan_handler([], utxos_by_addr={})
+    export_path = tmp_path / "transcript.txt"
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", VPUB],
+        monkeypatch,
+        handler,
+        [
+            "give me a new address",
+            f"/export {export_path}",
+            "/scrub",
+            "/help",
+            "exit",
+        ],
+        store_path=store_path,
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    assert "Transcript exported" in joined
+    assert "Transcript cleared." in joined
+    assert "Commands: /export" in joined
+    text = export_path.read_text(encoding="utf-8")
+    assert "local-wallet session export" in text
+    assert "tb1" not in text
+
+
+def test_repl_export_refuses_existing_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """OQ14 (TCK-P5-002): ``/export`` must not silently overwrite an existing
+    file — it refuses with a short value-free message and leaves the original
+    content unchanged."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    handler = _scan_handler([], utxos_by_addr={})
+    existing = tmp_path / "transcript.txt"
+    existing.write_text("ORIGINAL CONTENT", encoding="utf-8")
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", VPUB],
+        monkeypatch,
+        handler,
+        [
+            f"/export {existing}",
+            "exit",
+        ],
+        store_path=store_path,
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    assert "export: file already exists, choose another path" in joined
+    assert "Transcript exported" not in joined
+    assert existing.read_text(encoding="utf-8") == "ORIGINAL CONTENT"
 
 
 # --------------------------------------- send lifecycle (TCK-P3-005)
