@@ -7,7 +7,7 @@ temperature: 0.3
 permission:
   edit: deny
   bash:
-    "*": deny
+    "*": allow
     "git status": allow
     "git diff*": allow
     "git log*": allow
