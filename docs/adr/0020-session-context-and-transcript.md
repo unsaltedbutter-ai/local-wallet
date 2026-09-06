@@ -110,6 +110,16 @@ The model never gains access to a new capability or to any new secret material.
   strings), and cookie paths (`*.cookie`), replaced with stable value-free
   tokens (`<addr>`, `<amount>`, `<key>`, `<cookie-path>`). This is the
   documented set from the ticket.
+- **Redaction set — expanded by TCK-SEC-001 after independent review**
+  (dated 2026-09-06): the set above now additionally covers txids
+  (64-lowercase-hex, `→ <txid>`, matched before the legacy-address pattern
+  to avoid a false base58 match), JSON-keyed amounts (`"amount_sats"` /
+  `"amount_usd"` / `"fee_sats"` numeric values, `→ <amount>`, which the
+  canonical envelope JSON serializes verbatim), and BIP39-shaped seeds
+  (exactly 12 or 24 lowercase letter-only 3-8-char words, `→ <seed>` —
+  over-redaction of an ordinary 12-word lowercase sentence is accepted in
+  the fail-safe direction). Textual amount patterns and the export format
+  are unchanged.
 - **Scrub** (`/scrub`): clears the in-memory transcript and summary entirely
   — after a scrub the model's next prompt carries no history.
 - **Store involvement:** none in this slice (in-memory-only is acceptable

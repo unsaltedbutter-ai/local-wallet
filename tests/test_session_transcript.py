@@ -27,8 +27,20 @@ from localwallet.agent.session import MAX_SUMMARY_CHARS, redact_transcript
 
 
 def _env_json(intent: str) -> str:
-    """A canonical closed-intent envelope JSON document (model-output shape)."""
-    return json.dumps({"v": 0, "intent": intent, "params": {}})
+    """A canonical closed-intent envelope JSON document (model-output shape).
+
+    Realistic params: create/confirm carry ``amount_sats``/``amount_usd``,
+    and ``tx_status`` carries a 64-hex ``txid`` — exactly the shape the
+    security review flagged (raw numeric amounts and txids survive textual
+    redaction). Export/redaction tests must exercise these fields.
+    """
+    params: dict[str, object] = {}
+    if intent in {"create_tx", "confirm_tx"}:
+        params["amount_sats"] = 50000
+        params["amount_usd"] = 25.5
+    if intent == "tx_status":
+        params["txid"] = "a" * 64
+    return json.dumps({"v": 0, "intent": intent, "params": params})
 
 
 def _build_loop() -> AgentLoop:
@@ -169,6 +181,60 @@ class TestRedaction:
         assert "<amount>" in out
         assert "5000" not in out
         assert "satoshis" not in out
+
+    # -- TCK-SEC-001: txids, JSON-keyed amounts, BIP39-shaped seeds ------
+
+    def test_redacts_realistic_envelope_json_amounts(self) -> None:
+        # create_tx envelope carries raw numeric amounts in canonical JSON —
+        # these must be redacted even though no textual "<n> sats" form exists.
+        env = _env_json("create_tx")
+        out = redact_transcript(env)
+        assert "50000" not in out
+        assert "25.5" not in out
+        assert "<amount>" in out
+
+    def test_redacts_realistic_envelope_txid(self) -> None:
+        # tx_status-style 64-lowercase-hex txid survives without a pattern.
+        env = _env_json("tx_status")
+        txid = "a" * 64
+        assert txid in env
+        out = redact_transcript(env)
+        assert txid not in out
+        assert "<txid>" in out
+
+    def test_redacts_64_hex_txid_in_text(self) -> None:
+        txid = "9" * 64  # no '0' digit: would false-match the legacy-address pattern
+        out = redact_transcript(f"broadcast {txid} succeeded")
+        assert "<txid>" in out
+        assert txid not in out
+
+    def test_redacts_12_word_mnemonic(self) -> None:
+        seed = " ".join(["abandon"] * 12)
+        out = redact_transcript(f"my backup phrase: {seed}")
+        assert "<seed>" in out
+        assert "abandon" not in out
+
+    def test_redacts_24_word_mnemonic(self) -> None:
+        seed = " ".join(["zoo"] * 24)
+        out = redact_transcript(f"wallet seed: {seed}")
+        assert "<seed>" in out
+        assert "zoo" not in out
+
+    def test_normal_sentence_with_digits_not_wholesale_destroyed(self) -> None:
+        # Only pattern-matched spans are redacted; ordinary digits survive.
+        out = redact_transcript("I retried 2 times and 3 errors came up")
+        assert out == "I retried 2 times and 3 errors came up"
+
+    def test_redacts_all_existing_classes_together(self) -> None:
+        text = (
+            f"pay {_VALUE_LINE} using key {_XPUB} cookie {_COOKIE_PATH}"
+            f" tx {'b' * 64} seed: {' '.join(['cherry'] * 12)}"
+        )
+        out = redact_transcript(text)
+        for token in ("<addr>", "<amount>", "<key>", "<cookie-path>", "<txid>", "<seed>"):
+            assert token in out
+        for needle in ("tb1", "sats", "vpub", ".cookie", "b" * 64, "cherry"):
+            assert needle not in out
 
 
 class TestExport:

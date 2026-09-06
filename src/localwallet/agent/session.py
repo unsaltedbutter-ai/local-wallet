@@ -32,8 +32,9 @@ Transcript management (OQ14)
 ----------------------------
 - **Export**: render the session transcript to plain text with sensitive
   material **redacted** (see :data:`REDACTION` for the exact set —
-  addresses, amounts, xpub/keys, cookie paths). Value-free export: the
-  written file carries no addresses, amounts, or xpubs.
+  addresses, amounts, txids, xpub/keys, cookie paths, seed phrases).
+  Value-free export: the written file carries no addresses, amounts,
+  txids, or xpubs.
 - **Scrub**: clear the in-memory transcript/summary entirely.
 
 These are deterministic UI features exposed as CLI commands (``/export``,
@@ -84,20 +85,43 @@ _FLOW_INTENTS: Final[frozenset[str]] = frozenset(
 #: matched over the raw transcript text and replaced with a value-free token.
 #: Applied in order; the set is deliberately narrow and documented:
 #:
-#: 1. **Addresses** — testnet/mainnet bech32 (``tb1``/``bc1``/``bcrt1``)
+#: 1. **txids** — 64-lowercase-hex transaction ids, redacted as ``<txid>``.
+#:    Matched first: a 64-hex string containing no ``0`` digit can
+#:    false-match the looser base58 legacy-address pattern below (the bech32
+#:    pattern is prefix-anchored, so unaffected), so txids must win that race.
+#: 2. **JSON-context amounts** — the canonical envelope key:value pairs
+#:    ``"amount_sats":<n>`` / ``"amount_usd":<n[.dd]>`` / ``"fee_sats":<n>``,
+#:    redacted as ``<amount>``. Placed before the legacy-address pattern for
+#:    the same 64-hex-race reason, and before the loose textual amount
+#:    patterns.
+#: 3. **Addresses** — testnet/mainnet bech32 (``tb1``/``bc1``/``bcrt1``)
 #:    and common legacy prefixes, redacted as ``<addr>``.
-#: 2. **XPUBs / keys** — extended public (and any) key strings
+#: 4. **XPUBs / keys** — extended public (and any) key strings
 #:    (``xpub/ypub/zpub/tpub/upub/vpub`` and ``xprv/...``) redacted as
 #:    ``<key>``. (xprv material is refused at the gate; redacted here too
 #:    for defense in depth.)
-#: 3. **Cookie paths** — any path ending in ``.cookie`` (Bitcoin Core RPC
+#: 5. **BIP39-shaped seeds** — exactly 12 or exactly 24 whitespace-separated
+#:    lowercase letter-only words (each 3-8 chars), redacted as ``<seed>``.
+#:    A seed phrase pasted into chat is the same class of secret as an xprv
+#:    (defensively redacted). Over-redaction of an ordinary 12-word lowercase
+#:    sentence is ACCEPTABLE (fail-safe direction) and preferred over leaking
+#:    a seed.
+#: 6. **Cookie paths** — any path ending in ``.cookie`` (Bitcoin Core RPC
 #:    cookie), redacted as ``<cookie-path>``.
-#: 4. **Amounts** — ``<n> sats`` / ``<n> satoshis`` figures, ``$<n>`` USD
-#:    figures, and ``<n> BTC``-denominated figures, redacted as ``<amount>``.
+#: 7. **Amounts (textual)** — ``<n> sats`` / ``<n> satoshis`` figures,
+#:    ``$<n>`` USD figures, and ``<n> BTC``-denominated figures, redacted as
+#:    ``<amount>``.
 #:
-#: Ordering matters (addresses/keys are matched before the looser amount
-#: patterns). The tokens are stable and value-free.
+#: Ordering matters (txids/JSON amounts are matched before the address
+#: patterns; seeds after addresses/keys). The tokens are stable and value-free.
 _REDACTIONS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
+    (re.compile(r"\b[0-9a-f]{64}\b"), "<txid>"),
+    (
+        re.compile(
+            r'"(?:amount_sats|amount_usd|fee_sats)":\s*\d+(?:\.\d+)?'
+        ),
+        "<amount>",
+    ),
     (
         re.compile(
             r"\b(?:tb1|bc1|bcrt1)[0-9a-z]{25,}\b"
@@ -109,6 +133,13 @@ _REDACTIONS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
     (
         re.compile(r"\b(?:[xytuv]pub|xprv|tprv|yprv|zprv|vprv|uprv)[1-9A-HJ-NP-Za-km-z]{50,}\b"),
         "<key>",
+    ),
+    (
+        re.compile(
+            r"\b(?:(?:[a-z]{3,8}\s+){23}[a-z]{3,8}"
+            r"|(?:[a-z]{3,8}\s+){11}[a-z]{3,8})\b"
+        ),
+        "<seed>",
     ),
     (re.compile(r"\S*\.cookie\b"), "<cookie-path>"),
     (
@@ -123,19 +154,23 @@ _REDACTIONS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
 
 #: Documented redaction set (exported for tests / ADR cross-reference).
 REDACTION: Final[tuple[str, ...]] = (
+    "txids",
+    "json-keyed amounts",
     "addresses",
-    "amounts",
     "xpub/keys",
+    "BIP39-shaped seeds",
     "cookie paths",
+    "textual amounts",
 )
 
 
 def redact_transcript(text: str) -> str:
     """Return ``text`` with sensitive material redacted (value-free export).
 
-    Applies the :data:`REDACTION` set in order: addresses, xpub/key
-    material, cookie paths, then amounts. Output contains no addresses,
-    amounts, or xpubs — only stable ``<...>`` tokens. Deterministic.
+    Applies the :data:`REDACTION` set in order: txids, JSON-context
+    amounts, addresses, xpub/key material, BIP39-shaped seeds, cookie
+    paths, then textual amounts. Output contains no addresses, amounts,
+    txids, or xpubs — only stable ``<...>`` tokens. Deterministic.
     """
     out = text
     for pattern, token in _REDACTIONS:
