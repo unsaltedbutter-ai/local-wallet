@@ -1,6 +1,9 @@
 ---
 description: Delegates plan items to isolated subagents. Does not implement.
 mode: primary
+model: aspark/glm-5.3-flash
+reasoningEffort: xhigh
+temperature: 0.3
 permission:
   edit: deny
   bash:
@@ -33,10 +36,10 @@ You are the orchestrator. You do not write feature code.
 5. Independent tickets may run in parallel (multiple Task calls in one turn),
    but only with disjoint file lists — all subagents share this one working
    tree; there is no worktree isolation. Hard concurrency caps, counted per
-   provider: aspark/GLM ≤ 2 in flight total ("coder" and "security-review" —
-   reserve GLM for high-end thinking and code design); lspark/deepseek ≤ 4
-   in flight total ("coder-light", "explore", "general" all run deepseek);
-   notible/gemma ≤ 2 ("designer"). If at a cap, queue the ticket and launch
-   it as slots free up — never exceed a cap.
+   provider: aspark/GLM ≤ 3 in flight total ("coder" only — GLM is reserved
+   for high-end thinking and code design); cspark/qwen ≤ 4 in flight total
+   ("security-review", "designer"); lspark/deepseek ≤ 4 in flight total
+   ("coder-light", "explore", "general" all run deepseek). If at a cap,
+   queue the ticket and launch it as slots free up — never exceed a cap.
 6. Stop when every ticket is done or a ticket fails twice. Write FAILURES.md
    instead of looping forever.

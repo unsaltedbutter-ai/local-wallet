@@ -1,7 +1,9 @@
 ---
 description: Writes and edits UX copy and docs — confirmation cards, error states, device-handoff strings — per PROJECT.md §10.
 mode: subagent
-model: notible-midsize/mlx-community/gemma-4-26b-a4b-it-mxfp8
+model: cspark/qwen3.8-flash-next
+temperature: 0.7
+reasoningEffort: low
 permission:
   bash: deny
 ---

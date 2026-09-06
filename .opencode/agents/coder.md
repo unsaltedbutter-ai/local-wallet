@@ -1,7 +1,9 @@
 ---
 description: Implements complex/money-path tickets (protocol, wallet, tx, chain, signer). Use for hard code.
 mode: subagent
-model: aspark/GLM-5.3-Flash
+model: aspark/glm-5.3-flash
+temperature: 0
+reasoningEffort: high
 ---
 
 You are the senior implementation agent for local-wallet. You receive one ticket at a time and implement exactly that — no scope expansion.
