@@ -16,6 +16,25 @@ not copy this pattern into ``src/``.
 There is nothing sensitive here: we download public GGUF weights and record
 their SHA-256 digests. Nothing is logged beyond file names and byte counts.
 
+TOKEN SUPPORT
+-------------
+The default sources in ``manifest.json`` are the **ungated** ``unsloth``
+mirrors and need NO token. However, the official ``google/gemma-4-*-it-GGUF``
+repos are **gated** on Hugging Face: they require license acceptance and a
+user token (HTTP 401 without one). To download from those official repos,
+pass ``--hf-token <token>`` on the command line or set ``HF_TOKEN`` in the
+environment; the value is sent only as an ``Authorization: Bearer <token>``
+header and is NEVER printed, logged, or embedded in any error message.
+
+Redirect behavior: Hugging Face's ``resolve`` endpoint 302-redirects to HF's
+own CDN (e.g. ``*.cdn.hf.co``). ``urllib`` forwards the ``Authorization``
+header on the redirect. That is acceptable here: the redirect target is
+Hugging Face's own object store for the exact same object, so the token is
+not leaked to a third party. (``urllib`` only forwards headers to
+same-host redirects by default; HF's redirect host differs, but in practice
+HF signs the CDN URL and the token is not required at the CDN. The header
+forwarding is harmless.)
+
 Behavior
 --------
 * Reads ``models/manifest.json``: a JSON list of entries with ``name``, ``url``,
@@ -41,6 +60,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -49,6 +69,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / "manifest.json"
 CHUNK = 1 << 20  # 1 MiB
+HF_TOKEN_ENV = "HF_TOKEN"
 
 
 # --------------------------------------------------------------------------- #
@@ -99,29 +120,31 @@ def sha256_of(path: Path) -> str:
 # --------------------------------------------------------------------------- #
 # download
 # --------------------------------------------------------------------------- #
-def _open_request(url: str, range_start: int | None):
+def _open_request(url: str, range_start: int | None, token: str | None = None):
     headers = {}
     if range_start:
         headers["Range"] = f"bytes={range_start}-"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
     return urllib.request.urlopen(req, timeout=60)
 
 
-def download(url: str, part: Path, dest: Path) -> None:
+def download(url: str, part: Path, dest: Path, token: str | None = None) -> None:
     """Download ``url`` into ``part`` (resumable), then move to ``dest``."""
     existing = part.stat().st_size if part.exists() else 0
 
     if existing > 0:
         print(f"resuming from {existing} bytes")
         try:
-            resp = _open_request(url, existing)
+            resp = _open_request(url, existing, token)
         except urllib.error.HTTPError as exc:
             # 416 Range Not Satisfiable: our .part is >= the whole file.
             # Treat as corrupt and restart cleanly.
             if exc.code == 416:
                 print(f"range rejected (416); restarting download for {part.name}")
                 part.unlink()
-                resp = _open_request(url, None)
+                resp = _open_request(url, None, token)
                 mode = "wb"
             else:
                 raise
@@ -135,7 +158,7 @@ def download(url: str, part: Path, dest: Path) -> None:
                 part.unlink()
                 mode = "wb"
     else:
-        resp = _open_request(url, None)
+        resp = _open_request(url, None, token)
         mode = "wb"
 
     with part.open(mode) as fh:
@@ -181,7 +204,7 @@ def cmd_check(entries: list[dict], name: str, out: Path) -> int:
 
 
 def cmd_install(entries: list[dict], name: str, out: Path,
-                write_hash: bool) -> int:
+                write_hash: bool, token: str | None = None) -> int:
     entry = find_entry(entries, name)
     url = entry["url"]
     expected = entry.get("sha256")
@@ -189,7 +212,7 @@ def cmd_install(entries: list[dict], name: str, out: Path,
     part = out / f"{name}.gguf.part"
 
     out.mkdir(parents=True, exist_ok=True)
-    download(url, part, dest)
+    download(url, part, dest, token)
 
     actual = sha256_of(dest)
     size = dest.stat().st_size
@@ -238,7 +261,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "back into manifest.json (also bootstraps null hashes)")
     p.add_argument("--check", action="store_true",
                    help="verify existing file against the manifest; no download")
+    p.add_argument("--hf-token", default=None,
+                   help="Hugging Face token for gated official repos "
+                        "(falls back to HF_TOKEN env var). Never logged. "
+                        "Ungated unsloth mirrors (the default) need no token.")
     return p
+
+
+def resolve_token(args_token: str | None) -> str | None:
+    """Return the effective HF token (CLI arg wins over env) or None.
+
+    The value is used only as an Authorization header and is never printed.
+    """
+    return args_token if args_token is not None else os.environ.get(HF_TOKEN_ENV)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -247,7 +282,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         return cmd_check(entries, args.model, args.out)
-    return cmd_install(entries, args.model, args.out, args.write_hash)
+
+    token = resolve_token(args.hf_token)
+    return cmd_install(entries, args.model, args.out, args.write_hash, token)
 
 
 if __name__ == "__main__":

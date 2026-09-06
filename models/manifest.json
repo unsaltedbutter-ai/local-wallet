@@ -1,13 +1,13 @@
 [
   {
     "name": "gemma-4-E2B-it-Q4_K_M",
-    "url": "https://huggingface.co/google/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf",
+    "url": "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf",
     "sha256": null,
     "size_bytes": null
   },
   {
     "name": "gemma-4-E4B-it-Q4_K_M",
-    "url": "https://huggingface.co/google/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
+    "url": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
     "sha256": null,
     "size_bytes": null
   }

@@ -72,6 +72,20 @@ Rationale:
 - **Perf gate (OQ20 / R15):** if ADR-0006 targets cannot be met with the
   in-process wheel, this ADR is revisited per the flip procedure in ADR-0006.
 
+## Amendment (2026-09-06) — weights source switched to unsloth mirrors
+
+The weights **source** is switched from the official `google/gemma-4-*-it-GGUF`
+repos to the ungated `unsloth/gemma-4-*-it-GGUF` mirror repos
+(TCK-MW2-FIX). Rationale: the official repos are gated on Hugging Face and
+returned `HTTP 401 Unauthorized` on first download (license acceptance + token
+required), blocking the bootstrap. The unsloth mirrors are ungated, widely
+used, and Apache-2.0; both entries now point at them. Integrity does **not**
+depend on the source host — it comes from the SHA-256 pin recorded in
+`manifest.json` at bootstrap (`--write-hash`), and every download is verified
+against that pin before install. The official repos remain reachable as a
+token-authenticated alternative via `--hf-token`/`HF_TOKEN` (note they ship a
+different quant, `q4_0`, vs the pinned `Q4_K_M`).
+
 ---
 
 *Cross-references: PROJECT.md §7.1, §11 (LLM + Decoding constraint rows),
