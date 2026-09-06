@@ -330,6 +330,17 @@ OUT_OF_WINDOW_NOTICE: Final[str] = (
     "recommended; say 'rescan' is not available yet, restart with --rescan"
 )
 
+#: TCK-SEC-002 truncation surfacing: appended to the scan/rescan narration
+#: ONLY when ``summary.truncated`` (any branch hit the absolute window
+#: ceiling). Value-free — no addresses, amounts, or indices; the only
+#: quantitative reference is the documented ``window cap`` constant. Calm
+#: tone + a rescan/config nudge, mirroring :data:`OUT_OF_WINDOW_NOTICE`.
+TRUNCATION_NOTICE: Final[str] = (
+    "note: the address window cap was reached — usage may exist beyond it "
+    "and newer transactions may not be included; consider rescanning or "
+    "raising the window cap"
+)
+
 _BANNER_TITLE: Final[str] = (
     "local-wallet — watch-only Bitcoin wallet (testnet, Phase 1 wallet engine)"
 )
@@ -2026,6 +2037,15 @@ def _make_watch_probe(
     the total received to the wallet's addresses (verbatim tool output);
     ``confirmed`` is the transaction's height presence.
 
+    Truncation (TCK-SEC-002): the probe's ``scan_fn`` return value — a full
+    :class:`ScanSummary` that may carry ``truncated`` — is deliberately
+    DISCARDED here. Background watch narration surfaces incoming events
+    only; it never renders a scan summary, so the truncation notice belongs
+    to explicit scan/rescan narration and cannot spam every poll tick. This
+    is the simplest no-spam option: the flag is simply never consumed on
+    the watch path (a persistent condition is already surfaced by the
+    explicit-scan narration the user can trigger).
+
     Network only via ``scan_fn``/the chain client — this function itself
     performs no I/O.
     """
@@ -2406,7 +2426,21 @@ def _startup_scan(
     output_fn(
         f"Startup scan complete: {summary.utxo_count} UTXOs · "
         f"tip height {summary.tip_height}."
+        f"{_truncation_notice(summary)}"
     )
+
+
+def _truncation_notice(summary: wallet_scan.ScanSummary) -> str:
+    """One-line truncation notice, or ``""`` when the scan was not truncated.
+
+    Consumes ``summary.truncated`` (TCK-SEC-002) so an attacker-driven
+    scan/rescan that hit the absolute window ceiling is NEVER silent to the
+    user. Value-free and calm; returns ``""`` when ``truncated`` is False so
+    the non-truncated narration stays byte-identical to the pre-change text.
+    """
+    if not summary.truncated:
+        return ""
+    return " " + TRUNCATION_NOTICE
 
 
 def _rescan_summary_line(summary: wallet_scan.ScanSummary) -> str:
@@ -2419,6 +2453,7 @@ def _rescan_summary_line(summary: wallet_scan.ScanSummary) -> str:
     return (
         f"Rescan complete: {branches} · {summary.utxo_count} UTXOs · "
         f"tip height {summary.tip_height}"
+        f"{_truncation_notice(summary)}"
     )
 
 

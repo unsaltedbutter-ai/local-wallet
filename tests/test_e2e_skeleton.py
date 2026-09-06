@@ -33,6 +33,7 @@ import os
 import re
 import sys
 from collections.abc import Callable
+from dataclasses import asdict
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Final
@@ -1682,6 +1683,180 @@ def test_rescan_flag_repairs_stale_cache(
     assert "Balance (testnet): 50000 sats (confirmed) + 0 sats (unconfirmed)" in joined
     # The out-of-window warning stays cleared: usage stayed inside the window.
     assert "usage was found beyond your usual address window" not in joined
+
+
+# ------------------------------------------------- TCK-SEC-002b narration
+
+
+def _make_scan_summary(*, truncated: bool) -> app_module.wallet_scan.ScanSummary:
+    """A ScanSummary shaped like the rescan fixtures above (branch 0 used
+    through index 0, branch 1 unused), optionally flagged truncated."""
+    BS = app_module.wallet_scan.BranchScanSummary
+    return app_module.wallet_scan.ScanSummary(
+        wallet_id=1,
+        gap_limit=20,
+        tip_height=870000,
+        scanned_at="2026-08-31T00:00:00+00:00",
+        branches={
+            0: BS(
+                branch=0,
+                scanned=3,
+                window_last_index=2,
+                max_used_index=0,
+                next_index=1,
+                used_indices=(0,),
+                truncated=truncated,
+            ),
+            1: BS(
+                branch=1,
+                scanned=2,
+                window_last_index=1,
+                max_used_index=-1,
+                next_index=0,
+                used_indices=(),
+                truncated=False,
+            ),
+        },
+        utxo_count=1,
+        truncated=truncated,
+    )
+
+
+def test_rescan_summary_line_byte_identical_when_not_truncated() -> None:
+    """TCK-SEC-002b: non-truncated narration is byte-identical to the
+    pre-change text — no truncation notice is appended."""
+    summary = _make_scan_summary(truncated=False)
+    line = app_module._rescan_summary_line(summary)
+    assert line == (
+        "Rescan complete: branch 0: scanned 3, max used 0, next index 1 · "
+        "branch 1: scanned 2, max used -1, next index 0 · 1 UTXOs · "
+        "tip height 870000"
+    )
+    assert app_module._truncation_notice(summary) == ""
+
+
+def test_rescan_summary_line_appends_truncation_notice_when_truncated() -> None:
+    """TCK-SEC-002b: a truncated rescan appends the value-free window-cap
+    notice; the counts-only body is unchanged."""
+    summary = _make_scan_summary(truncated=True)
+    line = app_module._rescan_summary_line(summary)
+    assert line.startswith(
+        "Rescan complete: branch 0: scanned 3, max used 0, next index 1 · "
+        "branch 1: scanned 2, max used -1, next index 0 · 1 UTXOs · "
+        "tip height 870000 "
+    )
+    assert app_module.TRUNCATION_NOTICE in line
+
+
+def test_truncation_notice_is_value_free() -> None:
+    """TCK-SEC-002b: the notice carries no addresses, amounts, or indices —
+    no digits at all — and cites the cap only as the documented "window cap"
+    constant reference, nudging a rescan/config review in the narration tone."""
+    notice = app_module.TRUNCATION_NOTICE
+    assert not any(ch.isdigit() for ch in notice)
+    assert "window cap" in notice
+    assert "rescan" in notice
+
+
+def test_startup_scan_line_byte_identical_when_not_truncated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-SEC-002b: non-truncated startup-scan narration is byte-identical
+    to the pre-change text (period, no notice appended)."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    outputs: list[str] = []
+    with Store(store_path) as store:
+        wallet = store.get_wallet_by_name("default")
+        assert wallet is not None
+        monkeypatch.setattr(
+            app_module.wallet_scan,
+            "scan_wallet",
+            lambda store, client, wallet: _make_scan_summary(truncated=False),
+        )
+        app_module._startup_scan(
+            store, None, wallet, rescan_requested=False, output_fn=outputs.append
+        )
+    assert outputs == ["Startup scan complete: 1 UTXOs · tip height 870000."]
+
+
+def test_startup_scan_appends_truncation_notice_when_truncated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-SEC-002b: a truncated startup scan appends the notice to the
+    normal startup narration."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    outputs: list[str] = []
+    with Store(store_path) as store:
+        wallet = store.get_wallet_by_name("default")
+        assert wallet is not None
+        monkeypatch.setattr(
+            app_module.wallet_scan,
+            "scan_wallet",
+            lambda store, client, wallet: _make_scan_summary(truncated=True),
+        )
+        app_module._startup_scan(
+            store, None, wallet, rescan_requested=False, output_fn=outputs.append
+        )
+    assert len(outputs) == 1
+    assert outputs[0].startswith(
+        "Startup scan complete: 1 UTXOs · tip height 870000."
+    )
+    assert app_module.TRUNCATION_NOTICE in outputs[0]
+
+
+def test_watch_probe_discards_truncated_scan_summary(tmp_path: Path) -> None:
+    """TCK-SEC-002b: the background-watch probe never consumes the scan
+    summary — its ``truncated`` flag is ignored on the watch path — so the
+    truncation notice cannot spam every poll tick. It belongs to explicit
+    scan/rescan narration only (see ``_make_watch_probe`` docstring)."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    with Store(store_path) as store:
+        wallet = store.get_wallet_by_name("default")
+        assert wallet is not None
+        addr = derive_addresses(parse_watch_key(VPUB), 0, 0, 1)[0].address
+        store.upsert_txs(
+            [
+                TxRecord(
+                    wallet_id=wallet.id,
+                    txid="cc" * 32,
+                    height=800_000,
+                    block_time=1_700_000_000,
+                    fee_sats=1000,
+                    direction="in",
+                    raw_summary=None,
+                )
+            ]
+        )
+        store.replace_utxos_for_wallet(
+            wallet.id,
+            [
+                UtxoRecord(
+                    wallet_id=wallet.id,
+                    txid="cc" * 32,
+                    vout=0,
+                    address=addr,
+                    value_sats=50_000,
+                    confirmed=1,
+                    height=800_000,
+                )
+            ],
+        )
+        probe = app_module._make_watch_probe(
+            store, wallet.id, lambda: _make_scan_summary(truncated=True)
+        )
+        events = probe()
+    # The probe surfaces incoming events only; the truncated scan summary
+    # (and its notice) is discarded — nothing to spam on repeated polls.
+    assert any(e.incoming for e in events)
+    assert all(
+        app_module.TRUNCATION_NOTICE not in v
+        for e in events
+        for v in asdict(e).values()
+        if isinstance(v, str)
+    )
 
 
 def test_out_of_window_warning_printed_from_sync_state(
