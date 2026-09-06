@@ -35,6 +35,8 @@ from localwallet.agent.loop import (
     AgentLoop,
     AgentTurnStatus,
 )
+
+_NO_ENVELOPE_PLACEHOLDER: Final[str] = "(no envelope: the user was asked to rephrase)"
 from localwallet.protocol import DispatchTable, Envelope, IntentName
 
 # ---------------------------------------------------------------- constants
@@ -286,6 +288,46 @@ class TestContainment:
 
 
 class TestHistory:
+    def test_reinjected_envelope_json_is_sanitized(self) -> None:
+        """B5-L1 sanitize symmetry (TCK-SEC-004 change 2): the validated
+        envelope JSON re-injected as history passes the SAME sanitizer as
+        the sibling user-text injections — control (Cc) and format (Cf)
+        characters are stripped at the re-injection point."""
+        loop = AgentLoop(ScriptedGenerate([]), make_table())
+        # Raw history entry carrying Cc (\u0007 bell) and Cf (\u202e bidi
+        # override, U+200B zero-width) characters inside a param value.
+        raw_envelope = (
+            '{"v": 0, "intent": "respond", '
+            '"params": {"text": "a\u0007b\u202ec\u200bd"}}'
+        )
+        loop.add_turn("hello", raw_envelope)
+
+        prompt = loop.context_prompt("next question", {})
+
+        assert (
+            'envelope: {"v": 0, "intent": "respond", "params": {"text": "abcd"}}'
+            in prompt
+        )
+        # No control/format character survives into the prompt.
+        assert "\u0007" not in prompt
+        assert "\u202e" not in prompt
+        assert "\u200b" not in prompt
+        # The stored history keeps the raw envelope (sanitization is at the
+        # re-injection point, matching the user-text injection pattern).
+        assert loop.history[0].envelope_json == raw_envelope
+
+    def test_reinjected_envelope_placeholder_and_json_shape_preserved(self) -> None:
+        """Sanitization must not mangle a clean envelope's JSON shape, and
+        the no-envelope placeholder still renders."""
+        loop = AgentLoop(ScriptedGenerate([]), make_table())
+        loop.add_turn("q1", RESPOND_JSON)
+        loop.add_turn("q2", None)
+
+        prompt = loop.context_prompt("q3", {})
+
+        assert f"envelope: {RESPOND_JSON}" in prompt
+        assert f"envelope: {_NO_ENVELOPE_PLACEHOLDER}" in prompt
+
     def test_ok_run_is_recorded_and_reused(self) -> None:
         gen = ScriptedGenerate([RESPOND_JSON, RESPOND_JSON])
         loop = AgentLoop(gen, make_table())

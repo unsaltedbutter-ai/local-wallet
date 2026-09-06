@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from embit.transaction import Transaction
 
 _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
@@ -313,8 +314,28 @@ def test_backoff_delay_is_bounded_exponential_with_jitter():
 
 # --------------------------------------------------- broadcast (TCK-P3-004)
 
-TX_HEX = "0200" + "ab" * 31  # 64 hex chars, even length — guard-valid body
-BROADCAST_TXID = "c" * 64
+#: A REAL (embit-parseable) minimal transaction: version 2, one input
+#: spending an all-zero prevout with an empty scriptSig at sequence
+#: 0xfffffffe, one 1000-sat OP_RETURN output, locktime 0. broadcast_tx
+#: computes the EXPECTED txid from this serialization (embit
+#: ``Transaction.txid()``) and binds the backend's response to it, so the
+#: fixture must be a parseable transaction — charset validity alone is no
+#: longer sufficient (TCK-SEC-004 change 1).
+_BROADCAST_TX = Transaction.parse(
+    bytes.fromhex(
+        "0200000001"
+        + "00" * 32  # prevout txid
+        + "00000000"  # prevout vout
+        + "00"  # empty scriptSig
+        + "feffffff"  # sequence
+        + "01"  # output count
+        + "e803000000000000"  # 1000 sats
+        + "016a"  # OP_RETURN
+        + "00000000"  # locktime
+    )
+)
+TX_HEX = _BROADCAST_TX.serialize().hex()
+BROADCAST_TXID = _BROADCAST_TX.txid().hex()
 
 
 def test_broadcast_tx_happy_path():
@@ -421,6 +442,54 @@ def test_broadcast_tx_response_txid_is_revalidated():
         assert TX_HEX not in message
         for fragment in ("<html>", '{"txid"'):
             assert fragment not in message
+
+
+def test_broadcast_tx_refuses_well_formed_wrong_txid():
+    """TXID BINDING (TCK-SEC-004 change 1): a misbehaving backend must not
+    be able to hand back a DIFFERENT well-formed 64-hex txid — the response
+    is bound to the txid computed from the transaction we actually sent.
+    The refusal is value-free (neither txid nor tx hex echoed)."""
+    server = ScriptedServer(httpx.Response(200, text="e" * 64))
+    with server.client() as client, pytest.raises(ChainError) as excinfo:
+        client.broadcast_tx(TX_HEX)
+    message = str(excinfo.value)
+    assert "does not match the broadcast transaction" in message
+    assert "broadcast" in message
+    # value-free: neither the wrong txid, the expected txid, nor the hex
+    assert "e" * 64 not in message
+    assert BROADCAST_TXID not in message
+    assert TX_HEX not in message
+    assert len(server.requests) == 1  # the POST itself succeeded (2xx)
+
+
+def test_broadcast_tx_binding_accepts_the_exact_computed_txid():
+    """The bound path: the response txid equal to the embit-computed txid
+    of the sent serialization is accepted verbatim."""
+    server = ScriptedServer(httpx.Response(200, text=BROADCAST_TXID))
+    with server.client() as client:
+        assert client.broadcast_tx(TX_HEX) == BROADCAST_TXID
+
+
+def test_broadcast_tx_expected_txid_strips_witness_data():
+    """The expected txid must be the CONSENSUS txid (witness-stripped), not
+    the wtxid: for a segwit transaction, a naive sha256d of the witness-
+    inclusive serialization differs — embit's ``txid()`` is what binds."""
+    import hashlib
+
+    from embit.transaction import Witness
+
+    segwit = Transaction.parse(bytes.fromhex(TX_HEX))
+    segwit.vin[0].witness = Witness([b"\x51", b"\x02" * 33])
+    assert segwit.is_segwit
+    txid = segwit.txid().hex()
+    naive_wtxid = hashlib.sha256(
+        hashlib.sha256(segwit.serialize()).digest()
+    ).digest()[::-1].hex()
+    assert txid != naive_wtxid  # the fixture genuinely exercises stripping
+
+    server = ScriptedServer(httpx.Response(200, text=txid))
+    with server.client() as client:
+        assert client.broadcast_tx(segwit.serialize().hex()) == txid
 
 
 # ------------------------------------------------ tx status (TCK-P3-004)

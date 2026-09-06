@@ -72,7 +72,6 @@ import localwallet.app as app_module
 from localwallet.signer import SignedResult
 from localwallet.tx.flow import GateDecision, TxFlow, TxFlowStatus
 from tests.test_e2e_skeleton import (
-    BROADCAST_TXID,
     SEND_RECIPIENT,
     SEND_UTXO,
     FactsQuotingGenerate,
@@ -80,6 +79,7 @@ from tests.test_e2e_skeleton import (
     _extract_signed_tx,
     _FakeDeviceClient,
     _fixture_parsed,
+    _flow_txid,
     _run_send_repl,
     _send_chain_handler,
     _simulate_device_sign,
@@ -96,8 +96,9 @@ from tests.test_e2e_skeleton import (
 #: dispatcher/tool-owned — never model-invented.
 SEND_AMOUNT_SATS: Final[int] = 60_000
 
-#: The txid the mock broadcast POST returns (chain-owner value, quoted
-#: verbatim in status FACTS — see BROADCAST_TXID in test_e2e_skeleton).
+#: The txid the mock broadcast POST returns is COMPUTED from the posted
+#: transaction (honest-backend echo; TCK-SEC-004 change 1) — assertions
+#: derive it via :func:`_flow_txid` / ``_extract_signed_tx``.
 #: Status serves a confirmed-at-height-870001 payload for it.
 STATUS_HEIGHT: Final[int] = 870_001
 
@@ -243,7 +244,11 @@ def test_ac1_tampered_psbt_caught_before_broadcast_at_wiring_level(
         )
     )
     assert broadcast["status"] == "broadcast"
-    assert broadcast["txid"] == BROADCAST_TXID
+    # The recorded txid is the one COMPUTED from the signed transaction we
+    # actually broadcast (TCK-SEC-004 change 1 binding).
+    assert broadcast["txid"] == _extract_signed_tx(
+        signer.signed_psbts[1]
+    ).txid().hex()
     assert flow.state is TxFlowStatus.BROADCAST
     # Exactly one POST, carrying the re-validated (honest) transaction.
     posts = state["broadcast_posts"]
@@ -313,11 +318,12 @@ def test_ac2_full_lifecycle_file_signer_production_path(
     assert "integrity not verified" not in joined  # sidecar present
     # Broadcast: single POST with the re-validated tx; status confirmed.
     assert len(state["broadcast_posts"]) == 1
-    assert f"Sent! txid {BROADCAST_TXID} — tracking…" in joined
+    expected_txid = _flow_txid(flow)
+    assert f"Sent! txid {expected_txid} — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
     assert f"Confirmed at height {STATUS_HEIGHT}." in joined
     # The status turn quoted broadcast_txid from the FACTS (production path).
-    assert f"broadcast_txid: {BROADCAST_TXID}" in fake.prompts[5]
+    assert f"broadcast_txid: {expected_txid}" in fake.prompts[5]
     # Store history row: outbound, unconfirmed, the approved fee.
     store_path = tmp_path / "store.db"
     from localwallet.store import Store
@@ -327,10 +333,10 @@ def test_ac2_full_lifecycle_file_signer_production_path(
         assert wallet_row is not None
         rows = store.get_txs_for_wallet(wallet_row.id)
         assert [(r.txid, r.height, r.direction) for r in rows] == [
-            (BROADCAST_TXID, None, "out")
+            (expected_txid, None, "out")
         ]
     # History narration shows the outbound row.
-    assert f"tx {BROADCAST_TXID[:12]}… out unconfirmed" in joined
+    assert f"tx {expected_txid[:12]}… out unconfirmed" in joined
 
 
 # --------------------------------------------------------------------------
@@ -457,7 +463,7 @@ def test_ac3_device_absent_and_locked_guidance_then_retry(
     # the error phase (a failed sign preserves CONFIRMED; the next sign needs
     # it to proceed).
     assert "Signed and verified ✓" in joined
-    assert f"Sent! txid {BROADCAST_TXID} — tracking…" in joined
+    assert f"Sent! txid {_flow_txid(flow)} — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
     # Exact state-machine sequence across the turns (preservation invariant).
     assert seen == [
@@ -545,7 +551,7 @@ def test_ac3_broadcast_5xx_then_retry(
         "transaction is kept; say 'broadcast' to retry." in joined
     )
     # Retry succeeds; exactly one POST per attempt in total.
-    assert f"Sent! txid {BROADCAST_TXID} — tracking…" in joined
+    assert f"Sent! txid {_flow_txid(flow)} — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
     assert len(state["broadcast_posts"]) == 2
 

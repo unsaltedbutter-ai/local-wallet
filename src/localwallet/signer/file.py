@@ -66,6 +66,16 @@ _REF_ALNUM_ASCII = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 #: below unbounded transfer-file sizes.
 _MAX_PSBT_TEXT_CHARS = 200_000
 
+#: Byte-size ceiling applied at ``stat()`` time, BEFORE any read (TCK-SEC-004
+#: change 3): a multi-GB planted file must be refused without ever being
+#: read into memory. The allowance covers ADR-0014 trailing whitespace and
+#: encoding overhead between the byte count on disk and the character count
+#: of the stripped base64 text; the EXACT character-level ceiling
+#: (:data:`_MAX_PSBT_TEXT_CHARS`, applied to the stripped text) is
+#: re-checked after the bounded read — this byte gate is a memory guard,
+#: not the semantic ceiling.
+_MAX_PSBT_FILE_BYTES = _MAX_PSBT_TEXT_CHARS + 4096
+
 #: Signer identifier reported in SignedResult (ADR-0014).
 _SIGNER_NAME = "file"
 
@@ -277,6 +287,16 @@ class FilePsbtSigner:
                 raise SignerError(
                     "file reference does not match the expected transaction"
                 )
+
+        # Container-size gate at stat() time (TCK-SEC-004 change 3): the file
+        # size is bounded BEFORE any byte is read, so an oversized planted
+        # file can never spike memory on the money path. Value-free.
+        try:
+            file_size = path.stat().st_size
+        except OSError as exc:
+            raise SignerError("could not read the signed file") from exc
+        if file_size > _MAX_PSBT_FILE_BYTES:
+            raise SignerError("signed file exceeds the maximum container size")
 
         try:
             data = path.read_bytes()

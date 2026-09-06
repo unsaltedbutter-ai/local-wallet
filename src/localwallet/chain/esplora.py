@@ -49,6 +49,7 @@ from types import TracebackType
 from typing import Any, Self
 
 import httpx
+from embit.transaction import Transaction
 
 from localwallet.chain.config import ChainConfig
 from localwallet.config import Settings
@@ -476,6 +477,17 @@ class EsploraClient:
         whitespace-padded junk, an HTML error page) is a :class:`ChainError`,
         so a caller can never record a bogus id as broadcast.
 
+        TXID BINDING (TCK-SEC-004 change 1): the EXPECTED txid is computed
+        from ``tx_hex`` itself BEFORE the request is sent, by parsing the
+        serialization with embit and calling ``Transaction.txid()`` — which
+        implements the consensus txid definition (witness data stripped; a
+        naive ``sha256d`` of the witness-INCLUSIVE serialization would yield
+        the wtxid, not the txid). The response txid is then BOUND to the
+        transaction we actually sent: a well-formed but different txid (a
+        misbehaving backend) is refused with a value-free :class:`ChainError`
+        so a caller can never record/narrate a txid that is not this
+        transaction's.
+
         NO-RETRY DECISION (deliberate, TCK-P3-004): a POST is not
         idempotent. If a broadcast actually reached the server but the
         response was lost, an automatic retry would broadcast a second
@@ -502,11 +514,23 @@ class EsploraClient:
             response (64 lowercase hex, whitespace-stripped).
 
         Raises:
-            ChainError: malformed argument, any non-2xx status (single
-                attempt, no retries), transport failure, or a response
-                body that does not re-validate as a txid.
+            ChainError: malformed argument, a ``tx_hex`` that does not parse
+                as a transaction, any non-2xx status (single attempt, no
+                retries), transport failure, a response body that does not
+                re-validate as a txid, or a well-formed response txid that
+                does not match the broadcast transaction.
         """
         _validate_tx_hex(tx_hex)
+        # Compute the expected txid from the serialization BEFORE anything
+        # is sent (fail fast — an unparseable transaction never reaches the
+        # network). embit's ``txid()`` strips witness data per the consensus
+        # txid definition; the hex form is lowercase by construction.
+        try:
+            expected_txid = Transaction.parse(bytes.fromhex(tx_hex)).txid().hex()
+        except Exception as exc:  # containment: embit parse errors vary
+            raise ChainError(
+                f"{_KIND_BROADCAST} invalid transaction hex: not a parseable transaction"
+            ) from exc
         url = f"{self._base_url}/tx"
         try:
             response = self._client.post(
@@ -521,6 +545,15 @@ class EsploraClient:
         reported = response.text.strip()
         if len(reported) != _TXID_LENGTH_CHARS or not set(reported) <= _TXID_CHARSET:
             raise ChainError(f"{_KIND_BROADCAST} response was not a valid transaction id")
+        # Bind the reported txid to the transaction we actually sent
+        # (TCK-SEC-004 change 1). Both sides are lowercase hex here (the
+        # charset contract above; ``txid().hex()`` by construction), so a
+        # direct comparison is the case-insensitive-safe check. Value-free
+        # detail: neither txid is echoed.
+        if reported != expected_txid:
+            raise ChainError(
+                f"{_KIND_BROADCAST} response txid does not match the broadcast transaction"
+            )
         return reported
 
     def get_tx_status(self, txid: str) -> TxStatus:

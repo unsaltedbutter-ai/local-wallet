@@ -175,7 +175,8 @@ __all__ = [
     "NODE_STATUS_DETECTION_DISABLED",
     "OUT_OF_WINDOW_NOTICE",
     "PRIVACY_INDICATOR",
-    "PRIVACY_INDICATOR_OWN_NODE",
+    "PRIVACY_INDICATOR_OWN_NODE_LOCAL",
+    "PRIVACY_INDICATOR_OWN_NODE_REMOTE",
     "SIGNER_DIR_ENV_VAR",
     "SIGNER_ENV_VAR",
     "ZPUB_ENV_VAR",
@@ -225,39 +226,101 @@ _NEVER_CONFIRMED: Final[int] = 2**63 - 1
 
 #: The §9 honest privacy indicator, shown verbatim at startup (PROJECT.md
 #: §9 / R7 — never over-claim privacy while querying a public explorer).
-#: This is the PUBLIC-API wording: when the chain backend is the user's own
-#: node (``Settings.chain_base_url`` set, ADR-0018) the banner instead shows
-#: :data:`PRIVACY_INDICATOR_OWN_NODE`, selected by :func:`privacy_indicator`
-#: off the same single selection point the chain client uses.
+#: This is the PUBLIC-API wording (3-state banner, TCK-SEC-004 change 5):
+#: when the chain backend is the user's own node the banner instead shows
+#: :data:`PRIVACY_INDICATOR_OWN_NODE_LOCAL` (loopback host) or
+#: :data:`PRIVACY_INDICATOR_OWN_NODE_REMOTE` (any other configured host),
+#: selected by :func:`privacy_indicator` off the same single selection
+#: point the chain client uses.
 PRIVACY_INDICATOR: Final[str] = (
     "Querying public mempool.space — the operator can associate queried "
     "addresses with your IP."
 )
 
-#: The §9 privacy indicator for the self-hosted/own-node backend (ADR-0018:
-#: ``Settings.chain_base_url`` set ⇒ all chain lookups go to the configured
-#: instance, none to the public default).
-PRIVACY_INDICATOR_OWN_NODE: Final[str] = (
-    "Querying your own node — addresses and lookups stay on this machine."
+#: The §9 privacy indicator for a self-hosted backend on THIS machine
+#: (ADR-0018: ``Settings.chain_base_url`` set to a loopback host ⇒ all
+#: chain lookups go to the user's own node, none to the public default).
+PRIVACY_INDICATOR_OWN_NODE_LOCAL: Final[str] = (
+    "Querying your own node on this machine — addresses and lookups stay here."
 )
+
+#: The §9 privacy indicator for a self-hosted backend on ANOTHER machine
+#: (LAN/VPS instance): still the user's own node — but the R7 no-over-claim
+#: rule forbids saying lookups "stay on this machine".
+PRIVACY_INDICATOR_OWN_NODE_REMOTE: Final[str] = (
+    "Querying your own node on another machine — nothing goes to a public API."
+)
+
+#: The 3-way chain-backend privacy mode (TCK-SEC-004 change 5), returned by
+#: :func:`_backend_mode` and carried verbatim in the ``node_status`` FACTS.
+BACKEND_MODE_PUBLIC: Final[str] = "public"
+BACKEND_MODE_OWN_NODE_LOCAL: Final[str] = "own_node_local"
+BACKEND_MODE_OWN_NODE_REMOTE: Final[str] = "own_node_remote"
+
+#: Hosts that count as "the user's own node on this machine" — mirrors the
+#: intent of ``node/detect.py`` ``_LOOPBACK_HOSTS`` (that helper cannot be
+#: imported with its httpx dependency into this network-import-free module,
+#: so the set is mirrored here; keep the two in sync).
+_LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "localhost", "::1"})
+
+#: The ``node_status`` narration predicates (TCK-SEC-004 change 5, approved
+#: copy) — "You are " + one of these, mirroring the banner's 3-way split.
+#: The public wording is unchanged from the pre-change narration.
+_NODE_STATUS_PUBLIC: Final[str] = (
+    "You are querying the public API — the operator can associate queried "
+    "addresses with your IP."
+)
+_NODE_STATUS_OWN_NODE_LOCAL: Final[str] = (
+    "You are querying your own node on this machine — addresses and lookups "
+    "stay here."
+)
+_NODE_STATUS_OWN_NODE_REMOTE: Final[str] = (
+    "You are querying your own node on another machine — nothing goes to a "
+    "public API."
+)
+
+
+def _configured_url_host(url: str) -> str | None:
+    """Host of a ``scheme://host[:port]/…`` URL, parsed at string level.
+
+    This module must not import network libraries (urllib/httpx are
+    lint-banned outside ``chain/`` and the node doctor), so the host is
+    extracted with plain string surgery: scheme split, path/query/fragment
+    and userinfo dropped, IPv6 literal de-bracketed, port dropped. Returns
+    ``None`` when no host is parseable. Never raises; value-free.
+    """
+    rest = url.split("://", 1)[1] if "://" in url else url
+    rest = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" in rest:
+        rest = rest.rsplit("@", 1)[1]
+    if rest.startswith("["):
+        end = rest.find("]")
+        host = rest[1:end] if end != -1 else rest[1:]
+        return host or None
+    host = rest.split(":", 1)[0]
+    return host or None
 
 
 def privacy_indicator(settings: Settings) -> str:
     """Return the §9 privacy banner for the given backend selection.
 
     The wording is gated on the SAME single selection point the chain
-    client uses (ADR-0018 ``ChainConfig.from_settings``): when
-    ``Settings.chain_base_url`` is set the wallet is on the user's own node
-    and the indicator reflects that; otherwise the honest public-API
-    wording applies. Reading the knob here — rather than re-hardcoding a
-    public default — keeps the banner and the node_status narration from
-    ever diverging from what the client actually uses.
+    client uses (ADR-0018 ``ChainConfig.from_settings``) and classifies the
+    configured backend three ways (TCK-SEC-004 change 5): the public
+    default, the user's own node on this machine (loopback host), or the
+    user's own node on another machine. The 3-way split keeps the banner
+    honest for a remote LAN/VPS instance — "addresses and lookups stay on
+    this machine" would over-claim there (R7). Reading the knob here —
+    rather than re-hardcoding a public default — keeps the banner and the
+    node_status narration from ever diverging from what the client actually
+    uses.
     """
-    return (
-        PRIVACY_INDICATOR_OWN_NODE
-        if settings.chain_base_url.strip()
-        else PRIVACY_INDICATOR
-    )
+    mode = _backend_mode(settings)
+    if mode == BACKEND_MODE_OWN_NODE_LOCAL:
+        return PRIVACY_INDICATOR_OWN_NODE_LOCAL
+    if mode == BACKEND_MODE_OWN_NODE_REMOTE:
+        return PRIVACY_INDICATOR_OWN_NODE_REMOTE
+    return PRIVACY_INDICATOR
 
 #: ADR-0009 UI surfacing for ``sync_state["out_of_window_detected"]``:
 #: printed at startup when the store carries a non-empty warning payload.
@@ -1758,16 +1821,31 @@ def _make_tx_status_handler(client: EsploraClient, flow: TxFlow) -> Handler:
 
 
 def _backend_mode(settings: Settings) -> str:
-    """The chain-backend privacy mode (``own_node`` | ``public_api``).
+    """The chain-backend privacy mode — 3-way (TCK-SEC-004 change 5).
 
     Derived from the SAME single selection point the chain client uses
-    (ADR-0018 ``ChainConfig.from_settings``): the wallet is on the user's
-    own node exactly when ``Settings.chain_base_url`` is set (the knob that
-    feeds the selection); otherwise the public default serves it. The
-    node_status narration mirrors the :func:`privacy_indicator` banner, so
-    the two can never disagree about which backend is actually in use.
+    (ADR-0018 ``ChainConfig.from_settings``):
+
+    - :data:`BACKEND_MODE_PUBLIC` — no ``Settings.chain_base_url``: the
+      public explorer serves the lookups (R7 honesty: its operator can
+      associate queried addresses with the user's IP).
+    - :data:`BACKEND_MODE_OWN_NODE_LOCAL` — a configured URL whose host is
+      loopback: the user's own node on this machine.
+    - :data:`BACKEND_MODE_OWN_NODE_REMOTE` — any other configured host
+      (LAN/VPS instance): still the user's own node, but NOT on this
+      machine, so copy must not claim lookups "stay on this machine".
+
+    The node_status narration and the watch-mode line mirror this function,
+    so neither can disagree with the privacy banner about which backend is
+    actually in use.
     """
-    return "own_node" if settings.chain_base_url.strip() else "public_api"
+    configured = settings.chain_base_url.strip()
+    if not configured:
+        return BACKEND_MODE_PUBLIC
+    host = _configured_url_host(configured)
+    if host is not None and host.lower() in _LOOPBACK_HOSTS:
+        return BACKEND_MODE_OWN_NODE_LOCAL
+    return BACKEND_MODE_OWN_NODE_REMOTE
 
 
 def _make_node_status_handler(
@@ -1793,10 +1871,11 @@ def _make_node_status_handler(
     - **Detection unavailable** (defensive; detection is designed never to
       raise): ``detection_state="unavailable"``, no fabricated findings.
 
-    The result always carries ``backend_mode`` (``own_node``/``public_api``
-    from the chain-backend selection, :func:`_backend_mode`) so the
-    narration can state "querying your own node" vs "public API" in lockstep
-    with the privacy banner.
+    The result always carries ``backend_mode`` (the 3-way classification
+    from the chain-backend selection, :func:`_backend_mode`:
+    ``public``/``own_node_local``/``own_node_remote``) so the narration can
+    state "querying the public API" vs "your own node on this machine" vs
+    "your own node on another machine" in lockstep with the privacy banner.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -1910,6 +1989,21 @@ def _narrate_incoming_event(
     if suffix:
         line = f"{line} · {suffix}"
     return line
+
+
+def _watch_mode_fragment(mode: str) -> str:
+    """The watch-startup line's backend fragment, mirroring the banner.
+
+    Approved copy (TCK-SEC-004 change 5): ``the public API`` /
+    ``your own node on this machine`` / ``your own node on another
+    machine`` — the same three-way honesty split as
+    :func:`privacy_indicator` and the node_status narration.
+    """
+    return {
+        BACKEND_MODE_PUBLIC: "the public API",
+        BACKEND_MODE_OWN_NODE_LOCAL: "your own node on this machine",
+        BACKEND_MODE_OWN_NODE_REMOTE: "your own node on another machine",
+    }[mode]
 
 
 def _make_watch_probe(
@@ -2207,7 +2301,7 @@ def run(
             ),
             interval_s=settings.watch_interval_s,
         )
-        watch_mode = "your own node" if _backend_mode(settings) == "own_node" else "the public API"
+        watch_mode = _watch_mode_fragment(_backend_mode(settings))
         output_fn(
             f"Background watch: on — checks up to every "
             f"{settings.watch_interval_s:g}s against {watch_mode} "
@@ -2757,8 +2851,17 @@ def _print_confirmation_card(
     from ``result["recipient"]`` (tool-output verbatim rule); the USD
     segment appears only when the handler supplied ``usd_cents``, with
     the rate age and the stale marker when present.
+
+    Absent numeric keys render an explicit ``unavailable`` marker — never a
+    fabricated value (SR-006 class, TCK-SEC-004 change 4; the same failure
+    class removed for ``tip_height`` in :func:`_print_balance`): a missing
+    ``amount_sats``/``fee_sats``/``vsize``/``inputs_count``/``expires_in_s``
+    must not print as "0".
     """
-    amount_line = f"Amount: {result.get('amount_sats', 0)} sats"
+    if "amount_sats" in result:
+        amount_line = f"Amount: {result['amount_sats']} sats"
+    else:
+        amount_line = "Amount: unavailable"
     usd_cents = result.get("usd_cents")
     if isinstance(usd_cents, int):
         amount_line += f" (${usd_cents // 100}.{usd_cents % 100:02d}"
@@ -2770,19 +2873,33 @@ def _print_confirmation_card(
         amount_line += ")"
     output_fn(sanitize_tool_output(amount_line))
     output_fn(sanitize_tool_output(f"To: {result.get('recipient', '')}"))
-    output_fn(
-        sanitize_tool_output(
-            f"Fee: {result.get('fee_sats', 0)} sats "
-            f"({result.get('fee_rate_sat_vb', 0)} sat/vB, {result.get('fee_target', '')} target)"
-        )
-    )
-    output_fn(sanitize_tool_output(f"Size: {result.get('vsize', 0)} vB"))
-    output_fn(sanitize_tool_output(f"Inputs: {result.get('inputs_count', 0)}"))
+    if "fee_sats" in result:
+        fee_line = f"Fee: {result['fee_sats']} sats"
+        fee_parts: list[str] = []
+        if "fee_rate_sat_vb" in result:
+            fee_parts.append(f"{result['fee_rate_sat_vb']} sat/vB")
+        if "fee_target" in result:
+            fee_parts.append(f"{result['fee_target']} target")
+        if fee_parts:
+            fee_line += f" ({', '.join(fee_parts)})"
+    else:
+        fee_line = "Fee: unavailable"
+    output_fn(sanitize_tool_output(fee_line))
+    if "vsize" in result:
+        output_fn(sanitize_tool_output(f"Size: {result['vsize']} vB"))
+    else:
+        output_fn(sanitize_tool_output("Size: unavailable"))
+    if "inputs_count" in result:
+        output_fn(sanitize_tool_output(f"Inputs: {result['inputs_count']}"))
+    else:
+        output_fn(sanitize_tool_output("Inputs: unavailable"))
     change = result.get("change_sats")
     change_label = f"Change: {change} sats" if change is not None else "Change: none"
     output_fn(sanitize_tool_output(change_label))
-    expires_in_s = result.get("expires_in_s", 0)
-    output_fn(sanitize_tool_output(f"Expires: ~{int(expires_in_s) // 60} min"))
+    if "expires_in_s" in result:
+        output_fn(sanitize_tool_output(f"Expires: ~{int(result['expires_in_s']) // 60} min"))
+    else:
+        output_fn(sanitize_tool_output("Expires: unavailable"))
     eta_wording = result.get("eta_wording")
     if isinstance(eta_wording, str) and eta_wording:
         output_fn(sanitize_tool_output(f"ETA: {eta_wording}"))
@@ -2964,10 +3081,12 @@ def _print_node_status(result: Mapping[str, object], output_fn: Callable[[str], 
         output_fn(sanitize_tool_output(_error_line(result, "Node status lookup failed")))
         return
     backend = result.get("backend_mode")
-    if backend == "own_node":
-        output_fn(sanitize_tool_output("You are querying your own node — lookups stay on this machine."))
+    if backend == BACKEND_MODE_OWN_NODE_LOCAL:
+        output_fn(sanitize_tool_output(_NODE_STATUS_OWN_NODE_LOCAL))
+    elif backend == BACKEND_MODE_OWN_NODE_REMOTE:
+        output_fn(sanitize_tool_output(_NODE_STATUS_OWN_NODE_REMOTE))
     else:
-        output_fn(sanitize_tool_output("You are querying the public API — the operator can associate queried addresses with your IP."))
+        output_fn(sanitize_tool_output(_NODE_STATUS_PUBLIC))
 
     detection_state = result.get("detection_state")
     if detection_state == NODE_STATUS_DETECTION_DISABLED:

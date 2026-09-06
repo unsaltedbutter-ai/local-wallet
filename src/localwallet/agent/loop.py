@@ -338,7 +338,13 @@ class AgentLoop:
                         if turn.envelope_json is not None
                         else _NO_ENVELOPE_PLACEHOLDER
                     )
-                    lines.append(f"envelope: {assistant}")
+                    # B5-L1 sanitize symmetry: the re-injected envelope JSON
+                    # passes through the SAME sanitizer as the sibling
+                    # user-text injections (control/format characters
+                    # stripped, same length cap). Only safe-by-construction
+                    # before (sole producer: ``Envelope.model_dump_json()``);
+                    # now uniformly sanitized regardless of producer.
+                    lines.append(f"envelope: {sanitize_tool_output(assistant)}")
             parts.append("\n".join(lines))
         parts.append(f"user: {sanitize_tool_output(user_text)}")
         parts.append("envelope:")

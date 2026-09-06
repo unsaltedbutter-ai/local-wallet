@@ -412,6 +412,31 @@ class TestContainerSizeCeiling:
             signer.import_signed(path)
         assert "maximum container size" in str(exc.value)
 
+    def test_import_giant_file_refused_at_stat_before_any_read(
+        self, signer: FilePsbtSigner, folder: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """TCK-SEC-004 change 3: the size gate fires at ``stat()`` BEFORE any
+        byte is read, so a multi-GB planted file is refused cleanly without
+        ever being read into memory. The file is created SPARSE (seek/
+        truncate — no GBs allocated); ``read_bytes`` is sabotaged to prove
+        the stat-gate path is hit and no read happens."""
+        from localwallet.signer import file as file_module
+
+        path = folder / "localwallet-signed-abc12345.psbt.b64"
+        with open(path, "wb") as fh:
+            fh.seek(file_module._MAX_PSBT_FILE_BYTES)
+            fh.write(b"\0")  # sparse: 1 byte on disk, size over the gate
+        assert path.stat().st_size == file_module._MAX_PSBT_FILE_BYTES + 1
+
+        def _no_read(*args: object, **kwargs: object) -> bytes:
+            msg = "read_bytes must never run for an oversized file"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(Path, "read_bytes", _no_read)
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(path)
+        assert "maximum container size" in str(exc.value)
+
     def test_at_ceiling_passes_the_size_gate(self, signer: FilePsbtSigner):
         """Boundary: a payload of EXACTLY the ceiling gets past the size
         check (it may fail later validation — the size gate itself passed)."""

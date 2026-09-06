@@ -49,10 +49,14 @@ from localwallet.agent.loop import AgentLoop, AgentTurnStatus
 from localwallet.agent.runtime import GenerateFn
 from localwallet.app import (
     AUTO_SCAN_ENV_VAR,
+    BACKEND_MODE_OWN_NODE_LOCAL,
+    BACKEND_MODE_OWN_NODE_REMOTE,
+    BACKEND_MODE_PUBLIC,
     NODE_STATUS_DETECTION_DISABLED,
     OUT_OF_WINDOW_NOTICE,
     PRIVACY_INDICATOR,
-    PRIVACY_INDICATOR_OWN_NODE,
+    PRIVACY_INDICATOR_OWN_NODE_LOCAL,
+    PRIVACY_INDICATOR_OWN_NODE_REMOTE,
     ZPUB_ENV_VAR,
     SendSession,
     build_dispatch_table,
@@ -1371,11 +1375,13 @@ def test_node_status_repl_detects_and_narrates_facts(
 def test_node_status_own_node_narration_and_banner_flip(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """LOCALWALLET_CHAIN_BASE_URL set ⇒ own-node banner AND narration.
+    """LOCALWALLET_CHAIN_BASE_URL set to a LOOPBACK host ⇒ own-node-LOCAL
+    banner, narration, and watch line (TCK-SEC-004 change 5).
 
     The indicator flip derives from the same chain-backend selection the
-    client uses (ADR-0018), so banner and node_status narration must both
-    reflect own-node mode and the public wording must be absent.
+    client uses (ADR-0018), so banner, node_status narration, and the
+    background-watch line must all reflect own-node-local mode and the
+    public wording must be absent.
     """
     code, outputs, detect_calls = _run_node_repl(
         monkeypatch,
@@ -1387,10 +1393,97 @@ def test_node_status_own_node_narration_and_banner_flip(
     assert code == 0
     assert len(detect_calls) == 1
     joined = "\n".join(outputs)
-    assert PRIVACY_INDICATOR_OWN_NODE in joined
+    # Banner: approved LOCAL wording, verbatim.
+    assert PRIVACY_INDICATOR_OWN_NODE_LOCAL in joined
     assert PRIVACY_INDICATOR not in joined  # public wording flipped away
-    assert "You are querying your own node" in joined
+    assert PRIVACY_INDICATOR_OWN_NODE_REMOTE not in joined
+    # node_status narration: approved LOCAL predicate, verbatim.
+    assert (
+        "You are querying your own node on this machine — addresses and "
+        "lookups stay here." in joined
+    )
     assert "You are querying the public API" not in joined
+    # Watch line mirrors the same state.
+    assert "against your own node on this machine" in joined
+    assert "against the public API" not in joined
+
+
+def test_node_status_remote_own_node_narration_and_banner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """LOCALWALLET_CHAIN_BASE_URL pointing at a NON-loopback host (LAN/VPS)
+    ⇒ own-node-REMOTE wording everywhere (TCK-SEC-004 change 5, R7
+    no-over-claim): the banner must NOT claim lookups "stay on this
+    machine", and nothing may claim the public API either."""
+    code, outputs, _detect_calls = _run_node_repl(
+        monkeypatch,
+        tmp_path,
+        detect_report=_core_ready_report(),
+        chain_base_url="http://192.168.1.50:3006",
+    )
+
+    assert code == 0
+    joined = "\n".join(outputs)
+    # Banner: approved REMOTE wording, verbatim.
+    assert PRIVACY_INDICATOR_OWN_NODE_REMOTE in joined
+    assert PRIVACY_INDICATOR not in joined
+    assert PRIVACY_INDICATOR_OWN_NODE_LOCAL not in joined
+    # node_status narration: approved REMOTE predicate, verbatim.
+    assert (
+        "You are querying your own node on another machine — nothing goes "
+        "to a public API." in joined
+    )
+    assert "You are querying the public API" not in joined
+    assert "lookups stay on this machine" not in joined
+    # Watch line mirrors the same state.
+    assert "against your own node on another machine" in joined
+    assert "against the public API" not in joined
+
+
+def test_backend_mode_three_state_classification_and_watch_fragments() -> None:
+    """The 3-way classification (TCK-SEC-004 change 5): no configured URL ⇒
+    public; loopback host ⇒ own_node_local; anything else ⇒
+    own_node_remote. The watch fragments mirror the same three states."""
+    from localwallet.app import _backend_mode, _watch_mode_fragment
+    from localwallet.config import Settings
+
+    assert _backend_mode(Settings()) == BACKEND_MODE_PUBLIC
+    assert (
+        _backend_mode(Settings(chain_base_url="http://127.0.0.1:3006"))
+        == BACKEND_MODE_OWN_NODE_LOCAL
+    )
+    assert (
+        _backend_mode(Settings(chain_base_url="http://localhost:3006"))
+        == BACKEND_MODE_OWN_NODE_LOCAL
+    )
+    assert (
+        _backend_mode(Settings(chain_base_url="http://[::1]:3006"))
+        == BACKEND_MODE_OWN_NODE_LOCAL
+    )
+    assert (
+        _backend_mode(Settings(chain_base_url="  http://127.0.0.1:3006  "))
+        == BACKEND_MODE_OWN_NODE_LOCAL
+    )
+    assert (
+        _backend_mode(Settings(chain_base_url="http://192.168.1.50:3006"))
+        == BACKEND_MODE_OWN_NODE_REMOTE
+    )
+    assert (
+        _backend_mode(
+            Settings(chain_base_url="https://mempool.example.lan:3006/testnet4/api")
+        )
+        == BACKEND_MODE_OWN_NODE_REMOTE
+    )
+
+    assert _watch_mode_fragment(BACKEND_MODE_PUBLIC) == "the public API"
+    assert (
+        _watch_mode_fragment(BACKEND_MODE_OWN_NODE_LOCAL)
+        == "your own node on this machine"
+    )
+    assert (
+        _watch_mode_fragment(BACKEND_MODE_OWN_NODE_REMOTE)
+        == "your own node on another machine"
+    )
 
 
 def test_privacy_indicator_function_selects_wording_from_settings() -> None:
@@ -1399,7 +1492,9 @@ def test_privacy_indicator_function_selects_wording_from_settings() -> None:
 
     assert privacy_indicator(Settings()) == PRIVACY_INDICATOR
     own = Settings(chain_base_url="http://127.0.0.1:3006")
-    assert privacy_indicator(own) == PRIVACY_INDICATOR_OWN_NODE
+    assert privacy_indicator(own) == PRIVACY_INDICATOR_OWN_NODE_LOCAL
+    remote = Settings(chain_base_url="http://192.168.1.50:3006")
+    assert privacy_indicator(remote) == PRIVACY_INDICATOR_OWN_NODE_REMOTE
 
 
 def test_node_status_detection_disabled_does_not_probe(
@@ -1445,7 +1540,7 @@ def test_node_status_handler_facts_shape() -> None:
     envelope = validate_payload({"v": 0, "intent": "node_status", "params": {}})
     result = table[IntentName.NODE_STATUS](envelope)
 
-    assert result["backend_mode"] == "public_api"
+    assert result["backend_mode"] == "public"
     assert result["detection_state"] == "ran"
     assert result["core_reachable"] is True
     assert result["core_synced"] is True
@@ -1479,7 +1574,7 @@ def test_node_status_detection_disabled_facts_state() -> None:
     result = table[IntentName.NODE_STATUS](envelope)
 
     assert result["detection_state"] == NODE_STATUS_DETECTION_DISABLED
-    assert result["backend_mode"] == "public_api"
+    assert result["backend_mode"] == "public"
     assert "core_reachable" not in result  # nothing fabricated
 
 
@@ -1900,9 +1995,18 @@ SEND_UTXO_SMALL: Final[dict[str, Any]] = {
 
 RESPOND_NOTED_JSON: Final[str] = '{"v": 0, "intent": "respond", "params": {"text": "Noted."}}'
 
-#: The txid the mock broadcast endpoint reports (64 lowercase hex); the
-#: status endpoint serves the matching confirmed payload for it.
-BROADCAST_TXID: Final[str] = "ee" * 32
+#: The txid the mock broadcast endpoint reports is COMPUTED from the posted
+#: transaction hex (embit ``txid()`` — TCK-SEC-004 change 1 binds the chain
+#: client's response to the tx actually sent, so the mock backend must
+#: behave like an honest one and echo the posted transaction's txid).
+#: Assertions derive the expected value from the flow's signed record via
+#: :func:`_flow_txid`.
+
+
+def _flow_txid(flow: Any) -> str:
+    """The txid of the flow's signed (re-validated) transaction — what an
+    honest backend echoes back and what the app must record/narrate."""
+    return _extract_signed_tx(flow.signed.psbt_base64).txid().hex()
 
 GET_HISTORY_JSON: Final[str] = '{"v": 0, "intent": "get_history", "params": {}}'
 
@@ -1934,7 +2038,8 @@ def _send_chain_handler(
       endpoints to 500 mid-test;
     - ``state["broadcast_fail"]`` flips the broadcast POST to 500;
     - ``state["broadcast_txid"]`` overrides the txid the POST returns
-      (default ``BROADCAST_TXID``);
+      (default: the txid COMPUTED from the posted transaction — the
+      honest-backend echo the chain client binds to, TCK-SEC-004);
     - ``state["broadcast_posts"]`` records every POST body (single-
       attempt assertions);
     - ``state["status_fail"]`` / ``state["status_404"]`` flip the status
@@ -1962,7 +2067,14 @@ def _send_chain_handler(
             state.setdefault("broadcast_posts", []).append(request.content.decode("ascii"))
             if state.get("broadcast_fail"):
                 return httpx.Response(500, text="boom")
-            return httpx.Response(200, text=state.get("broadcast_txid", BROADCAST_TXID))
+            # Honest-backend behavior (TCK-SEC-004 change 1): echo the txid
+            # COMPUTED from the posted transaction (the chain client binds
+            # the response to it). ``state["broadcast_txid"]`` still
+            # overrides for explicit mismatch tests.
+            from embit.transaction import Transaction as _Tx
+
+            posted_txid = _Tx.parse(bytes.fromhex(request.content.decode("ascii"))).txid().hex()
+            return httpx.Response(200, text=state.get("broadcast_txid", posted_txid))
         if path.endswith("/status"):
             if state.get("status_fail"):
                 return httpx.Response(500, json=None)
@@ -2200,6 +2312,67 @@ def _run_send_repl(
 def _card_refs(outputs: list[str]) -> list[str]:
     """All ``Ref:`` values shown by confirmation cards, in order."""
     return [line.split("Ref: ", 1)[1] for line in outputs if line.startswith("Ref: ")]
+
+
+def test_confirmation_card_never_fabricates_absent_values() -> None:
+    """TCK-SEC-004 change 4 (D LOW-3 / SR-006 class): a handler payload
+    missing a card key renders an explicit ``unavailable`` marker — never a
+    fabricated ``0`` on the money-critical card surface."""
+    lines: list[str] = []
+    app_module._print_confirmation_card({}, lines.append)
+    joined = "\n".join(lines)
+    assert "Amount: unavailable" in joined
+    assert "Fee: unavailable" in joined
+    assert "Size: unavailable" in joined
+    assert "Inputs: unavailable" in joined
+    assert "Expires: unavailable" in joined
+    # No fabricated values anywhere on the card.
+    assert "0 sats" not in joined
+    assert "0 sat/vB" not in joined
+    assert "0 vB" not in joined
+    assert "Inputs: 0" not in joined
+    assert "~0 min" not in joined
+
+
+def test_confirmation_card_absent_fee_subkeys_do_not_fabricate() -> None:
+    """A present ``fee_sats`` with absent rate/target degrades honestly —
+    no fabricated ``0 sat/vB`` / empty-target segment."""
+    lines: list[str] = []
+    app_module._print_confirmation_card({"fee_sats": 282}, lines.append)
+    fee_line = next(line for line in lines if line.startswith("Fee: "))
+    assert fee_line == "Fee: 282 sats"
+    assert "0 sat/vB" not in fee_line
+
+
+def test_confirmation_card_full_payload_is_byte_identical_to_previous_format() -> None:
+    """The absent-key hardening must not change the fully-populated card:
+    every line identical to the pre-change format."""
+    result: dict[str, Any] = {
+        "amount_sats": 60_000,
+        "usd_cents": 1_200,
+        "rate_age_s": 0,
+        "recipient": "tb1qtest",
+        "fee_sats": 282,
+        "fee_rate_sat_vb": 2,
+        "fee_target": "medium",
+        "vsize": 141,
+        "inputs_count": 1,
+        "change_sats": 39_718,
+        "expires_in_s": 600,
+        "tx_ref": "abc12345",
+    }
+    lines: list[str] = []
+    app_module._print_confirmation_card(result, lines.append)
+    assert lines == [
+        "Amount: 60000 sats ($12.00 · rate age 0s)",
+        "To: tb1qtest",
+        "Fee: 282 sats (2 sat/vB, medium target)",
+        "Size: 141 vB",
+        "Inputs: 1",
+        "Change: 39718 sats",
+        "Expires: ~10 min",
+        "Ref: abc12345",
+    ]
 
 
 def test_send_flow_happy_path_card_then_dual_key_confirm(
@@ -3123,22 +3296,23 @@ def test_send_lifecycle_file_signer_full_happy_path(
     assert len(posts) == 1
     expected_hex = _extract_signed_tx(flow.signed.psbt_base64).serialize().hex()
     assert posts[0] == expected_hex
-    assert f"Sent! txid {BROADCAST_TXID} — tracking…" in joined
+    expected_txid = _flow_txid(flow)
+    assert f"Sent! txid {expected_txid} — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
-    assert flow.txid == BROADCAST_TXID
+    assert flow.txid == expected_txid
     # --- status: the model quoted broadcast_txid from the FACTS ---------
     status_prompt = fake.prompts[5]
-    assert f"broadcast_txid: {BROADCAST_TXID}" in status_prompt
+    assert f"broadcast_txid: {expected_txid}" in status_prompt
     assert "Confirmed at height 870001." in joined
     # --- history: the outbound row (store upsert after broadcast) -------
-    assert f"tx {BROADCAST_TXID[:12]}… out unconfirmed" in joined
+    assert f"tx {expected_txid[:12]}… out unconfirmed" in joined
     store_path = tmp_path / "store.db"
     with Store(store_path) as store:
         wallet_row = store.get_wallet_by_name("default")
         assert wallet_row is not None
         rows = store.get_txs_for_wallet(wallet_row.id)
         assert [(r.txid, r.height, r.direction, r.fee_sats) for r in rows] == [
-            (BROADCAST_TXID, None, "out", SEND_FEE_SATS)
+            (expected_txid, None, "out", SEND_FEE_SATS)
         ]
 
 
@@ -3186,7 +3360,7 @@ def test_send_lifecycle_hwi_signer_locked_retry_then_broadcast(
     assert "Signed and verified ✓ txid " in joined
     assert commands.sign_calls == 2  # the locked attempt + the retry
     assert commands.rec["closed"] is True  # device handle released both times
-    assert f"Sent! txid {BROADCAST_TXID} — tracking…" in joined
+    assert f"Sent! txid {_flow_txid(flow)} — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
 
 
@@ -3308,7 +3482,7 @@ def test_send_lifecycle_broadcast_5xx_stays_signed_retry_succeeds(
     )
     # Retry (the mock flips to success after the first POST): succeeds;
     # exactly one POST per attempt in total.
-    assert f"Sent! txid {BROADCAST_TXID} — tracking…" in joined
+    assert f"Sent! txid {_flow_txid(flow)} — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
     assert len(state["broadcast_posts"]) == 2  # 1 per attempt, no retries
 
@@ -3399,7 +3573,7 @@ def test_send_lifecycle_unknown_tx_eventual_consistency(
         "try again in a moment." in joined
     )
     # The status turn quoted broadcast_txid from the FACTS (production path).
-    assert f"broadcast_txid: {BROADCAST_TXID}" in fake.prompts[5]
+    assert f"broadcast_txid: {_flow_txid(flow)}" in fake.prompts[5]
 
 
 def test_send_lifecycle_sign_and_broadcast_gate_refusals(
