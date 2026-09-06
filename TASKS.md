@@ -43,6 +43,12 @@ Source: PROJECT.md §12 Phase 0. Phase 0-flagged open questions (OQ1, OQ2, OQ5, 
 | TCK-P6-001 | evals | eval expansion + full red-team (injection via chain data/tx labels, xpub-exfiltration attempts, destructive bypasses, fuzz depth); flip the ≥95% golden gate to ENFORCED in run_evals | TCK-P5-002 | gate enforced; red-team suite runs in CI-able pytest; results recorded | pending |
 | TCK-P6-002 | packaging | packaging decision + builds (pyinstaller/py2app, OQ9; signed/notarized macOS, Windows), model download UX (hash-pinned), Windows driver story (OQ10), tests where automatable | TCK-P6-001 | builds boot on clean base Mac mini + mid-range Windows laptop — DEFERRED-RUN (needs user hardware + Apple Developer account) | pending |
 | TCK-P6-003 | gate | R-register sweep (R1–R15 resolved-or-owned with named owners), privacy copy audit (§9 wording), mainnet-gate decision ADR (testnet→mainnet flip) | TCK-P6-002 | every AC green or deferred with owner; mainnet decision recorded | pending |
+| TCK-SEC-001 | agent/transcript | `src/localwallet/agent/session.py`, `tests/test_session_transcript.py`, `docs/adr/0020…` (amendment) | — | export redaction covers JSON amounts, 64-hex txids (ordered before legacy-addr), BIP39-shaped seeds; realistic-params test blind spot fixed; full suite green | in-progress |
+| TCK-SEC-002 | wallet/scan | `src/localwallet/wallet/scan.py`, `tests/test_wallet_scan.py`, `docs/adr/0009…` (amendment) | — | absolute per-branch walk ceiling + explicit truncation flag; request budget bounded; normal gap semantics unchanged; full suite green | in-progress |
+| TCK-SEC-003 | tools/lint | `tools/lint_network.py`, `tests/test_lint_network.py` | — | ban-list covers asyncio-outbound/poplib/imaplib/xmlrpc/multiprocessing.connection; dynamic-import detection; unparseable files fail loud; new bans test-pinned; lint exit 0 | in-progress |
+| TCK-SEC-004 | money-path hardening | `src/localwallet/chain/esplora.py`, `src/localwallet/agent/loop.py`, `src/localwallet/signer/file.py`, `src/localwallet/app.py` + their tests | TCK-SEC-002 (+ designer banner copy) | broadcast txid bound to sha256d(tx_hex); envelope re-injection sanitized like other injections; PSBT file size-checked before read; card renderer never fabricates 0; banner copy per designer strings; security-review gate passed | pending |
+| TCK-SEC-005 | docs/ledger | `HANDOFF.md` | TCK-SEC-001..004 | HANDOFF refreshed: registry 12, three lint exceptions, uv.lock resolved, SEC sweep outcomes recorded | pending |
+| TCK-DOC-001 | docs/ledgers | `MANUAL-WORK.md`, `TASKS.md`, `.gitignore`, `uv.lock` | — | this row's deliverables exist | in-progress |
 
 **Process notes:** security-review gate after TCK-P0-002, TCK-P0-003, TCK-P0-006 (touch `protocol/` or `chain/`). E4B-vs-E2B fallback validation (R1/R12) and the R15 perf measurement are structured for here but deferred-run (require the downloaded model on target hardware). Sandbox note: this environment restricts shell access to git commands — test runs are requested in-ticket and verified by code review if pytest cannot be executed.
 
@@ -60,3 +66,5 @@ Source: PROJECT.md §12 Phase 0. Phase 0-flagged open questions (OQ1, OQ2, OQ5, 
 11. Perf measurement vs ADR-0006 targets on base Mac mini + mid-range Windows (OQ20/R15) — needs the downloaded model on target hardware.
 
 **Follow-up (P0-009):** capture-to-fixture flow — one keystroke in the playground to append a (statement, raw, verdict) triple to evals/probes/captured.jsonl for triage into golden/redteam fixtures.
+
+**Follow-up register (security sweep):** 2026-09-06: independent 4-lane security sweep (A network, B model-trust, C money-path, D secrets/privacy) — D FIX-REQUIRED (export redaction), others APPROVE; findings tracked as TCK-SEC-001..005.
