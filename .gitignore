@@ -6,6 +6,7 @@ __pycache__/
 build/
 dist/
 *.egg
+uv.lock
 
 # Virtual environments
 .venv/
@@ -21,3 +22,4 @@ htmlcov/
 # Model weights (downloaded, pinned via models/MODELS.md)
 models/*.gguf
 models/models/
+

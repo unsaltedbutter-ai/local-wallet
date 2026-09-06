@@ -1,12 +1,33 @@
 # local-wallet
 
-A local-first Bitcoin wallet for **testnet** driven by a grammar-constrained local LLM.
+An easy-to-use Bitcoin wallet where you say your intentions and a local AI
+interprets them into wallet actions. Tell it what you want in plain language —
+send money, receive bitcoin, check your balance — and it figures out the right
+thing to do and carries it out.
 
 Read `PROJECT.md` for the full spec, architecture, and roadmap.
 
-**Testnet-only** until the Phase 6 mainnet gate — no mainnet keys, ever.
-
 Commands: `pytest` · `ruff check` · `python tools/lint_network.py`
+
+## How it works
+
+- **You say what you want; the AI does the wallet work.** You don't click
+  through forms or type addresses by hand. A local AI interprets your
+  intentions into wallet actions. For example you can ask it to send a specific
+  amount to a given address, tell it you need to receive some bitcoin, or ask
+  what your bitcoin is worth in USD — and it translates each into the right
+  action.
+- **You verify; you sign.** This software creates the transactions. Your job
+  is to verify that the addresses and amounts are what you intended, then sign
+  with your hardware wallet (Ledger, Trezor, Coldcard, Jade, BitBox02, etc.).
+  Nothing is signed or broadcast without you expressly approving it on the
+  device.
+- **Keys live only on your hardware wallet.** The app works from extended
+  public keys and never touches xprvs or seed phrases.
+- **Auditable core.** The AI only interprets intent and narrates results.
+  Every action it triggers runs through deterministic Python code you can read,
+  and nothing happens without your explicit confirmation — in chat and on the
+  device.
 
 ## Quick start
 
