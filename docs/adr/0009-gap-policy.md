@@ -73,8 +73,7 @@ provide a repair path that never silently guesses.
 
 - Usage deeper than the configured gap is invisible to normal scans by
   design; the UI must present the `out_of_window_detected` warning and
-  the rescan affordance (P1-004).
-- `rescan_wallet` rewrites in-window rows; rows beyond the current
+  the rescan affordance (P1-004).- `rescan_wallet` rewrites in-window rows; rows beyond the current
   window are left as cached history. They cannot hold live UTXOs (any
   fundable address reappears in the walk — its funding transaction
   marks it used and extends the window), and the wallet-wide UTXO
@@ -89,3 +88,24 @@ provide a repair path that never silently guesses.
   desync address statuses from the derivation cursor or sync state —
   the prior state stays exactly intact and the scan can be retried
   cleanly.
+
+## Amendment (TCK-SEC-002, 2026-09-06): absolute per-branch window ceiling
+
+The termination rule above ("bounded by used + gap") assumes honest
+on-chain usage; an observer of the public watch-only xpub can fund
+consecutive derivable indices 0, 1, 2, … N on public testnet and force
+N + gap derivations and ~2N network probes per branch per scan,
+re-triggered every background-watch cycle (DoS + IP-association
+amplification). Decision 2 is therefore amended with an absolute
+ceiling, `_MAX_WINDOW_ADDRESSES = 1000` (~50 × the default gap of 20,
+matching the per-call derivation batch bound and the `gap_limit` setting
+upper bound): the walk — normal scan and rescan alike — NEVER derives or
+probes beyond index 999 per branch, regardless of usage, bounding the
+request budget at ≤ ceiling txs probes + ≤ ceiling × 1 utxo probes per
+branch (≤ 2 × ceiling × branches per scan). When the ceiling, not the
+gap condition, stops the walk, the scan result is explicitly marked
+truncated (`ScanSummary.truncated` / `BranchScanSummary.truncated`,
+with `window_last_index` showing the per-branch stop index) so callers
+can surface that usage may exist beyond the scanned window — truncation
+is never silent. Normal wallets under the ceiling keep the exact
+ADR-0009 semantics; the ceiling only caps attacker-inflatable work.

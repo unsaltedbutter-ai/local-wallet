@@ -31,6 +31,22 @@ ascend, transactions are fetched before UTXOs, branch 0 runs before
 branch 1. Exactly one txs call and one utxo call per scanned window
 address.
 
+Absolute per-branch window ceiling (TCK-SEC-002): the gap-limited walk
+above is unbounded when usage itself is attacker-driven — an observer of
+the public watch-only xpub can fund consecutive derivable indices
+0, 1, 2, … N on public testnet and force N + gap probes per branch per
+scan, re-triggered by the background watch. The walk therefore NEVER
+derives or probes beyond ``_MAX_WINDOW_ADDRESSES`` indices per branch,
+regardless of usage. When the ceiling is reached the scan result is
+explicitly marked truncated (``ScanSummary.truncated`` /
+``BranchScanSummary.truncated``; the per-branch ceiling stop is also
+visible as ``window_last_index``) — never silent. As a consequence the
+request budget per scan is bounded: at most ``_MAX_WINDOW_ADDRESSES``
+txs probes plus at most ``_MAX_WINDOW_ADDRESSES`` utxo probes per
+branch (≤ 2 × ``_MAX_WINDOW_ADDRESSES`` × ``len(BRANCHES)`` probes
+total), and no retry path can exceed it because each window address is
+queried exactly once (see "Ordering" below).
+
 Failure semantics: the **entire chain phase runs before any
 persistence.** A scan that fails midway (transport error, malformed
 payload) raises and leaves the store untouched — fail closed. The persist
@@ -119,6 +135,23 @@ SCAN_AT_KEY: Final[str] = "last_scan_at"
 _MIN_GAP: Final[int] = 1
 _MAX_GAP: Final[int] = 1000
 
+#: Absolute per-branch ceiling on the scan window (TCK-SEC-002). The
+#: gap-limited walk terminates on ``gap`` consecutive unused addresses,
+#: which is unbounded when usage is attacker-driven (an observer of the
+#: public xpub can fund every consecutive derivable index); this constant
+#: bounds the window — and therefore the probe budget — regardless of
+#: usage. Value: 1000 ≈ 50 × default gap of 20 (ADR-0009), matching the
+#: per-call derivation batch bound (``wallet.derivation._MAX_DERIVE_COUNT``)
+#: and the ``gap_limit`` setting upper bound; a single-sig watch-only
+#: branch with >1000 used addresses is far outside the v1 target wallet,
+#: and hitting the ceiling is surfaced via ``truncated`` rather than
+#: silently under-scanning. The walk never derives or probes index
+#: ≥ ``_MAX_WINDOW_ADDRESSES``: at most ``_MAX_WINDOW_ADDRESSES`` txs
+#: probes + ``_MAX_WINDOW_ADDRESSES`` utxo probes per branch, i.e.
+#: ≤ 2 × ``_MAX_WINDOW_ADDRESSES`` × ``len(BRANCHES)`` network calls per
+#: scan, whatever the usage pattern.
+_MAX_WINDOW_ADDRESSES: Final[int] = 1000
+
 #: A txid is always a 64-character hex string.
 _TXID_CHARS: Final[frozenset[str]] = frozenset("0123456789abcdefABCDEF")
 
@@ -150,6 +183,10 @@ class BranchScanSummary:
     next_index: int
     #: Indices observed with transactions, ascending.
     used_indices: tuple[int, ...]
+    #: True when the walk stopped at the absolute window ceiling
+    #: (``_MAX_WINDOW_ADDRESSES``) instead of the gap condition — usage
+    #: may exist beyond the scanned window; never silent (TCK-SEC-002).
+    truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +206,9 @@ class ScanSummary:
     #: Branch (as str, JSON-friendly) → detail for usage found beyond the
     #: previous window; empty when none was detected.
     out_of_window: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: True when ANY branch walk hit the absolute window ceiling
+    #: (TCK-SEC-002); per-branch detail on ``branches[b].truncated``.
+    truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,7 +325,7 @@ def _run_scan(
 
     for branch in BRANCHES:
         existing = {r.index: r for r in store.get_addresses(wallet_id, branch)}
-        final_map = _walk_history(
+        final_map, branch_truncated = _walk_history(
             client,
             descriptor.parsed,
             branch,
@@ -314,6 +354,7 @@ def _run_scan(
             max_used_index=max_used_index,
             next_index=next_index,
             used_indices=tuple(used_indices),
+            truncated=branch_truncated,
         )
         window_maps[branch] = final_map
 
@@ -374,6 +415,7 @@ def _run_scan(
         utxo_count=len(utxo_records),
         utxo_value_sats=sum(record.value_sats for record in utxo_records),
         out_of_window=out_of_window,
+        truncated=any(s.truncated for s in branch_summaries.values()),
     )
 
 
@@ -422,15 +464,22 @@ def _walk_history(
     *,
     gap: int,
     rebuild: bool,
-) -> dict[int, str]:
+) -> tuple[dict[int, str], bool]:
     """Walk one branch ascending until ``gap`` consecutive unused addresses.
 
-    Returns the final ``{index: address}`` window map. Ensures every
-    walked index has an address (deriving from the branch key once per
-    walk; in ``rebuild`` mode cached mappings are re-derived and never
-    trusted). Observed transactions are validated strictly and merged
-    into ``raw_txs`` (first sighting wins; entries carry the full
-    tx so sightings agree).
+    Returns ``(final_map, truncated)`` — the ``{index: address}`` window
+    map and whether the walk stopped at the absolute window ceiling
+    (``_MAX_WINDOW_ADDRESSES``) instead of the gap condition (TCK-SEC-002:
+    usage is attacker-derivable, so the walk is absolutely bounded; the
+    ceiling — not ``used + gap`` — is the hard stop). At most
+    ``_MAX_WINDOW_ADDRESSES`` indices (0 .. ceiling − 1) are ever derived
+    or probed, so the per-branch request budget is
+    ≤ ``_MAX_WINDOW_ADDRESSES`` txs + ``_MAX_WINDOW_ADDRESSES`` utxo
+    probes no matter the usage pattern. Ensures every walked index has an
+    address (deriving from the branch key once per walk; in ``rebuild``
+    mode cached mappings are re-derived and never trusted). Observed
+    transactions are validated strictly and merged into ``raw_txs``
+    (first sighting wins; entries carry the full tx so sightings agree).
     """
     deriver = BranchDeriver(parsed, branch)
     final_map: dict[int, str] = {}
@@ -453,7 +502,11 @@ def _walk_history(
         else:
             consecutive_unused += 1
         if consecutive_unused >= gap:
-            return final_map
+            return final_map, False
+        if index + 1 >= _MAX_WINDOW_ADDRESSES:
+            # Absolute ceiling reached with usage still live: stop walking
+            # and report truncation (the caller marks the scan result).
+            return final_map, True
         index += 1
 
 

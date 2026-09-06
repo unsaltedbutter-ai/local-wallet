@@ -49,7 +49,7 @@ from localwallet.wallet import (
     scan_wallet,
 )
 from localwallet.wallet.descriptor import WatchKeyError
-from localwallet.wallet.scan import ScanError
+from localwallet.wallet.scan import _MAX_WINDOW_ADDRESSES, ScanError
 
 FIXTURE_SEED: Final = b"local-wallet phase 1 scan test seed (not a real wallet)"
 TIP: Final = 870_000
@@ -65,10 +65,15 @@ def _fixture_vpub() -> str:
 VPUB: Final = _fixture_vpub()
 WD: Final = WalletDescriptor.from_key(VPUB)
 PARSED: Final = WD.parsed
-# Window addresses for both branches, indices 0..59.
+# Window addresses for both branches, indices 0..59 — plus the full
+# absolute-ceiling window (indices 0..999) for branch 0, used by the
+# TCK-SEC-002 ceiling tests.
 ADDRS: Final[dict[int, list[str]]] = {
     branch: [d.address for d in derive_addresses(PARSED, branch, 0, 60)]
     for branch in (0, 1)
+}
+ADDRS_FULL: Final[dict[int, list[str]]] = {
+    0: [d.address for d in derive_addresses(PARSED, 0, 0, _MAX_WINDOW_ADDRESSES)]
 }
 
 
@@ -178,6 +183,16 @@ def _used_at(indices: dict[int, str], branch: int) -> dict[str, list[dict[str, A
     return {
         ADDRS[branch][index]: [tx_entry(txid, vout_addresses=(ADDRS[branch][index],))]
         for index, txid in indices.items()
+    }
+
+
+def _used_everywhere(branch: int, count: int) -> dict[str, list[dict[str, Any]]]:
+    """Txs marking EVERY address of ``ADDRS_FULL[branch][:count]`` used."""
+    return {
+        ADDRS_FULL[branch][i]: [
+            tx_entry(f"{i:064x}", vout_addresses=(ADDRS_FULL[branch][i],))
+        ]
+        for i in range(count)
     }
 
 
@@ -690,3 +705,110 @@ def _fixture_mainnet_zpub() -> str:
     root = HDKey.from_seed(FIXTURE_SEED + b"main", version=NETWORKS["main"]["zprv"])
     account = root.derive([84 + 2**31, 0 + 2**31, 0])
     return account.to_public().to_base58(version=NETWORKS["main"]["zpub"])
+
+
+# ------------------------------------------------ absolute window ceiling (TCK-SEC-002)
+
+
+def test_ceiling_terminates_walk_and_marks_truncated(store: Store) -> None:
+    """Attacker-driven usage (EVERY derivable index funded): the walk must
+    terminate at the absolute window ceiling — exactly ``_MAX_WINDOW_ADDRESSES``
+    indices derived/probed (0..ceiling-1, NO extra gap beyond the ceiling) —
+    and mark the result truncated explicitly (summary + per-branch), never
+    silently. An unused branch is unaffected (per-branch independence)."""
+    wid = _wallet_id(store)
+    chain = FakeChain(txs=_used_everywhere(0, _MAX_WINDOW_ADDRESSES))
+    summary = scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+
+    b0, b1 = summary.branches[0], summary.branches[1]
+    # Exactly the ceiling indices: derivation count == ceiling, window is
+    # 0..999 (the ceiling is the inclusive window bound — no +gap tail).
+    assert b0.scanned == _MAX_WINDOW_ADDRESSES == 1000
+    assert b0.window_last_index == _MAX_WINDOW_ADDRESSES - 1 == 999
+    assert b0.max_used_index == 999
+    assert b0.next_index == 1000
+    assert b0.truncated is True
+    assert summary.truncated is True  # explicit, caller-visible
+
+    # The store holds exactly the ceiling window mapping, derived from key.
+    indexes0 = [a.index for a in store.get_addresses(wid, 0)]
+    assert indexes0 == list(range(_MAX_WINDOW_ADDRESSES))
+
+    # Probe budget as a consequence: ≤ ceiling txs + ceiling utxo per branch.
+    txs_calls = [a for kind, a in chain.requests if kind == "txs"]
+    utxo_calls = [a for kind, a in chain.requests if kind == "utxo"]
+    assert len(txs_calls) == _MAX_WINDOW_ADDRESSES + 20  # b0 ceiling + b1 gap-stop
+    assert len(utxo_calls) == _MAX_WINDOW_ADDRESSES + 20
+    # Every branch-0 probe is inside the ceiling window.
+    assert set(txs_calls[:_MAX_WINDOW_ADDRESSES]) == set(ADDRS_FULL[0])
+
+    # Unused branch: normal gap semantics, not truncated.
+    assert (b1.scanned, b1.window_last_index, b1.max_used_index) == (20, 19, -1)
+    assert b1.truncated is False
+
+
+def test_wallet_under_ceiling_not_truncated(store: Store) -> None:
+    """Normal wallets (ADR-0009 semantics, usage + gap well under the
+    ceiling): truncated stays False on the summary and every branch."""
+    chain = FakeChain(txs=_used_at({0: "aa" * 32, 3: "dd" * 32}, 0))
+    summary = scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+    assert summary.truncated is False
+    assert all(not b.truncated for b in summary.branches.values())
+    assert summary.branches[0].window_last_index == 23  # unchanged gap semantics
+
+
+def test_gap_equal_to_ceiling_boundary(store: Store) -> None:
+    """Boundary semantics at gap == ceiling: an empty wallet with
+    gap_limit=1000 stops by the gap condition at exactly the ceiling with
+    truncated=False (window 0..999); the same gap with usage at index 0
+    would previously have walked 1001 addresses — the ceiling caps it at
+    1000 and flags truncated=True."""
+    row = store.get_wallet_by_name("main")
+
+    empty = scan_wallet(store, FakeChain().client(), row, gap_limit=1000)
+    b0 = empty.branches[0]
+    assert (b0.scanned, b0.window_last_index) == (1000, 999)
+    assert b0.truncated is False  # gap termination, not the ceiling
+    assert empty.truncated is False
+
+    used = scan_wallet(
+        store,
+        FakeChain(txs=_used_at({0: "aa" * 32}, 0)).client(),
+        row,
+        gap_limit=1000,
+    )
+    b0u = used.branches[0]
+    assert (b0u.scanned, b0u.window_last_index) == (1000, 999)
+    assert b0u.truncated is True  # capped by the ceiling, flagged
+    assert used.truncated is True
+
+
+def test_rescan_is_bounded_by_the_same_ceiling(store: Store) -> None:
+    """The rescan (cache-rebuild) path is bounded identically: with usage
+    on every derivable index it stops at the ceiling, reports truncated,
+    and its probe count stays within ceiling txs + ceiling utxo per
+    branch — a rescan can never exceed the scan budget."""
+    wid = _wallet_id(store)
+    row = store.get_wallet_by_name("main")
+    ceiling_txs = _used_everywhere(0, _MAX_WINDOW_ADDRESSES)
+
+    scan_wallet(store, FakeChain(txs=ceiling_txs).client(), row)  # truncated scan
+    assert len(store.get_addresses(wid, 0)) == _MAX_WINDOW_ADDRESSES
+
+    chain = FakeChain(txs=ceiling_txs)
+    summary = rescan_wallet(store, chain.client(), row)
+    b0 = summary.branches[0]
+    assert (b0.scanned, b0.window_last_index, b0.max_used_index) == (
+        _MAX_WINDOW_ADDRESSES,
+        _MAX_WINDOW_ADDRESSES - 1,
+        _MAX_WINDOW_ADDRESSES - 1,
+    )
+    assert b0.truncated is True and summary.truncated is True
+    assert [a.index for a in store.get_addresses(wid, 0)] == list(
+        range(_MAX_WINDOW_ADDRESSES)
+    )
+
+    txs_calls = [a for kind, a in chain.requests if kind == "txs"]
+    utxo_calls = [a for kind, a in chain.requests if kind == "utxo"]
+    assert len(txs_calls) <= _MAX_WINDOW_ADDRESSES + 20
+    assert len(utxo_calls) <= _MAX_WINDOW_ADDRESSES + 20
