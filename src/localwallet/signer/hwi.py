@@ -28,9 +28,14 @@ Layering and trust (AGENTS.md invariants):
   layer never accepts, stores, forwards, or logs a PIN or passphrase: the
   ``password`` parameter is omitted on every HWI call (no secret exists to
   pass). A device that needs unlocking surfaces as
-  :class:`DeviceLockedError` guidance instead.
+  :class:`DeviceLockedError` guidance instead. Jade unlock is the exception in
+  transport, not in trust: hwilib relays *blinded* PIN-server blobs through the
+  host while the user enters the scrambled PIN on-device, and the PIN itself
+  never touches the host process.
 - **No network I/O** (lint-enforced). USB/HID transport is device I/O; the
-  only networked module remains ``localwallet.chain``.
+  only networked module remains ``localwallet.chain``. (Transitive exception:
+  the Jade unlock above has *hwilib* — not this module, no import in our tree —
+  reach its pinserver for blinded blobs; ADR-0015 amendment.)
 - **Value-free errors.** Messages never echo PSBT content, addresses,
   amounts, or fingerprints — they name the situation and the next user
   action only (PROJECT.md §10 tone: short, actionable, zero jargon).
@@ -97,6 +102,15 @@ _MSG_NO_DEVICES = (
 _MSG_LOCKED = (
     "Enter your PIN/passphrase on the device, then say 'retry'."
 )
+_MSG_JADE_LOCKED = (
+    "Your Jade is locked — unlock it on the Jade screen and follow its PIN "
+    "prompt. If it offers menu options, choose 'Recovery Phrase Login' or "
+    "'QR PIN Unlock', then say 'retry'."
+)
+_MSG_HOST_PIN = (
+    "This device unlocks through its own app or companion software — unlock "
+    "it there, then say 'retry'."
+)
 _MSG_BUSY = (
     "Your device is busy — finish what's on its screen, then say 'retry'."
 )
@@ -154,12 +168,18 @@ class DeviceInfo:
     ``fingerprint_hex`` is the lowercase hex master-key fingerprint, or
     ``None`` when the device could not be read (locked/uninitialized) —
     such devices can never match, which the trust gate treats explicitly.
+    ``needs_pin_sent``/``needs_passphrase_sent``/``locked`` carry the rest
+    of the enumerate shape ``_select_device`` branches on for unlock
+    guidance; defaults keep old-shape (mocked) entries valid.
     """
 
     type: str
     model: str
     path: str
     fingerprint_hex: str | None
+    needs_pin_sent: bool = False
+    needs_passphrase_sent: bool = False
+    locked: bool = False
 
 
 def _normalize_fingerprint(value: Any) -> str | None:
@@ -276,12 +296,20 @@ class HwiUsbSigner(Signer):
         for raw in raw_devices:
             if not isinstance(raw, dict):
                 raise DeviceError(_MSG_UNEXPECTED)
+            # ponytail: with hwilib's networking enabled, a locked Jade blocks
+            # client construction (enumerate and get_client alike) while the
+            # user enters the PIN — hwi's auth_user loop runs long_timeout.
+            # Acceptable for the single-user CLI; revisit if this ever runs
+            # headless.
             devices.append(
                 DeviceInfo(
                     type=str(raw.get("type", "device")),
                     model=str(raw.get("model") or raw.get("type") or "device"),
                     path=str(raw.get("path", "")),
                     fingerprint_hex=_normalize_fingerprint(raw.get("fingerprint")),
+                    needs_pin_sent=bool(raw.get("needs_pin_sent", False)),
+                    needs_passphrase_sent=bool(raw.get("needs_passphrase_sent", False)),
+                    locked="error" in raw,
                 )
             )
         return devices
@@ -312,7 +340,19 @@ class HwiUsbSigner(Signer):
             return matches[0]
         if len(matches) == 0:
             if all(d.fingerprint_hex is None for d in devices):
-                # Present but unreadable: locked or uninitialized device.
+                # Present but unreadable: locked or uninitialized device —
+                # guidance depends on how that device class unlocks.
+                if any(d.type.startswith("jade") for d in devices):
+                    # Jade never takes a host-side PIN: hwi drives an
+                    # on-device scrambled PIN pad (blinded pinserver relay).
+                    # The generic line below loops forever here (TCK-HW-001).
+                    raise DeviceLockedError(_MSG_JADE_LOCKED)
+                if any(d.needs_pin_sent for d in devices):
+                    # Host-driven PIN class (e.g. locked Trezor): unlocking is
+                    # driven through the device's own app/companion flow;
+                    # relaying promptpin/sendpin is out of scope (ADR-0015
+                    # amendment).
+                    raise DeviceLockedError(_MSG_HOST_PIN)
                 raise DeviceLockedError(_MSG_LOCKED)
             raise DeviceMismatchError(_MSG_MISMATCH)
         raise DeviceError(_MSG_MULTIPLE)
@@ -410,6 +450,12 @@ class HwiUsbSigner(Signer):
         if mapped is not None:
             error_cls, message = mapped
             return error_cls(message)
+        # Jade device-side cancel escapes hwilib's wrappers as a bare
+        # jadepy JadeError (code -32000 USER_CANCELLED) — name-matched like
+        # the map above; the message may carry device text, so it is never
+        # echoed (value-free invariant).
+        if type(exc).__name__ == "JadeError" and getattr(exc, "code", None) == -32000:
+            return DeviceError(_MSG_CANCELED)
         return DeviceError(
             f"Something went wrong talking to your device "
             f"({type(exc).__name__}) — say 'retry' to try again."

@@ -127,3 +127,22 @@ that difference could be a wrong wallet, a typo'd descriptor, or an attack.
 - Locked-device ambiguity (fingerprint unreadable) is reported as the
   locked-device guidance, not as a mismatch — the right device must not be
   slandered before it can identify itself.
+
+## Amendment (TCK-HW-001, 2026-09-07): Jade pinserver relay inside the signer call stack
+
+With `requests` installed (required by hwilib's import-guarded Jade support),
+a locked Blockstream Jade authenticates during *client construction*: hwilib
+drives the on-device scrambled PIN pad and relays **blinded blobs** to the
+Jade pinserver over outbound HTTPS, inside the `get_client` (and `enumerate`)
+call path. This puts transient network I/O in the signer's *call stack* —
+not in its code: `localwallet.signer` still imports no network module, so the
+static-import lint (`tools/lint_network.py`) is unaffected and `chain/`
+remains the only module of ours with network imports.
+
+The no-secrets invariant is preserved: the PIN is entered on the device and
+never touches the host process; the host only ferries blinded pinserver
+blobs it cannot read. Host-driven-PIN devices (e.g. a locked Trezor,
+`needs_pin_sent=True`) are **not** wired to promptpin/sendpin relaying — the
+signer only names the companion-app unlock flow in its guidance. Wiring such
+relaying would put PIN material through the host and would need its own ADR.
+

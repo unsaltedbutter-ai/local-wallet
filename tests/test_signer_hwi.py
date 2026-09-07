@@ -95,6 +95,17 @@ class BadArgumentError(_FakeHwiError): ...
 class UnavailableActionError(_FakeHwiError): ...
 
 
+class JadeError(Exception):
+    """jadepy bare-error stand-in (NOT an HWWError — hwilib leaves it
+    unwrapped on device-side cancel). Class name + code drive our mapping."""
+
+    def __init__(self, code: int, message: str = "", data: object = None) -> None:
+        super().__init__(f"JadeError: {code} - {message} (Data: {data!r})")
+        self.code = code
+        self.message = message
+        self.data = data
+
+
 class FakeClient:
     """HardwareWalletClient stand-in that records close() calls."""
 
@@ -384,6 +395,122 @@ def test_two_matching_devices_refused_with_unplug_guidance():
         signer.sign_unsigned(PSBT_B64)
     assert "unplug" in str(excinfo.value).lower()
     assert ("signtx",) not in commands.calls
+
+
+# --------------------------------------------------------------------------
+# TCK-HW-001: locked-device guidance by device class (Jade / host-PIN)
+# --------------------------------------------------------------------------
+
+# Real hwi 3.2.0 enumerate shapes (handle_errors swallows the pre-construction
+# DeviceNotReadyError into the entry: error+code keys, NO fingerprint).
+JADE_LOCKED = {
+    "type": "jade",
+    "path": "/dev/tty.usbmodemJADE",
+    "model": "jade",
+    "needs_pin_sent": False,
+    "needs_passphrase_sent": False,
+    "error": (
+        'Use "Recovery Phrase Login" or "QR PIN Unlock" feature '
+        "on Jade hw to access wallet"
+    ),
+    "code": -12,
+}
+TREZOR_LOCKED = {
+    "type": "trezor",
+    "path": "hid:/dev/hidT",
+    "model": "trezor_t",
+    "needs_pin_sent": True,
+    "needs_passphrase_sent": False,
+    "error": "Trezor is locked. Unlock by using 'promptpin' and then 'sendpin'.",
+    "code": -12,
+}
+
+
+def test_enumerate_preserves_lock_class_fields():
+    """The class signals _select_device branches on survive enumeration;
+    old-shape entries default them to False."""
+    commands = FakeCommands(devices=[dict(JADE_LOCKED), dict(DEVICE_WALLET)])
+    devices = make_signer(commands).enumerate_devices()
+    assert devices[0].locked is True
+    assert devices[0].needs_pin_sent is False
+    assert devices[0].needs_passphrase_sent is False
+    assert devices[0].fingerprint_hex is None
+    assert devices[1] == DeviceInfo(  # defaults keep the old shape valid
+        type="trezor", model="trezor_t", path="hid:/dev/hid0",
+        fingerprint_hex=FP_WALLET,
+    )
+
+
+def test_locked_jade_gets_jade_on_device_guidance():
+    """A locked Jade enumerates with the swallowed pinserver error (code -12,
+    no fingerprint) — the guidance must name the Jade on-device unlock, NOT
+    the generic "PIN/passphrase on the device" line (which loops forever:
+    Jade never takes a host-side PIN)."""
+    commands = FakeCommands(devices=[dict(JADE_LOCKED)], signtx_result=default_sign_result())
+    with pytest.raises(DeviceLockedError) as excinfo:
+        make_signer(commands).sign_unsigned(PSBT_B64)
+    message = str(excinfo.value)
+    assert "jade" in message.lower()
+    assert "recovery phrase login" in message.lower()
+    assert "qr pin unlock" in message.lower()
+    assert "retry" in message.lower()
+    assert "pin/passphrase" not in message  # not the generic line
+    assert ("signtx",) not in commands.calls
+
+
+def test_host_pin_device_gets_companion_flow_guidance():
+    """needs_pin_sent=True (locked Trezor shape) → host-pin-class guidance:
+    unlock through the device's own app/companion flow. We do NOT relay
+    promptpin/sendpin (out of scope, ADR-0015 amendment)."""
+    commands = FakeCommands(devices=[dict(TREZOR_LOCKED)], signtx_result=default_sign_result())
+    with pytest.raises(DeviceLockedError) as excinfo:
+        make_signer(commands).sign_unsigned(PSBT_B64)
+    message = str(excinfo.value)
+    assert "companion" in message.lower()
+    assert "retry" in message.lower()
+    assert "jade" not in message.lower()
+    assert "pin/passphrase" not in message  # not the generic line either
+    assert ("signtx",) not in commands.calls
+
+
+def test_old_shape_locked_entry_keeps_generic_guidance():
+    """Old-shape entries (no needs_pin_sent/error keys — e.g. mocked fixtures
+    predating TCK-HW-001) keep the existing generic locked guidance."""
+    old_shape = {"type": "ledger", "path": "hid:/dev/hidL", "model": "ledger_nano_s"}
+    commands = FakeCommands(devices=[old_shape], signtx_result=default_sign_result())
+    with pytest.raises(DeviceLockedError) as excinfo:
+        make_signer(commands).sign_unsigned(PSBT_B64)
+    assert "pin/passphrase" in str(excinfo.value).lower()
+
+
+def test_bare_jade_error_user_cancelled_maps_to_canceled():
+    """A Jade device-side cancel escapes get_client as a bare jadepy
+    JadeError(code=-32000) — unwrapped by hwilib — and must surface as the
+    canceled guidance, never the generic unknown-error branch. The JadeError
+    message text (which may carry device values) never leaks."""
+    commands = FakeCommands(
+        get_client_error=JadeError(-32000, "User Canceled", None),
+        signtx_result=default_sign_result(),
+    )
+    with pytest.raises(DeviceError) as excinfo:
+        make_signer(commands).sign_unsigned(PSBT_B64)
+    message = str(excinfo.value).lower()
+    assert "canceled" in message
+    assert "retry" in message
+    assert "jadeerror" not in message  # not the class-name fallback branch
+    assert ("signtx",) not in commands.calls
+
+
+def test_bare_jade_error_other_code_stays_generic():
+    """The cancel guard is code-scoped: a non-cancel JadeError still lands in
+    the class-name-only generic branch."""
+    commands = FakeCommands(
+        get_client_error=JadeError(-32002, "HW locked", None),
+        signtx_result=default_sign_result(),
+    )
+    with pytest.raises(DeviceError) as excinfo:
+        make_signer(commands).sign_unsigned(PSBT_B64)
+    assert "JadeError" in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------

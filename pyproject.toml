@@ -13,6 +13,11 @@ dependencies = [
     "httpx>=0.27",
     "llama-cpp-python>=0.3",
     "hwi>=3.1",
+    # hwilib's Jade support is import-guarded on ``requests`` (HAS_NETWORKING):
+    # without it a locked Jade can never authenticate. hwilib does the network
+    # import itself; our tree imports none (network lint unaffected, ADR-0015
+    # amendment).
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]
