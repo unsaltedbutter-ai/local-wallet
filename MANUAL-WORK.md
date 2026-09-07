@@ -15,8 +15,11 @@
 - Unlocks: funded-wallet literal ACs + real send-flow demos. Since the wallet is now funded, the Phase 1 literal AC (docs/phase1-ac.md live cross-check) is now **runnable**.
 
 ## MW-4: Hardware-wallet live AC (Phase 3)
-- [ ] Plug in a device (Coldcard SD flow and/or any HWI USB device); follow docs/phase3-ac.md (real-device sign → on-chain broadcast).
-- Record quirks in docs/device-notes.md (per-device table is device-verified-later).
+- [x] **Done 2026-09-07 (Jade):** device detect + on-device PIN unlock + PSBT verification + SIGNING all working (fixes TCK-HW-001/002/003 landed first). On-chain broadcast intentionally deferred — see MW-9. Findings along the way drove TCK-HW-001..004 and UX feedback (tx-card redesign, UTXO notes/selection design).
+- Device quirks: record in docs/device-notes.md (per-device table is device-verified-later) — Jade master fp shown on screen (40dbb192), PIN unlock driven by hwilib client construction (blind-PIN pinserver relay; requests dep required).
+
+## MW-9: Broadcast AC (deferred from MW-4, later)
+- [ ] Complete the lifecycle on-chain: sign with the Jade → broadcast → verify on an explorer (docs/phase3-ac.md final step). The user chose not to move sats yet; run when ready.
 
 ## MW-5: Sparrow import AC
 - [ ] Follow docs/sparrow-ac.md (manual import of the deterministic fixture PSBT; pass criteria in the doc).
