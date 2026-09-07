@@ -14,32 +14,32 @@ from dataclasses import dataclass, fields
 class Settings:
     """Small, explicitly-settable runtime settings."""
 
-    esplora_base_url: str = "https://mempool.space/testnet4/api"
+    esplora_base_url: str = "https://mempool.space/api"
     # THE single chain-backend selection point (Phase 4, TCK-P4-002; ADR-0018).
     # When set (non-empty), this URL is the authoritative Esplora base for the
     # WHOLE wallet: every EsploraClient-mediated call (address txs/utxos, tip,
     # fees, price, broadcast) hits it. When empty (the default), the legacy
     # ``esplora_base_url`` is used instead — preserving the ADR-0003 public
     # default and full backward compatibility with LOCALWALLET_ESPLORA_BASE_URL.
-    # The instance must serve testnet4 (ADR-0004 invariant); the client's path
-    # shapes are identical regardless of host. Validation is fail-closed at
-    # client construction (ChainConfig), never mid-request.
+    # The instance must serve mainnet (mainnet-only invariant, ADR-0021); the
+    # client's path shapes are identical regardless of host. Validation is
+    # fail-closed at client construction (ChainConfig), never mid-request.
     chain_base_url: str = ""
     request_timeout_s: float = 10.0
     max_retries: int = 3
-    network: str = "testnet"
+    network: str = "main"
     store_path: str = "localwallet.db"
     price_ttl_s: float = 60.0
     price_enabled: bool = True
     fee_cache_ttl_s: float = 30.0
     # --- Node detection (Phase 4, node/ module; TCK-P4-001) ---
     # Path to a Bitcoin Core RPC cookie file. Empty string means "use the
-    # per-network default under ~/.bitcoin" (e.g. ~/.bitcoin/testnet4/.cookie).
-    # The cookie CONTENT is a secret and is never logged or echoed.
+    # per-network default under ~/.bitcoin" (e.g. ~/.bitcoin/.cookie for
+    # mainnet). The cookie CONTENT is a secret and is never logged or echoed.
     rpc_cookie_path: str = ""
-    # Bitcoin Core JSON-RPC port to probe. Defaults to testnet4 (48332) per
-    # ADR-0004 / Bitcoin Core chainparamsbase.cpp.
-    rpc_port: int = 48332
+    # Bitcoin Core JSON-RPC port to probe. Defaults to mainnet (8332) per
+    # Bitcoin Core chainparamsbase.cpp (mainnet-only invariant, ADR-0021).
+    rpc_port: int = 8332
     # Self-hosted mempool.space API root on localhost (well-known default
     # backend port 3006). Detected by the node doctor; full backend wiring
     # lands in TCK-P4-002.

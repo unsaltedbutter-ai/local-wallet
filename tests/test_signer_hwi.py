@@ -313,17 +313,31 @@ def test_sign_happy_path_one_match():
     assert commands.rec["closed"] is True
 
 
-def test_sign_gets_testnet4_chain():
-    """The device client is opened for the project's chain (ADR-0004)."""
+def test_sign_gets_mainnet_chain():
+    """The device client is opened for the project's chain (mainnet-only,
+    ADR-0021)."""
     commands = FakeCommands(signtx_result=default_sign_result())
     make_signer(commands).sign_unsigned(PSBT_B64)
     chain = next(c for c in commands.calls if c[0] == "get_client")[3]
     try:
         from hwilib.common import Chain
 
-        assert chain == Chain.TESTNET4
+        assert chain == Chain.MAIN
     except ImportError:  # hwilib absent → lenient string fallback
-        assert chain == "testnet4"
+        assert chain == "main"
+
+
+def test_default_chain_is_main():
+    """The default chain is mainnet (ADR-0021) and resolves via hwilib's
+    Chain enum (hwilib >= 3.1 exposes ``Chain.MAIN``)."""
+    signer = HwiUsbSigner(FP_WALLET)
+    assert signer.chain == "main"
+    try:
+        from hwilib.common import Chain
+
+        assert signer._chain_enum(None) is Chain.MAIN
+    except ImportError:  # hwilib absent → lenient string fallback
+        assert signer._chain_enum(None) == "main"
 
 
 def test_zero_devices_is_absent_error():

@@ -17,8 +17,8 @@ if str(_SRC) not in sys.path:
 from localwallet.chain import ChainError, EsploraClient
 from localwallet.chain import esplora as esplora_module
 
-BASE_URL = "https://mempool.space/testnet4/api"
-ADDRESS = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
+BASE_URL = "https://mempool.space/api"
+ADDRESS = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
 
 TXS_PAYLOAD = [
     {
@@ -79,7 +79,7 @@ def test_get_address_txs_happy_path():
     request = server.requests[0]
     assert request.method == "GET"
     assert request.url.host == "mempool.space"
-    assert request.url.path == f"/testnet4/api/address/{ADDRESS}/txs"
+    assert request.url.path == f"/api/address/{ADDRESS}/txs"
     assert "?" not in str(request.url)  # no query params / API keys
     assert request.headers["User-Agent"].startswith("local-wallet/")
 
@@ -91,7 +91,7 @@ def test_get_address_utxos_happy_path():
     assert result == UTXOS_PAYLOAD
     request = server.requests[0]
     assert request.method == "GET"
-    assert request.url.path == f"/testnet4/api/address/{ADDRESS}/utxo"
+    assert request.url.path == f"/api/address/{ADDRESS}/utxo"
 
 
 def test_get_tip_height_happy_path():
@@ -100,14 +100,14 @@ def test_get_tip_height_happy_path():
         assert client.get_tip_height() == 870_000
     request = server.requests[0]
     assert request.method == "GET"
-    assert request.url.path == "/testnet4/api/blocks/tip"
+    assert request.url.path == "/api/blocks/tip"
 
 
 def test_base_url_trailing_slash_is_normalized():
     server = ScriptedServer(httpx.Response(200, json=870_000))
     with server.client(base_url=BASE_URL + "/") as client:
         client.get_tip_height()
-    assert server.requests[0].url.path == "/testnet4/api/blocks/tip"
+    assert server.requests[0].url.path == "/api/blocks/tip"
 
 
 def test_default_client_uses_settings_defaults():
@@ -119,7 +119,7 @@ def test_default_client_uses_settings_defaults():
         client.close()
     request = server.requests[0]
     assert request.url.host == "mempool.space"
-    assert request.url.path == "/testnet4/api/blocks/tip"
+    assert request.url.path == "/api/blocks/tip"
 
 
 def test_env_override_flows_through_to_client(monkeypatch: pytest.MonkeyPatch):
@@ -282,7 +282,7 @@ def test_wrong_response_shape_raises_chain_error(invoke, payload):
 
 @pytest.mark.parametrize(
     "bad_address",
-    ["", " ", "tb1q x", "addr/ect", "x" * 101, "tb1qé", None],
+    ["", " ", "bc1q x", "addr/ect", "x" * 101, "bc1qé", None],
 )
 def test_invalid_address_argument_raises_without_requesting(bad_address):
     server = ScriptedServer(httpx.Response(200, json=[]))
@@ -345,7 +345,7 @@ def test_broadcast_tx_happy_path():
     assert len(server.requests) == 1  # single attempt: POST never retries
     request = server.requests[0]
     assert request.method == "POST"
-    assert request.url.path == "/testnet4/api/tx"
+    assert request.url.path == "/api/tx"
     assert request.headers["Content-Type"] == "text/plain"
     assert request.content.decode("ascii") == TX_HEX  # body verbatim
 
@@ -512,7 +512,7 @@ def test_get_tx_status_confirmed_happy_path():
     )
     request = server.requests[0]
     assert request.method == "GET"
-    assert request.url.path == f"/testnet4/api/tx/{STATUS_TXID}/status"
+    assert request.url.path == f"/api/tx/{STATUS_TXID}/status"
     assert "?" not in str(request.url)  # no query params / API keys
 
 

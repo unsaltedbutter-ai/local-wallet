@@ -113,8 +113,8 @@ SETUP_OPTIONS: tuple[SetupOption, ...] = (
         ),
         steps=(
             (
-                "Install Bitcoin Core and start it with your network selected "
-                "(testnet4 for development, per this project's convention)."
+                "Install Bitcoin Core and start it on mainnet (the default "
+                "network — no extra network flags needed)."
             ),
             "Enable pruning so the chain does not consume your whole disk.",
             (

@@ -141,10 +141,10 @@ _HWI_ERROR_MAP: dict[str, tuple[type[DeviceError], str]] = {
     "PSBTSerializationError": (DeviceError, _MSG_BAD_PSBT),
 }
 
-# Allowed chain names (resolved to hwilib's Chain enum lazily). Testnet4 is
-# the project default (ADR-0004).
+# Allowed chain names (resolved to hwilib's Chain enum lazily). Mainnet is
+# the project default (mainnet-only invariant, ADR-0021).
 _CHAIN_NAMES = ("main", "test", "testnet4", "signet", "regtest")
-_DEFAULT_CHAIN = "testnet4"
+_DEFAULT_CHAIN = "main"
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +180,8 @@ class HwiUsbSigner(Signer):
             a hex string (from the parsed descriptor). The signing device
             MUST match it exactly (ADR-0015).
         chain: which chain the device client is opened for; default
-            ``"testnet4"`` (ADR-0004). One of ``main``/``test``/``testnet4``/
+            ``"main"`` (mainnet-only invariant, ADR-0021). One of
+            ``main``/``test``/``testnet4``/
             ``signet``/``regtest``.
         commands_module: dependency seam — the ``hwilib.commands``-shaped
             module to call into. ``None`` (default) lazily imports

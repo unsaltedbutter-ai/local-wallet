@@ -10,7 +10,7 @@ and :data:`INTENT_REGISTRY`, re-exported here); this module is layer 3 —
 :data:`BUSINESS_RULES` maps each intent to a **pure** validator
 ``(params_model) -> list[str]``. Pydantic already bounds types and lengths;
 business rules re-check meaning-level properties (non-blank text; for
-``create_tx``: the recipient is a valid testnet witness-v0 P2WPKH bech32
+``create_tx``: the recipient is a valid mainnet witness-v0 P2WPKH bech32
 address per ADR-0008 and the amount XOR; for ``confirm_tx``/``sign_tx``/
 ``broadcast_tx``: the ``tx_ref`` shape; for ``tx_status``: the ``txid`` is
 EXACTLY 64 lowercase hex characters — the strict charset check that guards
@@ -140,8 +140,8 @@ def _rule_new_address(params: BaseParams) -> list[str]:
     return []
 
 
-#: Human-identifier part (HRP) of a testnet bech32 address (BIP173).
-_TESTNET_HRP: str = "tb"
+#: Human-identifier part (HRP) of a mainnet bech32 address (BIP173).
+_MAINNET_HRP: str = "bc"
 
 #: Required witness version (0 = native segwit v0) and P2WPKH program length
 #: (20-byte keyhash) for send recipients, per ADR-0008 (P2WPKH-only v1 send;
@@ -153,7 +153,7 @@ _P2WPKH_PROGRAM_LEN: int = 20
 def _recipient_rule_failure(params: CreateTxParams) -> list[str]:
     """Validate the ``create_tx`` recipient semantically (value-free).
 
-    The recipient must decode as a TESTNET bech32 address with witness
+    The recipient must decode as a MAINNET bech32 address with witness
     version 0 and a 20-byte program (P2WPKH) — ADR-0008. Each failure mode
     gets a specific, value-free string: the address itself (and any prefix
     of it) is NEVER echoed, because failure strings flow into error
@@ -162,14 +162,14 @@ def _recipient_rule_failure(params: CreateTxParams) -> list[str]:
     """
     encoding, hrp, _data = bech32.bech32_decode(params.recipient)
     if encoding is None or hrp is None:
-        return ["recipient is not a valid testnet bech32 address"]
-    if hrp != _TESTNET_HRP:
-        return ["recipient is not a testnet bech32 address (wrong network prefix)"]
-    witver, program = bech32.decode(_TESTNET_HRP, params.recipient)
+        return ["recipient is not a valid mainnet bech32 address"]
+    if hrp != _MAINNET_HRP:
+        return ["recipient is not a mainnet bech32 address (wrong network prefix)"]
+    witver, program = bech32.decode(_MAINNET_HRP, params.recipient)
     if witver is None or program is None:
         # Checksum/charset already passed above, so this is a malformed
         # witness program (length outside 2..40 bytes).
-        return ["recipient is not a valid testnet bech32 address"]
+        return ["recipient is not a valid mainnet bech32 address"]
     if witver != _WITNESS_V0:
         return ["recipient must be a witness version 0 address (taproot v1 and later are not supported)"]
     if len(program) != _P2WPKH_PROGRAM_LEN:
@@ -178,7 +178,7 @@ def _recipient_rule_failure(params: CreateTxParams) -> list[str]:
 
 
 def _rule_create_tx(params: BaseParams) -> list[str]:
-    """``create_tx``: amount XOR + bounds + testnet P2WPKH recipient (ADR-0008/0013).
+    """``create_tx``: amount XOR + bounds + mainnet P2WPKH recipient (ADR-0008/0013).
 
     - Exactly one of ``amount_sats``/``amount_usd`` must be present. The
       schema layer already enforces the XOR; this is the layer-3 re-check

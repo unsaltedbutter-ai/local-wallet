@@ -20,7 +20,7 @@ class ChainConfig:
     """Connection parameters for the chain adapter.
 
     Attributes:
-        base_url: Esplora API root, e.g. ``https://mempool.space/testnet4/api``
+        base_url: Esplora API root, e.g. ``https://mempool.space/api``
             (public default, ADR-0003) or a user's self-hosted instance
             selected via ``Settings.chain_base_url`` (ADR-0018). The single
             selection lives in :meth:`from_settings`.

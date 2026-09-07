@@ -63,11 +63,11 @@ __all__ = [
 
 #: Bitcoin Core JSON-RPC default ports. Source: Bitcoin Core v28.0
 #: ``src/chainparamsbase.cpp``, ``CreateBaseChainParams`` — mainnet 8332,
-#: testnet3 18332, testnet4 48332, signet 38332, regtest 18443. The project
-#: targets testnet4 (ADR-0004), so that port is probed first; the legacy/dev
-#: networks are kept so a user's existing node is still found. Each port maps
-#: to a per-network cookie datadir (see ``_COOKIE_BY_PORT``).
-CORE_RPC_PORTS: Final[tuple[int, ...]] = (48332, 18332, 18443, 38332, 8332)
+#: testnet3 18332, signet 38332, regtest 18443. The project is mainnet-only
+#: (ADR-0021), so mainnet 8332 is probed first; the legacy/dev networks are
+#: kept so a user's existing node is still found. Each port maps to a
+#: per-network cookie datadir (see ``_COOKIE_BY_PORT``).
+CORE_RPC_PORTS: Final[tuple[int, ...]] = (8332, 18332, 18443, 38332)
 
 #: Well-known self-hosted mempool.space API port (backend), and the electrs
 #: Esplora HTTP port. The mempool URL is configurable via Settings; the
@@ -78,14 +78,13 @@ ELECTRS_ESPLORA_HTTP_PORT: Final[int] = 3002
 
 #: Per-network RPC port → relative cookie path (within the data dir). In
 #: Bitcoin Core, each network's cookie lives in that network's net-specific
-#: data dir (``-testnet4`` ⇒ ``~/.bitcoin/testnet4/``); mainnet uses the data
-#: dir root. ``.cookie`` is the conventional cookie filename.
+#: data dir; mainnet (8332) uses the data dir root (``~/.bitcoin/.cookie``).
+#: ``.cookie`` is the conventional cookie filename.
 _COOKIE_BY_PORT: Final[dict[int, str]] = {
-    48332: "testnet4/.cookie",
+    8332: ".cookie",
     18332: "testnet3/.cookie",
     18443: "regtest/.cookie",
     38332: "signet/.cookie",
-    8332: ".cookie",
 }
 
 _LOCALHOST = "127.0.0.1"
@@ -124,7 +123,8 @@ class CoreHealth:
     0.0–1.0 IBD progress toward the assumevalid target.
 
     Attributes:
-        chain: The network name Core reports (e.g. ``test``, ``testnet4``).
+        chain: The network name Core reports (e.g. ``main``; ``main`` is the
+            expected value for this mainnet-only app, ADR-0021).
         blocks: Local best-block height.
         headers: Headers received (upper bound on sync target).
         verification_progress: Core's IBD progress fraction (0.0–1.0).

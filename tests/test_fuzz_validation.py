@@ -68,7 +68,7 @@ VALID_ENVELOPES: dict[str, dict[str, object]] = {
         "v": 0,
         "intent": "create_tx",
         "params": {
-            "recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            "recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
             "amount_sats": 250000,
             "fee_target": "fast",
         },
@@ -92,7 +92,7 @@ VALID_JSON = [
     '{"v":0,"intent":"get_utxos","params":{}}',
     '{"v":0,"intent":"new_address","params":{}}',
     '{"v":0,"intent":"new_address","params":{"branch":0}}',
-    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_usd":10.5}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4","amount_usd":10.5}}',
     '{"v":0,"intent":"confirm_tx","params":{"tx_ref":"3f2a9c"}}',
     # Phase 3 (TCK-P3-004): strict-key-order docs for the new intents —
     # sign_tx with the optional signer tail, broadcast_tx, tx_status with
@@ -278,7 +278,7 @@ def _fuzz_create_tx_both_amounts(rng: random.Random) -> object:
         "v": 0,
         "intent": "create_tx",
         "params": {
-            "recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            "recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
             "amount_sats": 1000,
             "amount_usd": 10.5,
         },
@@ -290,7 +290,7 @@ def _fuzz_create_tx_neither_amount(rng: random.Random) -> object:
     return {
         "v": 0,
         "intent": "create_tx",
-        "params": {"recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"},
+        "params": {"recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"},
     }
 
 
@@ -300,7 +300,7 @@ def _fuzz_create_tx_unknown_fee_target(rng: random.Random) -> object:
         "v": 0,
         "intent": "create_tx",
         "params": {
-            "recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            "recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
             "amount_sats": 1000,
             "fee_target": "urgent",
         },
@@ -308,11 +308,12 @@ def _fuzz_create_tx_unknown_fee_target(rng: random.Random) -> object:
 
 
 def _fuzz_create_tx_bad_recipient(rng: random.Random) -> object:
-    # mainnet-looking recipient: schema-valid shape, rules-invalid meaning.
+    # testnet-looking recipient: schema-valid shape, rules-invalid meaning
+    # (the wallet is mainnet-only, ADR-0021 — a valid tb1 address is refused).
     return {
         "v": 0,
         "intent": "create_tx",
-        "params": {"recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "amount_sats": 1000},
+        "params": {"recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "amount_sats": 1000},
     }
 
 
@@ -321,7 +322,7 @@ def _fuzz_create_tx_bool_amount(rng: random.Random) -> object:
     return {
         "v": 0,
         "intent": "create_tx",
-        "params": {"recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "amount_sats": True},
+        "params": {"recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "amount_sats": True},
     }
 
 

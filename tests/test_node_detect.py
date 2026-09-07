@@ -20,7 +20,7 @@ from localwallet.node.detect import (
 )
 
 
-def _core_result(chain: str = "testnet4", blocks: int = 100, headers: int = 100,
+def _core_result(chain: str = "main", blocks: int = 100, headers: int = 100,
                  progress: float = 1.0, ibd: bool = False) -> dict:
     return {
         "result": {
@@ -74,9 +74,9 @@ def _transport_for(core_by_port: dict[int, object] | None = None,
 
 
 def test_core_reachable_gives_health(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
-    transport = _transport_for(core_by_port={48332: _core_result(ibd=False)})
-    det = BitcoinCoreDetector(data_dir=data_dir, ports=(48332,), transport=transport)
+    data_dir = _cookie_dir(tmp_path, ".cookie")
+    transport = _transport_for(core_by_port={8332: _core_result(ibd=False)})
+    det = BitcoinCoreDetector(data_dir=data_dir, ports=(8332,), transport=transport)
     with det:
         probes = det.probe()
     assert len(probes) == 1
@@ -84,15 +84,15 @@ def test_core_reachable_gives_health(tmp_path):
     assert probe.status is NodeStatus.REACHABLE
     assert probe.cookie_present is True
     assert probe.health is not None
-    assert probe.health.chain == "testnet4"
+    assert probe.health.chain == "main"
     assert probe.health.is_synced is True
     assert probe.health.sync_percent == 100.0
 
 
 def test_core_unreachable_is_clean_offline_no_crash(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
-    transport = _transport_for(fail_ports={48332})
-    det = BitcoinCoreDetector(data_dir=data_dir, ports=(48332,), transport=transport)
+    data_dir = _cookie_dir(tmp_path, ".cookie")
+    transport = _transport_for(fail_ports={8332})
+    det = BitcoinCoreDetector(data_dir=data_dir, ports=(8332,), transport=transport)
     with det:
         probes = det.probe()
     assert len(probes) == 1
@@ -101,48 +101,48 @@ def test_core_unreachable_is_clean_offline_no_crash(tmp_path):
 
 
 def test_core_bad_cookie_is_auth_failed(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
-    transport = _transport_for(auth_fail_ports={48332})
-    det = BitcoinCoreDetector(data_dir=data_dir, ports=(48332,), transport=transport)
+    data_dir = _cookie_dir(tmp_path, ".cookie")
+    transport = _transport_for(auth_fail_ports={8332})
+    det = BitcoinCoreDetector(data_dir=data_dir, ports=(8332,), transport=transport)
     with det:
         probes = det.probe()
     assert probes[0].status is NodeStatus.AUTH_FAILED
 
 
 def test_core_malformed_json_is_malformed(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
+    data_dir = _cookie_dir(tmp_path, ".cookie")
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="not json", request=request)
 
-    det = BitcoinCoreDetector(data_dir=data_dir, ports=(48332,), transport=httpx.MockTransport(handler))
+    det = BitcoinCoreDetector(data_dir=data_dir, ports=(8332,), transport=httpx.MockTransport(handler))
     with det:
         probes = det.probe()
     assert probes[0].status is NodeStatus.MALFORMED
 
 
 def test_core_malformed_shape_is_malformed(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
-    transport = _transport_for(core_by_port={48332: {"result": {"chain": 5}, "error": None}})
-    det = BitcoinCoreDetector(data_dir=data_dir, ports=(48332,), transport=transport)
+    data_dir = _cookie_dir(tmp_path, ".cookie")
+    transport = _transport_for(core_by_port={8332: {"result": {"chain": 5}, "error": None}})
+    det = BitcoinCoreDetector(data_dir=data_dir, ports=(8332,), transport=transport)
     with det:
         probes = det.probe()
     assert probes[0].status is NodeStatus.MALFORMED
 
 
 def test_core_rpc_error_body_is_malformed(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
-    transport = _transport_for(core_by_port={48332: {"result": None, "error": {"code": -1, "message": "x"}}})
-    det = BitcoinCoreDetector(data_dir=data_dir, ports=(48332,), transport=transport)
+    data_dir = _cookie_dir(tmp_path, ".cookie")
+    transport = _transport_for(core_by_port={8332: {"result": None, "error": {"code": -1, "message": "x"}}})
+    det = BitcoinCoreDetector(data_dir=data_dir, ports=(8332,), transport=transport)
     with det:
         probes = det.probe()
     assert probes[0].status is NodeStatus.MALFORMED
 
 
 def test_core_syncing_reports_progress(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
-    transport = _transport_for(core_by_port={48332: _core_result(blocks=50, headers=100, progress=0.5, ibd=True)})
-    det = BitcoinCoreDetector(data_dir=data_dir, ports=(48332,), transport=transport)
+    data_dir = _cookie_dir(tmp_path, ".cookie")
+    transport = _transport_for(core_by_port={8332: _core_result(blocks=50, headers=100, progress=0.5, ibd=True)})
+    det = BitcoinCoreDetector(data_dir=data_dir, ports=(8332,), transport=transport)
     with det:
         probes = det.probe()
     probe = probes[0]
@@ -159,8 +159,8 @@ def test_core_syncing_reports_progress(tmp_path):
 def test_missing_cookie_sets_cookie_present_false(tmp_path):
     data_dir = tmp_path / "empty-datadir"  # no cookie file
     data_dir.mkdir()
-    transport = _transport_for(core_by_port={48332: _core_result()})
-    det = BitcoinCoreDetector(data_dir=data_dir, ports=(48332,), transport=transport)
+    transport = _transport_for(core_by_port={8332: _core_result()})
+    det = BitcoinCoreDetector(data_dir=data_dir, ports=(8332,), transport=transport)
     with det:
         probes = det.probe()
     assert probes[0].cookie_present is False
@@ -169,18 +169,18 @@ def test_missing_cookie_sets_cookie_present_false(tmp_path):
 def test_explicit_cookie_path_overrides_per_network(tmp_path):
     custom = tmp_path / "custom-cookie"
     custom.write_text("__cookie__:abc\n", encoding="ascii")
-    settings = Settings(rpc_port=48332, rpc_cookie_path=str(custom))
-    transport = _transport_for(core_by_port={48332: _core_result()})
-    det = BitcoinCoreDetector(settings, data_dir=tmp_path, ports=(48332,), transport=transport)
+    settings = Settings(rpc_port=8332, rpc_cookie_path=str(custom))
+    transport = _transport_for(core_by_port={8332: _core_result()})
+    det = BitcoinCoreDetector(settings, data_dir=tmp_path, ports=(8332,), transport=transport)
     with det:
         probes = det.probe()
     assert probes[0].status is NodeStatus.REACHABLE
 
 
 def test_cookie_secret_never_in_report(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
-    transport = _transport_for(core_by_port={48332: _core_result()})
-    det = BitcoinCoreDetector(data_dir=data_dir, ports=(48332,), transport=transport)
+    data_dir = _cookie_dir(tmp_path, ".cookie")
+    transport = _transport_for(core_by_port={8332: _core_result()})
+    det = BitcoinCoreDetector(data_dir=data_dir, ports=(8332,), transport=transport)
     with det:
         probes = det.probe()
     # The cookie CONTENT must never appear anywhere in probe data.
@@ -191,13 +191,13 @@ def test_cookie_secret_never_in_report(tmp_path):
 
 
 def test_detect_local_nodes_report_and_reachable_kinds(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
+    data_dir = _cookie_dir(tmp_path, ".cookie")
     settings = Settings(local_mempool_url="http://127.0.0.1:3006")
 
     # Use one transport covering both RPC and HTTP probes by URL port.
     def handler(request: httpx.Request) -> httpx.Response:
         port = request.url.port
-        if port == 48332:
+        if port == 8332:
             return httpx.Response(200, json=_core_result(), request=request)
         if port in (3006, 3002):
             return httpx.Response(200, request=request)
@@ -216,7 +216,7 @@ def test_detect_local_nodes_report_and_reachable_kinds(tmp_path):
 
 
 def test_detect_local_nodes_offline_when_everything_unreachable(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
+    data_dir = _cookie_dir(tmp_path, ".cookie")
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused", request=request)
@@ -229,7 +229,7 @@ def test_detect_local_nodes_offline_when_everything_unreachable(tmp_path):
 
 
 def test_detect_local_nodes_skipped_when_disabled(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
+    data_dir = _cookie_dir(tmp_path, ".cookie")
     settings = Settings(node_detection_enabled=False)
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -243,7 +243,7 @@ def test_detect_local_nodes_skipped_when_disabled(tmp_path):
 
 def test_detect_local_nodes_never_raises_for_missing_daemon(tmp_path):
     # Any collection of failures must resolve to a report, not an exception.
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
+    data_dir = _cookie_dir(tmp_path, ".cookie")
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused", request=request)
@@ -259,7 +259,7 @@ def test_malformed_configured_mempool_url_is_clean_state_not_crash(tmp_path):
     httpx 0.28), so it previously escaped the probe's except clause. It must now
     resolve to a clean state, and nothing may be probed for a bad URL.
     """
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
+    data_dir = _cookie_dir(tmp_path, ".cookie")
     settings = Settings(local_mempool_url="not-a-url")
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -268,7 +268,7 @@ def test_malformed_configured_mempool_url_is_clean_state_not_crash(tmp_path):
         if request.url.host != "127.0.0.1":
             raise AssertionError("malformed URL must not be probed")
         port = request.url.port
-        if port == 48332:
+        if port == 8332:
             return httpx.Response(200, json=_core_result(), request=request)
         if port == 3002:
             return httpx.Response(200, request=request)
@@ -284,27 +284,27 @@ def test_malformed_configured_mempool_url_is_clean_state_not_crash(tmp_path):
 
 
 def test_core_health_never_carries_secrets(tmp_path):
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
-    transport = _transport_for(core_by_port={48332: _core_result()})
-    det = BitcoinCoreDetector(data_dir=data_dir, ports=(48332,), transport=transport)
+    data_dir = _cookie_dir(tmp_path, ".cookie")
+    transport = _transport_for(core_by_port={8332: _core_result()})
+    det = BitcoinCoreDetector(data_dir=data_dir, ports=(8332,), transport=transport)
     with det:
         probes = det.probe()
     health = probes[0].health
     assert isinstance(health, CoreHealth)
     # Health carries only sync metadata — no wallet data.
-    assert health.chain == "testnet4"
+    assert health.chain == "main"
     assert isinstance(health.blocks, int)
 
 
 def test_detect_uses_only_loopback_hosts(tmp_path):
     """Detection never targets a non-loopback host (privacy invariant)."""
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
+    data_dir = _cookie_dir(tmp_path, ".cookie")
     seen_hosts: set[str] = set()
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen_hosts.add(request.url.host)
         port = request.url.port
-        if port == 48332:
+        if port == 8332:
             return httpx.Response(200, json=_core_result(), request=request)
         if port in (3006, 3002):
             return httpx.Response(200, request=request)
@@ -322,7 +322,7 @@ def test_detect_never_probes_public_mempool_url(tmp_path):
     never be contacted by this lint-exempt module. It resolves to the clean
     OFFLINE state instead; the transport proves zero requests to that host.
     """
-    data_dir = _cookie_dir(tmp_path, "testnet4", ".cookie")
+    data_dir = _cookie_dir(tmp_path, ".cookie")
     settings = Settings(local_mempool_url="http://example.com:3006")
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -330,7 +330,7 @@ def test_detect_never_probes_public_mempool_url(tmp_path):
         if request.url.host != "127.0.0.1":
             raise AssertionError(f"must not probe non-loopback host: {request.url.host}")
         port = request.url.port
-        if port == 48332:
+        if port == 8332:
             return httpx.Response(200, json=_core_result(), request=request)
         if port == 3002:
             return httpx.Response(200, request=request)
@@ -340,3 +340,18 @@ def test_detect_never_probes_public_mempool_url(tmp_path):
     assert report.mempool is NodeStatus.OFFLINE
     assert report.electrs is NodeStatus.REACHABLE
     assert any(p.status is NodeStatus.REACHABLE for p in report.core)
+
+
+# ------------------------------------------------------------ Default ports
+
+
+def test_default_ports_probe_mainnet_first_and_skip_testnet4():
+    """Mainnet Core RPC 8332 is the primary/default probe target; the removed
+    testnet4 port (48332) is never probed by default (mainnet-only, ADR-0021).
+    The mainnet cookie lives at the data-dir root."""
+    from localwallet.node.detect import _COOKIE_BY_PORT, CORE_RPC_PORTS
+
+    assert CORE_RPC_PORTS[0] == 8332
+    assert 48332 not in CORE_RPC_PORTS
+    assert _COOKIE_BY_PORT[8332] == ".cookie"
+    assert 48332 not in _COOKIE_BY_PORT

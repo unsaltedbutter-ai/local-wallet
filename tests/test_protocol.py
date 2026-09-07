@@ -65,9 +65,9 @@ from localwallet.protocol.envelope import (
 
 # ---------------------------------------------------------------- helpers
 
-#: A schema- and rules-valid testnet P2WPKH address (BIP173 testnet vector
+#: A schema- and rules-valid mainnet P2WPKH address (BIP173 mainnet vector
 #: for pubkey hash 751e76e8...). Used only as a well-formed fixture value.
-TESTNET_P2WPKH = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
+MAINNET_P2WPKH = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
 
 ACCEPT_CASES = {
     "respond": {"v": 0, "intent": "respond", "params": {"text": "hello there"}},
@@ -84,7 +84,7 @@ ACCEPT_CASES = {
     "create_tx": {
         "v": 0,
         "intent": "create_tx",
-        "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 250000},
+        "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 250000},
     },
     "confirm_tx": {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "3f2a9c"}},
     # Phase 3 v0 extension (ADR-0002/0013 amendment): signer handoff,
@@ -376,13 +376,13 @@ def test_node_status_rejects_any_params_key():
 @pytest.mark.parametrize(
     "params",
     [
-        {"recipient": TESTNET_P2WPKH, "amount_sats": 546},
-        {"recipient": TESTNET_P2WPKH, "amount_sats": 250_000, "fee_target": "fast"},
-        {"recipient": TESTNET_P2WPKH, "amount_sats": 250_000, "fee_target": "medium"},
-        {"recipient": TESTNET_P2WPKH, "amount_sats": 250_000, "fee_target": "slow"},
-        {"recipient": TESTNET_P2WPKH, "amount_usd": 100.0},
-        {"recipient": TESTNET_P2WPKH, "amount_usd": 10},  # integer JSON number
-        {"recipient": TESTNET_P2WPKH, "amount_usd": 0.01, "fee_target": "slow"},
+        {"recipient": MAINNET_P2WPKH, "amount_sats": 546},
+        {"recipient": MAINNET_P2WPKH, "amount_sats": 250_000, "fee_target": "fast"},
+        {"recipient": MAINNET_P2WPKH, "amount_sats": 250_000, "fee_target": "medium"},
+        {"recipient": MAINNET_P2WPKH, "amount_sats": 250_000, "fee_target": "slow"},
+        {"recipient": MAINNET_P2WPKH, "amount_usd": 100.0},
+        {"recipient": MAINNET_P2WPKH, "amount_usd": 10},  # integer JSON number
+        {"recipient": MAINNET_P2WPKH, "amount_usd": 0.01, "fee_target": "slow"},
     ],
     ids=["sats-min", "sats-fast", "sats-medium", "sats-slow", "usd-float", "usd-int-json", "usd-min-fee"],
 )
@@ -398,17 +398,17 @@ def test_accept_create_tx_param_combinations(params: dict):
 def test_accept_create_tx_amount_boundaries():
     """Schema bounds: sats 546..21_000_000_000_000_000, usd 0.01..1_000_000."""
     ok_sats_hi = validate_payload(
-        {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": MAX_AMOUNT_SATS}}
+        {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": MAX_AMOUNT_SATS}}
     )
     assert ok_sats_hi.params.amount_sats == MAX_AMOUNT_SATS
     assert MIN_AMOUNT_SATS == 546
     ok_usd_hi = validate_payload(
-        {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": MAX_AMOUNT_USD}}
+        {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_usd": MAX_AMOUNT_USD}}
     )
     assert ok_usd_hi.params.amount_usd == MAX_AMOUNT_USD
     assert MIN_AMOUNT_USD == 0.01
     ok_usd_int = validate_payload(
-        {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": 1_000_000}}
+        {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_usd": 1_000_000}}
     )
     assert ok_usd_int.params.amount_usd == 1_000_000.0
 
@@ -422,7 +422,7 @@ def test_accept_create_tx_exponent_json_is_schema_legal():
     wider authority for non-grammar producers.
     """
     envelope = validate_payload(
-        f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{TESTNET_P2WPKH}","amount_usd":1e2}}}}'
+        f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{MAINNET_P2WPKH}","amount_usd":1e2}}}}'
     )
     assert envelope.params.amount_usd == 100.0
 
@@ -440,15 +440,15 @@ def test_create_tx_hostile_json_numbers_rejected_cleanly():
     huge = "9" * 400
     cases = {
         "nan": (
-            f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{TESTNET_P2WPKH}",'
+            f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{MAINNET_P2WPKH}",'
             f'"amount_usd":NaN}}}}'
         ),
         "infinity": (
-            f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{TESTNET_P2WPKH}",'
+            f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{MAINNET_P2WPKH}",'
             f'"amount_usd":Infinity}}}}'
         ),
         "huge-int-literal": (
-            f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{TESTNET_P2WPKH}",'
+            f'{{"v":0,"intent":"create_tx","params":{{"recipient":"{MAINNET_P2WPKH}",'
             f'"amount_usd":{huge}}}}}'
         ),
     }
@@ -496,10 +496,10 @@ def test_create_tx_amount_xor_is_layered():
     # both/neither rejected at the schema layer (see REJECT_MATRIX); here:
     # the layer-3 re-check catches validation-skipping constructors.
     both = CreateTxParams.model_construct(
-        recipient=TESTNET_P2WPKH, amount_sats=546, amount_usd=1.0, fee_target=None
+        recipient=MAINNET_P2WPKH, amount_sats=546, amount_usd=1.0, fee_target=None
     )
     neither = CreateTxParams.model_construct(
-        recipient=TESTNET_P2WPKH, amount_sats=None, amount_usd=None, fee_target=None
+        recipient=MAINNET_P2WPKH, amount_sats=None, amount_usd=None, fee_target=None
     )
     for bad in (both, neither):
         failures = BUSINESS_RULES[IntentName.CREATE_TX](bad)
@@ -532,29 +532,30 @@ def test_create_tx_business_rule_amount_bounds_bypass():
     }
     for name, (amounts, field) in bounds.items():
         bypass = CreateTxParams.model_construct(
-            recipient=TESTNET_P2WPKH, fee_target=None, **amounts
+            recipient=MAINNET_P2WPKH, fee_target=None, **amounts
         )
         failures = BUSINESS_RULES[IntentName.CREATE_TX](bypass)
         assert len(failures) == 1, name
         assert field in failures[0], name
     # an in-range bypass still validates (XOR + recipient remain the checks)
     ok = CreateTxParams.model_construct(
-        recipient=TESTNET_P2WPKH, amount_sats=250_000, amount_usd=None, fee_target=None
+        recipient=MAINNET_P2WPKH, amount_sats=250_000, amount_usd=None, fee_target=None
     )
     assert BUSINESS_RULES[IntentName.CREATE_TX](ok) == []
 
 
 def test_business_rule_create_tx_recipient_matrix():
-    """Layer-3 recipient semantics: testnet witness-v0 P2WPKH only.
+    """Layer-3 recipient semantics: mainnet witness-v0 P2WPKH only.
 
     Each failure mode has a specific, value-free string; the address value
-    (and any prefix of it) never appears in a failure.
+    (and any prefix of it) never appears in a failure. Testnet (``tb1``)
+    recipients are refused — the wallet is mainnet-only (ADR-0021).
     """
     from embit import bech32
 
-    mainnet = bech32.encode("bc", 0, bytes.fromhex("751e76e8199196d454941c45d1b3a323f1433bd6"))
-    taproot_v1 = bech32.encode("tb", 1, b"\x11" * 32)
-    p2wsh_v0 = bech32.encode("tb", 0, b"\x22" * 32)
+    testnet = bech32.encode("tb", 0, bytes.fromhex("751e76e8199196d454941c45d1b3a323f1433bd6"))
+    taproot_v1 = bech32.encode("bc", 1, b"\x11" * 32)
+    p2wsh_v0 = bech32.encode("bc", 0, b"\x22" * 32)
 
     def rule_for(recipient: str) -> list[str]:
         env = validate_payload(
@@ -562,12 +563,18 @@ def test_business_rule_create_tx_recipient_matrix():
         )
         return BUSINESS_RULES[IntentName.CREATE_TX](env.params)
 
-    assert rule_for(TESTNET_P2WPKH) == []
+    # bc1 acceptance matrix: lowercase, BIP173-all-upper, and the whole
+    # witness-v0/20-byte-program shape space.
+    assert rule_for(MAINNET_P2WPKH) == []
     # uppercase is BIP173-legal (all-upper form); the decoder decides
-    assert rule_for(TESTNET_P2WPKH.upper()) == []
+    assert rule_for(MAINNET_P2WPKH.upper()) == []
 
-    assert rule_for(mainnet) == [
-        "recipient is not a testnet bech32 address (wrong network prefix)"
+    # testnet-refusal negatives: a valid tb1 P2WPKH is now refused (wrong HRP)
+    assert rule_for(testnet) == [
+        "recipient is not a mainnet bech32 address (wrong network prefix)"
+    ]
+    assert rule_for("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx") == [
+        "recipient is not a mainnet bech32 address (wrong network prefix)"
     ]
     assert rule_for(taproot_v1) == [
         "recipient must be a witness version 0 address (taproot v1 and later are not supported)"
@@ -575,24 +582,24 @@ def test_business_rule_create_tx_recipient_matrix():
     assert rule_for(p2wsh_v0) == [
         "recipient must be a P2WPKH address (witness v0 with a 20-byte program)"
     ]
-    for bad in ("not-an-address", TESTNET_P2WPKH[:-1] + "q", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzSx"):
+    for bad in ("not-an-address", MAINNET_P2WPKH[:-1] + "q", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3tSx"):
         failures = rule_for(bad)
-        assert failures == ["recipient is not a valid testnet bech32 address"]
+        assert failures == ["recipient is not a valid mainnet bech32 address"]
 
     # strings below the schema's 14-char floor never reach the rule via
     # validate_payload; a validation-skipping constructor must still be
     # refused here (the decoder is the only authority on bech32 validity)
-    for short in ("", "tb1q", "x" * 13):
+    for short in ("", "bc1q", "x" * 13):
         bypass = CreateTxParams.model_construct(
             recipient=short, amount_sats=546, amount_usd=None, fee_target=None
         )
         assert BUSINESS_RULES[IntentName.CREATE_TX](bypass) == [
-            "recipient is not a valid testnet bech32 address"
+            "recipient is not a valid mainnet bech32 address"
         ]
 
     # value-free: the address itself is never echoed (checked for a
     # representative long/short/valid-shaped address)
-    for addr in (TESTNET_P2WPKH, mainnet, taproot_v1, p2wsh_v0):
+    for addr in (MAINNET_P2WPKH, testnet, taproot_v1, p2wsh_v0):
         joined = "; ".join(rule_for(addr))
         assert addr not in joined
 
@@ -633,15 +640,20 @@ def test_business_rule_confirm_tx_empty_bypass():
 
 
 def test_create_tx_business_rule_failures_flow_through_handle_raw():
-    """A rules-invalid create_tx surfaces needs_retry with value-free text."""
+    """A rules-invalid create_tx surfaces needs_retry with value-free text.
+
+    Post-flip the invalid recipient is a valid TESTNET address — refused by
+    the mainnet-only HRP rule (ADR-0021) — proving the refusal flows through
+    the full dispatch path value-free.
+    """
     table, _ = make_table()
-    raw = {"v": 0, "intent": "create_tx", "params": {"recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "amount_sats": 546}}
+    raw = {"v": 0, "intent": "create_tx", "params": {"recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "amount_sats": 546}}
     outcome = handle_raw(raw, table)
     assert outcome.status is OutcomeStatus.NEEDS_RETRY
     assert any("wrong network prefix" in f for f in outcome.failures)
     # the address is not echoed into the error envelope detail
     assert outcome.error is not None
-    assert "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" not in outcome.error.error.detail
+    assert "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx" not in outcome.error.error.detail
 
 
 def test_new_intent_binding_validator_renders_hostile_key_value_free_create_tx():
@@ -655,7 +667,7 @@ def test_new_intent_binding_validator_renders_hostile_key_value_free_create_tx()
     raw = {
         "v": 0,
         "intent": "create_tx",
-        "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, hostile_key: "value"},
+        "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, hostile_key: "value"},
     }
     exc = expect_rejected(raw)
     joined = "; ".join(exc.failures)
@@ -929,31 +941,31 @@ REJECT_MATRIX = [
     ("new_address_limit_key", {"v": 0, "intent": "new_address", "params": {"limit": 5}}),
     ("new_address_extra_key", {"v": 0, "intent": "new_address", "params": {"count": 3}}),
     # Phase 2 v0 extension: create_tx / confirm_tx rejects (schema layer)
-    ("create_tx_both_amounts", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "amount_usd": 1.0}}),
-    ("create_tx_neither_amount", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH}}),
+    ("create_tx_both_amounts", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "amount_usd": 1.0}}),
+    ("create_tx_neither_amount", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH}}),
     ("create_tx_recipient_short", {"v": 0, "intent": "create_tx", "params": {"recipient": "x" * 13, "amount_sats": 546}}),
     ("create_tx_recipient_long", {"v": 0, "intent": "create_tx", "params": {"recipient": "x" * 101, "amount_sats": 546}}),
     ("create_tx_recipient_not_string", {"v": 0, "intent": "create_tx", "params": {"recipient": 42, "amount_sats": 546}}),
     ("create_tx_recipient_bool", {"v": 0, "intent": "create_tx", "params": {"recipient": True, "amount_sats": 546}}),
-    ("create_tx_sats_545", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 545}}),
-    ("create_tx_sats_negative", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": -5}}),
-    ("create_tx_sats_over_max", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": MAX_AMOUNT_SATS + 1}}),
-    ("create_tx_sats_string", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": "546"}}),
-    ("create_tx_sats_bool", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": True}}),
-    ("create_tx_sats_float", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546.0}}),
-    ("create_tx_sats_null", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": None}}),
-    ("create_tx_usd_009", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": 0.009}}),
-    ("create_tx_usd_zero", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": 0}}),
-    ("create_tx_usd_negative", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": -1.0}}),
-    ("create_tx_usd_over_max", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": 1_000_000.01}}),
-    ("create_tx_usd_string", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": "10.5"}}),
-    ("create_tx_usd_bool", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": False}}),
-    ("create_tx_usd_null", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_usd": None}}),
-    ("create_tx_fee_target_invalid", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "fee_target": "urgent"}}),
-    ("create_tx_fee_target_case", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "fee_target": "FAST"}}),
-    ("create_tx_fee_target_number", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "fee_target": 1}}),
-    ("create_tx_fee_target_null", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "fee_target": None}}),
-    ("create_tx_extra_key", {"v": 0, "intent": "create_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546, "memo": "hi"}}),
+    ("create_tx_sats_545", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 545}}),
+    ("create_tx_sats_negative", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": -5}}),
+    ("create_tx_sats_over_max", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": MAX_AMOUNT_SATS + 1}}),
+    ("create_tx_sats_string", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": "546"}}),
+    ("create_tx_sats_bool", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": True}}),
+    ("create_tx_sats_float", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546.0}}),
+    ("create_tx_sats_null", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": None}}),
+    ("create_tx_usd_009", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_usd": 0.009}}),
+    ("create_tx_usd_zero", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_usd": 0}}),
+    ("create_tx_usd_negative", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_usd": -1.0}}),
+    ("create_tx_usd_over_max", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_usd": 1_000_000.01}}),
+    ("create_tx_usd_string", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_usd": "10.5"}}),
+    ("create_tx_usd_bool", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_usd": False}}),
+    ("create_tx_usd_null", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_usd": None}}),
+    ("create_tx_fee_target_invalid", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_target": "urgent"}}),
+    ("create_tx_fee_target_case", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_target": "FAST"}}),
+    ("create_tx_fee_target_number", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_target": 1}}),
+    ("create_tx_fee_target_null", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_target": None}}),
+    ("create_tx_extra_key", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "memo": "hi"}}),
     ("create_tx_wrong_intent_key", {"v": 0, "intent": "create_tx", "params": {"tx_ref": "abc", "amount_sats": 546}}),
     ("confirm_tx_empty", {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": ""}}),
     ("confirm_tx_overlong", {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "x" * 65}}),
@@ -961,7 +973,7 @@ REJECT_MATRIX = [
     ("confirm_tx_null", {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": None}}),
     ("confirm_tx_extra_key", {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "abc", "decision": "yes"}}),
     ("confirm_tx_missing", {"v": 0, "intent": "confirm_tx", "params": {}}),
-    ("confirm_tx_create_tx_keys", {"v": 0, "intent": "confirm_tx", "params": {"recipient": TESTNET_P2WPKH, "amount_sats": 546}}),
+    ("confirm_tx_create_tx_keys", {"v": 0, "intent": "confirm_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546}}),
     # Phase 3 v0 extension: sign_tx / broadcast_tx / tx_status rejects (schema layer)
     ("sign_tx_empty", {"v": 0, "intent": "sign_tx", "params": {"tx_ref": ""}}),
     ("sign_tx_overlong", {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "x" * 65}}),

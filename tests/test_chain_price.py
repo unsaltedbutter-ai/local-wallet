@@ -24,7 +24,7 @@ from localwallet.chain import (
 from localwallet.chain import esplora as esplora_module
 from localwallet.chain import price as price_module
 
-BASE_URL = "https://mempool.space/testnet4/api"
+BASE_URL = "https://mempool.space/api"
 KIND = "price"
 
 PRICES = {"time": 1_700_000_000, "USD": 67_500.5}
@@ -80,7 +80,7 @@ def test_fresh_parses_usd_rate():
     assert rate.stale is False
     request = server.requests[0]
     assert request.method == "GET"
-    assert request.url.path == "/testnet4/api/v1/prices"
+    assert request.url.path == "/api/v1/prices"
 
 
 def test_age_s_tracks_clock(monkeypatch: pytest.MonkeyPatch):
@@ -276,6 +276,21 @@ def test_no_cache_malformed_200_also_hits_stale_ok():
     with server.client() as client, pytest.raises(PriceUnavailableError):
         PriceOracle(client, ttl_s=60.0).stale_ok()
     assert len(server.requests) == 1
+
+
+def test_provider_price_sentinel_is_the_degenerate_fail_closed_case():
+    """The provider's sentinel body (``{"time": ..., "USD": -1}`` — the shape
+    the public endpoint served when no fiat data was available) is a
+    DEGENERATE case now that mainnet real prices are the normal parse. The
+    sentinel must still fail closed to the sats-only degrade surface, and the
+    sentinel value must never surface as a rate.
+    """
+    server = ScriptedServer(httpx.Response(200, json={"time": 1_700_000_000, "USD": -1}))
+    with server.client() as client, pytest.raises(PriceUnavailableError) as excinfo:
+        PriceOracle(client, ttl_s=60.0).fresh()
+    assert "price unavailable" == str(excinfo.value)  # value-free sats-only degrade
+    assert "-1" not in str(excinfo.value)  # sentinel value never leaks
+    assert len(server.requests) == 1  # shape errors are not retried
 
 
 # -- non-finite / absurd rate rejection (A1) --------------------------------

@@ -32,15 +32,18 @@ from localwallet.wallet import GAP_LIMIT_SETTING, WalletDescriptor, scan_wallet
 from localwallet.wallet.derivation import derive_addresses
 
 PUBLIC_HOST = "mempool.space"
-PUBLIC_BASE = "https://mempool.space/testnet4/api"
+PUBLIC_BASE = "https://mempool.space/api"
 SELF_HOSTED = "http://127.0.0.1:3006"
-ADDRESS = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
+ADDRESS = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
 
-# The same fixed fixture vpub used across the suite (a public key, not a
-# secret — re-derived from a fixed seed in test_e2e_skeleton.py).
-VPUB: str = (
-    "vpub5ZJ3cDEGGk61yWWUHFHgmG3M4je4yFD3ebC6jWHsqV8Cxh2K5zz8c6X5Hk7FkUAB"
-    "FTjRkQBz3g84MYeRhjAdnq1QmrmyTRTrzs8rFVCJUyh"
+# The same fixed fixture mainnet zpub used across the suite (a public key,
+# not a secret — derived from the fixed seed in test_wallet_descriptor.py,
+# same procedure as the Phase 0 e2e fixtures). Mainnet-only (ADR-0021): the
+# wallet layer refuses testnet keys, so the former testnet vpub fixture is
+# replaced by the canonical mainnet zpub.
+ZPUB: str = (
+    "zpub6qh6bF4roUgQtg2fm5SUhRsQFEidwUPPLhS82BDHjtNh2UxmgNfCS8NF4jQoBqNCeEW"
+    "BaKyTxcmyBkq3iuZS5Seyz5dWMcwYxaMgpZn4cWQ"
 )
 
 RECOMMENDED = {
@@ -209,8 +212,8 @@ def test_config_selected_base_url_routes_all_queries_to_it(
         assert req.url.host == "127.0.0.1", req.url
         assert req.url.port == 3006
         assert "mempool.space" not in req.url.host
-    assert server.requests[0].url.path == "/address/tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx/txs"
-    assert server.requests[1].url.path == "/address/tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx/utxo"
+    assert server.requests[0].url.path == f"/address/{ADDRESS}/txs"
+    assert server.requests[1].url.path == f"/address/{ADDRESS}/utxo"
     assert server.requests[2].url.path == "/blocks/tip"
 
 
@@ -245,7 +248,7 @@ class AssertionTransport:
         if kind == "utxo":
             # Fund the first receive address with one 100_000-sat UTXO so the
             # create_tx path can select coins (proving fees+price fire).
-            addr0 = derive_addresses(WalletDescriptor.from_key(VPUB).parsed, 0, 0, 1)[0].address
+            addr0 = derive_addresses(WalletDescriptor.from_key(ZPUB).parsed, 0, 0, 1)[0].address
             return httpx.Response(200, json=[{"txid": "d" * 64, "vout": 0, "value": 100_000,
                                               "status": {"confirmed": True}}]
                                   if request.url.path.endswith(f"/{addr0}/utxo") else [])
@@ -265,7 +268,7 @@ def _self_hosted_table(monkeypatch: pytest.MonkeyPatch) -> tuple[
     )
     assert client._base_url == SELF_HOSTED  # selection active
     store = Store.memory()
-    wd = WalletDescriptor.from_key(VPUB)
+    wd = WalletDescriptor.from_key(ZPUB)
     wallet = store.create_wallet("default", wd.descriptor)
     store.set_active_wallet(wallet.id)
     store.set_setting(GAP_LIMIT_SETTING, "2")
@@ -292,7 +295,7 @@ def test_zero_public_calls_when_self_hosted_balance_fees_price(
 
         # create_tx → fee estimator + price oracle + change/recipient selection
         # (fees and price are wired over the SAME config-selected client).
-        recipient = derive_addresses(WalletDescriptor.from_key(VPUB).parsed, 0, 9, 1)[0].address
+        recipient = derive_addresses(WalletDescriptor.from_key(ZPUB).parsed, 0, 9, 1)[0].address
         create = table[IntentName.CREATE_TX](
             validate_payload(
                 {
