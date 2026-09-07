@@ -466,3 +466,95 @@ class TestSignedImportPath:
         digest = hashlib.sha256(b"../../etc/passwd").hexdigest()[:8]
         assert path == folder / f"localwallet-signed-{digest}.psbt.b64"
         assert ".." not in path.name
+
+
+class TestBoundedReads:
+    """TCK-SEC-007: every signer file read is a MAXIMUM-READ with a byte cap
+    — a planted oversized file (including via a stat-then-swap TOCTOU) is
+    refused deterministically, never buffered, and the refusal is value-free."""
+
+    def test_oversized_checksum_sidecar_refused_on_import(
+        self, signer: FilePsbtSigner, folder: Path
+    ):
+        from localwallet.signer import file as file_module
+
+        signed_path = make_signed_file(
+            folder, "localwallet-signed-abc12345.psbt.b64", sidecar=False
+        )
+        sidecar = folder / ("localwallet-signed-abc12345.psbt.b64.sha256")
+        sidecar.write_bytes(b"0" * (file_module._MAX_CHECKSUM_FILE_BYTES + 1))
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(signed_path)
+        # Same error class/pattern as the existing size gate, value-free.
+        assert "checksum sidecar exceeds the maximum size" in str(exc.value)
+        assert str(folder) not in str(exc.value)
+        assert not str(signed_path) in str(exc.value)
+
+    def test_sidecar_at_cap_boundary_still_verified(
+        self, signer: FilePsbtSigner, folder: Path
+    ):
+        # 65 valid bytes (hex digest + newline) sit far below the cap and
+        # must keep verifying — the cap only refuses OVER the limit.
+        signed_path = make_signed_file(folder, "localwallet-signed-abc12345.psbt.b64")
+        result = signer.import_signed(signed_path)
+        assert result.checksum_verified is True
+
+    def test_oversized_existing_unsigned_refused_on_export(
+        self, signer: FilePsbtSigner, folder: Path
+    ):
+        from localwallet.signer import file as file_module
+
+        b64 = psbt_to_base64(build_unsigned())
+        files = signer.export_unsigned(b64, "abc12345")
+        # Plant an oversized (sparse) file at the unsigned path; the
+        # idempotent re-export must refuse on the bounded read.
+        with open(files.unsigned_path, "wb") as fh:
+            fh.seek(file_module._MAX_PSBT_FILE_BYTES)
+            fh.write(b"\0")
+        with pytest.raises(SignerError) as exc:
+            signer.export_unsigned(b64, "abc12345")
+        assert "existing unsigned file exceeds the maximum container size" in str(
+            exc.value
+        )
+        assert str(folder) not in str(exc.value)
+
+    def test_signed_read_cap_survives_stat_swap_toctou(
+        self, signer: FilePsbtSigner, folder: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """TOCTOU: a file that LIES at stat() time (small st_size) but is
+        oversized on disk must still be refused by the read-time cap — the
+        cap is enforced on the bytes actually read, not only on the stat."""
+        from localwallet.signer import file as file_module
+
+        path = folder / "localwallet-signed-abc12345.psbt.b64"
+        with open(path, "wb") as fh:
+            fh.seek(file_module._MAX_PSBT_FILE_BYTES + 1)  # over the read cap
+            fh.write(b"\0")  # sparse
+        assert path.stat().st_size == file_module._MAX_PSBT_FILE_BYTES + 2
+
+        real_stat = Path.stat
+
+        def lying_stat(self: Path, *args: object, **kwargs: object):
+            if self == path:
+                return type("FakeStat", (), {"st_size": 1})()  # claims tiny
+            return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "stat", lying_stat)
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(path)
+        assert "signed file exceeds the maximum container size" in str(exc.value)
+        assert str(folder) not in str(exc.value)
+
+    def test_signed_file_exactly_at_read_cap_passes_the_read(
+        self, signer: FilePsbtSigner, folder: Path
+    ):
+        """Boundary: exactly ``_MAX_PSBT_FILE_BYTES`` bytes pass the bounded
+        read (the file then fails later validation — never the read cap)."""
+        from localwallet.signer import file as file_module
+
+        path = folder / "localwallet-signed-abc12345.psbt.b64"
+        path.write_bytes(b"A" * file_module._MAX_PSBT_FILE_BYTES)
+        with pytest.raises(SignerError) as exc:
+            signer.import_signed(path)
+        # The read itself succeeded; refusal comes from a later check.
+        assert "could not read" not in str(exc.value)

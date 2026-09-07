@@ -21,6 +21,12 @@ Implements the file conventions of ADR-0014 (OQ17):
   data, exactly as revalidate's parse-before-bounds note assumes.
 - **Value-free errors:** messages never echo PSBT content, addresses,
   amounts, or transfer-folder filenames.
+- **Bounded reads (TCK-SEC-007):** every file read on both paths (signed
+  PSBT, checksum sidecar, existing unsigned file) is a chunked read with a
+  running byte cap (:data:`_MAX_PSBT_FILE_BYTES` / :data:`_MAX_CHECKSUM_FILE_BYTES`)
+  — never an unbounded ``read()``/``read_text()`` — so a planted oversized
+  file cannot spike memory even if it slipped past a ``stat()`` gate
+  (stat-then-read TOCTOU).
 
 Security note (ADR-0014): PSBTs are **public data** (they carry no keys) so
 writing them to a transfer folder is safe, but this module never writes
@@ -73,8 +79,20 @@ _MAX_PSBT_TEXT_CHARS = 200_000
 #: of the stripped base64 text; the EXACT character-level ceiling
 #: (:data:`_MAX_PSBT_TEXT_CHARS`, applied to the stripped text) is
 #: re-checked after the bounded read — this byte gate is a memory guard,
-#: not the semantic ceiling.
+#: not the semantic ceiling. The same cap is ALSO enforced on the bytes
+#: actually read (TCK-SEC-007): a stat-then-swap TOCTOU can no longer make
+#: the read buffer more than this many bytes.
 _MAX_PSBT_FILE_BYTES = _MAX_PSBT_TEXT_CHARS + 4096
+
+#: Byte-size ceiling for a ``.sha256`` checksum sidecar read (TCK-SEC-007):
+#: a sidecar is a hex digest + newline (65 bytes) per ADR-0014, so 1 KiB
+#: bounds the read with generous headroom while refusing a planted
+#: oversized sidecar before it can ever be fully buffered.
+_MAX_CHECKSUM_FILE_BYTES = 1024
+
+#: Chunk size for bounded reads: files are consumed in fixed-size pieces
+#: with a running byte cap, never with an unbounded ``read()``/``read_text``.
+_READ_CHUNK_BYTES = 65_536
 
 #: Signer identifier reported in SignedResult (ADR-0014).
 _SIGNER_NAME = "file"
@@ -145,6 +163,34 @@ def _atomic_write(path: Path, data: bytes) -> None:
                 os.unlink(tmp_name)
     except OSError as exc:
         raise SignerError("could not write export file") from exc
+
+
+class _ReadOverCap(Exception):
+    """Internal: a bounded read hit its byte cap (never escapes the module)."""
+
+
+def _read_bounded(path: Path, limit: int) -> bytes:
+    """Read ``path`` in fixed-size chunks, refusing past a ``limit``-byte cap.
+
+    TCK-SEC-007 MAXIMUM-READ strategy: at most ``limit + 1`` bytes are ever
+    buffered — the read stops deterministically as soon as the running total
+    exceeds ``limit`` (signalled via :class:`_ReadOverCap`), so a planted
+    multi-gigabyte file can never spike memory even if it passed an earlier
+    ``stat()`` gate (stat-then-read TOCTOU). ``OSError`` propagates to the
+    caller, which maps it to the value-free :class:`SignerError` its call
+    site already uses.
+    """
+    chunks: list[bytes] = []
+    remaining = limit + 1
+    with path.open("rb") as fh:
+        while remaining:
+            chunk = fh.read(min(_READ_CHUNK_BYTES, remaining))
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    # Consumed limit + 1 bytes without hitting EOF ⇒ the file is over cap.
+    raise _ReadOverCap
 
 
 class FilePsbtSigner:
@@ -223,9 +269,20 @@ class FilePsbtSigner:
         # refused. The idempotent path ALSO (re)writes the sidecar (ADR-0014
         # "every export writes a sidecar"), healing a missing/mismatched one.
         if unsigned_path.exists():
+            # Bounded read (TCK-SEC-007): the existing file is attacker- and
+            # environment-controlled; cap it at the PSBT byte ceiling instead
+            # of an unbounded read_text.
             try:
-                existing = unsigned_path.read_text(encoding="utf-8").strip()
+                raw_existing = _read_bounded(unsigned_path, _MAX_PSBT_FILE_BYTES)
+            except _ReadOverCap as exc:
+                raise SignerError(
+                    "existing unsigned file exceeds the maximum container size"
+                ) from exc
             except OSError as exc:
+                raise SignerError("could not read the existing unsigned file") from exc
+            try:
+                existing = raw_existing.decode("utf-8").strip()
+            except UnicodeDecodeError as exc:
                 raise SignerError("could not read the existing unsigned file") from exc
             if existing != content:
                 raise SignerError(
@@ -299,7 +356,13 @@ class FilePsbtSigner:
             raise SignerError("signed file exceeds the maximum container size")
 
         try:
-            data = path.read_bytes()
+            # Bounded read (TCK-SEC-007): the stat() gate above is a fast
+            # fail, but the cap is re-enforced on the bytes ACTUALLY read so
+            # a stat-then-swap TOCTOU can never buffer more than
+            # :data:`_MAX_PSBT_FILE_BYTES` on the money path.
+            data = _read_bounded(path, _MAX_PSBT_FILE_BYTES)
+        except _ReadOverCap as exc:
+            raise SignerError("signed file exceeds the maximum container size") from exc
         except OSError as exc:
             raise SignerError("could not read the signed file") from exc
         if not data:
@@ -310,8 +373,18 @@ class FilePsbtSigner:
         sidecar = path.with_name(name + _CHECKSUM_SUFFIX)
         if sidecar.exists():
             try:
-                expected_digest = sidecar.read_text(encoding="utf-8").strip()
+                sidecar_bytes = _read_bounded(sidecar, _MAX_CHECKSUM_FILE_BYTES)
+            except _ReadOverCap as exc:
+                raise SignerError(
+                    "checksum sidecar exceeds the maximum size"
+                ) from exc
             except OSError as exc:
+                raise SignerError("could not read the checksum sidecar") from exc
+            try:
+                expected_digest = sidecar_bytes.decode("utf-8").strip()
+            except UnicodeDecodeError as exc:
+                # Fail closed (refuse-over-accept): a non-UTF-8 sidecar is
+                # refused, never crashed on nor accepted.
                 raise SignerError("could not read the checksum sidecar") from exc
             actual_digest = hashlib.sha256(data).hexdigest()
             if not expected_digest or expected_digest.lower() != actual_digest:
