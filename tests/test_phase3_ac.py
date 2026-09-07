@@ -1,10 +1,10 @@
 """Phase 3 acceptance harness (TCK-P3-006).
 
-The literal Phase 3 AC (PROJECT.md §12) — *"end-to-end testnet send with
+The literal Phase 3 AC (PROJECT.md §12) — *"end-to-end mainnet send with
 at least one real device (e.g. Coldcard file flow + one USB device);
 tampered-PSBT fixture is caught deterministically; broadcast verified
 on-chain; device-absent/locked error flows behave"* — needs real hardware
-and a live testnet4 broadcast. This module is its OFFLINE composite story:
+and a live mainnet broadcast. This module is its OFFLINE composite story:
 every AC line is exercised through the REAL app wiring (REPL handlers,
 TxFlow state machine, signer dispatch, re-validation gate, broadcast via a
 mock chain) with deterministic fake devices — no network, no hardware, in
@@ -34,7 +34,7 @@ AC coverage map (PROJECT.md §12 Phase 3 AC line → tests here):
   (app-level sign handler + revalidation hard stop + zero broadcast POSTs,
   then the honest signer completes the broadcast — the composite story, not
   just the unit gate).
-- "end-to-end testnet send …" →
+- "end-to-end mainnet send …" →
   ``test_ac2_full_lifecycle_file_signer_production_path``
   (create → dual-key confirm → file sign → revalidate → broadcast → status
   at height → store history row, one continuous e2e through the REAL REPL
@@ -46,7 +46,7 @@ AC coverage map (PROJECT.md §12 Phase 3 AC line → tests here):
 - "broadcast verified on-chain" → the offline half (mock POST 201 + txid +
   status-at-height) is ``test_ac2_*``; the literal on-chain verification is
   the LIVE procedure in ``docs/phase3-ac.md`` (Step 5 — mempool.space
-  testnet4 txid lookup).
+  txid lookup).
 - ``test_ac4_double_broadcast_refused`` guards the terminal-state invariant
   (a second broadcast POST is refused by the flow — no re-broadcast storm).
 

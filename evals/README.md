@@ -104,10 +104,13 @@ becomes a merge gate in Phase 6 (≥95% golden / 100% confirm-gates).
 - **golden-022** similarly uses a schema-valid amount: the draft's 250 sats
   is below the `create_tx` floor, so the fixture uses 250000 sats (matching
   the `create_tx` few-shot) with `fee_target: "fast"`.
-- **golden-025** (`send 100 sats to bc1…`): a mainnet (non-`tb`) recipient
-  must never reach `create_tx` — the layer-3 business rule rejects it. The
-  contract is `clarify` ("that looks like a mainnet address"); encoded
-  `intent_in ["clarify"]`.
+- **golden-025** (`send 100 sats to bc1…`): a bech32-INVALID recipient
+  string must never reach `create_tx` — the layer-3 business rule rejects
+  it. The contract is `clarify` (ask for a valid address); encoded
+  `intent_in ["clarify"]`. (Historical note: pre-ADR-0021 this case was
+  framed as "a mainnet recipient is refused"; since the mainnet-only flip a
+  valid `bc1…` recipient is the ACCEPTED case and `tb1…` testnet recipients
+  are the refusal case.)
 - **golden-026** (`yes please`, standalone) and **golden-027**
   (`confirm the transaction`, standalone): a bare confirmation utterance
   with no pending transaction and no session — the eval runner has no flow

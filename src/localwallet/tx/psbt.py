@@ -199,7 +199,7 @@ def build_unsigned_psbt(
         recipients: Ordered ``(script, value_sats)`` payment outputs.
             Values must individually and jointly respect dust and
             ``MAX_MONEY`` bounds.
-        change_address: Testnet bech32 address of a *fresh change index*
+        change_address: Mainnet bech32 address of a *fresh change index*
             (ADR-0009 allocation is the caller's store-side duty; this
             module only serializes it), or ``None``.
         change_sats: Change value in sats, or ``None``. Both change
@@ -209,7 +209,7 @@ def build_unsigned_psbt(
         account_fingerprint: 4-byte origin fingerprint for the PSBT
             derivation fields.
         account_path: Hardened origin path from that fingerprint, e.g.
-            ``(84 + 2**31, 1 + 2**31, 2**31)`` for the canonical testnet
+            ``(84 + 2**31, 0 + 2**31, 2**31)`` for the canonical mainnet
             BIP84 account.
         locktime: Transaction locktime (0..0xffffffff); 0 = final.
         sequence: nSequence for every input; defaults to
@@ -265,9 +265,9 @@ def build_unsigned_psbt(
     if change_address is not None:
         if not isinstance(change_address, str):
             raise PsbtError("change_address must be a string")
-        # Testnet-only gate (ADR-0004): bech32 testnet hrp is "tb".
-        if not change_address.startswith("tb1"):
-            raise PsbtError("change_address must be a testnet bech32 address")
+        # Mainnet-only gate (ADR-0021): bech32 mainnet hrp is "bc".
+        if not change_address.startswith("bc1"):
+            raise PsbtError("change_address must be a mainnet bech32 address")
         try:
             change_script = bytes(address_to_scriptpubkey(change_address).data)
         except Exception as exc:  # containment: embit raises varied errors for bad addresses

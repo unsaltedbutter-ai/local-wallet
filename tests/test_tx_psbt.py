@@ -10,7 +10,7 @@ Covers:
   sequence policy, fee, witness UTXO);
 - byte-level determinism and round-trip through embit's PSBT parser
   (including the base64 exchange form);
-- watch-only, testnet-gate, dust, and min-relay policy refusals;
+- watch-only, mainnet-gate, dust, and min-relay policy refusals;
 - vsize verification: the estimate equals the vsize of the embit-built
   transaction with maximal P2WPKH witnesses EXACTLY, and matches a really
   signed fixture (throwaway key from the public BIP32 test vector 1 seed,
@@ -40,8 +40,10 @@ from localwallet.tx.psbt import (
 from localwallet.tx.selection import P2WPKH_INPUT_WEIGHT_WU, select_coins
 
 # Public BIP32 test vector 1 seed — throwaway fixture material only.
+# Mainnet coin type 0 (ADR-0021): the tx engine refuses testnet change
+# addresses, so the fixture account is the canonical mainnet BIP84 path.
 SEED = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
-ACCOUNT_PATH = (84 + 2**31, 1 + 2**31, 2**31)
+ACCOUNT_PATH = (84 + 2**31, 0 + 2**31, 2**31)
 
 
 def account_key() -> bip32.HDKey:
@@ -59,7 +61,7 @@ def spk(branch: int, index: int) -> bytes:
 
 def change_address(index: int = 7) -> str:
     key = account_key().derive([1, index]).key
-    return script.p2wpkh(key).address(NETWORKS["test"])
+    return script.p2wpkh(key).address(NETWORKS["main"])
 
 
 def recipient_script() -> bytes:
@@ -281,25 +283,41 @@ class TestPolicyRefusals:
             )
         assert "private" in str(exc.value)
 
-    def test_mainnet_change_address_refused(self):
-        # bc1q... = mainnet bech32; the tx engine is testnet-only (ADR-0004).
-        with pytest.raises(PsbtError):
+    def test_testnet_change_address_refused(self):
+        # tb1q... = testnet bech32; the tx engine is mainnet-only (ADR-0021).
+        with pytest.raises(PsbtError, match="mainnet bech32"):
             build_unsigned_psbt(
                 [source("ab" * 32, 0, 200_000)],
                 [(recipient_script(), 60_000)],
-                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
                 100_000,
                 account_key=account_key(),
                 account_fingerprint=fingerprint(),
                 account_path=ACCOUNT_PATH,
             )
 
+    def test_mainnet_change_address_accepted(self):
+        # bc1q... mainnet bech32 change is the acceptance case (ADR-0021).
+        psbt, meta = build_unsigned_psbt(
+            [source("ab" * 32, 0, 200_000)],
+            [(recipient_script(), 60_000)],
+            change_address(),
+            100_000,
+            account_key=account_key(),
+            account_fingerprint=fingerprint(),
+            account_path=ACCOUNT_PATH,
+        )
+        change_script = script.p2wpkh(account_key().derive([1, 7]).key).data
+        assert bytes(psbt.tx.vout[1].script_pubkey.data) == change_script
+        assert psbt.tx.vout[1].value == 100_000
+        validate_psbt_shape(psbt, meta)
+
     def test_malformed_change_address_refused(self):
         with pytest.raises(PsbtError):
             build_unsigned_psbt(
                 [source("ab" * 32, 0, 200_000)],
                 [(recipient_script(), 60_000)],
-                "tb1qinvalid",
+                "bc1qinvalid",
                 100_000,
                 account_key=account_key(),
                 account_fingerprint=fingerprint(),

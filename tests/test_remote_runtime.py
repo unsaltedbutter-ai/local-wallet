@@ -389,11 +389,12 @@ def test_invalid_timeout_env_var_named_but_value_not_echoed(
 # ------------------------------------------------- app.py runtime selection
 
 
-# Fixture watch-only key from tests/test_e2e_skeleton.py (derived from a
-# fixed non-wallet seed; public keys only — not a secret).
-TESTNET_VPUB: Final[str] = (
-    "vpub5ZJ3cDEGGk61yWWUHFHgmG3M4je4yFD3ebC6jWHsqV8Cxh2K5zz8c6X5Hk7FkUAB"
-    "FTjRkQBz3g84MYeRhjAdnq1QmrmyTRTrzs8rFVCJUyh"
+# Canonical mainnet fixture zpub — the SAME constant as
+# tests/test_e2e_skeleton.py::ZPUB / tests/test_wallet_descriptor.py::ZPUB
+# (one fixed seed across the suite; public key only — not a secret).
+FIXTURE_ZPUB: Final[str] = (
+    "zpub6qh6bF4roUgQtg2fm5SUhRsQFEidwUPPLhS82BDHjtNh2UxmgNfCS8NF4jQoBqNCeEW"
+    "BaKyTxcmyBkq3iuZS5Seyz5dWMcwYxaMgpZn4cWQ"
 )
 
 
@@ -428,7 +429,7 @@ def test_app_selects_remote_runtime_and_prints_disclosure(
     monkeypatch.setenv(LLM_BASE_URL_ENV_VAR, BASE_URL)
     monkeypatch.setenv(LLM_MODEL_ENV_VAR, MODEL_ID)
     monkeypatch.setenv(LLM_API_KEY_ENV_VAR, API_KEY)
-    outputs = _run_app(monkeypatch, ["--zpub", TESTNET_VPUB])
+    outputs = _run_app(monkeypatch, ["--zpub", FIXTURE_ZPUB])
     notice_lines = [line for line in outputs if line.startswith("DEBUG: using remote LLM")]
     assert len(notice_lines) == 1
     assert "notible.local:8083" in notice_lines[0]
@@ -443,14 +444,14 @@ def test_app_remote_env_wins_over_model_path_and_stub(
     monkeypatch.setenv(LLM_BASE_URL_ENV_VAR, BASE_URL)
     monkeypatch.setenv(LLM_MODEL_ENV_VAR, MODEL_ID)
     monkeypatch.setenv(MODEL_PATH_ENV_VAR, "/some/model.gguf")
-    outputs = _run_app(monkeypatch, ["--stub-llm", "--zpub", TESTNET_VPUB])
+    outputs = _run_app(monkeypatch, ["--stub-llm", "--zpub", FIXTURE_ZPUB])
     assert any(line.startswith("DEBUG: using remote LLM") for line in outputs)
 
 
 def test_app_never_selects_remote_runtime_without_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    outputs = _run_app(monkeypatch, ["--stub-llm", "--zpub", TESTNET_VPUB])
+    outputs = _run_app(monkeypatch, ["--stub-llm", "--zpub", FIXTURE_ZPUB])
     assert not any("DEBUG: using remote LLM" in line for line in outputs)
 
 
@@ -466,7 +467,7 @@ def test_app_preflight_remote_env_without_model_exits_2(
     monkeypatch.setenv(LLM_BASE_URL_ENV_VAR, BASE_URL)
     # LLM_MODEL deliberately left unset.
     code = app.run(
-        ["--zpub", TESTNET_VPUB],
+        ["--zpub", FIXTURE_ZPUB],
         input_fn=lambda _prompt: "exit",
         output_fn=lambda _s: None,
     )
@@ -482,7 +483,7 @@ def test_app_preflight_remote_env_with_model_proceeds(
     """LOCALWALLET_LLM_BASE_URL + LOCALWALLET_LLM_MODEL → runtime selected."""
     monkeypatch.setenv(LLM_BASE_URL_ENV_VAR, BASE_URL)
     monkeypatch.setenv(LLM_MODEL_ENV_VAR, MODEL_ID)
-    outputs = _run_app(monkeypatch, ["--zpub", TESTNET_VPUB])
+    outputs = _run_app(monkeypatch, ["--zpub", FIXTURE_ZPUB])
     assert any(line.startswith("DEBUG: using remote LLM") for line in outputs)
 
 

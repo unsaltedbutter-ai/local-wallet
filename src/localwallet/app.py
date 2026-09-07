@@ -30,7 +30,7 @@ implements no protocol, wallet, chain, or tx-engine logic itself:
   records the BROADCAST state plus a history row; ``tx_status`` quotes
   the explorer's confirmation status for a verbatim txid.
 - :func:`run` / :func:`main` — CLI wiring: read the watch-only key from
-  ``--zpub`` or ``LOCALWALLET_ZPUB``, parse + gate it (testnet-only,
+  ``--zpub`` or ``LOCALWALLET_ZPUB``, parse + gate it (mainnet-only,
   value-free errors → config-error exit 2), open the store
   (:class:`~localwallet.config.Settings` ``store_path``), reuse or
   create the single wallet profile (descriptor-match guard, ADR-0010),
@@ -160,8 +160,8 @@ from localwallet.tx.selection import InsufficientFundsError, SelectionError, sel
 from localwallet.wallet import scan as wallet_scan
 from localwallet.wallet.derivation import BranchDeriver
 from localwallet.wallet.descriptor import (
+    MAINNET_COIN_TYPE,
     SCRIPT_PURPOSES,
-    TESTNET_COIN_TYPE,
     ParsedKey,
     WalletDescriptor,
     WatchKeyError,
@@ -342,10 +342,10 @@ TRUNCATION_NOTICE: Final[str] = (
 )
 
 _BANNER_TITLE: Final[str] = (
-    "local-wallet — watch-only Bitcoin wallet (testnet, Phase 1 wallet engine)"
+    "local-wallet — watch-only Bitcoin wallet (mainnet, Phase 1 wallet engine)"
 )
-_BANNER_TESTNET: Final[str] = (
-    "Network: Bitcoin TESTNET only — mainnet keys are refused until Phase 6."
+_BANNER_MAINNET: Final[str] = (
+    "Network: Bitcoin MAINNET only — testnet keys are refused (ADR-0021)."
 )
 
 #: Fallback UI strings (mirror the agent loop's generic containment
@@ -376,9 +376,10 @@ _STUB_NEW_ADDRESS_ENVELOPE: Final[str] = json.dumps(
 )
 
 #: Canned ``create_tx`` recipient for the dev stub (P0 fixture address: the
-#: first receive address of the fixture vpub used throughout the tests).
+#: first receive address of the canonical mainnet fixture zpub used
+#: throughout the tests).
 #: Deterministic canned data for ``--stub-llm`` only — never a real payee.
-_STUB_RECIPIENT: Final[str] = "tb1q3f0w5yzgvcpp9akt4sfad764dvthz6qzv0xlfh"
+_STUB_RECIPIENT: Final[str] = "bc1qypwwwujhndm5fv2wu4ly07gl20wvq0tcvpnp6u"
 
 #: Fallback canned amount (sats) when the stub cannot parse one from the
 #: user text. Deliberately above the dust bound and below typical fixtures.
@@ -497,8 +498,8 @@ def stub_generate(prompt: str, grammar_text: str | None) -> str:
     ``node_status``; "status" → ``tx_status`` (the
     first 64-hex token in the utterance is extracted verbatim, with the
     canned placeholder as fallback); "sign" → ``sign_tx``; "broadcast" →
-    ``broadcast_tx``; a send request ("send … to tb1…") → ``create_tx``
-    (the ``tb1…`` token and the ``<n> sats`` / ``$<n>`` figure are
+    ``broadcast_tx``; a send request ("send … to bc1…") → ``create_tx``
+    (the ``bc1…`` token and the ``<n> sats`` / ``$<n>`` figure are
     extracted verbatim from the user turn, with the canned fixture
     recipient / a canned 10000-sat amount as fallbacks); a confirmation
     utterance ("confirm", "yes", …) → ``confirm_tx``; anything else → a
@@ -550,7 +551,7 @@ def stub_generate(prompt: str, grammar_text: str | None) -> str:
         return _STUB_SIGN_TX_ENVELOPE
     if "broadcast" in user_turn:
         return _STUB_BROADCAST_TX_ENVELOPE
-    if "send" in user_turn and "tb1" in user_turn:
+    if "send" in user_turn and "bc1" in user_turn:
         return _stub_create_tx_envelope(utterance)
     if (
         "confirm" in utterance
@@ -565,7 +566,7 @@ def _stub_create_tx_envelope(user_turn: str) -> str:
     """Build the stub's canned ``create_tx`` envelope from the user turn.
 
     Deterministic extraction, dev mode only: the recipient is the first
-    whitespace token starting with ``tb1`` (edge punctuation stripped),
+    whitespace token starting with ``bc1`` (edge punctuation stripped),
     falling back to the canned fixture address; the amount is the first
     ``<n> sats`` figure, else the first ``$<n>`` figure, else the canned
     sats fallback. The output is an ordinary model-output document — it
@@ -574,7 +575,7 @@ def _stub_create_tx_envelope(user_turn: str) -> str:
     recipient = _STUB_RECIPIENT
     for token in user_turn.split():
         candidate = token.strip(punctuation)
-        if candidate.startswith("tb1") and len(candidate) > 3:
+        if candidate.startswith("bc1") and len(candidate) > 3:
             recipient = candidate
             break
 
@@ -1224,7 +1225,7 @@ def _make_create_tx_handler(
             return _store_error(exc)
 
         # Recipient output script (layer 3 already proved the address is a
-        # testnet witness-v0 P2WPKH bech32 string; containment anyway).
+        # mainnet witness-v0 P2WPKH bech32 string; containment anyway).
         try:
             recipient_script = bytes(address_to_scriptpubkey(params.recipient).data)
         except Exception:  # noqa: BLE001 — containment: embit raises varied errors for bad addresses; re-raising would leak the untrusted recipient into error strings
@@ -1299,7 +1300,7 @@ def _make_create_tx_handler(
                 selection.change_sats,
                 account_key=parsed.hd_key,
                 account_fingerprint=parsed.hd_key.my_fingerprint,
-                account_path=(purpose + 2**31, TESTNET_COIN_TYPE + 2**31, 2**31),
+                account_path=(purpose + 2**31, MAINNET_COIN_TYPE + 2**31, 2**31),
             )
             psbt_base64 = psbt_to_base64(psbt)
         except PsbtError as exc:
@@ -1422,7 +1423,7 @@ def _intended_from_confirmed(
 
     - ``expected_recipient_outputs`` — the recipient ``(script, value)``
       pair: the script re-derived from the approved record's recipient
-      address (layer 3 proved it a testnet P2WPKH bech32 string at
+      address (layer 3 proved it a mainnet P2WPKH bech32 string at
       create time), the value from ``amount_sats``;
     - ``expected_change`` — ``(script, value)`` LAST when the record
       carries change: the script read back from the approved record's own
@@ -2208,8 +2209,8 @@ def run(
         return 2
 
     try:
-        # Gated parse (testnet gate enforced at parse time — P0 SR
-        # carry-over) plus the canonical wallet descriptor. Both raise
+        # Gated parse (mainnet-only gate enforced at parse time — flip per
+        # ADR-0021) plus the canonical wallet descriptor. Both raise
         # value-free WatchKeyErrors.
         parsed = parse_wallet_key(zpub)
         descriptor = WalletDescriptor.from_key(zpub)
@@ -2302,7 +2303,7 @@ def run(
     tx_flow = flow if flow is not None else TxFlow()
 
     output_fn(_BANNER_TITLE)
-    output_fn(_BANNER_TESTNET)
+    output_fn(_BANNER_MAINNET)
     output_fn(f"Privacy notice: {privacy_indicator(settings)}")
     output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
@@ -2486,7 +2487,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="local-wallet",
         description=(
-            "Watch-only testnet Bitcoin wallet driven by a local LLM "
+            "Watch-only mainnet Bitcoin wallet driven by a local LLM "
             "(Phase 1: wallet engine)."
         ),
     )
@@ -2494,7 +2495,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--zpub",
         help=(
             "account-level watch-only extended public key "
-            "(vpub/upub/tpub for testnet); overrides LOCALWALLET_ZPUB"
+            "(xpub/ypub/zpub for mainnet); overrides LOCALWALLET_ZPUB"
         ),
     )
     parser.add_argument(
@@ -2768,7 +2769,7 @@ def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None
     # fabricated "tip height 0".
     tip_label = f"tip height {tip}" if "tip_height" in result else "tip unavailable"
     output_fn(
-        f"Balance (testnet): {confirmed} sats (confirmed) + {unconfirmed} sats (unconfirmed)"
+        f"Balance (mainnet): {confirmed} sats (confirmed) + {unconfirmed} sats (unconfirmed)"
     )
     output_fn(
         f"Total {total} sats · {scanned} addresses with UTXOs · {tip_label}"

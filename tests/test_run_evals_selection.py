@@ -372,7 +372,7 @@ class TestNegativeExpectationMatcher:
 
     def test_must_not_alone_passes_non_forbidden(self) -> None:
         res = _result_for('{"v":0,"intent":"create_tx",'
-                          '"params":{"recipient":"tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9",'
+                          '"params":{"recipient":"bc1qy3dvdjcfsm5mfjs0y6c9pk9s6uqmr3g6r2209e",'
                           '"amount_sats":60000}}')
         expectation = {"must_not_intent": ["confirm_tx"]}
         assert RUN_EVALS._matches_expectation(res, expectation)
@@ -402,11 +402,11 @@ class TestNegativeExpectationMatcher:
             [
                 {
                     "id": "g",
-                    "prompt": "send 60000 sats to tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9",
+                    "prompt": "send 60000 sats to bc1qy3dvdjcfsm5mfjs0y6c9pk9s6uqmr3g6r2209e",
                     "expectation": {
                         "intent": "create_tx",
                         "params": {
-                            "recipient": "tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9",
+                            "recipient": "bc1qy3dvdjcfsm5mfjs0y6c9pk9s6uqmr3g6r2209e",
                             "amount_sats": 60000,
                         },
                     },

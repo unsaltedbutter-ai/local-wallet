@@ -21,7 +21,7 @@ Canonical envelope contract v0 — the model-emitted wire format::
   ``{"amount_sats": int, 546..21e15}`` | ``{"amount_usd": number,
   0.01..1_000_000}``, plus optional ``{"fee_target": "fast"|"medium"|"slow"}``
   (the send entry point of the dispatcher-owned destructive flow — the
-  semantic recipient check is a testnet witness-v0 P2WPKH address, layer 3);
+  semantic recipient check is a mainnet witness-v0 P2WPKH address, layer 3);
   ``confirm_tx`` → ``{"tx_ref": str, 1..64 chars}`` (references the pending
   transaction created by ``create_tx``; content is matched against the
   dispatcher-owned flow state, not here);
@@ -138,7 +138,7 @@ MAX_QUESTION_CHARS: Final[int] = 1000
 #: effective BIP173 bound on a real witness-v0 P2WPKH address is 90
 #: characters, so the schema's 100 is deliberately transport headroom: a
 #: longer string passes this layer only to be refused at layer 3, where embit
-#: enforces the 90-char bech32 ceiling. The semantic check — a testnet
+#: enforces the 90-char bech32 ceiling. The semantic check — a mainnet
 #: witness-v0 P2WPKH address — is layer 3 (:mod:`localwallet.protocol.intents`).
 MIN_RECIPIENT_CHARS: Final[int] = 14
 MAX_RECIPIENT_CHARS: Final[int] = 100

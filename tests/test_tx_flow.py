@@ -78,7 +78,7 @@ def stage(flow: TxFlow, **overrides) -> PendingTx:
     """Stage a canonical pending transaction (fields overridable)."""
     fields: dict = {
         "amount_sats": 50_000,
-        "recipient": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+        "recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
         "fee_target": "fast",
         "fee_rate_sat_vb": 2,
         "fee_sats": 282,

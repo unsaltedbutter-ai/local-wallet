@@ -1,6 +1,6 @@
 # Phase 3 Acceptance Criteria — Live device + on-chain procedure (TCK-P3-006)
 
-Phase 3 AC (PROJECT.md §12): *"end-to-end testnet send with at least one
+Phase 3 AC (PROJECT.md §12): *"end-to-end mainnet send with at least one
 real device (e.g. Coldcard file flow + one USB device); tampered-PSBT
 fixture is caught deterministically; broadcast verified on-chain;
 device-absent/locked error flows behave."*
@@ -10,7 +10,7 @@ The AC is verified at **two layers**:
 | Layer | What it proves | Where |
 |---|---|---|
 | **Offline composite story** (runs in CI, no network, no hardware) | The full wiring catches a tampered PSBT deterministically *before* broadcast; the whole lifecycle (create → dual-key confirm → sign → revalidate → broadcast → status → store history) runs through the REAL REPL handlers with fake devices; device-absent/locked/file-missing/broadcast-fail error flows behave; a second broadcast is refused. | `tests/test_phase3_ac.py` |
-| **LIVE procedure** (this document, MANUAL) | The literal AC with real hardware: an end-to-end testnet4 send signed on a real device (Coldcard SD flow **and** one USB device), broadcast verified **on-chain**, and the device error flows observed live. | Steps 1–6 below |
+| **LIVE procedure** (this document, MANUAL) | The literal AC with real hardware: an end-to-end mainnet send signed on a real device (Coldcard SD flow **and** one USB device), broadcast verified **on-chain**, and the device error flows observed live. | Steps 1–6 below |
 
 **Honest status:** the literal device AC is **deferred-run** until hardware
 is available. Everything that *can* be automated is automated and green in
@@ -24,8 +24,8 @@ AC coverage map (AC line → offline test):
 | AC line (PROJECT.md §12) | Offline test |
 |---|---|
 | tampered-PSBT fixture is caught deterministically | `test_ac1_tampered_psbt_caught_before_broadcast_at_wiring_level` |
-| end-to-end testnet send (offline half) | `test_ac2_full_lifecycle_file_signer_production_path` |
-| broadcast verified on-chain | **LIVE Step 5** (mempool.space testnet4 txid lookup) |
+| end-to-end mainnet send (offline half) | `test_ac2_full_lifecycle_file_signer_production_path` |
+| broadcast verified on-chain | **LIVE Step 5** (mempool.space txid lookup) |
 | device-absent/locked error flows behave | `test_ac3_device_absent_and_locked_guidance_then_retry` (+ `test_ac3_signed_file_missing_guidance`, `test_ac3_broadcast_5xx_then_retry`) |
 | (terminal-state invariant) | `test_ac4_double_broadcast_refused` |
 
@@ -33,7 +33,7 @@ AC coverage map (AC line → offline test):
 
 ## Prerequisites
 
-1. **A funded testnet4 watch key (vpub)** — follow `docs/phase1-ac.md`
+1. **A funded mainnet watch key (zpub)** — follow `docs/phase1-ac.md`
    ("Prerequisites" + "Step 1") to create/fund one and record the explorer
    truth. Confirm ≥1 block on at least one UTXO worth more than what you
    will send plus the fee.
@@ -48,7 +48,7 @@ AC coverage map (AC line → offline test):
    `PYTHONPATH=src`).
 5. The offline harness green: `pytest tests/test_phase3_ac.py`.
 
-> Watch-only throughout: the app handles a **vpub / descriptor**, never an
+> Watch-only throughout: the app handles a **zpub / descriptor**, never an
 > xprv or seed phrase (it refuses them in chat, with guidance). Device PINs
 > and passphrases are entered **on the device** — never into the app.
 
@@ -61,7 +61,7 @@ AC coverage map (AC line → offline test):
 ```sh
 LOCALWALLET_SIGNER=file \
 LOCALWALLET_SIGNER_DIR=<sd-mount-or-transfer-dir> \
-LOCALWALLET_ZPUB=<vpub> \
+LOCALWALLET_ZPUB=<zpub> \
     .venv/bin/python -m localwallet.ui.cli
 ```
 
@@ -74,7 +74,7 @@ transfer medium). The signer writes `localwallet-unsigned-*.psbt.b64` +
 
 In the chat:
 
-- `send <amount> sats to <tb1 address>` → the confirmation card (amount,
+- `send <amount> sats to <bc1 address>` → the confirmation card (amount,
   recipient, fee, size, change, USD) is narrated **verbatim from tool
   output**.
 - On the **Coldcard screen**, the same unsigned transaction is what you will
@@ -116,11 +116,11 @@ In the chat:
 
 - `broadcast` → the app POSTs the re-validated transaction (single attempt)
   and prints `Sent! txid <txid> — tracking…`.
-- **THE on-chain verification step:** open the mempool.space **testnet4**
+- **THE on-chain verification step:** open the mempool.space **mainnet**
   transaction view for the quoted txid:
-  `https://mempool.space/testnet4/tx/<txid>`
-  (API: `https://mempool.space/testnet4/api/tx/<txid>` and
-  `https://mempool.space/testnet4/api/tx/<txid>/status`).
+  `https://mempool.space/tx/<txid>`
+  (API: `https://mempool.space/api/tx/<txid>` and
+  `https://mempool.space/api/tx/<txid>/status`).
   - The page must show the **same recipient address and amount** and a
     sane fee vs the card.
   - **No SPV-level claim:** this is an Esplora/TLS consistency check, not
@@ -142,7 +142,7 @@ Run the same app but with the HWI signer:
 
 ```sh
 LOCALWALLET_SIGNER=hwi \
-LOCALWALLET_ZPUB=<vpub> \
+LOCALWALLET_ZPUB=<zpub> \
     .venv/bin/python -m localwallet.ui.cli
 ```
 
@@ -193,7 +193,7 @@ the offline harness:
 | 2 | Tampered PSBT caught deterministically, before any POST | AC-1 test + live file-mode tamper | ☐ (live) |
 | 3 | Coldcard SD flow: full send signs, broadcasts, verifies on-chain | Steps 2–6 | ☐ (live) |
 | 4 | USB device flow: signs (after locked guidance), broadcasts | USB flow | ☐ (live) |
-| 5 | On-chain verification: mempool.space testnet4 shows the quoted txid with matching recipient/amount/fee | Step 5 | ☐ (live) |
+| 5 | On-chain verification: mempool.space mainnet shows the quoted txid with matching recipient/amount/fee | Step 5 | ☐ (live) |
 | 6 | Confirmation surfaced (`status` → confirmed at height) | Step 6 | ☐ (live) |
 | 7 | Error flows behave as narrated (absent/locked/mismatch/file-missing/revalidation/broadcast-retry) | Error-flow checklist | ☐ (live) |
 | 8 | Device quirks recorded/amended | `docs/device-notes.md`, ADR-0014 §4 | ☐ (live) |
@@ -225,8 +225,9 @@ available; rows 1–2 (and the whole offline composite) are green now.
   §9, ADR-0003): mempool.space is a public Esplora the operator associates
   with your IP; the honest privacy indicator applies. Phase 4 moves address
   queries to a self-hosted node.
-- **Watch-only throughout:** paste a **vpub/descriptor**, never an xprv or
+- **Watch-only throughout:** paste a **zpub/descriptor**, never an xprv or
   seed phrase. PINs/passphrases are entered on the device, never into the
   app.
-- Testnet4 faucet URLs and Sparrow testnet4 support are **verify-current**
-  (see `docs/phase1-ac.md`, `docs/sparrow-ac.md`).
+- Mainnet sends move REAL value: keep the live-run amount small, and quote
+  every address/amount verbatim from tool output (see `docs/phase1-ac.md`,
+  `docs/sparrow-ac.md`).

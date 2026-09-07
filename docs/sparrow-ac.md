@@ -37,14 +37,15 @@ it does not re-prove selection.
 ## The fixture (exact numbers)
 
 The canonical fixture is the two-input P2WPKH case from
-`tests/test_tx_psbt.py` (same BIP32 test-vector-1 key), rate **2 sat/vB**:
+`tests/test_tx_psbt.py` (same BIP32 test-vector-1 key, mainnet coin type
+0 per ADR-0021), rate **2 sat/vB**:
 
 - **Inputs:** `ab`×32 : v0 = **40_000 sats** (receive branch, index 3) and
   `cd`×32 : v0 = **50_000 sats** (change branch, index 4). Canonical order
   `ab` < `cd`. Inputs total **90_000 sats**.
-- **Recipient (output 0):** `tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9` —
+- **Recipient (output 0):** `bc1q84mgnsqrnqafh3ga4q3cuq0s3h3fe6fykh5mes` —
   **60_000 sats**.
-- **Change (output 1):** `tb1qfldesjqc6l7a05mmg2afxyxwcts5vcxjzkgfk4` —
+- **Change (output 1):** `bc1qet5wt2ujk6xakz90uhcruwmepge3sqe4vvmljr` —
   **29_582 sats**.
 - **Fee:** **418 sats** (90_000 − 60_000 − 29_582 = 418; also 209 vB × 2
   sat/vB = 418 — independent cross-check).
@@ -67,18 +68,15 @@ display change between versions). Check <https://sparrowwallet.com/download/>
 for the latest; record the version used in the sign-off. Sparrow ≥ 1.8
 handles PSBTv0 and BIP84 watch-only wallets well.
 
-### 2. Testnet4 mode
+### 2. Mainnet mode
 
-Sparrow must run in **testnet4** mode:
+Sparrow must run in **Mainnet** mode (the app is mainnet-only, ADR-0021):
 
 - **macOS:** `File ▸ Preferences ▸ Server ▸ Network`, or launch with the
-  testnet4 profile. If your Sparrow build only offers "Testnet" (testnet3),
-  **verify-current**: recent releases expose testnet4 (e.g. via
-  `File ▸ New Wallet ▸ Testnet` after enabling the network, or the
-  `--network testnet4` / config `network=testnet4` flag). Testnet3 vs
-  testnet4 do **not** share addresses — the wrong network mode will reject
-  or misdisplay everything.
-- Watch the status bar: it must show **testnet4**, not testnet/mainnet.
+  mainnet profile (Sparrow's default). Testnet/signet modes do **not**
+  share addresses with mainnet — the wrong network mode will reject or
+  misdisplay everything.
+- Watch the status bar: it must show **Mainnet**.
 
 ### 3. Import the watch-only wallet
 
@@ -88,7 +86,7 @@ In Sparrow: `File ▸ New Wallet ▸ Import ▸ Paste` and paste the descriptor
 from the app's wallet engine. The descriptor has the shape
 
 ```
-wpkh([<fingerprint>/84'/1'/0']vpub.../0/*)  and  wpkh([<fingerprint>/84'/1'/0']vpub.../1/*)
+wpkh([<fingerprint>/84'/0'/0']zpub.../0/*)  and  wpkh([<fingerprint>/84'/0'/0']zpub.../1/*)
 ```
 
 (as two branches `{0,1}/*` in the canonical single string — Sparrow splits
@@ -104,13 +102,13 @@ Sparrow's local copy of the *public* descriptor; it is not a signing key).
       "SELECT name, descriptor FROM wallets ORDER BY id;"
   ```
   (`descriptor` is the full checksummed string, e.g.
-  `wpkh([fp/84'/1'/0']vpub…/{0,1}/*)#checksum`.)
+  `wpkh([fp/84'/0'/0']zpub…/{0,1}/*)#checksum`.)
 - **Or a tiny python snippet** printing it via the wallet engine:
   ```python
   from localwallet.wallet import WalletDescriptor
-  print(WalletDescriptor.from_key("<vpub>").descriptor)
+  print(WalletDescriptor.from_key("<zpub>").descriptor)
   ```
-  (substitute your testnet4 watch key; the engine gate refuses mainnet).
+  (substitute your mainnet watch key; the engine gate refuses testnet).
 
 For this AC you do **not** strictly need a fully funded wallet — the import
 accepts the descriptor and shows the derived receive/change addresses so you
@@ -146,15 +144,15 @@ inputs from `tests/test_tx_psbt.py`.
 2. Select `sparrow_fixture.psbt`.
 3. Sparrow loads the unsigned transaction. It may warn that inputs are
    unconfirmed/unknown — fine (these UTXO txids are synthetic fixture
-   material that do not exist on testnet4); the point is that the structure
+   material that do not exist on mainnet); the point is that the structure
    and fee are valid.
 
 ## Step 3 — Verify in Sparrow's UI
 
 - **Inputs count:** exactly **2**.
-- **Recipient:** address `tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9`,
+- **Recipient:** address `bc1q84mgnsqrnqafh3ga4q3cuq0s3h3fe6fykh5mes`,
   amount **60_000 sats**.
-- **Change:** address `tb1qfldesjqc6l7a05mmg2afxyxwcts5vcxjzkgfk4`, amount
+- **Change:** address `bc1qet5wt2ujk6xakz90uhcruwmepge3sqe4vvmljr`, amount
   **29_582 sats**.
 - **Fee:** **418 sats** and the effective rate shown ≈ **2 sats/vB**.
   Sparrow recomputes the fee from the transaction, so the **418 sats must
@@ -170,13 +168,13 @@ inputs from `tests/test_tx_psbt.py`.
 |---|---|---|---|
 | 1 | Imports without a structure error | PSBT parses | ☐ |
 | 2 | Input count | 2 | ☐ |
-| 3 | Recipient address + amount | `tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9` = 60_000 sats | ☐ |
-| 4 | Change address + amount | `tb1qfldesjqc6l7a05mmg2afxyxwcts5vcxjzkgfk4` = 29_582 sats | ☐ |
+| 3 | Recipient address + amount | `bc1q84mgnsqrnqafh3ga4q3cuq0s3h3fe6fykh5mes` = 60_000 sats | ☐ |
+| 4 | Change address + amount | `bc1qet5wt2ujk6xakz90uhcruwmepge3sqe4vvmljr` = 29_582 sats | ☐ |
 | 5 | Fee (sats) | 418 (exact — Sparrow recomputes it) | ☐ |
 | 6 | Fee rate (sats/vB) | ≈ 2 (within ±0.01, rounding-only) | ☐ |
 | 7 | Offline harness green | `pytest tests/test_sparrow_ac.py` | ☐ |
 
-Sign-off records: Sparrow version, testnet4 confirmed, all boxes ☑, and any
+Sign-off records: Sparrow version, mainnet mode confirmed, all boxes ☑, and any
 deviations (should be none).
 
 ## What "FAIL" looks like + likely causes
@@ -184,9 +182,9 @@ deviations (should be none).
 | Symptom | Likely cause |
 |---|---|
 | Sparrow refuses to open / "invalid PSBT" | Corrupt base64 (wrapped lines, stray whitespace) or the file isn't plain base64 text; or Sparrow on the wrong network; or a stale Sparrow without PSBTv0 support. Re-export via the dump test; verify the first line starts `cHNidP8`. |
-| Addresses/amounts mismatch | Imported into the **wrong network mode** (testnet3 vs testnet4 — addresses don't transfer); or pasted the wrong descriptor; or edited the fixture. Addresses are quoted verbatim from tool output — recheck against Step 1 / Step 3. |
+| Addresses/amounts mismatch | Imported into the **wrong network mode** (testnet/signet vs mainnet — addresses don't transfer); or pasted the wrong descriptor; or edited the fixture. Addresses are quoted verbatim from tool output — recheck against Step 1 / Step 3. |
 | Fee (sats) mismatch | Tampered PSBT (an edited input witness-UTXO value or an output value changes the recomputed fee) — re-export a fresh fixture; do not hand-edit. |
-| Inputs shown unconfirmed/unknown | Expected — the synthetic UTXO txids do not exist on testnet4; this is not a failure of the AC (structure/fee are the object under test). |
+| Inputs shown unconfirmed/unknown | Expected — the synthetic UTXO txids do not exist on mainnet; this is not a failure of the AC (structure/fee are the object under test). |
 | Rate display not ≈2 | Display-only rounding; the exact sats are the source of truth (criterion 5). |
 
 ---
@@ -197,7 +195,7 @@ deviations (should be none).
   so 418 must match **exactly**); it **cannot** validate our *selection
   policy* — that is covered by unit tests
   (`tests/test_tx_selection.py`, `tests/test_tx_psbt.py`).
-- Watch-only throughout: paste a **vpub/descriptor**, never an xprv or seed
+- Watch-only throughout: paste a **zpub/descriptor**, never an xprv or seed
   phrase (the app refuses them in chat, with guidance).
 - The synthetic UTXO txids are fixture material, not real coins — nothing
   here is funded or broadcast; the object under test is the unsigned PSBT's

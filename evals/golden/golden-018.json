@@ -1,10 +1,10 @@
 {
   "id": "golden-018",
-  "prompt": "send 60000 sats to tb1q3f0w5yzgvcpp9akt4sfad764dvthz6qzv0xlfh",
+  "prompt": "send 60000 sats to bc1qypwwwujhndm5fv2wu4ly07gl20wvq0tcvpnp6u",
   "expectation": {
     "intent": "create_tx",
     "params": {
-      "recipient": "tb1q3f0w5yzgvcpp9akt4sfad764dvthz6qzv0xlfh",
+      "recipient": "bc1qypwwwujhndm5fv2wu4ly07gl20wvq0tcvpnp6u",
       "amount_sats": 60000
     }
   }

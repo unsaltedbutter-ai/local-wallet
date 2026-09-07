@@ -28,8 +28,10 @@ from localwallet.tx.psbt import (
 )
 
 # Public BIP32 test vector 1 seed — throwaway fixture material only.
+# Mainnet coin type 0 (ADR-0021): the tx engine refuses testnet change
+# addresses, so the fixture account is the canonical mainnet BIP84 path.
 SEED = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
-ACCOUNT_PATH = (84 + 2**31, 1 + 2**31, 2**31)
+ACCOUNT_PATH = (84 + 2**31, 0 + 2**31, 2**31)
 
 
 def account_key() -> bip32.HDKey:
@@ -47,7 +49,7 @@ def spk(branch: int, index: int) -> bytes:
 
 def change_address() -> str:
     key = account_key().derive([1, 7]).key
-    return script.p2wpkh(key).address(NETWORKS["test"])
+    return script.p2wpkh(key).address(NETWORKS["main"])
 
 
 def build_unsigned() -> PSBT:

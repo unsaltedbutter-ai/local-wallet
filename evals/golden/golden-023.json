@@ -1,5 +1,5 @@
 {
   "id": "golden-023",
-  "prompt": "send some money to tb1q5pdvjqq2xdlppkg9hhcemdusvjlkrh0wwrd5h9",
+  "prompt": "send some money to bc1qy3dvdjcfsm5mfjs0y6c9pk9s6uqmr3g6r2209e",
   "expectation": {"intent": "clarify", "question_nonempty": true}
 }

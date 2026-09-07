@@ -1,16 +1,16 @@
 """Phase 1 acceptance-criteria harness (TCK-P1-006).
 
 The literal Phase 1 AC (PROJECT.md §12: "balance/UTXO/history match
-Electrum + mempool.space on a testnet wallet with known history including
+Electrum + mempool.space on a mainnet wallet with known history including
 >20-address gaps; rescan fixes a simulated stale cache; unit tests for
-prefix→script-type mapping") needs a funded testnet wallet. This module is
+prefix→script-type mapping") needs a funded mainnet wallet. This module is
 its OFFLINE composite story: the full explorer→scan→store→handler chain is
 exercised against a HAND-CONSTRUCTED ground truth ("explorer view") served
 via ``httpx.MockTransport`` — no network in the default run. The LIVE
 procedure for the literal AC is documented in ``docs/phase1-ac.md``; the
 env-gated live cross-check test sits at the bottom of this file.
 
-Ground truth (the fixture wallet is the deterministic vpub from
+Ground truth (the fixture wallet is the deterministic mainnet zpub from
 tests/test_wallet_scan.py; usage deliberately spans both branches and
 includes a used address at index 25 — inside a gap=30 scan window, outside
 a gap=20 one):
@@ -147,7 +147,7 @@ NARROW_TX_TRUTH: Final = tuple(t for t in TX_TRUTH if t[0] != TX_FUND_R25)
 NARROW_CONFIRMED: Final = 50_000
 NARROW_TOTAL: Final = NARROW_CONFIRMED + UNCONFIRMED_TRUTH
 
-STALE_ADDRESS: Final = "tb1qstalerowthatneverexistedonchain000000000000"
+STALE_ADDRESS: Final = "bc1qstalerowthatneverexistedonchain000000000000"
 
 
 def _truth_chain() -> FakeChain:
@@ -398,7 +398,7 @@ def test_ac2_rescan_repairs_stale_cache_to_ground_truth(store: Store) -> None:
     store.replace_utxos_for_wallet(
         wid,
         [
-            UtxoRecord(wid, "f" * 64, 9, "tb1qjunk", 123_456, 1, 5),
+            UtxoRecord(wid, "f" * 64, 9, "bc1qjunk", 123_456, 1, 5),
             UtxoRecord(wid, "e" * 64, 3, None, 1, 0, None),
         ],
     )
@@ -630,25 +630,25 @@ def test_ac4_store_view_narration_inputs_match_truth(store: Store) -> None:
     reason="live-network test: set LOCALWALLET_E2E_LIVE=1 to include",
 )
 def test_live_phase1_ac_explorer_crosscheck_sheet() -> None:
-    """Real scan_wallet (gap 30) against mempool.space testnet4 for the
-    vpub in LOCALWALLET_AC_VPUB; prints a human comparison sheet (balance
+    """Real scan_wallet (gap 30) against mempool.space mainnet for the
+    zpub in LOCALWALLET_AC_ZPUB; prints a human comparison sheet (balance
     totals, utxo/tx counts, per-branch max_used, first/last window
     address) for the literal Phase 1 AC sign-off (see docs/phase1-ac.md).
 
     Run (add -s to see the sheet):
 
-        LOCALWALLET_E2E_LIVE=1 LOCALWALLET_AC_VPUB=<vpub> \\
+        LOCALWALLET_E2E_LIVE=1 LOCALWALLET_AC_ZPUB=<zpub> \\
             pytest tests/test_phase1_ac.py -k live -s
 
     Asserts structural sanity only — the numeric cross-check against
     mempool.space/Electrum is the human's job (value-free automation).
     """
-    vpub = os.environ.get("LOCALWALLET_AC_VPUB", "").strip()
-    if not vpub:
-        pytest.skip("LOCALWALLET_AC_VPUB not set")
+    zpub = os.environ.get("LOCALWALLET_AC_ZPUB", "").strip()
+    if not zpub:
+        pytest.skip("LOCALWALLET_AC_ZPUB not set")
 
-    descriptor = WalletDescriptor.from_key(vpub)
-    client = EsploraClient()  # default: https://mempool.space/testnet4/api
+    descriptor = WalletDescriptor.from_key(zpub)
+    client = EsploraClient()  # default: https://mempool.space/api
     try:
         with Store.memory() as store:
             wallet = store.create_wallet("default", descriptor.descriptor)
@@ -685,7 +685,7 @@ def test_live_phase1_ac_explorer_crosscheck_sheet() -> None:
         print(f"    last window address:  {last}")
     print(
         "  Compare each funded address on "
-        "https://mempool.space/testnet4/address/<addr> and in Electrum "
+        "https://mempool.space/address/<addr> and in Electrum "
         "(see docs/phase1-ac.md for the checklist)."
     )
 

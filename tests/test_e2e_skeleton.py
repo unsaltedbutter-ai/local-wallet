@@ -92,9 +92,13 @@ from localwallet.wallet.descriptor import (
 
 FIXTURE_SEED: Final = b"local-wallet phase 0 test fixture seed (not a real wallet)"
 
-VPUB: Final[str] = (
-    "vpub5ZJ3cDEGGk61yWWUHFHgmG3M4je4yFD3ebC6jWHsqV8Cxh2K5zz8c6X5Hk7FkUAB"
-    "FTjRkQBz3g84MYeRhjAdnq1QmrmyTRTrzs8rFVCJUyh"
+#: Canonical mainnet fixture zpub — the SAME constant as
+#: ``tests/test_wallet_descriptor.py::ZPUB`` and
+#: ``tests/test_chain_backend_switch.py::ZPUB`` (one fixed seed across the
+#: suite, ADR-0021 mainnet-only). Derived from DESCRIPTOR_SEED below.
+ZPUB: Final[str] = (
+    "zpub6qh6bF4roUgQtg2fm5SUhRsQFEidwUPPLhS82BDHjtNh2UxmgNfCS8NF4jQoBqNCeEW"
+    "BaKyTxcmyBkq3iuZS5Seyz5dWMcwYxaMgpZn4cWQ"
 )
 UPUB: Final[str] = (
     "upub5EZAYmn7rXyfeYphHTqJ3m8umysXpxE1Fz8rYCcMBCjJ2KdSuCNf24pxTYGDyDyz"
@@ -104,9 +108,11 @@ TPUB: Final[str] = (
     "tpubDCPxzVARcvNjZZjy5nZi1GS2NJsRG3TkDZeuncBCT2eWFMbMhkcf5WLeMiTsY6Ae"
     "N7CfrtRKkAJFTC8VqRgPwza2kDfgBEqJ3hkN8GcfXn9"
 )
-MAINNET_ZPUB: Final[str] = (
-    "zpub6rgMkYLjy1UMKp8DKDd75zsFRxWLZ9PqD1rMiFU7rKtojttHq3F7SwvsfKEZ4B9M"
-    "f1v79VxU34nbw4dQApHKxTEiyLh7fXb18VojW2ae944"
+# Testnet keys are the REFUSAL fixtures now (ADR-0021): the wallet layer
+# refuses them outright, so VPUB only ever appears in negative tests.
+VPUB: Final[str] = (
+    "vpub5ZJ3cDEGGk61yWWUHFHgmG3M4je4yFD3ebC6jWHsqV8Cxh2K5zz8c6X5Hk7FkUAB"
+    "FTjRkQBz3g84MYeRhjAdnq1QmrmyTRTrzs8rFVCJUyh"
 )
 # BIP32 test vector 1 root key — a *private* extended key (watch-only refusal).
 XPRV: Final[str] = (
@@ -114,8 +120,12 @@ XPRV: Final[str] = (
     "PGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi"
 )
 
-# Corrupted-checksum variant of the fixture vpub (last char replaced).
-CORRUPT_VPUB: Final[str] = VPUB[:-1] + ("1" if VPUB[-1] != "1" else "2")
+#: The seed behind the canonical ZPUB (shared with
+#: ``tests/test_wallet_descriptor.py`` — do not change one without the other).
+DESCRIPTOR_SEED: Final = b"local-wallet phase 1 descriptor test seed (not a real wallet)"
+
+# Corrupted-checksum variant of the fixture zpub (last char replaced).
+CORRUPT_ZPUB: Final[str] = ZPUB[:-1] + ("1" if ZPUB[-1] != "1" else "2")
 
 # Fixture UTXOs served by the MockTransport chain (branch 0, indices 0/1).
 UTXOS_ADDR0: Final[list[dict[str, Any]]] = [
@@ -145,7 +155,7 @@ NEW_ADDRESS_CHANGE_JSON: Final[str] = (
 )
 GARBAGE: Final[str] = "this is not json at all <<<>>>"
 
-_EXTERNAL: Final[str] = "tb1qexternalsenderaddressnotpartofthewallet000000"
+_EXTERNAL: Final[str] = "bc1qexternalsenderaddressnotpartofthewallet000000"
 
 
 def _rederive_fixture_key(purpose: int, coin: int, prv_version: bytes, pub_version: bytes) -> str:
@@ -167,16 +177,16 @@ def _expected_addresses(count: int, branch: int = 0) -> list[str]:
     from embit.descriptor import Descriptor
     from embit.networks import NETWORKS
 
-    descriptor = Descriptor.from_string(f"wpkh({VPUB}/{branch}/*)")
+    descriptor = Descriptor.from_string(f"wpkh({ZPUB}/{branch}/*)")
     return [
-        descriptor.derive(i, branch_index=0).address(network=NETWORKS["test"])
+        descriptor.derive(i, branch_index=0).address(network=NETWORKS["main"])
         for i in range(count)
     ]
 
 
 def _fixture_parsed() -> ParsedKey:
     """The fixture wallet's parsed key through the wallet-engine gate."""
-    return WalletDescriptor.from_key(VPUB).parsed
+    return WalletDescriptor.from_key(ZPUB).parsed
 
 
 def derive_fixture_addresses(count: int = 5, branch: int = 0) -> list[str]:
@@ -288,7 +298,7 @@ def _mock_client(
 ) -> EsploraClient:
     """EsploraClient wired to a MockTransport (no real network)."""
     return EsploraClient(
-        base_url="https://mempool.space/testnet4/api",
+        base_url="https://mempool.space/api",
         timeout_s=5.0,
         max_retries=max_retries,
         transport=httpx.MockTransport(handler),
@@ -312,7 +322,7 @@ def _build_table(
     recorded: list[httpx.Request] = []
     client = _mock_client(make_handler(recorded))
     store = Store.memory()
-    wd = WalletDescriptor.from_key(VPUB)
+    wd = WalletDescriptor.from_key(ZPUB)
     wallet = store.create_wallet("default", wd.descriptor)
     store.set_active_wallet(wallet.id)
     if gap_limit is not None:
@@ -328,25 +338,35 @@ def _build_table(
 
 def test_fixture_keys_match_embit_rederivation() -> None:
     """The hardcoded key constants are exactly what embit derives from the
-    fixed seed — proving they are real, checksum-valid SLIP-132 keys."""
-    from embit.bip32 import NETWORKS
+    fixed seeds — proving they are real, checksum-valid SLIP-132 keys.
 
-    assert VPUB == _rederive_fixture_key(
-        84, 1, NETWORKS["test"]["zprv"], NETWORKS["test"]["zpub"]
+    The canonical ZPUB comes from the shared descriptor-test seed (one fixed
+    seed across the suite); the testnet UPUB/TPUB refusal fixtures come from
+    the phase-0 e2e seed.
+    """
+    from embit.bip32 import NETWORKS, HDKey
+
+    def _rederive_from(seed: bytes, purpose: int, coin: int, prv_version: bytes, pub_version: bytes) -> str:
+        root = HDKey.from_seed(seed, version=prv_version)
+        account = root.derive([purpose + 2**31, coin + 2**31, 0])
+        return account.to_public().to_base58(version=pub_version)
+
+    assert ZPUB == _rederive_from(
+        DESCRIPTOR_SEED, 84, 0, NETWORKS["main"]["zprv"], NETWORKS["main"]["zpub"]
     )
-    assert UPUB == _rederive_fixture_key(
-        49, 1, NETWORKS["test"]["yprv"], NETWORKS["test"]["ypub"]
+    assert UPUB == _rederive_from(
+        FIXTURE_SEED, 49, 1, NETWORKS["test"]["yprv"], NETWORKS["test"]["ypub"]
     )
-    assert TPUB == _rederive_fixture_key(
-        44, 1, NETWORKS["test"]["xprv"], NETWORKS["test"]["xpub"]
+    assert TPUB == _rederive_from(
+        FIXTURE_SEED, 44, 1, NETWORKS["test"]["xprv"], NETWORKS["test"]["xpub"]
     )
-    assert MAINNET_ZPUB == _rederive_fixture_key(
-        84, 0, NETWORKS["main"]["zprv"], NETWORKS["main"]["zpub"]
+    assert VPUB == _rederive_from(
+        FIXTURE_SEED, 84, 1, NETWORKS["test"]["zprv"], NETWORKS["test"]["zpub"]
     )
 
 
 def _mainnet_fixture_key(script: str) -> str:
-    """Mainnet ypub/xpub fixtures derived from the same fixed seed."""
+    """Mainnet ypub/xpub fixtures derived from the phase-0 e2e seed."""
     from embit.bip32 import NETWORKS
 
     purpose = {"ypub": 49, "xpub": 44}[script]
@@ -358,8 +378,8 @@ def _mainnet_fixture_key(script: str) -> str:
 @pytest.mark.parametrize(
     ("key_id", "expected_network", "expected_script"),
     [
+        ("zpub", "main", "p2wpkh"),
         ("vpub", "testnet", "p2wpkh"),
-        ("zpub(main)", "main", "p2wpkh"),
         ("upub", "testnet", "p2sh_p2wpkh"),
         ("tpub", "testnet", "p2pkh"),
         ("ypub(main)", "main", "p2sh_p2wpkh"),
@@ -370,14 +390,16 @@ def test_parse_watch_key_detects_network_and_script_type(
     key_id: str, expected_network: str, expected_script: str
 ) -> None:
     key = {
+        "zpub": ZPUB,
         "vpub": VPUB,
-        "zpub(main)": MAINNET_ZPUB,
         "upub": UPUB,
         "tpub": TPUB,
         "ypub(main)": _mainnet_fixture_key("ypub"),
         "xpub(main)": _mainnet_fixture_key("xpub"),
     }[key_id]
 
+    # parse_watch_key keeps the Phase 0 detect-only contract (gate off);
+    # parse_wallet_key / WalletDescriptor enforce the ADR-0021 mainnet gate.
     parsed = parse_watch_key(key)
     assert isinstance(parsed, ParsedKey)
     assert parsed.network == expected_network
@@ -385,14 +407,14 @@ def test_parse_watch_key_detects_network_and_script_type(
     assert not parsed.hd_key.is_private
 
 
-def test_vpub_derives_deterministic_tb1_addresses_matching_descriptor() -> None:
-    parsed = parse_watch_key(VPUB)
-    assert parsed.network == "testnet"
+def test_zpub_derives_deterministic_bc1_addresses_matching_descriptor() -> None:
+    parsed = parse_watch_key(ZPUB)
+    assert parsed.network == "main"
     assert parsed.script_type == "p2wpkh"
 
     addresses = derive_receive_addresses(parsed, count=5)
-    # The ticket's testnet-prefix assertion: vpub path → bech32 tb1...
-    assert all(addr.startswith("tb1") for addr in addresses)
+    # The mainnet-prefix assertion: zpub path → bech32 bc1...
+    assert all(addr.startswith("bc1") for addr in addresses)
     # Cross-checked against embit's descriptor engine (independent path).
     assert addresses == _expected_addresses(5)
     # Deterministic and prefix-stable across calls and counts.
@@ -402,7 +424,7 @@ def test_vpub_derives_deterministic_tb1_addresses_matching_descriptor() -> None:
 
 
 def test_change_branch_derivation_differs_from_receive() -> None:
-    parsed = parse_watch_key(VPUB)
+    parsed = parse_watch_key(ZPUB)
     receive = derive_receive_addresses(parsed, count=2, branch=0)
     change = derive_receive_addresses(parsed, count=2, branch=1)
     assert receive != change
@@ -411,21 +433,21 @@ def test_change_branch_derivation_differs_from_receive() -> None:
 
 @pytest.mark.parametrize("count", [0, -1, True, 1001, 2.5, "3", None])
 def test_derive_rejects_out_of_range_count(count: object) -> None:
-    parsed = parse_watch_key(VPUB)
+    parsed = parse_watch_key(ZPUB)
     with pytest.raises(WatchKeyError, match="count"):
         derive_receive_addresses(parsed, count=count)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("branch", [2, -1, True, "0"])
 def test_derive_rejects_invalid_branch(branch: object) -> None:
-    parsed = parse_watch_key(VPUB)
+    parsed = parse_watch_key(ZPUB)
     with pytest.raises(WatchKeyError, match="branch"):
         derive_receive_addresses(parsed, count=1, branch=branch)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
     "bad_key",
-    ["", "   ", "\t\n", "not-a-key", "1" * 30, CORRUPT_VPUB, XPRV, f"{VPUB} {VPUB}"],
+    ["", "   ", "\t\n", "not-a-key", "1" * 30, CORRUPT_ZPUB, XPRV, f"{ZPUB} {ZPUB}"],
 )
 def test_unparseable_and_private_keys_fail_closed_without_echo(bad_key: str) -> None:
     with pytest.raises(WatchKeyError) as excinfo:
@@ -443,36 +465,45 @@ def test_private_key_refusal_names_the_watch_only_rule() -> None:
         parse_watch_key(XPRV)
 
 
-def test_mainnet_zpub_refused_by_testnet_gate() -> None:
-    parsed = parse_watch_key(MAINNET_ZPUB)
-    assert parsed.network == "main"  # parse detects; derive enforces the gate
+def test_testnet_vpub_refused_by_mainnet_gate() -> None:
+    """ADR-0021: the testnet key is the refusal case end to end."""
     with pytest.raises(WatchKeyError) as excinfo:
+        parse_wallet_key(VPUB)
+    message = str(excinfo.value)
+    assert "mainnet-only" in message
+    assert VPUB not in message  # key never echoed
+    # The derive-side gate refuses too (defense in depth): a detect-only
+    # testnet ParsedKey can never reach address encoding.
+    parsed = parse_watch_key(VPUB)
+    with pytest.raises(WatchKeyError, match="mainnet-only"):
         derive_receive_addresses(parsed)
-    message = str(excinfo.value)
-    assert "Phase 0 is testnet-only" in message
-    assert "vpub/upub/tpub" in message
-    assert MAINNET_ZPUB not in message  # key never echoed
 
 
-def test_parse_wallet_key_enforces_testnet_gate_at_parse() -> None:
-    """Phase 1 gate: parse_wallet_key refuses mainnet keys outright."""
-    with pytest.raises(WatchKeyError) as excinfo:
-        parse_wallet_key(MAINNET_ZPUB)
-    message = str(excinfo.value)
-    assert "testnet-only" in message
-    assert MAINNET_ZPUB not in message  # key never echoed
-    # Testnet keys pass.
-    assert parse_wallet_key(VPUB).network == "testnet"
-
-
-def test_testnet_keys_pass_the_gate() -> None:
+def test_parse_wallet_key_enforces_mainnet_gate_at_parse() -> None:
+    """ADR-0021 gate: parse_wallet_key refuses testnet keys outright."""
     for key in (VPUB, UPUB, TPUB):
+        with pytest.raises(WatchKeyError) as excinfo:
+            parse_wallet_key(key)
+        message = str(excinfo.value)
+        assert "mainnet-only" in message
+        assert key not in message  # key never echoed
+    # Mainnet keys pass.
+    assert parse_wallet_key(ZPUB).network == "main"
+
+
+def test_mainnet_keys_pass_the_gate() -> None:
+    for key in (ZPUB, _mainnet_fixture_key("ypub"), _mainnet_fixture_key("xpub")):
         addresses = derive_receive_addresses(parse_watch_key(key), count=2)
         assert len(addresses) == 2
+    # The canonical zpub derives bech32 bc1... receive addresses.
+    assert all(
+        addr.startswith("bc1")
+        for addr in derive_receive_addresses(parse_watch_key(ZPUB), count=2)
+    )
 
 
 def test_wallet_descriptor_is_canonical_and_checksummed() -> None:
-    wd = WalletDescriptor.from_key(VPUB)
+    wd = WalletDescriptor.from_key(ZPUB)
     assert wd.descriptor.startswith("wpkh([")
     assert "#" in wd.descriptor
     # Round-trip: rebuilt from the stored string, identical canonical form.
@@ -513,7 +544,7 @@ def test_stub_generate_emits_respond_otherwise() -> None:
 
 
 def test_stub_generate_send_phrase_emits_create_tx_with_extracted_fields() -> None:
-    """'send 60000 sats to <tb1…>' → create_tx with the tb1 token and the
+    """'send 60000 sats to <bc1…>' → create_tx with the bc1 token and the
     sats figure extracted verbatim from the user turn (canned dev model)."""
     prompt = f"SYSTEM...\n\nuser: send 60000 sats to {SEND_RECIPIENT}\n\nenvelope:"
     envelope = validate_payload(stub_generate(prompt, None))
@@ -533,14 +564,14 @@ def test_stub_generate_send_usd_phrase_emits_amount_usd() -> None:
 
 
 def test_stub_generate_send_falls_back_to_fixture_recipient_and_amount() -> None:
-    """No parsable amount/usable tb1 token → canned fixture recipient
+    """No parsable amount/usable bc1 token → canned fixture recipient
     (the P0 fixture address) and the canned 10000-sat amount."""
-    prompt = "SYSTEM...\n\nuser: send to tb1\n\nenvelope:"
+    prompt = "SYSTEM...\n\nuser: send to bc1\n\nenvelope:"
     envelope = validate_payload(stub_generate(prompt, None))
     assert envelope.intent is IntentName.CREATE_TX
     assert envelope.params.recipient == app_module._STUB_RECIPIENT
     assert envelope.params.amount_sats == 10_000
-    # The canned recipient IS the P0 fixture address (valid testnet P2WPKH).
+    # The canned recipient IS the P0 fixture address (valid mainnet P2WPKH).
     assert app_module._STUB_RECIPIENT == derive_fixture_addresses(1)[0]
 
 
@@ -597,7 +628,7 @@ def test_stub_lifecycle_placeholders_refuse_cleanly_through_repl(
     handler = _scan_handler(recorded)
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         ["sign it", "broadcast it", "exit"],
@@ -651,7 +682,7 @@ def test_balance_end_to_end_agent_to_dispatcher_to_scan_to_store() -> None:
     # per window address (gap 2 → 2 per branch) plus one tip request.
     utxo_paths = {r.url.path for r in recorded if r.url.path.endswith("/utxo")}
     assert utxo_paths == {
-        f"/testnet4/api/address/{a}/utxo"
+        f"/api/address/{a}/utxo"
         for a in (addr0, addr1, change0, change1)
     }
     assert any(r.url.path.endswith("/blocks/tip") for r in recorded)
@@ -1070,7 +1101,7 @@ def _preset_store(path: Path, *, gap_limit: int = TEST_GAP) -> WalletDescriptor:
     Exercises the duplicate-descriptor guard on every run: the startup
     must reuse this row, never create a second one.
     """
-    wd = WalletDescriptor.from_key(VPUB)
+    wd = WalletDescriptor.from_key(ZPUB)
     with Store(path) as store:
         wallet = store.create_wallet("default", wd.descriptor)
         store.set_active_wallet(wallet.id)
@@ -1121,7 +1152,7 @@ def test_startup_scan_populates_store_then_balance_reads_it(
     )
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         ["What's my balance?", "exit"],
@@ -1131,20 +1162,20 @@ def test_startup_scan_populates_store_then_balance_reads_it(
 
     assert code == 0
     joined = "\n".join(outputs)
-    # Banner: testnet notice + §9 privacy indicator verbatim.
-    assert "TESTNET" in joined
+    # Banner: mainnet notice + §9 privacy indicator verbatim.
+    assert "MAINNET" in joined
     assert PRIVACY_INDICATOR in joined
     # Startup scan feedback: counts + tip only (no addresses/amounts).
     assert "Startup scan complete: 3 UTXOs · tip height 870000." in joined
     # Balance line verbatim from the handler result dict.
     assert (
-        f"Balance (testnet): {EXPECTED_CONFIRMED} sats (confirmed) "
+        f"Balance (mainnet): {EXPECTED_CONFIRMED} sats (confirmed) "
         f"+ {EXPECTED_UNCONFIRMED} sats (unconfirmed)" in joined
     )
     assert f"Total {EXPECTED_TOTAL} sats" in joined
     assert f"tip height {TIP_HEIGHT}" in joined
     # Privacy/secret hygiene: the zpub and addresses are never echoed.
-    assert VPUB not in joined
+    assert ZPUB not in joined
     assert all(addr not in joined for addr in (addr0, addr1))
     assert wd.descriptor not in joined
     # 9 requests: 1 tip + (2 txs + 2 utxos) per branch at gap 2.
@@ -1171,7 +1202,7 @@ def test_repl_end_to_end_with_stub_llm_prints_verbatim_balance(
     )
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         ["What's my balance?", "exit"],
@@ -1180,15 +1211,15 @@ def test_repl_end_to_end_with_stub_llm_prints_verbatim_balance(
 
     assert code == 0
     joined = "\n".join(outputs)
-    assert "TESTNET" in joined
+    assert "MAINNET" in joined
     assert PRIVACY_INDICATOR in joined
     assert (
-        f"Balance (testnet): {EXPECTED_CONFIRMED} sats (confirmed) "
+        f"Balance (mainnet): {EXPECTED_CONFIRMED} sats (confirmed) "
         f"+ {EXPECTED_UNCONFIRMED} sats (unconfirmed)" in joined
     )
     assert f"Total {EXPECTED_TOTAL} sats" in joined
     assert f"tip height {TIP_HEIGHT}" in joined
-    assert VPUB not in joined
+    assert ZPUB not in joined
     assert all(addr not in joined for addr in (addr0, addr1))
     # Lazy scan only (auto-scan off): 1 tip + 4 txs + 4 utxos.
     assert len(recorded) == 9
@@ -1218,7 +1249,7 @@ def test_auto_scan_opt_out_balance_scans_lazily_on_first_ask(
         return value
 
     outputs: list[str] = []
-    code = run(["--stub-llm", "--zpub", VPUB], input_fn=read_line, output_fn=outputs.append)
+    code = run(["--stub-llm", "--zpub", ZPUB], input_fn=read_line, output_fn=outputs.append)
 
     assert code == 0
     assert marks["What's my balance?"] == 0  # startup made zero chain calls
@@ -1226,7 +1257,7 @@ def test_auto_scan_opt_out_balance_scans_lazily_on_first_ask(
     joined = "\n".join(outputs)
     assert "Startup scan complete" not in joined  # startup scan skipped
     assert (
-        f"Balance (testnet): {EXPECTED_CONFIRMED} sats (confirmed)" in joined
+        f"Balance (mainnet): {EXPECTED_CONFIRMED} sats (confirmed)" in joined
     )
     # Fresh-store path: the app created exactly one wallet row itself.
     with Store(store_path) as store:
@@ -1234,7 +1265,7 @@ def test_auto_scan_opt_out_balance_scans_lazily_on_first_ask(
 
 
 def test_repl_reads_zpub_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv(ZPUB_ENV_VAR, VPUB)
+    monkeypatch.setenv(ZPUB_ENV_VAR, ZPUB)
     store_path = _store_path(tmp_path)
     _preset_store(store_path)
     recorded: list[httpx.Request] = []
@@ -1250,20 +1281,20 @@ def test_repl_reads_zpub_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
     assert code == 0
     joined = "\n".join(outputs)
-    assert f"Balance (testnet): {EXPECTED_CONFIRMED} sats" in joined
-    assert VPUB not in joined  # env-sourced key never echoed either
+    assert f"Balance (mainnet): {EXPECTED_CONFIRMED} sats" in joined
+    assert ZPUB not in joined  # env-sourced key never echoed either
 
 
 def test_zpub_cli_arg_overrides_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    # Env holds a key the Phase 1 gate would refuse; the CLI arg must win.
-    monkeypatch.setenv(ZPUB_ENV_VAR, MAINNET_ZPUB)
+    # Env holds a key the ADR-0021 gate would refuse; the CLI arg must win.
+    monkeypatch.setenv(ZPUB_ENV_VAR, VPUB)
     store_path = _store_path(tmp_path)
     _preset_store(store_path)
     recorded: list[httpx.Request] = []
     handler = _scan_handler(recorded)
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         ["exit"],
@@ -1279,7 +1310,7 @@ def test_zpub_cli_arg_overrides_env(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 def _core_ready_report() -> LocalNodeReport:
     """A LocalNodeReport with a reachable+synced Core and a mempool indexer."""
     health = CoreHealth(
-        chain="testnet4",
+        chain="main",
         blocks=100,
         headers=100,
         verification_progress=1.0,
@@ -1287,7 +1318,7 @@ def _core_ready_report() -> LocalNodeReport:
     )
     core = (
         CoreRpcProbe(
-            port=48332, status=NodeStatus.REACHABLE, cookie_present=True, health=health
+            port=8332, status=NodeStatus.REACHABLE, cookie_present=True, health=health
         ),
     )
     return LocalNodeReport(
@@ -1338,7 +1369,7 @@ def _run_node_repl(
     outputs: list[str] = []
     lines = iter(["what's my node status?", "exit"])
     code = run(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         input_fn=lambda _p: next(lines),
         output_fn=outputs.append,
         node_detect_fn=fake_detect,
@@ -1471,7 +1502,7 @@ def test_backend_mode_three_state_classification_and_watch_fragments() -> None:
     )
     assert (
         _backend_mode(
-            Settings(chain_base_url="https://mempool.example.lan:3006/testnet4/api")
+            Settings(chain_base_url="https://mempool.example.lan:3006/api")
         )
         == BACKEND_MODE_OWN_NODE_REMOTE
     )
@@ -1527,7 +1558,7 @@ def test_node_status_handler_facts_shape() -> None:
     recorded: list[httpx.Request] = []
     client = _mock_client(_scan_handler(recorded))
     store = Store.memory()
-    wd = WalletDescriptor.from_key(VPUB)
+    wd = WalletDescriptor.from_key(ZPUB)
     wallet = store.create_wallet("default", wd.descriptor)
     store.set_active_wallet(wallet.id)
     table = build_dispatch_table(
@@ -1560,7 +1591,7 @@ def test_node_status_detection_disabled_facts_state() -> None:
 
     client = _mock_client(_scan_handler([]))
     store = Store.memory()
-    wd = WalletDescriptor.from_key(VPUB)
+    wd = WalletDescriptor.from_key(ZPUB)
     wallet = store.create_wallet("default", wd.descriptor)
     store.set_active_wallet(wallet.id)
     table = build_dispatch_table(
@@ -1587,7 +1618,7 @@ def test_repl_reports_chain_unavailable(
     handler = _scan_handler([], utxo_status=503)
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         ["What's my balance?", "exit"],
@@ -1600,7 +1631,7 @@ def test_repl_reports_chain_unavailable(
     # Startup scan failed → scrubbed warning, but the REPL still started.
     assert "warning: startup scan failed" in joined
     assert "chain unavailable" in joined
-    assert "Balance (testnet):" not in joined
+    assert "Balance (mainnet):" not in joined
 
 
 def test_rescan_flag_repairs_stale_cache(
@@ -1609,7 +1640,7 @@ def test_rescan_flag_repairs_stale_cache(
     """--rescan: re-derives from the key, rebuilds derivation state and
     replaces the stale UTXO snapshot with chain truth (Phase 1 AC)."""
     store_path = _store_path(tmp_path)
-    wd = WalletDescriptor.from_key(VPUB)
+    wd = WalletDescriptor.from_key(ZPUB)
     parsed = wd.parsed
     addr0 = derive_addresses(parsed, 0, 0, 1)[0].address
     stale_txid = "f" * 64
@@ -1655,7 +1686,7 @@ def test_rescan_flag_repairs_stale_cache(
     )
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB, "--rescan"],
+        ["--stub-llm", "--zpub", ZPUB, "--rescan"],
         monkeypatch,
         handler,
         ["What's my balance?", "exit"],
@@ -1680,7 +1711,7 @@ def test_rescan_flag_repairs_stale_cache(
         deriv = store.get_derivation(wallet.id, 0)
         assert (deriv.max_used_index, deriv.next_index) == (0, 1)
     # And the post-rescan balance reads the repaired cache.
-    assert "Balance (testnet): 50000 sats (confirmed) + 0 sats (unconfirmed)" in joined
+    assert "Balance (mainnet): 50000 sats (confirmed) + 0 sats (unconfirmed)" in joined
     # The out-of-window warning stays cleared: usage stayed inside the window.
     assert "usage was found beyond your usual address window" not in joined
 
@@ -1816,7 +1847,7 @@ def test_watch_probe_discards_truncated_scan_summary(tmp_path: Path) -> None:
     with Store(store_path) as store:
         wallet = store.get_wallet_by_name("default")
         assert wallet is not None
-        addr = derive_addresses(parse_watch_key(VPUB), 0, 0, 1)[0].address
+        addr = derive_addresses(parse_watch_key(ZPUB), 0, 0, 1)[0].address
         store.upsert_txs(
             [
                 TxRecord(
@@ -1885,7 +1916,7 @@ def test_out_of_window_warning_printed_from_sync_state(
     handler = _scan_handler(recorded)
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         ["exit"],
@@ -1897,7 +1928,7 @@ def test_out_of_window_warning_printed_from_sync_state(
     assert OUT_OF_WINDOW_NOTICE in joined
     assert "usage was found beyond your usual address window" in joined
     # The warning line is index-free/scrubbed: no addresses, no key material.
-    assert VPUB not in joined and wd.descriptor not in joined
+    assert ZPUB not in joined and wd.descriptor not in joined
 
 
 def test_out_of_window_warning_absent_without_flag(
@@ -1909,7 +1940,7 @@ def test_out_of_window_warning_absent_without_flag(
     handler = _scan_handler(recorded)
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         ["exit"],
@@ -1935,7 +1966,7 @@ def test_duplicate_descriptor_startup_reuses_wallet_row(
     handler = _scan_handler(recorded)
     for _ in range(2):
         code, _outputs = _run_captured(
-            ["--stub-llm", "--zpub", VPUB],
+            ["--stub-llm", "--zpub", ZPUB],
             monkeypatch,
             handler,
             ["exit"],
@@ -1967,7 +1998,7 @@ def test_repl_new_address_narration_and_persistence_across_runs(
     expected1 = derive_addresses(parsed, 0, 1, 1)[0].address
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         ["give me a new address", "exit"],
@@ -1978,7 +2009,7 @@ def test_repl_new_address_narration_and_persistence_across_runs(
     assert recorded == []  # allocation is network-free
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         ["give me a new address", "exit"],
@@ -2010,7 +2041,7 @@ def test_repl_history_narration_with_stub_phrase(
     handler = _scan_handler(recorded)
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         ["show my recent transactions", "exit"],
@@ -2029,12 +2060,12 @@ def test_repl_history_narration_with_stub_phrase(
     assert wd.descriptor not in joined
 
 
-def test_repl_refuses_mainnet_zpub_with_exit_code_2(
+def test_repl_refuses_testnet_vpub_with_exit_code_2(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store_path = _store_path(tmp_path)
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", MAINNET_ZPUB],
+        ["--stub-llm", "--zpub", VPUB],
         monkeypatch,
         lambda _req: None,  # the client factory is never reached
         [],
@@ -2042,8 +2073,8 @@ def test_repl_refuses_mainnet_zpub_with_exit_code_2(
     )
     assert code == 2
     joined = "\n".join(outputs)
-    assert "testnet-only" in joined
-    assert MAINNET_ZPUB not in joined
+    assert "mainnet-only" in joined
+    assert VPUB not in joined
     # Fail-closed before any store side effects for the rejected key.
     assert not store_path.exists()
 
@@ -2067,7 +2098,7 @@ def test_repl_without_model_or_stub_flag_fails_cleanly(
     monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
 
     outputs: list[str] = []
-    code = run(["--zpub", VPUB], input_fn=lambda _p: "exit", output_fn=outputs.append)
+    code = run(["--zpub", ZPUB], input_fn=lambda _p: "exit", output_fn=outputs.append)
 
     assert code == 2
     joined = "\n".join(outputs)
@@ -2088,7 +2119,7 @@ def test_store_path_into_a_file_fails_cleanly_exit_2(
     store_path = blocker / "db.sqlite"
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         lambda _req: None,
         [],
@@ -2110,7 +2141,7 @@ def test_startup_chain_down_repl_still_starts_and_balance_degrades(
     handler = _scan_handler([], utxo_status=503)
 
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         ["What's my balance?", "exit"],
@@ -2122,7 +2153,7 @@ def test_startup_chain_down_repl_still_starts_and_balance_degrades(
     joined = "\n".join(outputs)
     assert "warning: startup scan failed" in joined
     assert "chain unavailable" in joined
-    assert "Balance (testnet):" not in joined
+    assert "Balance (mainnet):" not in joined
     # The wallet row was still created; the store simply stays empty.
     with Store(store_path) as store:
         assert len(store.list_wallets()) == 1
@@ -2149,7 +2180,7 @@ SEND_FEES_PAYLOAD: Final[dict[str, int]] = {
 SEND_PRICE_USD: Final[float] = 20_000.0
 
 #: Recipient fixture: branch-0 index 9 of the fixture key — a valid
-#: testnet P2WPKH address OUTSIDE the gap-2 scan window, so the chain
+#: mainnet P2WPKH address OUTSIDE the gap-2 scan window, so the chain
 #: mock never confuses it with a wallet address.
 SEND_RECIPIENT: Final[str] = derive_addresses(_fixture_parsed(), 0, 9, 1)[0].address
 
@@ -2290,7 +2321,7 @@ def _build_send_table(
     recorded: list[httpx.Request] = []
     client = _mock_client(make_handler(recorded))
     store = Store.memory()
-    wd = WalletDescriptor.from_key(VPUB)
+    wd = WalletDescriptor.from_key(ZPUB)
     wallet = store.create_wallet("default", wd.descriptor)
     store.set_active_wallet(wallet.id)
     if gap_limit is not None:
@@ -2475,7 +2506,7 @@ def _run_send_repl(
 
     outputs: list[str] = []
     code = run(
-        ["--zpub", VPUB],
+        ["--zpub", ZPUB],
         input_fn=read_line,
         output_fn=outputs.append,
         flow=tx_flow,
@@ -2526,7 +2557,7 @@ def test_confirmation_card_full_payload_is_byte_identical_to_previous_format() -
         "amount_sats": 60_000,
         "usd_cents": 1_200,
         "rate_age_s": 0,
-        "recipient": "tb1qtest",
+        "recipient": "bc1qtest",
         "fee_sats": 282,
         "fee_rate_sat_vb": 2,
         "fee_target": "medium",
@@ -2540,7 +2571,7 @@ def test_confirmation_card_full_payload_is_byte_identical_to_previous_format() -
     app_module._print_confirmation_card(result, lines.append)
     assert lines == [
         "Amount: 60000 sats ($12.00 · rate age 0s)",
-        "To: tb1qtest",
+        "To: bc1qtest",
         "Fee: 282 sats (2 sat/vB, medium target)",
         "Size: 141 vB",
         "Inputs: 1",
@@ -3230,7 +3261,7 @@ def test_repl_transcript_export_scrub_commands(
     handler = _scan_handler([], utxos_by_addr={})
     export_path = tmp_path / "transcript.txt"
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         [
@@ -3250,7 +3281,7 @@ def test_repl_transcript_export_scrub_commands(
     assert "Commands: /export" in joined
     text = export_path.read_text(encoding="utf-8")
     assert "local-wallet session export" in text
-    assert "tb1" not in text
+    assert "bc1q" not in text
 
 
 def test_repl_export_refuses_existing_path(
@@ -3265,7 +3296,7 @@ def test_repl_export_refuses_existing_path(
     existing = tmp_path / "transcript.txt"
     existing.write_text("ORIGINAL CONTENT", encoding="utf-8")
     code, outputs = _run_captured(
-        ["--stub-llm", "--zpub", VPUB],
+        ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
         handler,
         [
@@ -3303,7 +3334,9 @@ LIFECYCLE_HISTORY_JSON: Final[str] = '{"v": 0, "intent": "get_history", "params"
 #: keys and signatures, never path labels, so the fake device derives the
 #: account node the way the fixture was actually built and uses the
 #: recorded leaf indexes (branch, index) from the PSBT derivation.
-FIXTURE_ACCOUNT_DERIVATION: Final[list[int]] = [84 + 2**31, 1 + 2**31, 0]
+#: The fake device's account node: the private counterpart of the
+#: canonical mainnet fixture zpub (coin 0, ADR-0021; see DESCRIPTOR_SEED).
+FIXTURE_ACCOUNT_DERIVATION: Final[list[int]] = [84 + 2**31, 0 + 2**31, 0]
 
 
 def _simulate_device_sign(unsigned_b64: str, *, tamper: bool = False) -> str:
@@ -3320,7 +3353,7 @@ def _simulate_device_sign(unsigned_b64: str, *, tamper: bool = False) -> str:
     from embit.psbt import PSBT as _PSBT
 
     psbt = _PSBT.parse(base64.b64decode(unsigned_b64))
-    account = bip32.HDKey.from_seed(FIXTURE_SEED).derive(FIXTURE_ACCOUNT_DERIVATION)
+    account = bip32.HDKey.from_seed(DESCRIPTOR_SEED).derive(FIXTURE_ACCOUNT_DERIVATION)
     for i, scope in enumerate(psbt.inputs):
         (pub, derivation), = scope.bip32_derivations.items()
         priv = account.derive(derivation.derivation[-2:]).key
@@ -3957,16 +3990,16 @@ def test_send_lifecycle_tx_status_unknown_vs_chain_error(tmp_path: Path) -> None
     os.environ.get("LOCALWALLET_E2E_LIVE") != "1",
     reason="live-network test: set LOCALWALLET_E2E_LIVE=1 to include",
 )
-def test_live_testnet4_balance_via_mempool_space() -> None:
+def test_live_mainnet_balance_via_mempool_space() -> None:
     """Real-network integration: the Phase 1 path against mempool.space
-    testnet4 — lazy scan populates the store, balance reads it, and a
-    new_address allocation derives a valid tb1 address at index 0."""
-    vpub = os.environ.get("LOCALWALLET_E2E_VPUB", "").strip()
-    if not vpub:
-        pytest.skip("LOCALWALLET_E2E_VPUB not set")
-    parsed = parse_wallet_key(vpub)
-    descriptor = WalletDescriptor.from_key(vpub)
-    client = EsploraClient()  # defaults: https://mempool.space/testnet4/api
+    mainnet — lazy scan populates the store, balance reads it, and a
+    new_address allocation derives a valid bc1 address at index 0."""
+    zpub = os.environ.get("LOCALWALLET_E2E_ZPUB", "").strip()
+    if not zpub:
+        pytest.skip("LOCALWALLET_E2E_ZPUB not set")
+    parsed = parse_wallet_key(zpub)
+    descriptor = WalletDescriptor.from_key(zpub)
+    client = EsploraClient()  # defaults: https://mempool.space/api
     try:
         with Store.memory() as store:
             wallet = store.create_wallet("default", descriptor.descriptor)
@@ -4000,4 +4033,4 @@ def test_live_testnet4_balance_via_mempool_space() -> None:
     assert address_turn.result is not None
     assert address_turn.result["index"] == 0
     address = address_turn.result["address"]
-    assert isinstance(address, str) and address.startswith("tb1")
+    assert isinstance(address, str) and address.startswith("bc1")

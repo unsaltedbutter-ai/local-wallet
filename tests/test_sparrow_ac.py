@@ -94,13 +94,14 @@ CHANGE_SCRIPT: Final = spk(1, 7)
 #: Byte-identical base64 of the canonical fixture PSBT (pinned — see the
 #: module docstring for the determinism verdict).
 CANONICAL_BASE64: Final = (
-    "cHNidP8BAJoCAAAAAqurq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urAAAAAAD9////"
-    "zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0AAAAAAP3///8CYOoAAAAAAAAWABSg"
-    "WskACjN+ENkFvfGdt5Bkv2Hd7o5zAAAAAAAAFgAUT9uYSBjX/dfTe0K6kxDOwuFGYNIAAAAA"
-    "AAEBH0CcAAAAAAAAFgAUxMzdDFKkzmyH7CTeF5ED5AHA88UiBgIHD/uasRuMPbjfvsIzCOA4"
-    "VeD7W0Ddqwz9s+xNed2VLRjJSIYKVAAAgAEAAIAAAACAAAAAAAMAAAAAAQEfUMMAAAAAAAAW"
-    "ABRtaUZa8aAbxUSmUNENdNYlAM8HIyIGAsLJjHOBB4ChcG6SWIdzAaMw5rdkWeWSKyZex13D"
-    "c7UOGMlIhgpUAACAAQAAgAAAAIABAAAABAAAAAAAAA=="
+    "cHNidP8BAJoCAAAAAqurq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urAAAA"
+    "AAD9////zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0AAAAAAP3///8C"
+    "YOoAAAAAAAAWABQ9donAA5g6m8UdqCOOAfCN4pzpJI5zAAAAAAAAFgAUyujlq5K2"
+    "jdsIr+XwPjt5CjMYAzUAAAAAAAEBH0CcAAAAAAAAFgAUpyvM58Qt7QH80V1bVmVZ"
+    "4aVJLRUiBgO3W1F6omIK8Zp42MXTBVwc34IzRb8zosobrF4CGaBNkxjoibavVAAA"
+    "gAAAAIAAAACAAAAAAAMAAAAAAQEfUMMAAAAAAAAWABQmjfcF6dHmBw/OyqvWChjK"
+    "6o2a7SIGAjr2BP5GwmQoRAfyUYbnl8x5vNoQPszwTNsViAiDcS2DGOiJtq9UAACA"
+    "AAAAgAAAAIABAAAABAAAAAAAAA=="
 )
 
 #: The :class:`PsbtMeta` the fixture builder must produce.
@@ -256,7 +257,7 @@ def test_dump_fixture_for_sparrow_import(tmp_path: Path) -> None:
         outputs.append(
             {
                 "script_pubkey_hex": script_bytes.hex(),
-                "address": Script(script_bytes).address(NETWORKS["test"]),
+                "address": Script(script_bytes).address(NETWORKS["main"]),
                 "value_sats": value,
             }
         )

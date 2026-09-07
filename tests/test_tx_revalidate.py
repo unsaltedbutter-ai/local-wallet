@@ -263,7 +263,7 @@ class TestTamperMatrix:
             "output value does not match the intended transaction",
         )
 
-    def test_recipient_script_swapped_for_another_valid_testnet_program(self):
+    def test_recipient_script_swapped_for_another_valid_mainnet_program(self):
         psbt_b64, _meta, intended = signed_container()
         tamper(
             psbt_b64,
