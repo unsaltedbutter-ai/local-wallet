@@ -22,4 +22,4 @@ htmlcov/
 # Model weights (downloaded, pinned via models/MODELS.md)
 models/*.gguf
 models/models/
-
+models/bin/
