@@ -577,3 +577,189 @@ value today (only `usd_cents`/`rate_age_s`/`rate_stale`/`rate_fetched_at`),
 so it is one new handler key when a user asks "what rate did you use?";
 USD + age answer the decision-relevant "is this dollar figure fresh?"
 without it.
+
+## 5. `/details` deep view: "where this money comes from" (per-source provenance)
+
+- **Source:** post-MW-4 user requirement (intent quoted): when we show a
+  proposed transaction and the user asks for more information, explain
+  where the UTXOs we are going to spend came from — (a) when they arrived,
+  (b) other transactions they're associated with if known, (c) any KYC or
+  non-KYC tag.
+- **Grounded in (read-only survey):** `store/models.py` (`UtxoRecord`,
+  `TxRecord`, `AddressRecord`), `store/db.py` accessors
+  (`get_utxos_for_wallet`, `get_txs_for_wallet`, `get_by_address`),
+  `tx/flow.py` (`PendingTx` — carries `psbt_base64` + `inputs_count`, NOT
+  the per-input list), `tx/psbt.py` / `tx/revalidate.py` (the deterministic
+  prevout/witness-utxo parse pattern to reuse), PROJECT.md §9/§10,
+  ADR-0020 (transcript-command channel).
+
+### 5.0 The honest-data rule (what this view may and may not say)
+
+Three ceilings, stated before any copy:
+
+1. **Store-only, zero new network.** Every claim below renders from rows
+   this wallet already wrote during its own scans. The view fetches
+   nothing — so it adds **nothing** to the §9 "what leaves the machine"
+   table, and the copy must never imply chain-wide graph analysis. A
+   question the local rows can't answer gets the honest fallback
+   ("beyond what this wallet has seen" — §5.4), not a lookup.
+2. **No KYC data source exists, and we will not fabricate one.** The
+   requirement's item (c) as literally phrased ("KYC or non-KYC tag") is
+   **not satisfiable in v1**: we have no exchange-attribute feed, no
+   oracle, nothing — and inventing one would be exactly the over-claim §9
+   forbids. The only honest v1 shape is **user-assigned notes** the user
+   typed themselves, surfaced verbatim. "This came from Coinbase" is ever
+   only the user's own note echoed back — never our inference, and the
+   copy says so (`src.bounds`). The tagging *feature* (schema + a way to
+   set notes) is a separate ticket (**LABELS-USER**, §5.5) — this section
+   designs only the display shape, including the `(unlabeled)` fallback so
+   shipping labels later doesn't reshape the view.
+3. **Terminal-only, never model context.** `/details` output is
+   code-rendered to the terminal (same channel and precedent as the card —
+   the model cannot see it, HANDOFF §3.7). That is deliberate and it also
+   closes a §9 threat vector: user notes are user input, and the §7.10
+   red-team list already names "prompt injection via labels" — verbatim
+   display to a human is safe; injecting the same strings into model
+   context is not, so they never go there. In chat, the model may only say
+   the view exists (FACTS carry balance-level facts, not provenance).
+
+Jargon: the word "UTXO" never appears in user-facing strings. The plain
+rendering is **source** with a one-time gloss on the view's head line
+("the separate payments your wallet holds — Bitcoin spends them like
+cash"), §10's zero-jargon-without-explanation rule.
+
+### 5.1 What the store actually has, per input (data audit)
+
+The pending record stores only `inputs_count` + `psbt_base64`, so the
+renderer deterministically parses prevouts (`txid:vout`, value) out of the
+cached PSBT — the exact parse `revalidate.py` already performs — then
+joins against store rows:
+
+| Need | Source today | Verdict |
+|---|---|---|
+| which coins are inputs (txid, vout, value, our address) | `PendingTx.psbt_base64` parse (code, verbatim) | **exists** |
+| (a) arrival, confirmed coins | `TxRecord.block_time` (unix seconds of the block) + `height`, joined on the funding `txid`; `UtxoRecord.height`/`confirmed` corroborate | **exists** |
+| (a) arrival, *unconfirmed* coins | `height=None`, `confirmed=0` is detectable, but **no first-seen/observed timestamp exists anywhere** — "when did it arrive" has no honest answer beyond "not in a block yet" | **needs store work** (one column — `STORE-FIRSTSEEN`, §5.5; no migration designed here) |
+| (b) same-address history this wallet watched | join `UtxoRecord.address` → other rows sharing that address across `utxos` + `transactions` (direction in/out/self counts). No dedicated accessor; load-and-join in the renderer is fine at v1 wallet sizes (ADR-0010) — `ponytail:` add store accessors if scan history ever outgrows the list scan | **exists** (own-scan bounds only — the copy must carry that) |
+| (c) any tag/label | nothing — `AddressRecord` has no label column; nothing classifies anything | **future ticket** (LABELS-USER); v1 renders `(unlabeled)` |
+| — | `TxRecord.raw_summary` is `None` at every write site; `UtxoRecord.confirmed` is a flag, not a time | not usable; not promised |
+
+### 5.2 Placement: inside `/details`, card unchanged
+
+The brief card stays exactly as §1 defines it — this view is a depth
+*below* `/details`, appended under the cached nine-line reprint:
+`/details` → full card verbatim (existing §1 plan) → blank line →
+provenance block (`src.*`). One affordance, one place.
+
+**Decision: v1 is reachable only while a transaction is pending.**
+Justification (brief): the requirement's trigger is precisely "when we
+show a proposed transaction and the user asks for more information" — the
+moment provenance matters is the destructive-flow review. Answering
+provenance questions about arbitrary coins outside a pending tx needs a
+coin-picking UX (which coin? addresses repeat; ambiguity handling) —
+real surface, zero current demand. The code path is identical either
+way, so a standalone `/coins` view later is a reuse, not a rewrite; until
+a user actually asks, YAGNI. Chat-side, "where do my coins come from?"
+with nothing pending is a `respond` turn that offers the view only when a
+tx pends.
+
+### 5.3 Per-source line format
+
+One block per input, ordered exactly as `select_coins` returns them
+(deterministic sort — the PSBT's input order, never re-ordered for
+display). Example with two sources (mainnet figures are illustrative,
+all values in real output are verbatim from the parse/store):
+
+```
+Where this comes from — 2 sources, 312,500 sats in total
+  Sources are the separate payments your wallet holds; Bitcoin spends
+  them like cash, so one payment can draw on several.
+
+  1.  250,000 sats · received 2026-08-31 (~7 days ago) · block 921,433
+      address bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh · (unlabeled)
+      other activity we've seen on that address: 2 received, 1 sent
+
+  2.  62,500 sats · received recently — not in a block yet
+      address bc1q9hm8cqq9vnv3zkfhq3fh3ddcmb88mypex0fydf · (unlabeled)
+      no other activity on that address in this wallet's history
+
+  This list covers only what this wallet has seen on its own. Nothing
+  was fetched to build it, and nothing here is a claim about who sent
+  anything — labels, where present, are your own notes, shown as you
+  wrote them.
+```
+
+The label line is the only part that changes when LABELS-USER ships:
+`(unlabeled)` → `your note: "marketplace payout"` (user's words verbatim,
+quotes are the verbatim delimiter, no rewriting/case-fixing).
+
+### 5.4 Copy rules inside the block
+
+- **Values verbatim, always** (§10 / HANDOFF §3.7): sats, full addresses
+  (never truncated mid-hash, copyable), txids when quoted, block heights —
+  all from the PSBT parse / store rows. Date + "(~N days ago)" is display
+  formatting derived from `block_time`, same class as the sats separators
+  §1 allows.
+- **Missing-data honesty, never a fabricated zero or guessed date:**
+  `block_time` null but height present → `confirmed in block {height} —
+  exact time not recorded`; unconfirmed → the `arrival_pending` line
+  (makes no claim about *when* — that's the STORE-FIRSTSEEN gap §5.1, and
+  the copy carries its ceiling, not hides it); funding txid absent from
+  `transactions` (older history than the current cache) →
+  `arrival_unknown` + association line `beyond_ours` ("we haven't watched
+  the whole chain — ask me to resync" style next-step, §10 error pattern).
+- **Association counts** are stated as what *we saw* (`"we've seen"`),
+  direction words are plain: received / sent / sent back to yourself
+  (`DIR_SELF`); `self` never renders as a suspicious duplicate.
+- **Dual units (§10) — scoped deviation, flagged for the orchestrator:**
+  the per-source lines are **sats-only**. The create_tx result carries
+  `usd_cents`/`rate_age_s` for the transaction total, not a raw rate, so a
+  per-line USD figure would need a new rate key (same deferred anchor as
+  §1's note) and would spam the block. The §10 dual-units duty is written
+  for confirmation *cards*; the card and the block's total line carry it.
+  If the orchestrator reads §10 strictly for every amount on screen, the
+  fix is one handler key (`rate_sat_usd`), not a copy change.
+
+### 5.5 Tickets this section files (post-MW-4; joins §4's list)
+
+1. **TX-PROVENANCE** — the §5.2–5.4 view: PSBT prevout parse (reuse the
+   `revalidate.py` pattern), in-renderer store joins, `src.*` strings,
+   `/details` append under the cached card. No envelope/grammar/intent
+   change, no network, no flow/gate change. Tests: golden render from
+   fixture store rows; honest-fallback branches (null block_time,
+   unconfirmed, unknown txid).
+2. **STORE-FIRSTSEEN** — one column so unconfirmed arrivals get an honest
+   "received ~N min ago". Not designed here (schema-migration owner is
+   the orchestrator); until it lands, `arrival_pending` is the ceiling.
+3. **LABELS-USER** (feature ticket, NOT copy) — user-assigned notes on
+   addresses: storage, a set/clear command, and the verbatim
+   `src.label_yours` render. Ships with an eval asserting label text
+   never enters model context (§9 injection vector, §5.0.3) and a copy
+   review confirming nothing auto-classifies.
+
+### Appendix additions (string block, structured for i18n)
+
+```
+src.head        = Where this comes from — {n} source{s? "s"} {total_sats} sats in total
+src.gloss       = Sources are the separate payments your wallet holds; Bitcoin spends them like cash, so one payment can draw on several.
+src.line_value  = {index}. {value_sats} sats · {arrival}
+src.arrival_block   = received {date} (~{age}) · block {height}          # from TxRecord.block_time
+src.arrival_height  = confirmed in block {height} — exact time not recorded
+src.arrival_pending = received recently — not in a block yet
+src.arrival_unknown = arrival outside what this wallet has recorded — try a resync, then /details again
+src.line_address = address {address} · {label}                          # address verbatim, never truncated
+src.label_none   = (unlabeled)                                          # v1 default; never implies we checked anything
+src.label_yours  = your note: "{user_label}"                            # LABELS-USER; user's words verbatim, our copy never endorses the claim
+src.assoc_counts = other activity we've seen on that address: {n_in} received, {n_out} sent{n_self? ", {n_self} back to yourself"}
+src.assoc_none   = no other activity on that address in this wallet's history
+src.assoc_beyond = we've watched {n} transaction{s? "s"} on that address; anything earlier or elsewhere is beyond what this wallet has seen
+src.bounds       = This list covers only what this wallet has seen on its own. Nothing was fetched to build it, and nothing here is a claim about who sent anything — labels, where present, are your own notes, shown as you wrote them.
+src.error        = I couldn't read the coin history for this wallet — check it's still loaded, then say "retry". Your pending transaction is untouched.   # value-free (§7.8): names no address/txid/amount
+```
+
+(`{arrival}`/`{label}` select one variant each, above; the renderer
+chooses by data presence, so no line ever renders an empty segment.
+`src.error` follows the §10 cause-plus-next-step pattern and the
+fail-closed rule: if provenance can't be read, `/details` shows the card
+reprint plus `src.error`, and the pending flow is untouched — provenance
+is informational, never a gate.)
