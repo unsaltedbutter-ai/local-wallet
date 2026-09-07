@@ -2,6 +2,14 @@
 
 Loaded from env vars prefixed ``LOCALWALLET_`` via ``from_env()``. Stdlib only.
 No secrets are stored or logged here.
+
+**Stdlib-only constraint (lint-enforced discipline for this module):** this
+module must never import :mod:`localwallet.store` (or anything doing I/O).
+The persisted chain-backend choice (ADR-0023, TCK-ONB-002) therefore enters
+through :func:`resolve_chain_base_url` as a plain argument: the startup wiring
+(TCK-ONB-003) reads the stored value from the store and injects it here.
+``Settings.chain_base_url`` remains the single backend selection point
+(ADR-0018); this module only decides *where its value may come from*.
 """
 
 from __future__ import annotations
@@ -109,3 +117,29 @@ class Settings:
             if raw is not None:
                 values[field.name] = _coerce(field.name, raw)
         return cls(**values)
+
+
+def resolve_chain_base_url(
+    env_value: str | None, stored_value: str | None
+) -> str | None:
+    """Resolve the chain backend selection (ADR-0023 precedence; TCK-ONB-002).
+
+    Pure function — no env reads, no I/O, no store import. Precedence::
+
+        env LOCALWALLET_CHAIN_BASE_URL  >  stored choice  >  None
+
+    Each rung treats ``None``, the empty string, and whitespace-only as
+    *unset* (an exported empty var is indistinguishable from an absent one —
+    both mean "no override"). The winning value is returned stripped; a
+    whitespace-only setting never resolves to a usable URL, so it falls
+    through to the next rung instead. ``None`` means *no rung is set*: the
+    caller keeps ``Settings.chain_base_url`` empty and the existing public
+    default applies unchanged (zero change when unset, ADR-0018 decision 2 /
+    ADR-0023 decision 3). Validation of a stored value happened at write time
+    (``Store.set_chain_base_url``); the env rung keeps failing closed in
+    ``ChainConfig.from_settings`` as before.
+    """
+    for value in (env_value, stored_value):
+        if value is not None and value.strip():
+            return value.strip()
+    return None

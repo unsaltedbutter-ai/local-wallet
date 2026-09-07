@@ -48,6 +48,11 @@ SCHEMA_VERSION = 1
 
 _BUSY_TIMEOUT_MS = 5000
 
+#: Settings key for the persisted chain backend choice (ADR-0023, TCK-ONB-002).
+#: Private: access only through :meth:`Store.get_chain_base_url` /
+#: :meth:`Store.set_chain_base_url`, which own the write validation.
+_CHAIN_BASE_URL_SETTING = "chain_base_url"
+
 
 class StoreError(Exception):
     """Base error for the store layer.
@@ -647,3 +652,61 @@ class Store(AbstractContextManager["Store"]):
             raise _wrap_integrity(exc) from exc
         except sqlite3.Error as exc:
             raise _wrap(exc) from exc
+
+    # ------------------------------------------- chain backend choice (ONB-002)
+    #
+    # The persisted first-run backend selection (ADR-0023, TCK-ONB-002). Same
+    # key-value mechanism as ``gap_limit``; the typed pair below is the ONLY
+    # sanctioned reader/writer of the key so validation can never be skipped.
+    # Resolution (env > stored > default) lives in
+    # :func:`localwallet.config.resolve_chain_base_url` — ``config`` never
+    # imports this module; the startup wiring (TCK-ONB-003) reads here and
+    # injects the value there.
+
+    def get_chain_base_url(self) -> str | None:
+        """Return the stored chain backend base URL, or ``None``.
+
+        ``None`` means "no choice stored" — the unset rung of the ADR-0023
+        precedence (the public default applies). A value that is only
+        whitespace cannot exist on disk (writes are validated), so it cannot
+        surface here either.
+        """
+        value = self.get_setting(_CHAIN_BASE_URL_SETTING)
+        if value is None or not value.strip():
+            return None
+        return value
+
+    def set_chain_base_url(self, url: str) -> None:
+        """Persist the user's chain backend choice; ``""`` clears it (back to default).
+
+        Validation is fail-closed at write, before anything lands on disk
+        (ADR-0023 decision 5): a non-empty value must be an http(s) URL with a
+        host and no embedded credentials — mirroring the ``ChainConfig``
+        construction check that stays as the last line of defense. A
+        whitespace-only write is refused (deliberate-but-blank is malformed,
+        never a silent clear); only the exact empty string clears the choice.
+        Errors are value-free: the URL (which may embed credentials) never
+        appears in the message.
+        """
+        candidate = url.strip()
+        if not candidate:
+            if url:
+                raise StoreError("chain base url must not be blank when set")
+            with self._transaction():
+                self._conn.execute(
+                    "DELETE FROM settings WHERE key = ?", (_CHAIN_BASE_URL_SETTING,)
+                )
+            return
+        # Plain-string checks (no urllib: network-ish imports are lint-banned
+        # outside chain/). As strict as the ChainConfig construction check it
+        # mirrors, plus an internal-whitespace guard.
+        if not candidate.startswith(("http://", "https://")):
+            raise StoreError("chain base url must be an http(s) URL")
+        if any(c.isspace() for c in candidate):
+            raise StoreError("chain base url must not contain whitespace")
+        netloc = candidate.partition("://")[2].split("/", 1)[0]
+        if not netloc:
+            raise StoreError("chain base url must have a host")
+        if "@" in netloc:  # embedded userinfo would ride on every request
+            raise StoreError("chain base url must not embed credentials")
+        self.set_setting(_CHAIN_BASE_URL_SETTING, candidate)
