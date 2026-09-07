@@ -11,7 +11,11 @@ fixing a simulated stale cache (Phase 1 AC), transaction direction
 malformed chain payloads (store untouched), the atomic persist phase
 (a store failure mid-persist rolls back the entire scan write and leaves
 the prior state intact), sync-state round-trips, and
-the wallet-input/testnet-gate surface.
+fail-closed behavior on
+malformed chain payloads (store untouched), the atomic persist phase
+(a store failure mid-persist rolls back the entire scan write and leaves
+the prior state intact), sync-state round-trips, and
+the wallet-input/mainnet-gate surface.
 """
 
 from __future__ import annotations
@@ -53,17 +57,17 @@ from localwallet.wallet.scan import _MAX_WINDOW_ADDRESSES, ScanError
 
 FIXTURE_SEED: Final = b"local-wallet phase 1 scan test seed (not a real wallet)"
 TIP: Final = 870_000
-_EXTERNAL: Final = "tb1qexternalsenderaddressnotpartofthewallet000000"
+_EXTERNAL: Final = "bc1qexternalsenderaddressnotpartofthewallet000000"
 
 
-def _fixture_vpub() -> str:
-    root = HDKey.from_seed(FIXTURE_SEED, version=NETWORKS["test"]["zprv"])
-    account = root.derive([84 + 2**31, 1 + 2**31, 0])
-    return account.to_public().to_base58(version=NETWORKS["test"]["zpub"])
+def _fixture_zpub() -> str:
+    root = HDKey.from_seed(FIXTURE_SEED, version=NETWORKS["main"]["zprv"])
+    account = root.derive([84 + 2**31, 0 + 2**31, 0])
+    return account.to_public().to_base58(version=NETWORKS["main"]["zpub"])
 
 
-VPUB: Final = _fixture_vpub()
-WD: Final = WalletDescriptor.from_key(VPUB)
+ZPUB: Final = _fixture_zpub()
+WD: Final = WalletDescriptor.from_key(ZPUB)
 PARSED: Final = WD.parsed
 # Window addresses for both branches, indices 0..59 — plus the full
 # absolute-ceiling window (indices 0..999) for branch 0, used by the
@@ -159,7 +163,7 @@ class FakeChain:
 
     def client(self) -> EsploraClient:
         return EsploraClient(
-            base_url="https://mempool.space/testnet4/api",
+            base_url="https://mempool.space/api",
             timeout_s=5.0,
             max_retries=0,
             transport=httpx.MockTransport(self.handler),
@@ -336,7 +340,7 @@ def test_gap_argument_validation(bad: object, store: Store) -> None:
 def test_utxo_snapshot_replaces_stale_cache(store: Store) -> None:
     wid = _wallet_id(store)
     junk = [
-        UtxoRecord(wid, "f" * 64, 0, "tb1qjunk", 999, 1, 10),
+        UtxoRecord(wid, "f" * 64, 0, "bc1qjunk", 999, 1, 10),
         UtxoRecord(wid, "e" * 64, 3, None, 1, 0, None),
     ]
     store.replace_utxos_for_wallet(wid, junk)
@@ -375,7 +379,7 @@ def test_malformed_utxo_payload_fails_closed_and_keeps_old_snapshot(
     store: Store, broken: dict[str, Any]
 ) -> None:
     wid = _wallet_id(store)
-    junk = [UtxoRecord(wid, "f" * 64, 0, "tb1qjunk", 999, 1, 10)]
+    junk = [UtxoRecord(wid, "f" * 64, 0, "bc1qjunk", 999, 1, 10)]
     store.replace_utxos_for_wallet(wid, junk)
     chain = FakeChain(utxos={ADDRS[0][0]: [broken]})
     with pytest.raises(ScanError):
@@ -402,10 +406,10 @@ def test_rescan_fixes_simulated_stale_cache(store: Store) -> None:
 
     # --- corrupt the cache in every cacheable dimension
     store.replace_utxos_for_wallet(
-        wid, [UtxoRecord(wid, "f" * 64, 9, "tb1qjunk", 123_456, 1, 5)]
+        wid, [UtxoRecord(wid, "f" * 64, 9, "bc1qjunk", 123_456, 1, 5)]
     )
     store.update_derivation(wid, 0, max_used_index=99, next_index=99)
-    stale = "tb1qstalerowthatneverexistedonchain000000000000"
+    stale = "bc1qstalerowthatneverexistedonchain000000000"
     store.upsert_batch(
         [AddressRecord(wid, 0, 1, stale, "p2wpkh", "used")]  # wrong mapping
     )
@@ -675,7 +679,7 @@ def test_scan_accepts_descriptor_object_and_rejects_unknown(store: Store) -> Non
 
     other = WalletDescriptor.from_key(
         # a different fixture wallet not present in the store
-        _fixture_vpub_other()
+        _fixture_zpub_other()
     )
     with pytest.raises(ScanError, match="no stored wallet"):
         scan_wallet(store, FakeChain().client(), other)
@@ -683,28 +687,40 @@ def test_scan_accepts_descriptor_object_and_rejects_unknown(store: Store) -> Non
         scan_wallet(store, FakeChain().client(), WD.descriptor)  # type: ignore[arg-type]
 
 
-def _fixture_vpub_other() -> str:
-    root = HDKey.from_seed(FIXTURE_SEED + b"other", version=NETWORKS["test"]["zprv"])
-    account = root.derive([84 + 2**31, 1 + 2**31, 0])
-    return account.to_public().to_base58(version=NETWORKS["test"]["zpub"])
+def _fixture_zpub_other() -> str:
+    root = HDKey.from_seed(FIXTURE_SEED + b"other", version=NETWORKS["main"]["zprv"])
+    account = root.derive([84 + 2**31, 0 + 2**31, 0])
+    return account.to_public().to_base58(version=NETWORKS["main"]["zpub"])
 
 
-def test_scan_refuses_mainnet_wallet_descriptor(store: Store) -> None:
-    """The testnet gate holds for stored wallets too (parse-time enforcement)."""
-    hd = parse_watch_key(_fixture_mainnet_zpub()).hd_key
-    mainnet_descriptor = add_checksum(
-        f"wpkh([{hd.my_fingerprint.hex()}/84'/1'/0']{_fixture_mainnet_zpub()}/{{0,1}}/*)"
+def test_scan_refuses_testnet_wallet_descriptor(store: Store) -> None:
+    """The mainnet-only gate (ADR-0021) holds for stored wallets too
+    (parse-time enforcement): a testnet descriptor can never be scanned,
+    whichever layer sees it first — the origin gate (testnet coin type 1')
+    or the parse gate (testnet key material)."""
+    hd = parse_watch_key(_fixture_testnet_vpub()).hd_key
+    # Testnet-shaped origin (84'/1'/0'): refused by the origin gate…
+    testnet_origin = add_checksum(
+        f"wpkh([{hd.my_fingerprint.hex()}/84'/1'/0']{_fixture_testnet_vpub()}/{{0,1}}/*)"
     )
-    store.create_wallet("mainnet", mainnet_descriptor)
-    row = store.get_wallet_by_name("mainnet")
-    with pytest.raises(WatchKeyError, match="testnet-only"):
+    store.create_wallet("testnet-origin", testnet_origin)
+    with pytest.raises(WatchKeyError, match="mainnet"):
+        scan_wallet(store, FakeChain().client(), store.get_wallet_by_name("testnet-origin"))
+    # …and a testnet key with mainnet-shaped origin (84'/0'/0') hits the
+    # parse gate.
+    testnet_key = add_checksum(
+        f"wpkh([{hd.my_fingerprint.hex()}/84'/0'/0']{_fixture_testnet_vpub()}/{{0,1}}/*)"
+    )
+    store.create_wallet("testnet", testnet_key)
+    row = store.get_wallet_by_name("testnet")
+    with pytest.raises(WatchKeyError, match="mainnet-only"):
         scan_wallet(store, FakeChain().client(), row)
 
 
-def _fixture_mainnet_zpub() -> str:
-    root = HDKey.from_seed(FIXTURE_SEED + b"main", version=NETWORKS["main"]["zprv"])
-    account = root.derive([84 + 2**31, 0 + 2**31, 0])
-    return account.to_public().to_base58(version=NETWORKS["main"]["zpub"])
+def _fixture_testnet_vpub() -> str:
+    root = HDKey.from_seed(FIXTURE_SEED + b"test", version=NETWORKS["test"]["zprv"])
+    account = root.derive([84 + 2**31, 1 + 2**31, 0])
+    return account.to_public().to_base58(version=NETWORKS["test"]["zpub"])
 
 
 # ------------------------------------------------ absolute window ceiling (TCK-SEC-002)

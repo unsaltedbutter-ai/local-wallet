@@ -7,19 +7,21 @@ single authority for turning user-supplied extended *public* keys into
 2. a :class:`WalletDescriptor` — the wallet-engine object carrying the
    canonical checksummed output descriptor, e.g.::
 
-       wpkh([af0a1d1f/84'/1'/0']vpub5ZJ.../{0,1}/*)#5wwe5gyr
+        wpkh([af0a1d1f/84'/0'/0']zpub6rFR.../{0,1}/*)#checksum
 
-Testnet gate (PROJECT.md §5 principle 8, §12)
----------------------------------------------
-The gate is enforced at **parse time** for the wallet engine:
-:func:`parse_wallet_key` (and :func:`parse_watch_key` with
-``require_testnet=True``) refuse mainnet zpub/ypub/xpub keys outright.
-The gate is enforced again structurally: a :class:`WalletDescriptor`
-cannot even be constructed for a non-testnet key (``__post_init__``),
-and :func:`derive_addresses` re-checks (belt and suspenders). The
-Phase 0 ``parse_watch_key`` default keeps detect-only semantics
-(backwards compatibility with TCK-P0-006 callers and tests); every
-Phase 1 money path goes through the gated entries.
+Mainnet-only gate (ADR-0021, supersedes the ADR-0004 testnet choice)
+-------------------------------------------------------------------
+local-wallet is mainnet-only; testnet code paths are removed, not kept
+as fallback. The gate is enforced at **parse time** for the wallet
+engine: :func:`parse_wallet_key` (and :func:`parse_watch_key` with
+``require_main=True``) refuse testnet vpub/upub/tpub keys (and any
+testnet-serialized key) outright. The gate is enforced again
+structurally: a :class:`WalletDescriptor` cannot even be constructed
+for a non-mainnet key (``__post_init__``), and
+:func:`localwallet.wallet.derivation.derive_addresses` re-checks (belt
+and suspenders). The Phase 0 ``parse_watch_key`` default keeps
+detect-only semantics (backwards compatibility with TCK-P0-006 callers
+and tests); every money path goes through the gated entries.
 
 Watch-only invariants
 ---------------------
@@ -35,7 +37,10 @@ embit 0.8.0 ships no ``embit.slip132`` module; the SLIP-132 version bytes
 are taken verbatim from ``embit.bip32.NETWORKS`` (same object as
 ``embit.networks.NETWORKS``), keyed by their mainnet prefix names (the
 testnet ``vpub``/``upub`` version bytes live under the ``zpub``/``ypub``
-keys of ``NETWORKS["test"]``).
+keys of ``NETWORKS["test"]``). Testnet version bytes are retained in the
+detection tables solely so testnet keys can be *detected and refused*
+with a precise, value-free error — they are never accepted as wallet
+material (ADR-0021).
 
 Descriptor checksum note (embit 0.8.0)
 --------------------------------------
@@ -62,6 +67,7 @@ from embit.descriptor.checksum import checksum as _descriptor_checksum
 from embit.networks import NETWORKS as _NETWORKS
 
 __all__ = [
+    "MAINNET_COIN_TYPE",
     "ParsedKey",
     "PrefixInfo",
     "WalletDescriptor",
@@ -86,12 +92,19 @@ SCRIPT_PURPOSES: Final[dict[str, int]] = {
     "p2pkh": 44,
 }
 
-#: BIP44 coin type for testnet (mainnet would be 0; refused by the gate).
-TESTNET_COIN_TYPE: Final[int] = 1
+#: BIP44 coin type for mainnet (BIP84 canonical account path 84'/0'/0').
+MAINNET_COIN_TYPE: Final[int] = 0
+
+#: Deprecated pre-mainnet-only name, kept solely so cross-layer callers
+#: outside this ticket's scope (app wiring, TCK-MAIN-002/003) keep
+#: importing during the migration; it equals the mainnet coin type
+#: because the wallet layer is mainnet-only (ADR-0021).
+TESTNET_COIN_TYPE: Final[int] = MAINNET_COIN_TYPE
 
 #: SLIP-132 string prefix → (network label, script type). Case-sensitive:
 #: SLIP-132 prefixes are lowercase (``Zpub``/``Vpub`` — P2WSH variants —
-#: are different version bytes and are not supported in v1).
+#: are different version bytes and are not supported in v1). Testnet
+#: prefixes are detected only to be refused by the mainnet-only gate.
 _PREFIX_TABLE: Final[dict[str, tuple[str, str]]] = {
     "zpub": ("main", "p2wpkh"),
     "vpub": ("testnet", "p2wpkh"),
@@ -121,10 +134,10 @@ _VERSION_TABLE: Final[dict[bytes, tuple[str, str, str]]] = {
 }
 
 #: Network label → embit network dict (bech32 HRP / base58 versions for
-#: address encoding).
+#: address encoding). Mainnet only (ADR-0021): the gate refuses every
+#: other network label before any lookup, fail closed.
 _NETWORKS_BY_LABEL: Final[dict[str, dict[str, object]]] = {
     "main": _NETWORKS["main"],
-    "testnet": _NETWORKS["test"],
 }
 
 #: Wildcard suffixes accepted when parsing a wallet descriptor. The
@@ -151,7 +164,7 @@ class WatchKeyError(ValueError):
 
     Raised (fail closed) for: unparseable/base58-invalid input, private
     extended keys, unknown version bytes, prefix/version mismatches,
-    mainnet keys under the testnet gate, and malformed descriptor
+    testnet keys under the mainnet-only gate, and malformed descriptor
     strings.
 
     Message contract: value-free. The offending key or descriptor is
@@ -169,9 +182,9 @@ class ParsedKey:
             derivation only).
         script_type: One of ``"p2wpkh"``, ``"p2sh_p2wpkh"``, ``"p2pkh"`` —
             detected from the SLIP-132 version bytes.
-        network: ``"testnet"`` or ``"main"`` — detected from the version
-            bytes. The wallet engine refuses ``"main"`` at parse time
-            (``parse_wallet_key``) and structurally
+        network: ``"main"`` or ``"testnet"`` — detected from the version
+            bytes. The wallet engine refuses ``"testnet"`` at parse time
+            (``parse_wallet_key``, ADR-0021 mainnet-only) and structurally
             (:class:`WalletDescriptor`).
     """
 
@@ -206,7 +219,7 @@ def detect_script_type(prefix: str) -> PrefixInfo:
     if prefix.endswith("prv"):
         raise WatchKeyError(
             "watch-only: private extended keys are never handled — provide a "
-            "public key (vpub/tpub or a mainnet zpub-style public key)"
+            "mainnet public key (xpub/ypub/zpub)"
         )
     entry = _PREFIX_TABLE.get(prefix)
     if entry is None:
@@ -217,13 +230,13 @@ def detect_script_type(prefix: str) -> PrefixInfo:
     return PrefixInfo(prefix=prefix, network=network, script_type=script_type)
 
 
-def parse_watch_key(key: str, *, require_testnet: bool = False) -> ParsedKey:
+def parse_watch_key(key: str, *, require_main: bool = False) -> ParsedKey:
     """Parse a SLIP-132 extended public key and detect network/script type.
 
-    Accepts ``zpub``/``vpub`` (P2WPKH), ``ypub``/``upub`` (P2SH-P2WPKH)
-    and ``xpub``/``tpub`` (P2PKH) account-level keys. Surrounding
-    whitespace is tolerated (clipboard pastes); internal whitespace is
-    not.
+    Detects ``zpub``/``vpub`` (P2WPKH), ``ypub``/``upub`` (P2SH-P2WPKH)
+    and ``xpub``/``tpub`` (P2PKH) account-level keys; the mainnet-only
+    gate refuses testnet keys. Surrounding whitespace is tolerated
+    (clipboard pastes); internal whitespace is not.
 
     The key's version bytes are the authoritative detection source; the
     string prefix must agree with them (both are deterministic functions
@@ -232,9 +245,10 @@ def parse_watch_key(key: str, *, require_testnet: bool = False) -> ParsedKey:
 
     Args:
         key: The extended public key string.
-        require_testnet: Enforce the Phase 1 testnet gate at parse time:
-            refuse mainnet keys. Defaults to ``False`` solely for
-            backwards compatibility with the Phase 0 detect-only
+        require_main: Enforce the mainnet-only gate at parse time
+            (ADR-0021): refuse testnet keys (``vpub``/``upub``/``tpub``
+            and any testnet-serialized key). Defaults to ``False`` solely
+            for backwards compatibility with the Phase 0 detect-only
             contract; the wallet engine always goes through
             :func:`parse_wallet_key` (gate on) or :class:`WalletDescriptor`
             (structural gate).
@@ -248,7 +262,7 @@ def parse_watch_key(key: str, *, require_testnet: bool = False) -> ParsedKey:
             over-long, fails base58/checksum parsing, is a *private*
             extended key (watch-only refusal), carries version bytes
             outside the supported SLIP-132 set, has a prefix/version
-            mismatch, or is a mainnet key while ``require_testnet`` is
+            mismatch, or is a testnet key while ``require_main`` is
             set. The message never echoes the input.
     """
     if not isinstance(key, str):
@@ -267,7 +281,7 @@ def parse_watch_key(key: str, *, require_testnet: bool = False) -> ParsedKey:
     if hd.is_private:
         raise WatchKeyError(
             "watch-only: private extended keys are never handled — provide a "
-            "public key (vpub/tpub or a mainnet zpub-style public key)"
+            "mainnet public key (xpub/ypub/zpub)"
         )
 
     prefix = _match_known_prefix(candidate)
@@ -278,28 +292,29 @@ def parse_watch_key(key: str, *, require_testnet: bool = False) -> ParsedKey:
         )
 
     _prefix, network, script_type = _VERSION_TABLE[hd.version]
-    if require_testnet and network != "testnet":
+    if require_main and network != "main":
         raise WatchKeyError(
-            "testnet-only: mainnet extended public keys are refused — provide "
-            "a testnet vpub/upub/tpub"
+            "mainnet-only: testnet extended public keys are refused — provide "
+            "a mainnet xpub/ypub/zpub"
         )
     return ParsedKey(hd_key=hd, script_type=script_type, network=network)
 
 
 def parse_wallet_key(key: str) -> ParsedKey:
-    """Parse a watch key with the Phase 1 testnet gate enforced at parse.
+    """Parse a watch key with the mainnet-only gate enforced at parse.
 
-    This is the wallet engine's parse entry point: mainnet
-    zpub/ypub/xpub keys are refused here, before any descriptor is built
-    or any address derived (P0 security-review carry-over: the gate lives
-    in parse, not only in derivation). :func:`derive_addresses` keeps its
+    This is the wallet engine's parse entry point: testnet
+    vpub/upub/tpub keys (and any testnet-serialized key) are refused
+    here, before any descriptor is built or any address derived
+    (P0 security-review carry-over: the gate lives in parse, not only in
+    derivation; network per ADR-0021). :func:`derive_addresses` keeps its
     own gate as a second layer.
 
     Raises:
         WatchKeyError: everything :func:`parse_watch_key` raises, plus
-            the mainnet refusal. Value-free messages.
+            the testnet refusal. Value-free messages.
     """
-    return parse_watch_key(key, require_testnet=True)
+    return parse_watch_key(key, require_main=True)
 
 
 def _match_known_prefix(candidate: str) -> str:
@@ -320,13 +335,13 @@ def _match_known_prefix(candidate: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class WalletDescriptor:
-    """A testnet watch-only wallet: parsed account key + canonical descriptor.
+    """A mainnet watch-only wallet: parsed account key + canonical descriptor.
 
     Invariants (enforced in ``__post_init__``, fail closed):
 
-    - testnet-only: ``network`` is ``"testnet"`` — a mainnet key cannot
-      be turned into a wallet descriptor at all (structural half of the
-      parse-time gate);
+    - mainnet-only (ADR-0021): ``network`` is ``"main"`` — a testnet key
+      cannot be turned into a wallet descriptor at all (structural half
+      of the parse-time gate);
     - ``script_type``/``network`` agree with ``parsed``;
     - ``descriptor`` is a checksummed canonical descriptor that embit's
       descriptor engine can parse back (round-trip validation) and whose
@@ -335,9 +350,9 @@ class WalletDescriptor:
     Attributes:
         parsed: The account-level :class:`ParsedKey` (public key only).
         script_type: ``"p2wpkh"`` | ``"p2sh_p2wpkh"`` | ``"p2pkh"``.
-        network: Always ``"testnet"`` (v1 gate).
+        network: Always ``"main"`` (mainnet-only gate, ADR-0021).
         descriptor: Canonical checksummed descriptor string, e.g.
-            ``wpkh([fp/84'/1'/0']vpub…/{0,1}/*)#checksum``. The origin
+            ``wpkh([fp/84'/0'/0']zpub…/{0,1}/*)#checksum``. The origin
             fingerprint is the supplied account key's own fingerprint
             (``hash160(pubkey)[:4]``) — the master fingerprint is not
             recoverable from an account-level key alone; device
@@ -351,9 +366,9 @@ class WalletDescriptor:
     descriptor: str
 
     def __post_init__(self) -> None:
-        if self.network != "testnet" or self.parsed.network != "testnet":
+        if self.network != "main" or self.parsed.network != "main":
             raise WatchKeyError(
-                "testnet-only: wallet descriptors require a testnet key"
+                "mainnet-only: wallet descriptors require a mainnet key"
             )
         if self.parsed.script_type != self.script_type:
             raise WatchKeyError("wallet descriptor script type does not match its key")
@@ -365,7 +380,7 @@ class WalletDescriptor:
     def from_key(cls, key: str) -> WalletDescriptor:
         """Parse a user-supplied extended public key into a wallet descriptor.
 
-        Gated parse (testnet-only, watch-only) followed by canonical
+        Gated parse (mainnet-only, watch-only) followed by canonical
         descriptor construction with checksum and round-trip validation.
 
         Raises:
@@ -445,11 +460,12 @@ def _build_descriptor_string(
     """Build the canonical checksummed descriptor string for ``parsed``.
 
     Shape per detected script type (ticket notation, apostrophe-hardened
-    origin path, ``{0,1}`` receive/change multibranch, ``*`` wildcard):
+    origin path, ``{0,1}`` receive/change multibranch, ``*`` wildcard),
+    BIP44/49/84 mainnet coin type 0':
 
-    - ``wpkh([fp/84'/1'/0']KEY/{0,1}/*)``          (P2WPKH, BIP84)
-    - ``sh(wpkh([fp/49'/1'/0']KEY/{0,1}/*))``      (P2SH-P2WPKH, BIP49)
-    - ``pkh([fp/44'/1'/0']KEY/{0,1}/*)``           (P2PKH, BIP44)
+    - ``wpkh([fp/84'/0'/0']KEY/{0,1}/*)``          (P2WPKH, BIP84)
+    - ``sh(wpkh([fp/49'/0'/0']KEY/{0,1}/*))``      (P2SH-P2WPKH, BIP49)
+    - ``pkh([fp/44'/0'/0']KEY/{0,1}/*)``           (P2PKH, BIP44)
 
     The fingerprint is the account key's own fingerprint unless an
     origin fingerprint was supplied in a parsed descriptor string.
@@ -462,7 +478,7 @@ def _build_descriptor_string(
         else parsed.hd_key.my_fingerprint.hex()
     )
     purpose, wrapper = _script_dispatch(parsed.script_type)
-    origin = f"{fingerprint}/{purpose}'/{TESTNET_COIN_TYPE}'/0'"
+    origin = f"{fingerprint}/{purpose}'/{MAINNET_COIN_TYPE}'/0'"
     key_string = parsed.hd_key.to_base58()
     inner = f"{wrapper}([{origin}]{key_string}/{{0,1}}/*)"
     body = f"{inner})" if wrapper == "sh(wpkh" else inner
@@ -537,10 +553,11 @@ def _split_wildcard(inner: str) -> str:
 def _validate_origin(origin: str, script_type: str) -> str:
     """Validate a ``fp/purpose'/coin'/0'`` origin; return the fingerprint.
 
-    Only the standard hardened path for ``script_type`` with the testnet
-    coin type is accepted (both apostrophe and ``h`` hardened notation);
-    mainnet coin-type origins are refused here — the network gate in
-    :func:`parse_wallet_key` refuses mainnet *keys*.
+    Only the standard hardened path for ``script_type`` with the mainnet
+    coin type (BIP44/49/84, coin 0') is accepted (both apostrophe and
+    ``h`` hardened notation); testnet coin-type origins are refused
+    here — the network gate in :func:`parse_wallet_key` refuses testnet
+    *keys* (ADR-0021).
     """
     parts = origin.split("/")
     if len(parts) != 4:
@@ -551,13 +568,13 @@ def _validate_origin(origin: str, script_type: str) -> str:
     purpose = SCRIPT_PURPOSES[script_type]
     expected = (
         [f"{purpose}'", f"{purpose}h"],
-        [f"{TESTNET_COIN_TYPE}'", f"{TESTNET_COIN_TYPE}h"],
+        [f"{MAINNET_COIN_TYPE}'", f"{MAINNET_COIN_TYPE}h"],
         ["0'", "0h"],
     )
     for value, allowed in zip(parts[1:], expected):
         if value not in allowed:
             raise WatchKeyError(
-                "descriptor origin path must be the standard testnet hardened "
+                "descriptor origin path must be the standard mainnet hardened "
                 "path for its script type"
             )
     return fingerprint

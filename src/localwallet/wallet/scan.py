@@ -34,7 +34,7 @@ address.
 Absolute per-branch window ceiling (TCK-SEC-002): the gap-limited walk
 above is unbounded when usage itself is attacker-driven — an observer of
 the public watch-only xpub can fund consecutive derivable indices
-0, 1, 2, … N on public testnet and force N + gap probes per branch per
+0, 1, 2, … N on the public chain and force N + gap probes per branch per
 scan, re-triggered by the background watch. The walk therefore NEVER
 derives or probes beyond ``_MAX_WINDOW_ADDRESSES`` indices per branch,
 regardless of usage. When the ceiling is reached the scan result is

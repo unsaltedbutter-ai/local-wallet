@@ -3,7 +3,7 @@
 Covers: batch correctness against embit's own descriptor engine (the
 independent cross-check) for all three script types on receive AND change
 branches, start-index windows, address encodings per network, argument
-validation (value-free errors), the derive-side testnet gate, and the
+validation (value-free errors), the derive-side mainnet-only gate, and the
 batching contract itself (single branch-key derivation, then children —
 asserted via a derivation-call spy).
 """
@@ -47,12 +47,12 @@ def _fixture_key(purpose: int, coin: int, script: str, network: str) -> str:
     return account.to_public().to_base58(version=NETWORKS[net][script])
 
 
+ZPUB: Final = _fixture_key(84, 0, "zpub", "main")
+YPUB: Final = _fixture_key(49, 0, "ypub", "main")
+XPUB: Final = _fixture_key(44, 0, "xpub", "main")
 VPUB: Final = _fixture_key(84, 1, "zpub", "testnet")
-UPUB: Final = _fixture_key(49, 1, "ypub", "testnet")
-TPUB: Final = _fixture_key(44, 1, "xpub", "testnet")
-MAINNET_ZPUB: Final = _fixture_key(84, 0, "zpub", "main")
 
-_CASES: Final = [(VPUB, "wpkh"), (UPUB, "sh(wpkh"), (TPUB, "pkh")]
+_CASES: Final = [(ZPUB, "wpkh"), (YPUB, "sh(wpkh"), (XPUB, "pkh")]
 
 
 def _engine_descriptor(key: str, wrapper: str) -> Descriptor:
@@ -79,7 +79,7 @@ def test_batch_matches_embit_descriptor_engine_both_branches(
         for derived in batch:
             expected = engine.derive(
                 derived.index, branch_index=branch
-            ).address(network=NET["test"])
+            ).address(network=NET["main"])
             assert derived.address == expected
             assert derived.branch == branch
             assert derived.script_type == parsed.script_type
@@ -88,70 +88,66 @@ def test_batch_matches_embit_descriptor_engine_both_branches(
 
 def test_multibranch_branch_index_semantics() -> None:
     """Our (branch, index) pair equals the {0,1} wildcard's branch_index."""
-    wd = WalletDescriptor.from_key(VPUB)
-    engine = _engine_descriptor(VPUB, "wpkh")
+    wd = WalletDescriptor.from_key(ZPUB)
+    engine = _engine_descriptor(ZPUB, "wpkh")
     for branch in (0, 1):
         for index in (0, 3, 9):
             ours = derive_addresses(wd.parsed, branch, index, 1)[0].address
             theirs = engine.derive(index, branch_index=branch).address(
-                network=NET["test"]
+                network=NET["main"]
             )
             assert ours == theirs
 
 
 def test_change_branch_differs_from_receive() -> None:
-    parsed = WalletDescriptor.from_key(VPUB).parsed
+    parsed = WalletDescriptor.from_key(ZPUB).parsed
     receive = derive_addresses(parsed, 0, 0, 3)
     change = derive_addresses(parsed, 1, 0, 3)
     assert [d.address for d in receive] != [d.address for d in change]
 
 
 def test_start_index_window_is_exact_slice() -> None:
-    parsed = WalletDescriptor.from_key(VPUB).parsed
+    parsed = WalletDescriptor.from_key(ZPUB).parsed
     full = derive_addresses(parsed, 1, 0, 20)
     window = derive_addresses(parsed, 1, 5, 3)
     assert [d.address for d in window] == [d.address for d in full[5:8]]
     assert [d.index for d in window] == [5, 6, 7]
     # ...and the window matches the engine at the same absolute indices.
-    engine = _engine_descriptor(VPUB, "wpkh")
+    engine = _engine_descriptor(ZPUB, "wpkh")
     for derived in window:
         assert derived.address == engine.derive(
             derived.index, branch_index=1
-        ).address(network=NET["test"])
+        ).address(network=NET["main"])
 
 
-def test_testnet_address_encodings_per_script_type() -> None:
-    # P2WPKH → bech32 (tb1), P2SH-P2WPKH → P2SH-wrapped (2N/2...), P2PKH → m/n.
-    prefixes = {"wpkh": "tb1", "sh(wpkh": "2", "pkh": ("m", "n")}
+def test_mainnet_address_encodings_per_script_type() -> None:
+    # P2WPKH → bech32 (bc1), P2SH-P2WPKH → P2SH-wrapped (3...), P2PKH → 1....
+    prefixes = {"wpkh": "bc1", "sh(wpkh": "3", "pkh": "1"}
     for key, wrapper in _CASES:
         parsed = WalletDescriptor.from_key(key).parsed
         addr = derive_addresses(parsed, 0, 0, 1)[0].address
-        expected = prefixes[wrapper]
-        if isinstance(expected, tuple):
-            assert addr[0] in expected
-        else:
-            assert addr.startswith(expected)
+        assert addr.startswith(prefixes[wrapper])
 
 
 # ------------------------------------------------------------ argument gates
 
 
-def test_derive_side_testnet_gate_keeps_phase0_message() -> None:
-    """Belt and suspenders: a mainnet ParsedKey cannot derive addresses.
-    The Phase 0 message is kept verbatim (TCK-P0-006 e2e asserts it)."""
-    parsed = parse_watch_key(MAINNET_ZPUB)
+def test_derive_side_mainnet_gate_refuses_testnet_keys() -> None:
+    """Belt and suspenders (ADR-0021): a testnet ParsedKey (obtainable via
+    the Phase 0 detect-only parse) cannot derive addresses."""
+    parsed = parse_watch_key(VPUB)
     with pytest.raises(WatchKeyError) as excinfo:
         derive_addresses(parsed, 0, 0, 1)
     message = str(excinfo.value)
-    assert "Phase 0 is testnet-only" in message
-    assert "vpub/upub/tpub" in message
-    assert MAINNET_ZPUB not in message  # value-free
-    with pytest.raises(WatchKeyError, match="testnet-only"):
+    assert "mainnet-only" in message
+    assert "xpub/ypub/zpub" in message
+    assert VPUB not in message  # value-free
+    with pytest.raises(WatchKeyError, match="mainnet-only"):
         BranchDeriver(parsed, 0)
 
 
 def test_deriver_refuses_bad_branch() -> None:
-    parsed = WalletDescriptor.from_key(VPUB).parsed
+    parsed = WalletDescriptor.from_key(ZPUB).parsed
     with pytest.raises(WatchKeyError, match="branch"):
         BranchDeriver(parsed, 2)
 
@@ -163,34 +159,34 @@ def test_deriver_address_refuses_out_of_range_indices(index: object) -> None:
     """N1 (security review): BranchDeriver.address range-checks the child
     index — negative, hardened-range (>= 2**31), hardened-marker and
     non-int inputs raise WatchKeyError, never a raw embit error."""
-    deriver = BranchDeriver(WalletDescriptor.from_key(VPUB).parsed, 0)
+    deriver = BranchDeriver(WalletDescriptor.from_key(ZPUB).parsed, 0)
     with pytest.raises(WatchKeyError, match="index") as excinfo:
         deriver.address(index)  # type: ignore[arg-type]
     assert VPUB not in str(excinfo.value)  # value-free: no key material
 
 
 def test_deriver_address_accepts_top_of_non_hardened_range() -> None:
-    deriver = BranchDeriver(WalletDescriptor.from_key(VPUB).parsed, 0)
-    assert deriver.address(2**31 - 1).startswith("tb1")
+    deriver = BranchDeriver(WalletDescriptor.from_key(ZPUB).parsed, 0)
+    assert deriver.address(2**31 - 1).startswith("bc1")
 
 
 @pytest.mark.parametrize("count", [0, -1, True, 1001, 2.5, "3", None])
 def test_count_validation(count: object) -> None:
-    parsed = WalletDescriptor.from_key(VPUB).parsed
+    parsed = WalletDescriptor.from_key(ZPUB).parsed
     with pytest.raises(WatchKeyError, match="count"):
         derive_addresses(parsed, 0, 0, count)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("branch", [2, -1, True, "0", None])
 def test_branch_validation(branch: object) -> None:
-    parsed = WalletDescriptor.from_key(VPUB).parsed
+    parsed = WalletDescriptor.from_key(ZPUB).parsed
     with pytest.raises(WatchKeyError, match="branch"):
         derive_addresses(parsed, branch, 0, 1)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("start", [-1, True, 2.5, "0", None, 2**31])
 def test_start_index_validation(start: object) -> None:
-    parsed = WalletDescriptor.from_key(VPUB).parsed
+    parsed = WalletDescriptor.from_key(ZPUB).parsed
     with pytest.raises(WatchKeyError, match="start_index"):
         derive_addresses(parsed, 0, start, 1)  # type: ignore[arg-type]
 
@@ -226,7 +222,7 @@ class _CountingKey:
 def test_batching_single_branch_derive_then_children() -> None:
     """Efficiency contract: exactly ONE derivation off the account key (the
     branch), then direct children — never a per-index full-path derivation."""
-    parsed = WalletDescriptor.from_key(VPUB).parsed
+    parsed = WalletDescriptor.from_key(ZPUB).parsed
     spy = _CountingKey(parsed.hd_key)
     spied = ParsedKey(hd_key=spy, script_type=parsed.script_type, network=parsed.network)
 
@@ -241,7 +237,7 @@ def test_batching_single_branch_derive_then_children() -> None:
 
 
 def test_branch_deriver_matches_batch_derivation() -> None:
-    parsed = WalletDescriptor.from_key(VPUB).parsed
+    parsed = WalletDescriptor.from_key(ZPUB).parsed
     deriver = BranchDeriver(parsed, 1)
     for index in (0, 4, 9):
         assert deriver.address(index) == derive_addresses(parsed, 1, index, 1)[0].address
@@ -249,7 +245,7 @@ def test_branch_deriver_matches_batch_derivation() -> None:
 
 def test_phase0_wrapper_parity() -> None:
     """derive_receive_addresses keeps its Phase 0 semantics exactly."""
-    parsed = WalletDescriptor.from_key(VPUB).parsed
+    parsed = WalletDescriptor.from_key(ZPUB).parsed
     assert derive_receive_addresses(parsed, 5) == [
         d.address for d in derive_addresses(parsed, 0, 0, 5)
     ]

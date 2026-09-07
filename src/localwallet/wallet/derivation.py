@@ -4,7 +4,7 @@ Derives receive (branch 0) and change (branch 1) addresses from an
 account-level extended public key using standard descriptor semantics:
 the account key sits at ``m/{purpose}'/{coin}'/0'`` and addresses are
 ``{branch}/{index}`` children of it — exactly what the canonical
-descriptor ``wpkh([fp/84'/1'/0']vpub/{0,1}/*)`` expresses.
+descriptor ``wpkh([fp/84'/0'/0']xpub/{0,1}/*)`` expresses.
 
 Batching contract: :func:`derive_addresses` performs a **single**
 derivation of the branch key from the account key, then derives each
@@ -12,13 +12,13 @@ child directly from that branch key — never a per-index full-path
 derivation. A test (:mod:`tests.test_wallet_derivation`) asserts the
 derivation-call shape via a counting spy.
 
-Testnet gate (belt and suspenders): the gate is already enforced at
-parse time (:func:`localwallet.wallet.descriptor.parse_wallet_key`) and
-structurally (:class:`localwallet.wallet.descriptor.WalletDescriptor`);
-derivation re-checks it so a mainnet :class:`ParsedKey` (obtainable via
+Mainnet-only gate (ADR-0021, belt and suspenders): the gate is already
+enforced at parse time (:func:`localwallet.wallet.descriptor.parse_wallet_key`)
+and structurally (:class:`localwallet.wallet.descriptor.WalletDescriptor`);
+derivation re-checks it so a testnet :class:`ParsedKey` (obtainable via
 the Phase 0 detect-only parse) can never reach address encoding. The
-Phase 0 error message is kept verbatim for backwards compatibility with
-the TCK-P0-006 tests.
+Phase 0 layered-gate structure is kept; only the gate direction flipped
+with the mainnet-only decision (ADR-0021).
 
 Watch-only invariants: public keys only; error messages are value-free
 (key material is never echoed); no network I/O; no logging.
@@ -47,10 +47,11 @@ _MAX_DERIVE_COUNT = 1000
 #: Highest non-hardened BIP32 child index.
 _MAX_CHILD_INDEX = 2**31 - 1
 
-#: Network label → embit network dict (address encoding).
+#: Network label → embit network dict (address encoding). Mainnet only
+#: (ADR-0021): the gate below refuses every other network label before
+#: any lookup, fail closed.
 _NETWORKS_BY_LABEL = {
     "main": NETWORKS["main"],
-    "testnet": NETWORKS["test"],
 }
 
 
@@ -84,14 +85,16 @@ def derive_addresses(
         ``start_index .. start_index + count - 1``.
 
     Raises:
-        WatchKeyError: ``parsed`` is a mainnet key (testnet gate),
+        WatchKeyError: ``parsed`` is a testnet key (mainnet-only gate),
             ``branch`` / ``count`` / ``start_index`` are out of range,
             or the script type is unsupported. Messages never echo key
             material.
     """
-    if parsed.network == "main":
-        # Phase 0 wording kept verbatim: the TCK-P0-006 e2e tests assert it.
-        raise WatchKeyError("Phase 0 is testnet-only — provide a vpub/upub/tpub")
+    if parsed.network != "main":
+        raise WatchKeyError(
+            "mainnet-only: testnet extended public keys are refused — provide "
+            "a mainnet xpub/ypub/zpub"
+        )
     if isinstance(branch, bool) or branch not in (0, 1):
         raise WatchKeyError("branch must be 0 (receive) or 1 (change)")
     if (
@@ -140,7 +143,7 @@ def derive_receive_addresses(
     Semantics are identical to the Phase 0 stub: addresses for indices
     ``0 .. count-1`` of ``branch``, encoded for the key's detected
     script type and network, with the same value-free error contract
-    and the derive-side testnet gate.
+    and the derive-side mainnet-only gate (ADR-0021).
     """
     return [
         derived.address
@@ -159,9 +162,12 @@ class BranchDeriver:
     """
 
     def __init__(self, parsed: ParsedKey, branch: int) -> None:
-        if parsed.network == "main":
+        if parsed.network != "main":
             # Same gate/message as derive_addresses (belt and suspenders).
-            raise WatchKeyError("Phase 0 is testnet-only — provide a vpub/upub/tpub")
+            raise WatchKeyError(
+                "mainnet-only: testnet extended public keys are refused — provide "
+                "a mainnet xpub/ypub/zpub"
+            )
         if branch not in (0, 1):
             raise WatchKeyError("branch must be 0 (receive) or 1 (change)")
         self._parsed = parsed

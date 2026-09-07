@@ -1,6 +1,10 @@
 # ADR-0004: Testnet4 for all development work
 
-- **Status:** Accepted
+> **SUPERSEDED by ADR-0021 (2026-09-06):** local-wallet is mainnet-only;
+> the testnet development path is removed, not kept as fallback. The
+> original decision text below is retained for the record.
+
+- **Status:** Superseded by ADR-0021 (was: Accepted)
 - **Date:** 2026-08-31
 - **Decides:** PROJECT.md OQ16 ("Testnet choice: testnet3 vs testnet4 vs
   signet for all dev work")
