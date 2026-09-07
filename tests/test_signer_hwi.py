@@ -1,29 +1,37 @@
-"""HwiUsbSigner tests (TCK-P3-003, ADR-0015).
+"""HwiUsbSigner tests (TCK-P3-003, ADR-0015 + amendment #2, TCK-HW-002).
 
 Covers: lazy hwilib import (module imports without the wheel; missing wheel
-→ HwiUnavailableError); enumerate mapping (hex/bytes fingerprints, unreadable
-devices) with dict-shaping containment; the fingerprint trust gate (1 match →
-sign; 0 devices → absent; devices-but-different-fingerprint → mismatch hard
-stop; unreadable-only → locked; 2 matches → refuse) plus the POST-OPEN
-re-verification of the open client's fingerprint (TOCTOU, TCK-P3-005 rider
+→ HwiUnavailableError); enumerate mapping (hex/bytes MASTER fingerprints,
+unreadable devices) with dict-shaping containment; the candidate gate
+(zero devices → absent; all-unreadable → locked guidance by device class)
+plus the POST-OPEN ACCOUNT-KEY BIND — the open client must serve the
+wallet's account key at the descriptor account path (the debugger repro:
+enumerate reports the MASTER fingerprint, e.g. the Jade's 40dbb192, which
+is never equal to the account-key fingerprint and must never gate
+selection; TCK-HW-002) — match → sign, wrong account key → mismatch hard
+stop, client that cannot serve the account key → fail closed (no skip,
 R1); str/bytes sign-result normalization incl. the empty-bytes refusal
-(rider R2); older-HWI bytes-input retry; locked/busy/canceled/unknown error
-mapping (guidance strings asserted, value-free); display_address best-effort
-mapping; SignedResult fields; no-network lint compliance.
+(rider R2); older-HWI bytes-input retry; locked/busy/canceled/unknown
+error mapping (guidance strings asserted, value-free); display_address
+best-effort mapping; SignedResult fields; no-network lint compliance.
 
 hwilib is faked via the ``commands_module`` constructor seam — the fake
 mirrors the empirically verified hwi 3.2.0 API surface (commands.enumerate /
-get_client / signtx / displayaddress). One env-gated test exercises the real
-wheel (HID enumeration only — device I/O, not network).
+get_client / signtx / displayaddress; client.get_pubkey_at_path per the
+base Client contract and JadeClient jade.py:164). One env-gated test
+exercises the real wheel (HID enumeration only — device I/O, not network).
 """
 
 import base64
+import hashlib
 import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from embit.hashes import hash160
 
 from localwallet.signer.base import Signer, SignerError
 from localwallet.signer.hwi import (
@@ -42,10 +50,20 @@ from localwallet.signer.hwi import DeviceBusyError as LwDeviceBusyError
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Distinct fixture fingerprints (value-free checks assert these NEVER leak
-# into error messages). "wallet" is the descriptor's; "other" is a decoy.
-FP_WALLET = "a1b2c3d4"
-FP_OTHER = "deadbeef"
+# The gate binds the device's ACCOUNT key (ADR-0015 amendment #2): the
+# wallet fingerprint is hash160(pubkey)[:4] of the account public key the
+# device serves at ACCOUNT_PATH. These "pubkeys" are arbitrary 33-byte
+# digests — our code only ever hashes them (no curve math).
+ACCOUNT_PATH = "m/84'/0'/0'"
+_ACCOUNT_PUBKEY = hashlib.sha512(b"localwallet hwi test account key").digest()[:33]
+_OTHER_PUBKEY = hashlib.sha512(b"localwallet hwi test decoy key").digest()[:33]
+FP_WALLET = hash160(_ACCOUNT_PUBKEY)[:4].hex()
+FP_OTHER = hash160(_OTHER_PUBKEY)[:4].hex()
+
+# hwilib ``enumerate`` reports the device MASTER fingerprint (network-
+# independent, unrelated to any account key) — the user's Jade shows
+# 40dbb192-style values. The trust gate must NEVER compare against it.
+MASTER_FP = "40dbb192"
 
 # Minimal well-formed-looking base64 PSBT text (fake hwilib never parses it).
 PSBT_B64 = base64.b64encode(b"psbt\xff" + b"\x01" * 24).decode("ascii")
@@ -55,7 +73,24 @@ DEVICE_WALLET = {
     "type": "trezor",
     "path": "hid:/dev/hid0",
     "model": "trezor_t",
-    "fingerprint": FP_WALLET,
+    "fingerprint": MASTER_FP,
+}
+DEVICE_OTHER = {
+    "type": "ledger",
+    "path": "hid:/dev/hid1",
+    "model": "ledger_nano_s",
+    "fingerprint": MASTER_FP,
+}
+# Unlocked Jade exactly as the MW-4 debugger traced it (TCK-HW-002 repro):
+# enumerate carries only the MASTER fingerprint; the account key lives at
+# the descriptor origin path and is what must bind.
+JADE_UNLOCKED = {
+    "type": "jade",
+    "path": "/dev/tty.usbmodemJADE",
+    "model": "jade",
+    "fingerprint": MASTER_FP,
+    "needs_pin_sent": False,
+    "needs_passphrase_sent": False,
 }
 DEVICE_OTHER = {
     "type": "ledger",
@@ -107,7 +142,11 @@ class JadeError(Exception):
 
 
 class FakeClient:
-    """HardwareWalletClient stand-in that records close() calls."""
+    """HardwareWalletClient stand-in that records close() calls.
+
+    Deliberately has NO ``get_pubkey_at_path``: a client that cannot serve
+    the account key must fail the gate closed (R1/ADR-0015 amendment #2).
+    """
 
     def __init__(self, recorder: dict) -> None:
         self.recorder = recorder
@@ -116,18 +155,25 @@ class FakeClient:
         self.recorder["closed"] = True
 
 
-class FakeFingerprintClient(FakeClient):
-    """FakeClient that also exposes the hwi 3.2.0 post-open fingerprint
-    getter (``get_master_fingerprint``) — for the TOCTOU re-check tests."""
+class FakeAccountClient(FakeClient):
+    """FakeClient serving the account-path key (hwi base-Client contract:
+    ``get_pubkey_at_path(path) -> object with .pubkey``, jade.py:164 shape).
 
-    def __init__(self, recorder: dict, fingerprint: object) -> None:
+    ``pubkey`` doubles as the fault injector: an Exception raises from the
+    getter, any other non-bytes value models an unusable response shape
+    (both must fail closed), and ``None`` serves the wallet account key.
+    Queried paths are recorded for gate-placement assertions."""
+
+    def __init__(self, recorder: dict, pubkey: object = None) -> None:
         super().__init__(recorder)
-        self._fingerprint = fingerprint
+        self._pubkey = _ACCOUNT_PUBKEY if pubkey is None else pubkey
+        self.paths: list[str] = []
 
-    def get_master_fingerprint(self) -> object:
-        if isinstance(self._fingerprint, Exception):
-            raise self._fingerprint
-        return self._fingerprint
+    def get_pubkey_at_path(self, bip32_path: str) -> object:
+        self.paths.append(bip32_path)
+        if isinstance(self._pubkey, Exception):
+            raise self._pubkey
+        return SimpleNamespace(pubkey=self._pubkey)
 
 
 class FakeCommands:
@@ -137,7 +183,7 @@ class FakeCommands:
         self,
         devices: list[dict] | None = None,
         enumerate_error: Exception | None = None,
-        client: FakeClient | None | object = "auto",
+        client: FakeClient | dict | None | object = "auto",
         get_client_error: Exception | None = None,
         signtx_result: object = None,
         signtx_error: Exception | None = None,
@@ -170,7 +216,10 @@ class FakeCommands:
         if self.get_client_error is not None:
             raise self.get_client_error
         if self.client == "auto":
-            return FakeClient(self.__dict__.setdefault("rec", {}))
+            return FakeAccountClient(self.__dict__.setdefault("rec", {}))
+        if isinstance(self.client, dict):
+            # path → client map for multi-device selection tests.
+            return self.client.get(device_path)
         return self.client
 
     def signtx(self, client, psbt):
@@ -194,7 +243,7 @@ class FakeCommands:
 
 
 def make_signer(commands: FakeCommands, fingerprint: str = FP_WALLET) -> HwiUsbSigner:
-    return HwiUsbSigner(fingerprint, commands_module=commands)
+    return HwiUsbSigner(fingerprint, ACCOUNT_PATH, commands_module=commands)
 
 
 def default_sign_result() -> dict:
@@ -234,7 +283,7 @@ def test_missing_wheel_maps_to_hwi_unavailable(monkeypatch):
     guidance — never a raw ImportError."""
     monkeypatch.setitem(sys.modules, "hwilib", None)
     monkeypatch.setitem(sys.modules, "hwilib.commands", None)
-    signer = HwiUsbSigner(FP_WALLET)  # no commands_module → real lazy import
+    signer = HwiUsbSigner(FP_WALLET, ACCOUNT_PATH)  # no commands_module → real lazy import
     with pytest.raises(HwiUnavailableError) as excinfo:
         signer.sign_unsigned(PSBT_B64)
     assert "retry" in str(excinfo.value)
@@ -261,9 +310,13 @@ def test_signer_abc_conformance():
 
 def test_constructor_validation():
     with pytest.raises(SignerError):
-        HwiUsbSigner("")  # empty fingerprint
+        HwiUsbSigner("", ACCOUNT_PATH)  # empty fingerprint
     with pytest.raises(SignerError):
-        HwiUsbSigner(FP_WALLET, chain="mainnet")  # unknown chain name
+        HwiUsbSigner(FP_WALLET, "  ")  # empty account path — no fallback gate
+    with pytest.raises(TypeError):
+        HwiUsbSigner(FP_WALLET)  # account_path is REQUIRED (one honest path)
+    with pytest.raises(SignerError):
+        HwiUsbSigner(FP_WALLET, ACCOUNT_PATH, chain="mainnet")  # unknown chain name
 
 
 # --------------------------------------------------------------------------
@@ -285,7 +338,7 @@ def test_enumerate_maps_fields_and_normalizes_fingerprint():
             type="trezor",
             model="trezor_t",
             path="hid:/dev/hid0",
-            fingerprint_hex=FP_WALLET,
+            fingerprint_hex="a1b2c3d4",
         ),
         DeviceInfo(
             type="trezor", model="trezor_t", path="hid:x", fingerprint_hex=None
@@ -304,7 +357,8 @@ def test_enumerate_error_maps_to_guidance():
 
 
 # --------------------------------------------------------------------------
-# Fingerprint trust gate (ADR-0015)
+# Trust gate: candidate narrowing + post-open account-key bind (ADR-0015
+# + amendment #2, TCK-HW-002)
 # --------------------------------------------------------------------------
 
 
@@ -324,6 +378,72 @@ def test_sign_happy_path_one_match():
     assert commands.rec["closed"] is True
 
 
+def test_unlocked_jade_master_fp_never_gates_signing():
+    """TCK-HW-002 debugger repro (MW-4): the unlocked Jade enumerates with
+    its MASTER fingerprint (40dbb192-style) — which is NOT, and can never
+    be, the wallet's account-key fingerprint. The gate must open the client
+    and bind the ACCOUNT key at the descriptor's path; the pre-fix code
+    refused here with DeviceMismatchError forever."""
+    commands = FakeCommands(
+        devices=[dict(JADE_UNLOCKED)], signtx_result=default_sign_result()
+    )
+    result = make_signer(commands).sign_unsigned(PSBT_B64)
+    assert result.psbt_base64 == SIGNED_B64
+    assert result.signer_name == "hwi:jade"
+
+
+def test_gate_binds_at_the_descriptor_account_path():
+    """The client is asked for the pubkey at the account path the signer
+    was constructed with — never some hardcoded or master path."""
+    client = FakeAccountClient({})
+    commands = FakeCommands(client=client, signtx_result=default_sign_result())
+    make_signer(commands).sign_unsigned(PSBT_B64)
+    assert client.paths == [ACCOUNT_PATH]
+
+
+def test_decoy_account_key_is_mismatch_hard_stop():
+    """A connected device whose account key is a DIFFERENT wallet's (its
+    master fingerprint is whatever) NEVER signs — wrong wallet / typo'd
+    descriptor / attack all stop here (ADR-0015)."""
+    recorder: dict = {}
+    commands = FakeCommands(
+        devices=[dict(DEVICE_OTHER)],
+        client=FakeAccountClient(recorder, _OTHER_PUBKEY),
+        signtx_result=default_sign_result(),
+    )
+    signer = make_signer(commands)
+    with pytest.raises(DeviceMismatchError) as excinfo:
+        signer.sign_unsigned(PSBT_B64)
+    assert "does not match this wallet" in str(excinfo.value)
+    # Hard stop: the signing command was never reached, handle released.
+    assert ("signtx",) not in commands.calls
+    assert recorder["closed"] is True
+
+
+def test_right_device_picked_among_readable_candidates():
+    """Multiple READABLE devices on the bus: enumeration no longer selects
+    (master fp is not the anchor), the account-key bind does — the decoy
+    is opened, checked, closed; the wallet's device signs."""
+    wallet_rec: dict = {}
+    other_rec: dict = {}
+    commands = FakeCommands(
+        devices=[dict(DEVICE_OTHER), dict(DEVICE_WALLET)],
+        client={
+            "hid:/dev/hid1": FakeAccountClient(other_rec, _OTHER_PUBKEY),
+            "hid:/dev/hid0": FakeAccountClient(wallet_rec),
+        },
+        signtx_result=default_sign_result(),
+    )
+    result = make_signer(commands).sign_unsigned(PSBT_B64)
+    assert result.signer_name == "hwi:trezor_t"
+    # Both handles released (decoy at bind-refusal, wallet after signing).
+    assert other_rec["closed"] is True and wallet_rec["closed"] is True
+    signed = [c for c in commands.calls if c[0] == "signtx"]
+    assert len(signed) == 1
+    opened = [c for c in commands.calls if c[0] == "get_client"]
+    assert [c[2] for c in opened] == ["hid:/dev/hid1", "hid:/dev/hid0"]
+
+
 def test_sign_gets_mainnet_chain():
     """The device client is opened for the project's chain (mainnet-only,
     ADR-0021)."""
@@ -341,7 +461,7 @@ def test_sign_gets_mainnet_chain():
 def test_default_chain_is_main():
     """The default chain is mainnet (ADR-0021) and resolves via hwilib's
     Chain enum (hwilib >= 3.1 exposes ``Chain.MAIN``)."""
-    signer = HwiUsbSigner(FP_WALLET)
+    signer = HwiUsbSigner(FP_WALLET, ACCOUNT_PATH)
     assert signer.chain == "main"
     try:
         from hwilib.common import Chain
@@ -357,18 +477,6 @@ def test_zero_devices_is_absent_error():
     with pytest.raises(DeviceAbsentError) as excinfo:
         signer.sign_unsigned(PSBT_B64)
     assert "plug in" in str(excinfo.value).lower()
-    assert ("signtx",) not in commands.calls
-
-
-def test_devices_present_none_match_is_mismatch_hard_stop():
-    """A different-fingerprint device NEVER signs (wrong wallet / typo /
-    attack — ADR-0015 hard stop)."""
-    commands = FakeCommands(devices=[dict(DEVICE_OTHER)], signtx_result=default_sign_result())
-    signer = make_signer(commands)
-    with pytest.raises(DeviceMismatchError) as excinfo:
-        signer.sign_unsigned(PSBT_B64)
-    assert "does not match this wallet" in str(excinfo.value)
-    # Hard stop: the signing command was never reached.
     assert ("signtx",) not in commands.calls
 
 
@@ -427,7 +535,7 @@ TREZOR_LOCKED = {
 
 
 def test_enumerate_preserves_lock_class_fields():
-    """The class signals _select_device branches on survive enumeration;
+    """The class signals _select_candidates branches on survive enumeration;
     old-shape entries default them to False."""
     commands = FakeCommands(devices=[dict(JADE_LOCKED), dict(DEVICE_WALLET)])
     devices = make_signer(commands).enumerate_devices()
@@ -437,7 +545,7 @@ def test_enumerate_preserves_lock_class_fields():
     assert devices[0].fingerprint_hex is None
     assert devices[1] == DeviceInfo(  # defaults keep the old shape valid
         type="trezor", model="trezor_t", path="hid:/dev/hid0",
-        fingerprint_hex=FP_WALLET,
+        fingerprint_hex=MASTER_FP,
     )
 
 
@@ -571,26 +679,28 @@ def test_client_none_is_absent_error():
 
 
 # --------------------------------------------------------------------------
-# Rider R1: post-open fingerprint re-verification (TOCTOU, ADR-0015)
+# Post-open account-key bind (TOCTOU closed by construction, ADR-0015
+# amendment #2; rider R1 kept fail-closed)
 # --------------------------------------------------------------------------
 
 
-def test_post_open_fingerprint_match_signs():
-    """The open client re-reports the wallet fingerprint → gate passes and
-    signing proceeds (the real hwi 3.2.0 client always exposes the getter)."""
+def test_post_open_account_key_match_signs():
+    """The open client serves the wallet's account key at the account
+    path → gate passes and signing proceeds."""
     commands = FakeCommands(
-        client=FakeFingerprintClient({}, bytes.fromhex(FP_WALLET)),
+        client=FakeAccountClient({}, _ACCOUNT_PUBKEY),
         signtx_result=default_sign_result(),
     )
     result = make_signer(commands).sign_unsigned(PSBT_B64)
     assert result.psbt_base64 == SIGNED_B64
 
 
-def test_post_open_fingerprint_mismatch_is_hard_stop():
-    """A device swapped in between enumerate and open (different fingerprint
-    post-open) NEVER signs — the TOCTOU window is closed."""
+def test_post_open_account_key_mismatch_is_hard_stop():
+    """A device swapped in between enumerate and open (different ACCOUNT
+    key) NEVER signs — the enumerate→open window is closed by binding on
+    the open client, not the enumeration."""
     commands = FakeCommands(
-        client=FakeFingerprintClient({}, bytes.fromhex(FP_OTHER)),
+        client=FakeAccountClient({}, _OTHER_PUBKEY),
         signtx_result=default_sign_result(),
     )
     with pytest.raises(DeviceMismatchError) as excinfo:
@@ -599,20 +709,38 @@ def test_post_open_fingerprint_mismatch_is_hard_stop():
     assert ("signtx",) not in commands.calls  # hard stop before signing
 
 
-def test_post_open_fingerprint_unreadable_is_locked_guidance():
-    """Post-open None (device locked itself after enumerate) → locked
-    guidance, never a mismatch (ADR-0015: don't slander the right device)."""
+def test_post_open_missing_getter_fails_closed_even_injected():
+    """A client that cannot serve the account key at all (no
+    get_pubkey_at_path) fails closed — the check is NEVER skipped, not
+    even for an injected test fake (R1, tightened by TCK-HW-002: the old
+    injected-fake skip is gone, there is one path)."""
     commands = FakeCommands(
-        client=FakeFingerprintClient({}, None), signtx_result=default_sign_result()
+        client=FakeClient({}), signtx_result=default_sign_result()
     )
-    with pytest.raises(DeviceLockedError):
+    signer = make_signer(commands)
+    with pytest.raises(DeviceError) as excinfo:
+        signer.sign_unsigned(PSBT_B64)
+    assert "re-verify" in str(excinfo.value)
+    assert "reconnect" in str(excinfo.value)
+    assert ("signtx",) not in commands.calls  # hard stop before signing
+
+
+def test_post_open_unusable_account_key_shape_fails_closed():
+    """A getter answer without a 33-byte compressed pubkey is an unusable
+    shape — refusal, never a guess."""
+    commands = FakeCommands(
+        client=FakeAccountClient({}, b"\x02short"),
+        signtx_result=default_sign_result(),
+    )
+    with pytest.raises(DeviceError) as excinfo:
         make_signer(commands).sign_unsigned(PSBT_B64)
+    assert "re-verify" in str(excinfo.value)
     assert ("signtx",) not in commands.calls
 
 
-def test_post_open_fingerprint_read_error_maps_to_guidance():
+def test_post_open_account_key_read_error_maps_to_guidance():
     commands = FakeCommands(
-        client=FakeFingerprintClient({}, DeviceNotReadyError("locked mid-flight")),
+        client=FakeAccountClient({}, DeviceNotReadyError("locked mid-flight")),
         signtx_result=default_sign_result(),
     )
     with pytest.raises(DeviceLockedError) as excinfo:
@@ -622,38 +750,24 @@ def test_post_open_fingerprint_read_error_maps_to_guidance():
 
 def test_post_open_recheck_also_gates_display_address():
     commands = FakeCommands(
-        client=FakeFingerprintClient({}, bytes.fromhex(FP_OTHER)),
-        display_result={"address": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"},
+        client=FakeAccountClient({}, _OTHER_PUBKEY),
+        display_result={"address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"},
     )
     with pytest.raises(DeviceMismatchError):
-        make_signer(commands).display_address("wpkh([a1b2c3d4/84'/1'/0']vpub)")
-
-
-def test_post_open_missing_getter_on_real_path_is_device_error():
-    """R1: a REAL (non-injected) client that lacks get_master_fingerprint
-    fails closed — the post-open re-check cannot run, so the pre-open
-    enumeration is never silently trusted (fail-open by omission closed).
-    The injected-test-fake skip is exercised by the existing happy-path and
-    normalization tests (FakeClient carries no getter)."""
-    commands = FakeCommands(client=FakeClient({}), signtx_result=default_sign_result())
-    signer = make_signer(commands)
-    signer._injected = False  # simulate the real lazy-imported hwilib path
-    with pytest.raises(DeviceError) as excinfo:
-        signer.sign_unsigned(PSBT_B64)
-    assert "re-verify" in str(excinfo.value)
-    assert "reconnect" in str(excinfo.value)
-    assert ("signtx",) not in commands.calls  # hard stop before signing
+        make_signer(commands).display_address("wpkh([a1b2c3d4/84'/0'/0']zpub)")
 
 
 def test_post_open_reverify_failure_closes_client():
-    """R2: when post-open re-verification raises (mismatch), the opened
-    device handle is still released — no handle leak on the mismatch path."""
+    """R2: when the account-key bind raises (read error mid-flight), the
+    opened device handle is still released — no handle leak."""
     recorder: dict = {}
     commands = FakeCommands(
-        client=FakeFingerprintClient(recorder, bytes.fromhex(FP_OTHER)),
+        client=FakeAccountClient(
+            recorder, ActionCanceledError("canceled at the getter")
+        ),
         signtx_result=default_sign_result(),
     )
-    with pytest.raises(DeviceMismatchError):
+    with pytest.raises(DeviceError):
         make_signer(commands).sign_unsigned(PSBT_B64)
     assert recorder["closed"] is True
     assert ("signtx",) not in commands.calls
@@ -796,11 +910,14 @@ def test_display_address_happy_path_uses_descriptor():
 
 
 def test_display_address_respects_fingerprint_gate():
-    """Address display opens the fingerprint-matched device too — never the
-    wrong device's screen."""
-    commands = FakeCommands(devices=[dict(DEVICE_OTHER)])
+    """Address display binds the account key too — never the wrong
+    device's screen."""
+    commands = FakeCommands(
+        devices=[dict(DEVICE_OTHER)],
+        client=FakeAccountClient({}, _OTHER_PUBKEY),
+    )
     with pytest.raises(DeviceMismatchError):
-        make_signer(commands).display_address("wpkh([a1b2c3d4/84'/1'/0']vpub)")
+        make_signer(commands).display_address("wpkh([a1b2c3d4/84'/0'/0']zpub)")
 
 
 def test_display_address_errors_map_to_guidance_never_silent():
@@ -853,6 +970,6 @@ def test_live_hwi_enumerate_no_device_is_absent_error():
     enumerate: with no device plugged in, signing refuses via the absent
     path — or mismatch/locked if a device happens to be attached (a locked
     device cannot prove its fingerprint either way)."""
-    signer = HwiUsbSigner(FP_WALLET)  # real lazy import of hwilib.commands
+    signer = HwiUsbSigner(FP_WALLET, ACCOUNT_PATH)  # real lazy import of hwilib.commands
     with pytest.raises((DeviceAbsentError, DeviceMismatchError, DeviceLockedError)):
         signer.sign_unsigned(PSBT_B64)

@@ -382,7 +382,10 @@ class _FakeLifecycleCommands:
                 "type": "trezor",
                 "path": "hid:fake",
                 "model": "trezor_t",
-                "fingerprint": self.fingerprint_hex,
+                # MASTER fingerprint (hwilib semantics) — never equal to,
+                # and never compared against, the wallet account fp
+                # (TCK-HW-002 / ADR-0015 amendment #2).
+                "fingerprint": "40dbb192",
             }
         ]
 
@@ -424,7 +427,9 @@ def test_ac3_device_absent_and_locked_guidance_then_retry(
     monkeypatch.setattr(
         app_module,
         "HwiUsbSigner",
-        lambda fp: RealHwiUsbSigner(fp, commands_module=commands),
+        lambda fp, account_path: RealHwiUsbSigner(
+            fp, account_path, commands_module=commands
+        ),
     )
     fake = FactsQuotingGenerate(["create", "confirm", "sign", "sign", "broadcast"])
     my_flow = TxFlow()

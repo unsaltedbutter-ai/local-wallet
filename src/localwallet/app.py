@@ -517,11 +517,13 @@ class SignerSelection:
       ``"hwi"`` (USB hardware wallet, ADR-0015);
     - ``dir_path`` — the file signer's transfer folder (created on demand
       at the first export);
-    - ``fingerprint_hex`` — the wallet's expected master-key fingerprint
-      from the parsed wallet key (the descriptor origin fingerprint); the
-      HWI signer's exactly-one-match gate (ADR-0015) is constructed from
-      it — lazily, ONLY when the hwi kind is selected, and per sign
-      attempt (the signer objects are stateless).
+    - ``fingerprint_hex`` — the wallet's expected ACCOUNT-key fingerprint
+      from the parsed wallet key (the descriptor origin fingerprint; the
+      device's master fingerprint is unknowable to a watch-only
+      account-level wallet — ADR-0015 amendment #2); the HWI signer's
+      post-open account-key bind is constructed from it together with the
+      descriptor's account path — lazily, ONLY when the hwi kind is
+      selected, and per sign attempt (the signer objects are stateless).
     """
 
     kind: str
@@ -1551,6 +1553,20 @@ def _extract_signed_tx_hex(psbt_base64: str) -> str:
     return tx.serialize().hex()
 
 
+def _descriptor_account_path(parsed: ParsedKey) -> str:
+    """The BIP 32 account path this wallet's descriptor origin carries.
+
+    Same canonical construction the descriptor string itself is built
+    from (``wallet.descriptor._build_descriptor_string``: purpose and
+    mainnet coin type from the key's script type) — derived from the
+    parsed key, never a hardcoded ``m/84'/0'/0'`` literal (ADR-0015
+    amendment #2: the HWI signer asks the device for its account key AT
+    this path and binds the answer to the descriptor origin fingerprint).
+    """
+    purpose = SCRIPT_PURPOSES[parsed.script_type]
+    return f"m/{purpose}'/{MAINNET_COIN_TYPE}'/0'"
+
+
 def _make_sign_tx_handler(
     flow: TxFlow,
     selection: SignerSelection,
@@ -1588,10 +1604,11 @@ def _make_sign_tx_handler(
          (idempotent on retry) and the handler returns
          ``{"error": "signed_file_missing", ...}`` with the export path
          and expected filename for narration.
-       - **hwi** (ADR-0015): :class:`HwiUsbSigner` is constructed lazily
-         ONLY when this kind runs (expected fingerprint from the parsed
-         wallet key), and the fingerprint gate + post-open re-check run
-         inside it. A :class:`DeviceError` maps to
+        - **hwi** (ADR-0015 + amendment #2): :class:`HwiUsbSigner` is
+          constructed lazily ONLY when this kind runs (expected account-key
+          fingerprint and the descriptor's account path, both from the
+          parsed wallet key), and the candidate gate + post-open
+          account-key bind run inside it. A :class:`DeviceError` maps to
          ``{"error": "device_error", "guidance": <§10 guidance>}`` — the
          guidance string is code-owned text from the error hierarchy and
          is narrated verbatim.
@@ -1685,7 +1702,9 @@ def _make_sign_tx_handler(
             device_signer = (
                 signer_override
                 if signer_override is not None
-                else HwiUsbSigner(selection.fingerprint_hex)
+                else HwiUsbSigner(
+                    selection.fingerprint_hex, _descriptor_account_path(parsed)
+                )
             )
             try:
                 signed_result = device_signer.sign_unsigned(confirmed.psbt_base64)
@@ -2436,7 +2455,16 @@ def run(
     loop = AgentLoop(generate, table)
 
     try:
-        _repl(loop, output_fn, input_fn, flow=tx_flow, session=session, watcher=watcher, client=client)
+        _repl(
+            loop,
+            output_fn,
+            input_fn,
+            flow=tx_flow,
+            session=session,
+            watcher=watcher,
+            client=client,
+            table=table,
+        )
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
     finally:
@@ -2672,8 +2700,14 @@ def _repl(
     session: SendSession,
     watcher: IncomingWatcher | None = None,
     client: EsploraClient | None = None,
+    table: DispatchTable,
 ) -> None:
     """Read user lines until EOF/exit and print each turn's outcome.
+
+    ``table`` is the allowlist dispatch table the loop runs on — forwarded
+    to :func:`_run_turn` for the deterministic CONFIRMED-retry re-sign
+    (TCK-HW-002), which calls the ``sign_tx`` handler directly (never the
+    model).
 
     The flow/session pair is owned by this loop's caller (:func:`run`);
     every turn runs through :func:`_run_turn` so the confirm gate sees
@@ -2705,7 +2739,9 @@ def _repl(
         if line.startswith("/"):
             _handle_transcript_command(line, loop, output_fn)
             continue
-        _run_turn(loop, flow, session, line, output_fn, client=client)
+        _run_turn(
+            loop, flow, session, line, output_fn, client=client, table=table
+        )
 
 
 #: Fallback wording for an unparseable ``/`` command (value-free).
@@ -2758,6 +2794,7 @@ def _run_turn(
     output_fn: Callable[[str], None],
     *,
     client: EsploraClient | None = None,
+    table: DispatchTable,
 ) -> None:
     """Run ONE REPL turn: gate classification → agent → flow narration.
 
@@ -2776,6 +2813,12 @@ def _run_turn(
       did not emit ``confirm_tx``): a guidance line — the flow is
       untouched.
     - NOT_A_DECISION: normal chat; a pending card simply stays pending.
+    - CONFIRMED + bare "retry" (TCK-HW-002, MW-4): intercepted BEFORE the
+      model — the ``sign_tx`` handler is re-invoked directly with the
+      dispatcher-owned confirmed ``tx_ref`` (the SAME code path the model
+      envelope dispatches to; the model can never reach here without the
+      user typing "retry", and an LLM "retry" is never consulted). Every
+      other state and every other utterance takes the unchanged pipeline.
     - FACTS (TCK-P2-004 SR fix, extended to the full lifecycle in
       TCK-P3-005): the flow's current state is injected as the turn's
       FACTS block (:func:`_flow_facts`) — the pending card while
@@ -2787,6 +2830,33 @@ def _run_turn(
       stay empty; the gate decision above remains the only confirmation
       authority either way.
     """
+    # TCK-HW-002 (MW-4): deterministic re-sign interception — device-error
+    # guidance tells the user to say 'retry'; routing that bare utterance
+    # through the model loses the intent. The envelope is built by CODE
+    # from dispatcher-owned flow state (the confirmed record's tx_ref —
+    # never a model- or user-supplied reference) and dispatched straight to
+    # the sign_tx handler; the handler's own flow gate remains the
+    # authority. History records the turn like any dispatched turn would.
+    confirmed = flow.confirmed if flow.state is TxFlowStatus.CONFIRMED else None
+    if confirmed is not None and line.strip().lower() == "retry":
+        envelope = Envelope(
+            v=0,
+            intent=IntentName.SIGN_TX,
+            params=SignTxParams(tx_ref=confirmed.tx_ref),
+        )
+        result = table[IntentName.SIGN_TX](envelope)
+        loop.add_turn(line, envelope.model_dump_json())
+        _print_turn(
+            AgentTurnResult(
+                status=AgentTurnStatus.OK,
+                envelope=envelope,
+                result=result,
+                user_message=None,
+                turns_used=0,
+            ),
+            output_fn,
+        )
+        return
     session.gate_decision = (
         ConfirmGate.classify(line)
         if flow.state is TxFlowStatus.CREATED

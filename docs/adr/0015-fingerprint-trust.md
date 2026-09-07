@@ -146,3 +146,51 @@ blobs it cannot read. Host-driven-PIN devices (e.g. a locked Trezor,
 signer only names the companion-app unlock flow in its guidance. Wiring such
 relaying would put PIN material through the host and would need its own ADR.
 
+## Amendment #2 (TCK-HW-002, 2026-09-07): the gate binds the ACCOUNT key, not the master fingerprint
+
+**What changed.** Decision 1's "devices whose master fingerprint equals
+the wallet's expected fingerprint" was unimplementable and is replaced:
+`hwilib`'s `enumerate` reports the device's **master** fingerprint
+(`jade.py:549` via `get_master_fingerprint`), while the value the app
+holds — and always held — is the **account key's own fingerprint**
+(`parsed.hd_key.my_fingerprint`, the descriptor origin, e.g. at
+`m/84'/0'/0'`). For any account-level zpub the two differ by
+construction, so the exactly-one-match gate could never pass for any
+device (MW-4 live blocker: the user's Jade reported master `40dbb192`
+against an expected account fingerprint; every sign attempt died with
+the mismatch guidance).
+
+**The re-framed gate.** The trust anchor moves from "the device's master
+fingerprint equals X" to "**the device controls the wallet's account
+key**": the signer opens each readable enumerated candidate and asks the
+OPEN client for the public key at the descriptor's account path
+(`get_pubkey_at_path` — the base `Client` contract, implemented by every
+supported client incl. JadeClient at `jade.py:164`), and binds it via
+`hash160(pubkey)[:4]` (BIP 32) against the descriptor origin fingerprint.
+Zero matches → mismatch hard stop (unchanged semantics, unchanged
+guidance); more than one → unchanged; a client that cannot serve the
+account key fails closed — the check is never skipped (the former
+injected-fake skip is gone). Enumeration now only narrows
+locked/unreadable devices for guidance; its master fingerprint decides
+nothing. Because binding happens on the open client, the
+enumerate→open TOCTOU window the post-open re-check closed is closed by
+construction.
+
+**Why watch-only cannot know more.** The master fingerprint is not
+recoverable from an account-level key (`wallet/descriptor.py` documents
+this); the app holds xpubs only, so no amount of device cooperation
+lets it predict what `enumerate` reports. The account fingerprint is the
+strongest identifier the wallet actually possesses.
+
+**What still binds the money.** The device gate proves device↔wallet-key
+identity; **`tx/revalidate.py` remains the binding gate for actual
+signatures** — a bound-but-wrong signature against the intended
+transaction is still a hard stop before broadcast, unchanged.
+
+**Fuller future path.** OQ18 device registration (enrollment records the
+device's master fingerprint ↔ descriptor pairing at setup time, enabling
+pre-open candidate selection and per-device identity across wallet
+changes) remains the complete answer; it is still unwired in v1, and
+this amendment is deliberately the smallest honest anchor that works
+for watch-only without it.
+

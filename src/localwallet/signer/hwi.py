@@ -5,8 +5,9 @@ Implements :class:`localwallet.signer.base.Signer` for USB-connected devices
 as a Python library — the Specter-Desktop pattern (PROJECT.md §7.6) — never
 as a CLI subprocess.
 
-Flow (PROJECT.md §7.6): ``enumerate → fingerprint match → display address →
-sign``.
+Flow (PROJECT.md §7.6, ADR-0015 amendment #2): ``enumerate → open
+candidate → account-key fingerprint bind (at the descriptor's account
+path) → display address / sign``.
 
 Layering and trust (AGENTS.md invariants):
 
@@ -14,11 +15,19 @@ Layering and trust (AGENTS.md invariants):
   (same pattern as ``agent/runtime.py``'s llama import), so this module
   imports cleanly without the wheel; tests inject a fake commands module via
   the ``commands_module`` constructor seam.
-- **Fingerprint trust is a hard gate (ADR-0015 / OQ18).** Signing proceeds
-  only when EXACTLY ONE enumerated device carries the wallet's expected
-  master fingerprint. Zero matches and multiple matches both refuse. A
-  mismatch is a hard stop — we never sign with a different device's key
-  (wrong wallet, typo'd descriptor, or attack).
+- **Account-key fingerprint trust is a hard gate (ADR-0015 + amendment #2 /
+  OQ18).** The binding check runs on the OPEN client: it must serve the
+  wallet's account public key at the descriptor's account derivation path
+  (e.g. ``m/84'/0'/0'``), and that key's fingerprint
+  (``hash160(pubkey)[:4]``, BIP 32) must equal the wallet's expected
+  fingerprint EXACTLY. The fingerprint ``enumerate`` reports is the
+  device's MASTER fingerprint — unknowable to a watch-only account-level
+  wallet — so enumeration only narrows candidates (readable vs locked)
+  and never decides trust. Zero matches and multiple matches both refuse;
+  a mismatch is a hard stop (wrong wallet, typo'd descriptor, or attack).
+  A client that cannot serve the account key fails closed — the check is
+  never skipped. Full device registration (OQ18) remains the fuller
+  future anchor.
 - **No re-validation here.** The signed PSBT returned by the device is
   transported verbatim; deterministic re-validation against the intended
   transaction is owned by ``localwallet.tx.revalidate`` before broadcast
@@ -46,6 +55,8 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from typing import Any
+
+from embit.hashes import hash160
 
 from localwallet.signer.base import SignedResult, Signer, SignerError
 
@@ -165,11 +176,13 @@ _DEFAULT_CHAIN = "main"
 class DeviceInfo:
     """One enumerated hardware device (subset of the hwilib enumerate dict).
 
-    ``fingerprint_hex`` is the lowercase hex master-key fingerprint, or
-    ``None`` when the device could not be read (locked/uninitialized) —
-    such devices can never match, which the trust gate treats explicitly.
+    ``fingerprint_hex`` is the lowercase hex MASTER-key fingerprint hwilib
+    reports, or ``None`` when the device could not be read
+    (locked/uninitialized) — locked-class guidance branches on that (ADR-0015
+    amendment #2: the master fingerprint is unknowable to a watch-only
+    account-level wallet, so this value never decides trust).
     ``needs_pin_sent``/``needs_passphrase_sent``/``locked`` carry the rest
-    of the enumerate shape ``_select_device`` branches on for unlock
+    of the enumerate shape ``_select_candidates`` branches on for unlock
     guidance; defaults keep old-shape (mocked) entries valid.
     """
 
@@ -196,9 +209,17 @@ class HwiUsbSigner(Signer):
     """USB hardware-wallet signer over HWI-as-a-library.
 
     Args:
-        expected_wallet_fingerprint: the wallet's master-key fingerprint as
-            a hex string (from the parsed descriptor). The signing device
-            MUST match it exactly (ADR-0015).
+        expected_wallet_fingerprint: the wallet's ACCOUNT-key fingerprint
+            as a hex string (the descriptor origin fingerprint —
+            ``parsed.hd_key.my_fingerprint``). The signing device MUST
+            prove control of the key with this fingerprint at the account
+            path (ADR-0015 + amendment #2).
+        account_path: the device-side BIP 32 account derivation path the
+            descriptor's origin carries (e.g. ``"m/84'/0'/0'"``) — where
+            the device is asked for the account public key. Required: a
+            signer without it cannot bind a device to the wallet's key
+            origin, so there is no fallback path (fail closed at
+            construction).
         chain: which chain the device client is opened for; default
             ``"main"`` (mainnet-only invariant, ADR-0021). One of
             ``main``/``test``/``testnet4``/
@@ -211,6 +232,7 @@ class HwiUsbSigner(Signer):
     def __init__(
         self,
         expected_wallet_fingerprint: str,
+        account_path: str,
         chain: str = _DEFAULT_CHAIN,
         commands_module: Any | None = None,
     ) -> None:
@@ -218,18 +240,16 @@ class HwiUsbSigner(Signer):
             expected_wallet_fingerprint.strip()
         ):
             raise SignerError("expected_wallet_fingerprint must be a hex string")
+        if not isinstance(account_path, str) or not account_path.strip():
+            raise SignerError("account_path must be a BIP 32 path string")
         if chain not in _CHAIN_NAMES:
             raise SignerError(
                 "chain must be one of: " + ", ".join(_CHAIN_NAMES)
             )
         self.expected_wallet_fingerprint = expected_wallet_fingerprint.strip().lower()
+        self.account_path = account_path.strip()
         self.chain = chain
         self._commands = commands_module
-        # ``True`` when a test fake was injected via the constructor seam,
-        # ``False`` when hwilib is lazily imported (the real path). R1 uses
-        # this to fail closed on a REAL client that lacks the post-open
-        # fingerprint getter while letting injected fakes keep the skip.
-        self._injected = commands_module is not None
 
     @property
     def name(self) -> str:
@@ -314,116 +334,146 @@ class HwiUsbSigner(Signer):
             )
         return devices
 
-    # -- fingerprint trust gate (ADR-0015) ---------------------------------
+    # -- fingerprint trust gate (ADR-0015 + amendment #2) ------------------
 
-    def _select_device(self, devices: list[DeviceInfo]) -> DeviceInfo:
-        """Pick the ONE device matching the wallet fingerprint (hard gate).
+    def _select_candidates(self, devices: list[DeviceInfo]) -> list[DeviceInfo]:
+        """Narrow the enumeration to openable candidates (pre-open, advisory).
+
+        The enumerated fingerprint is the device's MASTER fingerprint,
+        which a watch-only account-level wallet can never predict
+        (ADR-0015 amendment #2) — so this step filters by READABILITY
+        only and never decides trust:
 
         - zero devices → DeviceAbsentError;
-        - zero matches with devices present → DeviceMismatchError, unless
-          every device's fingerprint was unreadable (locked/uninitialized),
-          which is DeviceLockedError instead;
-        - more than one match → refuse (ambiguity; unplug extras).
+        - all devices unreadable (locked/uninitialized) → DeviceLockedError
+          with class-specific guidance (the right device must not be
+          slandered as a mismatch before it can identify itself);
+        - readable devices → returned as candidates, each opened and bound
+          by :meth:`_reverify_fingerprint`.
 
-        A mismatch NEVER falls through to signing — wrong wallet, typo'd
-        descriptor, or attack all stop here (ADR-0015).
+        ponytail: every readable candidate is opened per attempt to test
+        its account key; OQ18 device registration will let enumeration
+        pre-select instead.
         """
         if not devices:
             raise DeviceAbsentError(_MSG_NO_DEVICES)
-        expected = self.expected_wallet_fingerprint
-        matches = [
-            d
-            for d in devices
-            if d.fingerprint_hex is not None and d.fingerprint_hex == expected
-        ]
+        candidates = [d for d in devices if d.fingerprint_hex is not None]
+        if not candidates:
+            # Present but unreadable: locked or uninitialized device —
+            # guidance depends on how that device class unlocks.
+            if any(d.type.startswith("jade") for d in devices):
+                # Jade never takes a host-side PIN: hwi drives an
+                # on-device scrambled PIN pad (blinded pinserver relay).
+                # The generic line below loops forever here (TCK-HW-001).
+                raise DeviceLockedError(_MSG_JADE_LOCKED)
+            if any(d.needs_pin_sent for d in devices):
+                # Host-driven PIN class (e.g. locked Trezor): unlocking is
+                # driven through the device's own app/companion flow;
+                # relaying promptpin/sendpin is out of scope (ADR-0015
+                # amendment).
+                raise DeviceLockedError(_MSG_HOST_PIN)
+            raise DeviceLockedError(_MSG_LOCKED)
+        return candidates
+
+    def _client_account_fingerprint(self, client: Any) -> str:
+        """The device's fingerprint AT THE WALLET'S ACCOUNT PATH.
+
+        hwi 3.2.0 clients implement ``get_pubkey_at_path`` (base
+        ``Client`` contract, ``hwilib/hwwclient.py``; JadeClient at
+        ``hwilib/devices/jade.py:164`` returns an ``ExtendedKey`` whose
+        ``pubkey`` is the compressed account public key). The account
+        key's own fingerprint is ``hash160(pubkey)[:4]`` (BIP 32) —
+        exactly what the descriptor's origin carries.
+
+        Fail-closed (R1): a client that does not expose the getter, or
+        returns an unusable key, raises :class:`DeviceError` — the check
+        is NEVER skipped. Path errors map through the standard hierarchy.
+        """
+        getter = getattr(client, "get_pubkey_at_path", None)
+        if not callable(getter):
+            raise DeviceError(_MSG_REVERIFY)
+        try:
+            ext_key = getter(self.account_path)
+        except Exception as exc:
+            raise self._map_hwi_error(exc) from exc
+        pubkey = getattr(ext_key, "pubkey", None)
+        if not isinstance(pubkey, (bytes, bytearray)) or len(pubkey) != 33:
+            raise DeviceError(_MSG_REVERIFY)
+        return hash160(bytes(pubkey))[:4].hex()
+
+    def _open_matched_client(self, commands: Any) -> tuple[Any, DeviceInfo]:
+        """Open candidates and BIND each by account-key fingerprint (hard gate).
+
+        Sequence (ADR-0015 + amendment #2): enumerate →
+        :meth:`_select_candidates` (readability/locked guidance only) →
+        per candidate: open a client, then the BINDING check — the OPEN
+        client must serve the wallet's account key
+        (:meth:`_reverify_fingerprint`). Because trust is decided on the
+        open client, not on the enumeration, the enumerate→open TOCTOU
+        window is closed by construction. Exactly one account-key match
+        proceeds; zero → DeviceMismatchError; more than one → DeviceError
+        (unplug extras).
+
+        A mismatch NEVER falls through to signing — wrong wallet, typo'd
+        descriptor, or attack all stop here. Every non-selected client
+        handle is released (R2: no handle leaks on refusal paths).
+        """
+        matches: list[tuple[Any, DeviceInfo]] = []
+        for device in self._select_candidates(self.enumerate_devices()):
+            try:
+                client = commands.get_client(
+                    device.type, device.path, chain=self._chain_enum(commands)
+                )
+            except Exception as exc:
+                self._close_all(matches)
+                raise self._map_hwi_error(exc) from exc
+            if client is None:
+                self._close_all(matches)
+                raise DeviceAbsentError(_MSG_CLIENT_GONE)
+            try:
+                bound = self._reverify_fingerprint(client)
+            except Exception:
+                # Read failure / fail-closed shape error: release this
+                # handle AND every already-bound one (R2).
+                self._close_client(client)
+                self._close_all(matches)
+                raise
+            if bound:
+                matches.append((client, device))
+            else:
+                self._close_client(client)
         if len(matches) == 1:
             return matches[0]
-        if len(matches) == 0:
-            if all(d.fingerprint_hex is None for d in devices):
-                # Present but unreadable: locked or uninitialized device —
-                # guidance depends on how that device class unlocks.
-                if any(d.type.startswith("jade") for d in devices):
-                    # Jade never takes a host-side PIN: hwi drives an
-                    # on-device scrambled PIN pad (blinded pinserver relay).
-                    # The generic line below loops forever here (TCK-HW-001).
-                    raise DeviceLockedError(_MSG_JADE_LOCKED)
-                if any(d.needs_pin_sent for d in devices):
-                    # Host-driven PIN class (e.g. locked Trezor): unlocking is
-                    # driven through the device's own app/companion flow;
-                    # relaying promptpin/sendpin is out of scope (ADR-0015
-                    # amendment).
-                    raise DeviceLockedError(_MSG_HOST_PIN)
-                raise DeviceLockedError(_MSG_LOCKED)
+        self._close_all(matches)
+        if not matches:
             raise DeviceMismatchError(_MSG_MISMATCH)
         raise DeviceError(_MSG_MULTIPLE)
 
-    def _open_matched_client(self, commands: Any) -> tuple[Any, DeviceInfo]:
-        """Fingerprint-gate, then open a client for the matched device.
+    def _reverify_fingerprint(self, client: Any) -> bool:
+        """Bind the OPEN client to the wallet's account key (hard gate).
 
-        Post-open re-verification (TOCTOU, ADR-0015): hardware can change
-        between enumeration and client open, so the OPEN client is
-        re-queried for its master fingerprint and the match gate is
-        re-applied (:meth:`_reverify_fingerprint`) before any signing or
-        address display happens.
+        Returns ``True`` only when the client's fingerprint at the
+        descriptor's account path equals the wallet's expected
+        account-key fingerprint. A different key is NOT an error to
+        raise here — with several candidates on the bus, the caller
+        (:meth:`_open_matched_client`) must keep looking, and a device
+        that matches nothing surfaces as the mismatch hard stop
+        (_MSG_MISMATCH), never a bypass. Inability to serve the account
+        key raises fail-closed (see :meth:`_client_account_fingerprint`).
+
+        The signed PSBT itself remains bound by
+        :mod:`localwallet.tx.revalidate` — this gate binds the DEVICE,
+        revalidation binds the SIGNATURES (ADR-0015 amendment #2).
         """
-        device = self._select_device(self.enumerate_devices())
-        try:
-            client = commands.get_client(
-                device.type, device.path, chain=self._chain_enum(commands)
-            )
-        except Exception as exc:
-            raise self._map_hwi_error(exc) from exc
-        if client is None:
-            raise DeviceAbsentError(_MSG_CLIENT_GONE)
-        try:
-            self._reverify_fingerprint(client)
-        except Exception:
-            # R2: a post-open re-verification failure (mismatch, locked, or
-            # read error) must not leak the just-opened device handle —
-            # release it before propagating the mapped error.
-            self._close_client(client)
-            raise
-        return client, device
+        return (
+            self._client_account_fingerprint(client) == self.expected_wallet_fingerprint
+        )
 
-    def _reverify_fingerprint(self, client: Any) -> None:
-        """Re-apply the fingerprint match gate on the OPEN client (R1/ADR-0015).
-
-        hwi 3.2.0's ``HardwareWalletClient`` base class exposes
-        ``get_master_fingerprint()`` (verified empirically against the
-        pinned wheel), so the real path always re-checks after open —
-        closing the enumerate→open TOCTOU window: a device swapped in
-        between the two steps cannot sign under this wallet's identity.
-
-        Limitation (honest, R1): only an INJECTED client (test fake, exotic
-        transport) that does NOT expose the getter keeps the skip — the
-        pre-open enumerate gate plus the deterministic signed-PSBT
-        re-validation (:mod:`localwallet.tx.revalidate`) remain its
-        backstops. A REAL hwilib client (hwi 3.2.0 always exposes the
-        getter) lacking it CANNOT be re-verified, so it fails closed
-        (:class:`DeviceError` with reconnect guidance) instead of silently
-        trusting the pre-open enumeration.
-
-        Failure mapping: an unreadable post-open fingerprint (``None``)
-        is locked-device guidance — the right device must not be
-        slandered as a mismatch before it can identify itself (ADR-0015);
-        a DIFFERENT readable fingerprint is the mismatch hard stop; read
-        errors map through the standard hierarchy.
-        """
-        getter = getattr(client, "get_master_fingerprint", None)
-        if not callable(getter):
-            if not self._injected:
-                # Real hwilib path: the getter must exist; without it the
-                # post-open re-check cannot run → fail closed (R1).
-                raise DeviceError(_MSG_REVERIFY)
-            return  # documented limitation: injected test fakes may omit it
-        try:
-            reported = _normalize_fingerprint(getter())
-        except Exception as exc:
-            raise self._map_hwi_error(exc) from exc
-        if reported is None:
-            raise DeviceLockedError(_MSG_LOCKED)
-        if reported != self.expected_wallet_fingerprint:
-            raise DeviceMismatchError(_MSG_MISMATCH)
+    @classmethod
+    def _close_all(cls, opened: list[tuple[Any, DeviceInfo]]) -> None:
+        """Release every client handle in a ``(client, device)`` list."""
+        for client, _device in opened:
+            cls._close_client(client)
 
     @staticmethod
     def _close_client(client: Any) -> None:
@@ -466,8 +516,9 @@ class HwiUsbSigner(Signer):
     def sign_unsigned(self, psbt_base64: str) -> SignedResult:
         """Sign a base64 PSBT on the fingerprint-matched device.
 
-        Pipeline: fingerprint gate (ADR-0015) → client open with POST-OPEN
-        fingerprint re-verification (TOCTOU re-check, ADR-0015) → hwilib
+        Pipeline (ADR-0015 + amendment #2): candidate enumeration →
+        client open → POST-OPEN account-key fingerprint bind (closes the
+        enumerate→open TOCTOU window by construction) → hwilib
         ``signtx`` → normalize the device's response to base64 text →
         :class:`SignedResult`.
         The signed PSBT is returned verbatim for re-validation by

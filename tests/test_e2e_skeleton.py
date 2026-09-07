@@ -3489,14 +3489,29 @@ def _extract_signed_tx(psbt_b64: str) -> Any:
 
 
 class _FakeDeviceClient:
-    """Fake hwilib client: exposes the post-open fingerprint getter."""
+    """Fake hwilib client for the TCK-HW-002 gate: serves the fixture
+    ACCOUNT key's pubkey at the descriptor's account path (hwi base
+    ``Client.get_pubkey_at_path`` contract — JadeClient jade.py:164
+    shape), which the post-open bind hashes to the wallet fingerprint.
+    The device MASTER fingerprint is deliberately NOT exposed: nothing
+    on the signer path may need it (watch-only, ADR-0015 amendment #2)."""
 
     def __init__(self, fingerprint_hex: str, recorder: dict[str, bool]) -> None:
-        self._fingerprint = bytes.fromhex(fingerprint_hex)
+        del fingerprint_hex  # kept call-compatible; the gate never uses it
         self._recorder = recorder
 
-    def get_master_fingerprint(self) -> bytes:
-        return self._fingerprint
+    def get_pubkey_at_path(self, bip32_path: str):
+        from types import SimpleNamespace
+
+        from embit import bip32
+
+        # The descriptor origin path this wallet was built for (p2wpkh,
+        # mainnet coin 0) — pinned here so a wrong path is a hard test fail.
+        assert bip32_path == "m/84'/0'/0'", f"unexpected bind path {bip32_path}"
+        account = bip32.HDKey.from_seed(DESCRIPTOR_SEED).derive(
+            FIXTURE_ACCOUNT_DERIVATION
+        )
+        return SimpleNamespace(pubkey=account.key.sec())  # compressed, 33 B
 
     def close(self) -> None:
         self._recorder["closed"] = True
@@ -3504,9 +3519,12 @@ class _FakeDeviceClient:
 
 class _FakeDeviceCommands:
     """hwilib.commands stand-in whose device REALLY signs with the fixture
-    wallet key (enumerate → fingerprint → signtx, hwi 3.2.0 API shape).
-    ``fail_first_sign`` raises a name-mapped locked error on the first
-    signtx (DeviceLockedError mid-flow → guidance → retry works)."""
+    wallet key (enumerate → open → account-key bind → signtx, hwi 3.2.0
+    API shape). Enumeration reports a MASTER fingerprint distinct from the
+    wallet's account fingerprint — the MW-4 debugger repro (TCK-HW-002):
+    nothing may compare those two. ``fail_first_sign`` raises a name-mapped
+    locked error on the first signtx (DeviceLockedError mid-flow →
+    guidance → retry works)."""
 
     class DeviceNotReadyError(Exception): ...  # name-mapped: locked guidance
 
@@ -3524,7 +3542,9 @@ class _FakeDeviceCommands:
                 "type": "trezor",
                 "path": "hid:fake",
                 "model": "trezor_t",
-                "fingerprint": self.fingerprint_hex,
+                # hwilib reports the MASTER fingerprint here (the user's
+                # Jade: 40dbb192-style) — never the wallet account fp.
+                "fingerprint": "40dbb192",
             }
         ]
 
@@ -3641,9 +3661,11 @@ def test_send_lifecycle_file_signer_full_happy_path(
 def test_send_lifecycle_hwi_signer_locked_retry_then_broadcast(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """HWI path with a fake commands module: fingerprint gate (incl. the
-    post-open re-check) → DeviceLockedError mid-flow → §10 guidance line →
-    'retry' → sign → revalidate → broadcast. Flow discipline throughout."""
+    """HWI path with a fake commands module: candidate gate + post-open
+    account-key bind (master-fp enumeration never gates, TCK-HW-002) →
+    DeviceLockedError mid-flow → §10 guidance line → bare 'retry'
+    (DETERMINISTICALLY INTERCEPTED at CONFIRMED — no model call for it) →
+    sign → revalidate → broadcast. Flow discipline throughout."""
     from localwallet.signer.hwi import HwiUsbSigner as RealHwiUsbSigner
 
     addr0 = derive_fixture_addresses(1)[0]
@@ -3653,9 +3675,13 @@ def test_send_lifecycle_hwi_signer_locked_retry_then_broadcast(
     monkeypatch.setattr(
         app_module,
         "HwiUsbSigner",
-        lambda fp: RealHwiUsbSigner(fp, commands_module=commands),
+        lambda fp, account_path: RealHwiUsbSigner(
+            fp, account_path, commands_module=commands
+        ),
     )
-    fake = FactsQuotingGenerate(["create", "confirm", "sign", "sign", "broadcast"])
+    # 'retry' at CONFIRMED never reaches the model (TCK-HW-002): the plan
+    # has no fourth step for it — 'broadcast it' consumes "broadcast".
+    fake = FactsQuotingGenerate(["create", "confirm", "sign", "broadcast"])
 
     _code, outputs, flow = _run_send_repl(
         monkeypatch,
@@ -3669,7 +3695,7 @@ def test_send_lifecycle_hwi_signer_locked_retry_then_broadcast(
             "broadcast it",
             "exit",
         ],
-        ["create", "confirm", "sign", "sign", "broadcast"],
+        ["create", "confirm", "sign", "broadcast"],
         generate=fake,
         extra_env={"LOCALWALLET_SIGNER": "hwi"},
     )
@@ -3684,6 +3710,109 @@ def test_send_lifecycle_hwi_signer_locked_retry_then_broadcast(
     assert commands.rec["closed"] is True  # device handle released both times
     assert f"Sent! txid {_flow_txid(flow)} — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
+    # The retry turn was model-free: five REPL utterances before 'exit',
+    # the model saw four of them — and no prompt was ASKED about 'retry'
+    # (a re-injected history line is mid-prompt, never the final turn).
+    assert len(fake.prompts) == 4
+    assert not any(p.endswith("user: retry\n\nenvelope:") for p in fake.prompts)
+
+
+def test_retry_at_confirmed_resigns_deterministically_without_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-HW-002 pin: at ``CONFIRMED`` a bare ``"retry"`` (stripped,
+    case-insensitive) re-invokes the sign_tx handler DIRECTLY with the
+    dispatcher-owned confirmed tx_ref — the model is never consulted for
+    that turn — and the full sign pipeline (gate → bind → device sign →
+    revalidate → SIGNED) runs. Confirmed by the model-call count: five
+    REPL utterances before 'exit', the model saw four."""
+    from localwallet.signer.hwi import HwiUsbSigner as RealHwiUsbSigner
+
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    fingerprint = _fixture_parsed().hd_key.my_fingerprint.hex()
+    commands = _FakeDeviceCommands(fingerprint)
+    monkeypatch.setattr(
+        app_module,
+        "HwiUsbSigner",
+        lambda fp, account_path: RealHwiUsbSigner(
+            fp, account_path, commands_module=commands
+        ),
+    )
+    fake = FactsQuotingGenerate(["create", "confirm"])
+
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "yes please",
+            "  Retry  ",  # exact-utterance test: stripped + case-insensitive
+            "broadcast it",
+            "exit",
+        ],
+        ["create", "confirm", "broadcast"],
+        generate=fake,
+        extra_env={"LOCALWALLET_SIGNER": "hwi"},
+    )
+
+    joined = "\n".join(outputs)
+    assert f"Signed and verified ✓ txid {_flow_txid(flow)}." in joined
+    assert flow.state is TxFlowStatus.SIGNED
+    assert commands.sign_calls == 1
+    # The retry turn was model-free; 'broadcast it' was NOT (plan shifted
+    # by one: create, confirm, broadcast = 3 prompts for 4 live utterances).
+    # (Prompt-COUNT proves the bypass: a CONFIRMED sign via the model would
+    # have needed a fourth call — and the plan is exhausted past step 3.)
+    assert len(fake.prompts) == 3
+
+
+@pytest.mark.parametrize(
+    ("lines_prefix", "plan"),
+    [
+        # IDLE: bare 'retry' must NOT be intercepted (no pending flow) —
+        # the very first model call carries the utterance.
+        (["retry"], ["respond"]),
+        # CREATED: 'retry' is an ordinary utterance for the model.
+        (
+            [f"send 60000 sats to {SEND_RECIPIENT}", "retry"],
+            ["create", "respond"],
+        ),
+    ],
+    ids=["idle", "created"],
+)
+def test_retry_outside_confirmed_still_goes_through_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    lines_prefix: list[str],
+    plan: list[str],
+) -> None:
+    """States other than CONFIRMED are untouched by the interception: the
+    utterance reaches the model through the normal generate → validate →
+    dispatch pipeline (recorded prompt proves it)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    # Every model call answers with a canned respond (or the create); the
+    # retry-at-CONFIRMED path would bypass the model entirely, so the
+    # prompts below disprove interception here.
+    fake = FactsQuotingGenerate(plan)
+
+    _code, _outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [*lines_prefix, "exit"],
+        [],
+        generate=fake,
+        extra_env={"LOCALWALLET_SIGNER": "hwi"},
+    )
+
+    assert any("user: retry" in p for p in fake.prompts)
+    if len(lines_prefix) == 1:
+        assert flow.state is TxFlowStatus.IDLE
+    else:
+        assert flow.state is TxFlowStatus.CREATED
 
 
 def test_send_lifecycle_revalidation_hard_stop_tampered_psbt(
