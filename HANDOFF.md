@@ -1,10 +1,21 @@
 # HANDOFF.md — local-wallet orchestration handoff
 
 - **Written:** 2026-09-04, end of autonomous run (Phases 0–5 complete) — **amended 2026-09-06:** the security sweep (TCK-SEC-001..004) and the mainnet flip (TCK-MAIN-001..003, ADR-0021) landed since this was written.
-- **Branch:** `dev/plan-run-1` · **HEAD:** `3087904` (stale — **superseded by commits `55f8d6d..7d98854` — see TASKS.md**) · Working tree clean at last gate.
+- **Branch:** `dev/plan-run-1` · **HEAD:** `db820fe` (session 2026-09-07 — see SESSION UPDATE below; TASKS.md is authoritative) · Working tree clean at last gate (only the user's own .opencode files uncommitted).
 - **Source docs:** PROJECT.md (spec), TASKS.md (ticket table — authoritative for ids/status), docs/adr/0001–0015 (decisions), docs/phase1-ac.md / phase3-ac.md / sparrow-ac.md (deferred-run procedures), docs/device-notes.md
-- **Suite:** `pytest tests/ -q` → **1677 passed / 6 skipped** (last full run, per TCK-MAIN-003 commit message) · `ruff check src tests` clean · `python tools/lint_network.py` exit 0 · `python evals/run_evals.py` exit 0 (30/30 golden + 6/6 red-team fixture validation)
+- **Suite:** `pytest tests/ -q` → **1745 passed / 7 skipped** (session 2026-09-07) · `ruff check src tests evals` clean · `python tools/lint_network.py` exit 0 · `python evals/run_evals.py` exit 0 (30/30 golden + 23/23 red-team fixture validation) · model mode on pinned GGUF: **26/53 = 49.1%, exit 1 — the ENFORCED gate failing is the recorded, accepted outcome** (misses are model-quality limits; redteam "misses" are the by-design structural-gate case)
 - **Venv used by children:** `/var/folders/7q/zywlh9nn6pn2bs8z1y1b44j80000gn/T/opencode/protocol_venv` (has pydantic, httpx, embit==0.8.0, hwi 3.2.0, llama-cpp-python, pytest, ruff). It survived the reboot and was used (Python 3.12.13). For a fresh machine: `python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'` (requires Python ≥3.12 — PEP 695 syntax; friendly guard in evals/run_evals.py).
+
+## 0. SESSION UPDATE 2026-09-07 (read this first)
+
+Committed this session, all gates green:
+- **TCK-P6-001 DONE** (`a63e24e`): `_ENFORCE_PHASE6_GATE = True`; 17 new redteam fixtures (chain-injection, destructive-bypass, xpub-exfil → registry 23); CI-able gate pins `tests/test_run_evals_gate.py`; fuzz deep matrix.
+- **TCK-ONB-001 DONE** (`0198c4a`): ADR-0023 first-run backend selection, REVISED TWICE per user UX direction — 5-step onboarding conversation (greeting+zpub ask → skippable node-privacy ask post-xpub → non-blocking load narration → load-complete → backend setup branch); copy drafts pending §9 sign-off; ONB-003 AC rewritten to match.
+- **TCK-P6-004 DONE** (`db820fe` + runtime part in `46e80d9`): installed llama-cpp 0.3.35 GBNF parser rejects underscore rule names + multi-line rules — envelope.gbnf translated (machine-checked equivalence, 0/90 verdict diffs); drift pin now asserts REAL generate-time parse; fixed two latent local-runtime bugs (generate() returned dict not str; no max_tokens → 16-token truncation). Model mode now RUNS on the pinned GGUF.
+- **TCK-AGT-001 DONE** (`46e80d9`): DEFAULT_TEMPERATURE 1.0 → 0.2 (grammar-constrained JSON = low-temp task; live evidence: user's send request escalated while identical prompt passed 5/5 isolated). Probe 3/3 clean.
+- **TCK-CFG-002 opened** (pending): user-editable config file (gap_limit without env var) — user feature request.
+- **MW-4 IN FLIGHT (user):** hands-off = `src/localwallet/app.py`, `src/localwallet/wallet/scan.py`, `docs/phase3-ac.md`, `docs/device-notes.md`. TCK-SCAN-001 is READY but held until the user reports MW-4 done (don't churn scan.py mid-run).
+- **Next in order:** MW-4 report → TCK-SCAN-001 → TCK-SCAN-002 (ADR-0022) → TCK-SCAN-003 → TCK-CFG-002 / TCK-ONB-002/003 (ONB-003 touches app.py narration — after MW-4). TCK-P6-002 (packaging) also unblocked but needs user hardware (MW-8).
 
 ## 1. Current phase
 
