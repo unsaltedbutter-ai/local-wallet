@@ -153,12 +153,22 @@ already on file (returning user resumes at step 2's load narration from
 disk):
 
 ```
-Hi nice to meet you. I'm local wallet, your personal AI bitcoin wallet.
-everything we say and do together stays private. To get started, can you
-give me the xpub or zpub of the wallet you want to work with. This is not
-your seed words, but a long string of letters like xpubabc123...
-If you don't know where to get that, let me know and I will guide you.
+Hi, nice to meet you. I'm local wallet, your personal AI bitcoin wallet.
+Our conversation stays private — the AI runs right here on your machine.
+To get started, can you give me the xpub or zpub of the wallet you want to
+work with? These are not your seed words — and please never share your
+seed words with anyone, me included. An xpub or zpub is a long string of
+letters like xpubabc123... If you don't know where to get that, let me
+know and I will guide you.
 ```
+
+"everything we say and do together stays private" (the prior draft) was an
+over-claim per §9: chat stays local, but address queries go to the backend
+and transactions are public by nature on-chain. The promise is now scoped
+to the conversation, which is exactly what the §9 table guarantees; the
+address-visibility caveat is carried by the startup banner and the step-2
+ask. "me included" is honest — the app refuses seed phrases in chat and
+redirects to guidance, so the app truly is one of the "anyone."
 
 The seed-words clarification is load-bearing, not flavor: watch-only means
 seed phrases are refused in chat with guidance (AGENTS.md invariant), and
@@ -199,22 +209,25 @@ moment the xpub was received (before step 2's ask); this is its narration,
 sent right after the ask, non-blocking:
 
 ```
-I'm loading your wallet right now. While I check to see if anything
-happened since the last time I was online you can ask me questions and
-I'll give you the most up to date information I have.
+I'm loading your wallet right now. While I look through its history you
+can keep asking me questions — I'll give you the most up-to-date
+information I have.
 ```
 
 **Dependency (exact):** this string is honest only once TCK-SCAN-002/003 —
 ADR-0022's non-blocking startup scan with the deterministic tool-owned
 freshness flag — has landed; until then the startup scan blocks and the
-promise "you can ask me questions" is false. If TCK-ONB-003 ships before
-TCK-SCAN-003, it **must** use this interim variant instead, which promises
-nothing about wallet data during load:
+promise "you can keep asking me questions" is false. If TCK-ONB-003 ships
+before TCK-SCAN-003, it **must** use this interim variant instead, which
+promises nothing about being able to answer during load — neither wallet
+data nor app questions — because the blocking scan can keep no such
+promise (the prior interim draft's "you can ask me anything about how the
+app works" was exactly such a promise):
 
 ```
-I'm loading your wallet right now — until that's done I can't say what's
-in it, but you can ask me anything about how the app works. I'll tell you
-when the load finishes.
+I'm loading your wallet right now. Until the load finishes I can't answer
+questions or tell you what's in your wallet — I'll let you know when I'm
+done.
 ```
 
 The phrase "the most up to date information I have" is deliberate and ties
@@ -282,20 +295,29 @@ and I'll explain.
 
 ```
 Type the web address of your node's mempool.space app — its API
-address is usually the same, with /api at the end. Nothing is saved
-and nothing is sent to it until the app has checked that it answers
-correctly.
+address is usually the same, with /api at the end. Nothing is saved,
+and no address of your wallet goes to it, until the app has checked
+that it answers correctly.
 ```
 
 **(c) Validation-failure path (probe failed — plain cause, next step,
 no silent fallback, doctor pointer):**
 
+*Awaiting implementation-time copy (flagged, not sign-off-able now):*
+decision 5's *syncing-node* branch ("reported with its progress") has no
+drafted string — its wording depends on the doctor's `CORE_SYNCING` fact
+keys and must quote the progress verbatim from tool output when
+TCK-ONB-003 builds it. Likewise the step-3 non-blocking string and step 4
+may need a stale/out-of-window tail once TCK-SCAN-003's freshness flag and
+the existing `OUT_OF_WINDOW_NOTICE` semantics meet this flow; until then
+ship step 3's interim variant only.
+
 ```
 That address didn't check out: it wasn't reachable, or it didn't
-answer as a mainnet mempool.space API. Nothing was saved, and nothing
-was sent to it. Ask "node status" to see what the app can detect on
-your network — then say "retry" with the same or a new address, or
-pick the public server instead.
+answer as a mainnet mempool.space API. Nothing was saved, and no
+address of your wallet was ever sent to it. Ask "node status" to see
+what the app can detect on this machine — then say "retry" with the
+same or a new address, or pick the public server instead.
 ```
 
 **(d) Confirmation after a successful own-node setup (carries the L5
