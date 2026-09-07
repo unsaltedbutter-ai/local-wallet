@@ -5,9 +5,10 @@ Implements :class:`localwallet.signer.base.Signer` for USB-connected devices
 as a Python library — the Specter-Desktop pattern (PROJECT.md §7.6) — never
 as a CLI subprocess.
 
-Flow (PROJECT.md §7.6, ADR-0015 amendment #2): ``enumerate → open
+Flow (PROJECT.md §7.6, ADR-0015 amendments #2 + #3): ``enumerate → open
 candidate → account-key fingerprint bind (at the descriptor's account
-path) → display address / sign``.
+path) → derivation-fingerprint patch (account fp → device master fp, hint
+metadata only) → display address / sign``.
 
 Layering and trust (AGENTS.md invariants):
 
@@ -27,7 +28,10 @@ Layering and trust (AGENTS.md invariants):
   a mismatch is a hard stop (wrong wallet, typo'd descriptor, or attack).
   A client that cannot serve the account key fails closed — the check is
   never skipped. Full device registration (OQ18) remains the fuller
-  future anchor.
+  future anchor. The master fingerprint IS read from the bound client at
+  sign time — solely to rewrite PSBT derivation hints
+  (ADR-0015 amendment #3, :meth:`_patch_derivations_to_master`); it
+  never decides trust and never gates selection.
 - **No re-validation here.** The signed PSBT returned by the device is
   transported verbatim; deterministic re-validation against the intended
   transaction is owned by ``localwallet.tx.revalidate`` before broadcast
@@ -57,6 +61,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from embit.hashes import hash160
+from embit.psbt import PSBT
 
 from localwallet.signer.base import SignedResult, Signer, SignerError
 
@@ -516,10 +521,13 @@ class HwiUsbSigner(Signer):
     def sign_unsigned(self, psbt_base64: str) -> SignedResult:
         """Sign a base64 PSBT on the fingerprint-matched device.
 
-        Pipeline (ADR-0015 + amendment #2): candidate enumeration →
+        Pipeline (ADR-0015 + amendments #2/#3): candidate enumeration →
         client open → POST-OPEN account-key fingerprint bind (closes the
-        enumerate→open TOCTOU window by construction) → hwilib
-        ``signtx`` → normalize the device's response to base64 text →
+        enumerate→open TOCTOU window by construction) → derivation
+        fingerprint patch (account fp → device master fp on this wallet's
+        bip32 derivations only; ADR-0015 amendment #3, see
+        :meth:`_patch_derivations_to_master`) → hwilib ``signtx`` →
+        normalize the device's response to base64 text →
         :class:`SignedResult`.
         The signed PSBT is returned verbatim for re-validation by
         ``localwallet.tx.revalidate`` — this module performs no output
@@ -541,7 +549,8 @@ class HwiUsbSigner(Signer):
         commands = self._ensure_commands()
         client, device = self._open_matched_client(commands)
         try:
-            result = self._signtx(commands, client, psbt_base64)
+            to_sign = self._patch_derivations_to_master(client, psbt_base64)
+            result = self._signtx(commands, client, to_sign)
         finally:
             self._close_client(client)
         signed = self._normalize_signed(result)
@@ -550,6 +559,73 @@ class HwiUsbSigner(Signer):
             signer_name=f"hwi:{device.model}",
             checksum_verified=False,
         )
+
+    def _patch_derivations_to_master(self, client: Any, psbt_base64: str) -> str:
+        """Rewrite this wallet's PSBT derivation fingerprints account-fp →
+        device MASTER fp, just before signing (ADR-0015 amendment #3).
+
+        BIP 174 convention: ``bip32_derivations`` carries the master-key
+        fingerprint plus the full path from ``m/``. Our builder knows only
+        the account fingerprint (watch-only — the master fp is not
+        recoverable from a zpub), so it emits the account fp and this
+        signer, holding an OPENED and account-key-BOUND client, asks it for
+        ``get_master_fingerprint()`` and patches every input AND output
+        ``bip32_derivations`` entry whose fingerprint equals THIS signer's
+        expected account fingerprint. Nothing else is touched: paths and
+        pubkeys are preserved verbatim, and entries with any other
+        fingerprint (a different wallet mixed into the PSBT) are left
+        alone — this is a targeted correction, never a blind overwrite.
+
+        Trust impact: none. Derivation fields are SIGNER HINTS outside the
+        BIP-143 digest; ``localwallet.tx.revalidate`` reads no ``bip32_
+        derivations`` field at all, so the patch can neither fake nor hide
+        a signature — it only lets the device recognize its own keys
+        (unpatched, Jade signs nothing: "There are not relevant inputs
+        to be signed").
+
+        Fail-closed: a matched client that cannot report its master
+        fingerprint aborts with value-free guidance instead of shipping a
+        PSBT the device is known to refuse. A PSBT that does not parse (or
+        carries no entries for this wallet's account fp) is never
+        half-patched.
+
+        # ponytail: patched at sign time because no device is open at
+        # create time; OQ18 registration-lite (persist the master fp at
+        # enrollment) removes the per-sign round-trip.
+        """
+        try:
+            psbt = PSBT.parse(base64.b64decode(psbt_base64))
+        except Exception as exc:  # containment: any parse shape → guidance
+            raise DeviceError(_MSG_BAD_PSBT) from exc
+        try:
+            account_fp = bytes.fromhex(self.expected_wallet_fingerprint)
+        except ValueError as exc:
+            raise DeviceError(_MSG_REVERIFY) from exc
+        targets = [
+            derivation
+            for scope in (*psbt.inputs, *psbt.outputs)
+            for derivation in scope.bip32_derivations.values()
+            if derivation.fingerprint == account_fp
+        ]
+        if not targets:
+            return psbt_base64  # nothing of this wallet's to correct: verbatim
+        getter = getattr(client, "get_master_fingerprint", None)
+        if not callable(getter):
+            raise DeviceError(_MSG_REVERIFY)
+        try:
+            raw = getter()
+        except Exception as exc:
+            raise self._map_hwi_error(exc) from exc
+        master_hex = _normalize_fingerprint(raw)
+        try:
+            master_fp = bytes.fromhex(master_hex) if master_hex else None
+        except ValueError:
+            master_fp = None
+        if master_fp is None or len(master_fp) != 4:
+            raise DeviceError(_MSG_REVERIFY)
+        for derivation in targets:
+            derivation.fingerprint = master_fp
+        return base64.b64encode(psbt.serialize()).decode("ascii")
 
     @staticmethod
     def _signtx(commands: Any, client: Any, psbt_base64: str) -> Any:

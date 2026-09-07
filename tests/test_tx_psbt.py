@@ -92,6 +92,7 @@ def build_pair(inputs, amount_sats, rate=2, with_change=True):
         account_key=account_key(),
         account_fingerprint=fingerprint(),
         account_path=ACCOUNT_PATH,
+        change_index=7,  # the index change_address() derives
     ), result
 
 
@@ -306,6 +307,7 @@ class TestPolicyRefusals:
             account_key=account_key(),
             account_fingerprint=fingerprint(),
             account_path=ACCOUNT_PATH,
+            change_index=7,
         )
         change_script = script.p2wpkh(account_key().derive([1, 7]).key).data
         assert bytes(psbt.tx.vout[1].script_pubkey.data) == change_script

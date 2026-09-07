@@ -226,3 +226,34 @@ place it (or any message containing amounts) into logging context.
 - Sparrow importability of the produced PSBT is verified end-to-end by
   TCK-P2-006 (Phase 2 AC); this ticket provides the base64 artifact and
   embit round-trip evidence.
+
+## Amendment (TCK-HW-003, 2026-09-07): change-output derivations + sign-time fingerprint patch
+
+Decision 6's "own fingerprint of the account key until registration"
+shipped a live blocker (MW-4): BIP 174 derivation fields pair a MASTER
+fingerprint with a path from `m/`, and devices match on exactly that —
+with the account fingerprint no input is relevant to the device, and the
+absent change-OUTPUT derivation made the device render our change as a
+plain external address.
+
+In-policy now (implementation: `tx/psbt.py`, `signer/hwi.py`; trust
+framing: ADR-0015 amendment #3):
+
+1. `build_unsigned_psbt` requires `change_index` whenever it builds a
+   change output and emits that output's `bip32_derivations`
+   (`m/84'/0'/0'/1/change_index`, child key re-derived and structurally
+   checked against the change script — the same fail-closed convention
+   as the inputs).
+2. The build-time fingerprint stays the account fp (a watch-only wallet
+   cannot know the device master fp at create time); the USB signer
+   rewrites it to the device master fp at sign time, targeting ONLY
+   derivation entries that carry this wallet's account fp, both scopes.
+   Paths and pubkeys are never touched.
+
+Neither step can affect consensus: `bip32_derivations` are signer hints
+outside the BIP-143 digest, and `tx/revalidate.py` reads no
+`bip32_derivations` at all — the re-validation verdict on a
+patched-then-signed PSBT is byte-for-byte the verdict on the unpatched
+one (pinned by `tests/test_psbt_master_fp.py`). The canonical
+Sparrow-import fixture (TCK-P2-006) is re-pinned for the added
+change-derivation bytes.

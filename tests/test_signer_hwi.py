@@ -32,6 +32,9 @@ from types import SimpleNamespace
 
 import pytest
 from embit.hashes import hash160
+from embit.psbt import PSBT
+from embit.script import Script
+from embit.transaction import Transaction, TransactionInput, TransactionOutput
 
 from localwallet.signer.base import Signer, SignerError
 from localwallet.signer.hwi import (
@@ -65,8 +68,17 @@ FP_OTHER = hash160(_OTHER_PUBKEY)[:4].hex()
 # 40dbb192-style values. The trust gate must NEVER compare against it.
 MASTER_FP = "40dbb192"
 
-# Minimal well-formed-looking base64 PSBT text (fake hwilib never parses it).
-PSBT_B64 = base64.b64encode(b"psbt\xff" + b"\x01" * 24).decode("ascii")
+# A real, embit-parseable PSBT (unsigned, no bip32 derivations): the signer
+# pre-parses the PSBT before signing (TCK-HW-003 derivation-fp patch), so
+# fixture bytes must deserialize; with no wallet derivations the patch is a
+# verbatim pass-through and the fake hwilib never signs anything real.
+_TX = Transaction(
+    version=2,
+    vin=[TransactionInput(txid=bytes(32), vout=0, sequence=0xFFFFFFFD)],
+    vout=[TransactionOutput(60_000, Script(b"\x00\x14" + bytes(20)))],
+    locktime=0,
+)
+PSBT_B64 = base64.b64encode(PSBT(tx=_TX).serialize()).decode("ascii")
 SIGNED_B64 = base64.b64encode(b"psbt\xff" + b"\x02" * 24).decode("ascii")
 
 DEVICE_WALLET = {
@@ -157,16 +169,24 @@ class FakeClient:
 
 class FakeAccountClient(FakeClient):
     """FakeClient serving the account-path key (hwi base-Client contract:
-    ``get_pubkey_at_path(path) -> object with .pubkey``, jade.py:164 shape).
+    ``get_pubkey_at_path(path) -> object with .pubkey``, jade.py:164 shape)
+    and the device MASTER fingerprint (base ``Client.get_master_fingerprint``
+    → bytes, hwwclient.py:59-67) that the TCK-HW-003 sign-time derivation
+    patch reads.
 
     ``pubkey`` doubles as the fault injector: an Exception raises from the
     getter, any other non-bytes value models an unusable response shape
     (both must fail closed), and ``None`` serves the wallet account key.
+    ``master_fp`` is the bytes ``get_master_fingerprint`` returns; an
+    Exception raises from it; any other shape models a bad response.
     Queried paths are recorded for gate-placement assertions."""
 
-    def __init__(self, recorder: dict, pubkey: object = None) -> None:
+    def __init__(
+        self, recorder: dict, pubkey: object = None, master_fp: object = None
+    ) -> None:
         super().__init__(recorder)
         self._pubkey = _ACCOUNT_PUBKEY if pubkey is None else pubkey
+        self._master_fp = bytes.fromhex(MASTER_FP) if master_fp is None else master_fp
         self.paths: list[str] = []
 
     def get_pubkey_at_path(self, bip32_path: str) -> object:
@@ -174,6 +194,11 @@ class FakeAccountClient(FakeClient):
         if isinstance(self._pubkey, Exception):
             raise self._pubkey
         return SimpleNamespace(pubkey=self._pubkey)
+
+    def get_master_fingerprint(self) -> object:
+        if isinstance(self._master_fp, Exception):
+            raise self._master_fp
+        return self._master_fp
 
 
 class FakeCommands:

@@ -3493,8 +3493,14 @@ class _FakeDeviceClient:
     ACCOUNT key's pubkey at the descriptor's account path (hwi base
     ``Client.get_pubkey_at_path`` contract — JadeClient jade.py:164
     shape), which the post-open bind hashes to the wallet fingerprint.
-    The device MASTER fingerprint is deliberately NOT exposed: nothing
-    on the signer path may need it (watch-only, ADR-0015 amendment #2)."""
+    Also serves the device MASTER fingerprint (base
+    ``Client.get_master_fingerprint`` → bytes, hwwclient.py:59-67): the
+    TCK-HW-003 sign-time patch rewrites this wallet's bip32 derivation
+    fingerprints from the account fp to it. It remains a HINT reader only
+    — nothing in the trust gate consumes it (ADR-0015 amendments #2/#3)."""
+
+    #: The same master fp ``enumerate`` reports (jade.py MW-4 trace shape).
+    MASTER_FP = bytes.fromhex("40dbb192")
 
     def __init__(self, fingerprint_hex: str, recorder: dict[str, bool]) -> None:
         del fingerprint_hex  # kept call-compatible; the gate never uses it
@@ -3512,6 +3518,9 @@ class _FakeDeviceClient:
             FIXTURE_ACCOUNT_DERIVATION
         )
         return SimpleNamespace(pubkey=account.key.sec())  # compressed, 33 B
+
+    def get_master_fingerprint(self) -> bytes:
+        return self.MASTER_FP
 
     def close(self) -> None:
         self._recorder["closed"] = True

@@ -1351,6 +1351,9 @@ def _make_create_tx_handler(
                 account_key=parsed.hd_key,
                 account_fingerprint=parsed.hd_key.my_fingerprint,
                 account_path=(purpose + 2**31, MAINNET_COIN_TYPE + 2**31, 2**31),
+                # change_index is in scope from step 5; the builder emits the
+                # change output's bip32 derivation with it (TCK-HW-003).
+                change_index=change_index,
             )
             psbt_base64 = psbt_to_base64(psbt)
         except PsbtError as exc:

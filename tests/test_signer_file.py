@@ -70,6 +70,7 @@ def build_unsigned() -> PSBT:
         account_key=account_key(),
         account_fingerprint=fingerprint(),
         account_path=ACCOUNT_PATH,
+        change_index=7,  # the index change_address() derives
     )
     return psbt
 

@@ -194,3 +194,42 @@ changes) remains the complete answer; it is still unwired in v1, and
 this amendment is deliberately the smallest honest anchor that works
 for watch-only without it.
 
+
+## Amendment #3 (TCK-HW-003, 2026-09-07): PSBT derivation fields must carry the device MASTER fingerprint
+
+**Scope.** Amendment #2 governs DEVICE SELECTION (which open client is
+trusted). This amendment governs the PSBT CONTENT handed to a selected
+device — the two are independent and #2's selection gate is unchanged.
+
+**The rule.** BIP 174 `bip32_derivations` (input field 02 and output
+hd_keypaths) are an origin descriptor of the form
+`<master-fingerprint/path-from-m>`. Jade (and the other HWI clients)
+match an input as signable by `origin.fingerprint == master_fp`
+(`jade.py:194/210` legacy; the native firmware ≥ 0.1.47 does the same
+lookup in `jade.sign_psbt`), and flag change by matching output
+hd_keypaths against the master fingerprint (`jade.py:296-316`). Our
+watch-only builder cannot know the master fingerprint at create time (it
+holds an account-level zpub), so it records the account fingerprint at
+build time and the PSBT is otherwise path-correct.
+
+**The fix.** The USB signer, on the OPENED and ACCOUNT-KEY-BOUND client,
+reads `get_master_fingerprint()` (base `Client` contract,
+`hwwclient.py:59-67`) and rewrites every `bip32_derivations` fingerprint
+in BOTH scopes — and ONLY on entries whose fingerprint equals this
+signer's expected account fingerprint — to the device master fingerprint.
+Paths and pubkeys are untouched, foreign-fingerprint entries (a different
+wallet in the same PSBT) are left alone, and it fails closed if the
+matched client cannot report its master fingerprint. The change OUTPUT
+now also carries its derivation (emitted by `build_unsigned_psbt`), so
+change is recognized as change rather than a plain external address.
+
+**Why this does not weaken any gate.** Derivation fields are SIGNER HINTS
+outside the BIP-143 digest; `tx/revalidate.py` consumes no
+`bip32_derivations` (it reads `taproot_bip32_derivations` only as a
+refusal), so the patch can neither forge nor hide a signature — the
+re-validation verdict on a patched-then-signed PSBT is identical to the
+unpatched one (`tests/test_psbt_master_fp.py`). The master fingerprint is
+read solely to author these hints after #2's account-key bind has already
+passed; it never decides trust and never gates selection. OQ18
+registration-lite (persist the master fingerprint at enrollment) remains
+the upgrade path that removes the per-sign round trip.

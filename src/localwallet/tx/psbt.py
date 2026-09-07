@@ -2,14 +2,20 @@
 
 Builds a BIP174 PSBT for a *watch-only* single-sig P2WPKH wallet
 (ADR-0008): the app holds public keys only, so the PSBT carries
-``witness_utxo`` (BIP 174 field 01) and per-input ``bip32_derivations``
-(BIP 174 field 02) and leaves signing entirely to the hardware wallet
-(Phase 3). embit computes the child public keys from the account-level
-watch key; the derivation paths are expressed from the wallet origin the
-caller supplies (the same origin as the wallet descriptor, e.g.
-``[fp/84'/1'/0']`` — the fingerprint convention follows ADR-0009/0010 and
-descriptor.py: it is the account key's own fingerprint until device
-registration supplies the master fingerprint per OQ18).
+``witness_utxo`` (BIP 174 field 01), per-input ``bip32_derivations``
+(BIP 174 field 02) and a derivation on the change OUTPUT (so the device
+can flag change as its own) — and leaves signing entirely to the
+hardware wallet (Phase 3). embit computes the child public keys from the
+account-level watch key; the derivation paths are expressed from the
+wallet origin the caller supplies (the same origin as the wallet
+descriptor, e.g. ``[fp/84'/1'/0']``). The ``account_fingerprint``
+parameter is the wallet fingerprint known at BUILD time — the account
+key's own fingerprint from the zpub (ADR-0009/0010, descriptor.py);
+BIP 174 convention wants the device MASTER fingerprint there, so the
+USB signer rewrites these derivation fingerprints (never the paths or
+keys) to the device master fp at sign time — see ADR-0015 amendment #3
+and ``signer/hwi.py``. Full device registration per OQ18 remains the
+future anchor.
 
 RBF policy (PROJECT.md N4/R6 — decided here, documented in ADR-0012)
 -------------------------------------------------------------------
@@ -92,6 +98,9 @@ _MAX_RECIPIENTS = 100
 # v1 spend policy (ADR-0008): inputs come from the wallet's own P2WPKH
 # outputs only; change goes back to the wallet's change branch.
 _P2WPKH_SCRIPT_LEN = 22
+
+#: BIP44 change branch (fixed: the change output always belongs here).
+_BRANCH_CHANGE = 1
 
 
 class PsbtError(TxEngineError):
@@ -186,6 +195,7 @@ def build_unsigned_psbt(
     account_key: HDKey,
     account_fingerprint: bytes,
     account_path: Sequence[int],
+    change_index: int | None = None,
     locktime: int = 0,
     sequence: int = SEQUENCE_RBF_ENABLED,
 ) -> tuple[PSBT, PsbtMeta]:
@@ -207,10 +217,18 @@ def build_unsigned_psbt(
         account_key: The account-level embit watch key (public). Private
             keys are refused — watch-only invariant.
         account_fingerprint: 4-byte origin fingerprint for the PSBT
-            derivation fields.
+            derivation fields — the wallet fingerprint known at build
+            time (the account key's own fp from the zpub); the USB
+            signer rewrites it to the device master fingerprint at sign
+            time (ADR-0015 amendment #3, see module docstring).
         account_path: Hardened origin path from that fingerprint, e.g.
             ``(84 + 2**31, 0 + 2**31, 2**31)`` for the canonical mainnet
             BIP84 account.
+        change_index: The change branch (1) index behind ``change_address``
+             — required whenever a change output is built, used to emit
+             the change output's bip32 derivation so the signing device
+             recognizes the change as its own. Ignored when there is no
+             change output.
         locktime: Transaction locktime (0..0xffffffff); 0 = final.
         sequence: nSequence for every input; defaults to
             :data:`SEQUENCE_RBF_ENABLED` (see module docstring / ADR-0012).
@@ -279,6 +297,17 @@ def build_unsigned_psbt(
             raise PsbtError("change_sats out of range")
         if change_sats < dust_threshold(change_script):
             raise PsbtError("change_sats is below the dust threshold")
+        # A change output without its derivation coordinates cannot be
+        # labeled for the signing device — fail closed, not silent (the
+        # MW-4 live blocker shipped exactly this unlabelled change).
+        if change_index is None:
+            raise PsbtError("change_index is required when a change output is built")
+        if (
+            not isinstance(change_index, int)
+            or isinstance(change_index, bool)
+            or not 0 <= change_index <= 2**31 - 1
+        ):
+            raise PsbtError("change_index out of the non-hardened BIP32 range")
 
     # Canonical deterministic input order.
     ordered: list[PsbtInputSource] = sorted(
@@ -367,6 +396,28 @@ def build_unsigned_psbt(
             )
         psbt_input.bip32_derivations[child_pubkey] = DerivationPath(
             fingerprint, list(account_path) + [utxo.branch, utxo.index]
+        )
+
+    # Change-output derivation: the signing device flags a PSBT output as
+    # its own change by matching its bip32 derivation against the wallet
+    # (BIP174 psbt_out_hd_keypaths). Emitted at build time with the same
+    # account-key origin as the inputs; the child pubkey is derived from
+    # the wallet's own account key so the change coordinates can never be
+    # spoofed by the caller's address, only confirmed.
+    if change_script is not None:
+        change_pubkey = account_key.derive([_BRANCH_CHANGE, change_index]).key
+        change_derived = b"\x00\x14" + _hashes.hash160(change_pubkey.sec())
+        if change_derived != change_script:
+            raise PsbtError(
+                "change_address does not match its wallet change derivation"
+            )
+        # Identify the change output structurally: the last scope, whose
+        # script must equal the validated change script (never by amount).
+        change_scope = psbt.outputs[-1]
+        if bytes(change_scope.script_pubkey.data) != change_script:
+            raise PsbtError("change output scope does not match the change script")
+        change_scope.bip32_derivations[change_pubkey] = DerivationPath(
+            fingerprint, list(account_path) + [_BRANCH_CHANGE, change_index]
         )
 
     expected_outputs = tuple(

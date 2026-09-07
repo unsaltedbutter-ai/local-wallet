@@ -92,16 +92,20 @@ RECIPIENT_SCRIPT: Final = spk(0, 99)
 CHANGE_SCRIPT: Final = spk(1, 7)
 
 #: Byte-identical base64 of the canonical fixture PSBT (pinned — see the
-#: module docstring for the determinism verdict).
+#: module docstring for the determinism verdict). Re-pinned for TCK-HW-003:
+#: the change output now carries its bip32 derivation (device change
+#: recognition), which appends hd_keypaths bytes to the last output scope.
 CANONICAL_BASE64: Final = (
-    "cHNidP8BAJoCAAAAAqurq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urAAAA"
-    "AAD9////zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0AAAAAAP3///8C"
-    "YOoAAAAAAAAWABQ9donAA5g6m8UdqCOOAfCN4pzpJI5zAAAAAAAAFgAUyujlq5K2"
-    "jdsIr+XwPjt5CjMYAzUAAAAAAAEBH0CcAAAAAAAAFgAUpyvM58Qt7QH80V1bVmVZ"
-    "4aVJLRUiBgO3W1F6omIK8Zp42MXTBVwc34IzRb8zosobrF4CGaBNkxjoibavVAAA"
-    "gAAAAIAAAACAAAAAAAMAAAAAAQEfUMMAAAAAAAAWABQmjfcF6dHmBw/OyqvWChjK"
-    "6o2a7SIGAjr2BP5GwmQoRAfyUYbnl8x5vNoQPszwTNsViAiDcS2DGOiJtq9UAACA"
-    "AAAAgAAAAIABAAAABAAAAAAAAA=="
+    "cHNidP8BAJoCAAAAAqurq6urq6urq6urq6urq6urq6urq6urq6urq6urq6"
+    "urAAAAAAD9////zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0A"
+    "AAAAAP3///8CYOoAAAAAAAAWABQ9donAA5g6m8UdqCOOAfCN4pzpJI5zAA"
+    "AAAAAAFgAUyujlq5K2jdsIr+XwPjt5CjMYAzUAAAAAAAEBH0CcAAAAAAAA"
+    "FgAUpyvM58Qt7QH80V1bVmVZ4aVJLRUiBgO3W1F6omIK8Zp42MXTBVwc34"
+    "IzRb8zosobrF4CGaBNkxjoibavVAAAgAAAAIAAAACAAAAAAAMAAAAAAQEf"
+    "UMMAAAAAAAAWABQmjfcF6dHmBw/OyqvWChjK6o2a7SIGAjr2BP5GwmQoRA"
+    "fyUYbnl8x5vNoQPszwTNsViAiDcS2DGOiJtq9UAACAAAAAgAAAAIABAAAA"
+    "BAAAAAAAIgIDi6hfSOddQbIqqINEWg0C8YqhV1L6GFi6I56qU8H121wY6I"
+    "m2r1QAAIAAAACAAAAAgAEAAAAHAAAAAA=="
 )
 
 #: The :class:`PsbtMeta` the fixture builder must produce.
@@ -140,7 +144,7 @@ def test_base64_is_byte_deterministic() -> None:
     """
     b64s = {psbt_to_base64(build_fixture()[0]) for _ in range(3)}
     assert b64s == {CANONICAL_BASE64}
-    assert len(CANONICAL_BASE64) == 476
+    assert len(CANONICAL_BASE64) == 556
     # The pinned constant round-trips to the same serialized bytes.
     assert base64.b64decode(CANONICAL_BASE64) == base64.b64decode(next(iter(b64s)))
 
