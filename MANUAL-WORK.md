@@ -3,10 +3,11 @@
 > Tick items off by telling the orchestrator the MW-id (e.g. "MW-2 done"). Nothing here blocks code work unless noted.
 
 ## MW-1: Grant orchestrator read-only shell commands
-- [ ] Edit `.opencode/agents/orchestrator.md` → `permission.bash` allowlist: add `"find*": "allow"`, `"wc*": "allow"`, `"ls*": "allow"` (keeps deny-all posture, unblocks repo scans). May need a fresh session to take effect.
+- [x] **Superseded 2026-09-06** — the orchestrator's `permission.bash` was expanded far beyond the find/wc/ls allowlist (`"*": allow`); no fresh session needed for this item anymore.
 
 ## MW-2: Pinned-model bootstrap — GATES TCK-P6-001
-- [ ] Not yet run by the user. Sources are now **ungated** (switched to unsloth mirrors after the 401 on the gated google repos — `df0ef64`) and the E2B download URL has been **live-verified working** (200 + GGUF magic + Range 206). Run the exact command from `models/MODELS.md` (primary: E2B `Q4_K_M`). Note: the sibling ticket TCK-MODELS-002 is adding the google QAT `q4_0` alternative (`gemma-4-E2B_it-qat-q4_0_gguf`) for the R12 comparison.
+- [x] **Done 2026-09-06** — E2B `Q4_K_M` downloaded (3,106,738,272 bytes, byte-exact), pinned in `manifest.json` (`740185b21d22ceb8…`), `--check` verified. **TCK-P6-001 is unblocked.** (E4B + QAT entries remain unpinned — only needed for the R12 comparison / MW-6 breadth.)
+- Original note: Sources are now **ungated** (switched to unsloth mirrors after the 401 on the gated google repos — `df0ef64`) and the E2B download URL has been **live-verified working** (200 + GGUF magic + Range 206). Run the exact command from `models/MODELS.md` (primary: E2B `Q4_K_M`). Note: the sibling ticket TCK-MODELS-002 is adding the google QAT `q4_0` alternative (`gemma-4-E2B_it-qat-q4_0_gguf`) for the R12 comparison.
 - Unblocks: enforced ≥95% golden gate (TCK-P6-001 is sequenced BEHIND this — the gate must be adjudicated on the pinned GGUF, not the ADR-0007 bridge), R1/R12 E2B-vs-E4B check, ADR-0006 perf measurement.
 
 ## MW-3: Fund a MAINNET wallet — literal Phase 1 AC (was "testnet4"; mainnet per ADR-0021)
@@ -21,7 +22,7 @@
 - [ ] Follow docs/sparrow-ac.md (manual import of the deterministic fixture PSBT; pass criteria in the doc).
 
 ## MW-6: Model-mode eval record (after MW-2)
-- [ ] Run evals in model mode against the pinned GGUF; record results (bridge scores in TASKS.md are explicitly NOT the record per ADR-0007).
+- [ ] **Available now (MW-2 done).** Run evals in model mode against the pinned GGUF; record results (bridge scores in TASKS.md are explicitly NOT the record per ADR-0007).
 
 ## MW-7: Post-fix export spot-check (ready — TCK-SEC-001 landed 55f8d6d)
 - [ ] In the REPL: run a create_tx with real amounts, then `/export`; verify amounts render as `<amount>`, txids as `<txid>`, addresses as `<addr>`, and a pasted 12-word test phrase as `<seed>`.

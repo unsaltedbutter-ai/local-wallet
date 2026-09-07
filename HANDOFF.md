@@ -8,7 +8,7 @@
 
 ## 1. Current phase
 
-**Phases 0–5 COMPLETE.** The security sweep (TCK-SEC-001..004) and the mainnet flip (TCK-MAIN-001..003, ADR-0021) have both landed. Phase 6 queued, not started. Next ticket: **TCK-P6-001**, still **SEQUENCED BEHIND the model bootstrap** (`models/download_model.py --write-hash`) — the enforced ≥95% golden gate must not be adjudicated on ADR-0007 bridge results. The download is now **unblocked / live-verified working** (ungated unsloth mirrors per `df0ef64`; E2B URL verified 200 + GGUF magic + Range 206) once the sibling TCK-MODELS-002 lands (adds the E4B manifest entry + QAT q4_0 alternative).
+**Phases 0–5 COMPLETE.** The security sweep (TCK-SEC-001..004) and the mainnet flip (TCK-MAIN-001..003, ADR-0021) have both landed. Phase 6: **TCK-P6-001 is now UNBLOCKED** — model bootstrap (MW-2) completed 2026-09-06 (weights pinned + `--check` verified), so the gate's sequencing note is satisfied. Was: **SEQUENCED BEHIND the model bootstrap** (`models/download_model.py --write-hash`) — the enforced ≥95% golden gate must not be adjudicated on ADR-0007 bridge results. The download is now **unblocked / live-verified working** (ungated unsloth mirrors per `df0ef64`; E2B URL verified 200 + GGUF magic + Range 206) once the sibling TCK-MODELS-002 lands (adds the E4B manifest entry + QAT q4_0 alternative).
 
 ## 2. Tickets
 
@@ -94,11 +94,13 @@ Additionally, three things are NOT tests but are effectively deferred-run and mu
 
 ## 7. Next Task prompt
 
-> Next Task prompt: not pre-drafted this time. TCK-P6-001's row + ACs are in TASKS.md; PROJECT.md §12 Phase 6 + §13/§14 (R-register/OQ) carry the requirements. Sequence: ONLY after `models/download_model.py --write-hash` has pinned the GGUF (see §8) — the enforced gate must be adjudicated on the pinned model, not the ADR-0007 bridge.
+> Next Task prompt (drafted 2026-09-06, post model bootstrap):
+>
+> "Read AGENTS.md, TASKS.md, HANDOFF.md, MANUAL-WORK.md. Execute the next ready ticket in TASKS.md order: **TCK-P6-001** (eval expansion + flip `_ENFORCE_PHASE6_GATE` in evals/run_evals.py — adjudicate on the PINNED GGUF now in models/bin, not the ADR-0007 bridge; every protocol/prompt change ships an eval run). In parallel-eligible follow-ups behind it: TCK-SCAN-001 (utxo-skip), TCK-SCAN-002 (ADR-0022 scan-freshness), TCK-ONB-001 (ADR-0023 onboarding) — see queue notes in TASKS.md. The user is working MW-4 (live device AC, docs/phase3-ac.md) and will report MW-ids as they complete — update MANUAL-WORK.md + ledger on report, do not edit docs/phase3-ac.md or the narration paths (app.py/scan.py UX-001 surface) while that live run is in flight. Gates: .venv is Python 3.12.13 (3.14 breaks hwilib/protobuf — do not recreate on 3.14); venv managed with uv (`uv pip install …`); full suite baseline 1695 passed / 6 skipped."
 
 ## 8. Actions for You
 
-1. **MW-2 — model download (NEXT, still pending).** Sources are now ungated + live-verified working; run the exact command from `models/MODELS.md` (primary E2B `Q4_K_M`). Pins the SHA-256 (ADR-0001 bootstrap), enables the official GGUF eval record + R1/R12 E2B-vs-E4B check, the ADR-0006 perf measurement, and unblocks TCK-P6-001 enforcement. TCK-MODELS-002 (in flight) adds the QAT q4_0 alternative for the R12 comparison.
+1. **MW-2 — model download (DONE 2026-09-06).** E2B Q4_K_M pinned + `--check` green → **TCK-P6-001 unblocked**. Optional later: download E4B + QAT entries for the R12 comparison (commands in models/MODELS.md).
 2. **MW-3 — fund a MAINNET wallet (DONE 2026-09-06).** The literal Phase 1 AC (docs/phase1-ac.md live cross-check) is now runnable; real send-flow demos are unlocked.
 3. **MW-4+ — available now:** MW-4 hardware-wallet live AC (docs/phase3-ac.md), MW-5 Sparrow import AC (docs/sparrow-ac.md), MW-6 model-mode eval record (after MW-2), MW-7 post-SEC-001 export spot-check, MW-8 Phase 6 packaging prerequisites (Apple Developer account + Windows box, later).
 4. **Full manual checklist:** see MANUAL-WORK.md (authoritative for MW-id status).
