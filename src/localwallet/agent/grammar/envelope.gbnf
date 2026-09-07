@@ -64,6 +64,26 @@
 # CROSS-REFERENCE: this grammar maps 1:1 to the pydantic envelope schema v0
 # and MUST be updated together with it (docs/adr/0002-envelope-spec.md and
 # docs/adr/0013-confirm-gate.md).
+#
+# PARSER DIALECT (TCK-P6-004): llama.cpp's vendored GBNF parser (the one
+# compiled into llama-cpp-python) restricts rule NAMES to [A-Za-z0-9-] (no
+# underscores — its isword() accepts letters, digits and '-'; an underscore
+# ends the name and the next token must be '::=' or a newline) and terminates
+# every rule body at a NEWLINE (a body may NOT be continued across lines with
+# a leading '|'). Both idioms are legal in the wider GBNF literature and were
+# used in earlier revisions of this file, but the installed wheel rejects them
+# at generate-time grammar load (the vendored parser prints
+# "parse: error parsing grammar: ..." and hands llama_sampler_chain_add a NULL
+# grammar, which then crashes the model run). So every rule below is written
+# as a SINGLE-LINE body with dash-separated rule names. This is a pure
+# DIALECT translation: the accepted envelope LANGUAGE is unchanged — only bare
+# rule identifiers were underscore->dash renamed and multi-line bodies joined
+# onto one line (GBNF sequences are whitespace-insensitive between symbols).
+# The quoted string literals are byte-for-byte identical, so intent values and
+# JSON keys keep their underscores (e.g. the literal "get_balance") — a rule
+# NAME is only ever a bare identifier, never a quoted literal. The drift pin
+# (tests/test_grammar_conformance.py) enforces this dialect and parses the file
+# through the installed parser so a regression fails loudly.
 
 # Root rule: exactly one envelope (with optional trailing whitespace).
 root ::= envelope ws
@@ -71,59 +91,43 @@ root ::= envelope ws
 # A complete envelope. Opening brace, v=0, then an intent body which carries
 # the intent key, its params, and closes the object. Strict key order; the
 # only keys allowed are v, intent, params — no extras.
-envelope ::= "{" ws "\"v\"" ws ":" ws "0" ws "," ws intent_body
+envelope ::= "{" ws "\"v\"" ws ":" ws "0" ws "," ws intent-body
 
 # Each intent branch carries its exact params shape and closes the params
 # object and the envelope. This couples intent -> params at decode time.
-intent_body ::= respond | clarify | get_balance | get_history | get_utxos | new_address | create_tx | confirm_tx | sign_tx | broadcast_tx | tx_status | node_status
+intent-body ::= respond | clarify | get-balance | get-history | get-utxos | new-address | create-tx | confirm-tx | sign-tx | broadcast-tx | tx-status | node-status
 
 # intent "respond" -> params {"text": string}
-respond ::=
-  "\"intent\"" ws ":" ws "\"respond\"" ws "," ws
-  "\"params\"" ws ":" ws
-  "{" ws "\"text\"" ws ":" ws string ws "}" ws "}" ws
+respond ::= "\"intent\"" ws ":" ws "\"respond\"" ws "," ws "\"params\"" ws ":" ws "{" ws "\"text\"" ws ":" ws string ws "}" ws "}" ws
 
 # intent "clarify" -> params {"question": string}
-clarify ::=
-  "\"intent\"" ws ":" ws "\"clarify\"" ws "," ws
-  "\"params\"" ws ":" ws
-  "{" ws "\"question\"" ws ":" ws string ws "}" ws "}" ws
+clarify ::= "\"intent\"" ws ":" ws "\"clarify\"" ws "," ws "\"params\"" ws ":" ws "{" ws "\"question\"" ws ":" ws string ws "}" ws "}" ws
 
 # intent "get_balance" -> params {} (empty object)
-get_balance ::=
-  "\"intent\"" ws ":" ws "\"get_balance\"" ws "," ws
-  "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
+get-balance ::= "\"intent\"" ws ":" ws "\"get_balance\"" ws "," ws "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
 
 # intent "get_history" -> params {} OR {"limit": <1-3 digit int>}
 # The optional key is expressed as a top-level alternation between the two
 # complete params objects (never an optional-token sequence), so key order
 # stays strict and no other key can slip in.
-get_history ::=
-  "\"intent\"" ws ":" ws "\"get_history\"" ws "," ws
-  "\"params\"" ws ":" ws params_history
+get-history ::= "\"intent\"" ws ":" ws "\"get_history\"" ws "," ws "\"params\"" ws ":" ws params-history
 
-params_history ::= "{" ws "}" ws "}" ws
-                 | "{" ws "\"limit\"" ws ":" ws limit_int ws "}" ws "}" ws
+params-history ::= "{" ws "}" ws "}" ws | "{" ws "\"limit\"" ws ":" ws limit-int ws "}" ws "}" ws
 
 # limit: 1..999 syntactic (1-3 digits, no leading zero); the semantic
 # 1..100 business bound is enforced at the schema layer (layer 2/3).
-limit_int ::= [1-9] [0-9]? [0-9]?
+limit-int ::= [1-9] [0-9]? [0-9]?
 
 # intent "get_utxos" -> params {} (empty object)
-get_utxos ::=
-  "\"intent\"" ws ":" ws "\"get_utxos\"" ws "," ws
-  "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
+get-utxos ::= "\"intent\"" ws ":" ws "\"get_utxos\"" ws "," ws "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
 
 # intent "new_address" -> params {} OR {"branch": "0"|"1"}
-new_address ::=
-  "\"intent\"" ws ":" ws "\"new_address\"" ws "," ws
-  "\"params\"" ws ":" ws params_new_address
+new-address ::= "\"intent\"" ws ":" ws "\"new_address\"" ws "," ws "\"params\"" ws ":" ws params-new-address
 
-params_new_address ::= "{" ws "}" ws "}" ws
-                     | "{" ws "\"branch\"" ws ":" ws branch_digit ws "}" ws "}" ws
+params-new-address ::= "{" ws "}" ws "}" ws | "{" ws "\"branch\"" ws ":" ws branch-digit ws "}" ws "}" ws
 
 # branch: single digit, 0 (receive chain) or 1 (change chain).
-branch_digit ::= "0" | "1"
+branch-digit ::= "0" | "1"
 
 # intent "create_tx" -> params {"recipient": string, (amount_sats | amount_usd)[, "fee_target"]}
 # Keys in FIXED order: recipient first, then exactly one amount key
@@ -131,101 +135,76 @@ branch_digit ::= "0" | "1"
 # syntactically impossible), then an OPTIONAL fee_target tail. The optional
 # tail is a named two-branch rule so no other key can slip in and the order
 # recipient < amount < fee_target stays strict.
-create_tx ::=
-  "\"intent\"" ws ":" ws "\"create_tx\"" ws "," ws
-  "\"params\"" ws ":" ws params_create_tx
+create-tx ::= "\"intent\"" ws ":" ws "\"create_tx\"" ws "," ws "\"params\"" ws ":" ws params-create-tx
 
-params_create_tx ::=
-  "{" ws recipient_kv ws "," ws amount_pair ws create_tx_tail
+params-create-tx ::= "{" ws recipient-kv ws "," ws amount-pair ws create-tx-tail
 
-recipient_kv ::= "\"recipient\"" ws ":" ws string
+recipient-kv ::= "\"recipient\"" ws ":" ws string
 
-amount_pair ::= amount_sats_kv | amount_usd_kv
+amount-pair ::= amount-sats-kv | amount-usd-kv
 
-amount_sats_kv ::= "\"amount_sats\"" ws ":" ws sats_int
+amount-sats-kv ::= "\"amount_sats\"" ws ":" ws sats-int
 
-amount_usd_kv ::= "\"amount_usd\"" ws ":" ws usd_num
+amount-usd-kv ::= "\"amount_usd\"" ws ":" ws usd-num
 
-create_tx_tail ::=
-  "}" ws "}" ws
-  | "," ws fee_target_kv ws "}" ws "}" ws
+create-tx-tail ::= "}" ws "}" ws | "," ws fee-target-kv ws "}" ws "}" ws
 
-fee_target_kv ::= "\"fee_target\"" ws ":" ws fee_target
+fee-target-kv ::= "\"fee_target\"" ws ":" ws fee-target
 
 # fee target: the closed enum, quoted literals only.
-fee_target ::= "\"fast\"" | "\"medium\"" | "\"slow\""
+fee-target ::= "\"fast\"" | "\"medium\"" | "\"slow\""
 
 # amount_sats: JSON integer, no leading zeros (single "0" allowed — the
 # schema rejects it below the 546 floor), up to 16 digits. The semantic
 # bound 546..21_000_000_000_000_000 is enforced at the schema layer.
-sats_int ::= [1-9] [0-9]{0,15} | "0"
+sats-int ::= [1-9] [0-9]{0,15} | "0"
 
 # amount_usd: JSON decimal WITHOUT exponent notation — integer part ("0" or
 # nonzero-start) with an optional fractional part of >= 1 digit. Exponent
 # forms (1e2) are schema-legal but grammar-rejected (conservative narrowing:
 # only restricts model freedom, never admits an invalid envelope).
-usd_num ::= ("0" | [1-9] [0-9]*) ("." [0-9] [0-9]*)?
+usd-num ::= ("0" | [1-9] [0-9]*) ("." [0-9] [0-9]*)?
 
 # intent "confirm_tx" -> params {"tx_ref": string}
-confirm_tx ::=
-  "\"intent\"" ws ":" ws "\"confirm_tx\"" ws "," ws
-  "\"params\"" ws ":" ws
-  "{" ws "\"tx_ref\"" ws ":" ws string ws "}" ws "}" ws
+confirm-tx ::= "\"intent\"" ws ":" ws "\"confirm_tx\"" ws "," ws "\"params\"" ws ":" ws "{" ws "\"tx_ref\"" ws ":" ws string ws "}" ws "}" ws
 
 # intent "sign_tx" -> params {"tx_ref": string[, "signer": "file"|"hwi"]}
 # Keys in FIXED order: tx_ref first, then an OPTIONAL signer tail (a named
 # two-branch rule, mirroring the create_tx tail, so no other key can slip
 # in). Omitted signer -> the handler applies its default signer policy.
-sign_tx ::=
-  "\"intent\"" ws ":" ws "\"sign_tx\"" ws "," ws
-  "\"params\"" ws ":" ws params_sign_tx
+sign-tx ::= "\"intent\"" ws ":" ws "\"sign_tx\"" ws "," ws "\"params\"" ws ":" ws params-sign-tx
 
-params_sign_tx ::=
-  "{" ws "\"tx_ref\"" ws ":" ws string ws sign_tx_tail
+params-sign-tx ::= "{" ws "\"tx_ref\"" ws ":" ws string ws sign-tx-tail
 
-sign_tx_tail ::=
-  "}" ws "}" ws
-  | "," ws "\"signer\"" ws ":" ws signer_enum ws "}" ws "}" ws
+sign-tx-tail ::= "}" ws "}" ws | "," ws "\"signer\"" ws ":" ws signer-enum ws "}" ws "}" ws
 
 # signer: the closed enum, quoted literals only (device handoff policy is
 # the handler's decision; the model may only name one of these two).
-signer_enum ::= "\"file\"" | "\"hwi\""
+signer-enum ::= "\"file\"" | "\"hwi\""
 
 # intent "broadcast_tx" -> params {"tx_ref": string}
-broadcast_tx ::=
-  "\"intent\"" ws ":" ws "\"broadcast_tx\"" ws "," ws
-  "\"params\"" ws ":" ws
-  "{" ws "\"tx_ref\"" ws ":" ws string ws "}" ws "}" ws
+broadcast-tx ::= "\"intent\"" ws ":" ws "\"broadcast_tx\"" ws "," ws "\"params\"" ws ":" ws "{" ws "\"tx_ref\"" ws ":" ws string ws "}" ws "}" ws
 
 # intent "tx_status" -> params {"txid": "<exactly 64 lowercase hex chars>"}
 # The txid is interpolated into a request URL path by the chain layer, so
 # the grammar pins the injection-safe charset: lowercase hex only, exactly
 # 64 characters (bounded repetition) between JSON string quotes. The
 # schema/rule layer re-checks the same shape for non-grammar producers.
-tx_status ::=
-  "\"intent\"" ws ":" ws "\"tx_status\"" ws "," ws
-  "\"params\"" ws ":" ws
-  "{" ws "\"txid\"" ws ":" ws "\"" hex_txid "\"" ws "}" ws "}" ws
+tx-status ::= "\"intent\"" ws ":" ws "\"tx_status\"" ws "," ws "\"params\"" ws ":" ws "{" ws "\"txid\"" ws ":" ws "\"" hex-txid "\"" ws "}" ws "}" ws
 
 # txid: exactly 64 lowercase hex characters ([0-9a-f]{64}). Uppercase is
 # deliberately grammar-rejected: the lowercase-only contract keeps quoted
 # txids verbatim-comparable and URL-safe without normalization.
-hex_txid ::= [0-9a-f]{64}
+hex-txid ::= [0-9a-f]{64}
 
 # intent "node_status" -> params {} (empty object)
 # The model emits nothing else; the dispatcher owns all data (detect +
 # doctor guidance). Any key here is syntactically impossible.
-node_status ::=
-  "\"intent\"" ws ":" ws "\"node_status\"" ws "," ws
-  "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
+node-status ::= "\"intent\"" ws ":" ws "\"node_status\"" ws "," ws "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
 
 # Conservative JSON string: any char except quote, backslash, and control
 # chars (\x00-\x1f), OR a valid escape sequence. No raw control characters.
-string ::=
-  "\"" (
-    [^"\\\x00-\x1f] |
-    "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})
-  )* "\""
+string ::= "\"" ([^"\\\x00-\x1f] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4}))* "\""
 
 # Optional ASCII whitespace.
 ws ::= ([ \t\n] ws)?

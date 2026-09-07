@@ -28,13 +28,40 @@ pure ASCII). The llama-gated test remains authoritative for real decoding
 semantics.
 """
 
+import importlib.util
+import os
+import re
 from pathlib import Path
 
 import pytest
 
+_REPO = Path(__file__).resolve().parent.parent
 _GRAMMAR = (
-    Path(__file__).resolve().parent.parent / "src" / "localwallet" / "agent" / "grammar" / "envelope.gbnf"
+    _REPO / "src" / "localwallet" / "agent" / "grammar" / "envelope.gbnf"
 )
+
+#: Pinned GGUF used for the real-parse probe (ADR-0021-era models/bin, the
+#: same weights the Phase 6 adjudication runs). The path mirrors the runtime
+#: precedence (``LOCALWALLET_MODEL_PATH`` then the models/bin default). A
+#: vocab-only load is cheap (~0.3s, no weights touched), so this only needs
+#: the file to exist, not the model to actually generate.
+_MODEL_PATH_ENV_VAR = "LOCALWALLET_MODEL_PATH"
+_DEFAULT_GGUF = _REPO / "models" / "bin" / "gemma-4-E2B-it-Q4_K_M.gguf"
+
+
+def _llama_cpp_available() -> bool:
+    return importlib.util.find_spec("llama_cpp") is not None
+
+
+def _parse_probe_model() -> Path | None:
+    env = os.environ.get(_MODEL_PATH_ENV_VAR)
+    if env and Path(env).is_file():
+        return Path(env)
+    return _DEFAULT_GGUF if _DEFAULT_GGUF.is_file() else None
+
+
+_LLAMA_CPP_AVAILABLE = _llama_cpp_available()
+_PROBE_MODEL = _parse_probe_model()
 
 
 # ---------------------------------------------------------------- matcher
@@ -183,9 +210,13 @@ def _tokenize(body: str) -> list[tuple[str, object]]:
                 raise ValueError(f"malformed {{m,n}} repetition at offset {i}")
             tokens.append(("braced", (lo, hi)))
             i = j + 1
-        elif ch.isalnum() or ch == "_":
+        elif ch.isalnum() or ch in "_-":
+            # llama.cpp GBNF rule names are [A-Za-z0-9-] (dashes, NOT
+            # underscores — see the PARSER DIALECT note in envelope.gbnf and
+            # TCK-P6-004); underscores are kept here too so the matcher can
+            # still read the pre-TCK-P6-004 grammar for the regression probes.
             j = i
-            while j < n and (body[j].isalnum() or body[j] == "_"):
+            while j < n and (body[j].isalnum() or body[j] in "_-"):
                 j += 1
             tokens.append(("name", body[i:j]))
             i = j
@@ -551,37 +582,37 @@ def test_grammar_parses_without_unsupported_constructs(matcher: GbnfMatcher):
     assert set(matcher.rules) >= {
         "root",
         "envelope",
-        "intent_body",
+        "intent-body",
         "respond",
         "clarify",
-        "get_balance",
-        "get_history",
-        "params_history",
-        "limit_int",
-        "get_utxos",
-        "new_address",
-        "params_new_address",
-        "branch_digit",
-        "create_tx",
-        "params_create_tx",
-        "recipient_kv",
-        "amount_pair",
-        "amount_sats_kv",
-        "amount_usd_kv",
-        "create_tx_tail",
-        "fee_target_kv",
-        "fee_target",
-        "sats_int",
-        "usd_num",
-        "confirm_tx",
-        "sign_tx",
-        "params_sign_tx",
-        "sign_tx_tail",
-        "signer_enum",
-        "broadcast_tx",
-        "tx_status",
-        "hex_txid",
-        "node_status",
+        "get-balance",
+        "get-history",
+        "params-history",
+        "limit-int",
+        "get-utxos",
+        "new-address",
+        "params-new-address",
+        "branch-digit",
+        "create-tx",
+        "params-create-tx",
+        "recipient-kv",
+        "amount-pair",
+        "amount-sats-kv",
+        "amount-usd-kv",
+        "create-tx-tail",
+        "fee-target-kv",
+        "fee-target",
+        "sats-int",
+        "usd-num",
+        "confirm-tx",
+        "sign-tx",
+        "params-sign-tx",
+        "sign-tx-tail",
+        "signer-enum",
+        "broadcast-tx",
+        "tx-status",
+        "hex-txid",
+        "node-status",
         "string",
         "ws",
     }
@@ -608,11 +639,150 @@ def test_grammar_intent_branches_cover_the_closed_enum(matcher: GbnfMatcher):
 
 
 def test_grammar_hex_txid_is_exactly_64_lowercase_hex(matcher: GbnfMatcher):
-    """Pin the hex_txid rule shape: one class, bounded to exactly 64.
+    """Pin the hex-txid rule shape: one class, bounded to exactly 64.
 
     Lowercase-only ([0-9a-f], no A-F) is the documented contract (ADR-0002
     Phase 3): quoted txids stay verbatim-comparable and URL-safe without
     normalization; the rule text is pinned so a silent widening fails here.
     """
     text = _GRAMMAR.read_text(encoding="utf-8")
-    assert "hex_txid ::= [0-9a-f]{64}" in text
+    assert "hex-txid ::= [0-9a-f]{64}" in text
+
+
+# ------------------------------------------------------- installed-parser pin
+#
+# TCK-P6-004: the whole reason model mode used to segfault was that the test
+# suite never actually parsed the grammar through the installed llama.cpp
+# wheel. ``LlamaGrammar.from_string`` in 0.3.35 is a no-op holder (it just
+# stashes the text; the vendored C++ parser only runs at *generate* time when
+# ``llama_sampler_init_grammar`` builds the grammar against a vocab). These
+# checks force that real build so a dialect the wheel rejects fails the test
+# suite instead of crashing a live model run.
+
+_RULE_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
+
+# Minimal grammars reproducing the two idioms the installed parser rejects.
+_UNDERSCORE_NAME_GBNF = 'root ::= env_body\nenv_body ::= "{" "}"\n'
+_MULTILINE_CONTINUATION_GBNF = 'root ::= a\na ::= "x"\n   | "y"\n'
+
+
+@pytest.fixture(scope="module")
+def _probe_vocab():
+    """A real llama.cpp vocab for the vendored grammar parser (module-scoped).
+
+    Loads the pinned GGUF in **vocab-only** mode (weights are never touched,
+    ~0.3s) and returns the ``(vocab, ctypes-lib)`` pair. This is the exact
+    handle passed to ``llama_sampler_init_grammar`` by
+    ``llama_cpp._internals.LlamaSampler.add_grammar`` — the same call
+    ``ModelRuntime.generate`` makes at generate time, which is where the
+    pre-TCK-P6-004 grammar produced a NULL sampler and then crashed the run.
+    The ``Llama`` object is stashed on the closure so its vocab outlives the
+    tests.
+    """
+    from llama_cpp import Llama  # gated by skipif on every using test
+    from llama_cpp import llama_cpp as _lib
+
+    llm = Llama(model_path=str(_PROBE_MODEL), vocab_only=True, verbose=False)
+    return llm._model.vocab, _lib
+
+
+def _parses(vocab, lib, text: str) -> bool:
+    """True iff the installed C++ parser builds a non-NULL grammar sampler."""
+    import ctypes
+
+    sampler = lib.llama_sampler_init_grammar(vocab, text.encode("utf-8"), b"root")
+    null = sampler is None or ctypes.cast(sampler, ctypes.c_void_p).value in (None, 0)
+    if not null:
+        lib.llama_sampler_free(sampler)
+    return not null
+
+
+_WHEEL = pytest.mark.skipif(
+    not _LLAMA_CPP_AVAILABLE, reason="llama-cpp-python wheel not installed"
+)
+_MODEL = pytest.mark.skipif(
+    _PROBE_MODEL is None,
+    reason=f"no GGUF (set {_MODEL_PATH_ENV_VAR} or place models/bin/gemma-4-E2B-it-Q4_K_M.gguf)",
+)
+
+
+@_WHEEL
+@_MODEL
+def test_grammar_parses_under_installed_parser(_probe_vocab):
+    """The installed llama.cpp parser genuinely accepts envelope.gbnf.
+
+    This is the authoritative decoder check that replaces the old
+    ``LlamaGrammar.from_string``-only assertion (which passed vacuously and
+    let the segfaulting grammar ship). A dialect regression that the wheel
+    rejects — an underscore rule name or a multi-line body — returns a NULL
+    sampler here and fails this test before any model run can crash.
+    """
+    vocab, lib = _probe_vocab
+    text = _GRAMMAR.read_text(encoding="utf-8")
+    assert _parses(vocab, lib, text), (
+        "envelope.gbnf must parse under the installed llama-cpp-python wheel; "
+        "a NULL grammar sampler means the vendored GBNF parser rejected a "
+        "construct (rule-name charset or multi-line body)."
+    )
+
+
+@_WHEEL
+@_MODEL
+def test_installed_parser_rejects_underscore_rule_name(_probe_vocab):
+    """Regression (TCK-P6-004): underscores in rule names crash the model run.
+
+    The pre-fix grammar used ``intent_body`` / ``get_balance`` / ... as rule
+    NAMES; the vendored parser stops a name at ``_`` and then errors
+    ("expecting newline or end at _body"), handing the sampler chain a NULL
+    grammar. The rewritten grammar is dash-only, so this probe documents the
+    trap the rewrite must never re-introduce.
+    """
+    vocab, lib = _probe_vocab
+    assert not _parses(vocab, lib, _UNDERSCORE_NAME_GBNF)
+
+
+@_WHEEL
+@_MODEL
+def test_installed_parser_rejects_multiline_continuation(_probe_vocab):
+    """Regression (TCK-P6-004): rule bodies may not span lines.
+
+    A body continued onto the next line with a leading ``|`` makes the
+    parser treat the second line as a fresh rule and error ("expecting name
+    at |"). Every rule in envelope.gbnf is therefore a single line.
+    """
+    vocab, lib = _probe_vocab
+    assert not _parses(vocab, lib, _MULTILINE_CONTINUATION_GBNF)
+
+
+def test_grammar_uses_installed_parser_dialect():
+    """Always-on static guard for the installed-parser dialect (no wheel/model).
+
+    CI runs this even where the real-parse probes above skip (wheel absent or
+    weights not downloaded). Two invariants, both required by the vendored
+    llama.cpp parser and both silently fatal at generate time if violated:
+
+    1. every rule NAME is ``[A-Za-z0-9-]`` — no underscores;
+    2. every non-blank content line is a COMPLETE single-line rule — no rule
+       body continued onto a following line (the parser ends a rule at the
+       newline).
+
+    Comments (a ``#`` starts a comment anywhere) and blank lines are skipped;
+    this file never places a ``#`` inside a string literal, so the naive
+    split matches the matcher's own comment handling.
+    """
+    for lineno, raw in enumerate(_GRAMMAR.read_text(encoding="utf-8").splitlines(), 1):
+        code = raw.split("#", 1)[0].rstrip()
+        if not code.strip():
+            continue
+        assert "::=" in code, (
+            f"envelope.gbnf line {lineno} is a rule-body continuation; the "
+            f"installed parser ends a rule at the newline: {raw!r}"
+        )
+        name = code.split("::=", 1)[0].strip()
+        assert "_" not in name, (
+            f"envelope.gbnf line {lineno} rule name has an underscore, which "
+            f"the installed parser rejects: {name!r}"
+        )
+        assert _RULE_NAME_RE.fullmatch(name), (
+            f"envelope.gbnf line {lineno} has an invalid rule name: {name!r}"
+        )

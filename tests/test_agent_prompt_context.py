@@ -306,11 +306,40 @@ class TestGrammar:
     @pytest.mark.skipif(
         not LLAMA_CPP_AVAILABLE, reason="llama-cpp-python wheel not installed"
     )
+    @pytest.mark.skipif(
+        not MODEL_FILE_AVAILABLE,
+        reason=f"no model file; set {MODEL_PATH_ENV_VAR} to a local GGUF",
+    )
     def test_grammar_parses_under_llama_cpp(self) -> None:
-        from llama_cpp import LlamaGrammar
+        """REAL parse (TCK-P6-004): build the grammar through the installed parser.
 
-        grammar = LlamaGrammar.from_string(load_grammar_text())
-        assert grammar is not None
+        ``LlamaGrammar.from_string`` is a no-op holder in llama-cpp-python
+        0.3.35 — the vendored GBNF parser only runs at *generate* time when
+        ``llama_sampler_init_grammar`` builds against a vocab — so the old
+        ``assert grammar is not None`` passed vacuously and let the segfaulting
+        underscore/multi-line grammar ship. This now forces the same call the
+        runtime makes (vocab-only load, weights untouched) and asserts a
+        non-NULL sampler. Model-gated so it skips cleanly without the GGUF;
+        the always-on dialect guard lives in tests/test_grammar_conformance.py.
+        """
+        import ctypes
+
+        from llama_cpp import Llama
+        from llama_cpp import llama_cpp as _lib
+
+        llm = Llama(
+            model_path=os.environ[MODEL_PATH_ENV_VAR],
+            vocab_only=True,
+            verbose=False,
+        )
+        sampler = _lib.llama_sampler_init_grammar(
+            llm._model.vocab, load_grammar_text().encode("utf-8"), b"root"
+        )
+        assert sampler is not None
+        assert ctypes.cast(sampler, ctypes.c_void_p).value not in (None, 0), (
+            "installed GBNF parser rejected the grammar (NULL sampler)"
+        )
+        _lib.llama_sampler_free(sampler)
 
 
 # ------------------------------------------------------------------- runtime
