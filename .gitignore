@@ -23,3 +23,13 @@ htmlcov/
 models/*.gguf
 models/models/
 models/bin/
+
+# runtime artifacts (local store, signer transfer dir, macOS)
+localwallet.db
+localwallet.db-wal
+localwallet.db-shm
+*.db
+*.db-wal
+*.db-shm
+psbt-transfer/
+.DS_Store
