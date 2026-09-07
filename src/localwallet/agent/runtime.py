@@ -20,8 +20,10 @@ agent never touches llama.cpp directly. Design points:
   user text).
 
 Sampling defaults follow PROJECT.md §7.1 (Gemma 4 model-card defaults:
-temp 1.0, top_p 0.95, top_k 64) with a v0 context budget of 8K
-(ADR-0006).
+top_p 0.95, top_k 64) with a v0 context budget of 8K (ADR-0006).
+Temperature is 0.2 rather than the model-card 1.0: grammar-constrained
+JSON emission is a low-temperature task, and 0.2 reduces envelope-wording
+flakiness (live evidence: escalation on a prompt that passes 5/5 isolated).
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from typing import Final
 from localwallet.agent.grammar import GRAMMAR_PATH
 
 __all__ = [
+    "DEFAULT_MAX_TOKENS",
     "DEFAULT_N_CTX",
     "DEFAULT_TEMPERATURE",
     "DEFAULT_TOP_K",
@@ -53,9 +56,25 @@ MODEL_PATH_ENV_VAR: Final[str] = "LOCALWALLET_MODEL_PATH"
 DEFAULT_N_CTX: Final[int] = 8192
 
 #: Sampling defaults (PROJECT.md §7.1, Gemma 4 model-card defaults).
-DEFAULT_TEMPERATURE: Final[float] = 1.0
+#: Grammar-constrained JSON envelope emission is a low-temperature task:
+#: 0.2 (down from the model-card 1.0) reduces envelope-wording flakiness
+#: (live evidence: a user send request that escalated while passing 5/5
+#: isolated). top_p/top_k are left at the model-card values.
+DEFAULT_TEMPERATURE: Final[float] = 0.2
 DEFAULT_TOP_P: Final[float] = 0.95
 DEFAULT_TOP_K: Final[int] = 64
+
+#: Completion budget. ``llama_cpp.create_completion`` defaults to a 16-token
+#: ceiling, which truncates EVERY non-trivial envelope mid-string (the
+#: grammar-constrained output is a single complete envelope — 16 tokens is far
+#: below even the shortest ``create_tx``). The bridge never hit this because an
+#: OpenAI-compat server applies its own large default, and the local path was
+#: never exercised past the TCK-P6-004 grammar-load segfault, so the default
+#: silently shipped. This is a correctness floor, not a sampling knob: the
+#: grammar forces EOS the instant ``root`` is satisfied, so the model can never
+#: emit more than one envelope — the ceiling only bounds a pathological trailing
+#: whitespace loop (the recursive ``ws`` rule is unbounded).
+DEFAULT_MAX_TOKENS: Final[int] = 512
 
 #: Test injection seam: given the prompt and the grammar text, return the
 #: raw model completion. ``grammar_text`` is ``None`` only when a caller
@@ -99,9 +118,13 @@ class ModelRuntime:
         model_path: Explicit GGUF model path. When ``None``,
             :data:`MODEL_PATH_ENV_VAR` is consulted at generation time.
         n_ctx: Context window size (v0 budget: 8K, ADR-0006).
-        temperature: Sampling temperature (default 1.0).
+        temperature: Sampling temperature (default 0.2); kept low because
+            grammar-constrained JSON emission is a low-temperature task.
         top_p: Nucleus sampling cutoff (default 0.95).
         top_k: Top-k sampling cutoff (default 64).
+        max_tokens: Completion budget (default :data:`DEFAULT_MAX_TOKENS`);
+            a correctness floor that keeps llama.cpp's 16-token default from
+            truncating an envelope (see :data:`DEFAULT_MAX_TOKENS`).
         generate_fn: Optional injection seam
             (``generate_fn(prompt, grammar_text) -> str``). When provided,
             llama.cpp is never imported and the model path is irrelevant.
@@ -115,6 +138,7 @@ class ModelRuntime:
         temperature: float = DEFAULT_TEMPERATURE,
         top_p: float = DEFAULT_TOP_P,
         top_k: int = DEFAULT_TOP_K,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         generate_fn: GenerateFn | None = None,
     ) -> None:
         self.model_path = model_path
@@ -122,6 +146,7 @@ class ModelRuntime:
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
+        self.max_tokens = max_tokens
         self._generate_fn = generate_fn
         self._llama: object | None = None
         self._grammar_cls: type | None = None
@@ -168,16 +193,32 @@ class ModelRuntime:
         return self._generate_with_llama(prompt, text)
 
     def _generate_with_llama(self, prompt: str, grammar_text: str) -> str:
-        """Real llama.cpp path: cached model + cached grammar, one call."""
+        """Real llama.cpp path: cached model + cached grammar, one call.
+
+        ``Llama.__call__`` returns the full non-streaming completion mapping,
+        but the runtime contract (mirrored by the injected ``generate_fn``
+        seam and by :class:`RemoteOpenAIRuntime`, which unwraps
+        ``choices[0].message.content``) is the raw completion *text* — so
+        unwrap ``choices[0]["text"]`` here. This was latent only because the
+        TCK-P6-004 grammar-load segfault meant this path never returned a
+        value, so the mapping leaked straight through to ``handle_raw``.
+        """
         llama = self._ensure_llama()
         grammar = self._ensure_grammar(grammar_text)
-        return llama(  # type: ignore[operator]
+        result = llama(  # type: ignore[operator]
             prompt=prompt,
             grammar=grammar,
             temperature=self.temperature,
             top_p=self.top_p,
             top_k=self.top_k,
+            max_tokens=self.max_tokens,
         )
+        try:
+            return result["choices"][0]["text"]
+        except (KeyError, IndexError, TypeError) as exc:
+            # Value-free: never leak prompt/model text or raw completions.
+            msg = "llama.cpp returned an unexpected completion shape"
+            raise ModelRuntimeError(msg) from exc
 
     def _ensure_llama(self) -> object:
         """Lazily import llama_cpp and load the model (first use only).
