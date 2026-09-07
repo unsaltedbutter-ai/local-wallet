@@ -86,6 +86,25 @@ against that pin before install. The official repos remain reachable as a
 token-authenticated alternative via `--hf-token`/`HF_TOKEN` (note they ship a
 different quant, `q4_0`, vs the pinned `Q4_K_M`).
 
+## Amendment (2026-09-06) — sources state: unsloth primary (all URLs live-verified), QAT q4_0 added
+
+Weights **source state** as of today (TCK-MODELS-002). The ungated
+`unsloth/gemma-4-*-it-GGUF` mirror repos remain the **primary** pinned source
+(`manifest.json`): they are ungated, Apache-2.0, and both entries point at
+them. All manifest entries were re-verified live (HTTP 200/206 + GGUF magic at
+byte 0) against the download tool's own request path; the E2B and E4B entries
+were confirmed correct — an earlier claim of an E4B 404 was an orchestration
+misread and is retracted. The official
+`google/gemma-4-E2B-it-qat-q4_0-gguf` repo — the **QAT** `q4_0` build of E2B —
+is **ungated** (gated: `false`, verified live) and is now added as a third
+manifest entry (`gemma-4-E2B-it-qat-q4_0`) so it can serve as a second eval
+subject for the **R12** quant-quality comparison (official QAT `q4_0` vs the
+pinned unsloth `Q4_K_M`). The full-size official `google/gemma-4-*-it-GGUF`
+repos remain gated / token-optional (`--hf-token`/`HF_TOKEN`). Trust still
+does **not** come from the source host: integrity comes from hash-pinning via
+`--write-hash` at bootstrap, and every download is verified against that pin
+before install.
+
 ---
 
 *Cross-references: PROJECT.md §7.1, §11 (LLM + Decoding constraint rows),

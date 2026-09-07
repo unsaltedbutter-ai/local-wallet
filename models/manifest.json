@@ -10,5 +10,11 @@
     "url": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
     "sha256": null,
     "size_bytes": null
+  },
+  {
+    "name": "gemma-4-E2B-it-qat-q4_0",
+    "url": "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf",
+    "sha256": null,
+    "size_bytes": null
   }
 ]

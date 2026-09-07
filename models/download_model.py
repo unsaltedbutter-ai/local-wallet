@@ -22,18 +22,23 @@ The default sources in ``manifest.json`` are the **ungated** ``unsloth``
 mirrors and need NO token. However, the official ``google/gemma-4-*-it-GGUF``
 repos are **gated** on Hugging Face: they require license acceptance and a
 user token (HTTP 401 without one). To download from those official repos,
-pass ``--hf-token <token>`` on the command line or set ``HF_TOKEN`` in the
-environment; the value is sent only as an ``Authorization: Bearer <token>``
-header and is NEVER printed, logged, or embedded in any error message.
+the recommended method is to set the ``HF_TOKEN`` environment variable and
+run without the flag. Passing ``--hf-token <token>`` on the command line
+still works, but it exposes the token via the process table and shell
+history, so prefer the environment variable. The value is sent only as an
+``Authorization: Bearer <token>`` header and is NEVER printed, logged, or
+embedded in any error message.
 
 Redirect behavior: Hugging Face's ``resolve`` endpoint 302-redirects to HF's
-own CDN (e.g. ``*.cdn.hf.co``). ``urllib`` forwards the ``Authorization``
-header on the redirect. That is acceptable here: the redirect target is
-Hugging Face's own object store for the exact same object, so the token is
-not leaked to a third party. (``urllib`` only forwards headers to
-same-host redirects by default; HF's redirect host differs, but in practice
-HF signs the CDN URL and the token is not required at the CDN. The header
-forwarding is harmless.)
+own CDN (e.g. ``*.cdn.hf.co``). ``urllib``'s ``HTTPRedirectHandler`` forwards
+caller-set headers (only dropping ``Content-length``/``Content-type``) on
+redirects, including cross-host ones, so the ``Authorization`` header is sent
+to the CDN too. That remains acceptable here for three reasons: (a) the
+default manifest sources are ungated and tokenless, so no token is involved;
+(b) when a token IS used, the 302 target is HF's own CDN object store for the
+exact same object and the CDN fetch is pre-signed, so the token is not needed
+there anyway; and (c) the token value is never echoed into logs or error
+messages.
 
 Behavior
 --------
@@ -264,7 +269,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hf-token", default=None,
                    help="Hugging Face token for gated official repos "
                         "(falls back to HF_TOKEN env var). Never logged. "
-                        "Ungated unsloth mirrors (the default) need no token.")
+                        "Ungated unsloth mirrors (the default) need no token. "
+                        "Prefer setting the HF_TOKEN env var and omitting "
+                        "this flag: a flag value appears in the process table "
+                        "and shell history. Avoid shell-expanding $HF_TOKEN "
+                        "in the flag (\"--hf-token $HF_TOKEN\" would put the "
+                        "literal in history/args) — set the env var instead.")
     return p
 
 
