@@ -2,8 +2,9 @@
 
 ## Repo state
 
-- Greenfield: the only file is `PROJECT.md` — the full spec (architecture, roadmap, invariants). Read it before writing anything.
-- No code, manifests, or build/test tooling yet. When scaffolding, follow the layout in PROJECT.md §15: `src/localwallet/{agent,protocol,wallet,chain,tx,signer,node,store,ui}`, `evals/`, `tests/`, `models/` (gitignored; pinned-download script + hashes), ADRs in `docs/adr/`.
+- Phases 0–5 complete; the security sweep (TCK-SEC-001..004) and the MAINNET FLIP (TCK-MAIN-001..003, ADR-0021) are committed on `dev/plan-run-1`. Last full suite: 1677 passed / 6 skipped; evals fixture mode green. Read HANDOFF.md for current state and TASKS.md for the authoritative ticket ledger.
+- Model bootstrap (MANUAL-WORK.md MW-2) gates Phase 6 (TCK-P6-001). Weights live in `models/bin/` (gitignored); the pinned download script + `manifest.json` are tracked.
+- Layout follows PROJECT.md §15: `src/localwallet/{agent,protocol,wallet,chain,tx,signer,node,store,ui}`, `evals/`, `tests/`, `models/`, ADRs in `docs/adr/`.
 
 ## Non-negotiable invariants (from PROJECT.md)
 
@@ -15,7 +16,7 @@
 - Signed PSBTs are re-parsed and re-validated against the intended transaction before broadcast. Any mismatch is a hard stop.
 - Addresses and amounts are quoted verbatim from tool output — the model never generates or "corrects" them.
 - Dust/min-relay thresholds are computed from script size, not hardcoded constants.
-- Testnet-only until the Phase 6 mainnet gate (PROJECT.md §12).
+- Mainnet-only (ADR-0021, supersedes the original "testnet-only until Phase 6" plan): testnet keys/addresses and all private keys are refused at parse; recipients must be mainnet scripts.
 
 ## Conventions
 

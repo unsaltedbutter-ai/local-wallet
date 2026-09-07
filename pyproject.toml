@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "local-wallet"
 version = "0.1.0"
-description = "Local-first testnet Bitcoin wallet driven by a grammar-constrained local LLM."
+description = "Local-first Bitcoin wallet driven by a grammar-constrained local LLM."
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.7",

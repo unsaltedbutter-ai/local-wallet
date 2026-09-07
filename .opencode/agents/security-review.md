@@ -22,6 +22,6 @@ Check, in order:
 3. Model-output trust — envelope handling validates in three layers (grammar → pydantic → business rules) and dispatches via the closed allowlist; no `eval`, no codegen from model output; unknown intents are rejected, never executed; destructive flows still run through the dispatcher-owned state machine and no path lets an LLM "yes" count as user confirmation.
 4. PSBT integrity — signed PSBTs are re-parsed and re-validated against the intended transaction before broadcast; any mismatch hard-stops.
 5. Verbatim quoting — addresses and amounts rendered from tool output, never generated or "corrected" by the model.
-6. Dust/min-relay computed from script size, not hardcoded; testnet-only assumptions intact.
+6. Dust/min-relay computed from script size, not hardcoded; mainnet-only gate (ADR-0021) intact — testnet keys/addresses refused at every layer.
 
 Return: a pass/fail/N-A verdict per item with file:line evidence, a severity-ranked findings list, and an explicit APPROVE or FIX-REQUIRED. Do not propose rewrites — findings only.
