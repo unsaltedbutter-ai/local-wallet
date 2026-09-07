@@ -1,9 +1,9 @@
 ---
 description: Read-only security review of a diff against the AGENTS.md invariants. Run after money-path changes.
 mode: subagent
-model: cspark/qwen3.8-flash-next
+model: aspark/glm-5.3-flash
 temperature: 0
-reasoningEffort: medium
+reasoningEffort: xhigh
 permission:
   edit: deny
   bash:

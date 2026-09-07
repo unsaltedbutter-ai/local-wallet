@@ -1,8 +1,8 @@
 ---
 description: Delegates plan items to isolated subagents. Does not implement.
 mode: primary
-model: cspark/qwen3.8-flash-next
-reasoningEffort: xhigh
+model: aspark/glm-5.3-flash
+reasoningEffort: high
 temperature: 0.3
 permission:
   edit: deny
@@ -36,9 +36,9 @@ You are the orchestrator. You do not write feature code.
 5. Independent tickets may run in parallel (multiple Task calls in one turn),
    but only with disjoint file lists — all subagents share this one working
    tree; there is no worktree isolation. Hard concurrency caps, counted per
-   provider: aspark/glm ≤ 3 in flight total ("coder" only — glm is reserved
-   for high-end thinking and code design); cspark/qwen ≤ 6 in flight total
-   ("security-review", "designer"); lspark/deepseek ≤ 4 in flight total
+   provider: aspark/glm ≤ 3 in flight total ("security-review");
+   cspark/qwen ≤ 6 in flight total
+   ("coder", "designer"); lspark/deepseek ≤ 4 in flight total
    ("coder-light", "explore", "general" all run deepseek). If at a cap, consider using cspark/qwen for "coder-light" or lspark/deepseek for "designer" or aspark/glm for "security-review" as an acceptable substitute. If no substitute is available because of caps, 
    queue the ticket and launch it as slots free up — never exceed a cap.
 6. Stop when every ticket is done or a ticket fails twice. Write FAILURES.md
