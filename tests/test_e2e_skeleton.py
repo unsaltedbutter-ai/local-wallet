@@ -53,6 +53,7 @@ from localwallet.app import (
     BACKEND_MODE_OWN_NODE_LOCAL,
     BACKEND_MODE_OWN_NODE_REMOTE,
     BACKEND_MODE_PUBLIC,
+    GAP_LIMIT_ENV_VAR,
     NODE_STATUS_DETECTION_DISABLED,
     OUT_OF_WINDOW_NOTICE,
     PRIVACY_INDICATOR,
@@ -60,12 +61,14 @@ from localwallet.app import (
     PRIVACY_INDICATOR_OWN_NODE_REMOTE,
     ZPUB_ENV_VAR,
     SendSession,
+    _env_gap_limit,
     build_dispatch_table,
     privacy_indicator,
     run,
     stub_generate,
 )
 from localwallet.chain import EsploraClient, PriceOracle
+from localwallet.config import Settings
 from localwallet.node import LocalNodeReport, NodeStatus
 from localwallet.node.detect import CoreHealth, CoreRpcProbe
 from localwallet.protocol import Envelope, IntentName, validate_payload
@@ -1806,8 +1809,8 @@ def test_startup_scan_line_byte_identical_when_not_truncated(
         monkeypatch.setattr(
             app_module.wallet_scan,
             "scan_wallet",
-            lambda store, client, wallet, *, progress_fn=None: _make_scan_summary(
-                truncated=False
+            lambda store, client, wallet, *, progress_fn=None, gap_limit=None: (
+                _make_scan_summary(truncated=False)
             ),
         )
         app_module._startup_scan(
@@ -1833,8 +1836,8 @@ def test_startup_scan_appends_truncation_notice_when_truncated(
         monkeypatch.setattr(
             app_module.wallet_scan,
             "scan_wallet",
-            lambda store, client, wallet, *, progress_fn=None: _make_scan_summary(
-                truncated=True
+            lambda store, client, wallet, *, progress_fn=None, gap_limit=None: (
+                _make_scan_summary(truncated=True)
             ),
         )
         app_module._startup_scan(
@@ -2088,6 +2091,106 @@ def test_repl_refuses_testnet_vpub_with_exit_code_2(
     assert VPUB not in joined
     # Fail-closed before any store side effects for the rejected key.
     assert not store_path.exists()
+
+
+# -------------------------------------------------- gap-limit env knob (TCK-CFG-001)
+
+
+def test_env_gap_limit_unit_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LOCALWALLET_GAP_LIMIT resolves to an int; empty/unset → None; a
+    non-integer or out-of-range value fails closed with a value-free error."""
+    monkeypatch.delenv(GAP_LIMIT_ENV_VAR, raising=False)
+    assert _env_gap_limit(Settings()) is None
+    assert _env_gap_limit(Settings(gap_limit="")) is None
+    assert _env_gap_limit(Settings(gap_limit="  2  ")) == 2
+    assert _env_gap_limit(Settings(gap_limit="1000")) == 1000
+    for bad in ("abc", "30.5", "0", "-1", "1001", "2 0"):
+        with pytest.raises(ValueError) as excinfo:
+            _env_gap_limit(Settings(gap_limit=bad))
+        assert GAP_LIMIT_ENV_VAR in str(excinfo.value)
+        # Value-free: the actual (malformed) value is never echoed as itself.
+        # ("0" is skipped — it legitimately appears inside "1000".)
+    for bad in ("abc", "30.5", "2 0"):
+        with pytest.raises(ValueError) as excinfo:
+            _env_gap_limit(Settings(gap_limit=bad))
+        assert bad not in str(excinfo.value)  # value-free
+
+
+def test_repl_refuses_malformed_gap_limit_env_with_exit_code_2(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A non-integer LOCALWALLET_GAP_LIMIT refuses startup with exit 2 and a
+    value-free message (mirrors the zpub config-error path), before any store
+    side effect."""
+    store_path = _store_path(tmp_path)
+    monkeypatch.setenv(GAP_LIMIT_ENV_VAR, "abc")
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", ZPUB],
+        monkeypatch,
+        lambda _req: None,  # the client factory is never reached
+        [],
+        store_path=store_path,
+    )
+    assert code == 2
+    joined = "\n".join(outputs)
+    assert GAP_LIMIT_ENV_VAR in joined
+    assert "abc" not in joined  # value-free
+    assert not store_path.exists()  # no store side effects on the config error
+
+
+def test_env_gap_limit_walk_and_precedence_over_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """LOCALWALLET_GAP_LIMIT=2 makes the startup scan walk a 2-gap window,
+    and the env wins over a wider DB ``gap_limit`` setting. Probe-count
+    assertion over MockTransport: an empty wallet with gap 2 → indices 0..1
+    per branch = 2 txs + 2 utxo probes × 2 branches."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path, gap_limit=5)  # DB key says 5 — env must win
+    monkeypatch.setenv(GAP_LIMIT_ENV_VAR, "2")
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")  # keep probe count deterministic
+    recorded: list[httpx.Request] = []
+    handler = _scan_handler(recorded)
+
+    code, _outputs = _run_captured(
+        ["--stub-llm", "--zpub", ZPUB],
+        monkeypatch,
+        handler,
+        ["exit"],
+        store_path=store_path,
+        auto_scan=True,
+    )
+    assert code == 0
+    txs_probes = [r for r in recorded if r.url.path.endswith("/txs")]
+    utxo_probes = [r for r in recorded if r.url.path.endswith("/utxo")]
+    assert len(txs_probes) == len(utxo_probes) == 4  # 2 branches × gap-2 window
+
+
+def test_db_gap_limit_used_when_env_unset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With LOCALWALLET_GAP_LIMIT unset the DB ``gap_limit`` setting is
+    honored unchanged: gap 2 → indices 0..1 per branch (4 txs + 4 utxo
+    probes)."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path, gap_limit=TEST_GAP)  # DB key = 2
+    monkeypatch.delenv(GAP_LIMIT_ENV_VAR, raising=False)
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")  # keep probe count deterministic
+    recorded: list[httpx.Request] = []
+    handler = _scan_handler(recorded)
+
+    code, _outputs = _run_captured(
+        ["--stub-llm", "--zpub", ZPUB],
+        monkeypatch,
+        handler,
+        ["exit"],
+        store_path=store_path,
+        auto_scan=True,
+    )
+    assert code == 0
+    txs_probes = [r for r in recorded if r.url.path.endswith("/txs")]
+    utxo_probes = [r for r in recorded if r.url.path.endswith("/utxo")]
+    assert len(txs_probes) == len(utxo_probes) == 4  # 2 branches × gap-2 window
 
 
 def test_repl_without_zpub_fails_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4061,7 +4164,12 @@ def test_startup_scan_notice_before_scan_completion_after(
     events: list[str] = []
 
     def fake_scan(
-        store: Store, client: object, wallet: object, *, progress_fn: Callable[[], None] | None = None
+        store: Store,
+        client: object,
+        wallet: object,
+        *,
+        progress_fn: Callable[[], None] | None = None,
+        gap_limit: int | None = None,
     ) -> app_module.wallet_scan.ScanSummary:
         events.append("scan-start")
         assert progress_fn is not None
@@ -4099,7 +4207,12 @@ def test_rescan_path_notice_before_scan_completion_after(
     events: list[str] = []
 
     def fake_rescan(
-        store: Store, client: object, wallet: object, *, progress_fn: Callable[[], None] | None = None
+        store: Store,
+        client: object,
+        wallet: object,
+        *,
+        progress_fn: Callable[[], None] | None = None,
+        gap_limit: int | None = None,
     ) -> app_module.wallet_scan.ScanSummary:
         events.append("scan-start")
         assert progress_fn is not None
@@ -4140,7 +4253,12 @@ def test_startup_scan_dots_stream_to_stdout(
     _preset_store(store_path)
 
     def fake_scan(
-        store: Store, client: object, wallet: object, *, progress_fn: Callable[[], None] | None = None
+        store: Store,
+        client: object,
+        wallet: object,
+        *,
+        progress_fn: Callable[[], None] | None = None,
+        gap_limit: int | None = None,
     ) -> app_module.wallet_scan.ScanSummary:
         assert progress_fn is not None
         for _ in range(4):

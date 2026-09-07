@@ -172,6 +172,7 @@ __all__ = [
     "AUTO_SCAN_ENV_VAR",
     "DEFAULT_HISTORY_LIMIT",
     "DEFAULT_SIGNER_DIR",
+    "GAP_LIMIT_ENV_VAR",
     "NODE_STATUS_DETECTION_DISABLED",
     "OUT_OF_WINDOW_NOTICE",
     "PRIVACY_INDICATOR",
@@ -196,6 +197,17 @@ ZPUB_ENV_VAR: Final[str] = "LOCALWALLET_ZPUB"
 #: Environment variable opting out of the startup scan (``"0"`` disables;
 #: any other value — including unset — keeps the default on).
 AUTO_SCAN_ENV_VAR: Final[str] = "LOCALWALLET_AUTO_SCAN"
+
+#: Dev knob (TCK-CFG-001): overrides the per-scan address gap limit
+#: (``LOCALWALLET_GAP_LIMIT``). An integer 1..1000; validated fail-closed at
+#: startup (exit 2, value-free) and threaded into every scan as the per-call
+#: ``gap_limit`` — so precedence is: explicit per-call argument >
+#: LOCALWALLET_GAP_LIMIT > DB ``gap_limit`` setting > default 20 (ADR-0009).
+GAP_LIMIT_ENV_VAR: Final[str] = "LOCALWALLET_GAP_LIMIT"
+
+#: Bounds for the env gap limit (mirror ``wallet.scan._MIN_GAP/_MAX_GAP``).
+GAP_LIMIT_MIN: Final[int] = 1
+GAP_LIMIT_MAX: Final[int] = 1000
 
 #: Environment variable selecting the signing backend (``--signer``
 #: overrides it): ``"file"`` (airgap transfer folder, ADR-0014 — the
@@ -299,6 +311,33 @@ def _configured_url_host(url: str) -> str | None:
         return host or None
     host = rest.split(":", 1)[0]
     return host or None
+
+
+def _env_gap_limit(settings: Settings) -> int | None:
+    """Resolve the :data:`GAP_LIMIT_ENV_VAR` override to an int, or ``None``.
+
+    Fail-closed startup preflight (the same spirit as the zpub config-error
+    path): a non-empty but non-integer — or out-of-range (1..1000) — value is
+    a config error, raised with a VALUE-FREE message (the env value is never
+    echoed). ``None`` means unset → scans use the DB ``gap_limit`` setting
+    (else the default 20, ADR-0009).
+    """
+    raw = settings.gap_limit.strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{GAP_LIMIT_ENV_VAR} must be an integer between "
+            f"{GAP_LIMIT_MIN} and {GAP_LIMIT_MAX}"
+        ) from exc
+    if not GAP_LIMIT_MIN <= value <= GAP_LIMIT_MAX:
+        raise ValueError(
+            f"{GAP_LIMIT_ENV_VAR} must be an integer between "
+            f"{GAP_LIMIT_MIN} and {GAP_LIMIT_MAX}"
+        )
+    return value
 
 
 def privacy_indicator(settings: Settings) -> str:
@@ -2162,7 +2201,10 @@ def run(
     """Wire the application from ``argv``/environment and run the REPL.
 
     Configuration precedence: ``--zpub`` overrides ``LOCALWALLET_ZPUB``;
-    ``--signer`` overrides ``LOCALWALLET_SIGNER`` for the signing backend
+    ``LOCALWALLET_GAP_LIMIT`` (validated fail-closed at startup, exit 2 on a
+    malformed value) overrides the DB ``gap_limit`` setting for every scan,
+    which in turn falls back to the default 20 (ADR-0009); ``--signer``
+    overrides ``LOCALWALLET_SIGNER`` for the signing backend
     (default ``file``; the HWI signer is constructed lazily only when
     selected, with the expected fingerprint from the parsed wallet key;
     the file signer's transfer folder comes from
@@ -2284,6 +2326,18 @@ def run(
         return 2
 
     settings = Settings.from_env()
+
+    # TCK-CFG-001 preflight: resolve + validate LOCALWALLET_GAP_LIMIT
+    # (fail-closed, value-free — the same spirit as the zpub config-error
+    # path above). A malformed value refuses startup with exit 2 BEFORE any
+    # store side effects; a valid value is threaded into every scan below as
+    # the per-call gap_limit so it overrides the DB setting (ADR-0009).
+    try:
+        env_gap = _env_gap_limit(settings)
+    except ValueError as exc:
+        output_fn(f"Configuration error: {exc}")
+        return 2
+
     try:
         store = Store(settings.store_path)
         try:
@@ -2326,7 +2380,9 @@ def run(
             _make_watch_probe(
                 store,
                 wallet_row.id,
-                lambda: wallet_scan.scan_wallet(store, client, wallet_row),
+                lambda: wallet_scan.scan_wallet(
+                    store, client, wallet_row, gap_limit=env_gap
+                ),
             ),
             interval_s=settings.watch_interval_s,
         )
@@ -2339,7 +2395,14 @@ def run(
     else:
         output_fn("Background watch: off.")
 
-    _startup_scan(store, client, wallet_row, rescan_requested=args.rescan, output_fn=output_fn)
+    _startup_scan(
+        store,
+        client,
+        wallet_row,
+        rescan_requested=args.rescan,
+        output_fn=output_fn,
+        gap_limit=env_gap,
+    )
     out_of_window = _out_of_window_line(store, wallet_row.id)
     if out_of_window is not None:
         output_fn(out_of_window)
@@ -2360,7 +2423,7 @@ def run(
         wallet_row,
         parsed,
         client,
-        lambda: wallet_scan.scan_wallet(store, client, wallet_row),
+        lambda: wallet_scan.scan_wallet(store, client, wallet_row, gap_limit=env_gap),
         flow=tx_flow,
         session=session,
         fee_estimator=fee_estimator,
@@ -2432,6 +2495,7 @@ def _startup_scan(
     *,
     rescan_requested: bool,
     output_fn: Callable[[str], None],
+    gap_limit: int | None = None,
 ) -> None:
     """Run the startup scan (or ``--rescan`` repair scan); never fatal.
 
@@ -2454,7 +2518,11 @@ def _startup_scan(
         output_fn(SCAN_PROGRESS_NOTICE)
         try:
             summary = wallet_scan.rescan_wallet(
-                store, client, wallet, progress_fn=_scan_progress_tick
+                store,
+                client,
+                wallet,
+                gap_limit=gap_limit,
+                progress_fn=_scan_progress_tick,
             )
         except (
             ChainError,
@@ -2474,7 +2542,11 @@ def _startup_scan(
     output_fn(SCAN_PROGRESS_NOTICE)
     try:
         summary = wallet_scan.scan_wallet(
-            store, client, wallet, progress_fn=_scan_progress_tick
+            store,
+            client,
+            wallet,
+            gap_limit=gap_limit,
+            progress_fn=_scan_progress_tick,
         )
     except (
         ChainError,

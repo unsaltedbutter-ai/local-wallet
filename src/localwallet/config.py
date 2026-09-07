@@ -55,6 +55,16 @@ class Settings:
     # documented in ADR-0019; on the user's own node (``chain_base_url`` set,
     # ADR-0018) polling is cheap and private either way.
     watch_interval_s: float = 60.0
+    #: Dev knob (TCK-CFG-001): the per-scan address gap limit override
+    #: (``LOCALWALLET_GAP_LIMIT``), as a DECIMAL STRING. Empty string = unset
+    #: (use the DB ``gap_limit`` setting, else :data:`~localwallet.wallet.scan.DEFAULT_GAP_LIMIT`
+    #: of 20 — ADR-0009). Kept as a string so ``from_env`` needs no special
+    #: coercion: the app validates + bounds it (fail-closed, value-free) at
+    #: startup, then threads the resolved int into every scan as the per-call
+    #: ``gap_limit`` argument (so it wins over the DB setting). A small gap
+    #: speeds up scans but can MISS allocated-but-unused addresses; widen +
+    #: rescan per ADR-0009.
+    gap_limit: str = ""
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -68,7 +78,8 @@ class Settings:
         ``LOCALWALLET_FEE_CACHE_TTL_S``, ``LOCALWALLET_RPC_COOKIE_PATH``,
         ``LOCALWALLET_RPC_PORT``, ``LOCALWALLET_LOCAL_MEMPOOL_URL``,
         ``LOCALWALLET_NODE_DETECTION_ENABLED``,
-        ``LOCALWALLET_WATCH_INTERVAL_S``. Unknown variables are ignored.
+        ``LOCALWALLET_WATCH_INTERVAL_S``, ``LOCALWALLET_GAP_LIMIT``.
+        Unknown variables are ignored.
 
         Boolean fields accept ``0``/``1`` or ``true``/``false``/``yes``/``no``
         (any case); anything else raises :class:`ValueError` (fail closed —

@@ -43,3 +43,11 @@ Run tests and evals with the venv's interpreter (or activate it first):
 .venv/bin/pytest tests/
 .venv/bin/python evals/run_evals.py
 ```
+
+## Configuration (env vars)
+
+- **`LOCALWALLET_GAP_LIMIT`** — dev knob: overrides the per-scan address gap
+  limit (default 20, ADR-0009). An integer `1..1000`; a malformed value
+  refuses startup. A small value (e.g. `2`) makes scans fast, but a gap that
+  is too small can **miss allocated-but-unused addresses** — if you suspect
+  funds on addresses you handed out, widen the gap and rescan per ADR-0009.

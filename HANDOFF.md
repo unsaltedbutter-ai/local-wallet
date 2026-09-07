@@ -103,7 +103,7 @@ Additionally, three things are NOT tests but are effectively deferred-run and mu
 3. **MW-4+ — available now:** MW-4 hardware-wallet live AC (docs/phase3-ac.md), MW-5 Sparrow import AC (docs/sparrow-ac.md), MW-6 model-mode eval record (after MW-2), MW-7 post-SEC-001 export spot-check, MW-8 Phase 6 packaging prerequisites (Apple Developer account + Windows box, later).
 4. **Full manual checklist:** see MANUAL-WORK.md (authoritative for MW-id status).
 
-No sudo needed for anything in-repo: `python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'`, then `.venv/bin/python -m localwallet.ui.cli --stub-llm` (no model needed) or with the bridge env vars (`LOCALWALLET_LLM_BASE_URL=http://notible.local:8084/v1`, `LOCALWALLET_LLM_MODEL=mlx-community/gemma-4-e2b-it-4bit`) for real E2B inference.
+No sudo needed for anything in-repo: `python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'`, then `.venv/bin/python -m localwallet.ui.cli --stub-llm` (no model needed) or with the bridge env vars (`LOCALWALLET_LLM_BASE_URL=http://notible.local:8084/v1`, `LOCALWALLET_LLM_MODEL=mlx-community/gemma-4-e2b-it-4bit`) for real E2B inference. For fast scans in dev, set `LOCALWALLET_GAP_LIMIT=2` (overrides the DB `gap_limit` setting; default 20 — a too-small gap can miss allocated-but-unused addresses; widen + rescan per ADR-0009).
 
 ## 9. Two honest footnotes (carried from the phase reports)
 
