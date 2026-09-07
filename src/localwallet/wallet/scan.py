@@ -79,6 +79,7 @@ surface; nothing is ever silently guessed.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Final
@@ -234,6 +235,7 @@ def scan_wallet(
     wallet: WalletRecord | WalletDescriptor,
     *,
     gap_limit: int | None = None,
+    progress_fn: Callable[[], None] | None = None,
 ) -> ScanSummary:
     """Scan ``wallet`` and refresh the cached state in ``store``.
 
@@ -250,6 +252,11 @@ def scan_wallet(
             wallet row by descriptor string).
         gap_limit: Gap override; ``None`` reads the ``gap_limit`` setting
             and falls back to :data:`DEFAULT_GAP_LIMIT`.
+        progress_fn: Optional zero-argument callback (TCK-UX-001) invoked
+            exactly once per address probed by the walk — a bare tick that
+            receives NO address/index/amount data (value-free by
+            construction). ``None`` (the default) leaves behavior and
+            output byte-identical to the pre-callback scan.
 
     Returns:
         A :class:`ScanSummary` describing the scan.
@@ -265,7 +272,9 @@ def scan_wallet(
             :class:`StoreIntegrityError` is a subclass. Messages are
             value-free.
     """
-    return _run_scan(store, client, wallet, gap_limit=gap_limit, rebuild=False)
+    return _run_scan(
+        store, client, wallet, gap_limit=gap_limit, rebuild=False, progress_fn=progress_fn
+    )
 
 
 def rescan_wallet(
@@ -274,6 +283,7 @@ def rescan_wallet(
     wallet: WalletRecord | WalletDescriptor,
     *,
     gap_limit: int | None = None,
+    progress_fn: Callable[[], None] | None = None,
 ) -> ScanSummary:
     """Full rescan: re-derive everything from the key, ignore cached state.
 
@@ -286,9 +296,13 @@ def rescan_wallet(
     preserved by address string so a rescan does not silently re-issue
     addresses the user already received. Otherwise identical to
     :meth:`scan_wallet` (including the chain-phase-before-persistence
-    failure semantics).
+    failure semantics). The optional ``progress_fn`` behaves exactly as in
+    :meth:`scan_wallet` (one bare tick per probed address; ``None`` = no
+    callback, unchanged behavior).
     """
-    return _run_scan(store, client, wallet, gap_limit=gap_limit, rebuild=True)
+    return _run_scan(
+        store, client, wallet, gap_limit=gap_limit, rebuild=True, progress_fn=progress_fn
+    )
 
 
 # ----------------------------------------------------------------- internal
@@ -301,8 +315,14 @@ def _run_scan(
     *,
     gap_limit: int | None,
     rebuild: bool,
+    progress_fn: Callable[[], None] | None,
 ) -> ScanSummary:
-    """Shared scan core; ``rebuild`` selects the rescan trust model."""
+    """Shared scan core; ``rebuild`` selects the rescan trust model.
+
+    ``progress_fn`` (may be ``None``) is forwarded to
+    :func:`_walk_history` verbatim — one bare tick per probed address,
+    no data attached (TCK-UX-001).
+    """
     gap = _resolve_gap_limit(store, gap_limit)
     descriptor, wallet_id = _resolve_wallet(store, wallet)
 
@@ -333,6 +353,7 @@ def _run_scan(
             raw_txs,
             gap=gap,
             rebuild=rebuild,
+            progress_fn=progress_fn,
         )
         used_indices, max_used_index, last_index = _summarize_walk(final_map, raw_txs)
         utxo_records.extend(
@@ -464,6 +485,7 @@ def _walk_history(
     *,
     gap: int,
     rebuild: bool,
+    progress_fn: Callable[[], None] | None = None,
 ) -> tuple[dict[int, str], bool]:
     """Walk one branch ascending until ``gap`` consecutive unused addresses.
 
@@ -480,6 +502,13 @@ def _walk_history(
     mode cached mappings are re-derived and never trusted). Observed
     transactions are validated strictly and merged into ``raw_txs``
     (first sighting wins; entries carry the full tx so sightings agree).
+
+    ``progress_fn`` (TCK-UX-001): optional zero-argument callback invoked
+    EXACTLY once per probed address — immediately before the ``txs``
+    probe below. It receives NO arguments: no address, no index, no
+    amounts — a bare tick, value-free by construction (the caller owns
+    any rendering). ``None`` (the default) performs no callback and
+    leaves the walk byte-identical to the pre-callback behavior.
     """
     deriver = BranchDeriver(parsed, branch)
     final_map: dict[int, str] = {}
@@ -492,6 +521,10 @@ def _walk_history(
             address = deriver.address(index)
         final_map[index] = address
 
+        # One bare tick per probed address (TCK-UX-001): zero arguments,
+        # no address/index/amount data — value-free by construction.
+        if progress_fn is not None:
+            progress_fn()
         entries = client.get_address_txs(address)
         # Validate the whole payload before acting on any of it.
         validated = [_parse_tx_entry(entry) for entry in entries]

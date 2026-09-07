@@ -330,6 +330,15 @@ OUT_OF_WINDOW_NOTICE: Final[str] = (
     "recommended; say 'rescan' is not available yet, restart with --rescan"
 )
 
+#: TCK-UX-001 pre-scan notice: printed via ``output_fn`` BEFORE the
+#: startup/``--rescan`` scan runs so the user knows why the prompt is not
+#: live yet (the scan probes every window address sequentially and can
+#: take a while against a slow backend). Value-free by construction — no
+#: addresses, amounts, or counts.
+SCAN_PROGRESS_NOTICE: Final[str] = (
+    "Checking for new transactions (may take a moment)…"
+)
+
 #: TCK-SEC-002 truncation surfacing: appended to the scan/rescan narration
 #: ONLY when ``summary.truncated`` (any branch hit the absolute window
 #: ceiling). Value-free — no addresses, amounts, or indices; the only
@@ -2305,7 +2314,6 @@ def run(
     output_fn(_BANNER_TITLE)
     output_fn(_BANNER_MAINNET)
     output_fn(f"Privacy notice: {privacy_indicator(settings)}")
-    output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
     # Background watch (Phase 5, TCK-P5-001; ADR-0019). Single-threaded /
     # tick-driven: the watcher holds no thread and shares no sqlite object
@@ -2335,6 +2343,12 @@ def run(
     out_of_window = _out_of_window_line(store, wallet_row.id)
     if out_of_window is not None:
         output_fn(out_of_window)
+
+    # TCK-UX-001: the "type a message" hint is printed only AFTER the
+    # startup scan (+ out-of-window notice) so it appears when input is
+    # actually live — the scan can take minutes and users were typing
+    # into a prompt that could not read yet.
+    output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
     session = SendSession()
     # The confirmation-ETA mempool hint (TCK-P5-002): consulted per create_tx
@@ -2392,6 +2406,25 @@ def _resolve_or_create_wallet(
     return store.create_wallet(name="default", descriptor=descriptor.descriptor)
 
 
+def _scan_progress_tick() -> None:
+    """One progress tick for the startup/``--rescan`` scan (TCK-UX-001).
+
+    Strict zero-argument callable — the shape ``scan_wallet``/
+    ``rescan_wallet`` invoke once per probed address. Value-free by
+    construction: it writes a single ``.`` onto the wrapping progress
+    line (started by :data:`SCAN_PROGRESS_NOTICE`) and never receives or
+    renders any address/index/amount data.
+    """
+    sys.stdout.write(".")
+    sys.stdout.flush()
+
+
+def _end_scan_progress_line() -> None:
+    """Close the progress-dot line: one newline + flush (TCK-UX-001)."""
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def _startup_scan(
     store: Store,
     client: EsploraClient,
@@ -2402,6 +2435,14 @@ def _startup_scan(
 ) -> None:
     """Run the startup scan (or ``--rescan`` repair scan); never fatal.
 
+    UX contract (TCK-UX-001): a notice line is printed via ``output_fn``
+    BEFORE the scan starts, one ``.`` is streamed to ``sys.stdout`` per
+    probed address (via the scan's ``progress_fn`` callback — a bare
+    value-free tick), the dot line is closed with a newline when the scan
+    returns (success or failure), and only THEN do the completion
+    narration lines follow exactly as before. The background watcher's
+    probe (``_make_watch_probe``) passes no callback and stays silent.
+
     A chain/scan/store failure prints a scrubbed warning (scan, chain,
     store, and key error strings are value-free by contract) and the
     REPL still starts — handlers surface the resulting store-empty
@@ -2410,20 +2451,42 @@ def _startup_scan(
     """
     auto_scan = os.environ.get(AUTO_SCAN_ENV_VAR, "").strip() != "0"
     if rescan_requested:
+        output_fn(SCAN_PROGRESS_NOTICE)
         try:
-            summary = wallet_scan.rescan_wallet(store, client, wallet)
-        except (ChainError, wallet_scan.ScanError, WatchKeyError, StoreError, sqlite3.Error) as exc:
+            summary = wallet_scan.rescan_wallet(
+                store, client, wallet, progress_fn=_scan_progress_tick
+            )
+        except (
+            ChainError,
+            wallet_scan.ScanError,
+            WatchKeyError,
+            StoreError,
+            sqlite3.Error,
+        ) as exc:
+            _end_scan_progress_line()
             output_fn(f"warning: rescan failed: {exc} — continuing with cached state.")
             return
+        _end_scan_progress_line()
         output_fn(_rescan_summary_line(summary))
         return
     if not auto_scan:
         return
+    output_fn(SCAN_PROGRESS_NOTICE)
     try:
-        summary = wallet_scan.scan_wallet(store, client, wallet)
-    except (ChainError, wallet_scan.ScanError, WatchKeyError, StoreError, sqlite3.Error) as exc:
+        summary = wallet_scan.scan_wallet(
+            store, client, wallet, progress_fn=_scan_progress_tick
+        )
+    except (
+        ChainError,
+        wallet_scan.ScanError,
+        WatchKeyError,
+        StoreError,
+        sqlite3.Error,
+    ) as exc:
+        _end_scan_progress_line()
         output_fn(f"warning: startup scan failed: {exc} — continuing with cached state.")
         return
+    _end_scan_progress_line()
     output_fn(
         f"Startup scan complete: {summary.utxo_count} UTXOs · "
         f"tip height {summary.tip_height}."

@@ -1793,7 +1793,10 @@ def test_startup_scan_line_byte_identical_when_not_truncated(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """TCK-SEC-002b: non-truncated startup-scan narration is byte-identical
-    to the pre-change text (period, no notice appended)."""
+    to the pre-change text (period, no notice appended).
+
+    TCK-UX-001: the completion line is preceded by the pre-scan notice
+    line (and the progress-dot stream on stdout, not captured here)."""
     store_path = _store_path(tmp_path)
     _preset_store(store_path)
     outputs: list[str] = []
@@ -1803,12 +1806,17 @@ def test_startup_scan_line_byte_identical_when_not_truncated(
         monkeypatch.setattr(
             app_module.wallet_scan,
             "scan_wallet",
-            lambda store, client, wallet: _make_scan_summary(truncated=False),
+            lambda store, client, wallet, *, progress_fn=None: _make_scan_summary(
+                truncated=False
+            ),
         )
         app_module._startup_scan(
             store, None, wallet, rescan_requested=False, output_fn=outputs.append
         )
-    assert outputs == ["Startup scan complete: 1 UTXOs · tip height 870000."]
+    assert outputs == [
+        app_module.SCAN_PROGRESS_NOTICE,
+        "Startup scan complete: 1 UTXOs · tip height 870000.",
+    ]
 
 
 def test_startup_scan_appends_truncation_notice_when_truncated(
@@ -1825,16 +1833,19 @@ def test_startup_scan_appends_truncation_notice_when_truncated(
         monkeypatch.setattr(
             app_module.wallet_scan,
             "scan_wallet",
-            lambda store, client, wallet: _make_scan_summary(truncated=True),
+            lambda store, client, wallet, *, progress_fn=None: _make_scan_summary(
+                truncated=True
+            ),
         )
         app_module._startup_scan(
             store, None, wallet, rescan_requested=False, output_fn=outputs.append
         )
-    assert len(outputs) == 1
-    assert outputs[0].startswith(
+    assert len(outputs) == 2
+    assert outputs[0] == app_module.SCAN_PROGRESS_NOTICE
+    assert outputs[1].startswith(
         "Startup scan complete: 1 UTXOs · tip height 870000."
     )
-    assert app_module.TRUNCATION_NOTICE in outputs[0]
+    assert app_module.TRUNCATION_NOTICE in outputs[1]
 
 
 def test_watch_probe_discards_truncated_scan_summary(tmp_path: Path) -> None:
@@ -4034,3 +4045,180 @@ def test_live_mainnet_balance_via_mempool_space() -> None:
     assert address_turn.result["index"] == 0
     address = address_turn.result["address"]
     assert isinstance(address, str) and address.startswith("bc1")
+
+
+# --------------------------------------------- startup progress UX (TCK-UX-001)
+
+
+def test_startup_scan_notice_before_scan_completion_after(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-UX-001: the pre-scan notice is emitted BEFORE the scan runs and
+    the completion narration AFTER it returns; the scan receives a strict
+    zero-argument progress callback (one bare dot per tick on stdout)."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    events: list[str] = []
+
+    def fake_scan(
+        store: Store, client: object, wallet: object, *, progress_fn: Callable[[], None] | None = None
+    ) -> app_module.wallet_scan.ScanSummary:
+        events.append("scan-start")
+        assert progress_fn is not None
+        progress_fn()  # strict zero-arg call: any argument would TypeError
+        progress_fn()
+        events.append("scan-end")
+        return _make_scan_summary(truncated=False)
+
+    monkeypatch.setattr(app_module.wallet_scan, "scan_wallet", fake_scan)
+    with Store(store_path) as store:
+        wallet = store.get_wallet_by_name("default")
+        assert wallet is not None
+        app_module._startup_scan(
+            store,
+            None,
+            wallet,
+            rescan_requested=False,
+            output_fn=lambda line: events.append(f"out:{line}"),
+        )
+    assert events == [
+        f"out:{app_module.SCAN_PROGRESS_NOTICE}",
+        "scan-start",
+        "scan-end",
+        "out:Startup scan complete: 1 UTXOs · tip height 870000.",
+    ]
+
+
+def test_rescan_path_notice_before_scan_completion_after(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-UX-001: the ``--rescan`` repair scan gets the same ordering —
+    notice first, completion narration last — via ``rescan_wallet``."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    events: list[str] = []
+
+    def fake_rescan(
+        store: Store, client: object, wallet: object, *, progress_fn: Callable[[], None] | None = None
+    ) -> app_module.wallet_scan.ScanSummary:
+        events.append("scan-start")
+        assert progress_fn is not None
+        progress_fn()
+        events.append("scan-end")
+        return _make_scan_summary(truncated=False)
+
+    monkeypatch.setattr(app_module.wallet_scan, "rescan_wallet", fake_rescan)
+    with Store(store_path) as store:
+        wallet = store.get_wallet_by_name("default")
+        assert wallet is not None
+        app_module._startup_scan(
+            store,
+            None,
+            wallet,
+            rescan_requested=True,
+            output_fn=lambda line: events.append(f"out:{line}"),
+        )
+    assert events == [
+        f"out:{app_module.SCAN_PROGRESS_NOTICE}",
+        "scan-start",
+        "scan-end",
+        (
+            "out:Rescan complete: branch 0: scanned 3, "
+            "max used 0, next index 1 · branch 1: scanned 2, "
+            "max used -1, next index 0 · 1 UTXOs · tip height 870000"
+        ),
+    ]
+
+
+def test_startup_scan_dots_stream_to_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """TCK-UX-001: each probe tick streams one '.' (flushed) on a single
+    wrapping stdout line, closed by one newline when the scan returns —
+    while the narration lines go through ``output_fn`` only."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+
+    def fake_scan(
+        store: Store, client: object, wallet: object, *, progress_fn: Callable[[], None] | None = None
+    ) -> app_module.wallet_scan.ScanSummary:
+        assert progress_fn is not None
+        for _ in range(4):
+            progress_fn()
+        return _make_scan_summary(truncated=False)
+
+    monkeypatch.setattr(app_module.wallet_scan, "scan_wallet", fake_scan)
+    outputs: list[str] = []
+    with Store(store_path) as store:
+        wallet = store.get_wallet_by_name("default")
+        assert wallet is not None
+        app_module._startup_scan(
+            store, None, wallet, rescan_requested=False, output_fn=outputs.append
+        )
+    captured = capsys.readouterr().out
+    assert captured == "....\n"  # four bare ticks, one closing newline
+    # The narration lines go through output_fn only — no dots-only lines.
+    assert all(set(line) != {"."} for line in outputs)
+
+
+def test_run_prints_type_a_message_last_after_startup_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-UX-001 end-to-end ordering: banner → background-watch line →
+    pre-scan notice → completion narration → out-of-window notice →
+    "Type a message" LAST (input is actually live when the hint shows)."""
+    store_path = _store_path(tmp_path)
+    wd = _preset_store(store_path)
+    addr0, addr1 = derive_fixture_addresses(2)
+    handler = _scan_handler(
+        [], utxos_by_addr={addr0: UTXOS_ADDR0, addr1: UTXOS_ADDR1}
+    )
+
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", ZPUB],
+        monkeypatch,
+        handler,
+        ["exit"],
+        store_path=store_path,
+        auto_scan=True,
+    )
+
+    assert code == 0
+    notice_idx = outputs.index(app_module.SCAN_PROGRESS_NOTICE)
+    complete_idx = next(
+        i for i, line in enumerate(outputs) if line.startswith("Startup scan complete")
+    )
+    type_idx = outputs.index("Type a message — 'exit' or Ctrl-D quits.")
+    assert notice_idx < complete_idx < type_idx
+    # With a bare "exit" the REPL adds no further output: the hint is last.
+    assert outputs[-1] == "Type a message — 'exit' or Ctrl-D quits."
+    # The value-free notice carries no addresses/amounts and no zpub.
+    assert wd.descriptor not in outputs[notice_idx]
+    assert ZPUB not in outputs[notice_idx]
+
+
+def test_run_prints_type_a_message_last_when_startup_scan_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-UX-001 failure path: notice → scrubbed warning → newline-closed
+    dot line → "Type a message" still LAST (the REPL starts regardless)."""
+    store_path = _store_path(tmp_path)
+    handler = _scan_handler([], utxo_status=503)
+
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", ZPUB],
+        monkeypatch,
+        handler,
+        ["exit"],
+        store_path=store_path,
+        auto_scan=True,
+    )
+
+    assert code == 0
+    notice_idx = outputs.index(app_module.SCAN_PROGRESS_NOTICE)
+    warning_idx = next(
+        i for i, line in enumerate(outputs) if line.startswith("warning: startup scan failed")
+    )
+    type_idx = outputs.index("Type a message — 'exit' or Ctrl-D quits.")
+    assert notice_idx < warning_idx < type_idx
+    assert outputs[-1] == "Type a message — 'exit' or Ctrl-D quits."

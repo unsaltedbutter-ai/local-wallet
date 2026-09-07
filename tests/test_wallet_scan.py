@@ -20,6 +20,7 @@ the wallet-input/mainnet-gate surface.
 
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from datetime import datetime
@@ -52,6 +53,7 @@ from localwallet.wallet import (
     rescan_wallet,
     scan_wallet,
 )
+from localwallet.wallet import scan as wallet_scan_module
 from localwallet.wallet.descriptor import WatchKeyError
 from localwallet.wallet.scan import _MAX_WINDOW_ADDRESSES, ScanError
 
@@ -828,3 +830,92 @@ def test_rescan_is_bounded_by_the_same_ceiling(store: Store) -> None:
     utxo_calls = [a for kind, a in chain.requests if kind == "utxo"]
     assert len(txs_calls) <= _MAX_WINDOW_ADDRESSES + 20
     assert len(utxo_calls) <= _MAX_WINDOW_ADDRESSES + 20
+
+
+# ------------------------------------------------ progress callback (TCK-UX-001)
+
+
+def test_progress_callback_ticks_once_per_probed_address(store: Store) -> None:
+    """TCK-UX-001 (scan branch): the optional progress callback fires
+    EXACTLY once per address probed by the walk — tick count equals the
+    number of txs probes (== per-branch ``scanned`` sums) for a used+gap
+    pattern across BOTH branches. Strict zero-arg: the callback below
+    accepts no parameters, so any argument would raise TypeError."""
+    # Branch 0 used at 0 and 2, default gap 20 → walk 0..22 (23 probed);
+    # branch 1 fully unused → walk 0..19 (20 probed). Total 43.
+    chain = FakeChain(txs=_used_at({0: "aa" * 32, 2: "cc" * 32}, 0))
+    ticks: list[None] = []
+
+    def tick() -> None:  # strict zero-argument callback (value-free tick)
+        ticks.append(None)
+
+    row = store.get_wallet_by_name("main")
+    summary = scan_wallet(store, chain.client(), row, progress_fn=tick)
+
+    b0, b1 = summary.branches[0], summary.branches[1]
+    assert (b0.scanned, b1.scanned) == (23, 20)
+    assert len(ticks) == b0.scanned + b1.scanned == 43
+    txs_probes = [a for kind, a in chain.requests if kind == "txs"]
+    assert len(txs_probes) == len(ticks) == 43
+
+
+def test_progress_callback_ticks_on_rescan_branch(store: Store) -> None:
+    """TCK-UX-001 (rescan/rebuild branch): identical one-tick-per-probed-
+    address contract on ``rescan_wallet``; the strict zero-arg callback
+    proves no address/index/amount data is ever passed."""
+    chain = FakeChain(txs=_used_at({1: "bb" * 32}, 0))
+    ticks: list[None] = []
+
+    def tick() -> None:  # strict zero-argument callback
+        ticks.append(None)
+
+    row = store.get_wallet_by_name("main")
+    summary = rescan_wallet(store, chain.client(), row, progress_fn=tick)
+
+    b0, b1 = summary.branches[0], summary.branches[1]
+    assert (b0.scanned, b1.scanned) == (22, 20)  # used@1 + gap 20 / unused gap 20
+    assert len(ticks) == b0.scanned + b1.scanned == 42
+    assert len([1 for kind, _ in chain.requests if kind == "txs"]) == 42
+
+
+def test_progress_callback_none_is_unchanged_behavior(store: Store) -> None:
+    """TCK-UX-001: ``progress_fn=None`` (and the kwarg omitted entirely)
+    produce byte-identical results and request patterns — the plumbing is
+    purely additive (this is the path every existing call site, the
+    background watcher probe, and the lazy scans take)."""
+    txs = _used_at({0: "aa" * 32, 3: "dd" * 32}, 0)
+    row = store.get_wallet_by_name("main")
+
+    plain = scan_wallet(store, FakeChain(txs=txs).client(), row)
+    explicit_none = scan_wallet(
+        store, FakeChain(txs=txs).client(), row, progress_fn=None
+    )
+    # scanned_at is a wall-clock timestamp; every other field must match.
+    for field in (
+        "wallet_id", "gap_limit", "tip_height", "utxo_count",
+        "utxo_value_sats", "truncated",
+    ):
+        assert getattr(plain, field) == getattr(explicit_none, field)
+    assert plain.branches == explicit_none.branches
+    assert plain.out_of_window == explicit_none.out_of_window
+
+
+def test_progress_callback_signature_is_zero_arg(store: Store) -> None:
+    """TCK-UX-001: the callback contract is a bare tick — proven two ways:
+    (1) a strict zero-parameter callable survives a full scan/rescan (any
+    argument would raise TypeError), and (2) the documented parameter
+    type on all public entry points is a zero-argument callable."""
+    row = store.get_wallet_by_name("main")
+    ticks: list[None] = []
+
+    def tick() -> None:
+        ticks.append(None)
+
+    scan_wallet(store, FakeChain().client(), row, progress_fn=tick)
+    rescan_wallet(store, FakeChain().client(), row, progress_fn=tick)
+    assert len(ticks) > 0
+
+    for fn in (wallet_scan_module.scan_wallet, wallet_scan_module.rescan_wallet):
+        param = inspect.signature(fn).parameters["progress_fn"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is None
