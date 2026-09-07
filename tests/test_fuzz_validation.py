@@ -45,6 +45,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from localwallet.protocol import (
+    MAX_TEXT_CHARS,
     IntentName,
     OutcomeStatus,
     handle_raw,
@@ -379,6 +380,71 @@ def _fuzz_broadcast_tx_extra_key(rng: random.Random) -> object:
     return {"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": "abc", "signer": "hwi"}}
 
 
+# ------------------------------------------- Phase 6 deep malformed matrix
+# TCK-P6-001: deeper malformed-output coverage — truncation at brace depth,
+# unknown top-level keys (including action-shaped ones), int-vs-str type
+# confusion on amount fields, deeply nested params, single oversized string
+# fields, and a wrong-typed/missing/wrong-version ``v``. Every case must
+# still take the clean reject path: needs_retry/rejected, zero dispatch,
+# no uncaught exception.
+
+#: A schema-valid mainnet recipient used inside malformed payloads.
+_RECIPIENT = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+
+#: Canned documents cut off mid-structure at increasing brace depth.
+TRUNCATED_AT_DEPTH = [
+    '{"v":0,"intent":"respond","params":',  # truncated at depth 1
+    '{"v":0,"intent":"respond","params":{"text"',  # depth 2, mid-key
+    '{"v":0,"intent":"create_tx","params":{"recipient":"' + _RECIPIENT + '","amount_sats":',
+    '{"v":0,"intent":"respond","params":{"text":"unterminated',  # depth 2, mid-string
+    "{",
+]
+
+
+def _fuzz_truncated_at_brace_depth(rng: random.Random) -> str:
+    return rng.choice(TRUNCATED_AT_DEPTH)
+
+
+def _fuzz_unknown_top_level_keys(rng: random.Random) -> object:
+    base = copy.deepcopy(rng.choice(list(VALID_ENVELOPES.values())))
+    base["confidence"] = 0.9
+    base["dispatch"] = {"intent": "confirm_tx", "params": {"tx_ref": "abc"}}
+    return base
+
+
+def _fuzz_amount_str(rng: random.Random) -> object:
+    # amount_sats is a true JSON integer; numeric-looking strings never coerce.
+    return {
+        "v": 0,
+        "intent": "create_tx",
+        "params": {"recipient": _RECIPIENT, "amount_sats": rng.choice(["1000", "0", "1e3"])},
+    }
+
+
+def _fuzz_v_wrong(rng: random.Random) -> object:
+    base = copy.deepcopy(VALID_ENVELOPES["get_balance"])
+    bad = rng.choice(["0", None, 1, -1, True, {}])
+    if bad == "0" and rng.random() < 0.3:
+        del base["v"]  # sometimes missing entirely rather than wrong-typed
+    else:
+        base["v"] = bad
+    return base
+
+
+def _fuzz_params_deep_nesting(rng: random.Random) -> str:
+    # A JSON document that parses fine but nests hundreds of levels inside
+    # a single params value: the reject must come from the schema, not a
+    # parser stack overflow.
+    depth = rng.randrange(100, 500)
+    return '{"v":0,"intent":"respond","params":{"text":' + "[" * depth + "]" * depth + "}}"
+
+
+def _fuzz_oversized_field(rng: random.Random) -> object:
+    base = copy.deepcopy(VALID_ENVELOPES["respond"])
+    base["params"]["text"] = "a" * (MAX_TEXT_CHARS + rng.choice([1, 1000, 1_000_000]))
+    return base
+
+
 _CATEGORIES = [
     _fuzz_truncated,
     _fuzz_bytes,
@@ -413,6 +479,13 @@ _CATEGORIES = [
     _fuzz_txid_wrong_length,
     _fuzz_sign_tx_unknown_signer,
     _fuzz_broadcast_tx_extra_key,
+    # Phase 6 (TCK-P6-001): deep malformed matrix mixed into the seeded run.
+    _fuzz_truncated_at_brace_depth,
+    _fuzz_unknown_top_level_keys,
+    _fuzz_amount_str,
+    _fuzz_v_wrong,
+    _fuzz_params_deep_nesting,
+    _fuzz_oversized_field,
 ]
 
 
@@ -512,6 +585,75 @@ def test_new_intent_near_misses_are_cleanly_rejected():
     # is rejected — the 1..100 business range is a genuine schema constraint.
     env = validate_payload({"v": 0, "intent": "get_history", "params": {"limit": 100}})
     assert env.params.limit == 100
+
+
+# ------------------------------------------------- Phase 6 deep matrix test
+
+#: Deterministic deep malformed matrix (TCK-P6-001). Each named payload
+#: must be rejected cleanly by handle_raw: terminal retry/reject status,
+#: zero dispatch, no uncaught exception (the raise-free call is the test).
+DEEP_MALFORMED_MATRIX: dict[str, object] = {
+    # truncation at brace depth (parse-level rejects)
+    "truncated_at_depth1": '{"v":0,"intent":"respond","params":',
+    "truncated_at_depth2_midkey": '{"v":0,"intent":"respond","params":{"text"',
+    "truncated_at_depth2_midvalue": (
+        '{"v":0,"intent":"create_tx","params":{"recipient":"' + _RECIPIENT + '","amount_sats":'
+    ),
+    "truncated_unterminated_string": '{"v":0,"intent":"respond","params":{"text":"unterminated',
+    "truncated_bare_brace": "{",
+    # unknown extra top-level keys, including an action-shaped one
+    "unknown_top_level_keys": {
+        "v": 0, "intent": "respond", "params": {"text": "ok"},
+        "confidence": 0.9, "dispatch": {"intent": "confirm_tx", "params": {"tx_ref": "abc"}},
+    },
+    # int-vs-str (and float) type confusion on amount fields
+    "amount_sats_numeric_string": {
+        "v": 0, "intent": "create_tx", "params": {"recipient": _RECIPIENT, "amount_sats": "1000"},
+    },
+    "amount_sats_float": {
+        "v": 0, "intent": "create_tx", "params": {"recipient": _RECIPIENT, "amount_sats": 1000.0},
+    },
+    "amount_usd_string": {
+        "v": 0, "intent": "create_tx", "params": {"recipient": _RECIPIENT, "amount_usd": "10.5"},
+    },
+    "limit_string": {"v": 0, "intent": "get_history", "params": {"limit": "5"}},
+    # deeply nested params values (schema reject, not parser overflow)
+    "params_text_deep_list": json.loads(
+        '{"v":0,"intent":"respond","params":{"text":' + "[" * 400 + "]" * 400 + "}}"
+    ),
+    "params_recipient_nested_dict": {
+        "v": 0,
+        "intent": "create_tx",
+        "params": {"recipient": {"a": {"b": {"c": {"d": _RECIPIENT}}}}, "amount_sats": 1000},
+    },
+    # single oversized string fields
+    "oversized_text": {
+        "v": 0, "intent": "respond", "params": {"text": "a" * (MAX_TEXT_CHARS + 1)},
+    },
+    "oversized_recipient": {
+        "v": 0, "intent": "create_tx", "params": {"recipient": "bc1q" + "a" * 50_000,
+                                                  "amount_sats": 1000},
+    },
+    # wrong-typed / missing / unknown-version ``v``
+    "v_string": {"v": "0", "intent": "get_balance", "params": {}},
+    "v_true": {"v": True, "intent": "get_balance", "params": {}},
+    "v_missing": {"intent": "get_balance", "params": {}},
+    "v_unknown_version": {"v": 1, "intent": "get_balance", "params": {}},
+}
+
+
+@pytest.mark.parametrize("name", sorted(DEEP_MALFORMED_MATRIX))
+def test_deep_malformed_matrix_rejects_cleanly(name: str):
+    payload = DEEP_MALFORMED_MATRIX[name]
+    table = CountingTable()
+    outcome = handle_raw(payload, table.table())
+    assert outcome.status in (
+        OutcomeStatus.NEEDS_RETRY,
+        OutcomeStatus.REJECTED,
+    ), f"{name}: deep malformed payload must never dispatch"
+    assert table.envelopes == []
+    for intent in IntentName:
+        assert table.counts[intent] == 0, f"{name} illegally dispatched {intent}"
 
 
 # ------------------------------------------------- test 2: grammar/schema conformance

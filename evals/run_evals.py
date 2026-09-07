@@ -18,10 +18,10 @@ Two modes:
   conclusions from it; a one-line disclosure is printed to stderr);
   otherwise a local GGUF via ``--model-path`` or ``LOCALWALLET_MODEL_PATH``.
 
-Exit codes: ``0`` success (fixture mode all valid; model mode ran and, in
-Phase 0, reports the Phase 6 gate informational score); ``1`` fixture /
-validation failure; ``2`` model mode requested but neither the remote
-endpoint nor a model path is available.
+Exit codes: ``0`` success (fixture mode all valid; model mode score at or
+above the ENFORCED Phase 6 gate, >=95% since TCK-P6-001); ``1`` fixture /
+validation failure, or model mode below the enforced gate; ``2`` model mode
+requested but neither the remote endpoint nor a model path is available.
 
 No network imports at module level (the ADR-0007 remote bridge, which
 speaks HTTP, is imported lazily only when model mode selects it), no
@@ -91,12 +91,13 @@ _LLM_BASE_URL_ENV_VAR = "LOCALWALLET_LLM_BASE_URL"
 _LLM_MODEL_ENV_VAR = "LOCALWALLET_LLM_MODEL"
 
 #: Phase 6 gate threshold (PROJECT.md §12 Phase 6 AC: eval pass >= 95%).
-#: In Phase 0 this is informational (see :data:`_ENFORCE_PHASE6_GATE`).
+#: ENFORCED since TCK-P6-001 (see :data:`_ENFORCE_PHASE6_GATE`).
 _PHASE6_SCORE_THRESHOLD = 0.95
 
-#: When False (Phase 0), model mode reports the score and prints the gate
-#: note but does not fail the run; the orchestrator flips this at Phase 6.
-_ENFORCE_PHASE6_GATE = False
+#: Phase 6 gate enforcement (TCK-P6-001): model mode exits 1 when the score
+#: is below :data:`_PHASE6_SCORE_THRESHOLD`. Adjudicated on the pinned GGUF
+#: (models/bin, ADR-0021-era), never the ADR-0007 debug bridge.
+_ENFORCE_PHASE6_GATE = True
 
 #: Placeholder used only to schema-validate predicate expectations.
 _PLACEHOLDER_TEXT = "fixture-validated placeholder"
@@ -515,8 +516,8 @@ def _run_model_mode(
     if score < _PHASE6_SCORE_THRESHOLD:
         note = (
             f"Below the Phase 6 gate ({_PHASE6_SCORE_THRESHOLD * 100:.0f}%). "
-            "Phase 6 AC requires >=95% golden; in Phase 0 this is "
-            "informational and does not gate merges."
+            "Phase 6 AC requires >=95% golden; the gate is ENFORCED "
+            "(TCK-P6-001) — this run fails."
         )
         print(f"NOTE: {note}")
         if _ENFORCE_PHASE6_GATE:
