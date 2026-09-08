@@ -445,13 +445,6 @@ TRUNCATION_NOTICE: Final[str] = (
     "raising the window cap"
 )
 
-_BANNER_TITLE: Final[str] = (
-    "local-wallet — watch-only Bitcoin wallet (mainnet, Phase 1 wallet engine)"
-)
-_BANNER_MAINNET: Final[str] = (
-    "Network: Bitcoin MAINNET only — testnet keys are refused (ADR-0021)."
-)
-
 #: TCK-SCAN-003 (ADR-0022 decision 5): the closed values of the
 #: tool-owned ``freshness`` result key attached to cache-served
 #: wallet-read answers. ``fresh`` = the store carries a completed scan
@@ -3991,8 +3984,6 @@ def _wire(
     # thread (this wiring's owner) persists everything via ScanFlow.
     worker = ChainWorker(client)
 
-    output_fn(_BANNER_TITLE)
-    output_fn(_BANNER_MAINNET)
     output_fn(f"Privacy notice: {privacy_indicator(settings)}")
 
     # Background watch (Phase 5, TCK-P5-001; ADR-0019, ADR-0022 decision 4).

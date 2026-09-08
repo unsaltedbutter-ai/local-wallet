@@ -1246,8 +1246,7 @@ def test_startup_scan_populates_store_then_balance_reads_it(
 
     assert code == 0
     joined = "\n".join(outputs)
-    # Banner: mainnet notice + §9 privacy indicator verbatim.
-    assert "MAINNET" in joined
+    # Banner: §9 privacy indicator verbatim.
     assert PRIVACY_INDICATOR in joined
     # Startup scan feedback: counts + tip only (no addresses/amounts).
     assert "Startup scan complete: 3 UTXOs · tip height 870000." in joined
@@ -1297,7 +1296,6 @@ def test_repl_end_to_end_with_stub_llm_prints_verbatim_balance(
 
     assert code == 0
     joined = "\n".join(outputs)
-    assert "MAINNET" in joined
     assert PRIVACY_INDICATOR in joined
     assert (
         f"Balance (mainnet): {EXPECTED_CONFIRMED} sats (confirmed) "
