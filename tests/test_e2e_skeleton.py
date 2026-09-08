@@ -3414,7 +3414,9 @@ def test_requote_narration_and_ceiling_copy(
 ) -> None:
     """The renderer wires the §2.3 copy: direction-bearing lead +
     variant-B card after a faster re-quote; ceiling/floor results print
-    ONLY the notice line (the staged card stays valid on screen)."""
+    ONLY the notice line (the staged card stays valid on screen). The
+    ceiling copy (TCK-UX-004) asks for an explicit sat/vB rate rather than
+    silently refusing at the top rung."""
     lines: list[str] = []
     app_module._print_create_tx(
         {
@@ -3445,6 +3447,9 @@ def test_requote_narration_and_ceiling_copy(
         {"error": "tx_pending", "rate_notice": "ceiling"}, ceiling.append
     )
     assert ceiling == [app_module._CARD_RATE_CEILING]
+    assert "tell me a rate in sat/vB" in app_module._CARD_RATE_CEILING
+    # ...and the ask never leaks an address/amount (value-free, per §2.2.3).
+    assert "bc1qtest" not in app_module._CARD_RATE_CEILING
     floor: list[str] = []
     app_module._print_create_tx(
         {"error": "tx_pending", "rate_notice": "floor"}, floor.append

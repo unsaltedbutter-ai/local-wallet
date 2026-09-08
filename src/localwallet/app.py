@@ -515,7 +515,9 @@ _CARD_REQUOTE_LEAD: Final[str] = (
 _CARD_REQUOTE_LEAD_SAME_RUNG: Final[str] = "Re-quoted — review the new fee below:"
 _CARD_RATE_CEILING: Final[str] = (
     "That's already the fastest recommended rate (next-block target). "
-    'Say "sign" to proceed or "cancel" to discard.'
+    "If you'd like confirmation sooner, tell me a rate in sat/vB and I'll "
+    'rebuild the transaction at that rate — or say "sign" to proceed or '
+    '"cancel" to discard.'
 )
 _CARD_RATE_FLOOR: Final[str] = (
     "That's already the cheapest recommended rate — we never quote below "
