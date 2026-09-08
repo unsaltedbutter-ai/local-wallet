@@ -2539,9 +2539,18 @@ EVENT_TURN_END: Final[str] = "turn_end"
 STATE_SNAPSHOT_COMMAND: Final[str] = "/state"
 
 #: ``/state`` snapshot schema tags (value-free; a fixed literal, never data).
-#: ``state/1`` = typed snapshot (flow + watch); ``state/0`` = the minimal
-#: transport-only shape served while the engine is busy (the client tolerates
-#: BOTH — it is written to key off the transport fields, which are unchanged).
+#: ``state/1`` = typed snapshot (flow + watch + scan); ``state/0`` = the
+#: minimal transport-only shape served while the engine is busy (the client
+#: tolerates BOTH — it is written to key off the transport fields, which are
+#: unchanged).
+#: TCK-WEB-005 DECISION: the scan fields (``scan_state``,
+#: ``first_scan_complete``) are ADDITIVE under ``state/1`` — the tag is NOT
+#: bumped. The client (and every future one) reads a state/1 snapshot by
+#: NAMED key and ignores unknown keys, and the pinned static client refuses
+#: any tag other than ``state/0``/``state/1``; a ``state/2`` bump would
+#: blind-side the shipped UI for zero new information. Rule for the next
+#: change: additive = keep the tag; any rename/removal = bump and update the
+#: client in the same ticket.
 STATE_SCHEMA: Final[str] = "state/1"
 STATE_SCHEMA_TRANSPORT_ONLY: Final[str] = "state/0"
 
@@ -2656,6 +2665,15 @@ class StartupScan:
     @property
     def enabled(self) -> bool:
         return self._state != "disabled"
+
+    @property
+    def state(self) -> str:
+        """The gate's state as a CLOSED enum name (TCK-WEB-005): exactly one
+        of ``disabled``/``pending``/``running``/``done``/``skipped``. The web
+        ``/state`` snapshot exposes this string and nothing else about the
+        scan — it is a name, never data (no progress/counts: a percentage
+        would leak wallet size through the door of a progress bar)."""
+        return self._state
 
     @property
     def in_progress(self) -> bool:
@@ -2960,6 +2978,15 @@ class ScanFlow:
         return self.gate.in_progress
 
     @property
+    def first_scan_recorded(self) -> bool:
+        """The DURABLE first-scan-completion fact (ADR-0022 decision 5's
+        completed-scan cursor), read on the ENGINE thread. Unlike the gate
+        (this session's startup-scan state) it survives restarts and covers
+        the AUTO_SCAN=0 lazy path — the honest source for the web snapshot's
+        ``first_scan_complete`` flag (TCK-WEB-005)."""
+        return _has_completed_scan(self._store, self._wallet_id)
+
+    @property
     def pending(self) -> bool:
         """True while a submitted startup scan result has not yet been
         handled (persisted + narrated) by the engine thread."""
@@ -3031,6 +3058,10 @@ class EngineContext:
     #: The non-blocking startup-scan controller (TCK-SCAN-003, ADR-0022);
     #: the pump attaches it to the command queue and drives its events.
     scan: ScanFlow | None = None
+    #: The engine-owned store, present when the pump must answer settings
+    #: reads/writes (TCK-WEB-005). Only the pump thread may touch it — the
+    #: web bootstrap constructs it ON the engine thread.
+    store: Store | None = None
 
 
 @dataclass(frozen=True)
@@ -3053,15 +3084,20 @@ def build_state_snapshot(
     flow: TxFlow,
     session: SendSession,
     watcher: IncomingWatcher | None,
+    scan: ScanFlow | None = None,
 ) -> dict[str, object]:
     """The value-free ``/state`` snapshot, built ON the engine thread.
 
     Deliberately minimal and validated-by-construction: the only facts are the
     dispatcher-owned flow position (a closed :class:`TxFlowStatus` enum name),
     whether a transaction pends (a boolean), the last turn's gate classification
-    (a closed :class:`GateDecision` enum name) and whether a watcher is
-    configured/enabled (booleans). No address, amount, txid, ``tx_ref`` or key
-    material CAN appear — every value is an enum NAME or a boolean, never data.
+    (a closed :class:`GateDecision` enum name), whether a watcher is
+    configured/enabled (booleans), and — TCK-WEB-005 — the startup-scan state
+    (a closed :class:`StartupScan` state name) plus the durable
+    first-scan-completed boolean. No address, amount, txid, ``tx_ref``, key
+    material OR scan progress CAN appear — every value is an enum NAME or a
+    boolean, never data. No progress percentage: a percent is a ratio against
+    the wallet's address count and leaks wallet size through the back door.
     """
     return {
         "schema": STATE_SCHEMA,
@@ -3072,7 +3108,185 @@ def build_state_snapshot(
             "configured": watcher is not None,
             "enabled": bool(watcher is not None and watcher.enabled),
         },
+        "scan_state": scan.gate.state if scan is not None else "disabled",
+        "first_scan_complete": bool(scan is not None and scan.first_scan_recorded),
     }
+
+
+# ------------------------------------------------- settings surface (TCK-WEB-005)
+
+#: Command token the web transport stamps on a typed ``/settings`` read/write
+#: (the sibling of :data:`STATE_SNAPSHOT_COMMAND`): recognized ONLY as the
+#: ``command`` label of a :class:`SettingsRequest`, it is never a model turn
+#: and never a chat line, so nothing sensitive can ride it.
+SETTINGS_COMMAND: Final[str] = "/settings"
+
+#: ``/settings`` snapshot schema tag — value-free literal; same additive-tag
+#: rule as :data:`STATE_SCHEMA` (add fields under ``settings/1``; bump only on
+#: a rename/removal, with the client in the same ticket).
+SETTINGS_SCHEMA: Final[str] = "settings/1"
+
+#: Env rung of the ADR-0023 ladder for the chain backend (displayed as the
+#: honest ``env_override`` flag only — resolution stays in
+#: :func:`localwallet.config.resolve_chain_base_url`; the value is never read).
+CHAIN_BASE_URL_ENV_VAR: Final[str] = "LOCALWALLET_CHAIN_BASE_URL"
+
+#: Cap on a POSTed setting value (the body-size gate bounds the request; this
+#: keeps junk out of the store). A URL the user's own wiring already accepts
+#: fits with orders of magnitude to spare.
+MAX_SETTING_VALUE_CHARS: Final[int] = 2048
+
+#: The store key of the persisted chain-backend choice — readable/writable
+#: ONLY through the store's typed pair (``get_chain_base_url`` /
+#: ``set_chain_base_url``), which owns the write validation (TCK-ONB-002).
+_CHAIN_BASE_URL_KEY: Final[str] = "chain_base_url"
+
+#: THE allowlist (fail-closed, TCK-WEB-005): only settings keys that EXIST in
+#: the store's key/value table and are READ by live code today. Anything
+#: else — invented ``fee_cache_ttl_s``/``utxo_*``/env-only scalars — would be
+#: a write with no reader, so it is refused. Unknown future keys 404 here
+#: until their ladder ships.
+_SETTINGS_KEYS: Final[frozenset[str]] = frozenset(
+    {wallet_scan.GAP_LIMIT_SETTING, _CHAIN_BASE_URL_KEY}
+)
+
+
+@dataclass(frozen=True)
+class SettingsRequest:
+    """A typed ``/settings`` read (``key is None``) or single-key write
+    (``key`` + ``value``) queued THROUGH the engine pump.
+
+    Like :class:`StateSnapshotRequest`, the transport never touches the store
+    (ADR-0024 §3): the request rides the command queue and the ENGINE thread
+    validates, persists, and answers between turns. One key per write keeps
+    the contract honest — a rejected change cannot half-apply, and unrelated
+    keys are structurally untouched.
+    """
+
+    command: str
+    key: str | None
+    value: str | None
+    reply: queue.Queue[dict[str, object]]
+
+
+def _env_overridden(env_var: str) -> bool:
+    """Whether an env var is set to a non-blank value (the honest
+    ``env_override`` flag: the stored rung is shadowed until restart with the
+    env unset; the VALUE is never read or echoed)."""
+    return bool(os.environ.get(env_var, "").strip())
+
+
+def _settings_entries(store: Store) -> list[dict[str, object]]:
+    """The current stored value of every allowlisted key, with its type,
+    allowed range, and honest effect flags. Values here are user-authored
+    scalars (a gap count, a backend URL) — never wallet data (no address,
+    amount or key material exists in the settings table)."""
+    return [
+        {
+            "key": wallet_scan.GAP_LIMIT_SETTING,
+            "type": "int",
+            "value": store.get_setting(wallet_scan.GAP_LIMIT_SETTING),
+            "default": str(wallet_scan.DEFAULT_GAP_LIMIT),
+            "min": wallet_scan._MIN_GAP,
+            "max": wallet_scan._MAX_GAP,
+            # Every scan plan re-reads the setting (wallet.scan._resolve_gap_limit):
+            # takes effect on the NEXT scan, no restart.
+            "requires_restart": False,
+            "env_override": _env_overridden(GAP_LIMIT_ENV_VAR),
+        },
+        {
+            "key": _CHAIN_BASE_URL_KEY,
+            "type": "url",
+            "value": store.get_chain_base_url(),
+            # Unset stored rung → the built-in public default (ADR-0003);
+            # null value below means exactly that.
+            "default": None,
+            "min": None,
+            "max": None,
+            # ADR-0018: the switch is CONFIG-only — the chain client (and the
+            # fee/price wrappers riding it) are constructed once at bootstrap;
+            # a stored change takes effect on the next launch, never hot.
+            "requires_restart": True,
+            "env_override": _env_overridden(CHAIN_BASE_URL_ENV_VAR),
+        },
+    ]
+
+
+def _apply_setting_change(store: Store, key: str, value: str) -> str | None:
+    """Validate + persist ONE allowlisted change on the ENGINE thread.
+
+    ``None`` on success, else a value-free refusal line (it names the key and
+    the rule — the submitted value is never echoed). ``chain_base_url``
+    delegates to the store's typed writer, the ONLY sanctioned writer of that
+    key (validation is never duplicated there).
+
+    ponytail: ``gap_limit`` has no typed store writer yet (read side:
+    ``wallet.scan._resolve_gap_limit``), so the canonical-form + bounds check
+    lives here, with the bounds imported from the scan layer (single source);
+    when TCK-UTXO-003's typed accessor pair lands, this becomes a call to it.
+    """
+    if key == wallet_scan.GAP_LIMIT_SETTING:
+        text = value.strip()
+        try:
+            gap = int(text)
+        except ValueError:
+            gap = -1
+        if str(gap) != text or not wallet_scan._MIN_GAP <= gap <= wallet_scan._MAX_GAP:
+            return (
+                f"{key} must be a whole number between "
+                f"{wallet_scan._MIN_GAP} and {wallet_scan._MAX_GAP}"
+            )
+        try:
+            store.set_setting(key, str(gap))  # canonical decimal string
+        except (StoreError, sqlite3.Error):
+            return f"could not save {key}"
+        return None
+    try:
+        # ``""`` clears the stored rung (the set_chain_base_url convention);
+        # every other validation (scheme, host, no credentials, no
+        # whitespace) is the store writer's, fail-closed, value-free by
+        # the store layer's contract — safe to surface.
+        store.set_chain_base_url(value)
+    except (StoreError, sqlite3.Error) as exc:
+        return str(exc)
+    return None
+
+
+def handle_settings_request(
+    store: Store | None, key: str | None, value: str | None
+) -> dict[str, object]:
+    """Answer a :class:`SettingsRequest` ON THE ENGINE THREAD — the only
+    thread that ever reads/writes the settings table for the web transport.
+
+    Read → the allowlisted entries. Write → validate fail-closed, persist via
+    the store's settings API, and reply with the freshly re-read entry (the
+    client confirms from tool truth, never from its own echo). Refusals carry
+    a value-free ``error``; an off-allowlist key is refused WITHOUT even
+    naming the request (the name itself is untrusted input)."""
+    unknown = {"schema": SETTINGS_SCHEMA, "status": "rejected", "error": "unknown setting"}
+    if store is None:
+        # Only reachable if the transport talks to an engine without the
+        # settings wiring (a bare test pump); fail closed, never guess.
+        return {
+            "schema": SETTINGS_SCHEMA,
+            "status": "unavailable",
+            "error": "settings not available",
+        }
+    if key is None:
+        return {"schema": SETTINGS_SCHEMA, "status": "ok", "settings": _settings_entries(store)}
+    if key not in _SETTINGS_KEYS or not isinstance(value, str):
+        return unknown
+    if len(value) > MAX_SETTING_VALUE_CHARS:
+        return {
+            "schema": SETTINGS_SCHEMA,
+            "status": "rejected",
+            "key": key,
+            "error": "value too long",
+        }
+    if (error := _apply_setting_change(store, key, value)) is not None:
+        return {"schema": SETTINGS_SCHEMA, "status": "rejected", "key": key, "error": error}
+    entry = next(e for e in _settings_entries(store) if e["key"] == key)
+    return {"schema": SETTINGS_SCHEMA, "status": "applied", "settings": [entry]}
 
 
 @dataclass
@@ -3103,6 +3317,25 @@ class EngineHandle:
         """
         reply: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
         self.commands.put(StateSnapshotRequest(STATE_SNAPSHOT_COMMAND, reply))
+        try:
+            return reply.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def request_settings(
+        self, timeout: float, key: str | None = None, value: str | None = None
+    ) -> dict[str, object] | None:
+        """Read the allowlisted settings (``key is None``) or apply ONE
+        validated change THROUGH the pump (TCK-WEB-005).
+
+        Same discipline as :meth:`request_state`: the transport thread never
+        touches the store; the ENGINE thread validates fail-closed, persists,
+        and answers between turns. ``None`` on timeout = engine busy past the
+        deadline (the transport answers 503; never-cancel stands — the queued
+        consult may still be answered after the caller gave up, so the client
+        RE-READS via GET rather than assuming the write failed)."""
+        reply: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+        self.commands.put(SettingsRequest(SETTINGS_COMMAND, key, value, reply))
         try:
             return reply.get(timeout=timeout)
         except queue.Empty:
@@ -3147,6 +3380,7 @@ def start_engine(
             client=ctx.client,
             emitter=handle.emitter,
             scan=ctx.scan,
+            store=ctx.store,
         )
 
     handle.thread = threading.Thread(target=body, name="engine", daemon=True)
@@ -3202,6 +3436,7 @@ def _pump(
     emitter: EventEmitter | None = None,
     ready: threading.Event | None = None,
     scan: ScanFlow | None = None,
+    store: Store | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
     ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
@@ -3223,6 +3458,11 @@ def _pump(
     worker) persists. While the first scan runs the watch drain stands down
     (the single worker is occupied). On exit the pending scan is drained to
     completion so its result is persisted + narrated exactly once.
+
+    Typed transport consults (TCK-WEB-003/005): ``StateSnapshotRequest`` and
+    ``SettingsRequest`` are answered BETWEEN commands on this thread — the
+    settings pair needs ``store`` (the engine-owned store); without it (CLI
+    pumps, bare test pumps) the request is refused fail-closed.
     """
     if scan is not None:
         scan.attach(commands)
@@ -3245,7 +3485,18 @@ def _pump(
             # Typed value-free /state read (TCK-WEB-003), answered ON the engine
             # thread — no model, no output event, no chat line; the transport
             # blocks on this reply (or falls back to transport-only on timeout).
-            command.reply.put(build_state_snapshot(flow, session, watcher))
+            # TCK-WEB-005: the scan gate's closed state name + the durable
+            # first-scan boolean ride the same snapshot (still enum/bool only).
+            command.reply.put(build_state_snapshot(flow, session, watcher, scan))
+            continue
+        if isinstance(command, SettingsRequest):
+            # Typed /settings read/single-key write (TCK-WEB-005), answered ON
+            # the engine thread — the ONLY thread that reads/writes the
+            # settings table for the transport. Fail-closed validation,
+            # value-free refusals, unrelated keys structurally untouched.
+            command.reply.put(
+                handle_settings_request(store, command.key, command.value)
+            )
             continue
         line = command.strip()
         if not line:
@@ -3740,6 +3991,7 @@ def _run_web(
             watcher=wiring.watcher,
             client=wiring.client,
             scan=wiring.scan,
+            store=wiring.store,
         )
 
     try:

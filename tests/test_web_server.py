@@ -41,6 +41,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -48,11 +49,14 @@ import pytest
 from localwallet import app
 from localwallet.agent.loop import AgentLoop
 from localwallet.app import EngineContext, EngineEvent
+from localwallet.chain import PriceUnavailableError
 from localwallet.protocol import IntentName
+from localwallet.store import Store
 from localwallet.tx.flow import TxFlow, TxFlowStatus
 from localwallet.ui.web import server as webserver
 from localwallet.ui.web.server import serve_web, sse_frame
-from tests.test_e2e_skeleton import ZPUB
+from localwallet.wallet import WalletDescriptor
+from tests.test_e2e_skeleton import SEND_RECIPIENT, ZPUB
 
 # ------------------------------------------------------------------ harness
 
@@ -209,9 +213,11 @@ def test_every_endpoint_requires_token_and_replies_http_1_0(serve: Any) -> None:
     assert port != 0  # ephemeral port bound (never fixed/predictable)
     cases = [
         ("GET", "/state", None),
+        ("GET", "/settings", None),
         ("GET", "/", None),
         ("POST", "/turn", {"text": "hi"}),
         ("POST", "/action", {"utterance": "confirm"}),
+        ("POST", "/settings", {"key": "gap_limit", "value": "5"}),
     ]
     for method, path, body in cases:
         status, headers, data, response = _request(server, method, path, body)
@@ -663,7 +669,9 @@ def test_dns_rebinding_host_is_refused_before_the_token(serve: Any) -> None:
     token layer, with a value-free body (the offending host is never echoed)."""
     server = serve()
     for path, method, body in (("/state", "GET", None), ("/", "GET", None),
+                               ("/settings", "GET", None),
                                ("/turn", "POST", {"text": "hi"}),
+                               ("/settings", "POST", {"key": "gap_limit", "value": "5"}),
                                ("/events", "GET", None)):
         status, data = _host(
             server, method, path, "evil.example", token=server.token, body=body
@@ -696,7 +704,9 @@ def test_dns_rebinding_cross_product_matrix_blocks_every_drive_by(
 
     # (1) Public (rebound) Host → 400, regardless of a VALID token.
     for path, method, body in (("/", "GET", None), ("/state", "GET", None),
-                               ("/turn", "POST", {"text": "x"})):
+                               ("/settings", "GET", None),
+                               ("/turn", "POST", {"text": "x"}),
+                               ("/settings", "POST", {"key": "gap_limit", "value": "5"})):
         status, data = _host(
             server, method, path, f"rebound-to-loopback.example:{port}",
             token=server.token, body=body,
@@ -753,6 +763,12 @@ def test_cross_origin_post_is_refused_same_origin_and_ignored_when_absent(
         server, "POST", "/turn", {"text": "again"}, token=server.token
     )
     assert status == 202
+    # 202 means QUEUED, not executed (never-cancel) — wait for the pump to
+    # have run both turns before reading the list (under full-suite load the
+    # engine thread can legitimately still be mid-drain when we get here).
+    deadline = time.monotonic() + 10.0
+    while echo_turns != ["ok", "again"] and time.monotonic() < deadline:
+        time.sleep(0.02)
     assert echo_turns == ["ok", "again"]
 
 
@@ -911,6 +927,12 @@ def test_state_snapshot_serializes_through_the_engine_queue(
     assert snapshot["pending_present"] is False
     assert snapshot["gate_decision"] == "not_a_decision"
     assert snapshot["watch"] == {"configured": False, "enabled": False}
+    # TCK-WEB-005: the scan state rides the SAME state/1 tag (additive keys;
+    # the client reads by name and ignores the rest) — closed enum name + bool
+    # only, no progress value that could leak wallet size. This harness has no
+    # ScanFlow wired: "disabled".
+    assert snapshot["scan_state"] == "disabled"
+    assert snapshot["first_scan_complete"] is False
     # Value-free: no address/amount/xpub/txid-shaped value anywhere in the body.
     assert server.token.encode() not in data  # never via /state
     # The snapshot request is NOT a user turn — the pump answers it on the
@@ -986,6 +1008,253 @@ def test_state_snapshot_never_carries_values(
         assert secret not in text
     assert str(server.token) not in text
 
+
+
+# ------------------------------------------- /settings read+write (TCK-WEB-005)
+
+
+def _settings_server(
+    tmp_path: Path, name: str = "settings.db", *, monkeypatch: Any = None
+) -> Any:
+    """A real server over a REAL engine-owned store (constructed ON the
+    engine thread — the check_same_thread contract the pump relies on)."""
+    if monkeypatch is not None:  # hermetic env_override flags
+        monkeypatch.delenv(app.GAP_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.delenv(app.CHAIN_BASE_URL_ENV_VAR, raising=False)
+
+    def bootstrap() -> EngineContext:
+        return EngineContext(
+            loop=AgentLoop(
+                app.stub_generate,
+                {
+                    IntentName.RESPOND: app._respond_handler,
+                    IntentName.CLARIFY: app._clarify_handler,
+                },
+            ),
+            flow=TxFlow(),
+            session=app.SendSession(),
+            table={},
+            store=Store(tmp_path / name),
+        )
+
+    return serve_web(bootstrap, static_dir=tmp_path / "static")
+
+
+def test_settings_get_lists_the_allowlist_shape_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /settings = the UI-agnostic data model (TCK-UTXO-003 alignment):
+    every allowlisted key with its stored value, type, bounds, and the HONEST
+    effect flags. Only keys whose DB rung is read by live code today are
+    listed — invented keys would be writes with no reader."""
+    server = _settings_server(tmp_path, monkeypatch=monkeypatch)
+    try:
+        status, headers, data, _r = _request(
+            server, "GET", "/settings", token=server.token
+        )
+        assert status == 200
+        assert headers["content-type"] == "application/json"
+        snapshot = json.loads(data)
+        assert snapshot["schema"] == "settings/1"
+        assert snapshot["status"] == "ok"
+        entries = {entry["key"]: entry for entry in snapshot["settings"]}
+        assert set(entries) == {"gap_limit", "chain_base_url"}
+        gap = entries["gap_limit"]
+        assert gap["type"] == "int" and gap["value"] is None
+        assert gap["default"] == str(app.wallet_scan.DEFAULT_GAP_LIMIT)
+        assert gap["min"] == 1 and gap["max"] == 1000
+        # Honest flags: gap_limit re-resolves per scan; chain_base_url is
+        # CONFIG-only (ADR-0018) — the client is built at bootstrap.
+        assert gap["requires_restart"] is False
+        assert gap["env_override"] is False
+        chain = entries["chain_base_url"]
+        assert chain["type"] == "url" and chain["value"] is None
+        assert chain["requires_restart"] is True
+        assert server.token.encode() not in data
+    finally:
+        server.stop()
+
+
+def test_settings_post_writes_apply_and_refusals_are_value_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /settings = one allowlisted key per write, validated fail-closed
+    ON THE ENGINE THREAD. Applied changes re-read from the store (tool truth,
+    never the client's echo); refusals carry a value-free error (the submitted
+    value is never echoed) and leave EVERY unrelated key untouched."""
+    server = _settings_server(tmp_path, monkeypatch=monkeypatch)
+    try:
+        # Valid gap_limit write → applied, re-read entry confirms it.
+        status, _h, data, _r = _request(
+            server, "POST", "/settings",
+            {"key": "gap_limit", "value": "5"}, token=server.token,
+        )
+        assert status == 200
+        applied = json.loads(data)
+        assert applied["status"] == "applied"
+        assert applied["settings"] == [
+            {
+                "key": "gap_limit", "type": "int", "value": "5", "default": "20",
+                "min": 1, "max": 1000, "requires_restart": False,
+                "env_override": False,
+            }
+        ]
+        # Valid chain_base_url write goes through the store's typed writer.
+        status, _h, data, _r = _request(
+            server, "POST", "/settings",
+            {"key": "chain_base_url", "value": "http://127.0.0.1:3006/api"},
+            token=server.token,
+        )
+        assert status == 200
+        assert json.loads(data)["status"] == "applied"
+
+        # Invalid writes → 400, value-free, nothing echoed, nothing stored.
+        for bad, echo in (
+            ({"key": "gap_limit", "value": "abc"}, b"abc"),
+            ({"key": "gap_limit", "value": "0"}, b"'0'"),
+            ({"key": "gap_limit", "value": "1001"}, b"1001"),
+            # off-allowlist: refused WITHOUT naming the key back (fail-closed)
+            ({"key": "active_wallet_id", "value": "9"}, b"active_wallet_id"),
+            # the store typed writer refuses credentials — the password too
+            ({"key": "chain_base_url", "value": "http://user:hunter2@x"}, b"hunter2"),
+            ({"key": "chain_base_url", "value": "ftp://x"}, b"ftp://x"),
+            ({"key": "gap_limit", "value": "x" * 5000}, None),
+        ):
+            status, _h, data, _r = _request(
+                server, "POST", "/settings", bad, token=server.token
+            )
+            assert status == 400, bad
+            rejected = json.loads(data)
+            assert rejected.get("status") == "rejected", (bad, rejected)
+            if echo is not None:
+                assert echo not in data
+            if bad["key"] == "gap_limit" and len(bad["value"]) < 200:
+                assert rejected["key"] == "gap_limit"
+            if bad["key"] == "chain_base_url" and len(bad["value"]) < 60:
+                assert rejected["key"] == "chain_base_url"
+
+        # Malformed shapes → clean 400s (never a crash, never the engine).
+        status, _h, _d, _r = _request(
+            server, "POST", "/settings", {"key": 5, "value": "7"},
+            token=server.token,
+        )
+        assert status == 400
+        status, _h, _d, _r = _request(
+            server, "POST", "/settings", raw_body=b"{not json", token=server.token
+        )
+        assert status == 400
+
+        # Body cap applies here too (shared _read_body path).
+        big = json.dumps({"key": "gap_limit", "value": "y" * (webserver.MAX_BODY_BYTES + 10)})
+        status, _h, _d, _r = _request(
+            server, "POST", "/settings", raw_body=big.encode(), token=server.token
+        )
+        assert status == 413
+
+        # Zero effect on unrelated keys: both writes above still stand exactly
+        # as set (the invalid attempts changed nothing).
+        status, _h, data, _r = _request(
+            server, "GET", "/settings", token=server.token
+        )
+        assert status == 200
+        entries = {e["key"]: e for e in json.loads(data)["settings"]}
+        assert entries["gap_limit"]["value"] == "5"
+        assert entries["chain_base_url"]["value"] == "http://127.0.0.1:3006/api"
+    finally:
+        server.stop()
+
+
+def test_settings_endpoints_answer_503_when_the_engine_is_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No fallback shape for settings (a settings page showing guessed values
+    is worse than an honest failure): a dead engine → 503, value-free, on
+    BOTH endpoints — GET and the write path (which must never half-apply)."""
+    server = _settings_server(tmp_path)
+    try:
+        monkeypatch.setattr(server.handle, "error", RuntimeError("bootstrap died"))
+        status, _h, data, _r = _request(
+            server, "GET", "/settings", token=server.token
+        )
+        assert status == 503 and b"engine busy" in data
+        status, _h, _d, _r = _request(
+            server, "POST", "/settings", {"key": "gap_limit", "value": "5"},
+            token=server.token,
+        )
+        assert status == 503
+        monkeypatch.setattr(server.handle, "error", None)
+        # The refused write indeed never happened: the fresh read is pristine.
+        status, _h, data, _r = _request(
+            server, "GET", "/settings", token=server.token
+        )
+        entries = {e["key"]: e for e in json.loads(data)["settings"]}
+        assert entries["gap_limit"]["value"] is None
+    finally:
+        server.stop()
+
+
+# --------------------------- pre-first-scan refusal over the web turn (WEB-005)
+
+
+def test_web_send_pre_first_scan_gets_the_loading_refusal_as_text(
+    tmp_path: Path,
+) -> None:
+    """Deliverable 2 pin: the engine-side create_tx refusal (ADR-0022
+    decision 6) needs NO new server code — a web turn with the scan gate
+    still pending routes through the same full pipeline and the friendly,
+    dispatcher-owned line arrives as an SSE ``text`` event, verbatim."""
+
+    def bootstrap() -> EngineContext:
+        store = Store(tmp_path / "loading.db")
+        wd = WalletDescriptor.from_key(ZPUB)
+        wallet = store.create_wallet("default", wd.descriptor)
+        table = app.build_dispatch_table(
+            store,
+            wallet,
+            wd.parsed,
+            None,  # client: the refusal fires before ANY chain/store work
+            lambda: pytest.fail("refusal must precede any scan"),
+            fee_estimator=SimpleNamespace(
+                estimate=lambda target: SimpleNamespace(sat_per_vb=2)
+            ),
+            price_oracle=SimpleNamespace(
+                fresh=lambda: (_ for _ in ()).throw(PriceUnavailableError("stub")),
+                sats_to_usd=lambda sats, rate: None,
+            ),
+            scan_gate=app.StartupScan(enabled=True),  # pending = pre-first-scan
+        )
+        return EngineContext(
+            loop=AgentLoop(app.stub_generate, table),
+            flow=TxFlow(),
+            session=app.SendSession(),
+            table=table,
+            store=store,
+        )
+
+    server = serve_web(bootstrap, static_dir=tmp_path / "static")
+    try:
+        stream = _Stream(server)
+        stream.read_head()
+        status, _h, _d, _r = _request(
+            server, "POST", "/turn",
+            {"text": f"send 10000 sats to {SEND_RECIPIENT}"},
+            token=server.token,
+        )
+        assert status == 202
+        buf = stream.read_until(app.WALLET_LOADING_REFUSAL.encode(), timeout=30)
+        # The refusal rides a TEXT frame verbatim (no re-encoding, no model
+        # wording), and it is the friendly line, not an error dump.
+        assert f"data: {app.WALLET_LOADING_REFUSAL}\n\n".encode() in buf
+        # No transaction ever pended (the refusal is pre-flow, structural):
+        status, _h, data, _r = _request(
+            server, "GET", "/state", token=server.token
+        )
+        snapshot = json.loads(data)
+        assert snapshot["flow_state"] == "idle"
+        assert snapshot["pending_present"] is False
+        stream.close()
+    finally:
+        server.stop()
 
 
 # --------------------------------------------------------- run() wiring §5

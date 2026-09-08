@@ -7,7 +7,9 @@ Thin stdlib HTTP/SSE transport over the engine pump (:func:`localwallet.app`
   threads marshal bytes only — every mutation funnels through
   ``engine.submit()`` into the pump's full ``_run_turn`` path (a button
   utterance is a TYPED LINE, never a handler/flow bypass, §8), and reads
-  serialize through the engine queue too (GET /state, §3 consult F5).
+  serialize through the engine queue too (GET /state, §3 consult F5;
+  GET/POST /settings ride the same queue via ``SettingsRequest`` — the
+  transport never touches the store, TCK-WEB-005).
 * **SSE (§5):** fetch-compatible ``id:``/``event:``/``data:`` frames; a
   server-side event-id ring buffer replayed from ``Last-Event-ID`` — the
   replay backlog is streamed straight to the socket under the same lock
@@ -428,6 +430,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._events()
         elif path == "/state":
             self._state()
+        elif path == "/settings":
+            self._settings_get()
         elif path in ("/", "/index.html"):
             self._static("index.html", inject_token=True)
         elif path.startswith("/static/"):
@@ -447,14 +451,21 @@ class _Handler(BaseHTTPRequestHandler):
             self._drain_body()
             return
         path = self._path()
-        if path not in ("/turn", "/action"):
+        if path not in ("/turn", "/action", "/settings"):
             self._drain_body()
             self._send_json(404, {"error": "not found"})
             return
-        field = "text" if path == "/turn" else "utterance"
         body = self._read_body()
         if body is None:
             return  # 413 already sent
+        if path == "/settings":
+            # The ONLY write endpoint: a single allowlisted key, validated
+            # fail-closed ON THE ENGINE THREAD (TCK-WEB-005). The transport
+            # never touches the store — it marshals the request through the
+            # pump queue like every other state access.
+            self._settings_post(body)
+            return
+        field = "text" if path == "/turn" else "utterance"
         try:
             payload = json.loads(body)
             value = payload[field] if isinstance(payload, dict) else None
@@ -568,6 +579,61 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, {**base, "schema": STATE_SCHEMA_TRANSPORT_ONLY})
             return
         self._send_json(200, {**base, **typed})
+
+    # -- settings (TCK-WEB-005) ----------------------------------------------
+    def _settings_get(self) -> None:
+        # Reads serialize through the engine queue exactly like /state: the
+        # transport asks for the ALLOWLISTED settings snapshot and never touches
+        # the store. No transport-only fallback exists for settings (a settings
+        # page that shows stale/absent values is worse than an honest 503): a
+        # busy/dead engine answers 503 and the client retries. Value-free —
+        # only user-authored scalars (gap count, backend URL) appear, never
+        # wallet data; the token is never here.
+        settings = (
+            None
+            if self.engine.error is not None
+            else self.engine.request_settings(self.state_timeout_s)
+        )
+        if settings is None:
+            self._send_json(503, {"error": "engine busy"})
+            return
+        self._send_json(200, settings)
+
+    def _settings_post(self, body: bytes) -> None:
+        # ONE key per write (the engine applies + re-reads it, or refuses with
+        # a value-free error). HTTP maps the engine's closed status:
+        # applied→200, rejected→400, anything else (unavailable)→503.
+        try:
+            payload = json.loads(body)
+            key = payload["key"] if isinstance(payload, dict) else None
+            value = payload["value"] if isinstance(payload, dict) else None
+        except (ValueError, KeyError, TypeError):
+            self._send_json(
+                400, {"error": "expected JSON object with 'key' and 'value'"}
+            )
+            return
+        if not isinstance(key, str) or not isinstance(value, str):
+            self._send_json(400, {"error": "'key' and 'value' must be strings"})
+            return
+        # (No value checks here: ALL validation — allowlist, type, bounds,
+        # size cap — is engine-owned and fail-closed; the request body is
+        # already size-bounded by _read_body. The transport never duplicates
+        # a rule it cannot see the truth of.)
+        result = (
+            None
+            if self.engine.error is not None
+            else self.engine.request_settings(self.state_timeout_s, key, value)
+        )
+        if result is None:
+            # Dead engine: no apply ever happened. A TIMEOUT is the never-
+            # cancel semantics POST /turn already has: the queued write may
+            # still land when the engine drains — the client re-reads via GET
+            # rather than assuming failure (never a silent double-submit).
+            self._send_json(503, {"error": "engine busy"})
+            return
+        status = result.get("status")
+        code = {"applied": 200, "rejected": 400}.get(status, 503)
+        self._send_json(code, result)
 
     # -- static -------------------------------------------------------------
     def _static(self, rel: str, inject_token: bool = False) -> None:

@@ -494,6 +494,53 @@ def test_create_tx_refuses_pre_first_scan_then_works_after(wallet_store) -> None
     assert scans == []  # cursor present → no lazy scan needed either
 
 
+def test_state_snapshot_carries_scan_state_as_enum_name_and_bool(
+    wallet_store,
+) -> None:
+    """TCK-WEB-005 pin: the web ``/state`` snapshot exposes the startup-scan
+    state as the CLOSED gate name (disabled/pending/running/done/skipped) and
+    the DURABLE first-scan fact as a bool (the completed-scan cursor — it
+    covers the AUTO_SCAN=0 lazy path and survives restarts, unlike the
+    per-session gate). NOTHING else about the scan rides the snapshot: no
+    progress/counts — a percentage is a ratio against the wallet's address
+    count and would leak wallet size through the back door."""
+    store, wallet, _wd = wallet_store
+    worker = app.ChainWorker(None)  # client unused: no fetch ever runs
+    try:
+        flow = app.ScanFlow(store, wallet, worker, gap_limit=None)
+
+        def snap() -> dict[str, object]:
+            return app.build_state_snapshot(app.TxFlow(), app.SendSession(), None, flow)
+
+        assert snap()["scan_state"] == "disabled"
+        assert snap()["first_scan_complete"] is False
+
+        flow.gate = _gate("running")
+        assert snap()["scan_state"] == "running"
+        assert snap()["first_scan_complete"] is False  # cursor still absent
+
+        # The scan COMPLETES: gate flips AND the durable cursor lands.
+        flow.gate.mark_done()
+        store.set_sync_state(wallet.id, wallet_scan.CURSOR_KEY, '{"0": 24, "1": 24}')
+        assert snap()["scan_state"] == "done"
+        assert snap()["first_scan_complete"] is True
+
+        # Skipped (failed startup scan): state honest, first scan NOT complete
+        # (the durable cursor for THIS wallet is still present from `done` —
+        # the two fields are independent facts by design: gate = this session,
+        # complete = the wallet has EVER been scanned; the UI blocks sends on
+        # the gate, and only the absence of BOTH means "never scanned").
+        flow.gate = _gate("skipped")
+        assert snap()["scan_state"] == "skipped"
+        assert snap()["first_scan_complete"] is True
+
+        # A scan-less pump (scan=None, e.g. CLI bare harness): disabled/False.
+        bare = app.build_state_snapshot(app.TxFlow(), app.SendSession(), None)
+        assert bare["scan_state"] == "disabled" and bare["first_scan_complete"] is False
+    finally:
+        worker.stop()
+
+
 def test_freshness_fact_reaches_the_model_turn_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

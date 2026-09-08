@@ -321,9 +321,9 @@ def test_state_snapshot_request_is_answered_on_the_engine_thread(
     build_threads: list[int] = []
     real_build = app.build_state_snapshot
 
-    def spy_build(flow, session, watcher):
+    def spy_build(flow, session, watcher, scan=None):
         build_threads.append(threading.get_ident())
-        return real_build(flow, session, watcher)
+        return real_build(flow, session, watcher, scan)
 
     monkeypatch.setattr(app, "build_state_snapshot", spy_build)
     events: list[EngineEvent] = []
@@ -345,6 +345,11 @@ def test_state_snapshot_request_is_answered_on_the_engine_thread(
         "pending_present": False,
         "gate_decision": "not_a_decision",
         "watch": {"configured": False, "enabled": False},
+        # TCK-WEB-005: no scan flow wired → the closed "disabled" state, and
+        # no durable first-scan record. Additive keys under the UNCHANGED
+        # state/1 tag (the pinned client ignores unknown keys).
+        "scan_state": "disabled",
+        "first_scan_complete": False,
     }
     # Answered by the ENGINE thread, not the caller (main):
     assert build_threads == [handle.thread.ident]
@@ -381,6 +386,10 @@ def test_build_state_snapshot_is_value_free() -> None:
     snap = app.build_state_snapshot(flow, app.SendSession(), None)
     assert snap["flow_state"] == "created"
     assert snap["pending_present"] is True
+    # TCK-WEB-005 scan fields are a closed state NAME and a BOOL — never a
+    # count/percent (a progress value would leak wallet size indirectly).
+    assert snap["scan_state"] == "disabled"
+    assert snap["first_scan_complete"] is False
     dumped = repr(snap)
     for leak in ("REFSECRET", "654321", "bc1qLEAK", "cHNidP8"):
         assert leak not in dumped
