@@ -33,8 +33,24 @@
 ## MW-8: Phase 6 packaging prerequisites (later)
 - [ ] Apple Developer account (signed/notarized macOS builds) + Windows box (driver/packaging matrix, OQ10).
 
-## MW-10: Web-UI manual matrix (after TCK-WEB-004)
+## MW-10: Web-UI manual matrix (UNBLOCKED 2026-09-08 — full web UI live: buttons, settings panel, scan chip)
 - [ ] localhost matrix: macOS/Windows/Linux × VPN/proxy/firewall-on; both `localhost` and `127.0.0.1` URLs; multi-tab; kill-and-reconnect replay (Last-Event-ID); confirm/cancel/sign buttons vs CLI parity.
 
 ## MW-11: Web-UI browser check (after the WEB-002 client lands)
-- [ ] Open the launch URL in a real browser: page loads under CSP, token island works (no 401), a full turn renders (narration lines stream as text), action buttons fire canonical utterances, kill-the-server reload replays via Last-Event-ID, connection-status transitions, XSS spot-check (a narration containing <img onerror> renders as text). Complements the web-builder agent's static audit; feeds TCK-WEB-003/004.
+- [ ] Open the launch URL in a real browser: page loads under CSP, token island works (no 401), a full turn renders (narration lines stream as text), action buttons fire canonical utterances, kill-the-server reload replays via Last-Event-ID, connection-status transitions, XSS spot-check (a narration containing <img onerror> renders as text). Complements the web-builder agent's static audit; feeds TCK-WEB-003/004. NEW 2026-09-08, also exercise: settings panel (gear/toggle — change gap_limit, see chain_base_url restart + env-override notes, out-of-range rejection), scan-status chip during startup ("wallet loading" until first scan completes), create_tx refused with the friendly line if you try to send pre-first-scan, kill-server reload replays with the "some earlier events may be missing" notice.
+
+## MW-12: Publish to GitHub (TCK-DIST-003 prepared everything)
+- [ ] Follow docs/publish.md exactly: sanity-check the flagged strings first — decide whether `notible.local` (your LAN hostname, in HANDOFF/TASKS/ADR-0007/remote_runtime) and `192.168.1.50` (tests only) stay or get scrubbed BEFORE the public push; fill the SECURITY.md email placeholder; then push to github.com/unsaltedbutter-ai/local-wallet and flip repo settings (default branch, Actions on, branch protection).
+- Unblocks: the /install route on the landing page (it redirects to raw.githubusercontent on main).
+
+## MW-13: Deploy the landing page to unsaltedbutter.ai (TCK-DIST-002 staged the files)
+- [ ] Copy website/app/* into ~/unsaltedbutter/web per website/README.md (src/app vs app mapping table included), `npm run build`, `pm2 restart`. No nginx change expected (/ and /install already proxy to :3000).
+- [ ] Verify: page renders (dark mode too), copy button works on the HTTPS origin, `curl -fsSL https://unsaltedbutter.ai/install | bash` returns the script (after MW-12 push + only when install.sh is on main).
+- NOTE: files were authored blind (no Next.js on this machine) — if Next 16 complains, the likely culprits are metadata/route-handler conventions; report the build error and I'll fix.
+
+## MW-14: install.sh smoke on a clean machine (optional, after MW-12)
+- [ ] On any spare mac/Linux: `curl -fsSL https://unsaltedbutter.ai/install | bash` (or run ./install.sh from a fresh clone) with INSTALL_ROOT=<tmp>; confirm OS/arch detection, uv + Python 3.12 (<3.14) install, venv boot, model-download prompt defaults to NO, next-steps output. Report failures verbatim.
+
+## MW-15: Live run — new fee + UX behavior (the 2026-09-08 changes)
+- [ ] Start a send and check the new fee line: FAST should now bid near the mempool floor (your 0.3–0.5 sat/vB morning → expect 1 sat/vB, not 2) and the Pay line shows `@ $/BTC` instead of `rate age`. Say "faster" twice — the second time it should ASK for a sat/vB rate; answer with a number (e.g. "3") and the rebuild should go through the normal confirm flow. Also try an explicit rate from the start ("send 100000 sats to <addr> at 5 sat/vB"). Startup should NOT block: the prompt appears immediately with dots finishing in the background.
+- Report anything that looks wrong — fee estimator, ceiling ask, rate display, and scan behavior are all new today.
