@@ -76,7 +76,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from string import punctuation
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from embit import finalizer
 from embit.psbt import PSBT
@@ -173,6 +173,9 @@ from localwallet.wallet.descriptor import (
     parse_wallet_key,
 )
 
+if TYPE_CHECKING:  # circular at runtime: ui.web.server imports this module
+    from localwallet.ui.web.server import WebServer
+
 __all__ = [
     "AUTO_SCAN_ENV_VAR",
     "DEFAULT_HISTORY_LIMIT",
@@ -185,6 +188,7 @@ __all__ = [
     "PRIVACY_INDICATOR_OWN_NODE_REMOTE",
     "SIGNER_DIR_ENV_VAR",
     "SIGNER_ENV_VAR",
+    "UI_ENV_VAR",
     "ZPUB_ENV_VAR",
     "SendSession",
     "SignerSelection",
@@ -202,6 +206,12 @@ ZPUB_ENV_VAR: Final[str] = "LOCALWALLET_ZPUB"
 #: Environment variable opting out of the startup scan (``"0"`` disables;
 #: any other value — including unset — keeps the default on).
 AUTO_SCAN_ENV_VAR: Final[str] = "LOCALWALLET_AUTO_SCAN"
+
+#: Environment variable selecting the UI transport (TCK-WEB-002, ADR-0024
+#: §1/§11): ``"web"`` serves the opt-in localhost web UI instead of the
+#: REPL. The CLI default is unchanged (unset/any other value = REPL); the
+#: ``--web`` flag overrides this.
+UI_ENV_VAR: Final[str] = "LOCALWALLET_UI"
 
 #: Dev knob (TCK-CFG-001): overrides the per-scan address gap limit
 #: (``LOCALWALLET_GAP_LIMIT``). An integer 1..1000; validated fail-closed at
@@ -2623,6 +2633,7 @@ def run(
     flow: TxFlow | None = None,
     generate_fn: GenerateFn | None = None,
     node_detect_fn: Callable[[], LocalNodeReport] | None = None,
+    on_web_server: Callable[[WebServer], None] | None = None,
 ) -> int:
     """Wire the application from ``argv``/environment and run the REPL.
 
@@ -2671,6 +2682,10 @@ def run(
             handler. Defaults to the real :func:`detect_local_nodes` over
             the resolved settings (advise-only; honors
             LOCALWALLET_NODE_DETECTION_ENABLED).
+        on_web_server: Web mode only (test seam, TCK-WEB-002): called with
+            the started :class:`~localwallet.ui.web.server.WebServer` once
+            the engine bootstraps and the launch lines are printed, before
+            ``run`` parks on the server.
 
     Returns:
         Process exit code: ``0`` on normal exit (including ``exit``,
@@ -2764,18 +2779,121 @@ def run(
         output_fn(f"Configuration error: {exc}")
         return 2
 
+    # TCK-WEB-002 (ADR-0024 §1/§11): the web UI is opt-in and shares every
+    # config decision above; the split is only at the input/output seam —
+    # _run_web runs the SAME wiring inside start_engine's engine-thread
+    # bootstrap (closing TCK-WEB-001's deferred deviation) and serves the
+    # loopback HTTP/SSE front instead of the REPL.
+    if args.web or os.environ.get(UI_ENV_VAR, "").strip().lower() == "web":
+        return _run_web(
+            parsed=parsed,
+            descriptor=descriptor,
+            signer_selection=signer_selection,
+            settings=settings,
+            env_gap=env_gap,
+            rescan=args.rescan,
+            flow=flow,
+            generate=generate,
+            node_detect_fn=node_detect_fn,
+            output_fn=output_fn,
+            on_web_server=on_web_server,
+        )
+
+    try:
+        wiring = _wire(
+            parsed=parsed,
+            descriptor=descriptor,
+            signer_selection=signer_selection,
+            settings=settings,
+            env_gap=env_gap,
+            rescan=args.rescan,
+            flow=flow,
+            generate=generate,
+            node_detect_fn=node_detect_fn,
+            output_fn=output_fn,
+        )
+    except _WiringError as exc:
+        output_fn(str(exc))
+        return 2
+
+    try:
+        _repl(
+            wiring.loop,
+            output_fn,
+            input_fn,
+            flow=wiring.flow,
+            session=wiring.session,
+            watcher=wiring.watcher,
+            client=wiring.client,
+            table=wiring.table,
+        )
+    except KeyboardInterrupt:
+        pass  # clean exit on Ctrl-C
+    finally:
+        wiring.client.close()
+        wiring.store.close()
+        # The remote debug bridge also owns a client (httpx) — close it
+        # alongside the Esplora client when it exposes close().
+        close = getattr(generate, "close", None)
+        if callable(close):
+            close()
+    return 0
+
+
+class _WiringError(Exception):
+    """A startup wiring failure that pre-web ``run`` exited 2 on; carries
+    the exact user-facing (value-free) line. Raised from :func:`_wire` so
+    both transports report it identically (CLI inline, web via the engine
+    bootstrap)."""
+
+
+@dataclass
+class _Wiring:
+    """The stateful engine pieces :func:`_wire` builds (ADR-0024 §3: in web
+    mode these are all constructed ON the engine thread — the Store's
+    ``check_same_thread`` is the guard)."""
+
+    store: Store
+    client: EsploraClient
+    loop: AgentLoop
+    flow: TxFlow
+    session: SendSession
+    table: DispatchTable
+    watcher: IncomingWatcher | None
+
+
+def _wire(
+    *,
+    parsed: ParsedKey,
+    descriptor: WalletDescriptor,
+    signer_selection: SignerSelection,
+    settings: Settings,
+    env_gap: int | None,
+    rescan: bool,
+    flow: TxFlow | None,
+    generate: ModelRuntime | GenerateFn | RemoteOpenAIRuntime,
+    node_detect_fn: Callable[[], LocalNodeReport] | None,
+    output_fn: Callable[[str], None],
+) -> _Wiring:
+    """Build store → wallet profile → chain client → watch → startup scan →
+    dispatch table → agent loop (moved verbatim from the pre-web ``run``).
+
+    The CLI calls this on the MAIN thread (behavior byte-identical to the
+    old inline block); the web UI calls it INSIDE the
+    :func:`start_engine` bootstrap — the engine thread (ADR-0024 §3).
+    Config-fatal failures raise :class:`_WiringError` with the exact line
+    the pre-web REPL printed before its ``return 2``.
+    """
     try:
         store = Store(settings.store_path)
         try:
             wallet_row = _resolve_or_create_wallet(store, descriptor)
             store.set_active_wallet(wallet_row.id)
         except (StoreError, sqlite3.Error) as exc:
-            output_fn(f"Could not prepare the wallet store: {exc}")
             store.close()
-            return 2
+            raise _WiringError(f"Could not prepare the wallet store: {exc}") from exc
     except (StoreError, sqlite3.Error, OSError) as exc:
-        output_fn(f"Could not open the wallet store: {exc}")
-        return 2
+        raise _WiringError(f"Could not open the wallet store: {exc}") from exc
 
     client = EsploraClient(
         timeout_s=settings.request_timeout_s,
@@ -2825,7 +2943,7 @@ def run(
         store,
         client,
         wallet_row,
-        rescan_requested=args.rescan,
+        rescan_requested=rescan,
         output_fn=output_fn,
         gap_limit=env_gap,
     )
@@ -2860,25 +2978,120 @@ def run(
         seconds_since_last_block_fn=seconds_since_last_block_fn,
     )
     loop = AgentLoop(generate, table)
+    return _Wiring(
+        store=store,
+        client=client,
+        loop=loop,
+        flow=tx_flow,
+        session=session,
+        table=table,
+        watcher=watcher,
+    )
+
+
+def _run_web(
+    *,
+    parsed: ParsedKey,
+    descriptor: WalletDescriptor,
+    signer_selection: SignerSelection,
+    settings: Settings,
+    env_gap: int | None,
+    rescan: bool,
+    flow: TxFlow | None,
+    generate: ModelRuntime | GenerateFn | RemoteOpenAIRuntime,
+    node_detect_fn: Callable[[], LocalNodeReport] | None,
+    output_fn: Callable[[str], None],
+    on_web_server: Callable[[WebServer], None] | None = None,
+) -> int:
+    """The web launch (TCK-WEB-002, ADR-0024 §1/§3/§11).
+
+    The full startup wiring flows through :func:`start_engine` (closing
+    TCK-WEB-001's deferred deviation): ``bootstrap`` runs ``_wire`` ON the
+    engine thread — the Store's ``check_same_thread`` pins construction
+    there — and the server owns the one engine instance behind the loopback
+    HTTP/SSE front. Prints the launch URL and the per-launch token on
+    SEPARATE lines (the token is copyable but NEVER embedded in a URL —
+    ADR-0024 §6); then parks until Ctrl-C. Exit codes mirror the CLI:
+    ``0`` normal, ``2`` wiring/config failure (surfaced from the bootstrap).
+    """
+    # Late import: ui.web.server imports this module (no cycle at runtime).
+    from localwallet.ui.web.server import serve_web
+
+    booted = threading.Event()
+    startup: dict[str, BaseException | None] = {"exc": None}
+    wired: dict[str, _Wiring] = {}
+
+    def bootstrap() -> EngineContext:
+        try:
+            wiring = _wire(
+                parsed=parsed,
+                descriptor=descriptor,
+                signer_selection=signer_selection,
+                settings=settings,
+                env_gap=env_gap,
+                rescan=rescan,
+                flow=flow,
+                generate=generate,
+                node_detect_fn=node_detect_fn,
+                output_fn=output_fn,
+            )
+        except BaseException as exc:
+            startup["exc"] = exc
+            booted.set()
+            raise
+        wired["wiring"] = wiring
+        booted.set()
+        return EngineContext(
+            loop=wiring.loop,
+            flow=wiring.flow,
+            session=wiring.session,
+            table=wiring.table,
+            watcher=wiring.watcher,
+            client=wiring.client,
+        )
 
     try:
-        _repl(
-            loop,
-            output_fn,
-            input_fn,
-            flow=tx_flow,
-            session=session,
-            watcher=watcher,
-            client=client,
-            table=table,
-        )
+        server = serve_web(bootstrap)
+    except OSError:
+        # A bind failure (address/port unavailable) is the only startup
+        # failure serve_web can raise. Exit 2 with the clean, VALUE-FREE
+        # message — never echo the socket error (it carries the address),
+        # exactly how every other config-fatal path reports. The engine
+        # thread bootstrap may have spawned is a daemon: it dies with this
+        # exiting process, so there is nothing to tear down here.
+        output_fn("Could not start the web server.")
+        return 2
+    try:
+        # Same startup order the CLI user sees: banner + startup scan finish
+        # before the URL prints (a blocking startup scan is WEB-005's
+        # problem; turns queued meanwhile are served in order).
+        booted.wait()
+        exc = startup["exc"]
+        if exc is not None:
+            output_fn(
+                str(exc)
+                if isinstance(exc, _WiringError)
+                else "Could not start the engine."
+            )
+            return 2
+        output_fn(f"Web UI: {server.url}")
+        output_fn(f"Token: {server.token}")
+        if on_web_server is not None:
+            on_web_server(server)
+        server.wait()
     except KeyboardInterrupt:
-        pass  # clean exit on Ctrl-C
+        pass  # clean exit on Ctrl-C (mirrors the CLI)
     finally:
-        client.close()
-        store.close()
-        # The remote debug bridge also owns a client (httpx) — close it
-        # alongside the Esplora client when it exposes close().
+        server.stop()
+        wiring = wired.get("wiring")
+        if wiring is not None:
+            # server.stop() pushed QUIT and joined the engine thread; the
+            # httpx-backed client has no thread affinity, closing here is
+            # fine. The Store is deliberately NOT closed from this thread
+            # (check_same_thread pins it to the engine): the store is
+            # autocommit (isolation_level=None), everything written was
+            # already durable, and the connection dies with the process.
+            wiring.client.close()
         close = getattr(generate, "close", None)
         if callable(close):
             close()
@@ -3099,6 +3312,14 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "signing backend for the send flow: 'file' (airgap transfer "
             "folder, default) or 'hwi' (USB hardware wallet); overrides "
             "LOCALWALLET_SIGNER"
+        ),
+    )
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help=(
+            "serve the opt-in localhost web UI (ADR-0024) instead of the "
+            "REPL; overrides LOCALWALLET_UI=web"
         ),
     )
     return parser.parse_args(list(argv) if argv is not None else None)
