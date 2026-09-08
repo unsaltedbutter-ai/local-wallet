@@ -1591,10 +1591,11 @@ def _make_sign_tx_handler(
        description of the approved transaction the signed result must
        match exactly.
     3. Signer dispatch: the app-configured backend (``selection.kind``,
-       from ``--signer`` / :data:`SIGNER_ENV_VAR`) is the default; the
-       model's optional closed-enum ``signer`` param may pick the other
-       kind (handler policy per the protocol contract — the model never
-       touches signer configuration, only the enum choice).
+       from ``--signer`` / :data:`SIGNER_ENV_VAR`) is AUTHORITATIVE
+       (TCK-HW-004). The model's optional closed-enum ``signer`` param is
+       advisory ONLY and never overrides the user's configured backend — a
+       mismatch surfaces a value-free guidance note naming the configured
+       kind (never the model's), never a re-route.
        - **file** (ADR-0014): the EXPECTED signed file is the
          deterministic ADR-0014 name derived from the confirmed
          ``tx_ref`` (``FilePsbtSigner.signed_import_path``); the model's
@@ -1670,8 +1671,24 @@ def _make_sign_tx_handler(
                 "detail": "confirmed transaction record is inconsistent with its staged psbt",
             }
 
-        # 3. Signer dispatch.
-        kind = params.signer if params.signer is not None else selection.kind
+        # 3. Signer dispatch (TCK-HW-004): the app-configured backend is
+        # AUTHORITATIVE. The model's optional closed-enum ``signer`` param
+        # never reroutes the user's airgap-vs-device security choice — it is
+        # advisory only. If the model named a DIFFERENT kind than the
+        # configured one, surface a value-free guidance line naming the
+        # configured kind (never the model's text); the configured kind
+        # still runs.
+        kind = selection.kind
+        if params.signer is not None and params.signer != selection.kind:
+            conflict_note = f"Using your configured signer ({selection.kind})."
+        else:
+            conflict_note = None
+
+        def _out(result: dict[str, object]) -> dict[str, object]:
+            if conflict_note is not None and "guidance" not in result:
+                result["guidance"] = conflict_note
+            return result
+
         if kind == SIGNER_KIND_FILE:
             file_signer = (
                 signer_override
@@ -1687,20 +1704,20 @@ def _make_sign_tx_handler(
                         signed_path, expected_tx_ref=confirmed.tx_ref
                     )
                 except SignerError as exc:
-                    return {"error": "import_failed", "detail": str(exc)}
+                    return _out({"error": "import_failed", "detail": str(exc)})
             else:
                 try:
                     exported = file_signer.export_unsigned(
                         confirmed.psbt_base64, confirmed.tx_ref
                     )
                 except SignerError as exc:
-                    return {"error": "export_failed", "detail": str(exc)}
-                return {
+                    return _out({"error": "export_failed", "detail": str(exc)})
+                return _out({
                     "error": "signed_file_missing",
                     "unsigned_path": str(exported.unsigned_path),
                     "signed_filename": signed_path.name,
                     "signer_name": file_signer.name,
-                }
+                })
         else:
             device_signer = (
                 signer_override
@@ -1713,29 +1730,29 @@ def _make_sign_tx_handler(
                 signed_result = device_signer.sign_unsigned(confirmed.psbt_base64)
             except DeviceError as exc:
                 # guidance is code-owned §10 text from the error hierarchy.
-                return {"error": "device_error", "guidance": str(exc)}
+                return _out({"error": "device_error", "guidance": str(exc)})
             except SignerError as exc:
-                return {"error": "signer_error", "detail": str(exc)}
+                return _out({"error": "signer_error", "detail": str(exc)})
 
         # 4. Revalidation gate — mismatch is a HARD STOP, flow untouched.
         try:
             revalidated = revalidate_signed_psbt(signed_result.psbt_base64, intended)
         except TamperedPsbtError as exc:
-            return {"error": "revalidation_failed", "detail": str(exc)}
+            return _out({"error": "revalidation_failed", "detail": str(exc)})
 
         # 5. Record the signed PSBT (CONFIRMED → SIGNED).
         try:
             signed = flow.mark_signed(params.tx_ref, signed_result.psbt_base64)
         except FlowError as exc:  # unreachable single-threaded after the gate
-            return {"error": "sign_refused", "detail": str(exc)}
+            return _out({"error": "sign_refused", "detail": str(exc)})
 
-        return {
+        return _out({
             "status": "signed",
             "tx_ref": signed.tx_ref,
             "txid": revalidated.txid,
             "signer_name": signed_result.signer_name,
             "checksum_verified": signed_result.checksum_verified,
-        }
+        })
 
     return handler
 

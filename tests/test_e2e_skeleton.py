@@ -243,6 +243,31 @@ class ScriptedGenerate:
         return GARBAGE
 
 
+def _funding_txs(address: str, utxos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Esplora-truthful txs mirror for a scripted utxo payload (TCK-SCAN-001).
+
+    An address holding UTXOs necessarily has their funding transactions in
+    its history; the scan no longer fetches ``/utxo`` for empty-history
+    addresses, so fixtures that script only utxos must serve the matching
+    funding txs too. One entry per utxo, mirroring its confirmed/height
+    status; fee absent (tolerated as ``None``, never fabricated).
+    """
+    entries: list[dict[str, Any]] = []
+    for utxo in utxos:
+        status = utxo.get("status", {})
+        entries.append(
+            _tx_entry(
+                utxo["txid"],
+                vout_addresses=(address,),
+                fee=None,
+                confirmed=bool(status.get("confirmed")),
+                height=status.get("block_height"),
+                block_time=None,
+            )
+        )
+    return entries
+
+
 def _scan_handler(
     recorded: list[httpx.Request],
     *,
@@ -253,7 +278,13 @@ def _scan_handler(
     txs_status: int = 200,
     utxo_status: int = 200,
 ) -> Callable[[httpx.Request], httpx.Response]:
-    """MockTransport handler serving per-address txs/utxo payloads + tip."""
+    """MockTransport handler serving per-address txs/utxo payloads + tip.
+
+    Addresses with scripted utxos but no scripted txs get the matching
+    funding-tx mirror (TCK-SCAN-001: the scan skips ``/utxo`` for
+    empty-history addresses, so utxo-only fixtures must be chain-truthful
+    about their history too).
+    """
 
     txs_by_addr = txs_by_addr or {}
     utxos_by_addr = utxos_by_addr or {}
@@ -268,7 +299,11 @@ def _scan_handler(
         if kind == "txs":
             if txs_status != 200:
                 return httpx.Response(txs_status, json=None)
-            return httpx.Response(200, json=txs_by_addr.get(address, []))
+            if address in txs_by_addr:
+                return httpx.Response(200, json=txs_by_addr[address])
+            return httpx.Response(
+                200, json=_funding_txs(address, utxos_by_addr.get(address, []))
+            )
         if kind == "utxo":
             if utxo_status != 200:
                 return httpx.Response(utxo_status, json=None)
@@ -662,7 +697,6 @@ def test_balance_end_to_end_agent_to_dispatcher_to_scan_to_store() -> None:
     allowlist dispatch → get_balance handler → lazy scan (mock chain) →
     store → totals."""
     addr0, addr1 = derive_fixture_addresses(2)
-    change0, change1 = derive_fixture_addresses(2, branch=1)
     table, store, wallet, client, recorded = _build_table(
         lambda rec: _scan_handler(rec, utxos_by_addr={addr0: UTXOS_ADDR0, addr1: UTXOS_ADDR1})
     )
@@ -681,12 +715,14 @@ def test_balance_end_to_end_agent_to_dispatcher_to_scan_to_store() -> None:
         "addresses_scanned": 2,  # addresses WITH utxos (ticket contract)
         "tip_height": TIP_HEIGHT,
     }
-    # The lazy scan really hit the chain adapter: one txs + one utxo call
-    # per window address (gap 2 → 2 per branch) plus one tip request.
+    # The lazy scan really hit the chain adapter: one txs call per window
+    # address, utxo calls only for addresses with txs (TCK-SCAN-001:
+    # addr0/addr1 got funding-tx mirrors; the empty history of
+    # change0/change1 skips their /utxo fetch) plus one tip request.
     utxo_paths = {r.url.path for r in recorded if r.url.path.endswith("/utxo")}
     assert utxo_paths == {
         f"/api/address/{a}/utxo"
-        for a in (addr0, addr1, change0, change1)
+        for a in (addr0, addr1)
     }
     assert any(r.url.path.endswith("/blocks/tip") for r in recorded)
     # The scripted model received the real envelope grammar via the seam.
@@ -996,7 +1032,11 @@ def test_utxos_empty_store_prints_no_unspent_outputs() -> None:
 def test_handler_chain_error_surfaces_as_result_without_raising() -> None:
     addr0, _addr1 = derive_fixture_addresses(2)
     table, store, _wallet, client, _recorded = _build_table(
-        lambda rec: _scan_handler(rec, utxo_status=500)
+        # Fund addr0 so the scan actually reaches (and trips on) /utxo
+        # — empty-history addresses are never fetched (TCK-SCAN-001).
+        lambda rec: _scan_handler(
+            rec, utxos_by_addr={addr0: [SEND_UTXO]}, utxo_status=500
+        )
     )
 
     envelope: Envelope = validate_payload(GET_BALANCE_JSON)
@@ -1021,8 +1061,13 @@ def _wallet_id(store: Store) -> int:
 
 
 def test_chain_error_flows_through_loop_as_ok_with_error_result() -> None:
+    addr0 = derive_fixture_addresses(1)[0]
     table, store, _wallet, client, _recorded = _build_table(
-        lambda rec: _scan_handler(rec, utxo_status=503)
+        # Funded addr0 keeps the /utxo endpoint on the scan path
+        # (TCK-SCAN-001: empty-history addresses are never fetched).
+        lambda rec: _scan_handler(
+            rec, utxos_by_addr={addr0: [SEND_UTXO]}, utxo_status=503
+        )
     )
 
     turn = AgentLoop(ScriptedGenerate([GET_BALANCE_JSON]), table).run(
@@ -1181,7 +1226,9 @@ def test_startup_scan_populates_store_then_balance_reads_it(
     assert ZPUB not in joined
     assert all(addr not in joined for addr in (addr0, addr1))
     assert wd.descriptor not in joined
-    # 9 requests: 1 tip + (2 txs + 2 utxos) per branch at gap 2.
+    # 9 requests: 1 tip + 6 txs (gap-2 window extends past the two funded
+    # branch-0 addresses) + 2 utxo (only the addresses with txs,
+    # TCK-SCAN-001).
     assert len(recorded) == 9
     # The store holds exactly the pre-seeded wallet row + scanned state.
     with Store(store_path) as store:
@@ -1224,7 +1271,8 @@ def test_repl_end_to_end_with_stub_llm_prints_verbatim_balance(
     assert f"tip height {TIP_HEIGHT}" in joined
     assert ZPUB not in joined
     assert all(addr not in joined for addr in (addr0, addr1))
-    # Lazy scan only (auto-scan off): 1 tip + 4 txs + 4 utxos.
+    # Lazy scan only (auto-scan off): 1 tip + 6 txs + 2 utxo (funded
+    # addresses only — TCK-SCAN-001 skip for the empty-history rest).
     assert len(recorded) == 9
 
 
@@ -1618,7 +1666,12 @@ def test_repl_reports_chain_unavailable(
 ) -> None:
     store_path = _store_path(tmp_path)
     _preset_store(store_path)
-    handler = _scan_handler([], utxo_status=503)
+    # addr0 funded: the /utxo failure stays on the scan path (addresses
+    # with empty history are never fetched, TCK-SCAN-001).
+    handler = _scan_handler(
+        [], utxos_by_addr={derive_fixture_addresses(1)[0]: [SEND_UTXO]},
+        utxo_status=503,
+    )
 
     code, outputs = _run_captured(
         ["--stub-llm", "--zpub", ZPUB],
@@ -2144,7 +2197,8 @@ def test_env_gap_limit_walk_and_precedence_over_db(
     """LOCALWALLET_GAP_LIMIT=2 makes the startup scan walk a 2-gap window,
     and the env wins over a wider DB ``gap_limit`` setting. Probe-count
     assertion over MockTransport: an empty wallet with gap 2 → indices 0..1
-    per branch = 2 txs + 2 utxo probes × 2 branches."""
+    per branch = 4 txs probes; zero /utxo fetches — empty history means no
+    UTXO (TCK-SCAN-001)."""
     store_path = _store_path(tmp_path)
     _preset_store(store_path, gap_limit=5)  # DB key says 5 — env must win
     monkeypatch.setenv(GAP_LIMIT_ENV_VAR, "2")
@@ -2163,15 +2217,16 @@ def test_env_gap_limit_walk_and_precedence_over_db(
     assert code == 0
     txs_probes = [r for r in recorded if r.url.path.endswith("/txs")]
     utxo_probes = [r for r in recorded if r.url.path.endswith("/utxo")]
-    assert len(txs_probes) == len(utxo_probes) == 4  # 2 branches × gap-2 window
+    assert len(txs_probes) == 4  # 2 branches × gap-2 window
+    assert len(utxo_probes) == 0  # TCK-SCAN-001: nothing to fetch
 
 
 def test_db_gap_limit_used_when_env_unset(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """With LOCALWALLET_GAP_LIMIT unset the DB ``gap_limit`` setting is
-    honored unchanged: gap 2 → indices 0..1 per branch (4 txs + 4 utxo
-    probes)."""
+    honored unchanged: gap 2 → indices 0..1 per branch (4 txs probes,
+    0 utxo — TCK-SCAN-001 skip for the empty-history wallet)."""
     store_path = _store_path(tmp_path)
     _preset_store(store_path, gap_limit=TEST_GAP)  # DB key = 2
     monkeypatch.delenv(GAP_LIMIT_ENV_VAR, raising=False)
@@ -2190,7 +2245,8 @@ def test_db_gap_limit_used_when_env_unset(
     assert code == 0
     txs_probes = [r for r in recorded if r.url.path.endswith("/txs")]
     utxo_probes = [r for r in recorded if r.url.path.endswith("/utxo")]
-    assert len(txs_probes) == len(utxo_probes) == 4  # 2 branches × gap-2 window
+    assert len(txs_probes) == 4  # 2 branches × gap-2 window
+    assert len(utxo_probes) == 0  # TCK-SCAN-001: nothing to fetch
 
 
 def test_repl_without_zpub_fails_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2252,7 +2308,12 @@ def test_startup_chain_down_repl_still_starts_and_balance_degrades(
     and the REPL still starts; the balance handler's lazy scan fails and
     surfaces the graceful chain_unavailable error path."""
     store_path = _store_path(tmp_path)
-    handler = _scan_handler([], utxo_status=503)
+    # addr0 funded: the /utxo failure stays on the scan path (addresses
+    # with empty history are never fetched, TCK-SCAN-001).
+    handler = _scan_handler(
+        [], utxos_by_addr={derive_fixture_addresses(1)[0]: [SEND_UTXO]},
+        utxo_status=503,
+    )
 
     code, outputs = _run_captured(
         ["--stub-llm", "--zpub", ZPUB],
@@ -2348,8 +2409,11 @@ def _send_chain_handler(
 ) -> Callable[[httpx.Request], httpx.Response]:
     """MockTransport handler for send-flow tests.
 
-    Serves per-address txs (always empty — keeps the scan window at the
-    gap) and utxo payloads, plus ``/v1/fees/recommended``,
+    Serves per-address txs (the funding-tx mirror of the scripted utxo
+    payload, TCK-SCAN-001: an address with UTXOs always has their funding
+    transactions in its history — the scan no longer fetches ``/utxo``
+    for empty-history addresses) and utxo payloads, plus
+    ``/v1/fees/recommended``,
     ``/v1/prices``, the Phase 3 broadcast POST (``/tx``) and the tx
     status GET (``/tx/<txid>/status``). ``state`` is a mutable injection
     point for the tests:
@@ -2410,7 +2474,9 @@ def _send_chain_handler(
         parts = path.rstrip("/").split("/")
         address, kind = parts[-2], parts[-1]
         if kind == "txs":
-            return httpx.Response(200, json=[])
+            return httpx.Response(
+                200, json=_funding_txs(address, utxos_by_addr.get(address, []))
+            )
         if kind == "utxo":
             return httpx.Response(200, json=utxos_by_addr.get(address, []))
         return httpx.Response(404, json=None)
@@ -3662,8 +3728,11 @@ def test_send_lifecycle_file_signer_full_happy_path(
         wallet_row = store.get_wallet_by_name("default")
         assert wallet_row is not None
         rows = store.get_txs_for_wallet(wallet_row.id)
+        # The funded UTXO's funding tx rides along in history (the mock
+        # chain serves the truthful mirror, TCK-SCAN-001).
         assert [(r.txid, r.height, r.direction, r.fee_sats) for r in rows] == [
-            (expected_txid, None, "out", SEND_FEE_SATS)
+            (expected_txid, None, "out", SEND_FEE_SATS),
+            ("d" * 64, None, "in", None),
         ]
 
 
@@ -4178,6 +4247,92 @@ def test_send_lifecycle_sign_tx_result_contract_and_tamper_value_free(
     _store.close()
 
 
+def _file_sign_ready(
+    table: dict[IntentName, Any],
+    session: SendSession,
+    *,
+    signer_param: str | None,
+) -> tuple[str, Any]:
+    """Drive the send flow to CONFIRMED and run sign_tx once, returning
+    ``(tx_ref, sign_result)`` — the sign turn carries an optional
+    model-emitted ``signer`` param (TCK-HW-004 matrix)."""
+    created = table[IntentName.CREATE_TX](validate_payload(_create_tx_envelope_json()))
+    tx_ref = created["tx_ref"]
+    session.gate_decision = GateDecision.CONFIRM
+    table[IntentName.CONFIRM_TX](
+        validate_payload(
+            json.dumps({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": tx_ref}})
+        )
+    )
+    params: dict[str, Any] = {"tx_ref": tx_ref}
+    if signer_param is not None:
+        params["signer"] = signer_param
+    sign_env = validate_payload(
+        json.dumps({"v": 0, "intent": "sign_tx", "params": params})
+    )
+    return tx_ref, table[IntentName.SIGN_TX](sign_env)
+
+
+def test_signer_config_is_authoritative_over_model_signer_param(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-HW-004: the app-configured signer (env) is AUTHORITATIVE. A
+    model-emitted ``signer:"hwi"`` param never reroutes the airgap-vs-device
+    choice: the configured FILE backend runs (export to
+    ``LOCALWALLET_SIGNER_DIR`` with ADR-0014 naming + sidecar),
+    ``HwiUsbSigner`` is never constructed, and the result carries a
+    value-free guidance note naming the configured kind (never the model's)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    transfer = tmp_path / "transfer"
+    monkeypatch.setenv("LOCALWALLET_SIGNER", "file")
+    monkeypatch.setenv("LOCALWALLET_SIGNER_DIR", str(transfer))
+
+    constructed: list[tuple[Any, Any]] = []
+
+    def spy(fp: Any, account_path: Any) -> Any:
+        constructed.append((fp, account_path))
+        raise AssertionError("HwiUsbSigner must not run when file is configured")
+
+    monkeypatch.setattr(app_module, "HwiUsbSigner", spy)
+    table, _store, _wallet, client, _recorded, flow, session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]}),
+    )
+    _tx_ref, result = _file_sign_ready(table, session, signer_param="hwi")
+
+    assert result["error"] == "signed_file_missing"  # configured file ran
+    assert constructed == []  # HwiUsbSigner never constructed
+    assert flow.state is TxFlowStatus.CONFIRMED
+    exported = sorted(transfer.glob("localwallet-unsigned-*.psbt.b64"))
+    assert len(exported) == 1
+    assert (transfer / (exported[0].name + ".sha256")).exists()  # ADR-0014 sidecar
+    # Value-free guidance names the CONFIGURED kind, not the model's "hwi".
+    assert result["guidance"] == "Using your configured signer (file)."
+    assert "hwi" not in result["guidance"]
+    client.close()
+    _store.close()
+
+
+def test_signer_param_matching_config_runs_file_without_guidance_noise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-HW-004: a model ``signer:"file"`` param that MATCHES the
+    configured file kind runs the file branch with NO guidance note."""
+    addr0 = derive_fixture_addresses(1)[0]
+    transfer = tmp_path / "transfer"
+    monkeypatch.setenv("LOCALWALLET_SIGNER", "file")
+    monkeypatch.setenv("LOCALWALLET_SIGNER_DIR", str(transfer))
+    table, _store, _wallet, client, _recorded, flow, session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]}),
+    )
+    _tx_ref, result = _file_sign_ready(table, session, signer_param="file")
+
+    assert result["error"] == "signed_file_missing"
+    assert "guidance" not in result  # no noise when the param agrees
+    assert flow.state is TxFlowStatus.CONFIRMED
+    client.close()
+    _store.close()
+
+
 def test_send_lifecycle_tx_status_unknown_vs_chain_error(tmp_path: Path) -> None:
     """unknown_tx is reserved for the flow's own broadcast txid (404 =
     eventual consistency); the same 404 for any other txid is the generic
@@ -4459,7 +4614,12 @@ def test_run_prints_type_a_message_last_when_startup_scan_fails(
     """TCK-UX-001 failure path: notice → scrubbed warning → newline-closed
     dot line → "Type a message" still LAST (the REPL starts regardless)."""
     store_path = _store_path(tmp_path)
-    handler = _scan_handler([], utxo_status=503)
+    # addr0 funded: the /utxo failure stays on the scan path (addresses
+    # with empty history are never fetched, TCK-SCAN-001).
+    handler = _scan_handler(
+        [], utxos_by_addr={derive_fixture_addresses(1)[0]: [SEND_UTXO]},
+        utxo_status=503,
+    )
 
     code, outputs = _run_captured(
         ["--stub-llm", "--zpub", ZPUB],

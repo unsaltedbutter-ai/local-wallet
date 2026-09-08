@@ -462,11 +462,13 @@ class SignTxParams(_OmitNoneDump):
     (quoted verbatim from the confirmation card; the flow matches content,
     this layer checks shape only).
 
-    ``signer``: OPTIONAL enum literal ``"file"|"hwi"``. Omitted ⇒ the
-    handler applies its default signer policy (which signer is used is a
-    handler/app decision, never model-chosen beyond this closed enum);
-    explicit ``null`` is rejected — omission is expressed by leaving the
-    key out entirely, mirroring ``limit``/``branch``/``fee_target``. The
+    ``signer``: OPTIONAL enum literal ``"file"|"hwi"``, ADVISORY ONLY.
+    Which signer backend runs is a handler/app decision from the user's
+    configuration (``--signer`` / :data:`SIGNER_ENV_VAR`), never from this
+    param — it cannot override configuration (TCK-HW-004). Omitted ⇒ the
+    configured backend runs. Explicit ``null`` is rejected — omission is
+    expressed by leaving the key out entirely, mirroring
+    ``limit``/``branch``/``fee_target``. The
     device interaction itself is the user action (the trust anchor is the
     hardware wallet screen, PROJECT.md §9) — no additional utterance gate
     exists at the flow level for signing; see :mod:`localwallet.tx.flow`.
