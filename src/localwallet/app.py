@@ -35,8 +35,11 @@ implements no protocol, wallet, chain, or tx-engine logic itself:
   (:class:`~localwallet.config.Settings` ``store_path``), reuse or
   create the single wallet profile (descriptor-match guard, ADR-0010),
   pick the model runtime (remote debug bridge → local GGUF →
-  ``--stub-llm``), run the startup scan (or ``--rescan``; env opt-out
-  via ``LOCALWALLET_AUTO_SCAN=0``) and the chat REPL. The REPL owns the
+  ``--stub-llm``), start the NON-BLOCKING startup scan (or ``--rescan``;
+  env opt-out via ``LOCALWALLET_AUTO_SCAN=0``) on the dedicated chain
+  worker (:class:`ScanFlow`, TCK-SCAN-003 / ADR-0022 — the REPL prompt is
+  live while the scan runs, dots flow between turns, and the engine
+  thread persists the result) and run the chat REPL. The REPL owns the
   :class:`TxFlow` / :class:`SendSession` pair and classifies every user
   utterance against the confirm gate at the top of each turn. The REPL
   is the CLI transport over the queue-driven engine pump
@@ -52,6 +55,14 @@ Invariants honored here:
   imports that local module, never a network library (lint-enforced).
   Handlers reach the chain only through the scan callable (lazy first
   scan) — ``new_address``/``get_history``/``get_utxos`` never do I/O.
+  Scan/watch I/O runs on the dedicated :class:`ChainWorker` thread
+  (ADR-0022), which holds NO Store reference: the worker returns
+  immutable record sets and the ENGINE thread is the only persister
+  (:meth:`ScanFlow.scan_now` and the pump's scan-event handling).
+- Cache answers during the first scan carry the deterministic,
+  tool-owned ``freshness`` flag (ADR-0022 decision 5); ``create_tx``
+  refuses until the first scan completes (decision 6) — both computed
+  by code, never by the model.
 - The UI prints values verbatim from handler result dicts — it computes
   nothing, and the model narrates no numbers. Addresses appear only in
   result/narration output (``get_utxos``/``new_address``), never in
@@ -72,8 +83,10 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from string import punctuation
 from typing import TYPE_CHECKING, Any, Final
@@ -411,6 +424,37 @@ _BANNER_MAINNET: Final[str] = (
     "Network: Bitcoin MAINNET only — testnet keys are refused (ADR-0021)."
 )
 
+#: TCK-SCAN-003 (ADR-0022 decision 5): the closed values of the
+#: tool-owned ``freshness`` result key attached to cache-served
+#: wallet-read answers. ``fresh`` = the store carries a completed scan
+#: (sync cursor) and no first scan is running; ``stale`` = the first
+#: scan is still running (or has never completed) and the answer comes
+#: from a possibly-empty/partial cache. Code computes it from the scan's
+#: completion state — the model never authors freshness claims; it only
+#: narrates the flag (values fixed here; nothing user- or model-derived).
+FRESHNESS_FRESH: Final[str] = "fresh"
+FRESHNESS_STALE: Final[str] = "stale"
+
+#: CLI narration suffix on a stale-flagged read (ADR-0022 decision 5's
+#: honesty rule for the terminal path). Value-free: it annotates that
+#: the figures above may not be final; it carries no address/amount.
+FRESHNESS_NOTE: Final[str] = (
+    "note: wallet cache may be incomplete — the first scan has not finished"
+)
+
+#: TCK-SCAN-003 (ADR-0022 decision 6): the friendly, value-free
+#: ``create_tx`` refusal while the FIRST scan has not completed —
+#: dispatcher-owned code gates it (never model judgment), mirroring the
+#: ADR-0013 pending-guard style. Value movement stays blocked until the
+#: scan finishes; chat (and stale-flagged reads) remain unblocked.
+WALLET_LOADING_REFUSAL: Final[str] = (
+    "Your wallet is still loading — the first scan has not finished, so I "
+    "can't build a transaction yet. In the meantime I can share your "
+    "balance, history, or a new address (any cached figures will be "
+    "marked as still loading)."
+)
+
+
 #: Fallback UI strings (mirror the agent loop's generic containment
 #: messages; the loop normally supplies these).
 _GENERIC_FAILURE: Final[str] = (
@@ -714,11 +758,12 @@ def build_dispatch_table(
     settings: Settings | None = None,
     node_detect_fn: Callable[[], LocalNodeReport] | None = None,
     seconds_since_last_block_fn: Callable[[], int | None] | None = None,
+    scan_gate: StartupScan | None = None,
 ) -> DispatchTable:
     """Build the allowlist dispatch table for the running app.
 
     Args:
-        store: The open persistence layer every handler reads.
+        store: The persistence layer every handler reads.
         wallet: The active wallet row (ADR-0010: exactly one profile).
         parsed: The wallet's parsed account key (for ``new_address``
             derivation, the send flow's PSBT account fields, and the HWI
@@ -728,8 +773,17 @@ def build_dispatch_table(
             fee/price wrappers below, and by the ``broadcast_tx`` /
             ``tx_status`` handlers; the read handlers never touch it.
         scan_fn: Zero-argument callable performing one wallet scan
-            (``scan_wallet(store, client, wallet)`` in production). Used
-            lazily when the store has no sync cursor.
+            (the app's plan→worker-fetch→persist composition of
+            :mod:`localwallet.wallet.scan` in production). Used lazily
+            when the store has no sync cursor.
+        scan_gate: The engine's startup-scan state (TCK-SCAN-003,
+            ADR-0022 decisions 5/6): while its first scan is in progress
+            the read handlers answer cache-served and ``stale``-flagged,
+            the lazy in-handler scan stands down (the worker owns the
+            chain), and ``create_tx`` refuses with the friendly
+            :data:`WALLET_LOADING_REFUSAL` line. ``None`` (tests, the
+            AUTO_SCAN=0 wiring) = no scan in flight — the pre-split
+            behavior.
         flow: The dispatcher-owned send-flow state machine (TCK-P2-004).
             Defaults to a fresh :class:`TxFlow` with the real clock and
             uuid id factory; the REPL and tests share ONE instance.
@@ -784,10 +838,10 @@ def build_dispatch_table(
         IntentName.RESPOND: _respond_handler,
         IntentName.CLARIFY: _clarify_handler,
         IntentName.GET_BALANCE: _make_get_balance_handler(
-            store, wallet_id, scan_fn
+            store, wallet_id, scan_fn, scan_gate
         ),
-        IntentName.GET_HISTORY: _make_get_history_handler(store, wallet_id),
-        IntentName.GET_UTXOS: _make_get_utxos_handler(store, wallet_id),
+        IntentName.GET_HISTORY: _make_get_history_handler(store, wallet_id, scan_gate),
+        IntentName.GET_UTXOS: _make_get_utxos_handler(store, wallet_id, scan_gate),
         IntentName.NEW_ADDRESS: _make_new_address_handler(store, wallet_id, parsed),
         IntentName.CREATE_TX: _make_create_tx_handler(
             store,
@@ -798,6 +852,7 @@ def build_dispatch_table(
             price_oracle if price_oracle is not None else PriceOracle(client),
             scan_fn,
             seconds_since_last_block_fn=seconds_since_last_block_fn,
+            scan_gate=scan_gate,
         ),
         IntentName.CONFIRM_TX: _make_confirm_tx_handler(tx_flow, send_session),
         IntentName.SIGN_TX: _make_sign_tx_handler(
@@ -840,16 +895,23 @@ def _make_get_balance_handler(
     store: Store,
     wallet_id: int,
     scan_fn: Callable[[], object],
+    scan_gate: StartupScan | None = None,
 ) -> Handler:
     """Create the ``get_balance`` handler closed over the store.
 
     Sums the cached UTXO snapshot (confirmed/unconfirmed split) and
     reports the count of addresses holding UTXOs plus the tip height
     recorded by the last scan. If the wallet has never scanned (no sync
-    cursor), ``scan_fn`` runs once lazily first — this keeps the
-    Phase 0 AC ("What's my balance?" returns a correct live balance)
-    working when the startup scan is opted out via
-    :data:`AUTO_SCAN_ENV_VAR`. At most one scan attempt happens per
+    cursor) AND no startup scan is in flight, ``scan_fn`` runs once
+    lazily first — this keeps the Phase 0 AC ("What's my balance?"
+    returns a correct live balance) working when the startup scan is
+    opted out via :data:`AUTO_SCAN_ENV_VAR`. While the non-blocking
+    startup scan runs (ADR-0022 decision 6) the lazy scan stands down —
+    the chain worker already owns the chain — and the cache answers as
+    served. Every answer carries the deterministic, tool-owned
+    ``freshness`` key (decision 5): ``stale`` while the first scan has
+    not completed, ``fresh`` after; narration-only — the balance values
+    stay verbatim from the cache. At most one scan attempt happens per
     call; a failed lazy scan surfaces as
     ``{"error": "chain_unavailable", "detail": <scrubbed>}`` (chain and
     scan error strings are value-free by contract), store failures as
@@ -860,7 +922,11 @@ def _make_get_balance_handler(
     def handler(envelope: Envelope) -> dict[str, object]:
         del envelope  # get_balance params are empty by schema
         try:
-            if store.get_sync_state(wallet_id, wallet_scan.CURSOR_KEY) is None:
+            in_flight = scan_gate is not None and scan_gate.in_progress
+            if (
+                store.get_sync_state(wallet_id, wallet_scan.CURSOR_KEY) is None
+                and not in_flight
+            ):
                 try:
                     scan_fn()
                 except (ChainError, wallet_scan.ScanError, WatchKeyError) as exc:
@@ -878,6 +944,10 @@ def _make_get_balance_handler(
             "unconfirmed_sats": unconfirmed,
             "total_sats": confirmed + unconfirmed,
             "addresses_scanned": len({u.address for u in utxos if u.address}),
+            # Tool-owned freshness (ADR-0022 decision 5): the model
+            # narrates it, never authors it; the values above are cache
+            # verbatim either way.
+            "freshness": _freshness(store, wallet_id, scan_gate),
         }
         if tip_raw is not None:
             try:
@@ -891,7 +961,11 @@ def _make_get_balance_handler(
     return handler
 
 
-def _make_get_history_handler(store: Store, wallet_id: int) -> Handler:
+def _make_get_history_handler(
+    store: Store,
+    wallet_id: int,
+    scan_gate: StartupScan | None = None,
+) -> Handler:
     """Create the ``get_history`` handler closed over the store.
 
     Projects cached transactions ordered by height DESC then block_time
@@ -900,7 +974,10 @@ def _make_get_history_handler(store: Store, wallet_id: int) -> Handler:
     carry ``txid``/``height``/``direction``/``fee_sats``/``block_time``
     exactly as cached (nullable fields stay ``None``); the result is
     deliberately address-free — addresses appear only in
-    ``get_utxos``/``new_address`` output. No network I/O.
+    ``get_utxos``/``new_address`` output. The result carries the
+    tool-owned ``freshness`` key (ADR-0022 decision 6: this read MAY
+    answer cache-served and stale-flagged before the first scan
+    completes). No network I/O.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -910,6 +987,7 @@ def _make_get_history_handler(store: Store, wallet_id: int) -> Handler:
         limit = params.limit if params.limit is not None else DEFAULT_HISTORY_LIMIT
         try:
             txs = store.get_txs_for_wallet(wallet_id)
+            freshness = _freshness(store, wallet_id, scan_gate)
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
         ordered = sorted(
@@ -933,24 +1011,33 @@ def _make_get_history_handler(store: Store, wallet_id: int) -> Handler:
                 for t in shown
             ],
             "shown": len(shown),
+            "freshness": freshness,
         }
 
     return handler
 
 
-def _make_get_utxos_handler(store: Store, wallet_id: int) -> Handler:
+def _make_get_utxos_handler(
+    store: Store,
+    wallet_id: int,
+    scan_gate: StartupScan | None = None,
+) -> Handler:
     """Create the ``get_utxos`` handler closed over the store.
 
     Returns the cached UTXO snapshot verbatim (``txid``/``vout``/
     ``address``/``value_sats``/``confirmed``) plus a count. Addresses
     come from the store — i.e. from tool output via the scan — so the
-    quote-verbatim rule is satisfied end to end. No network I/O.
+    quote-verbatim rule is satisfied end to end. The result carries the
+    tool-owned ``freshness`` key (ADR-0022 decision 6: cache-served
+    answers before the first scan completes are stale-flagged, never
+    withheld). No network I/O.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
         del envelope  # get_utxos params are empty by schema
         try:
             records = store.get_utxos_for_wallet(wallet_id)
+            freshness = _freshness(store, wallet_id, scan_gate)
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
         utxos = [
@@ -963,7 +1050,7 @@ def _make_get_utxos_handler(store: Store, wallet_id: int) -> Handler:
             }
             for r in records
         ]
-        return {"utxos": utxos, "count": len(utxos)}
+        return {"utxos": utxos, "count": len(utxos), "freshness": freshness}
 
     return handler
 
@@ -1267,10 +1354,28 @@ def _make_create_tx_handler(
     scan_fn: Callable[[], object],
     *,
     seconds_since_last_block_fn: Callable[[], int | None] | None = None,
+    scan_gate: StartupScan | None = None,
 ) -> Handler:
     """Create the ``create_tx`` handler: stage an unsigned pending transaction.
 
     Pipeline (every step fail-closed; nothing stages unless ALL succeed):
+
+    0. First-scan gate (TCK-SCAN-003, ADR-0022 decision 6 — the
+       load-bearing AC): while the enabled startup scan's first scan has
+       NOT completed, the handler refuses with the friendly, value-free
+       :data:`WALLET_LOADING_REFUSAL` line (``{"error": "wallet_loading",
+       ...}``) BEFORE any network or store work. Sending against a
+       partial/empty cache could select coins or present a balance the
+       scan would later revise — this is dispatcher-owned code gating
+       value movement, never model judgment, and not a silent partial
+       send. Once the first scan completed (or was skipped by a startup
+       failure), the gate lifts and the pre-split path applies: a store
+       with no completed scan still lazy-scans (step 4) exactly as
+       before, so ``AUTO_SCAN=0`` sessions and failed-startup sessions
+       behave as they always did.
+       ``confirm_tx``/``sign_tx``/``broadcast_tx`` are untouched: a
+       pending can only exist post-gate, and the ADR-0013 state machine
+       remains their only authority.
 
     1. Pending guard: with a transaction already pending, an *identical*
        recipient + ``amount_sats`` envelope is a dispatcher-owned
@@ -1346,6 +1451,14 @@ def _make_create_tx_handler(
         params = envelope.params
         if not isinstance(params, CreateTxParams):
             return {"error": "internal", "detail": "create_tx params shape mismatch"}
+
+        # 0. First-scan gate (ADR-0022 decision 6): value movement waits
+        #    for the first scan, before ANY network/store work and before
+        #    even the pending guard. Fail closed on refusal; the copy is
+        #    the dispatcher-owned, value-free line (the model narrates it
+        #    verbatim; it never generates or "corrects" it).
+        if scan_gate is not None and scan_gate.first_scan_incomplete:
+            return {"error": "wallet_loading", "detail": WALLET_LOADING_REFUSAL}
 
         # 1. Pending guard (before any network/store work). A create_tx
         #    quoting the SAME recipient and sats amount as the staged
@@ -2296,9 +2409,11 @@ def _make_watch_probe(
     """Build the production ``watch_incoming`` probe for the current wallet.
 
     The probe refreshes the chain state through ``scan_fn`` (which in the app
-    wraps :func:`localwallet.wallet.scan.scan_wallet` over the SINGLE
-    config-selected EsploraClient — ADR-0018; a self-hosted poll hits the
-    user's node, never the public API), then reads the wallet's transactions
+    is :meth:`ScanFlow.scan_now` — the ADR-0022 split run as ONE blocking
+    scan: plan on the engine, the derive+fetch on the dedicated chain worker
+    over the SINGLE config-selected EsploraClient, persist by the engine;
+    ADR-0018 — a self-hosted poll hits the user's node, never the public
+    API), then reads the wallet's transactions
     and UTXOs back from the store and shapes them into
     :class:`WatchedTx` observations for the poller.
 
@@ -2484,6 +2599,398 @@ def cli_emitter(output_fn: Callable[[str], None]) -> EventEmitter:
     return EventEmitter(cli_sink(output_fn))
 
 
+# ------------------------------------------- chain worker (TCK-SCAN-003, ADR-0022)
+
+
+def _has_completed_scan(store: Store, wallet_id: int) -> bool:
+    """Whether the store carries a completed-scan cursor (the durable
+    first-scan-completion record ADR-0022 decision 5 names). A read failure
+    is treated as "not completed" (fail closed toward ``stale``)."""
+    try:
+        return store.get_sync_state(wallet_id, wallet_scan.CURSOR_KEY) is not None
+    except (StoreError, sqlite3.Error):
+        return False
+
+
+def _freshness(store: Store, wallet_id: int, gate: StartupScan | None) -> str:
+    """The deterministic, TOOL-owned ``freshness`` flag (ADR-0022 decision 5).
+
+    ``stale`` while the (enabled) startup scan has not completed, or when the
+    cache was never populated by a completed scan; ``fresh`` once a scan has
+    completed and the store carries its cursor. Computed purely from the
+    scan's completion state — the model never authors it, and it never
+    changes the answer's values (balances/addresses stay verbatim from the
+    cache); it is narration-only.
+    """
+    if gate is not None and gate.first_scan_incomplete:
+        return FRESHNESS_STALE
+    return FRESHNESS_FRESH if _has_completed_scan(store, wallet_id) else FRESHNESS_STALE
+
+
+class StartupScan:
+    """The startup-scan state gate (ADR-0022 decisions 5/6), shared with the
+    handlers as ``scan_gate``.
+
+    A tiny closed state machine owned by the ENGINE thread: only the pump
+    (engine) flips it via :meth:`mark_running`/:meth:`mark_done`/
+    :meth:`mark_skipped`; the chain worker never touches it (it delivers its
+    result through the command queue). Handlers only read it. ``disabled`` is
+    the "no startup scan configured" state (``AUTO_SCAN=0`` or a table built
+    without a gate) — the pre-split lazy behavior applies and no
+    ``create_tx`` block is imposed.
+
+    ``first_scan_incomplete`` (pending or running) is the load-bearing gate:
+    ``create_tx`` refuses while it is set (value movement waits for the
+    first scan), the lazy in-handler scan stands down (the worker owns the
+    chain), and cache reads are ``stale``-flagged. Once the scan completes
+    (``done``) or is skipped after a failure (``skipped``), it clears.
+    """
+
+    __slots__ = ("_state",)
+
+    def __init__(self, *, enabled: bool) -> None:
+        self._state = "pending" if enabled else "disabled"
+
+    @property
+    def enabled(self) -> bool:
+        return self._state != "disabled"
+
+    @property
+    def in_progress(self) -> bool:
+        return self._state in ("pending", "running")
+
+    @property
+    def complete(self) -> bool:
+        return self._state == "done"
+
+    @property
+    def first_scan_incomplete(self) -> bool:
+        """Stale-flag predicate: a startup scan is configured but its first
+        scan has not completed (pending or running)."""
+        return self._state in ("pending", "running")
+
+    def mark_running(self) -> None:
+        self._state = "running"
+
+    def mark_done(self) -> None:
+        self._state = "done"
+
+    def mark_skipped(self) -> None:
+        self._state = "skipped"
+
+
+class _ScanTick:
+    """A value-free progress marker the worker enqueues (one per probed
+    address) so the pump renders a bare ``.`` between turns. Carries no
+    address/index/amount data (TCK-UX-001 progress contract, re-hosted on
+    the engine queue for the non-blocking scan)."""
+
+    __slots__ = ()
+
+
+@dataclass(frozen=True)
+class _ScanDone:
+    """The worker's terminal delivery: ``value`` is the immutable
+    :class:`~localwallet.wallet.scan.ScanRecords` (``ok=True``) or the
+    exception the chain/scan phase raised (``ok=False``). Enqueued onto the
+    command queue so the ENGINE thread persists it (ADR-0022 decision 3)."""
+
+    ok: bool
+    value: object
+
+
+#: Worker-queue shutdown sentinel.
+_WORKER_STOP: Final[object] = object()
+
+
+@dataclass
+class _WorkerJob:
+    """One submitted fetch job: a completion signal + result slot the engine
+    reads only after :attr:`done` is set (``ok``/``value`` mirror the
+    :class:`_ScanDone` fields)."""
+
+    done: threading.Event = dataclass_field(default_factory=threading.Event)
+    ok: bool = False
+    value: object = None
+
+
+class ChainWorker:
+    """The dedicated chain-I/O thread (ADR-0022 decision 2, ADR-0024 §4).
+
+    Runs scan/watch :func:`~localwallet.wallet.scan.fetch_scan` jobs off the
+    engine thread against a :class:`ScanPlan` snapshot + the chain client and
+    hands back immutable :class:`ScanRecords`. It holds NO ``Store`` reference
+    — the whole point of the split — so cross-thread sqlite is impossible by
+    construction; only the engine persists (decision 3). One worker thread
+    processes jobs serially, so at most one chain fetch is ever in flight.
+
+    The startup scan uses :meth:`submit` (async; the caller pumps the command
+    queue and persists on completion). The lazy in-turn scan and the watch
+    poll use :meth:`scan` (submit + block until the worker's own job finishes;
+    the engine waits between/within a turn, exactly as the pre-split
+    synchronous scan did, but with no chain I/O on the engine thread).
+    """
+
+    def __init__(self, client: EsploraClient) -> None:
+        self._client = client
+        self._jobs: queue.Queue[Any] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="chain-worker", daemon=True)
+        self._thread.start()
+
+    def submit(
+        self,
+        plan: wallet_scan.ScanPlan,
+        *,
+        on_progress: Callable[[], None] | None = None,
+        on_result: Callable[[bool, object], None] | None = None,
+    ) -> _WorkerJob:
+        """Queue a fetch job. ``on_progress`` (worker thread) fires per probed
+        address; ``on_result`` (worker thread) fires once at completion. Both
+        callbacks run on the worker thread and must be thread-safe queue
+        puts only — the app pushes :class:`_ScanTick`/:class:`_ScanDone`
+        markers onto the command queue so the engine does the persisting."""
+        job = _WorkerJob()
+        self._jobs.put((job, plan, on_progress, on_result))
+        return job
+
+    def scan(self, plan: wallet_scan.ScanPlan) -> wallet_scan.ScanRecords:
+        """Run one blocking fetch on the worker and return its record set
+        (raising the job's exception on THIS thread so callers surface it
+        through their own error mapping). The chain I/O never touches the
+        calling thread; the caller persists the returned records. Only call
+        when no async job is in flight (the gate guarantees this) — the
+        single worker processes jobs serially."""
+        job = self.submit(plan)
+        job.done.wait()
+        if not job.ok:
+            raise job.value  # type: ignore[misc]
+        return job.value  # type: ignore[return-value]
+
+    def _run(self) -> None:
+        while True:
+            item = self._jobs.get()
+            if item is _WORKER_STOP:
+                return
+            job, plan, on_progress, on_result = item  # type: ignore[misc]
+            ok = True
+            value: object = None
+            try:
+                value = wallet_scan.fetch_scan(plan, self._client, progress_fn=on_progress)
+            except BaseException as exc:  # noqa: BLE001 — carried to the engine
+                ok, value = False, exc
+            job.ok, job.value = ok, value
+            job.done.set()
+            if on_result is not None:
+                on_result(ok, value)
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop after the current job drains (an in-flight fetch is never
+        cancelled; it is bounded by the chain client's own timeouts). The
+        thread is joined up to ``timeout`` and otherwise abandoned (daemon) —
+        an abandoned job delivers to nobody, and the store stays consistent
+        because only the engine ever persists."""
+        self._jobs.put(_WORKER_STOP)
+        self._thread.join(timeout)
+
+
+class ScanFlow:
+    """The engine-side startup-scan controller + the shared blocking scan
+    (TCK-SCAN-003, ADR-0022 decisions 1/3/4).
+
+    Owns the :class:`ChainWorker`, the :class:`StartupScan` gate, and the
+    store/wallet needed to persist. Only the pump (engine) thread mutates it:
+    :meth:`begin` submits the non-blocking startup fetch, and
+    :meth:`handle_command` persists the delivered record set + narrates the
+    completion (or the scrubbed failure warning), flipping the gate.
+    :meth:`scan_now` is the synchronous composition (plan → worker fetch →
+    engine persist) that the lazy in-handler scan and the watch poll ride, so
+    every scan/watch chain fetch runs on the worker and every persist runs on
+    the engine (the P5-001 "full scan per poll on the engine thread" cost is
+    retired). The web half (surfacing this in the browser) is TCK-WEB-005.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        wallet: WalletRecord,
+        worker: ChainWorker,
+        *,
+        gap_limit: int | None,
+        startup_plan: wallet_scan.ScanPlan | None = None,
+        rescan: bool = False,
+    ) -> None:
+        self._store = store
+        self._wallet = wallet
+        self._wallet_id = wallet.id
+        self._worker = worker
+        self._gap_limit = gap_limit
+        self._startup_plan = startup_plan
+        self._rescan = rescan
+        self._commands: queue.Queue[Any] | None = None
+        self.gate = StartupScan(enabled=startup_plan is not None)
+        self._started = False
+
+    def set_startup(self, plan: wallet_scan.ScanPlan, *, rescan: bool = False) -> None:
+        """Arm the non-blocking startup scan (engine-thread wiring call).
+        The gate enables IMMEDIATELY — the stale flags and the ``create_tx``
+        block apply from the moment wiring returns, before the pump even
+        starts the fetch on the worker (ADR-0022 decision 6: value movement
+        waits for the first scan; there is no unlocked window)."""
+        self._startup_plan = plan
+        self._rescan = rescan
+        self.gate = StartupScan(enabled=True)
+
+    # ------------------------------------------------------ non-blocking startup
+
+    def attach(self, commands: queue.Queue[Any]) -> None:
+        """Bind the pump's command queue (the worker delivers here)."""
+        self._commands = commands
+
+    def begin(self) -> None:
+        """Submit the non-blocking startup scan once (the pump calls this at
+        the top of its loop, AFTER the prompt is already live — ADR-0022
+        decision 1). No-op when no startup scan is configured."""
+        if self._started or self._startup_plan is None or self._commands is None:
+            return
+        self._started = True
+        self.gate.mark_running()
+        commands = self._commands
+        self._worker.submit(
+            self._startup_plan,
+            on_progress=lambda: commands.put(_ScanTick()),
+            on_result=lambda ok, value: commands.put(_ScanDone(ok, value)),
+        )
+
+    def handle_command(
+        self,
+        command: object,
+        output_fn: Callable[[str], None],
+        emitter: EventEmitter | None,
+    ) -> bool:
+        """Consume one scan event ON THE ENGINE THREAD; ``True`` when handled.
+        :class:`_ScanTick` renders a bare dot; :class:`_ScanDone` closes the
+        dot line, persists the record set (the ONLY store write of the scan),
+        flips the gate, and narrates the completion/failure exactly as the
+        pre-split blocking scan did."""
+        if isinstance(command, _ScanTick):
+            if emitter is not None:
+                emitter.emit(EVENT_PROGRESS, ".")
+            return True
+        if isinstance(command, _ScanDone):
+            self._finish(command, output_fn, emitter)
+            return True
+        return False
+
+    def _finish(
+        self,
+        done: _ScanDone,
+        output_fn: Callable[[str], None],
+        emitter: EventEmitter | None,
+    ) -> None:
+        if emitter is not None:
+            emitter.emit(EVENT_PROGRESS, "\n")  # close the progress-dot line
+        if not done.ok:
+            exc = done.value
+            self.gate.mark_skipped()
+            if isinstance(
+                exc,
+                (
+                    ChainError,
+                    wallet_scan.ScanError,
+                    WatchKeyError,
+                    StoreError,
+                    sqlite3.Error,
+                ),
+            ):
+                self._warn(output_fn, str(exc))
+                self._out_of_window(output_fn)
+                return
+            raise exc  # a genuine worker bug must not be swallowed
+        try:
+            summary = wallet_scan.persist_scan(self._store, done.value)  # engine thread
+        except (StoreError, sqlite3.Error) as exc:
+            self.gate.mark_skipped()
+            self._warn(output_fn, str(exc))
+            self._out_of_window(output_fn)
+            return
+        self.gate.mark_done()
+        output_fn(
+            _rescan_summary_line(summary) if self._rescan else _scan_summary_line(summary)
+        )
+        self._out_of_window(output_fn)
+
+    def _out_of_window(self, output_fn: Callable[[str], None]) -> None:
+        """The ADR-0009 warning as re-assessed by the scan that just landed
+        (printed after the completion/failure narration, where the scan
+        result's out-of-window write lives)."""
+        out_of_window = _out_of_window_line(self._store, self._wallet_id)
+        if out_of_window is not None:
+            output_fn(out_of_window)
+
+    def _warn(self, output_fn: Callable[[str], None], detail: str) -> None:
+        """The scrubbed startup-failure line (scan/chain/store/key errors are
+        value-free by their layers' contracts). The REPL still runs; handlers
+        surface store-empty/chain-down states per turn."""
+        label = "rescan" if self._rescan else "startup scan"
+        output_fn(f"warning: {label} failed: {detail} — continuing with cached state.")
+
+    # ------------------------------------------------------------- blocking scan
+
+    def scan_now(self) -> wallet_scan.ScanSummary:
+        """One synchronous scan composed across the split: ``plan_scan``
+        (engine) → worker ``fetch_scan`` (engine waits) → ``persist_scan``
+        (engine). The lazy in-handler first scan and the watch poll both ride
+        this, so all their chain I/O runs on the worker and all persistence on
+        the engine. Behavior (ordering, failure semantics) matches the
+        pre-split ``scan_wallet(store, client, wallet)``.
+
+        Raises:
+            ChainError / ScanError / WatchKeyError / StoreError: as the fused
+                scan did (the worker re-raises its exception here).
+        """
+        plan = wallet_scan.plan_scan(
+            self._store, self._wallet, gap_limit=self._gap_limit, rebuild=False
+        )
+        return wallet_scan.persist_scan(self._store, self._worker.scan(plan))
+
+    @property
+    def in_progress(self) -> bool:
+        return self.gate.in_progress
+
+    @property
+    def pending(self) -> bool:
+        """True while a submitted startup scan result has not yet been
+        handled (persisted + narrated) by the engine thread."""
+        return self._started and self.gate.in_progress
+
+    def drain_until_complete(
+        self,
+        output_fn: Callable[[str], None],
+        emitter: EventEmitter | None,
+        *,
+        timeout: float = 8.0,
+    ) -> None:
+        """Session-end drain: collect any still-pending startup-scan events
+        (blocking on the command queue) so the result is persisted + narrated
+        exactly once before :func:`run` returns — the scan never silently
+        vanishes. Non-scan commands queued behind the exit are dropped (the
+        session is ending). Bounded by ``timeout`` (the fetch itself is
+        bounded by the chain client's own timeouts); a scan that has already
+        finished is a no-op."""
+        if not self.pending or self._commands is None:
+            return
+        deadline = time.monotonic() + timeout
+        while self.pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                command = self._commands.get(timeout=remaining)
+            except queue.Empty:
+                break
+            self.handle_command(command, output_fn, emitter)
+
+
 class _QuitSentinel:
     """Terminal command: stops the pump BETWEEN turns (never-cancel)."""
 
@@ -2519,6 +3026,9 @@ class EngineContext:
     table: DispatchTable
     watcher: IncomingWatcher | None = None
     client: EsploraClient | None = None
+    #: The non-blocking startup-scan controller (TCK-SCAN-003, ADR-0022);
+    #: the pump attaches it to the command queue and drives its events.
+    scan: ScanFlow | None = None
 
 
 @dataclass(frozen=True)
@@ -2634,6 +3144,7 @@ def start_engine(
             watcher=ctx.watcher,
             client=ctx.client,
             emitter=handle.emitter,
+            scan=ctx.scan,
         )
 
     handle.thread = threading.Thread(target=body, name="engine", daemon=True)
@@ -2688,6 +3199,7 @@ def _pump(
     client: EsploraClient | None = None,
     emitter: EventEmitter | None = None,
     ready: threading.Event | None = None,
+    scan: ScanFlow | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
     ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
@@ -2699,18 +3211,34 @@ def _pump(
     the ordering WEB-002's ring buffer replays). The between-turns watch
     drain (ADR-0019) is preserved. ``ready`` is the CLI feeder's pacing
     hook (None for queue-native transports).
+
+    Non-blocking startup scan (TCK-SCAN-003, ADR-0022): when a ``scan`` flow
+    is given, the pump attaches it to the command queue and starts the
+    worker fetch, then treats the worker's ``_ScanTick``/``_ScanDone``
+    deliveries as first-class queue items — so the prompt goes live
+    immediately, progress dots and the completion narration surface between
+    turns as they arrive on the same queue, and the engine (never the
+    worker) persists. While the first scan runs the watch drain stands down
+    (the single worker is occupied). On exit the pending scan is drained to
+    completion so its result is persisted + narrated exactly once.
     """
+    if scan is not None:
+        scan.attach(commands)
+        scan.begin()
     while True:
-        watch_count = _drain_watch(watcher, output_fn, client=client)
-        if watch_count:
-            loop.record_event("watch_events", watch_count)
+        if not (scan is not None and scan.in_progress):
+            watch_count = _drain_watch(watcher, output_fn, client=client)
+            if watch_count:
+                loop.record_event("watch_events", watch_count)
         if ready is not None:
             ready.set()
         command = commands.get()
+        if scan is not None and scan.handle_command(command, output_fn, emitter):
+            continue
         if isinstance(command, _PumpError):
             raise command.exc
         if command is QUIT:
-            return
+            break
         if isinstance(command, StateSnapshotRequest):
             # Typed value-free /state read (TCK-WEB-003), answered ON the engine
             # thread — no model, no output event, no chat line; the transport
@@ -2721,17 +3249,20 @@ def _pump(
         if not line:
             continue
         if line.lower() in ("exit", "quit"):
-            return
+            break
         if line.startswith("/"):
             _handle_transcript_command(
                 line, loop, output_fn, flow=flow, session=session
             )
         else:
             _run_turn(
-                loop, flow, session, line, output_fn, client=client, table=table
+                loop, flow, session, line, output_fn, client=client, table=table,
+                scan_gate=scan.gate if scan is not None else None,
             )
         if emitter is not None:
             emitter.emit(EVENT_TURN_END)
+    if scan is not None:
+        scan.drain_until_complete(output_fn, emitter)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2767,8 +3298,12 @@ def run(
     wallet profile is reused when the store already holds the same
     descriptor, else created (``name="default"``; ADR-0010
     single-wallet). The startup scan (``--rescan`` for the full repair
-    scan) populates the cache; ``LOCALWALLET_AUTO_SCAN=0`` skips it —
-    the first balance/created-tx lookup then scans lazily. Chain/store
+    scan) runs NON-BLOCKING on the dedicated chain worker (TCK-SCAN-003,
+    ADR-0022): the REPL prompt goes live immediately, dots flow between
+    turns, and the engine persists + narrates the result when it lands —
+    while ``create_tx`` stays gated until that first scan completes.
+    ``LOCALWALLET_AUTO_SCAN=0`` skips
+    it — the first balance/created-tx lookup then scans lazily. Chain/store
     failures at startup print a scrubbed warning and the REPL still
     starts; handlers surface store-empty / chain-down states per turn.
 
@@ -2940,10 +3475,12 @@ def run(
             watcher=wiring.watcher,
             client=wiring.client,
             table=wiring.table,
+            scan=wiring.scan,
         )
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
     finally:
+        wiring.worker.stop()  # join the chain worker before closing its client
         wiring.client.close()
         wiring.store.close()
         # The remote debug bridge also owns a client (httpx) — close it
@@ -2974,6 +3511,8 @@ class _Wiring:
     session: SendSession
     table: DispatchTable
     watcher: IncomingWatcher | None
+    worker: ChainWorker
+    scan: ScanFlow
 
 
 def _wire(
@@ -2989,14 +3528,22 @@ def _wire(
     node_detect_fn: Callable[[], LocalNodeReport] | None,
     output_fn: Callable[[str], None],
 ) -> _Wiring:
-    """Build store → wallet profile → chain client → watch → startup scan →
-    dispatch table → agent loop (moved verbatim from the pre-web ``run``).
+    """Build store → wallet profile → chain client → watch → startup-scan
+    plan → dispatch table → agent loop (moved verbatim from the pre-web
+    ``run``, plus the ADR-0022 non-blocking scan wiring).
 
     The CLI calls this on the MAIN thread (behavior byte-identical to the
     old inline block); the web UI calls it INSIDE the
     :func:`start_engine` bootstrap — the engine thread (ADR-0024 §3).
     Config-fatal failures raise :class:`_WiringError` with the exact line
     the pre-web REPL printed before its ``return 2``.
+
+    The startup scan is NOT run here (TCK-SCAN-003, ADR-0022 decision 1):
+    the store-snapshot plan (:func:`localwallet.wallet.scan.plan_scan`,
+    engine-thread reads only, network-free) is prepared and armed on the
+    :class:`ScanFlow`, which the pump starts once the REPL loop exists —
+    the prompt goes live while the chain worker fetches, and the engine
+    persists + narrates the result between turns.
     """
     try:
         store = Store(settings.store_path)
@@ -3023,25 +3570,29 @@ def _wire(
     price_oracle = PriceOracle(client)
     tx_flow = flow if flow is not None else TxFlow()
 
+    # The dedicated chain worker (ADR-0022 decision 2): ALL scan/watch chain
+    # I/O runs on this thread; it receives store snapshots (ScanPlans) and
+    # returns immutable ScanRecords — it never holds the Store. The engine
+    # thread (this wiring's owner) persists everything via ScanFlow.
+    worker = ChainWorker(client)
+
     output_fn(_BANNER_TITLE)
     output_fn(_BANNER_MAINNET)
     output_fn(f"Privacy notice: {privacy_indicator(settings)}")
 
-    # Background watch (Phase 5, TCK-P5-001; ADR-0019). Single-threaded /
-    # tick-driven: the watcher holds no thread and shares no sqlite object
-    # across threads; the REPL runs a due poll cycle between turns. The
-    # startup line states — in lockstep with the privacy banner — whether
-    # background watching runs against the user's own node or the public API.
+    # Background watch (Phase 5, TCK-P5-001; ADR-0019, ADR-0022 decision 4).
+    # Tick-driven in the CLI: the watcher holds no thread and shares no
+    # sqlite object across threads; the REPL runs a due poll cycle between
+    # turns, and the poll's chain fetch rides the SAME worker (the P5-001
+    # "full scan per poll on the engine thread" cost note is retired — the
+    # engine only persists what the worker fetched). The startup line
+    # states — in lockstep with the privacy banner — whether background
+    # watching runs against the user's own node or the public API.
+    scan = ScanFlow(store, wallet_row, worker, gap_limit=env_gap)
     watcher: IncomingWatcher | None = None
     if settings.watch_interval_s > 0:
         watcher = IncomingWatcher(
-            _make_watch_probe(
-                store,
-                wallet_row.id,
-                lambda: wallet_scan.scan_wallet(
-                    store, client, wallet_row, gap_limit=env_gap
-                ),
-            ),
+            _make_watch_probe(store, wallet_row.id, scan.scan_now),
             interval_s=settings.watch_interval_s,
         )
         watch_mode = _watch_mode_fragment(_backend_mode(settings))
@@ -3053,22 +3604,43 @@ def _wire(
     else:
         output_fn("Background watch: off.")
 
-    _startup_scan(
-        store,
-        client,
-        wallet_row,
-        rescan_requested=rescan,
-        output_fn=output_fn,
-        gap_limit=env_gap,
-    )
-    out_of_window = _out_of_window_line(store, wallet_row.id)
-    if out_of_window is not None:
-        output_fn(out_of_window)
+    # Startup scan plan (non-blocking, ADR-0022 decision 1) — or the
+    # opted-out / failed-to-plan fallback. Planning is store-reads-only and
+    # network-free, so it stays on the engine thread; the fetch runs on the
+    # worker once the pump starts the flow.
+    auto_scan = os.environ.get(AUTO_SCAN_ENV_VAR, "").strip() != "0"
+    if rescan or auto_scan:
+        output_fn(SCAN_PROGRESS_NOTICE)
+        try:
+            scan.set_startup(
+                wallet_scan.plan_scan(
+                    store, wallet_row, gap_limit=env_gap, rebuild=rescan
+                ),
+                rescan=rescan,
+            )
+        except (
+            ChainError,
+            wallet_scan.ScanError,
+            WatchKeyError,
+            StoreError,
+            sqlite3.Error,
+        ) as exc:
+            label = "rescan" if rescan else "startup scan"
+            output_fn(f"warning: {label} failed: {exc} — continuing with cached state.")
 
-    # TCK-UX-001: the "type a message" hint is printed only AFTER the
-    # startup scan (+ out-of-window notice) so it appears when input is
-    # actually live — the scan can take minutes and users were typing
-    # into a prompt that could not read yet.
+    if not scan.gate.enabled:
+        # No startup scan will run (opted out, or planning failed): the
+        # persisted out-of-window warning is current — show it now, and the
+        # handlers lazy-scan via the worker as they have always done.
+        out_of_window = _out_of_window_line(store, wallet_row.id)
+        if out_of_window is not None:
+            output_fn(out_of_window)
+
+    # TCK-SCAN-003 (supersedes the TCK-UX-001 hint ordering): the "type a
+    # message" hint prints IMMEDIATELY — the startup scan runs on the chain
+    # worker concurrently, the prompt is live while the dots still flow
+    # between turns, and the completion narration lands when the engine
+    # persists the result (the scan can take minutes; the REPL may not).
     output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
     session = SendSession()
@@ -3081,7 +3653,7 @@ def _wire(
         wallet_row,
         parsed,
         client,
-        lambda: wallet_scan.scan_wallet(store, client, wallet_row, gap_limit=env_gap),
+        scan.scan_now,
         flow=tx_flow,
         session=session,
         fee_estimator=fee_estimator,
@@ -3090,6 +3662,7 @@ def _wire(
         settings=settings,
         node_detect_fn=node_detect_fn,
         seconds_since_last_block_fn=seconds_since_last_block_fn,
+        scan_gate=scan.gate,
     )
     loop = AgentLoop(generate, table)
     return _Wiring(
@@ -3100,6 +3673,8 @@ def _wire(
         session=session,
         table=table,
         watcher=watcher,
+        worker=worker,
+        scan=scan,
     )
 
 
@@ -3162,6 +3737,7 @@ def _run_web(
             table=wiring.table,
             watcher=wiring.watcher,
             client=wiring.client,
+            scan=wiring.scan,
         )
 
     try:
@@ -3176,9 +3752,11 @@ def _run_web(
         output_fn("Could not start the web server.")
         return 2
     try:
-        # Same startup order the CLI user sees: banner + startup scan finish
-        # before the URL prints (a blocking startup scan is WEB-005's
-        # problem; turns queued meanwhile are served in order).
+        # The engine bootstraps (banner + watch line + prompt state) before
+        # the URL prints; the startup scan now runs NON-BLOCKING on the
+        # chain worker inside the pump (TCK-SCAN-003, ADR-0022) — turns
+        # queued meanwhile are served in order, and the web UI's
+        # freshness/progress surfacing of the same flow is TCK-WEB-005.
         booted.wait()
         exc = startup["exc"]
         if exc is not None:
@@ -3199,12 +3777,15 @@ def _run_web(
         server.stop()
         wiring = wired.get("wiring")
         if wiring is not None:
-            # server.stop() pushed QUIT and joined the engine thread; the
-            # httpx-backed client has no thread affinity, closing here is
+            # server.stop() pushed QUIT and joined the engine thread (whose
+            # pump drained the startup scan to completion before returning);
+            # stopping the chain worker joins its idle loop. The httpx-backed
+            # client has no thread affinity, closing after the worker is
             # fine. The Store is deliberately NOT closed from this thread
             # (check_same_thread pins it to the engine): the store is
             # autocommit (isolation_level=None), everything written was
             # already durable, and the connection dies with the process.
+            wiring.worker.stop()
             wiring.client.close()
         close = getattr(generate, "close", None)
         if callable(close):
@@ -3231,103 +3812,11 @@ def _resolve_or_create_wallet(
     return store.create_wallet(name="default", descriptor=descriptor.descriptor)
 
 
-def _startup_scan(
-    store: Store,
-    client: EsploraClient,
-    wallet: WalletRecord,
-    *,
-    rescan_requested: bool,
-    output_fn: Callable[[str], None],
-    gap_limit: int | None = None,
-    emitter: EventEmitter | None = None,
-) -> None:
-    """Run the startup scan (or ``--rescan`` repair scan); never fatal.
-
-    UX contract (TCK-UX-001): a notice line is printed via ``output_fn``
-    BEFORE the scan starts, one ``.`` is streamed to ``sys.stdout`` per
-    probed address (via the scan's ``progress_fn`` callback — a bare
-    value-free tick), the dot line is closed with a newline when the scan
-    returns (success or failure), and only THEN do the completion
-    narration lines follow exactly as before. The background watcher's
-    probe (``_make_watch_probe``) passes no callback and stays silent.
-
-    TCK-WEB-001 (packaging prerequisite, ADR-0024 §12): the dots flow
-    through the engine's event stream — ``progress`` events on the given
-    ``emitter``, a CLI emitter by default, so stdout stays byte-identical
-    for the terminal while a non-CLI transport receives them as events
-    instead of leaking them onto the console.
-
-    A chain/scan/store failure prints a scrubbed warning (scan, chain,
-    store, and key error strings are value-free by contract) and the
-    REPL still starts — handlers surface the resulting store-empty
-    states per turn. The summary lines carry counts and the tip height
-    only — never addresses or amounts.
-    """
-    if emitter is None:
-        emitter = cli_emitter(output_fn)
-
-    def dot() -> None:
-        """One progress tick (TCK-UX-001): a bare ``.`` as a progress event.
-
-        Strict zero-argument callable — the shape ``scan_wallet``/
-        ``rescan_wallet`` invoke once per probed address. Value-free by
-        construction: the CLI emitter writes it onto the wrapping progress
-        line (started by :data:`SCAN_PROGRESS_NOTICE`); it never receives or
-        renders any address/index/amount data.
-        """
-        emitter.emit(EVENT_PROGRESS, ".")
-
-    def end_line() -> None:
-        """Close the progress-dot line: one newline (TCK-UX-001)."""
-        emitter.emit(EVENT_PROGRESS, "\n")
-
-    auto_scan = os.environ.get(AUTO_SCAN_ENV_VAR, "").strip() != "0"
-    if rescan_requested:
-        output_fn(SCAN_PROGRESS_NOTICE)
-        try:
-            summary = wallet_scan.rescan_wallet(
-                store,
-                client,
-                wallet,
-                gap_limit=gap_limit,
-                progress_fn=dot,
-            )
-        except (
-            ChainError,
-            wallet_scan.ScanError,
-            WatchKeyError,
-            StoreError,
-            sqlite3.Error,
-        ) as exc:
-            end_line()
-            output_fn(f"warning: rescan failed: {exc} — continuing with cached state.")
-            return
-        end_line()
-        output_fn(_rescan_summary_line(summary))
-        return
-    if not auto_scan:
-        return
-    output_fn(SCAN_PROGRESS_NOTICE)
-    try:
-        summary = wallet_scan.scan_wallet(
-            store,
-            client,
-            wallet,
-            gap_limit=gap_limit,
-            progress_fn=dot,
-        )
-    except (
-        ChainError,
-        wallet_scan.ScanError,
-        WatchKeyError,
-        StoreError,
-        sqlite3.Error,
-    ) as exc:
-        end_line()
-        output_fn(f"warning: startup scan failed: {exc} — continuing with cached state.")
-        return
-    end_line()
-    output_fn(
+def _scan_summary_line(summary: wallet_scan.ScanSummary) -> str:
+    """The startup-scan completion line (counts + tip height only — never
+    addresses or amounts; byte-identical to the TCK-UX-001-era narration,
+    now emitted by :class:`ScanFlow` when the engine lands the scan)."""
+    return (
         f"Startup scan complete: {summary.utxo_count} UTXOs · "
         f"tip height {summary.tip_height}."
         f"{_truncation_notice(summary)}"
@@ -3450,6 +3939,7 @@ def _repl(
     client: EsploraClient | None = None,
     table: DispatchTable,
     emitter: EventEmitter | None = None,
+    scan: ScanFlow | None = None,
 ) -> None:
     """The CLI transport over the engine pump (TCK-WEB-001, ADR-0024 §3).
 
@@ -3464,7 +3954,9 @@ def _repl(
     ``table`` is the allowlist dispatch table the loop runs on — forwarded
     to :func:`_run_turn` for the deterministic CONFIRMED-retry re-sign
     (TCK-HW-002), which calls the ``sign_tx`` handler directly (never the
-    model).
+    model). ``scan`` (TCK-SCAN-003, ADR-0022) is the non-blocking startup-scan
+    flow the pump drives: the REPL prompt goes live immediately and the scan
+    completes across turns via the command queue.
 
     The flow/session pair is owned by this loop's caller (:func:`run`);
     every turn runs through :func:`_run_turn` so the confirm gate sees
@@ -3495,6 +3987,7 @@ def _repl(
             client=client,
             emitter=emitter,
             ready=ready,
+            scan=scan,
         )
     finally:
         stop.set()
@@ -3576,6 +4069,7 @@ def _run_turn(
     *,
     client: EsploraClient | None = None,
     table: DispatchTable,
+    scan_gate: StartupScan | None = None,
 ) -> None:
     """Run ONE REPL turn: gate classification → agent → flow narration.
 
@@ -3584,6 +4078,15 @@ def _run_turn(
     through :meth:`ConfirmGate.classify` and stores the decision on the
     session, so the ``confirm_tx`` handler (which runs inside
     ``loop.run``) consumes a gate decision from the SAME turn.
+
+    ``scan_gate`` (TCK-SCAN-003): while the first startup scan has not
+    completed — running, or skipped after a failed startup scan (the
+    cache was never populated by this run's scan; the handler results
+    carry the matching ``freshness: stale``, ADR-0022 decision 5
+    security-review fix) — a tool-owned ``freshness=stale`` fact is
+    added to the turn's FACTS so the model narrates the loading state
+    honestly (it never authors the claim — the gate computes it from
+    completion state). ``None``/disabled/complete adds nothing.
 
     - DENY while pending: the gate decision is authoritative — the flow
       is cancelled proactively (no model cancel intent is waited for)
@@ -3664,6 +4167,14 @@ def _run_turn(
     facts = _flow_facts(
         flow, seconds_since_last_block_fn=seconds_since_last_block_fn
     )
+    if scan_gate is not None and scan_gate.enabled and not scan_gate.complete:
+        # ADR-0022 decision 5 (SR fix): the deterministic, tool-owned
+        # freshness fact while the first scan has NOT completed — pending,
+        # running, or skipped after a failed startup scan, matching the
+        # handlers' stale flag. ``first_scan_incomplete`` stays the
+        # narrower create_tx gate (decision 6): a skip unblocks sends.
+        # The model narrates from it; it never authors a freshness claim.
+        facts["freshness"] = FRESHNESS_STALE
     turn = loop.run(line, facts)
     _print_turn(turn, output_fn, session=session)
     # GATE-MERGE (TCK-UX-002, ADR-0013 amendment): a successful confirm
@@ -3794,7 +4305,12 @@ def _error_line(result: Mapping[str, object], label: str) -> str:
 
 
 def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
-    """Print the balance verbatim from the handler's result dict."""
+    """Print the balance verbatim from the handler's result dict.
+
+    A ``stale`` freshness flag (TCK-SCAN-003, ADR-0022 decision 5) adds one
+    value-free note line — honest display of the tool-owned flag; the
+    figures themselves print verbatim from the cache either way.
+    """
     if result.get("error") is not None:
         output_fn(sanitize_tool_output(_error_line(result, "Balance lookup failed")))
         return
@@ -3813,17 +4329,31 @@ def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None
     output_fn(
         f"Total {total} sats · {scanned} addresses with UTXOs · {tip_label}"
     )
+    _print_freshness_note(result, output_fn)
+
+
+def _print_freshness_note(
+    result: Mapping[str, object], output_fn: Callable[[str], None]
+) -> None:
+    """One value-free note line when the tool flagged the answer
+    ``stale`` (first scan not complete, ADR-0022); nothing when fresh."""
+    if result.get("freshness") == FRESHNESS_STALE:
+        output_fn(sanitize_tool_output(FRESHNESS_NOTE))
 
 
 def _print_history(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
     """Print history lines: ``tx <short-txid>… <direction> <height|unconfirmed>``.
 
     Address-free by contract (P1 narration): only txid/direction/height
-    are shown; values are verbatim from the handler result dict.
+    are shown; values are verbatim from the handler result dict. A
+    stale-flagged answer (ADR-0022) leads with the value-free loading note
+    — an empty cache during the first scan must never read as a final
+    "No transactions found."
     """
     if result.get("error") is not None:
         output_fn(sanitize_tool_output(_error_line(result, "History lookup failed")))
         return
+    _print_freshness_note(result, output_fn)
     transactions = result.get("transactions")
     if not isinstance(transactions, list) or not transactions:
         output_fn(sanitize_tool_output("No transactions found."))
@@ -3840,10 +4370,16 @@ def _print_history(result: Mapping[str, object], output_fn: Callable[[str], None
 
 
 def _print_utxos(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
-    """Print one line per UTXO with the address verbatim from the result."""
+    """Print one line per UTXO with the address verbatim from the result.
+
+    A stale-flagged answer (ADR-0022) leads with the value-free loading
+    note — an empty/partial cache during the first scan must never read
+    as a final "No unspent outputs."
+    """
     if result.get("error") is not None:
         output_fn(sanitize_tool_output(_error_line(result, "UTXO lookup failed")))
         return
+    _print_freshness_note(result, output_fn)
     utxos = result.get("utxos")
     if not isinstance(utxos, list) or not utxos:
         output_fn(sanitize_tool_output("No unspent outputs."))
@@ -3927,6 +4463,11 @@ def _print_create_tx(
             return
         output_fn(sanitize_tool_output(_GUIDANCE_STILL_PENDING))
         _print_brief_card(result, output_fn, session)
+        return
+    if error == "wallet_loading":
+        # ADR-0022 decision 6: the pre-first-scan refusal is a friendly
+        # dispatcher-owned line (value-free), not an error dump.
+        output_fn(sanitize_tool_output(str(result.get("detail", "")) or WALLET_LOADING_REFUSAL))
         return
     if error is not None:
         output_fn(sanitize_tool_output(_error_line(result, "Could not create the transaction")))

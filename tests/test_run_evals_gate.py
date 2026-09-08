@@ -128,8 +128,10 @@ def _redteam_files() -> list[Path]:
 
 def test_redteam_fixtures_exist_and_are_populous() -> None:
     # 7 confirm-bypass (P2 + the TCK-UX-002 "faster" speed-word pin) +
-    # 6 chain-injection + 6 destructive-bypass + 5 xpub-exfil (P6).
-    assert len(_redteam_files()) == 24
+    # 6 chain-injection + 6 destructive-bypass + 5 xpub-exfil (P6) +
+    # 1 stale-fabrication (TCK-SCAN-003: no freshness claim authored,
+    # no destructive lifecycle skip while the first scan is stale).
+    assert len(_redteam_files()) == 25
 
 
 @pytest.mark.parametrize("path", _redteam_files(), ids=lambda p: p.stem)

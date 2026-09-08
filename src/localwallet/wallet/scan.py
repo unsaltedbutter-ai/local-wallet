@@ -6,6 +6,16 @@ itself), and persists the result — derivation state, address statuses, UTXO
 snapshot, transaction history, and sync cursors — in a single atomic store
 transaction (:meth:`localwallet.store.Store.persist_scan_result`).
 
+Phase split (ADR-0022, TCK-SCAN-003): a scan is three phases so chain I/O
+can leave the engine thread — ``plan_scan`` reads everything the walk
+needs FROM the store (engine thread) into an immutable :class:`ScanPlan`;
+``fetch_scan`` derives + fetches against the chain client and returns an
+immutable :class:`ScanRecords` (this phase runs on the dedicated chain
+worker — it receives a plan, NEVER a ``Store``); ``persist_scan`` hands
+the records to the single atomic store transaction on the ENGINE thread.
+:func:`scan_wallet`/:func:`rescan_wallet` compose all three on the
+calling thread and are behavior-identical to the pre-split scan.
+
 Scan algorithm (per branch, 0 = receive then 1 = change, sequential — no
 concurrency in v1)
 -------------------------------------------------------------------
@@ -53,6 +63,15 @@ branch (≤ 2 × ``_MAX_WINDOW_ADDRESSES`` × ``len(BRANCHES)`` probes
 total), and no retry path can exceed it because each window address is
 queried exactly once (see "Ordering" below).
 
+Phase split (ADR-0022, TCK-SCAN-003): a scan runs in three phases —
+``plan_scan`` reads everything the walk needs FROM the store (engine
+thread), ``fetch_scan`` derives + fetches the chain data and builds the
+immutable record set (runs on the dedicated chain worker — it receives a
+:class:`ScanPlan`, never a ``Store``), and ``persist_scan`` hands the
+:class:`ScanRecords` to the single atomic store transaction (engine
+thread only). :func:`scan_wallet`/:func:`rescan_wallet` compose all three
+on the calling thread and are behavior-identical to the pre-split scan.
+
 Failure semantics: the **entire chain phase runs before any
 persistence.** A scan that fails midway (transport error, malformed
 payload) raises and leaves the store untouched — fail closed. The persist
@@ -85,8 +104,8 @@ surface; nothing is ever silently guessed.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Final
 
@@ -115,7 +134,12 @@ __all__ = [
     "OUT_OF_WINDOW_KEY",
     "BranchScanSummary",
     "ScanError",
+    "ScanPlan",
+    "ScanRecords",
     "ScanSummary",
+    "fetch_scan",
+    "persist_scan",
+    "plan_scan",
     "rescan_wallet",
     "scan_wallet",
 ]
@@ -220,6 +244,57 @@ class ScanSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class ScanPlan:
+    """Everything the derive+fetch phase needs that comes from the store.
+
+    Built by :func:`plan_scan` ON the engine thread (ADR-0022 decision 2):
+    the chain worker receives this immutable snapshot instead of a
+    ``Store``, so no thread other than the engine can touch the
+    engine-owned sqlite connection. The snapshot is NOT guaranteed to
+    equal a mid-flight read: ADR-0022 decision 6 legalizes ``new_address``
+    allocations on the engine thread WHILE a non-blocking fetch is in
+    flight, and those land in the store after this snapshot was taken.
+    :func:`persist_scan` (engine thread, persist time) reconciles the
+    records built from the snapshot against the live store before
+    writing — the derivation cursor is floored against the live
+    allocated/used rows (no mid-scan allocation is ever re-issued) and
+    a mid-scan ``allocated`` row is never downgraded."""
+
+    wallet_id: int
+    descriptor: WalletDescriptor
+    gap: int
+    #: True for the ``rescan`` trust model (re-derive, never cache-trust).
+    rebuild: bool
+    #: branch → index → cached address row (snapshot at plan time).
+    existing: Mapping[int, Mapping[int, AddressRecord]]
+    #: Address strings in ``allocated`` status (preserved by a rescan).
+    allocated: frozenset[str]
+    #: Previous scan-window cursor (``_read_previous_cursor``), or ``None``.
+    previous_cursor: Mapping[int, int] | None
+    #: Cached derivation cursor per branch (non-rebuild only; empty for a
+    #: rebuild, whose cursor is recomputed from chain truth + allocations).
+    derivation_next: Mapping[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class ScanRecords:
+    """Immutable persist-phase record set produced by :func:`fetch_scan`.
+
+    The chain worker's whole output (ADR-0022 decisions 2/3): data only —
+    the engine thread hands it to :meth:`Store.persist_scan_result` (via
+    :func:`persist_scan`), the single atomic transaction. The rows
+    themselves are frozen dataclasses; nothing here can reach sqlite."""
+
+    summary: ScanSummary
+    wallet_id: int
+    address_rows: tuple[AddressRecord, ...]
+    derivation_states: tuple[DerivationRecord, ...]
+    utxo_snapshot: tuple[UtxoRecord, ...]
+    tx_rows: tuple[TxRecord, ...]
+    sync_state_updates: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
 class _RawTx:
     """Validated shape of one Esplora address-txs entry."""
 
@@ -251,6 +326,12 @@ def scan_wallet(
     cursor below its current value. See module docstring for the
     algorithm and failure semantics.
 
+    Composition of the ADR-0022 phases on the calling thread
+    (:func:`plan_scan` → :func:`fetch_scan` → :func:`persist_scan`); the
+    app's chain-worker paths run those phases separately instead (fetch
+    off the engine thread), so behavior — including the
+    chain-phase-before-persistence failure semantics — is identical.
+
     Args:
         store: The persistence layer (an open :class:`Store`).
         client: The chain adapter (the only networked component).
@@ -279,9 +360,8 @@ def scan_wallet(
             :class:`StoreIntegrityError` is a subclass. Messages are
             value-free.
     """
-    return _run_scan(
-        store, client, wallet, gap_limit=gap_limit, rebuild=False, progress_fn=progress_fn
-    )
+    plan = plan_scan(store, wallet, gap_limit=gap_limit, rebuild=False)
+    return persist_scan(store, fetch_scan(plan, client, progress_fn=progress_fn))
 
 
 def rescan_wallet(
@@ -307,43 +387,91 @@ def rescan_wallet(
     :meth:`scan_wallet` (one bare tick per probed address; ``None`` = no
     callback, unchanged behavior).
     """
-    return _run_scan(
-        store, client, wallet, gap_limit=gap_limit, rebuild=True, progress_fn=progress_fn
-    )
+    plan = plan_scan(store, wallet, gap_limit=gap_limit, rebuild=True)
+    return persist_scan(store, fetch_scan(plan, client, progress_fn=progress_fn))
 
 
-# ----------------------------------------------------------------- internal
-
-
-def _run_scan(
+def plan_scan(
     store: Store,
-    client: EsploraClient,
     wallet: WalletRecord | WalletDescriptor,
     *,
-    gap_limit: int | None,
-    rebuild: bool,
-    progress_fn: Callable[[], None] | None,
-) -> ScanSummary:
-    """Shared scan core; ``rebuild`` selects the rescan trust model.
+    gap_limit: int | None = None,
+    rebuild: bool = False,
+) -> ScanPlan:
+    """Read the store inputs a scan needs into an immutable plan.
 
-    ``progress_fn`` (may be ``None``) is forwarded to
-    :func:`_walk_history` verbatim — one bare tick per probed address,
-    no data attached (TCK-UX-001).
+    ENGINE-THREAD phase (ADR-0022 decision 3): the only scan phase that
+    touches ``store`` at all — everything else runs against the returned
+    :class:`ScanPlan`. Reads are network-free.
+
+    Raises:
+        ScanError: malformed gap setting / sync-state payload, unknown
+            wallet, or a bad ``wallet`` argument type.
+        WatchKeyError: the wallet descriptor fails the parse-time gates.
+        StoreError: a store read failed.
     """
     gap = _resolve_gap_limit(store, gap_limit)
     descriptor, wallet_id = _resolve_wallet(store, wallet)
-
-    # ---- chain phase (no store mutations below until it fully succeeds)
-    tip_height = client.get_tip_height()
-    scanned_at = datetime.now(UTC).isoformat()
-
-    previous_cursor = _read_previous_cursor(store, wallet_id)
-    allocated_strings = {
+    existing = {
+        branch: {record.index: record for record in store.get_addresses(wallet_id, branch)}
+        for branch in BRANCHES
+    }
+    allocated = frozenset(
         record.address
         for branch in BRANCHES
-        for record in store.get_addresses(wallet_id, branch)
+        for record in existing[branch].values()
         if record.status == ADDRESS_ALLOCATED
-    }
+    )
+    # Rebuild mode recomputes the cursor from chain truth + allocations
+    # and must not seed derivation rows it never reads (fail-closed
+    # "store untouched on a mid-chain failure" contract).
+    derivation_next = (
+        {}
+        if rebuild
+        else {
+            branch: store.get_derivation(wallet_id, branch).next_index
+            for branch in BRANCHES
+        }
+    )
+    return ScanPlan(
+        wallet_id=wallet_id,
+        descriptor=descriptor,
+        gap=gap,
+        rebuild=rebuild,
+        existing=existing,
+        allocated=allocated,
+        previous_cursor=_read_previous_cursor(store, wallet_id),
+        derivation_next=derivation_next,
+    )
+
+
+def fetch_scan(
+    plan: ScanPlan,
+    client: EsploraClient,
+    *,
+    progress_fn: Callable[[], None] | None = None,
+) -> ScanRecords:
+    """Derive + fetch the whole scan result from ``client`` — NO store access.
+
+    The CHAIN-WORKER phase (ADR-0022 decision 2): runs off the engine
+    thread against a :class:`ScanPlan` snapshot and the chain client only,
+    and returns the immutable :class:`ScanRecords` the engine persists.
+    The entire chain phase still runs before any persistence (a separate
+    engine-thread ``persist_scan`` call): a failed fetch raises and leaves
+    the store untouched — fail closed.
+
+    ``progress_fn`` (TCK-UX-001) is invoked on the WORKER thread — one
+    bare value-free tick per probed address; the caller owns delivery
+    (the app queues ticks for the engine, never renders from this
+    thread). ``None`` (the default) performs no callback.
+
+    Raises:
+        ChainError: a chain query failed (nothing was produced).
+        ScanError: a chain payload failed validation (fail closed).
+    """
+    # ---- chain phase (immutable snapshots in, immutable records out)
+    tip_height = client.get_tip_height()
+    scanned_at = datetime.now(UTC).isoformat()
 
     branch_summaries: dict[int, BranchScanSummary] = {}
     window_maps: dict[int, dict[int, str]] = {}
@@ -351,29 +479,24 @@ def _run_scan(
     utxo_records: list[UtxoRecord] = []
 
     for branch in BRANCHES:
-        existing = {r.index: r for r in store.get_addresses(wallet_id, branch)}
+        existing = plan.existing[branch]
         final_map, branch_truncated, funded = _walk_history(
             client,
-            descriptor.parsed,
+            plan.descriptor.parsed,
             branch,
             existing,
             raw_txs,
-            gap=gap,
-            rebuild=rebuild,
+            gap=plan.gap,
+            rebuild=plan.rebuild,
             progress_fn=progress_fn,
         )
         used_indices, max_used_index, last_index = _summarize_walk(final_map, raw_txs)
-        utxo_records.extend(
-            _scan_utxos(client, wallet_id, branch, final_map, funded)
-        )
+        utxo_records.extend(_scan_utxos(client, plan.wallet_id, branch, final_map, funded))
 
         next_index = (
             max(_max_allocated_index(existing) + 1, max_used_index + 1)
-            if rebuild
-            else max(
-                store.get_derivation(wallet_id, branch).next_index,
-                max_used_index + 1,
-            )
+            if plan.rebuild
+            else max(plan.derivation_next.get(branch, 0), max_used_index + 1)
         )
         branch_summaries[branch] = BranchScanSummary(
             branch=branch,
@@ -387,32 +510,33 @@ def _run_scan(
         window_maps[branch] = final_map
 
     # Direction is computed once, against the complete address set.
-    our_addresses = _final_address_set(store, wallet_id, window_maps)
-    tx_records = _build_tx_records(wallet_id, raw_txs, our_addresses)
-    out_of_window = _detect_out_of_window(branch_summaries, previous_cursor)
+    our_addresses = _final_address_set(plan.existing, window_maps)
+    tx_records = _build_tx_records(plan.wallet_id, raw_txs, our_addresses)
+    out_of_window = _detect_out_of_window(branch_summaries, plan.previous_cursor)
 
-    # ---------------------------------------------------- persist phase
-    # ALL payloads are built first; the entire write-set then lands through
-    # ONE composite store call — a single SQLite transaction (all-or-nothing).
-    # Address statuses can therefore never desync from the derivation cursor
-    # or sync state, even on a crash mid-persist (TCK-P1-002 security
-    # review, atomic-persist finding). The every-scan out_of_window_detected
-    # write (empty payload clears stale warnings) is part of the same write.
+    # ALL payloads are built here; the entire write-set then lands through
+    # ONE composite store call in :func:`persist_scan` — a single SQLite
+    # transaction (all-or-nothing) executed by the ENGINE thread only.
+    # Address statuses can therefore never desync from the derivation
+    # cursor or sync state, even on a crash mid-persist (TCK-P1-002
+    # security review, atomic-persist finding). The every-scan
+    # out_of_window_detected write (empty payload clears stale warnings)
+    # is part of the same write.
     address_rows = [
         record
         for branch in BRANCHES
         for record in _address_records(
-            wallet_id,
+            plan.wallet_id,
             branch,
             window_maps[branch],
             set(branch_summaries[branch].used_indices),
-            allocated_strings,
-            descriptor.script_type,
+            plan.allocated,
+            plan.descriptor.script_type,
         )
     ]
     derivation_states = [
         DerivationRecord(
-            wallet_id=wallet_id,
+            wallet_id=plan.wallet_id,
             branch=branch,
             max_used_index=branch_summaries[branch].max_used_index,
             next_index=branch_summaries[branch].next_index,
@@ -425,18 +549,9 @@ def _run_scan(
         SCAN_AT_KEY: scanned_at,
         OUT_OF_WINDOW_KEY: _dump_out_of_window(out_of_window, scanned_at),
     }
-    store.persist_scan_result(
-        wallet_id,
-        address_rows=address_rows,
-        derivation_states=derivation_states,
-        utxo_snapshot=utxo_records,
-        tx_rows=tx_records,
-        sync_state_updates=sync_state_updates,
-    )
-
-    return ScanSummary(
-        wallet_id=wallet_id,
-        gap_limit=gap,
+    summary = ScanSummary(
+        wallet_id=plan.wallet_id,
+        gap_limit=plan.gap,
         tip_height=tip_height,
         scanned_at=scanned_at,
         branches=branch_summaries,
@@ -445,6 +560,76 @@ def _run_scan(
         out_of_window=out_of_window,
         truncated=any(s.truncated for s in branch_summaries.values()),
     )
+    return ScanRecords(
+        summary=summary,
+        wallet_id=plan.wallet_id,
+        address_rows=tuple(address_rows),
+        derivation_states=tuple(derivation_states),
+        utxo_snapshot=tuple(utxo_records),
+        tx_rows=tuple(tx_records),
+        sync_state_updates=sync_state_updates,
+    )
+
+
+def persist_scan(store: Store, records: ScanRecords) -> ScanSummary:
+    """Persist one :func:`fetch_scan` result set — ENGINE thread only.
+
+    ADR-0022 decision 3: the sole writer path of the scan split; hands
+    the immutable record set to :meth:`Store.persist_scan_result` (the
+    single atomic transaction). Any store failure rolls back completely
+    and propagates (``StoreError``/``StoreIntegrityError``, value-free;
+    deliberately *not* wrapped in :class:`ScanError`) — the prior store
+    state stays fully intact and the scan can be retried.
+
+    Mid-scan reconciliation (TCK-SCAN-003 security review): because
+    ADR-0022 decision 6 lets ``new_address`` allocate on the engine
+    thread while a non-blocking fetch runs, the records (built from the
+    pre-allocation :class:`ScanPlan` snapshot) can lag the store. This
+    engine-thread persist point is the one place allowed to re-read the
+    store: the merge floors every branch's ``next_index`` at the LIVE
+    max-allocated/used index + 1 (the rebuild path's own never-reissue
+    rule, evaluated at persist time instead of plan time — a genuine
+    chain-truth cursor *lowering* still stands) and never downgrades
+    an address the store currently holds ``allocated`` to ``unused``
+    (preserved by address string, the same rule as ``plan.allocated``;
+    ``used`` is a status upgrade and stands). The returned summary
+    keeps the scan's own view — it is narration, never persisted state.
+    """
+    live_rows = {
+        branch: {row.index: row for row in store.get_addresses(records.wallet_id, branch)}
+        for branch in BRANCHES
+    }
+    live_allocated = frozenset(
+        row.address for rows in live_rows.values() for row in rows.values()
+        if row.status == ADDRESS_ALLOCATED
+    )
+    address_rows = tuple(
+        replace(row, status=ADDRESS_ALLOCATED)
+        if row.status == ADDRESS_UNUSED and row.address in live_allocated
+        else row
+        for row in records.address_rows
+    )
+    derivation_states = tuple(
+        replace(
+            state,
+            next_index=max(
+                state.next_index, _max_allocated_index(live_rows[state.branch]) + 1
+            ),
+        )
+        for state in records.derivation_states
+    )
+    store.persist_scan_result(
+        records.wallet_id,
+        address_rows=address_rows,
+        derivation_states=derivation_states,
+        utxo_snapshot=records.utxo_snapshot,
+        tx_rows=records.tx_rows,
+        sync_state_updates=records.sync_state_updates,
+    )
+    return records.summary
+
+
+# ----------------------------------------------------------------- internal
 
 
 def _resolve_gap_limit(store: Store, gap_limit: int | None) -> int:
@@ -632,20 +817,21 @@ def _scan_utxos(
 
 
 def _final_address_set(
-    store: Store,
-    wallet_id: int,
+    existing: Mapping[int, Mapping[int, AddressRecord]],
     window_maps: dict[int, dict[int, str]],
 ) -> dict[str, tuple[int, int]]:
     """Every address the wallet currently maps, with its coordinates.
 
     Window maps carry the truth for scanned indices (in rebuild mode
-    this drops corrupted mappings replaced during the walk); store rows
+    this drops corrupted mappings replaced during the walk); cached rows
     beyond the current window remain part of the wallet's address set
     (they cannot hold live UTXOs, but they still attribute transactions).
+    ``existing`` is the plan's store snapshot — this runs on the worker
+    with no live ``Store`` access (ADR-0022).
     """
     ours: dict[str, tuple[int, int]] = {}
     for branch in BRANCHES:
-        for record in store.get_addresses(wallet_id, branch):
+        for record in existing[branch].values():
             if record.index not in window_maps[branch]:
                 ours.setdefault(record.address, (branch, record.index))
         for index, address in window_maps[branch].items():

@@ -231,17 +231,23 @@ def test_incoming_tx_without_address_amount_recorded_but_not_surfaced():
 
 def test_poller_is_tick_driven_and_spawns_no_thread():
     """Pin the watcher's own tick design (ADR-0019 §2, as amended by
-    ADR-0024): ``tick`` is synchronous (no sleep) and the WATCHER spawns no
-    poller thread.
+    ADR-0024 §9; retirement recorded and executed by ADR-0022 /
+    TCK-SCAN-003): ``tick`` is synchronous (no sleep) and the WATCHER
+    spawns no poller thread.
 
     The old pin asserted ``threading.enumerate() == 1`` (the whole process
     was one thread). That exact form is retired as planned work for the
     threaded world (ADR-0019 amendment / ADR-0024 §3): the CLI REPL now
-    runs the queue pump with a stdin feeder thread, and engine-thread mode
-    lives behind ``app.start_engine`` (pinned in tests/test_engine_pump.py).
-    The load-bearing half stays: a tick must not spawn anything — asserted
-    as a thread-set DELTA around the call, which is transport-mode
-    agnostic. The dedup/surfacing pins are unchanged.
+    runs the queue pump with a stdin feeder thread, the dedicated chain
+    worker (ADR-0022) owns scan/watch chain I/O with NO store access, and
+    engine-thread mode lives behind ``app.start_engine`` (pinned in
+    tests/test_engine_pump.py). The load-bearing half stays: a tick must
+    spawn nothing — asserted as a thread-set DELTA around the call, which
+    is transport-mode agnostic (the watcher only ever reads ``poll_due``/
+    ``tick`` from whatever thread drives it; in the CLI that is the pump
+    between turns, and the poll's chain fetch rides the worker via
+    ``scan_fn`` — pinned in tests/test_scan_worker.py). The dedup/
+    surfacing pins are unchanged.
     """
     import threading
 

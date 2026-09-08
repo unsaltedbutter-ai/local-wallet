@@ -113,6 +113,7 @@ FACTS AND VERBATIM RULE
 - Addresses, amounts, and balances are provided in the FACTS block. Copy \
 them VERBATIM. Never invent, round, reformat, or "correct" them. If a \
 fact you need is missing, ask for it via clarify.
+- FACTS ``freshness: stale`` is tool-owned; never claim data is up to date.
 
 SECRETS RULE
 - local-wallet is watch-only: seed phrases and private keys (xprv) are \

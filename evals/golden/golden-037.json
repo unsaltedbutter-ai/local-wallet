@@ -1,0 +1,11 @@
+{
+  "id": "golden-037",
+  "prompt": "is the balance you keep showing me totally up to date?",
+  "facts": {
+    "freshness": "stale"
+  },
+  "expectation": {
+    "intent": "respond",
+    "text_nonempty": true
+  }
+}

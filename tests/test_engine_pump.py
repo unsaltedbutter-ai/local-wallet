@@ -421,37 +421,40 @@ def _summary() -> ScanSummary:
 def test_scan_dots_are_events_for_non_cli_transports(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """TCK-UX-001 dots no longer leak straight to stdout once an emitter is
-    given: a non-CLI transport receives them as ``progress`` events (and
-    only that — the console stays clean)."""
+    """TCK-UX-001 (re-scoped onto the non-blocking scan, TCK-SCAN-003): the
+    startup scan's progress dots flow through the engine event stream —
+    ``progress`` events on the given ``emitter`` — and the completion
+    narration follows when the ENGINE persists the worker's record set. A
+    non-CLI transport keeps the console clean (nothing leaks to stdout).
 
-    def fake_scan(
-        store: Store,
-        client: object,
-        wallet: object,
-        *,
-        progress_fn: Callable[[], None] | None = None,
-        gap_limit: int | None = None,
-    ) -> ScanSummary:
-        assert progress_fn is not None  # strict zero-arg tick shape
-        for _ in range(3):
-            progress_fn()
+    ``handle_command`` is the engine-thread half of :class:`ScanFlow`: the
+    exact path the pump drives from the command queue (the worker delivers
+    the same markers). Persistence stays single-threaded here (the engine),
+    never on the worker (pinned in tests/test_scan_flow.py).
+    """
+
+    def fake_persist(_store: object, _records: object) -> ScanSummary:
         return _summary()
 
-    monkeypatch.setattr(app.wallet_scan, "scan_wallet", fake_scan)
-    monkeypatch.setenv(app.AUTO_SCAN_ENV_VAR, "1")
+    monkeypatch.setattr(app.wallet_scan, "persist_scan", fake_persist)
     events: list[EngineEvent] = []
     outputs: list[str] = []
+    emitter = EventEmitter(events.append)
     store = Store(None)
     wallet = store.create_wallet("default", "desc")
-    app._startup_scan(
-        store,
-        None,
-        wallet,
-        rescan_requested=False,
-        output_fn=outputs.append,
-        emitter=EventEmitter(events.append),
+    worker = app.ChainWorker(None)  # client unused: fetch never runs here
+    flow = app.ScanFlow(
+        store, wallet, worker, gap_limit=None, startup_plan=object()
     )
+    flow.attach(queue.Queue())
+    try:
+        for _ in range(3):  # three bare ticks → three dots
+            assert flow.handle_command(app._ScanTick(), outputs.append, emitter)
+        assert flow.handle_command(
+            app._ScanDone(True, object()), outputs.append, emitter
+        )
+    finally:
+        worker.stop()
     assert capsys.readouterr().out == ""  # nothing hit the console
     assert [(e.kind, e.payload) for e in events] == [
         (EVENT_PROGRESS, "."),
@@ -460,7 +463,6 @@ def test_scan_dots_are_events_for_non_cli_transports(
         (EVENT_PROGRESS, "\n"),
     ]
     assert outputs == [
-        app.SCAN_PROGRESS_NOTICE,
         "Startup scan complete: 1 UTXOs · tip height 870000.",
     ]
 

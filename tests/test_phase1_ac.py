@@ -530,6 +530,9 @@ def test_ac4_store_view_narration_inputs_match_truth(store: Store) -> None:
         "total_sats": TOTAL_TRUTH,
         "addresses_scanned": 3,  # three addresses hold the UTXO set
         "tip_height": TIP,
+        # TCK-SCAN-003 (ADR-0022): tool-owned freshness; the scan completed,
+        # so this cache answer is fresh.
+        "freshness": "fresh",
     }
 
     # --- UTXO rows, verbatim (store order: txid, vout).

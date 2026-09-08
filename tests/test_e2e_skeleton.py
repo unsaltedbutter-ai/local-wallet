@@ -32,6 +32,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import asdict
 from io import BytesIO
@@ -714,6 +716,9 @@ def test_balance_end_to_end_agent_to_dispatcher_to_scan_to_store() -> None:
         "total_sats": EXPECTED_TOTAL,
         "addresses_scanned": 2,  # addresses WITH utxos (ticket contract)
         "tip_height": TIP_HEIGHT,
+        # TCK-SCAN-003 (ADR-0022): the tool-owned freshness flag rides every
+        # cache answer; the lazy scan completed, so this one is fresh.
+        "freshness": "fresh",
     }
     # The lazy scan really hit the chain adapter: one txs call per window
     # address, utxo calls only for addresses with txs (TCK-SCAN-001:
@@ -1157,6 +1162,25 @@ def _preset_store(path: Path, *, gap_limit: int = TEST_GAP) -> WalletDescriptor:
     return wd
 
 
+def _wait_scan_narration(outputs: list[str], timeout: float = 10.0) -> None:
+    """Feeder-side sync for the NON-BLOCKING startup scan (TCK-SCAN-003,
+    ADR-0022): hold the next user line until the engine thread has narrated
+    the scan's completion or failure, so a line that must read the
+    post-scan cache is deterministic (the prompt was live long before)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(
+            line.startswith(
+                ("Startup scan complete", "Rescan complete", "warning: startup scan failed",
+                 "warning: rescan failed")
+            )
+            for line in outputs
+        ):
+            return
+        time.sleep(0.005)
+    raise AssertionError("startup scan never narrated its outcome")
+
+
 def _run_captured(
     argv: list[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -1165,8 +1189,14 @@ def _run_captured(
     *,
     store_path: Path | None = None,
     auto_scan: bool = False,
+    sync_first_line: bool = False,
 ) -> tuple[int, list[str]]:
-    """Run app.run() with stub I/O, a tmp store, and a mock chain client."""
+    """Run app.run() with stub I/O, a tmp store, and a mock chain client.
+
+    ``sync_first_line`` gates the FIRST user line on the startup scan's
+    narration (see :func:`_wait_scan_narration`) — used by tests asserting
+    post-scan reads; tests of the stale/mid-scan behavior leave it off and
+    race nothing (their assertions hold either way)."""
     monkeypatch.delenv("LOCALWALLET_MODEL_PATH", raising=False)
     monkeypatch.delenv("LOCALWALLET_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LOCALWALLET_LLM_MODEL", raising=False)
@@ -1177,11 +1207,16 @@ def _run_captured(
         app_module, "EsploraClient", lambda **_: _mock_client(handler)
     )
     inputs = iter(lines)
+    outputs: list[str] = []
+    state = {"first": True}
 
     def read_line(_prompt: str) -> str:
-        return next(inputs)
+        line = next(inputs)
+        if sync_first_line and state["first"]:
+            state["first"] = False
+            _wait_scan_narration(outputs)
+        return line
 
-    outputs: list[str] = []
     code = run(argv, input_fn=read_line, output_fn=outputs.append)
     return code, outputs
 
@@ -1206,6 +1241,7 @@ def test_startup_scan_populates_store_then_balance_reads_it(
         ["What's my balance?", "exit"],
         store_path=store_path,
         auto_scan=True,
+        sync_first_line=True,  # TCK-SCAN-003: read AFTER the async scan lands
     )
 
     assert code == 0
@@ -1680,6 +1716,7 @@ def test_repl_reports_chain_unavailable(
         ["What's my balance?", "exit"],
         store_path=store_path,
         auto_scan=True,
+        sync_first_line=True,  # balance runs after the failed async scan is narrated
     )
 
     assert code == 0
@@ -1747,6 +1784,7 @@ def test_rescan_flag_repairs_stale_cache(
         handler,
         ["What's my balance?", "exit"],
         store_path=store_path,
+        sync_first_line=True,  # TCK-SCAN-003: read AFTER the async rescan lands
     )
 
     assert code == 0
@@ -1845,63 +1883,26 @@ def test_truncation_notice_is_value_free() -> None:
     assert "rescan" in notice
 
 
-def test_startup_scan_line_byte_identical_when_not_truncated(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_startup_scan_line_byte_identical_when_not_truncated() -> None:
     """TCK-SEC-002b: non-truncated startup-scan narration is byte-identical
     to the pre-change text (period, no notice appended).
 
-    TCK-UX-001: the completion line is preceded by the pre-scan notice
-    line (and the progress-dot stream on stdout, not captured here)."""
-    store_path = _store_path(tmp_path)
-    _preset_store(store_path)
-    outputs: list[str] = []
-    with Store(store_path) as store:
-        wallet = store.get_wallet_by_name("default")
-        assert wallet is not None
-        monkeypatch.setattr(
-            app_module.wallet_scan,
-            "scan_wallet",
-            lambda store, client, wallet, *, progress_fn=None, gap_limit=None: (
-                _make_scan_summary(truncated=False)
-            ),
-        )
-        app_module._startup_scan(
-            store, None, wallet, rescan_requested=False, output_fn=outputs.append
-        )
-    assert outputs == [
-        app_module.SCAN_PROGRESS_NOTICE,
-        "Startup scan complete: 1 UTXOs · tip height 870000.",
-    ]
-
-
-def test_startup_scan_appends_truncation_notice_when_truncated(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """TCK-SEC-002b: a truncated startup scan appends the notice to the
-    normal startup narration."""
-    store_path = _store_path(tmp_path)
-    _preset_store(store_path)
-    outputs: list[str] = []
-    with Store(store_path) as store:
-        wallet = store.get_wallet_by_name("default")
-        assert wallet is not None
-        monkeypatch.setattr(
-            app_module.wallet_scan,
-            "scan_wallet",
-            lambda store, client, wallet, *, progress_fn=None, gap_limit=None: (
-                _make_scan_summary(truncated=True)
-            ),
-        )
-        app_module._startup_scan(
-            store, None, wallet, rescan_requested=False, output_fn=outputs.append
-        )
-    assert len(outputs) == 2
-    assert outputs[0] == app_module.SCAN_PROGRESS_NOTICE
-    assert outputs[1].startswith(
-        "Startup scan complete: 1 UTXOs · tip height 870000."
+    TCK-SCAN-003: the completion line is now produced by the engine-thread
+    persist step (:func:`_scan_summary_line`, emitted by :class:`ScanFlow`
+    when the startup scan lands), so the truncation contract is pinned on
+    that pure builder directly."""
+    assert (
+        app_module._scan_summary_line(_make_scan_summary(truncated=False))
+        == "Startup scan complete: 1 UTXOs · tip height 870000."
     )
-    assert app_module.TRUNCATION_NOTICE in outputs[1]
+
+
+def test_startup_scan_appends_truncation_notice_when_truncated() -> None:
+    """TCK-SEC-002b: a truncated startup scan appends the notice to the
+    normal startup narration (:func:`_scan_summary_line`)."""
+    line = app_module._scan_summary_line(_make_scan_summary(truncated=True))
+    assert line.startswith("Startup scan complete: 1 UTXOs · tip height 870000.")
+    assert app_module.TRUNCATION_NOTICE in line
 
 
 def test_watch_probe_discards_truncated_scan_summary(tmp_path: Path) -> None:
@@ -2322,6 +2323,7 @@ def test_startup_chain_down_repl_still_starts_and_balance_degrades(
         ["What's my balance?", "exit"],
         store_path=store_path,
         auto_scan=True,
+        sync_first_line=True,  # balance runs after the failed async scan is narrated
     )
 
     assert code == 0
@@ -5242,173 +5244,222 @@ def test_live_mainnet_balance_via_mempool_space() -> None:
 
 
 def test_startup_scan_notice_before_scan_completion_after(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """TCK-UX-001: the pre-scan notice is emitted BEFORE the scan runs and
-    the completion narration AFTER it returns; the scan receives a strict
-    zero-argument progress callback (one bare dot per tick on stdout)."""
-    store_path = _store_path(tmp_path)
-    _preset_store(store_path)
-    events: list[str] = []
-
-    def fake_scan(
-        store: Store,
-        client: object,
-        wallet: object,
-        *,
-        progress_fn: Callable[[], None] | None = None,
-        gap_limit: int | None = None,
-    ) -> app_module.wallet_scan.ScanSummary:
-        events.append("scan-start")
-        assert progress_fn is not None
-        progress_fn()  # strict zero-arg call: any argument would TypeError
-        progress_fn()
-        events.append("scan-end")
-        return _make_scan_summary(truncated=False)
-
-    monkeypatch.setattr(app_module.wallet_scan, "scan_wallet", fake_scan)
-    with Store(store_path) as store:
-        wallet = store.get_wallet_by_name("default")
-        assert wallet is not None
-        app_module._startup_scan(
-            store,
-            None,
-            wallet,
-            rescan_requested=False,
-            output_fn=lambda line: events.append(f"out:{line}"),
-        )
-    assert events == [
-        f"out:{app_module.SCAN_PROGRESS_NOTICE}",
-        "scan-start",
-        "scan-end",
-        "out:Startup scan complete: 1 UTXOs · tip height 870000.",
-    ]
-
-
-def test_rescan_path_notice_before_scan_completion_after(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """TCK-UX-001: the ``--rescan`` repair scan gets the same ordering —
-    notice first, completion narration last — via ``rescan_wallet``."""
-    store_path = _store_path(tmp_path)
-    _preset_store(store_path)
-    events: list[str] = []
-
-    def fake_rescan(
-        store: Store,
-        client: object,
-        wallet: object,
-        *,
-        progress_fn: Callable[[], None] | None = None,
-        gap_limit: int | None = None,
-    ) -> app_module.wallet_scan.ScanSummary:
-        events.append("scan-start")
-        assert progress_fn is not None
-        progress_fn()
-        events.append("scan-end")
-        return _make_scan_summary(truncated=False)
-
-    monkeypatch.setattr(app_module.wallet_scan, "rescan_wallet", fake_rescan)
-    with Store(store_path) as store:
-        wallet = store.get_wallet_by_name("default")
-        assert wallet is not None
-        app_module._startup_scan(
-            store,
-            None,
-            wallet,
-            rescan_requested=True,
-            output_fn=lambda line: events.append(f"out:{line}"),
-        )
-    assert events == [
-        f"out:{app_module.SCAN_PROGRESS_NOTICE}",
-        "scan-start",
-        "scan-end",
-        (
-            "out:Rescan complete: branch 0: scanned 3, "
-            "max used 0, next index 1 · branch 1: scanned 2, "
-            "max used -1, next index 0 · 1 UTXOs · tip height 870000"
-        ),
-    ]
-
-
-def test_startup_scan_dots_stream_to_stdout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """TCK-UX-001: each probe tick streams one '.' (flushed) on a single
-    wrapping stdout line, closed by one newline when the scan returns —
-    while the narration lines go through ``output_fn`` only."""
+    """TCK-UX-001 re-scoped onto the non-blocking scan (TCK-SCAN-003): the
+    pre-scan notice still precedes everything, the fetch runs on the chain
+    WORKER and receives the strict zero-argument progress callback (two
+    bare dots stream to stdout, newline-closed), and the completion
+    narration follows on the ENGINE thread when the record set persists —
+    AFTER the live prompt hint (the old blocking contract's inversion)."""
     store_path = _store_path(tmp_path)
     _preset_store(store_path)
+    events: list[str] = []
 
-    def fake_scan(
-        store: Store,
+    def fake_fetch(
+        plan: object,
         client: object,
-        wallet: object,
         *,
         progress_fn: Callable[[], None] | None = None,
-        gap_limit: int | None = None,
-    ) -> app_module.wallet_scan.ScanSummary:
-        assert progress_fn is not None
-        for _ in range(4):
-            progress_fn()
-        return _make_scan_summary(truncated=False)
+    ) -> object:
+        events.append("scan-start")
+        assert progress_fn is not None  # strict zero-arg tick shape
+        progress_fn()
+        progress_fn()
+        events.append("scan-end")
+        return object()  # engine-side persist_scan is patched below
 
-    monkeypatch.setattr(app_module.wallet_scan, "scan_wallet", fake_scan)
-    outputs: list[str] = []
-    with Store(store_path) as store:
-        wallet = store.get_wallet_by_name("default")
-        assert wallet is not None
-        app_module._startup_scan(
-            store, None, wallet, rescan_requested=False, output_fn=outputs.append
-        )
-    captured = capsys.readouterr().out
-    assert captured == "....\n"  # four bare ticks, one closing newline
-    # The narration lines go through output_fn only — no dots-only lines.
-    assert all(set(line) != {"."} for line in outputs)
-
-
-def test_run_prints_type_a_message_last_after_startup_scan(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """TCK-UX-001 end-to-end ordering: banner → background-watch line →
-    pre-scan notice → completion narration → out-of-window notice →
-    "Type a message" LAST (input is actually live when the hint shows)."""
-    store_path = _store_path(tmp_path)
-    wd = _preset_store(store_path)
-    addr0, addr1 = derive_fixture_addresses(2)
-    handler = _scan_handler(
-        [], utxos_by_addr={addr0: UTXOS_ADDR0, addr1: UTXOS_ADDR1}
+    monkeypatch.setattr(app_module.wallet_scan, "fetch_scan", fake_fetch)
+    monkeypatch.setattr(
+        app_module.wallet_scan,
+        "persist_scan",
+        lambda store, records: _make_scan_summary(truncated=False),
     )
-
     code, outputs = _run_captured(
         ["--stub-llm", "--zpub", ZPUB],
         monkeypatch,
-        handler,
+        lambda request: pytest.fail(f"unexpected chain call: {request.url}"),
         ["exit"],
         store_path=store_path,
         auto_scan=True,
     )
 
     assert code == 0
+    assert events == ["scan-start", "scan-end"]
     notice_idx = outputs.index(app_module.SCAN_PROGRESS_NOTICE)
+    type_idx = outputs.index("Type a message — 'exit' or Ctrl-D quits.")
+    complete_idx = outputs.index(
+        "Startup scan complete: 1 UTXOs · tip height 870000."
+    )
+    assert notice_idx < type_idx < complete_idx
+    assert capsys.readouterr().out == "..\n"  # two bare ticks, newline-closed
+
+
+def test_rescan_path_notice_before_scan_completion_after(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-UX-001 re-scoped (TCK-SCAN-003 item 5): ``--rescan`` RIDES THE
+    SPLIT — plan with ``rebuild=True`` on the engine thread, the derive+fetch
+    on the worker (immutable record set out), the persist + completion
+    narration on the engine — with the same notice → hint → summary
+    ordering as the ordinary startup scan."""
+    store_path = _store_path(tmp_path)
+    _preset_store(store_path)
+    events: list[str] = []
+    real_plan = app_module.wallet_scan.plan_scan
+
+    def spy_plan(store: Store, wallet: object, *, gap_limit: int | None = None,
+                 rebuild: bool = False):
+        events.append(f"plan:{rebuild}")
+        return real_plan(store, wallet, gap_limit=gap_limit, rebuild=rebuild)
+
+    def fake_fetch(
+        plan: object,
+        client: object,
+        *,
+        progress_fn: Callable[[], None] | None = None,
+    ) -> object:
+        events.append("fetch")
+        assert progress_fn is not None
+        progress_fn()
+        return object()
+
+    monkeypatch.setattr(app_module.wallet_scan, "plan_scan", spy_plan)
+    monkeypatch.setattr(app_module.wallet_scan, "fetch_scan", fake_fetch)
+    monkeypatch.setattr(
+        app_module.wallet_scan,
+        "persist_scan",
+        lambda store, records: _make_scan_summary(truncated=False),
+    )
+    code, outputs = _run_captured(
+        ["--stub-llm", "--zpub", ZPUB, "--rescan"],
+        monkeypatch,
+        lambda request: pytest.fail(f"unexpected chain call: {request.url}"),
+        ["exit"],
+        store_path=store_path,
+    )
+
+    assert code == 0
+    assert events == ["plan:True", "fetch"]  # the split, in order
+    notice_idx = outputs.index(app_module.SCAN_PROGRESS_NOTICE)
+    type_idx = outputs.index("Type a message — 'exit' or Ctrl-D quits.")
+    complete_idx = next(
+        i for i, line in enumerate(outputs) if line.startswith("Rescan complete:")
+    )
+    assert notice_idx < type_idx < complete_idx
+    assert outputs[complete_idx] == (
+        "Rescan complete: branch 0: scanned 3, max used 0, next index 1 · "
+        "branch 1: scanned 2, max used -1, next index 0 · 1 UTXOs · "
+        "tip height 870000"
+    )
+
+
+def test_prompt_is_live_while_startup_scan_still_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-SCAN-003 (ADR-0022 decision 1; re-scopes the TCK-UX-001
+    "hint-last" pin, which the non-blocking startup scan supersedes): the
+    notice and the "Type a message" hint print WHILE the startup scan is
+    still fetching (held on the mock chain) — the prompt is live in well
+    under a second; a turn taken during the scan answers from the cache
+    with the tool-owned stale flag + value-free note (no second scan
+    fires); the completion narration lands after the hint, once the
+    engine persists the worker's records; the later turn reads the
+    populated cache verbatim, fresh."""
+    store_path = _store_path(tmp_path)
+    wd = _preset_store(store_path)
+    recorded: list[httpx.Request] = []
+    addr0, addr1 = derive_fixture_addresses(2)
+    inner = _scan_handler(
+        recorded, utxos_by_addr={addr0: UTXOS_ADDR0, addr1: UTXOS_ADDR1}
+    )
+    release = threading.Event()
+
+    def gating(request: httpx.Request) -> httpx.Response:
+        # The scan cannot complete until the test releases it: any turn
+        # taken before then is DETERMINISTICALLY mid-first-scan.
+        release.wait(10)
+        return inner(request)
+
+    lines = iter(["What's my balance?", "What's my balance?", "exit"])
+    outputs: list[str] = []
+    asked = {"n": 0}
+
+    def read_line_gated(_prompt: str) -> str:
+        line = next(lines)
+        if line == "What's my balance?":
+            asked["n"] += 1
+            if asked["n"] == 2:
+                # Second ask: let the scan finish, and wait for the engine's
+                # completion narration before the turn runs.
+                release.set()
+                _wait_scan_narration(outputs)
+        return line
+
+    monkeypatch.delenv("LOCALWALLET_MODEL_PATH", raising=False)
+    monkeypatch.delenv("LOCALWALLET_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LOCALWALLET_LLM_MODEL", raising=False)
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
+    monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "1")
+    monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(gating))
+    try:
+        code = run(
+            ["--stub-llm", "--zpub", ZPUB],
+            input_fn=read_line_gated,
+            output_fn=outputs.append,
+        )
+    finally:
+        release.set()
+
+    assert code == 0
+    notice_idx = outputs.index(app_module.SCAN_PROGRESS_NOTICE)
+    type_idx = outputs.index("Type a message — 'exit' or Ctrl-D quits.")
     complete_idx = next(
         i for i, line in enumerate(outputs) if line.startswith("Startup scan complete")
     )
-    type_idx = outputs.index("Type a message — 'exit' or Ctrl-D quits.")
-    assert notice_idx < complete_idx < type_idx
-    # With a bare "exit" the REPL adds no further output: the hint is last.
-    assert outputs[-1] == "Type a message — 'exit' or Ctrl-D quits."
-    # The value-free notice carries no addresses/amounts and no zpub.
-    assert wd.descriptor not in outputs[notice_idx]
-    assert ZPUB not in outputs[notice_idx]
+    # Prompt-live contract: notice → hint → (scan still running) → completion.
+    assert notice_idx < type_idx < complete_idx
+    # The mid-scan balance: cache-served zeros + the value-free stale note,
+    # both BEFORE the completion line (the tool owns the flag).
+    first_balance_idx = next(
+        i for i, line in enumerate(outputs) if line.startswith("Balance (mainnet):")
+    )
+    assert first_balance_idx < complete_idx
+    assert "Balance (mainnet): 0 sats (confirmed) + 0 sats (unconfirmed)" in outputs
+    note_idx = outputs.index(app_module.FRESHNESS_NOTE)
+    assert first_balance_idx < note_idx < complete_idx
+    # The post-scan balance: real values, no trailing stale note after it.
+    assert (
+        f"Balance (mainnet): {EXPECTED_CONFIRMED} sats (confirmed) "
+        f"+ {EXPECTED_UNCONFIRMED} sats (unconfirmed)" in outputs
+    )
+    last_balance_idx = max(
+        i for i, line in enumerate(outputs) if line.startswith("Balance (mainnet):")
+    )
+    assert last_balance_idx > complete_idx
+    assert app_module.FRESHNESS_NOTE not in outputs[last_balance_idx:]
+    # One scan (9 requests: 1 tip + 6 txs + 2 utxo, TCK-SCAN-001) — the
+    # mid-scan turn did NOT trigger a second scan.
+    assert len(recorded) == 9
+    joined = "\n".join(outputs)
+    assert ZPUB not in joined and wd.descriptor not in joined
+    assert all(addr not in joined for addr in (addr0, addr1))
+    with Store(store_path) as store:
+        rows = store.list_wallets()
+        assert len(rows) == 1
+        assert store.get_sync_state(rows[0].id, "last_scan_cursor") is not None
 
 
-def test_run_prints_type_a_message_last_when_startup_scan_fails(
+def test_prompt_live_and_startup_failure_narrated_after_hint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """TCK-UX-001 failure path: notice → scrubbed warning → newline-closed
-    dot line → "Type a message" still LAST (the REPL starts regardless)."""
+    """TCK-SCAN-003 failure path (re-scopes the TCK-UX-001 failure pin):
+    notice → "Type a message" (prompt live) → scrubbed warning on the
+    engine thread when the worker's scan fails — the REPL still runs. A
+    later balance turn then lazy-retries via the worker and surfaces the
+    chain state honestly (gate lifted → lazy path, as ever)."""
     store_path = _store_path(tmp_path)
+    _preset_store(store_path)
     # addr0 funded: the /utxo failure stays on the scan path (addresses
     # with empty history are never fetched, TCK-SCAN-001).
     handler = _scan_handler(
@@ -5416,13 +5467,32 @@ def test_run_prints_type_a_message_last_when_startup_scan_fails(
         utxo_status=503,
     )
 
-    code, outputs = _run_captured(
+    outputs: list[str] = []
+    lines = iter(["What's my balance?", "exit"])
+
+    def read_line(_prompt: str) -> str:
+        line = next(lines)
+        if line == "What's my balance?":
+            # Deterministic: wait for the engine to narrate the startup
+            # failure before the balance turn runs.
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not any(
+                ln.startswith("warning: startup scan failed") for ln in outputs
+            ):
+                time.sleep(0.005)
+        return line
+
+    monkeypatch.delenv("LOCALWALLET_MODEL_PATH", raising=False)
+    monkeypatch.delenv("LOCALWALLET_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LOCALWALLET_LLM_MODEL", raising=False)
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
+    monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "1")
+    monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
+
+    code = run(
         ["--stub-llm", "--zpub", ZPUB],
-        monkeypatch,
-        handler,
-        ["exit"],
-        store_path=store_path,
-        auto_scan=True,
+        input_fn=read_line,
+        output_fn=outputs.append,
     )
 
     assert code == 0
@@ -5431,5 +5501,9 @@ def test_run_prints_type_a_message_last_when_startup_scan_fails(
         i for i, line in enumerate(outputs) if line.startswith("warning: startup scan failed")
     )
     type_idx = outputs.index("Type a message — 'exit' or Ctrl-D quits.")
-    assert notice_idx < warning_idx < type_idx
-    assert outputs[-1] == "Type a message — 'exit' or Ctrl-D quits."
+    assert notice_idx < type_idx < warning_idx  # prompt live BEFORE the outcome
+    joined = "\n".join(outputs)
+    # The lazy retry after the failed startup scan: chain still down →
+    # the honest chain-unavailable line, never a fabricated balance.
+    assert "chain unavailable" in joined
+    assert "Balance (mainnet):" not in joined
