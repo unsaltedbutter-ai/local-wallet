@@ -9,7 +9,11 @@ Implements the file conventions of ADR-0014 (OQ17):
   first 8 characters of a sanitized transaction reference (hex/alnum only,
   else the first 8 hex chars of its SHA-256 — see :func:`_sanitize_tx_ref`).
   The fixed prefixes sort the two directions apart and the ``<ref>`` prefix
-  makes collisions across transactions unlikely.
+  makes collisions across transactions unlikely. Each export ALSO writes a
+  **binary** sibling ``localwallet-unsigned-<ref>.psbt`` — the raw BIP-174
+  bytes (base64-decoded form of the .b64 text) — for wallets (e.g. Sparrow)
+  that open binary .psbt files natively; the .b64 remains the canonical
+  localwallet export and the only form import reads.
 - **Checksums:** every export writes a ``<name>.sha256`` sidecar (hex digest
   + newline). On import a present sidecar MUST match (fail closed); an
   absent sidecar is allowed and reported via ``SignedResult.checksum_verified
@@ -52,6 +56,7 @@ __all__ = ["ExportedFiles", "FilePsbtSigner", "SignedResult", "SignerError"]
 _UNSIGNED_PREFIX = "localwallet-unsigned-"
 _SIGNED_PREFIX = "localwallet-signed-"
 _SUFFIX = ".psbt.b64"
+_BINARY_SUFFIX = ".psbt"
 _CHECKSUM_SUFFIX = ".sha256"
 
 #: BIP174 PSBT magic bytes.
@@ -104,6 +109,7 @@ class ExportedFiles:
 
     unsigned_path: Path
     checksum_path: Path
+    binary_path: Path
 
 
 def _sanitize_tx_ref(tx_ref: str) -> str:
@@ -123,13 +129,14 @@ def _sanitize_tx_ref(tx_ref: str) -> str:
     return digest[:_REF_LEN]
 
 
-def _validate_psbt_text(content: str) -> None:
+def _validate_psbt_text(content: str) -> bytes:
     """Refuse an export payload that is not a well-formed base64 PSBT.
 
     Container-size ceiling first (bounds BEFORE any decode), then strict
     base64 decode → BIP174 magic prefix → embit parse — all run BEFORE any
     byte is written toward a device (A6): a device must never receive a
-    malformed or mislabeled container. Errors are value-free.
+    malformed or mislabeled container. Errors are value-free. Returns the
+    decoded raw PSBT bytes (reused for the binary sibling export).
     """
     if len(content) > _MAX_PSBT_TEXT_CHARS:
         raise SignerError("psbt text exceeds the maximum container size")
@@ -143,6 +150,7 @@ def _validate_psbt_text(content: str) -> None:
         PSBT.parse(raw)
     except Exception as exc:  # containment: embit parse errors vary
         raise SignerError("psbt text is not a valid PSBT") from exc
+    return raw
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -193,12 +201,32 @@ def _read_bounded(path: Path, limit: int) -> bytes:
     raise _ReadOverCap
 
 
+def _read_existing_bounded(path: Path) -> bytes | None:
+    """Read an existing export file bounded (TCK-SEC-007); None if absent.
+
+    OSError and over-cap map to the same value-free SignerError the call
+    site already used for the .b64 file — shared by the .b64 and binary
+    sibling so the overwrite-refusal semantics stay identical.
+    """
+    if not path.exists():
+        return None
+    try:
+        return _read_bounded(path, _MAX_PSBT_FILE_BYTES)
+    except _ReadOverCap as exc:
+        raise SignerError(
+            "existing unsigned file exceeds the maximum container size"
+        ) from exc
+    except OSError as exc:
+        raise SignerError("could not read the existing unsigned file") from exc
+
+
 class FilePsbtSigner:
     """Airgap signer over a transfer folder (SD mount, USB stick, plain dir).
 
     The constructor creates ``directory`` (and parents) if missing. The
-    directory holds exported unsigned PSBTs and their SHA-256 sidecars;
-    imported signed PSBTs are expected to follow the ADR-0014 convention.
+    directory holds exported unsigned PSBTs (base64 text + binary sibling)
+    and their SHA-256 sidecars; imported signed PSBTs are expected to follow
+    the ADR-0014 convention.
     """
 
     def __init__(self, directory: Path) -> None:
@@ -214,11 +242,14 @@ class FilePsbtSigner:
     # -- export ---------------------------------------------------------
 
     def export_unsigned(self, psbt_base64: str, tx_ref: str) -> ExportedFiles:
-        """Write an unsigned base64 PSBT plus its SHA-256 sidecar.
+        """Write an unsigned base64 PSBT, its SHA-256 sidecar, and a binary
+        sibling.
 
-        The unsigned file is ``localwallet-unsigned-<ref>.psbt.b64`` and the
+        The unsigned file is ``localwallet-unsigned-<ref>.psbt.b64``, the
         sidecar ``localwallet-unsigned-<ref>.psbt.b64.sha256`` (hex digest +
-        newline), per ADR-0014.
+        newline), and the binary sibling ``localwallet-unsigned-<ref>.psbt``
+        (the raw BIP-174 bytes, i.e. the base64-decoded .b64 text), per
+        ADR-0014 (amended for wallet interop).
 
         Refusals (value-free):
         - a non-string / empty PSBT;
@@ -237,7 +268,8 @@ class FilePsbtSigner:
             tx_ref: transaction reference; sanitized per :func:`_sanitize_tx_ref`.
 
         Returns:
-            :class:`ExportedFiles` with the unsigned and checksum paths.
+            :class:`ExportedFiles` with the unsigned, checksum, and binary
+            paths.
         """
         if not isinstance(psbt_base64, str):
             raise SignerError("psbt_base64 must be a string")
@@ -248,11 +280,12 @@ class FilePsbtSigner:
             raise SignerError("tx_ref must be a string")
 
         # Validate the payload before writing anything toward a device.
-        _validate_psbt_text(content)
+        raw = _validate_psbt_text(content)
 
         ref = _sanitize_tx_ref(tx_ref)
         unsigned_path = self.directory / f"{_UNSIGNED_PREFIX}{ref}{_SUFFIX}"
         checksum_path = Path(str(unsigned_path) + _CHECKSUM_SUFFIX)
+        binary_path = Path(str(unsigned_path)[: -len(_SUFFIX)] + _BINARY_SUFFIX)
 
         # Refuse a reference that would collide with an existing signed file.
         signed_path = self.directory / f"{_SIGNED_PREFIX}{ref}{_SUFFIX}"
@@ -266,35 +299,35 @@ class FilePsbtSigner:
         digest = hashlib.sha256(file_bytes).hexdigest()
 
         # Overwrite policy: same content is idempotent; different content is
-        # refused. The idempotent path ALSO (re)writes the sidecar (ADR-0014
-        # "every export writes a sidecar"), healing a missing/mismatched one.
-        if unsigned_path.exists():
-            # Bounded read (TCK-SEC-007): the existing file is attacker- and
-            # environment-controlled; cap it at the PSBT byte ceiling instead
-            # of an unbounded read_text.
+        # refused. Applied to BOTH the .b64 text and the binary sibling (raw
+        # bytes compared). The idempotent path ALSO (re)writes the sidecar
+        # (ADR-0014 "every export writes a sidecar"), healing a missing or
+        # mismatched one.
+        existing_text = _read_existing_bounded(unsigned_path)
+        if existing_text is not None:
             try:
-                raw_existing = _read_bounded(unsigned_path, _MAX_PSBT_FILE_BYTES)
-            except _ReadOverCap as exc:
-                raise SignerError(
-                    "existing unsigned file exceeds the maximum container size"
-                ) from exc
-            except OSError as exc:
-                raise SignerError("could not read the existing unsigned file") from exc
-            try:
-                existing = raw_existing.decode("utf-8").strip()
+                existing = existing_text.decode("utf-8").strip()
             except UnicodeDecodeError as exc:
                 raise SignerError("could not read the existing unsigned file") from exc
             if existing != content:
                 raise SignerError(
                     "refused: an existing unsigned file has different content"
                 )
+        existing_binary = _read_existing_bounded(binary_path)
+        if existing_binary is not None and existing_binary != raw:
+            raise SignerError(
+                "refused: an existing unsigned file has different content"
+            )
 
         # Atomic export (temp + os.replace) for payload AND sidecar.
         self.directory.mkdir(parents=True, exist_ok=True)
         _atomic_write(unsigned_path, file_bytes)
+        _atomic_write(binary_path, raw)
         _atomic_write(checksum_path, (digest + "\n").encode("utf-8"))
         return ExportedFiles(
-            unsigned_path=unsigned_path, checksum_path=checksum_path
+            unsigned_path=unsigned_path,
+            checksum_path=checksum_path,
+            binary_path=binary_path,
         )
 
     # -- import ---------------------------------------------------------

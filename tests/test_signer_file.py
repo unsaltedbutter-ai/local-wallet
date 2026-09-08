@@ -121,6 +121,25 @@ class TestExport:
         digest = files.checksum_path.read_text(encoding="utf-8").strip()
         assert digest == hashlib.sha256(written.encode()).hexdigest()
 
+    def test_exports_binary_sibling_matching_base64(self, signer, folder):
+        import base64
+
+        b64 = psbt_to_base64(build_unsigned())
+        files = signer.export_unsigned(b64, "abc12345")
+        assert files.binary_path == folder / "localwallet-unsigned-abc12345.psbt"
+        assert files.binary_path.exists()
+        # Raw bytes == base64-decoded .b64 text, byte-identical.
+        assert files.binary_path.read_bytes() == base64.b64decode(b64)
+        assert files.binary_path.read_bytes().startswith(b"psbt\xff")
+
+    def test_binary_sibling_refused_on_different_content(self, signer, folder):
+        signer.export_unsigned(psbt_to_base64(build_unsigned()), "abc12345")
+        signed = sign_psbt(build_unsigned())  # different body
+        assert signed != psbt_to_base64(build_unsigned())
+        with pytest.raises(SignerError) as exc:
+            signer.export_unsigned(signed, "abc12345")
+        assert "different content" in str(exc.value)
+
     def test_creates_directory_if_missing(self, tmp_path: Path):
         target = tmp_path / "does" / "not" / "exist"
         assert not target.exists()

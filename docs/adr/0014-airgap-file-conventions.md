@@ -40,6 +40,21 @@ trust anchor is the hardware device screen (§10).
 - On import the text is base64-decoded and must start with the BIP174 magic
   `b"psbt\xff"` (structural check before any parse).
 
+#### Amendment (2026-09-07, TCK-PSBT-001)
+
+Each unsigned export additionally writes a **binary** sibling file
+`localwallet-unsigned-<ref>.psbt` containing the raw BIP-174 bytes (the
+base64-decoded form of the `.b64` text, byte-identical to
+`base64.b64decode(...)`). Rationale: wallet interop — external wallets such
+as Sparrow open binary `.psbt` files natively, so a user can hand the
+transfer folder directly to such a wallet. The `.b64` text remains the
+canonical localwallet export (human-inspectable, cross-OS/SD-safe) and the
+only form import reads; the binary sibling is an additive convenience file
+and is never used for import. Overwrite-refusal semantics are unchanged and
+apply to the sibling as well (same content idempotent, different content
+refused). The sibling is public data (a PSBT carries no keys), so it does not
+violate the "never write anything else to the transfer directory" rule.
+
 ### 2. Filename scheme
 
 - **Unsigned export:** `localwallet-unsigned-<ref>.psbt.b64`
@@ -102,8 +117,9 @@ or amended.
 - **Never write anything else to the transfer directory** — no xpubs, no
   descriptors with fingerprints, no wallet material, no secrets. The
   transfer folder is untrusted third-party-adjacent media; only the PSBT
-  and its checksum belong there. FilePsbtSigner writes exactly those two
-  files per export and nothing else.
+  and its checksum belong there. FilePsbtSigner writes exactly those files
+  (PSBT text, its checksum sidecar, and the binary sibling) per export and
+  nothing else.
 
 ## Consequences
 
