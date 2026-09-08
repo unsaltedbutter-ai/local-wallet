@@ -265,7 +265,7 @@ body {
   color: var(--c-text-muted);
 }
 
-/* --------------------------------------------------- actions (next tkt) */
+/* -------------------------------------------------------- actions (TCK-WEB-004) */
 
 #actions {
   margin-inline: auto;
@@ -276,10 +276,27 @@ body {
   gap: var(--sp-2);
 }
 
+.btn-secondary {
+  background: var(--c-surface-2);
+  color: var(--c-text);
+  border-color: var(--c-border-strong);
+}
+
 .btn-danger {
   background: var(--c-danger-soft);
   color: var(--c-danger);
   border-color: var(--c-danger);
+}
+
+/* queued user lines: clearly not yet processed by the engine */
+.turn-queued { opacity: 0.55; }
+
+.turn-queued-tag {
+  float: inline-end;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--c-text-muted);
 }
 
 /* ------------------------------------------------------------ phone width */

@@ -1,6 +1,9 @@
-// Local Wallet web client (TCK-WEB-002). Vanilla ES module — no framework,
-// no build step. XSS contract: every dynamic value (all model output) is
-// rendered via textContent ONLY. HTML-string sinks are banned here (ADR-0024 §7).
+// Local Wallet web client (TCK-WEB-002 + TCK-WEB-004). Vanilla ES module —
+// no framework, no build step. XSS contract: every dynamic value (all model
+// output) is rendered via textContent ONLY. HTML-string sinks are banned
+// here (ADR-0024 §7). Buttons inject canonical utterances through POST
+// /action into the FULL engine turn pipeline (ADR-0024 §8) — the client can
+// never skip a gate because it never touches a handler or the flow.
 
 const island = window.__LOCALWALLET__;
 const token = island && typeof island.token === "string" ? island.token : "";
@@ -13,12 +16,39 @@ const inputEl = document.getElementById("turn-text");
 const sendBtn = document.getElementById("turn-send");
 const busyEl = document.getElementById("turn-busy");
 const scrollerEl = document.getElementById("scroller");
+const actionsEl = document.getElementById("actions");
+
+// One map for every user-facing string this file injects (designer pass —
+// button labels live in index.html markup, likewise for rewording).
+const LABELS = {
+  resyncGap: "Reconnected — some earlier events may be missing.",
+  queuedTag: "queued",
+  unreachable: "Could not reach the wallet server. Is it still running?",
+};
+
+// Which buttons the typed /state snapshot shows, per flow position. The
+// canonical utterances (data-utterance in markup) are quoted from the engine:
+//   confirm/sign/cancel — ConfirmGate whitelists (tx/flow.py); "sign" is the
+//     TCK-UX-002 gate-merge phrase (confirm + same-turn device handoff).
+//   retry — the CONFIRMED-state re-sign interception in app.py _run_turn.
+//   faster/slower — NOT gate utterances: the fee-target offer words the card
+//     names (app.py); they ride POST /action as ordinary chat-classified
+//     turns, exactly as if typed.
+const VISIBILITY = {
+  created: ["confirm", "sign", "cancel", "faster", "slower"],
+  confirmed: ["retry"],
+};
+const FLOW_STATES = new Set([
+  "idle", "created", "confirmed", "signed", "broadcast", "cancelled", "expired",
+]);
 
 const state = {
   lastEventId: 0,       // SSE cursor; sent as Last-Event-ID on reconnect
   openTurn: null,       // <li> currently receiving engine output
   progressLine: null,   // text node receiving raw progress chars (dots)
   busy: false,
+  queue: [],            // local <li>s submitted while a turn was in flight
+  everConnected: false, // first /state comes from boot; later ones from reconnect
   stopped: false,       // true on 401/no-token: stop reconnecting
   backoffMs: 500,
 };
@@ -38,9 +68,9 @@ function setStatus(kind, label) {
 }
 
 function setBusy(busy) {
+  // Send stays enabled: the server queues turns (queued rendering below).
   state.busy = busy;
   busyEl.hidden = !busy;
-  sendBtn.disabled = busy;
 }
 
 function scrollToEnd() {
@@ -94,21 +124,68 @@ function appendSystem(text) {
   scrollToEnd();
 }
 
-function appendUser(text) {
-  const turn = el("li", "turn turn-user");
+function appendUser(text, queued) {
+  const turn = el("li", "turn turn-user" + (queued ? " turn-queued" : ""));
   turn.appendChild(el("span", "turn-role", "You"));
+  if (queued) turn.appendChild(el("span", "turn-queued-tag", LABELS.queuedTag));
   const line = el("p", "turn-text");
   line.appendChild(document.createTextNode(text));
   turn.appendChild(line);
   transcriptEl.appendChild(turn);
   hintEl.hidden = true;
   scrollToEnd();
+  return turn;
 }
 
-function endTurn() {
+// One turn_end closed the engine's current turn. Promote the oldest locally
+// queued submit (it is the next line the FIFO pump will pick up) and re-sync
+// button visibility — flow state only changes during turns. No turn_start
+// event exists (kinds are text/progress/turn_end), so turn_end is the
+// reconcile point.
+function noteTurnEnd() {
   state.openTurn = null;
   state.progressLine = null;
-  setBusy(false);
+  const next = state.queue.shift();
+  if (next) {
+    next.classList.remove("turn-queued");
+    const tag = next.querySelector(".turn-queued-tag");
+    if (tag) tag.remove();
+  }
+  setBusy(state.queue.length > 0);
+  refreshState();
+}
+
+// ---------------------------------------------------------------- app state
+// Button visibility comes ONLY from the typed value-free /state snapshot
+// (state/1). Anything else — state/0 (engine busy/dead), a malformed or
+// unknown payload — hides all actions and keeps chat working. No prose is
+// ever parsed to infer structure.
+
+function visibleActions(snap) {
+  if (!snap || snap.schema !== "state/1") return [];
+  if (typeof snap.flow_state !== "string" || !FLOW_STATES.has(snap.flow_state)) return [];
+  if (snap.pending_present === true && snap.flow_state === "created") {
+    return VISIBILITY.created;
+  }
+  if (snap.flow_state === "confirmed") return VISIBILITY.confirmed;
+  return [];
+}
+
+function applyState(snap) {
+  const visible = new Set(visibleActions(snap));
+  for (const btn of actionsEl.querySelectorAll("button")) {
+    btn.hidden = !visible.has(btn.dataset.action);
+  }
+}
+
+async function refreshState() {
+  try {
+    const response = await fetch("/state", { headers: authHeaders(), cache: "no-store" });
+    if (!response.ok) return;
+    applyState(await response.json());
+  } catch {
+    // server unreachable: leave visibility as-is; the stream status shows it
+  }
 }
 
 // ------------------------------------------------------------- event stream
@@ -121,7 +198,15 @@ function handleEvent(id, kind, data) {
   // Unknown future kinds are ignored, never fatal (server may outgrow us).
   if (kind === "text") appendText(data);
   else if (kind === "progress") appendProgress(data);
-  else if (kind === "turn_end") endTurn();
+  else if (kind === "turn_end") noteTurnEnd();
+  else if (kind === "resync") {
+    // too_far_behind: the cursor predates the server ring, so part of the
+    // transcript is unrecoverable — say so (never silently gap-fill), then
+    // re-sync state. The retained backlog follows this frame on the same
+    // stream; the duplicate guard above drops any of it we already saw.
+    appendSystem(LABELS.resyncGap);
+    refreshState();
+  }
 }
 
 function parseFrame(frame) {
@@ -179,6 +264,8 @@ async function listen() {
       if (!response.ok || !response.body) throw new Error(String(response.status));
       state.backoffMs = 500; // a live stream resets the backoff ladder
       setStatus("live", "Connected");
+      if (state.everConnected) refreshState(); // reconnect: buttons may have moved
+      state.everConnected = true;
       await consumeStream(response.body);
     } catch {
       // transport failure: treat like a closed stream and retry
@@ -192,21 +279,29 @@ async function listen() {
 
 // ------------------------------------------------------------------ sending
 
-async function sendTurn(text) {
-  appendUser(text);
+// One send path for typed lines AND button clicks: render the user echo
+// (dimmed "queued" if a turn is already in flight — the server queue makes
+// the FIFO order honest), POST it, then let the SSE stream carry the reply.
+// 202 = queued only; busy clears via turn_end. A failed POST un-renders the
+// echo: the engine never saw that line.
+async function submit(path, field, value) {
+  const queued = state.busy;
+  const echo = appendUser(value, queued);
+  if (queued) state.queue.push(echo);
   setBusy(true);
   try {
-    const response = await fetch("/turn", {
+    const response = await fetch(path, {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ [field]: value }),
     });
     if (!response.ok) throw new Error(String(response.status));
-    // 202 = queued only; the actual output arrives over the SSE stream and
-    // clears busy via turn_end.
   } catch {
-    setBusy(false);
-    appendSystem("Could not reach the wallet server. Is it still running?");
+    echo.remove();
+    const at = state.queue.indexOf(echo);
+    if (at !== -1) state.queue.splice(at, 1);
+    setBusy(state.queue.length > 0);
+    appendSystem(LABELS.unreachable);
   }
 }
 
@@ -215,10 +310,21 @@ formEl.addEventListener("submit", (event) => {
   const text = inputEl.value.trim();
   if (!text || state.stopped) return;
   inputEl.value = "";
-  sendTurn(text);
+  submit("/turn", "text", text);
+});
+
+// Delegated listener (ADR-0024 §8): a click POSTs the button's canonical
+// utterance to /action — the engine's FULL _run_turn path, the same gate
+// classification a typed phrase meets. Nothing here calls a handler.
+actionsEl.addEventListener("click", (event) => {
+  const btn = event.target.closest("button[data-utterance]");
+  if (!btn || state.stopped) return;
+  submit("/action", "utterance", btn.dataset.utterance);
 });
 
 // -------------------------------------------------------------------- start
+
+refreshState(); // (a) on load
 
 if (!token) {
   // The island is server-injected; absence means this file was not served

@@ -27,8 +27,18 @@
     <button id="turn-send" class="btn btn-primary" type="submit">Send</button>
   </form>
   <p id="turn-busy" class="meta" hidden>Working…</p>
-  <!-- Actions (confirm / cancel / sign / retry / fee-speed) are routed by TCK-WEB-004; this container is markup-only placeholder. -->
-  <section id="actions" aria-label="Flow actions"></section>
+  <!-- TCK-WEB-004: action buttons (labels are designer-owned copy). Each click is the
+       user's second key: its data-utterance (a canonical engine phrase) is POSTed to
+       /action and runs the FULL turn pipeline, exactly like typing it. Visibility is
+       driven only by the typed GET /state snapshot; all hidden until one arrives. -->
+  <section id="actions" aria-label="Flow actions">
+    <button type="button" class="btn btn-primary" data-action="confirm" data-utterance="confirm" title="Sends: confirm" hidden>Confirm</button>
+    <button type="button" class="btn btn-primary" data-action="sign" data-utterance="sign" title="Sends: sign" hidden>Sign</button>
+    <button type="button" class="btn btn-danger" data-action="cancel" data-utterance="cancel" title="Sends: cancel" hidden>Cancel</button>
+    <button type="button" class="btn btn-secondary" data-action="retry" data-utterance="retry" title="Sends: retry" hidden>Retry signing</button>
+    <button type="button" class="btn btn-secondary" data-action="faster" data-utterance="faster" title="Sends: faster" hidden>Faster fee</button>
+    <button type="button" class="btn btn-secondary" data-action="slower" data-utterance="slower" title="Sends: slower" hidden>Slower fee</button>
+  </section>
 </footer>
 
 </body>
