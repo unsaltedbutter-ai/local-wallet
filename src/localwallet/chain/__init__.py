@@ -7,11 +7,13 @@ network modules.
 
 from localwallet.chain.config import ChainConfig
 from localwallet.chain.esplora import (
+    MAINNET_GENESIS_HASH,
     Balance,
     ChainError,
     EsploraClient,
     TipBlock,
     balance_from_utxos,
+    check_backend,
 )
 from localwallet.chain.eta import EtaEstimate, estimate_eta
 from localwallet.chain.fees import FeeEstimate, FeeEstimator, FeeSource, FeeTarget
@@ -29,6 +31,7 @@ from localwallet.chain.watch import (
 )
 
 __all__ = [
+    "MAINNET_GENESIS_HASH",
     "Balance",
     "ChainConfig",
     "ChainError",
@@ -47,6 +50,7 @@ __all__ = [
     "TipBlock",
     "WatchedTx",
     "balance_from_utxos",
+    "check_backend",
     "estimate_eta",
     "time_since_last_block",
 ]

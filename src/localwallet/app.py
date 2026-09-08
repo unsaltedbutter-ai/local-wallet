@@ -31,20 +31,29 @@ implements no protocol, wallet, chain, or tx-engine logic itself:
   the explorer's confirmation status for a verbatim txid.
 - :func:`run` / :func:`main` — CLI wiring: read the watch-only key from
   ``--zpub`` or ``LOCALWALLET_ZPUB``, parse + gate it (mainnet-only,
-  value-free errors → config-error exit 2), open the store
-  (:class:`~localwallet.config.Settings` ``store_path``), reuse or
-  create the single wallet profile (descriptor-match guard, ADR-0010),
-  pick the model runtime (remote debug bridge → local GGUF →
-  ``--stub-llm``), start the NON-BLOCKING startup scan (or ``--rescan``;
-  env opt-out via ``LOCALWALLET_AUTO_SCAN=0``) on the dedicated chain
-  worker (:class:`ScanFlow`, TCK-SCAN-003 / ADR-0022 — the REPL prompt is
-  live while the scan runs, dots flow between turns, and the engine
-  thread persists the result) and run the chat REPL. The REPL owns the
-  :class:`TxFlow` / :class:`SendSession` pair and classifies every user
-  utterance against the confirm gate at the top of each turn. The REPL
-  is the CLI transport over the queue-driven engine pump
-  (:func:`_pump`, ADR-0024 §3); the threaded engine entry point for the
-  web UI (WEB-002) is :func:`start_engine`.
+  value-free errors → config-error exit 2); on an interactive first
+  launch with no key supplied, the ADR-0023 onboarding greeting asks for
+  it instead (:func:`localwallet.ui.onboarding.ask_watch_key`). Then open
+  the store (:class:`~localwallet.config.Settings` ``store_path``),
+  inject the stored backend rung (ADR-0023 decision 3:
+  ``env > config file > stored > public default``, resolved through
+  :func:`localwallet.config.resolve_chain_base_url` — the ONE place the
+  stored choice enters), reuse or create the single wallet profile
+  (descriptor-match guard, ADR-0010), pick the model runtime (remote
+  debug bridge → local GGUF → ``--stub-llm``), start the NON-BLOCKING
+  startup scan (or ``--rescan``; env opt-out via ``LOCALWALLET_AUTO_SCAN=0``)
+  on the dedicated chain worker (:class:`ScanFlow`, TCK-SCAN-003 /
+  ADR-0022 — the REPL prompt is live while the scan runs, dots flow
+  between turns, and the engine thread persists the result), run the
+  first-run onboarding conversation when fresh + interactive + no backend
+  on any rung (:class:`~localwallet.ui.onboarding.OnboardingFlow`,
+  TCK-ONB-003 — deterministic, code-owned, never model context; the
+  step-2 ask stays open across ordinary chat turns), and run the chat
+  REPL. The REPL owns the :class:`TxFlow` / :class:`SendSession` pair and
+  classifies every user utterance against the confirm gate at the top of
+  each turn. The REPL is the CLI transport over the queue-driven engine
+  pump (:func:`_pump`, ADR-0024 §3); the threaded engine entry point for
+  the web UI (WEB-002) is :func:`start_engine`.
 
 Invariants honored here:
 
@@ -115,10 +124,11 @@ from localwallet.chain import (
     PriceOracle,
     PriceUnavailableError,
     WatchedTx,
+    check_backend,
     estimate_eta,
     time_since_last_block,
 )
-from localwallet.config import Settings
+from localwallet.config import Settings, resolve_chain_base_url
 from localwallet.node import LocalNodeReport, NodeStatus, detect_local_nodes
 from localwallet.node.doctor import NodeDoctor
 from localwallet.protocol import (
@@ -177,6 +187,7 @@ from localwallet.tx.revalidate import (
     revalidate_signed_psbt,
 )
 from localwallet.tx.selection import InsufficientFundsError, SelectionError, select_coins
+from localwallet.ui.onboarding import WEB_SETUP_HINT, OnboardingFlow, ask_watch_key
 from localwallet.wallet import scan as wallet_scan
 from localwallet.wallet.derivation import BranchDeriver
 from localwallet.wallet.descriptor import (
@@ -341,6 +352,21 @@ def _configured_url_host(url: str) -> str | None:
         return host or None
     host = rest.split(":", 1)[0]
     return host or None
+
+
+def _loopback_host_of(url: str) -> str | None:
+    """The host when ``url`` targets a loopback host, else ``None``.
+
+    The app-level mirror of the node/ detector's loopback gate (ADR-0016):
+    passed into :class:`~localwallet.ui.onboarding.OnboardingFlow` as the
+    "may the doctor probe this URL?" predicate, so a REMOTE candidate's
+    validation is a pure ``chain/`` concern. Reuses the same string-
+    surgery host parser as the banner split — one helper, one truth.
+    """
+    host = _configured_url_host(url)
+    if host is not None and host.lower() in _LOOPBACK_HOSTS:
+        return host
+    return None
 
 
 def _env_gap_limit(settings: Settings) -> int | None:
@@ -2890,6 +2916,11 @@ class ScanFlow:
         self._commands: queue.Queue[Any] | None = None
         self.gate = StartupScan(enabled=startup_plan is not None)
         self._started = False
+        #: One-shot first-run narration hook (TCK-ONB-003 step 4): called
+        #: with the pump's output function ONCE, when the FIRST startup
+        #: scan persists successfully (never on failure — the load did not
+        #: complete). ``_wire`` arms it only for an onboarding session.
+        self.on_first_scan_done: Callable[[Callable[[str], None]], None] | None = None
 
     def set_startup(self, plan: wallet_scan.ScanPlan, *, rescan: bool = False) -> None:
         """Arm the non-blocking startup scan (engine-thread wiring call).
@@ -2979,6 +3010,13 @@ class ScanFlow:
             _rescan_summary_line(summary) if self._rescan else _scan_summary_line(summary)
         )
         self._out_of_window(output_fn)
+        if self.on_first_scan_done is not None:
+            # ADR-0023 step 4 (one-shot): the onboarding conversation's
+            # load-complete line rides the same engine-thread narration as
+            # the scan summary it follows.
+            hook = self.on_first_scan_done
+            self.on_first_scan_done = None
+            hook(output_fn)
 
     def _out_of_window(self, output_fn: Callable[[str], None]) -> None:
         """The ADR-0009 warning as re-assessed by the scan that just landed
@@ -3478,6 +3516,7 @@ def _pump(
     ready: threading.Event | None = None,
     scan: ScanFlow | None = None,
     store: Store | None = None,
+    onboarding: OnboardingFlow | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
     ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
@@ -3548,6 +3587,11 @@ def _pump(
             _handle_transcript_command(
                 line, loop, output_fn, flow=flow, session=session, store=store
             )
+        elif onboarding is not None and onboarding.handle_line(line, output_fn):
+            # TCK-ONB-003: consumed on the deterministic onboarding channel
+            # (the node ask's own vocabulary) — never model context, never
+            # the dispatcher. Everything else below stays an ordinary turn.
+            pass
         else:
             _run_turn(
                 loop, flow, session, line, output_fn, client=client, table=table,
@@ -3573,6 +3617,8 @@ def run(
     generate_fn: GenerateFn | None = None,
     node_detect_fn: Callable[[], LocalNodeReport] | None = None,
     on_web_server: Callable[[WebServer], None] | None = None,
+    interactive: bool | None = None,
+    backend_check_fn: Callable[[str], bool] | None = None,
 ) -> int:
     """Wire the application from ``argv``/environment and run the REPL.
 
@@ -3629,6 +3675,15 @@ def run(
             the started :class:`~localwallet.ui.web.server.WebServer` once
             the engine bootstraps and the launch lines are printed, before
             ``run`` parks on the server.
+        interactive: ADR-0023 onboarding gate (TCK-ONB-003; test seam).
+            ``None`` (production) means "stdin's tty state" — a headless
+            or scripted launch NEVER enters the first-run conversation and
+            is never blocked by it; ``True`` drives the conversation with
+            the injected ``input_fn``.
+        backend_check_fn: The step-5 URL-validation probe (test seam,
+            TCK-ONB-003): ``base_url -> serves mainnet in Esplora shape``.
+            Defaults to :func:`localwallet.chain.check_backend` (the only
+            networked module) on the resolved timeout settings.
 
     Returns:
         Process exit code: ``0`` on normal exit (including ``exit``,
@@ -3638,10 +3693,37 @@ def run(
     """
     args = _parse_args(argv)
 
+    # TCK-ONB-003 launch gates. ``interactive`` is the test/automation seam
+    # (production: ``None`` → stdin's tty state; a closed or redirected
+    # stdin counts as headless — the ADR-0023 rule that scripted launches
+    # are NEVER blocked by a conversation). The web transport never gets the
+    # onboarding conversation (requirement 5: terminal-only).
+    web_mode = bool(
+        args.web or os.environ.get(UI_ENV_VAR, "").strip().lower() == "web"
+    )
+    if interactive is None:
+        try:
+            is_interactive = sys.stdin.isatty()
+        except (OSError, ValueError):  # closed stdin: headless
+            is_interactive = False
+    else:
+        is_interactive = bool(interactive)
+
     zpub = (args.zpub or os.environ.get(ZPUB_ENV_VAR, "")).strip()
     if not zpub:
-        output_fn(f"No watch key configured: pass --zpub or set {ZPUB_ENV_VAR}.")
-        return 2
+        if web_mode or not is_interactive:
+            output_fn(f"No watch key configured: pass --zpub or set {ZPUB_ENV_VAR}.")
+            return 2
+        # ADR-0023 step 1: an interactive first launch is GREETED and asked
+        # for the key instead of refused (headless keeps the exit-2 line
+        # above — a conversation never gates a scripted launch). The ask
+        # validates through the same gated parser as the startup path, so
+        # seed-shaped lines are refused with guidance and private/testnet
+        # keys fail value-free; None = the user exited.
+        asked = ask_watch_key(input_fn, output_fn)
+        if asked is None:
+            return 0
+        zpub = asked
 
     try:
         # Gated parse (mainnet-only gate enforced at parse time — flip per
@@ -3735,7 +3817,7 @@ def run(
     # _run_web runs the SAME wiring inside start_engine's engine-thread
     # bootstrap (closing TCK-WEB-001's deferred deviation) and serves the
     # loopback HTTP/SSE front instead of the REPL.
-    if args.web or os.environ.get(UI_ENV_VAR, "").strip().lower() == "web":
+    if web_mode:
         return _run_web(
             parsed=parsed,
             descriptor=descriptor,
@@ -3762,6 +3844,8 @@ def run(
             generate=generate,
             node_detect_fn=node_detect_fn,
             output_fn=output_fn,
+            cli_interactive=is_interactive,
+            backend_check_fn=backend_check_fn,
         )
     except _WiringError as exc:
         output_fn(str(exc))
@@ -3779,6 +3863,7 @@ def run(
             table=wiring.table,
             scan=wiring.scan,
             store=wiring.store,
+            onboarding=wiring.onboarding,
         )
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
@@ -3816,6 +3901,10 @@ class _Wiring:
     watcher: IncomingWatcher | None
     worker: ChainWorker
     scan: ScanFlow
+    #: TCK-ONB-003: the first-run conversation for THIS session, or ``None``
+    #: (any non-first-run launch, and every web launch — the browser never
+    #: gets an onboarding surface, only :data:`WEB_SETUP_HINT`).
+    onboarding: OnboardingFlow | None = None
 
 
 def _wire(
@@ -3830,6 +3919,9 @@ def _wire(
     generate: ModelRuntime | GenerateFn | RemoteOpenAIRuntime,
     node_detect_fn: Callable[[], LocalNodeReport] | None,
     output_fn: Callable[[str], None],
+    cli_interactive: bool = False,
+    web_mode: bool = False,
+    backend_check_fn: Callable[[str], bool] | None = None,
 ) -> _Wiring:
     """Build store → wallet profile → chain client → watch → startup-scan
     plan → dispatch table → agent loop (moved verbatim from the pre-web
@@ -3851,7 +3943,7 @@ def _wire(
     try:
         store = Store(settings.store_path)
         try:
-            wallet_row = _resolve_or_create_wallet(store, descriptor)
+            wallet_row, created_here = _resolve_or_create_wallet(store, descriptor)
             store.set_active_wallet(wallet_row.id)
         except (StoreError, sqlite3.Error) as exc:
             store.close()
@@ -3859,7 +3951,27 @@ def _wire(
     except (StoreError, sqlite3.Error, OSError) as exc:
         raise _WiringError(f"Could not open the wallet store: {exc}") from exc
 
+    # TCK-ONB-003: the STORED backend rung enters the resolution here — the
+    # one sanctioned injection point (ADR-0023 decision 3; config.py stays
+    # store-free, so the stored value rides in as a plain argument). The
+    # effective selection (env > config file > stored) is written back onto
+    # ``settings.chain_base_url``, the single selection point (ADR-0018):
+    # the chain client, the 3-state privacy banner, the watch-mode line, and
+    # the node_status narration all read that one field and can therefore
+    # never disagree (decision 6). With nothing on any rung, the value stays
+    # empty and behavior is bit-identical to the public default.
+    effective_backend = resolve_chain_base_url(
+        settings.chain_base_url, store.get_chain_base_url()
+    )
+    if effective_backend is not None:
+        settings.chain_base_url = effective_backend
+
     client = EsploraClient(
+        # ``None`` keeps today's client-side ``ChainConfig.from_settings``
+        # resolution; the only difference is that the stored rung has now
+        # been folded into ``settings.chain_base_url`` above, so the client
+        # and every banner/mode surface resolve the SAME value.
+        base_url=settings.chain_base_url or None,
         timeout_s=settings.request_timeout_s,
         max_retries=settings.max_retries,
     )
@@ -3946,6 +4058,45 @@ def _wire(
     # persists the result (the scan can take minutes; the REPL may not).
     output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
+    # TCK-ONB-003 (ADR-0023): the first-run conversation — CLI transport
+    # ONLY, and only when nothing resolved a backend (env > config file >
+    # stored all empty — a preset ladder rung is an operator decision the
+    # conversation must not overwrite or re-ask) AND the wallet profile was
+    # created THIS run (returning users never see the startup ask). The web
+    # transport gets the one-line hint instead (requirement 5: no
+    # onboarding surface in the browser). Construction and narration are
+    # pure store/console I/O — the model is never involved.
+    onboarding: OnboardingFlow | None = None
+    if web_mode:
+        if effective_backend is None:
+            output_fn(WEB_SETUP_HINT)
+    elif cli_interactive and effective_backend is None and created_here:
+        onboarding = OnboardingFlow(
+            store=store,
+            check_backend=backend_check_fn
+            or (
+                # Snappy setup probe: one attempt (min'ing the retry budget
+                # down, never up), the shared per-request timeout. The probe
+                # itself is chain/ code — the ONLY networked module (G5).
+                lambda url: check_backend(
+                    url,
+                    timeout_s=settings.request_timeout_s,
+                    max_retries=min(settings.max_retries, 1),
+                )
+            ),
+            node_report=(
+                None
+                if not settings.node_detection_enabled
+                else (node_detect_fn or (lambda: detect_local_nodes(settings)))
+            ),
+            loopback_host=_loopback_host_of,
+        )
+        for line in onboarding.opening_lines(load_started=scan.gate.enabled):
+            output_fn(line)
+        # Step 4 fires when the FIRST startup scan persists successfully
+        # (one-shot; never on scan failure — the load did not complete).
+        scan.on_first_scan_done = onboarding.emit_load_complete
+
     session = SendSession()
     # The confirmation-ETA mempool hint (TCK-P5-002): consulted per create_tx
     # and per CREATED turn (lazily, fail-closed to no congestion adjustment);
@@ -3978,6 +4129,7 @@ def _wire(
         watcher=watcher,
         worker=worker,
         scan=scan,
+        onboarding=onboarding,
     )
 
 
@@ -4026,6 +4178,7 @@ def _run_web(
                 generate=generate,
                 node_detect_fn=node_detect_fn,
                 output_fn=output_fn,
+                web_mode=True,
             )
         except BaseException as exc:
             startup["exc"] = exc
@@ -4099,8 +4252,13 @@ def _run_web(
 
 def _resolve_or_create_wallet(
     store: Store, descriptor: WalletDescriptor
-) -> WalletRecord:
+) -> tuple[WalletRecord, bool]:
     """Reuse the wallet row carrying this descriptor, else create one.
+
+    Returns ``(row, created_this_run)`` — the fresh-wallet flag gates the
+    ADR-0023 first-run conversation (returning users resume silently; the
+    skipped node ask is re-offered by the chat-time triggers, not by every
+    startup).
 
     Duplicate-descriptor guard (ADR-0010 single-wallet profile): the
     store is searched for a row whose descriptor matches the supplied
@@ -4112,8 +4270,8 @@ def _resolve_or_create_wallet(
     """
     for row in store.list_wallets():
         if row.descriptor == descriptor.descriptor:
-            return row
-    return store.create_wallet(name="default", descriptor=descriptor.descriptor)
+            return row, False
+    return store.create_wallet(name="default", descriptor=descriptor.descriptor), True
 
 
 def _scan_summary_line(summary: wallet_scan.ScanSummary) -> str:
@@ -4245,6 +4403,7 @@ def _repl(
     emitter: EventEmitter | None = None,
     scan: ScanFlow | None = None,
     store: Store | None = None,
+    onboarding: OnboardingFlow | None = None,
 ) -> None:
     """The CLI transport over the engine pump (TCK-WEB-001, ADR-0024 §3).
 
@@ -4296,6 +4455,7 @@ def _repl(
             ready=ready,
             scan=scan,
             store=store,
+            onboarding=onboarding,
         )
     finally:
         stop.set()

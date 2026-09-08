@@ -46,7 +46,7 @@ import random
 import time
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Final, Self
 
 import httpx
 from embit.transaction import Transaction
@@ -55,12 +55,14 @@ from localwallet.chain.config import ChainConfig
 from localwallet.config import Settings
 
 __all__ = [
+    "MAINNET_GENESIS_HASH",
     "Balance",
     "ChainError",
     "EsploraClient",
     "TipBlock",
     "TxStatus",
     "balance_from_utxos",
+    "check_backend",
 ]
 
 # Keep in sync with the version in pyproject.toml.
@@ -91,6 +93,16 @@ _KIND_TIP_HEIGHT = "tip-height"
 _KIND_TIP_BLOCK = "tip-block"
 _KIND_BROADCAST = "broadcast"
 _KIND_TX_STATUS = "tx-status"
+_KIND_BLOCKS_AT_HEIGHT = "blocks-at-height"
+
+#: Mainnet genesis block hash — Bitcoin's protocol constant, the canonical
+#: proof that a backend serves MAINNET (ADR-0021/0023 decision 5; the
+#: Esplora API exposes no network-name endpoint). Public data, not user
+#: data; regtest shares this genesis and is refused by the app's loopback
+#: node probe at the setup layer (ui/onboarding.py), not here.
+MAINNET_GENESIS_HASH: Final[str] = (
+    "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+)
 
 
 class ChainError(Exception):
@@ -634,6 +646,15 @@ class EsploraClient:
         for attempt in range(self._config.max_retries + 1):
             try:
                 response = self._client.get(url)
+            except httpx.InvalidURL:
+                # Request-time URL breakage that ChainConfig's shape check
+                # cannot see (e.g. a non-numeric port: ``http://h:port``).
+                # Deterministic — every attempt fails identically, so no
+                # retry — and it ends as this method's contract-promised
+                # value-free ChainError: the raw httpx exception (whose own
+                # message can carry a URL fragment) never escapes to the
+                # caller's thread (TCK-ONB-003 review, finding 1).
+                raise ChainError(f"{kind} request failed: invalid base URL") from None
             except httpx.TransportError as exc:
                 # Connection errors and timeouts are the retryable class.
                 last_failure = f"network error ({type(exc).__name__})"
@@ -651,3 +672,65 @@ class EsploraClient:
         raise ChainError(
             f"{kind} request failed after {self._config.max_retries} retries: {last_failure}"
         )
+
+
+def check_backend(
+    base_url: str,
+    *,
+    timeout_s: float = 10.0,
+    max_retries: int = 0,
+    transport: httpx.BaseTransport | None = None,
+) -> bool:
+    """Probe a candidate self-hosted backend (ADR-0023 decision 5).
+
+    ``True`` only when the URL (a) constructs through the fail-closed
+    :class:`ChainConfig` shape check (well-formed http(s), no userinfo),
+    (b) answers in Esplora shape (the strict tip-height parse proves
+    reachability *and* the API family), and (c) serves **mainnet** — its
+    block-height-0 list must contain a block whose hash is
+    :data:`MAINNET_GENESIS_HASH` (canonical Esplora entries are block
+    objects carrying ``"id"``; a bare hash string is tolerated). A
+    testnet/other-network instance fails (c) and is refused (ADR-0021).
+
+    Every failure collapses to ``False`` — construction, transport, HTTP,
+    parse and shape alike, including any httpx request error outside the
+    :class:`ChainError` surface (an escaping exception would kill the
+    engine pump this runs on; TCK-ONB-003 review, finding 1). The caller
+    owns the one honest user-facing message, so no URL, host, status, or
+    exception detail ever leaves this function (value-free by
+    construction). Retries are pointless for a setup probe of a server the
+    user just pointed at — default ``max_retries=0`` keeps the prompt
+    snappy; the caller may raise it.
+
+    ``transport`` is the standard test seam; production passes ``None``.
+    """
+    try:
+        client = EsploraClient(
+            base_url=base_url,
+            timeout_s=timeout_s,
+            max_retries=max_retries,
+            transport=transport,
+        )
+    except ValueError:
+        return False  # malformed URL: ChainConfig failed closed at construction
+    try:
+        client.get_tip_height()
+        blocks = client.get_json("/blocks/0", _KIND_BLOCKS_AT_HEIGHT)
+    except (ChainError, httpx.InvalidURL):
+        # The whole request surface collapses to False — ChainError covers
+        # transport/HTTP/JSON/shape failures, and httpx.InvalidURL is
+        # belt-and-braces for request-time URL breakage (non-numeric port)
+        # that _request_json also converts; the contract here is that
+        # NOTHING escapes to the caller (finding 1).
+        return False
+    finally:
+        client.close()
+    if not isinstance(blocks, list):
+        return False
+    # Esplora's /blocks/<height> serves block OBJECTS whose "id" is the
+    # block hash (the same canonical shape :meth:`EsploraClient.get_tip_block`
+    # parses); a bare-hash list is tolerated leniently. Matching the raw
+    # entries rejected every genuine object-shaped mainnet backend
+    # (TCK-ONB-003 review, finding 2).
+    ids = [b.get("id") if isinstance(b, dict) else b for b in blocks]
+    return MAINNET_GENESIS_HASH in ids

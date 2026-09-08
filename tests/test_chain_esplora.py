@@ -280,6 +280,28 @@ def test_wrong_response_shape_raises_chain_error(invoke, payload):
     assert len(server.requests) == 1  # shape errors are not retried
 
 
+def test_request_time_invalid_url_ends_as_value_free_chain_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # TCK-ONB-003 review (finding 1): a base URL that PASSES ChainConfig's
+    # shape check but httpx refuses to build a request from (non-numeric
+    # port) must end as the documented value-free ChainError — never the
+    # raw httpx.InvalidURL, which escaped straight through callers'
+    # ChainError handling (the startup scan's fail-closed branch, and the
+    # engine pump that died on it). Deterministic: no retry, no sleep.
+    sleeps = _record_sleeps(monkeypatch)
+    client = EsploraClient(base_url="http://h:port/api", timeout_s=0.5, max_retries=3)
+    try:
+        with pytest.raises(ChainError) as excinfo:
+            client.get_tip_height()
+    finally:
+        client.close()
+    message = str(excinfo.value)
+    assert "invalid base URL" in message
+    assert "h:port" not in message  # value-free: the URL is never echoed
+    assert sleeps == []  # not retried — every attempt would fail identically
+
+
 @pytest.mark.parametrize(
     "bad_address",
     ["", " ", "bc1q x", "addr/ect", "x" * 101, "bc1qé", None],
