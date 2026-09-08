@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Wallet</title>
+<link rel="stylesheet" href="/static/styles.css">
+<script type="module" src="/static/app.js"></script>
+<!-- the per-launch token island is injected here by the server (TCK-WEB-002) -->
+</head>
+<body>
+<header class="bar">
+  <h1 class="brand">Local Wallet</h1>
+  <p id="conn-status" class="status" role="status" aria-live="polite" data-state="connecting">Connecting…</p>
+</header>
+
+<main id="scroller" class="transcript-region">
+  <ol id="transcript" class="transcript" aria-label="Wallet conversation">
+    <li id="hint" class="turn turn-system">Turns you send and lines from your wallet appear here.</li>
+  </ol>
+</main>
+
+<footer class="bar bar-compose">
+  <form id="turn-form" class="compose" autocomplete="off">
+    <label class="visually-hidden" for="turn-text">Message</label>
+    <input id="turn-text" name="text" type="text" placeholder="Ask your wallet…" maxlength="4096" required>
+    <button id="turn-send" class="btn btn-primary" type="submit">Send</button>
+  </form>
+  <p id="turn-busy" class="meta" hidden>Working…</p>
+  <!-- Actions (confirm / cancel / sign / retry / fee-speed) are routed by TCK-WEB-004; this container is markup-only placeholder. -->
+  <section id="actions" aria-label="Flow actions"></section>
+</footer>
+
+</body>
+</html>
