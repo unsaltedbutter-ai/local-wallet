@@ -22,22 +22,53 @@
 - [ ] Complete the lifecycle on-chain: sign with the Jade → broadcast → verify on an explorer (docs/phase3-ac.md final step). The user chose not to move sats yet; run when ready.
 
 ## MW-5: Sparrow import AC
-- [ ] Follow docs/sparrow-ac.md (manual import of the deterministic fixture PSBT; pass criteria in the doc). NOTE 2026-09-07: the fixture changed in TCK-HW-003 (change-output derivation added, base64 re-pinned 476→556 chars) — re-dump the env-gated artifact before importing so you import the current fixture; docs/sparrow-ac.md needs no edit (artifact is generated at dump time).
+- [x] **Done 2026-09-08 (user):** fixture PSBT imported into Sparrow and verified good (both the `.psbt.b64` and the binary `.psbt` sibling open cleanly — TCK-PSBT-001). Aside from actually transmitting (MW-9), the Sparrow AC is closed.
 
 ## MW-6: Model-mode eval record (after MW-2)
 - [x] **Done 2026-09-07** — official pinned-GGUF record: 26/53 = 49.1% (golden 21/30, redteam 5/23), exit 1 from the ENFORCED gate — recorded and ACCEPTED as the outcome (misses are model-quality limits; redteam "misses" are the by-design structural-gate case). Runs landed with TCK-P6-001/AGT-001 (a63e24e/46e80d9). Do not re-adjudicate or tune prompts/temperature to chase it.
 
-## MW-7: Post-fix export spot-check (ready — TCK-SEC-001 landed 55f8d6d)
-- [ ] In the REPL: run a create_tx with real amounts, then `/export`; verify amounts render as `<amount>`, txids as `<txid>`, addresses as `<addr>`, and a pasted 12-word test phrase as `<seed>`.
+## MW-7: Post-fix export redaction spot-check (TCK-SEC-001) — fully OFFLINE, no real key needed
+Steps:
+1. `cd ~/local-wallet`
+2. Start the CLI in stub mode with the public fixture key and a throwaway DB (nothing touches your real wallet):
+   `LOCALWALLET_STORE_PATH=/tmp/mw7.db .venv/bin/python -m localwallet.ui.cli --stub-llm --zpub $(python3 -c "from tests.test_e2e_skeleton import ZPUB; print(ZPUB)")`
+3. At the prompt, ask for a send — stub mode has a canned create_tx: type `send 100000 sats to bc1qexampledummyrecipientaddress0000000000` (any text with an amount works; the stub builds the envelope).
+4. Run `/export`.
+5. Verify in the exported file: amounts render as `<amount>`, txids as `<txid>`, addresses as `<addr>`, and paste a 12-word test phrase (e.g. from BIP39 docs) into the chat first — it must render as `<seed>`.
+6. Also confirm the terminal still shows real values (redaction is for the export only).
+7. `rm -rf /tmp/mw7.db*` when done.
 
-## MW-8: Phase 6 packaging prerequisites (later)
-- [ ] Apple Developer account (signed/notarized macOS builds) + Windows box (driver/packaging matrix, OQ10).
+## MW-8: Phase 6 packaging — RE-SCOPED 2026-09-08 (install.sh + GitHub is the distribution)
+- [ ] NOTHING needed for the current distribution path: `curl … | bash` install + source checkout requires NO Apple Developer account and NO signed builds.
+- OPTIONAL, only if you later want a double-clickable .app: Apple Developer account ($99/yr) for signed/notarized macOS builds (Gatekeeper warns on unsigned pyinstaller output) + a Windows box for the driver/packaging matrix (OQ10). Deferred until you ask for it — TCK-P6-002 stays pending on this, TCK-WEB-006 (frozen-build web UI) likewise.
 
-## MW-10: Web-UI manual matrix (UNBLOCKED 2026-09-08 — full web UI live: buttons, settings panel, scan chip)
-- [ ] localhost matrix: macOS/Windows/Linux × VPN/proxy/firewall-on; both `localhost` and `127.0.0.1` URLs; multi-tab; kill-and-reconnect replay (Last-Event-ID); confirm/cancel/sign buttons vs CLI parity.
+## MW-10: Web-UI manual matrix — steps
+Setup (per OS/browser you're testing; use YOUR real zpub via env — it never lands in a committed file):
+1. `cd ~/local-wallet && LOCALWALLET_ZPUB="<zpub>" .venv/bin/python -m localwallet.ui.cli --web`
+2. The launch line prints a canonical URL + per-launch token — open exactly that URL (copy-paste; the token is in the page, not the URL).
+Checklist — repeat per OS/browser row you care about (macOS Safari/Chrome, Windows Edge/Chrome, Linux Firefox):
+- [ ] Both `http://localhost:<port>/` and `http://127.0.0.1:<port>/` load (token island works, no 401). A DIFFERENT hostname (your LAN IP, a custom DNS name) must be REFUSED with `host not allowed` — that's the DNS-rebinding defense, not a bug.
+- [ ] With VPN/proxy/firewall ON: page still loads (it's loopback — proxies must not intercept localhost; if a proxy env var breaks it, that's a finding to report).
+- [ ] Full turn renders: type "what's my balance?" → narration streams as text; scan dots appear inline while the first scan runs (prompt is live <1 s).
+- [ ] Buttons: create a send → Confirm / Cancel / Faster fee / Slower fee appear; Confirm sends the literal utterance (tooltip shows it); after confirm → Sign appears (GATE-MERGE chained turn); Retry after a signer error if you get one.
+- [ ] Multi-tab: open 2 tabs, act in one, both see all turns (shared session, event-sourced).
+- [ ] Kill-and-reconnect: Ctrl-C the server mid-session, restart with the SAME command, reload the tab → Last-Event-ID replay; force the too-far-behind path by letting many events accumulate while the tab is closed → you should see "Reconnected — some earlier messages may be missing."
+- [ ] Settings panel: change gap_limit (persists), out-of-range value rejected inline, chain_base_url shows "takes effect after restart" + the public-default/IP-disclosure hint.
+- [ ] Scan chip visible while loading; create a send BEFORE the first scan finishes → friendly refusal line.
+- [ ] XSS spot-check: a narration containing `<img onerror>` (hard to produce naturally — skip if impractical; the automated render-contract tests cover it).
+- [ ] CLI parity: same actions in the plain CLI behave the same (confirm gate, card, wording).
+Report any deviation with the exact URL/tab/step.
 
-## MW-11: Web-UI browser check (after the WEB-002 client lands)
-- [ ] Open the launch URL in a real browser: page loads under CSP, token island works (no 401), a full turn renders (narration lines stream as text), action buttons fire canonical utterances, kill-the-server reload replays via Last-Event-ID, connection-status transitions, XSS spot-check (a narration containing <img onerror> renders as text). Complements the web-builder agent's static audit; feeds TCK-WEB-003/004. NEW 2026-09-08, also exercise: settings panel (gear/toggle — change gap_limit, see chain_base_url restart + env-override notes, out-of-range rejection), scan-status chip during startup ("wallet loading" until first scan completes), create_tx refused with the friendly line if you try to send pre-first-scan, kill-server reload replays with the "some earlier events may be missing" notice.
+## MW-11: Web-UI browser check (developer smoke — lighter than MW-10) — steps
+One browser, ~5 minutes. Same setup as MW-10 step 1-2 (`LOCALWALLET_ZPUB="<zpub>" ... --web`, open the printed URL).
+- [ ] Page loads under CSP: open DevTools → Console — NO CSP violation errors (the only inline script is the server-injected token island with a nonce).
+- [ ] Token island works: no 401; opening the URL in a SECOND browser profile (no token… token is in the page, so just verify a fresh normal reload stays authorized).
+- [ ] A full turn renders (narration streams as text, not HTML — view a balance reply; addresses appear complete, selectable, never mid-hash-truncated).
+- [ ] Action buttons fire the canonical utterances (click Confirm → the transcript shows the literal word "confirm" echoed as your message).
+- [ ] Kill-the-server reload replays via Last-Event-ID (same as MW-10).
+- [ ] Connection-status transitions: stop the server → status shows reconnecting/unreachable wording; restart → recovers WITHOUT manual reload if the stream re-attaches (else reload — report which).
+- [ ] XSS spot-check: in the CLI on the SAME throwaway DB it's hard to inject markup naturally — if impractical, rely on the automated `tests/test_web_render_contract.py` (run: `.venv/bin/python -m pytest tests/test_web_render_contract.py -q`).
+Feeds TCK-WEB-003/004 follow-ups; MW-10 is the thorough version. NEW 2026-09-08, also exercise: settings panel (gear/toggle — change gap_limit, see chain_base_url restart + env-override notes, out-of-range rejection), scan-status chip during startup ("wallet loading" until first scan completes), create_tx refused with the friendly line if you try to send pre-first-scan, kill-server reload replays with the "some earlier events may be missing" notice.
 
 ## MW-12: Publish to GitHub (TCK-DIST-003 prepared everything)
 - [ ] Follow docs/publish.md exactly: sanity-check the flagged strings first — decide whether `notible.local` (your LAN hostname, in HANDOFF/TASKS/ADR-0007/remote_runtime) and `192.168.1.50` (tests only) stay or get scrubbed BEFORE the public push; fill the SECURITY.md email placeholder; then push to github.com/unsaltedbutter-ai/local-wallet and flip repo settings (default branch, Actions on, branch protection).

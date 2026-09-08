@@ -6,8 +6,10 @@ non-negotiable.
 
 ## Development setup
 
-Requires **Python 3.12+** (PEP 695 syntax). Do **not** use Python 3.14 — it
-breaks `hwilib`/`protobuf`. Use 3.12.
+Requires **Python 3.12+** (PEP 695 syntax). Do **not** use Python 3.14 —
+verified 2026-09-08: `hwi` pins `protobuf <5.0.0`, whose upb C-extension
+crashes on 3.14 (`TypeError: Metaclasses with custom tp_new are not
+supported`), breaking hwilib's protobuf device path. Use 3.12.
 
 ```sh
 python3 -m venv .venv

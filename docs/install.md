@@ -4,6 +4,9 @@ local-wallet is a Python 3.12 project installed straight from its GitHub repo
 (`github.com/unsaltedbutter-ai/local-wallet`) via `uv`. There is no PyPI
 package; `install.sh` clones the repo and does an editable install for you.
 
+> **Verified 2026-09-08:** Python 3.14.6, hwi 3.2.0, protobuf 4.25.9, embit
+> 0.8.0, llama-cpp-python 0.3.35 (3.14 wheel available).
+
 ## Quick install (curl | bash)
 
 ```sh
@@ -28,10 +31,13 @@ It is **idempotent**: re-running it updates the existing clone (`git pull`,
 best-effort — offline is not fatal) and reinstalls. Every step fails loudly
 with a non-zero exit and a clear message; nothing is silently skipped.
 
-> **Why not 3.14?** Python 3.14 breaks `hwilib` and `protobuf`, which the
-> hardware-wallet and model stacks depend on. The installer refuses to use it.
-> If you already have only 3.14 on your machine, it installs a 3.12 side by
-> side and uses that.
+> **Why not 3.14?** Verified 2026-09-08 (Python 3.14.6, hwi 3.2.0, protobuf
+> 4.25.9, embit 0.8.0): `hwi` pins `protobuf <5.0.0`, and that protobuf's upb
+> C-extension crashes on 3.14 with `TypeError: Metaclasses with custom tp_new
+> are not supported` — breaking hwilib's protobuf-dependent device path (e.g.
+> BitBox02). The installer refuses 3.14 and installs a 3.12 side by side.
+> Re-check when `hwi` lifts its `protobuf <5` pin:
+> `uv venv --python 3.14 /tmp/v && uv pip install -e '.[dev]' --python /tmp/v/bin/python && /tmp/v/bin/python -c "from hwilib.devices.bitbox02_lib.communication.generated import hww_pb2"`.
 
 ## Where things go
 
@@ -44,7 +50,7 @@ with a non-zero exit and a clear message; nothing is silently skipped.
 If you prefer to do it by hand, the equivalent steps are:
 
 ```sh
-# 1. Pick a Python 3.12 (or 3.13) — never 3.14.
+# 1. Pick a Python 3.12 (or 3.13) — not 3.14.
 # 2. Clone and enter the repo.
 git clone https://github.com/unsaltedbutter-ai/local-wallet \
     "$HOME/.local/share/local-wallet"
@@ -99,10 +105,11 @@ directory. If you installed `uv` only for this project, remove it separately
 
 - **"unsupported OS / architecture"** — only macOS (arm64/x86_64) and Linux
   (x86_64) are supported. The installer refuses to guess on anything else.
-- **Python 3.14 problems** — if your default `python3` is 3.14, `hwilib` /
-  `protobuf` fail to build or import. The installer sidesteps this by
-  installing Python 3.12 via `uv`; for a manual install, make sure your venv
-  was created from 3.12 or 3.13.
+- **Python 3.14 problems** — verified 2026-09-08: `hwi` pins `protobuf
+  <5.0.0`, whose upb C-extension crashes on 3.14 (`TypeError: Metaclasses with
+  custom tp_new are not supported`), breaking hwilib's protobuf device path
+  (BitBox02). The installer sidesteps this by installing Python 3.12 via `uv`;
+  for a manual install, make sure your venv was created from 3.12 or 3.13.
 - **Offline re-run** — the update step (`git pull`) is best-effort: if you are
   offline it warns and continues with the existing clone, then reinstalls.
 - **`uv` not found after install** — the official installer puts it at

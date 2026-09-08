@@ -7,9 +7,10 @@
 #
 # Installs the package by cloning the GitHub repo and doing a `uv`-based
 # editable install. Detects OS/arch, ensures a Python >=3.12 <3.14 runtime
-# (NEVER 3.14 — hwilib/protobuf break on it), and optionally downloads the
-# hash-pinned GGUF model. Idempotent: re-running updates the clone and
-# reinstalls. Fails loudly at every step — no silent continues.
+# (NEVER 3.14 — hwilib's protobuf device path breaks on it; verified
+# 2026-09-08), and optionally downloads the hash-pinned GGUF model.
+# Idempotent: re-running updates the clone and reinstalls. Fails loudly at
+# every step — no silent continues.
 #
 # Testability: set INSTALL_ROOT to install to a custom directory instead of
 # the default $XDG_DATA_HOME/local-wallet (see docs/install.md).
@@ -57,7 +58,8 @@ ensure_uv() {
 
 ensure_python() {
   # Prefer an existing >=3.12 <3.14 interpreter; else install 3.12 via uv.
-  # We never go to 3.14: hwilib/protobuf break on it (HANDOFF §7).
+  # Never 3.14: hwi pins protobuf <5.0.0, whose upb C-extension fails on 3.14
+  # ("Metaclasses with custom tp_new are not supported") — verified 2026-09-08.
   if PY="$("$UV" python find '>=3.12,<3.14' 2>/dev/null)"; then
     return
   fi
