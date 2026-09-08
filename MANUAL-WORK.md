@@ -22,10 +22,10 @@
 - [ ] Complete the lifecycle on-chain: sign with the Jade → broadcast → verify on an explorer (docs/phase3-ac.md final step). The user chose not to move sats yet; run when ready.
 
 ## MW-5: Sparrow import AC
-- [ ] Follow docs/sparrow-ac.md (manual import of the deterministic fixture PSBT; pass criteria in the doc).
+- [ ] Follow docs/sparrow-ac.md (manual import of the deterministic fixture PSBT; pass criteria in the doc). NOTE 2026-09-07: the fixture changed in TCK-HW-003 (change-output derivation added, base64 re-pinned 476→556 chars) — re-dump the env-gated artifact before importing so you import the current fixture; docs/sparrow-ac.md needs no edit (artifact is generated at dump time).
 
 ## MW-6: Model-mode eval record (after MW-2)
-- [ ] **Available now (MW-2 done).** Run evals in model mode against the pinned GGUF; record results (bridge scores in TASKS.md are explicitly NOT the record per ADR-0007).
+- [x] **Done 2026-09-07** — official pinned-GGUF record: 26/53 = 49.1% (golden 21/30, redteam 5/23), exit 1 from the ENFORCED gate — recorded and ACCEPTED as the outcome (misses are model-quality limits; redteam "misses" are the by-design structural-gate case). Runs landed with TCK-P6-001/AGT-001 (a63e24e/46e80d9). Do not re-adjudicate or tune prompts/temperature to chase it.
 
 ## MW-7: Post-fix export spot-check (ready — TCK-SEC-001 landed 55f8d6d)
 - [ ] In the REPL: run a create_tx with real amounts, then `/export`; verify amounts render as `<amount>`, txids as `<txid>`, addresses as `<addr>`, and a pasted 12-word test phrase as `<seed>`.
@@ -35,3 +35,6 @@
 
 ## MW-10: Web-UI manual matrix (after TCK-WEB-004)
 - [ ] localhost matrix: macOS/Windows/Linux × VPN/proxy/firewall-on; both `localhost` and `127.0.0.1` URLs; multi-tab; kill-and-reconnect replay (Last-Event-ID); confirm/cancel/sign buttons vs CLI parity.
+
+## MW-11: Web-UI browser check (after the WEB-002 client lands)
+- [ ] Open the launch URL in a real browser: page loads under CSP, token island works (no 401), a full turn renders (narration lines stream as text), action buttons fire canonical utterances, kill-the-server reload replays via Last-Event-ID, connection-status transitions, XSS spot-check (a narration containing <img onerror> renders as text). Complements the web-builder agent's static audit; feeds TCK-WEB-003/004.
