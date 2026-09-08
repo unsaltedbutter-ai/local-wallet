@@ -1522,6 +1522,7 @@ def _make_create_tx_handler(
         rate_stale = rate.stale if rate is not None else False
         rate_age_s = int(rate.age_s()) if rate is not None else None
         rate_fetched_at = rate.fetched_at if rate is not None else None
+        btc_usd = rate.usd_per_btc if rate is not None else None
 
         # 3 (cont.). Fee rate: the literal user-quoted sat/vB rate when
         # present (no estimator call — the user's number is quoted verbatim
@@ -1690,6 +1691,7 @@ def _make_create_tx_handler(
             "rate_stale": rate_stale,
             "rate_age_s": rate_age_s,
             "rate_fetched_at": rate_fetched_at,
+            "btc_usd": btc_usd,
             "fee_target": pending.fee_target,
             # Display-only card-view selectors (TCK-UX-002; NOT flow
             # state): variant A of the card tail when the envelope carried
@@ -4494,6 +4496,16 @@ def _card_sats(result: Mapping[str, object], key: str) -> str | None:
     return f"{value:,}"
 
 
+def _card_rate(result: Mapping[str, object]) -> str | None:
+    """Thousands-separated USD/BTC rate, whole dollars when the source gave
+    whole dollars (the price provider does — ADR-0011 §4), else 2 decimals.
+    ``None`` when absent/not numeric (fail-closed: never a fabricated rate)."""
+    value = result.get("btc_usd")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return f"{int(value):,}" if float(value).is_integer() else f"{value:,.2f}"
+
+
 def _print_brief_card(
     result: Mapping[str, object],
     output_fn: Callable[[str], None],
@@ -4523,11 +4535,17 @@ def _print_brief_card(
         usd_cents = result.get("usd_cents")
         if isinstance(usd_cents, int):
             pay += f" (${usd_cents // 100}.{usd_cents % 100:02d}"
-            rate_age = result.get("rate_age_s")
-            if rate_age is not None:
-                pay += f" · rate age {rate_age}s"
             if result.get("rate_stale"):
+                # Stale per the ADR-0011 ladder: surface WHY the number may
+                # be off (age) instead of the (now-untrusted) rate figure.
+                rate_age = result.get("rate_age_s")
+                if rate_age is not None:
+                    pay += f" · rate age {rate_age}s"
                 pay += " · stale"
+            else:
+                rate = _card_rate(result)
+                if rate is not None:
+                    pay += f" · @ ${rate}/BTC"
             pay += ")"
     output_fn(sanitize_tool_output(pay))
     fee_sats = _card_sats(result, "fee_sats")
@@ -4587,11 +4605,17 @@ def _print_confirmation_card(
     usd_cents = result.get("usd_cents")
     if isinstance(usd_cents, int):
         amount_line += f" (${usd_cents // 100}.{usd_cents % 100:02d}"
-        rate_age = result.get("rate_age_s")
-        if rate_age is not None:
-            amount_line += f" · rate age {rate_age}s"
         if result.get("rate_stale"):
+            # Stale per the ADR-0011 ladder: surface WHY the number may be
+            # off (age) instead of the (now-untrusted) rate figure.
+            rate_age = result.get("rate_age_s")
+            if rate_age is not None:
+                amount_line += f" · rate age {rate_age}s"
             amount_line += " · stale"
+        else:
+            rate = _card_rate(result)
+            if rate is not None:
+                amount_line += f" · @ ${rate}/BTC"
         amount_line += ")"
     output_fn(sanitize_tool_output(amount_line))
     output_fn(sanitize_tool_output(f"To: {result.get('recipient', '')}"))

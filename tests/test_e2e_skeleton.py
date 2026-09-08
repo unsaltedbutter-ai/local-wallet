@@ -2722,7 +2722,7 @@ def _card_refs(outputs: list[str]) -> list[str]:
 BRIEF_CARD_LINES: Final[list[str]] = [
     'Pending — say "sign" to review it on your device, or "cancel" to discard.',
     f"To: {SEND_RECIPIENT}",
-    "Pay: 60,000 sats ($12.00 · rate age 0s)",
+    "Pay: 60,000 sats ($12.00 · @ $20,000/BTC)",
     "Fee: 282 sats · 2 sat/vB × 141 vB · medium — ETA ~60-70 min — estimate only, not a guarantee",
     "From: your wallet (1 source) · 39,718 sats come back as change",
     (
@@ -2750,6 +2750,7 @@ def test_brief_card_full_line_sequence_variant_a() -> None:
             "recipient": SEND_RECIPIENT,
             "amount_sats": 60_000,
             "usd_cents": 1_200,
+            "btc_usd": 20_000.0,
             "rate_age_s": 0,
             "fee_sats": 282,
             "fee_rate_sat_vb": 2,
@@ -2774,6 +2775,7 @@ def test_brief_card_variant_b_tail_no_preference_asked_twice() -> None:
             "recipient": SEND_RECIPIENT,
             "amount_sats": 60_000,
             "usd_cents": 1_200,
+            "btc_usd": 20_000.0,
             "rate_age_s": 0,
             "fee_sats": 282,
             "fee_rate_sat_vb": 2,
@@ -2856,10 +2858,12 @@ def test_confirmation_card_absent_fee_subkeys_do_not_fabricate() -> None:
 
 def test_confirmation_card_full_payload_is_byte_identical_to_previous_format() -> None:
     """The absent-key hardening must not change the fully-populated card:
-    every line identical to the pre-change format."""
+    every line identical to the pre-change format (TCK-UX-005: the fresh
+    rate now renders ``@ $20,000/BTC`` instead of its age)."""
     result: dict[str, Any] = {
         "amount_sats": 60_000,
         "usd_cents": 1_200,
+        "btc_usd": 20_000.0,
         "rate_age_s": 0,
         "recipient": "bc1qtest",
         "fee_sats": 282,
@@ -2874,7 +2878,7 @@ def test_confirmation_card_full_payload_is_byte_identical_to_previous_format() -
     lines: list[str] = []
     app_module._print_confirmation_card(result, lines.append)
     assert lines == [
-        "Amount: 60000 sats ($12.00 · rate age 0s)",
+        "Amount: 60000 sats ($12.00 · @ $20,000/BTC)",
         "To: bc1qtest",
         "Fee: 282 sats (2 sat/vB, medium target)",
         "Size: 141 vB",
@@ -2883,6 +2887,54 @@ def test_confirmation_card_full_payload_is_byte_identical_to_previous_format() -
         "Expires: ~10 min",
         "Ref: abc12345",
     ]
+
+
+def test_confirmation_card_stale_rate_keeps_age_wording() -> None:
+    """A stale rate (ADR-0011 ladder) shows WHY the number may be off — the
+    age wording — instead of the now-untrusted rate figure (TCK-UX-005)."""
+    result: dict[str, Any] = {
+        "amount_sats": 60_000,
+        "usd_cents": 1_200,
+        "btc_usd": 20_000.0,
+        "rate_age_s": 2_520,
+        "rate_stale": True,
+        "recipient": "bc1qtest",
+        "fee_sats": 282,
+        "fee_rate_sat_vb": 2,
+        "fee_target": "medium",
+        "vsize": 141,
+        "inputs_count": 1,
+        "change_sats": 39_718,
+        "expires_in_s": 600,
+        "tx_ref": "abc12345",
+    }
+    lines: list[str] = []
+    app_module._print_confirmation_card(result, lines.append)
+    assert "Amount: 60000 sats ($12.00 · rate age 2520s · stale)" in lines
+    assert "@ $20,000/BTC" not in lines[0]
+
+
+def test_confirmation_card_no_rate_omits_both_segments() -> None:
+    """No rate (absent ``btc_usd``) → neither the rate figure nor a stale
+    age appears; only the USD figure (TCK-UX-005 no-rate fallback)."""
+    result: dict[str, Any] = {
+        "amount_sats": 60_000,
+        "usd_cents": 1_200,
+        "recipient": "bc1qtest",
+        "fee_sats": 282,
+        "fee_rate_sat_vb": 2,
+        "fee_target": "medium",
+        "vsize": 141,
+        "inputs_count": 1,
+        "change_sats": 39_718,
+        "expires_in_s": 600,
+        "tx_ref": "abc12345",
+    }
+    lines: list[str] = []
+    app_module._print_confirmation_card(result, lines.append)
+    assert lines[0] == "Amount: 60000 sats ($12.00)"
+    assert "rate age" not in lines[0]
+    assert "@ $" not in lines[0]
 
 
 def test_send_flow_happy_path_card_then_dual_key_confirm(
@@ -2960,6 +3012,7 @@ def test_send_flow_handler_result_card_fields(
         "rate_stale",
         "rate_age_s",
         "rate_fetched_at",
+        "btc_usd",
         "fee_target",
         "fee_target_defaulted",
         "fee_requote",
@@ -3788,7 +3841,7 @@ def test_details_reprints_full_card_and_gates_on_pending(
     while_pending = "\n".join(outputs)
     # The full nine-line classic render, verbatim (the brief card's
     # stricter sibling — same data, two depths).
-    assert f"Amount: {SEND_AMOUNT_SATS} sats ($12.00 · rate age 0s)" in while_pending
+    assert f"Amount: {SEND_AMOUNT_SATS} sats ($12.00 · @ $20,000/BTC)" in while_pending
     assert f"Size: {SEND_VSIZE} vB" in while_pending
     assert "Inputs: 1" in while_pending
     assert "Expires: ~10 min" in while_pending
@@ -3855,7 +3908,7 @@ def test_send_flow_amount_usd_resolves_via_fresh_price(
     )
     joined = "\n".join(outputs)
     # $12 @ 20000 USD/BTC → exactly 60000 sats → identical card figures.
-    assert "Pay: 60,000 sats ($12.00 · rate age 0s)" in joined
+    assert "Pay: 60,000 sats ($12.00 · @ $20,000/BTC)" in joined
     assert flow.state is TxFlowStatus.CREATED
 
 
