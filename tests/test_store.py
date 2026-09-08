@@ -501,3 +501,98 @@ def test_persist_scan_result_integrity_failure_rolls_back_delete_and_writes():
         assert store.get_txs_for_wallet(wid) == []
         assert store.get_sync_state(wid, "last_scan_cursor") == "old-cursor"
         assert store.get_sync_state(wid, "last_scan_at") is None
+
+
+# =====================================================================
+# TCK-UTXO-002: typed coin-setting pair + security-review LOW fixes
+# =====================================================================
+
+MIN = "utxo_target_min_sats"
+MAX = "utxo_target_max_sats"
+VB = "consolidate_below_sat_vb"
+
+
+def test_coin_setting_roundtrip_and_clear() -> None:
+    with Store.memory() as store:
+        assert store.get_coin_setting(MIN) is None  # unset rung
+        store.set_coin_setting(MIN, "20000")
+        store.set_coin_setting(MAX, "500000")
+        store.set_coin_setting(VB, "1")
+        assert store.get_coin_setting(MIN) == "20000"
+        assert store.get_coin_setting(VB) == "1"
+        store.set_coin_setting(VB, "")  # "" clears (chain_base_url convention)
+        assert store.get_coin_setting(VB) is None
+        assert store.get_setting(VB) is None  # the generic API sees the same
+
+
+def test_coin_setting_unknown_key_refused() -> None:
+    with Store.memory() as store:
+        with pytest.raises(StoreError):
+            store.set_coin_setting("gap_limit", "6")
+        with pytest.raises(StoreError):
+            store.get_coin_setting("chain_base_url")
+
+
+# NB: rejected values chosen so none is a substring of the honest
+# bounds text the error is allowed to print ("between 546 and 100000000").
+@pytest.mark.parametrize("bad", ["abc", "1e4", "-1", "+1", "1 000", "1_000",
+                                 "١٢٣", "545", "100000001", " "])
+def test_coin_setting_malformed_and_out_of_bounds_refused_value_free(bad: str) -> None:
+    with Store.memory() as store:
+        with pytest.raises(StoreError) as excinfo:
+            store.set_coin_setting(MIN, bad)
+        assert bad.strip() not in str(excinfo.value) or not bad.strip()
+        assert store.get_setting(MIN) is None  # nothing landed
+
+
+def test_coin_setting_min_max_pair_refused_at_write() -> None:
+    # Against the stored sibling...
+    with Store.memory() as store:
+        store.set_coin_setting(MAX, "500000")
+        with pytest.raises(StoreError) as excinfo:
+            store.set_coin_setting(MIN, "500000")
+        assert "500000" not in str(excinfo.value)
+        assert store.get_setting(MIN) is None
+        # ...and against the sibling's shipped DEFAULT (max defaults 10M):
+        with pytest.raises(StoreError):
+            store.set_coin_setting(MIN, "50000000")
+        assert store.get_setting(MIN) is None
+
+
+def test_coin_setting_valid_pair_roundtrips() -> None:
+    with Store.memory() as store:
+        # 50M is fine ONLY once the stored max says so (it was refused
+        # against the default 10M above) — the pair check is on effective
+        # values, across stored rungs.
+        store.set_coin_setting(MAX, "60000000")
+        store.set_coin_setting(MIN, "50000000")
+        assert store.get_coin_setting(MIN) == "50000000"
+
+
+# LOW fix (a): propagate_coin_lineage surfaces sqlite failures as the
+# store's value-free StoreError, like every sibling accessor.
+
+def test_lineage_sqlite_failure_wrapped_value_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    with Store.memory() as store:
+        wid = store.create_wallet("w", DESCRIPTOR).id
+        txid = "aa" * 32
+
+        def boom(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(Store, "get_coin_label", boom)
+        with pytest.raises(StoreError) as excinfo:
+            store.propagate_coin_lineage(wid, txid, (0,), [(txid, 1)])
+        assert isinstance(excinfo.value.__cause__, sqlite3.OperationalError)
+        assert "locked" not in str(excinfo.value)  # driver text never echoed
+
+
+# LOW fix (b): the migration docstring states the ACTUAL guarantee
+# (per-statement atomicity + idempotent steps + version-stamp-last), not a
+# one-transaction claim that executescript would break anyway.
+
+def test_migration_atomicity_comment_states_real_guarantee() -> None:
+    doc = Store._migrate.__doc__ or ""
+    lowered = doc.lower()
+    assert "idempotent" in lowered and "stamp" in lowered
+    assert "inside one transaction" not in lowered

@@ -39,6 +39,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
+from localwallet.config import (
+    COIN_SETTING_BOUNDS,
+    COIN_SETTING_DEFAULTS,
+    UTXO_TARGET_MAX_SETTING,
+    UTXO_TARGET_MIN_SETTING,
+)
 from localwallet.store.models import (
     COIN_NOTE_MAX_CHARS,
     COIN_TAGS,
@@ -64,6 +70,12 @@ _BUSY_TIMEOUT_MS = 5000
 #: Private: access only through :meth:`Store.get_chain_base_url` /
 #: :meth:`Store.set_chain_base_url`, which own the write validation.
 _CHAIN_BASE_URL_SETTING = "chain_base_url"
+
+# Coin-selection policy settings (TCK-UTXO-002, docs/ux-utxo-notes-design.md
+# §2.3): keys, bounds and shipped defaults are owned by localwallet.config
+# (the env > stored > default ladder lives there; config imports nothing from
+# store, so this direction is cycle-free). See :meth:`Store.get_coin_setting`
+# / :meth:`Store.set_coin_setting`.
 
 
 class StoreError(Exception):
@@ -275,8 +287,15 @@ class Store(AbstractContextManager["Store"]):
           (here the v1→v2 add of ``coin_labels``) and re-stamp. A version with
           no registered migration path is refused (fail closed).
 
-        All steps run inside one transaction: a half-applied migration can
-        never leave a DB stamped at the new version with the table missing.
+        Atomicity, stated honestly (TCK-UTXO-002 security-review LOW): the
+        steps are NOT one SQLite transaction — each runs as its own statement
+        (``executescript`` commits beforehand), so durability rests on the
+        contract itself: every migration step is IDEMPOTENT (purely additive,
+        ``CREATE TABLE IF NOT EXISTS``), and the ``user_version`` stamp is
+        written LAST. A crash between a step and the stamp leaves the DB at
+        the old version with the additive step applied — the next open simply
+        re-runs the idempotent step and re-stamps. No step ever destructively
+        rewrites data, so per-statement atomicity is sufficient.
         """
         conn = self._conn
         current = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -791,10 +810,13 @@ class Store(AbstractContextManager["Store"]):
         for vout in output_vouts:
             _check_label_vout(vout)
         input_tags: set[str] = set()
-        for in_txid, in_vout in spent_inputs:
-            row = self.get_coin_label(wallet_id, in_txid, in_vout)
-            if row is not None:
-                input_tags.update(row.tags)
+        try:
+            for in_txid, in_vout in spent_inputs:
+                row = self.get_coin_label(wallet_id, in_txid, in_vout)
+                if row is not None:
+                    input_tags.update(row.tags)
+        except sqlite3.Error as exc:
+            raise _wrap(exc) from exc
         if not input_tags:
             return  # unlabeled inputs → unlabeled outputs (no rows written)
         with self._atomic():
@@ -967,3 +989,74 @@ class Store(AbstractContextManager["Store"]):
         if "@" in netloc:  # embedded userinfo would ride on every request
             raise StoreError("chain base url must not embed credentials")
         self.set_setting(_CHAIN_BASE_URL_SETTING, candidate)
+
+    # ------------------------------------ coin-selection policy settings (UTXO-002)
+    #
+    # The three doc §2.3 keys (utxo_target_min_sats / utxo_target_max_sats /
+    # consolidate_below_sat_vb). Same key/value mechanism as gap_limit and
+    # chain_base_url; the typed pair below is the ONLY sanctioned writer, so
+    # write-time validation can never be skipped (the web settings page and
+    # /settings, TCK-UTXO-003, reuse it verbatim). Bounds/defaults are single-
+    # sourced from localwallet.config (the env > stored > default ladder and
+    # the startup fail-closed re-check live there; config imports no store).
+
+    def get_coin_setting(self, key: str) -> str | None:
+        """Typed reader for a coin-selection setting (``None`` = unset rung)."""
+        if key not in COIN_SETTING_BOUNDS:
+            raise StoreError("unknown coin setting key")
+        return self.get_setting(key)
+
+    def set_coin_setting(self, key: str, value: str) -> None:
+        """Persist a coin-selection setting; ``""`` clears it (back to default).
+
+        Fail-closed at write, before anything lands on disk (ADR-0009 /
+        ADR-0023 pattern): the key must be one of the three managed settings;
+        the value must be a plain ASCII decimal integer within the key's
+        bound, and the resulting min/max PAIR (this write plus the stored
+        sibling, or its shipped default when unset) must satisfy ``min < max``
+        — a corrupt pair is malformed and never silently flips selection
+        policy. Errors are value-free: nothing the user typed is echoed.
+        """
+        bounds = COIN_SETTING_BOUNDS.get(key)
+        if bounds is None:
+            raise StoreError("unknown coin setting key")
+        if not isinstance(value, str):
+            raise StoreError("coin setting must be text")
+        if not value:
+            with self._transaction():
+                self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            return
+        if not value.isascii() or not value.isdigit():
+            raise StoreError(f"setting {key!r} must be a plain decimal integer")
+        parsed = int(value)
+        lo, hi = bounds
+        if not lo <= parsed <= hi:
+            raise StoreError(f"setting {key!r} must be between {lo} and {hi}")
+        effective = {
+            UTXO_TARGET_MIN_SETTING: parsed
+            if key == UTXO_TARGET_MIN_SETTING
+            else self._effective_coin_setting(UTXO_TARGET_MIN_SETTING),
+            UTXO_TARGET_MAX_SETTING: parsed
+            if key == UTXO_TARGET_MAX_SETTING
+            else self._effective_coin_setting(UTXO_TARGET_MAX_SETTING),
+        }
+        if effective[UTXO_TARGET_MIN_SETTING] >= effective[UTXO_TARGET_MAX_SETTING]:
+            raise StoreError(
+                "utxo target minimum must stay below the maximum "
+                "(raise the maximum or lower the minimum)"
+            )
+        self.set_setting(key, value)
+
+    def _effective_coin_setting(self, key: str) -> int:
+        """Stored value, else the shipped default (for the write cross-check).
+
+        Stored values are only ever written through this pair, so they are
+        parseable here by construction; anything else on disk (a hand-edited
+        DB) resolves to the default at write time and is caught fail-closed
+        by the startup ladder (:func:`localwallet.config.resolve_coin_selection_settings`),
+        not silently adopted.
+        """
+        raw = self.get_setting(key)
+        if raw is None or not raw.isascii() or not raw.isdigit():
+            return COIN_SETTING_DEFAULTS[key]
+        return int(raw)

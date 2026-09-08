@@ -131,3 +131,115 @@ def test_resolution_flows_through_the_one_selection_point() -> None:
     assert (
         ChainConfig.from_settings(Settings()).base_url == "https://mempool.space/api"
     )
+
+
+# =============================================================================
+# TCK-UTXO-002: coin-selection settings ladder (doc §2.3, ADR-0012 amendment)
+# =============================================================================
+
+from localwallet.config import (
+    CONSOLIDATE_BELOW_SAT_VB_SETTING,
+    UTXO_TARGET_MAX_SETTING,
+    UTXO_TARGET_MIN_SETTING,
+    CoinSelectionSettings,
+    resolve_coin_selection_settings,
+)
+
+MIN = UTXO_TARGET_MIN_SETTING
+MAX = UTXO_TARGET_MAX_SETTING
+VB = CONSOLIDATE_BELOW_SAT_VB_SETTING
+
+
+def test_defaults_ship_the_doc_values() -> None:
+    got = resolve_coin_selection_settings({}, {})
+    assert got == CoinSelectionSettings(100_000, 10_000_000, 2)
+
+
+def test_precedence_env_over_stored_over_default() -> None:
+    got = resolve_coin_selection_settings(
+        {MIN: "7000"},
+        {MIN: "9000", MAX: "30000"},
+    )
+    assert got.target_min_sats == 7_000  # env wins
+    assert got.target_max_sats == 30_000  # stored wins over default
+    assert got.consolidate_below_sat_vb == 2  # no rung -> shipped default
+
+
+@pytest.mark.parametrize("blank", [None, "", "   ", "\t"])
+def test_blank_rungs_are_unset_not_malformed(blank: str | None) -> None:
+    env = {MIN: blank, MAX: blank, VB: blank}
+    stored = {MIN: blank, MAX: blank, VB: blank}
+    got = resolve_coin_selection_settings(env, stored)  # type: ignore[arg-type]
+    assert got == CoinSelectionSettings(100_000, 10_000_000, 2)
+
+
+def test_stripped_env_rung_is_accepted_stripped() -> None:
+    got = resolve_coin_selection_settings({MIN: "  7000  "}, {})
+    assert got.target_min_sats == 7_000
+
+
+@pytest.mark.parametrize("bad", ["abc", "0x10", "1e5", "-5", "+5", "1 000",
+                                 "1_000", "١٢٣", "5.0", "٢٠٢٦"])
+def test_malformed_refuses_startup_value_free(bad: str) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        resolve_coin_selection_settings({MAX: bad}, {})
+    message = str(excinfo.value)
+    assert "LOCALWALLET_UTXO_TARGET_MAX_SATS" in message
+    assert bad not in message  # nothing the user typed is echoed
+
+
+@pytest.mark.parametrize(("key", "bad"), [
+    (MIN, "545"), (MIN, "100000001"),
+    (MAX, "545"), (MAX, "21000000000001"),
+    (VB, "0"), (VB, "101"),
+])
+def test_out_of_bounds_refused(key: str, bad: str) -> None:
+    with pytest.raises(ValueError):
+        resolve_coin_selection_settings({key: bad}, {})
+
+
+def test_min_not_below_max_refused_across_rungs() -> None:
+    # env min crossing a stored max: the cross-check spans rungs (a corrupt
+    # mix never silently flips policy — ADR-0009 applies verbatim).
+    with pytest.raises(ValueError) as excinfo:
+        resolve_coin_selection_settings({MIN: "30000"}, {MAX: "30000"})
+    assert "utxo_target_min_sats" in str(excinfo.value)
+    assert "30000" not in str(excinfo.value)
+    with pytest.raises(ValueError):
+        resolve_coin_selection_settings({MIN: "200000"}, {MAX: "100000"})
+    # default max with an env min above it also refuses:
+    with pytest.raises(ValueError):
+        resolve_coin_selection_settings({MIN: "50000000"}, {})
+
+
+def test_from_env_reads_the_three_new_rungs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOCALWALLET_UTXO_TARGET_MIN_SATS", "12345")
+    monkeypatch.setenv("LOCALWALLET_UTXO_TARGET_MAX_SATS", "678901")
+    monkeypatch.setenv("LOCALWALLET_CONSOLIDATE_BELOW_SAT_VB", "1")
+    settings = Settings.from_env()
+    assert settings.utxo_target_min_sats == "12345"
+    assert settings.utxo_target_max_sats == "678901"
+    assert settings.consolidate_below_sat_vb == "1"
+    # from_env does not parse (gap_limit precedent): the strings ride raw.
+    got = resolve_coin_selection_settings(
+        {MIN: settings.utxo_target_min_sats,
+         MAX: settings.utxo_target_max_sats,
+         VB: settings.consolidate_below_sat_vb},
+        {MIN: "999999"},  # stored loses to env
+    )
+    assert got == CoinSelectionSettings(12_345, 678_901, 1)
+
+
+def test_ladder_consumes_the_store_settings_api() -> None:
+    # The stored rung is read through the generic settings API (get_setting)
+    # and written through the typed pair; resolution then matches what was
+    # written — the ladder's stored rung is the DB, not a parallel channel.
+    with Store.memory() as store:
+        store.set_coin_setting(MIN, "20000")
+        store.set_coin_setting(MAX, "500000")
+        store.set_coin_setting(VB, "1")
+        got = resolve_coin_selection_settings(
+            {},
+            {key: store.get_setting(key) for key in (MIN, MAX, VB)},
+        )
+    assert got == CoinSelectionSettings(20_000, 500_000, 1)

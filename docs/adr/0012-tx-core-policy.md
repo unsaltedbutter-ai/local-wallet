@@ -293,3 +293,44 @@ In-policy now (`protocol/envelope.py`, `app.py`, grammar, prompt in lockstep):
    (commit-only-on-success, fresh `tx_ref`/TTL, old ref inert); a re-quote
    carrying it simply bypasses the rung ceiling/floor guard — that bypass is
    the ceiling ask's resolution, reached only after the handler offered it.
+
+## Amendment (TCK-UTXO-002, 2026-09-07): partitioned selection, target min/max, low-fee consolidation
+
+> Draft landed verbatim from `docs/ux-utxo-notes-design.md` §2.4; the
+> implementation is `tx/selection.py` (policy layers A/B/C + step 5), the
+> settings ladder is `config.resolve_coin_selection_settings` +
+> `Store.set_coin_setting`, and the label join is the caller's duty
+> (`tx/` reads only the resulting booleans).
+
+Decisions 1–4 are unchanged *within a candidate pool*; three policy
+layers wrap them. Coin tags and target settings arrive as plain data on
+the UTXO snapshot and the settings argument, exactly like the fee rate —
+`tx/` performs no store access and reads no user free text (the note
+field never reaches this module; only the `kyc_side`/`mixed` booleans and
+integer settings do).
+
+1. **Partition preference.** Run decision 1 (steps 1–4) over the kyc-side
+   pool, the other-side pool, and the full set. A pure pool wins over the
+   mixed result whenever it finalizes (choice: lowest `fee_sats`, then
+   fixed pool order other-side → kyc-side); mixed inputs occur only when
+   no pure pool funds the amount. Purely by design, a pure pool may pay
+   more than a mixed selection; the caller must surface the mix on the
+   confirmation card. Coins created by a mixed spend inherit both
+   classes (caller-side lineage; `tx/` sees only the resulting boolean,
+   where mixed means kyc-side).
+2. **Step 3 bound (max target).** The single-coin improvement pass never
+   substitutes a coin above `utxo_target_max_sats`; preserving one large
+   coin outweighs a cheaper fee.
+3. **Step 5, low-fee consolidation.** After step 4: when the fee rate ≤
+   `consolidate_below_sat_vb`, fold unselected pool coins with
+   `value_sats < utxo_target_min_sats` in canonical order, bounded by 4
+   added inputs and per-coin value ≥ 2 × incremental input fee, keeping
+   finalization. Pure function of inputs like steps 1–4; the conservation
+   assert covers the final set.
+4. **Settings ladder.** `utxo_target_min_sats` (default 100,000),
+   `utxo_target_max_sats` (default 10,000,000), `consolidate_below_sat_vb`
+   (default 2): `settings` keys with typed fail-closed store writers
+   (`Store.set_coin_setting`, bounds single-sourced from `config`), pure
+   env > stored > default resolution in `config`
+   (`resolve_coin_selection_settings`), malformed value = startup refusal,
+   value-free errors — the ADR-0009 / ADR-0023 pattern.

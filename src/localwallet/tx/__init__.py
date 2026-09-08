@@ -30,6 +30,7 @@ from localwallet.tx.selection import (
     InsufficientFundsError,
     SelectionError,
     SelectionResult,
+    coin_partition,
     estimate_tx_vsize,
     select_coins,
 )
@@ -47,9 +48,10 @@ __all__ = [
     "TxEngineError",
     # psbt
     "build_unsigned_psbt",
+    # selection
+    "coin_partition",
     # dust
     "dust_threshold",
-    # selection
     "estimate_tx_vsize",
     "min_relay_fee_vbytes",
     "psbt_to_base64",

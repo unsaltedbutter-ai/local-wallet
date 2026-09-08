@@ -48,9 +48,54 @@ module never hardcodes it).
    economically-unspendable dust — walk the canonical order over the
    unselected UTXOs, adding one at a time, and take the first superset
    that finalizes with a *viable change output* (``change >= change_dust``).
-   If none does, keep the previous result. This is the only step that may
-   select beyond the minimum, and it only fires when the alternative is
-   dead dust on-chain (never gratuitous UTXO shattering).
+    If none does, keep the previous result. This is the only step that may
+    select beyond the minimum, and it only fires when the alternative is
+    dead dust on-chain (never gratuitous UTXO shattering).
+
+POLICY LAYERS (TCK-UTXO-002, ADR-0012 amendment; docs/ux-utxo-notes-design.md
+§2) — layered AROUND steps 1–4, which stay unchanged within any pool
+-------------------------------------------------------------------------------
+Tags arrive pre-joined by the CALLER as plain data on the UTXO objects —
+this module reads NO store, NO env, NO free text (the note field never
+reaches it). Each duck-typed UTXO may carry ``kyc_side: bool`` (absent =
+False = other-side, §1.4 "unlabeled = other-side by default", which makes an
+untagged wallet behave exactly like pre-amendment selection). The pure
+:func:`coin_partition` is the canonical tag-set -> (kyc_side, mixed) mapping
+for that caller-side join (mixed-by-lineage coins are kyc-side — fail-safe).
+
+A. **Partition preference.** Steps 1–4 (+5) run over the other-side pool and
+   the kyc-side pool; any pure pool that finalizes wins — between two
+   funding pure pools the lower ``fee_sats`` wins, ties broken by fixed pool
+   order (other-side, then kyc-side, so equal-fee runs are reproducible).
+   The full set is only run when NO pure pool funds the amount: the result
+   is then a MIX (``SelectionResult.mixed`` — the caller MUST surface the
+   mix warning on the confirmation card; narration renders from the final
+   selection, so a re-quote can never silently change the tag-mix). A pure
+   pool MAY COST MORE than a mixed selection — that is by design (rule "don't
+   mix KYC with non-KYC coins" outweighs fee-pennies, as step 3's max-coin
+   rule already outweighs fee for one big coin).
+
+B. **Step 3 bound (``utxo_target_max_sats``).** The single-coin improvement
+   never substitutes a coin above target max: preserving one large coin
+   outweighs a cheaper fee (canonical order is value-ascending, so the scan
+   simply ends at the first over-max candidate).
+
+C. **Step 5, low-fee consolidation (``consolidate_below_sat_vb``,
+   ``utxo_target_min_sats``).** After step 4, when the fee rate <= the
+   threshold AND the pool holds >= 2 unselected coins below target min:
+   walk those candidates in canonical order, adding one at a time while ALL
+   hold — added inputs <= ``_MAX_CONSOLIDATE`` (4); each coin's value >=
+   2 x its incremental input fee (2 x 68 vB x rate — a folding coin earns
+   its passage at double the greedy skip bound); the set still finalizes.
+   Stop at the first violation. The number added is reported as
+   ``SelectionResult.folded_count`` (the caller narrates it on the From
+   line). Change/fee recompute through ``finalize()``; the conservation
+   assert covers the final set.
+
+Steps A–C are pure functions of snapshot + rate + settings, like steps 1–4:
+same inputs, same output. Settings arguments are ``None`` = feature off =
+pre-amendment behavior (the handler threads the values resolved by
+:func:`localwallet.config.resolve_coin_selection_settings`).
 
 FINALIZE (exact integer accounting, no float money)
 ---------------------------------------------------
@@ -107,10 +152,16 @@ logs — callers must keep them out of logging context (ADR-0012).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from localwallet.config import (
+    COIN_SETTING_BOUNDS,
+    CONSOLIDATE_BELOW_SAT_VB_SETTING,
+    UTXO_TARGET_MAX_SETTING,
+    UTXO_TARGET_MIN_SETTING,
+)
 from localwallet.tx.dust import (
     TxEngineError,
     dust_threshold,
@@ -122,6 +173,7 @@ __all__ = [
     "InsufficientFundsError",
     "SelectionError",
     "SelectionResult",
+    "coin_partition",
     "estimate_tx_vsize",
     "select_coins",
 ]
@@ -137,6 +189,19 @@ P2WPKH_INPUT_WEIGHT_WU = 4 * _P2WPKH_INPUT_NONWITNESS_BYTES + _P2WPKH_WITNESS_BY
 
 #: Segwit marker + flag byte: serialized once (witness section), not 4x.
 _SEGWIT_MARKER_FLAG_WU = 2
+
+#: Partition classes over the closed coin-tag vocabulary (doc §1.4 table;
+#: ``store.models.COIN_TAGS`` is the authoritative tag list — mirrored here
+#: because tx/ must not import store/). ``consolidation`` is deliberately
+#: absent: it describes the payment, not the coins' character (display-only).
+#: A coin whose tags touch BOTH classes (a lineage union after a mixed spend)
+#: is MIXED: kyc-side — the fail-safe direction ("a mixed coin can un-mix
+#: nothing", §1.3) — with the ``mixed`` flag for the caller's narration.
+_KYC_SIDE_TAGS = frozenset({"kyc", "exchange"})
+_OTHER_SIDE_TAGS = frozenset({"p2p", "purchase"})
+
+#: Step 5 consolidation bound (doc §2.2): at most this many extra inputs.
+_MAX_CONSOLIDATE = 4
 
 #: v1 wallet change script (BIP84 P2WPKH): OP_0 <20-byte program>. Built
 #: from the template, never a dust constant — the threshold still comes
@@ -176,6 +241,39 @@ class InsufficientFundsError(SelectionError):
         )
 
 
+def coin_partition(tags: Iterable[str]) -> tuple[bool, bool]:
+    """Map a coin's tag set to its selection partition (doc §1.4 + §1.3).
+
+    Returns ``(kyc_side, mixed)`` — the two booleans the caller joins onto
+    each UTXO before :func:`select_coins` (tags themselves never reach the
+    engine; the free-text note never reaches this module at all). The
+    decision table:
+
+    ==============================  ==========  ======  ==================
+    tag set                         kyc_side    mixed partition
+    ==============================  ==========  ======  ==================
+    contains kyc/exchange AND       True        True    kyc-side pool
+      p2p/purchase (mixed lineage)
+    contains only kyc/exchange      True        False   kyc-side pool
+      (any mix of the two)
+    everything else: p2p, purchase, False       False   other-side pool
+      consolidation (neutral),
+      unlabeled/empty
+    ==============================  ==========  ======  ==================
+
+    Unknown tag words count as neither side (the store's typed writer only
+    admits the closed set; this is belt-and-braces, never an error).
+    """
+    kyc = False
+    other = False
+    for tag in tags:
+        if tag in _KYC_SIDE_TAGS:
+            kyc = True
+        elif tag in _OTHER_SIDE_TAGS:
+            other = True
+    return (kyc, kyc and other)
+
+
 @dataclass(frozen=True, slots=True)
 class SelectionResult:
     """Outcome of :func:`select_coins`.
@@ -191,6 +289,15 @@ class SelectionResult:
             against embit-built transactions — see the module docstring).
         fee_sats: Fee in sats for the estimated vsize at the given rate.
         inputs_total: Sum of the selected UTXO values in sats.
+        mixed: ``True`` iff the FINAL selection spans both partition
+            classes (only reachable via the full-set fallback — a pure pool
+            always wins when it funds). The caller must surface the mix
+            warning on the confirmation card when set; renderers compute it
+            from the just-returned set, so a re-quote can never silently
+            change the tag-mix (doc §4.2).
+        folded_count: Step 5 consolidation count — unselected below-target-min
+            coins folded in "to save fees later" (0 = step did not fire).
+            The caller narrates it on the card's From line (doc §2.2/§4.3).
     """
 
     selected: list[Any]
@@ -198,6 +305,8 @@ class SelectionResult:
     estimated_vsize: int
     fee_sats: int
     inputs_total: int
+    mixed: bool = False
+    folded_count: int = 0
 
 
 def _validate_int(value: int, name: str, lo: int, hi: int) -> int:
@@ -342,6 +451,145 @@ class _Selector:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class _Policy:
+    """Engine-side policy bundle (amount/rate/scripts + the §2.3 settings;
+    a ``None`` setting switches its layer off = pre-amendment behavior)."""
+
+    amount_sats: int
+    fee_rate_sat_vb: int
+    change_cost_vbytes: int
+    output_script: bytes
+    change_script: bytes
+    target_min_sats: int | None
+    target_max_sats: int | None
+    consolidate_below_sat_vb: int | None
+
+
+def _select_from_pool(ordered: list[Any], policy: _Policy) -> SelectionResult | None:
+    """Steps 1-5 over ONE canonical-ordered pool; ``None`` = pool can't fund.
+
+    Steps 1-4 are the ADR-0012 decision-1 algorithm, unchanged within a pool
+    (module docstring); step 5 is the §2.2 low-fee consolidation. Never
+    raises :class:`InsufficientFundsError` — the caller (pool driver) decides
+    which non-finalizing run owns the user-facing error.
+    """
+    if not ordered:
+        return None
+    selector = _Selector(
+        ordered,
+        policy.amount_sats,
+        policy.fee_rate_sat_vb,
+        policy.change_cost_vbytes,
+        policy.output_script,
+        policy.change_script,
+    )
+
+    # Step 2: greedy smallest-larger-first; first finalizing prefix wins.
+    # A UTXO worth less than the incremental per-input fee (the P2WPKH
+    # input weight is 272 WU = 68 vB exactly, so 68 × rate sats) adds less
+    # value than the fee it costs: it can never help finalization and would
+    # poison every greedy prefix (TCK-P2-002 review). The skip is a pure
+    # function of value and rate — deterministic. The improvement passes
+    # below still see every UTXO; finalize() remains the real gate there.
+    min_useful_value = (P2WPKH_INPUT_WEIGHT_WU // 4) * policy.fee_rate_sat_vb
+    chosen: list[Any] = []
+    finalized: _Finalized | None = None
+    for utxo in ordered:
+        if utxo.value_sats < min_useful_value:
+            continue
+        chosen.append(utxo)
+        finalized = selector.finalize(chosen)
+        if finalized is not None:
+            break
+    if finalized is None:
+        return None  # pool cannot fund: the driver moves to the next pool
+
+    # Step 3: single-coin improvement (only when greedy used >= 2 inputs).
+    # Policy layer B: candidates above utxo_target_max_sats are never
+    # substituted — preserving one large coin outweighs a cheaper fee (the
+    # canonical order is value-ascending, so the scan ends at the first
+    # over-max candidate).
+    if len(chosen) >= 2:
+        for utxo in ordered:
+            if (
+                policy.target_max_sats is not None
+                and utxo.value_sats > policy.target_max_sats
+            ):
+                break
+            single = selector.finalize([utxo])
+            if single is not None and single.fee_sats <= finalized.fee_sats:
+                chosen, finalized = [utxo], single
+                break
+
+    # Step 4: no-shattering dust sweep — only when change is folded and the
+    # wallet would keep unspendable dust behind.
+    remainder = selector.wallet_total - finalized.total
+    if finalized.change_sats is None and 0 < remainder < selector.change_dust:
+        selected_keys = {(u.txid.lower(), u.vout) for u in chosen}
+        candidate = list(chosen)
+        for utxo in ordered:
+            if (utxo.txid.lower(), utxo.vout) in selected_keys:
+                continue
+            candidate.append(utxo)
+            swept = selector.finalize(candidate)
+            if swept is not None and swept.change_sats is not None:
+                chosen, finalized = candidate, swept
+                break
+
+    # Step 5 (policy layer C): low-fee consolidation — fold unselected
+    # below-target-min coins while fee rate <= the threshold, bounded by
+    # _MAX_CONSOLIDATE added inputs, each earning 2x its own incremental
+    # input fee, and continued finalization; stop at the FIRST violation
+    # (doc §2.2; deterministic like steps 1-4).
+    folded = 0
+    if (
+        policy.target_min_sats is not None
+        and policy.consolidate_below_sat_vb is not None
+        and policy.fee_rate_sat_vb <= policy.consolidate_below_sat_vb
+    ):
+        selected_keys = {(u.txid.lower(), u.vout) for u in chosen}
+        fold_candidates = [
+            u for u in ordered
+            if (u.txid.lower(), u.vout) not in selected_keys
+            and u.value_sats < policy.target_min_sats
+        ]
+        if len(fold_candidates) >= 2:  # §2.2 trigger: pool holds >= 2 small coins
+            fold_passage = 2 * (P2WPKH_INPUT_WEIGHT_WU // 4) * policy.fee_rate_sat_vb
+            for utxo in fold_candidates:
+                if folded >= _MAX_CONSOLIDATE or utxo.value_sats < fold_passage:
+                    break
+                candidate = list(chosen)
+                candidate.append(utxo)
+                swept = selector.finalize(candidate)
+                if swept is None:
+                    break
+                chosen, finalized = candidate, swept
+                folded += 1
+
+    change_for_invariant = (
+        finalized.change_sats if finalized.change_sats is not None else 0
+    )
+    # Conservation invariant at the money-path boundary (see module
+    # docstring): asserted, not error-handled — a violation is a bug here,
+    # and AssertionError is the documented failure mode. Covers the FINAL
+    # set, after step 5 (ADR-0012 amendment decision 3).
+    assert finalized.total == (
+        policy.amount_sats + finalized.fee_sats + change_for_invariant
+    ), "selection conservation invariant violated: inputs_total != amount + fee + change"
+
+    kyc_flags = [bool(getattr(u, "kyc_side", False)) for u in chosen]
+    return SelectionResult(
+        selected=sorted(chosen, key=_utxo_sort_key),
+        change_sats=finalized.change_sats,
+        estimated_vsize=finalized.vsize,
+        fee_sats=finalized.fee_sats,
+        inputs_total=finalized.total,
+        mixed=any(kyc_flags) and not all(kyc_flags),
+        folded_count=folded,
+    )
+
+
 def select_coins(
     utxos: Sequence[Any],
     amount_sats: int,
@@ -350,14 +598,19 @@ def select_coins(
     output_script: bytes,
     *,
     change_script: bytes | None = None,
+    utxo_target_min_sats: int | None = None,
+    utxo_target_max_sats: int | None = None,
+    consolidate_below_sat_vb: int | None = None,
 ) -> SelectionResult:
     """Select UTXOs for paying ``amount_sats`` (+fee) — see module docstring.
 
     Args:
         utxos: The wallet's spendable UTXOs; duck-typed on ``value_sats``
-            (positive int), ``txid`` (non-empty str), ``vout`` (int >= 0).
-            Plain data in, plain data out — the store and chain modules are
-            never touched here.
+            (positive int), ``txid`` (non-empty str), ``vout`` (int >= 0),
+            and (optionally, joined by the caller from stored coin labels —
+            see :func:`coin_partition`) ``kyc_side`` (bool; absent = False =
+            other-side). Plain data in, plain data out — the store and chain
+            modules are never touched here.
         amount_sats: Recipient value in sats. Must be at least the dust
             threshold of ``output_script`` (computed, not hardcoded).
         fee_rate_sat_vb: Integer fee rate in sat/vB, 1..10000.
@@ -371,9 +624,22 @@ def select_coins(
         change_script: The change output scriptPubKey. Defaults to the
             v1 wallet change type (BIP84 P2WPKH template) per ADR-0008;
             the dust threshold is always computed from this script's size.
+        utxo_target_min_sats: Step 5 consolidation floor (doc §2.3): coins
+            below this fold in at low fee rates. ``None`` = step 5 off.
+        utxo_target_max_sats: Step 3 protection ceiling: the single-coin
+            improvement never shatters a coin above this. ``None`` = unbound.
+        consolidate_below_sat_vb: Fee-rate ceiling for step 5. ``None`` =
+            step 5 off. The startup ladder
+            (:func:`localwallet.config.resolve_coin_selection_settings`)
+            owns the min<max cross-check; it is re-checked here fail-closed
+            so a direct caller cannot smuggle a contradictory pair into the
+            money path.
 
     Returns:
-        A deterministic :class:`SelectionResult`.
+        A deterministic :class:`SelectionResult` (partition layer A: a pure
+        pool wins whenever it finalizes — the possibly-cheaper mixed result
+        is discarded, BY DESIGN; ``mixed``/``folded_count`` describe the
+        FINAL selection, for the caller's card narration).
 
     Raises:
         SelectionError: structurally invalid arguments (value-free).
@@ -388,6 +654,39 @@ def select_coins(
     fee_rate_sat_vb = _validate_int(
         fee_rate_sat_vb, "fee_rate_sat_vb", 1, _MAX_FEE_RATE_SAT_VB
     )
+    target_min_sats = (
+        None
+        if utxo_target_min_sats is None
+        else _validate_int(
+            utxo_target_min_sats,
+            UTXO_TARGET_MIN_SETTING,
+            *COIN_SETTING_BOUNDS[UTXO_TARGET_MIN_SETTING],
+        )
+    )
+    target_max_sats = (
+        None
+        if utxo_target_max_sats is None
+        else _validate_int(
+            utxo_target_max_sats,
+            UTXO_TARGET_MAX_SETTING,
+            *COIN_SETTING_BOUNDS[UTXO_TARGET_MAX_SETTING],
+        )
+    )
+    consolidate_below = (
+        None
+        if consolidate_below_sat_vb is None
+        else _validate_int(
+            consolidate_below_sat_vb,
+            CONSOLIDATE_BELOW_SAT_VB_SETTING,
+            *COIN_SETTING_BOUNDS[CONSOLIDATE_BELOW_SAT_VB_SETTING],
+        )
+    )
+    if (
+        target_min_sats is not None
+        and target_max_sats is not None
+        and target_min_sats >= target_max_sats
+    ):
+        raise SelectionError("utxo target minimum must be below the maximum")
     if not isinstance(output_script, (bytes, bytearray, memoryview)):
         raise SelectionError("output_script must be bytes")
     output_script = bytes(output_script)
@@ -434,73 +733,58 @@ def select_coins(
             raise SelectionError("duplicate utxo in the selection input")
         seen.add(key)
 
+    policy = _Policy(
+        amount_sats=amount_sats,
+        fee_rate_sat_vb=fee_rate_sat_vb,
+        change_cost_vbytes=change_cost_vbytes,
+        output_script=output_script,
+        change_script=change_script,
+        target_min_sats=target_min_sats,
+        target_max_sats=target_max_sats,
+        consolidate_below_sat_vb=consolidate_below,
+    )
+
+    # Policy layer A: partition preference (doc §2.1). Run the pure pools;
+    # the lowest fee wins, ties broken by FIXED pool order (other-side
+    # first — iteration order + strict <, so equal-fee runs are
+    # reproducible). With no kyc-side coin the driver degenerates: the
+    # other-side pool IS the full set — one run, exactly pre-amendment.
+    kyc_pool = [u for u in ordered if getattr(u, "kyc_side", False)]
+    if kyc_pool:
+        other_pool = [u for u in ordered if not getattr(u, "kyc_side", False)]
+        pure: SelectionResult | None = None
+        for pool in (other_pool, kyc_pool):
+            run = _select_from_pool(pool, policy)
+            if run is not None and (pure is None or run.fee_sats < pure.fee_sats):
+                pure = run
+        if pure is not None:
+            return pure  # a pure pool funds; the mixed run is discarded (§2.1)
+        fallback = _select_from_pool(ordered, policy)
+        if fallback is None:
+            raise _insufficient(ordered, policy)
+        return fallback  # unavoidable mix — the caller MUST surface the warning
+
+    result = _select_from_pool(ordered, policy)
+    if result is None:
+        raise _insufficient(ordered, policy)
+    return result
+
+
+def _insufficient(ordered: list[Any], policy: _Policy) -> InsufficientFundsError:
+    """User-facing error over the FULL wallet: not even everything finalizes."""
     selector = _Selector(
-        ordered, amount_sats, fee_rate_sat_vb, change_cost_vbytes,
-        output_script, change_script,
+        ordered,
+        policy.amount_sats,
+        policy.fee_rate_sat_vb,
+        policy.change_cost_vbytes,
+        policy.output_script,
+        policy.change_script,
     )
-
-    # Step 2: greedy smallest-larger-first; first finalizing prefix wins.
-    # A UTXO worth less than the incremental per-input fee (the P2WPKH
-    # input weight is 272 WU = 68 vB exactly, so 68 × rate sats) adds less
-    # value than the fee it costs: it can never help finalization and would
-    # poison every greedy prefix (TCK-P2-002 review). The skip is a pure
-    # function of value and rate — deterministic. The improvement passes
-    # below still see every UTXO; finalize() remains the real gate there.
-    min_useful_value = (P2WPKH_INPUT_WEIGHT_WU // 4) * fee_rate_sat_vb
-    chosen: list[Any] = []
-    finalized: _Finalized | None = None
-    for utxo in ordered:
-        if utxo.value_sats < min_useful_value:
-            continue
-        chosen.append(utxo)
-        finalized = selector.finalize(chosen)
-        if finalized is not None:
-            break
-    if finalized is None:
-        # Not even the full set finalizes: report needed/available.
-        needed = amount_sats + selector._vsize(len(ordered), with_change=False) * fee_rate_sat_vb
-        raise InsufficientFundsError(needed=needed, available=selector.wallet_total)
-
-    # Step 3: single-coin improvement (only when greedy used >= 2 inputs).
-    if len(chosen) >= 2:
-        for utxo in ordered:
-            single = selector.finalize([utxo])
-            if single is not None and single.fee_sats <= finalized.fee_sats:
-                chosen, finalized = [utxo], single
-                break
-
-    # Step 4: no-shattering dust sweep — only when change is folded and the
-    # wallet would keep unspendable dust behind.
-    remainder = selector.wallet_total - finalized.total
-    if finalized.change_sats is None and 0 < remainder < selector.change_dust:
-        selected_keys = {(u.txid.lower(), u.vout) for u in chosen}
-        candidate = list(chosen)
-        for utxo in ordered:
-            if (utxo.txid.lower(), utxo.vout) in selected_keys:
-                continue
-            candidate.append(utxo)
-            swept = selector.finalize(candidate)
-            if swept is not None and swept.change_sats is not None:
-                chosen, finalized = candidate, swept
-                break
-
-    change_for_invariant = (
-        finalized.change_sats if finalized.change_sats is not None else 0
+    needed = (
+        policy.amount_sats
+        + selector._vsize(len(ordered), with_change=False) * policy.fee_rate_sat_vb
     )
-    # Conservation invariant at the money-path boundary (see module
-    # docstring): asserted, not error-handled — a violation is a bug here,
-    # and AssertionError is the documented failure mode.
-    assert finalized.total == (
-        amount_sats + finalized.fee_sats + change_for_invariant
-    ), "selection conservation invariant violated: inputs_total != amount + fee + change"
-
-    return SelectionResult(
-        selected=sorted(chosen, key=_utxo_sort_key),
-        change_sats=finalized.change_sats,
-        estimated_vsize=finalized.vsize,
-        fee_sats=finalized.fee_sats,
-        inputs_total=finalized.total,
-    )
+    return InsufficientFundsError(needed=needed, available=selector.wallet_total)
 
 
 def _needed_floor(amount_sats: int, fee_rate_sat_vb: int, output_script: bytes) -> int:
