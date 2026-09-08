@@ -108,6 +108,7 @@ body {
 .bar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--sp-3);
   padding: var(--sp-3) var(--sp-4);
   background: var(--c-surface);
@@ -142,6 +143,108 @@ body {
 .status[data-state="reconnecting"]::before { background: var(--c-conn-reconnect); }
 .status[data-state="down"]::before,
 .status[data-state="unauthorized"]::before { background: var(--c-conn-down); }
+
+/* ------------------------------------------------------------------- chip */
+/* TCK-WEB-005: scan status pill — quiet warn styling, text supplied by app.js */
+
+.chip {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--c-warn);
+  background: var(--c-surface-2);
+  border: 1px solid var(--c-border-strong);
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+}
+
+/* ---------------------------------------------------------------- settings */
+
+.btn-ghost {
+  background: transparent;
+  color: var(--c-text-muted);
+  border-color: var(--c-border);
+  font-weight: 500;
+  padding: var(--sp-2) var(--sp-3);
+}
+
+.btn-ghost:hover { color: var(--c-text); border-color: var(--c-border-strong); }
+
+.settings {
+  background: var(--c-surface);
+  border-bottom: 1px solid var(--c-border);
+  box-shadow: var(--shadow-1);
+  padding: var(--sp-4);
+  max-block-size: 45vh;
+  overflow-y: auto;
+}
+
+.settings-status {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-sm);
+  color: var(--c-text-muted);
+}
+
+.settings-list {
+  margin: 0 auto;
+  padding: 0;
+  max-inline-size: 46rem;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.setting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.setting-key {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
+.setting-line {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+.setting-input {
+  flex: 1;
+  min-inline-size: 0;
+  padding: var(--sp-2) var(--sp-3);
+  font: inherit;
+  color: var(--c-text);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+}
+
+.setting-apply { padding: var(--sp-2) var(--sp-4); }
+
+.setting-hint {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--c-text-muted);
+}
+
+.setting-flag {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--c-warn);
+}
+
+.setting-status {
+  margin: 0;
+  min-block-size: var(--fs-sm);
+  font-size: var(--fs-xs);
+  color: var(--c-text-muted);
+}
+
+.setting-status[data-kind="ok"]   { color: var(--c-ok); }
+.setting-status[data-kind="error"] { color: var(--c-danger); }
 
 /* ------------------------------------------------------------ transcript */
 

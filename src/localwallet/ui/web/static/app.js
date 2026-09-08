@@ -17,6 +17,11 @@ const sendBtn = document.getElementById("turn-send");
 const busyEl = document.getElementById("turn-busy");
 const scrollerEl = document.getElementById("scroller");
 const actionsEl = document.getElementById("actions");
+const scanChipEl = document.getElementById("scan-chip");
+const settingsToggleEl = document.getElementById("settings-toggle");
+const settingsPanelEl = document.getElementById("settings-panel");
+const settingsStatusEl = document.getElementById("settings-status");
+const settingsListEl = document.getElementById("settings-list");
 
 // One map for every user-facing string this file injects (designer pass —
 // button labels live in index.html markup, likewise for rewording).
@@ -24,6 +29,23 @@ const LABELS = {
   resyncGap: "Reconnected — some earlier events may be missing.",
   queuedTag: "queued",
   unreachable: "Could not reach the wallet server. Is it still running?",
+  // scan chip (TCK-WEB-005) — honest states straight from /state's scan_state
+  scanLoading: "Wallet loading — balances may be stale until the first scan completes.",
+  scanSkipped: "Scanning skipped.",
+  // settings panel (TCK-WEB-005)
+  settingsLoading: "Loading…",
+  settingsUnavailable: "Could not load settings — the wallet is busy or unreachable.",
+  settingsApply: "Apply",
+  settingsSaving: "Saving…",
+  settingsApplied: "Applied.",
+  settingsRejected: "Rejected.",
+  settingsRejectedPrefix: "Rejected:",
+  settingsBusy: "The wallet is busy — try again.",
+  settingsFailed: "Could not save — try again.",
+  settingsRestart: "Takes effect after restart.",
+  settingsEmptyIsDefault: "Empty = public default.",
+  settingsEnvOverride: "Set via environment variable — edit there or remove it.",
+  settingsRange: (min, max) => `Must be a whole number between ${min} and ${max}.`,
 };
 
 // Which buttons the typed /state snapshot shows, per flow position. The
@@ -176,6 +198,22 @@ function applyState(snap) {
   for (const btn of actionsEl.querySelectorAll("button")) {
     btn.hidden = !visible.has(btn.dataset.action);
   }
+  applyScanChip(snap);
+}
+
+// The scan chip reflects ONLY the typed snapshot's scan_state (additive under
+// state/1). Unknown/absent values (state/0 fallback, future states) clear it —
+// never a guess, never a hard-fail.
+function applyScanChip(snap) {
+  scanChipEl.hidden = true;
+  if (!snap || snap.schema !== "state/1") return;
+  if (snap.scan_state === "pending" || snap.scan_state === "running") {
+    scanChipEl.textContent = LABELS.scanLoading;
+    scanChipEl.hidden = false;
+  } else if (snap.scan_state === "skipped") {
+    scanChipEl.textContent = LABELS.scanSkipped;
+    scanChipEl.hidden = false;
+  }
 }
 
 async function refreshState() {
@@ -320,6 +358,149 @@ actionsEl.addEventListener("click", (event) => {
   const btn = event.target.closest("button[data-utterance]");
   if (!btn || state.stopped) return;
   submit("/action", "utterance", btn.dataset.utterance);
+});
+
+// ------------------------------------------------------------------ settings
+// TCK-WEB-005. GET /settings renders an allowlisted snapshot the SERVER owns;
+// unknown keys/fields render generically (a text input) and never crash the
+// panel. POSTs reuse the same auth header path as every other request. Values
+// live only in panel DOM state — never logged, never stored client-side.
+
+function settingRow(entry, index) {
+  const li = el("li", "setting");
+  const keyId = "setting-input-" + index;
+
+  const label = el("label", "setting-key", entry.key);
+  label.htmlFor = keyId;
+  li.appendChild(label);
+
+  const line = el("div", "setting-line");
+  const input = document.createElement("input");
+  input.className = "setting-input";
+  input.id = keyId;
+  input.value = typeof entry.value === "string" ? entry.value : "";
+  const bounded =
+    entry.type === "int" && Number.isInteger(entry.min) && Number.isInteger(entry.max);
+  input.type = bounded ? "number" : "text";
+  if (bounded) {
+    input.min = String(entry.min);
+    input.max = String(entry.max);
+  }
+  if (entry.type === "url") input.placeholder = LABELS.settingsEmptyIsDefault;
+  const btn = el("button", "btn btn-secondary setting-apply", LABELS.settingsApply);
+  btn.type = "button";
+  btn.dataset.settingKey = entry.key;
+  line.append(input, btn);
+  li.appendChild(line);
+
+  if (entry.type === "url") {
+    li.appendChild(el("p", "setting-hint", LABELS.settingsEmptyIsDefault));
+  }
+  if (entry.requires_restart === true) {
+    li.appendChild(el("p", "setting-flag", LABELS.settingsRestart));
+  }
+  if (entry.env_override === true) {
+    li.appendChild(el("p", "setting-flag", LABELS.settingsEnvOverride));
+  }
+  const status = el("p", "setting-status");
+  status.setAttribute("role", "status");
+  li.appendChild(status);
+  return li;
+}
+
+async function loadSettings() {
+  settingsStatusEl.textContent = LABELS.settingsLoading;
+  settingsListEl.replaceChildren();
+  try {
+    const response = await fetch("/settings", { headers: authHeaders(), cache: "no-store" });
+    const data = response.ok ? await response.json().catch(() => null) : null;
+    if (!data || !Array.isArray(data.settings)) {
+      settingsStatusEl.textContent = LABELS.settingsUnavailable;
+      return;
+    }
+    settingsStatusEl.textContent = "";
+    const rows = [];
+    for (const entry of data.settings) {
+      // an entry without a string key is unrenderable: skip it, keep the rest
+      if (entry && typeof entry.key === "string") rows.push(settingRow(entry, rows.length));
+    }
+    settingsListEl.replaceChildren(...rows);
+    if (rows.length === 0) settingsStatusEl.textContent = LABELS.settingsUnavailable;
+  } catch {
+    settingsStatusEl.textContent = LABELS.settingsUnavailable;
+  }
+}
+
+// Inline pre-POST check for bounded int keys; the engine re-validates
+// fail-closed anyway. Returns "" when the value may be sent.
+function localSettingProblem(input) {
+  if (input.type !== "number") return "";
+  const text = input.value.trim();
+  const min = Number(input.min);
+  const max = Number(input.max);
+  if (/^\d+$/.test(text)) {
+    const n = Number(text);
+    if (n >= min && n <= max) return "";
+  }
+  return LABELS.settingsRange(min, max);
+}
+
+// Delegated (same pattern as /action): apply clicks POST one {key, value} to
+// /settings and render the server's honest status. Rejection bodies are
+// value-free; we show the server's own reason line, inventing no detail.
+settingsListEl.addEventListener("click", async (event) => {
+  const btn = event.target.closest("button[data-setting-key]");
+  if (!btn || state.stopped) return;
+  const row = btn.closest(".setting");
+  const input = row.querySelector("input");
+  const status = row.querySelector(".setting-status");
+  const problem = localSettingProblem(input);
+  status.dataset.kind = "error";
+  if (problem) {
+    status.textContent = problem;
+    return;
+  }
+  btn.disabled = true;
+  status.textContent = LABELS.settingsSaving;
+  try {
+    const response = await fetch("/settings", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ key: btn.dataset.settingKey, value: input.value.trim() }),
+    });
+    const data = await response.json().catch(() => null);
+    if (response.status === 200 && data && data.status === "applied") {
+      status.dataset.kind = "ok";
+      status.textContent = LABELS.settingsApplied;
+      // confirm from the server's freshly re-read entry, never our own echo
+      const fresh = Array.isArray(data.settings) ? data.settings[0] : null;
+      if (fresh && Object.prototype.hasOwnProperty.call(fresh, "value")) {
+        input.value = typeof fresh.value === "string" ? fresh.value : "";
+      }
+    } else if (response.status === 400 && data && data.status === "rejected") {
+      status.dataset.kind = "error";
+      status.textContent =
+        typeof data.error === "string"
+          ? LABELS.settingsRejectedPrefix + " " + data.error
+          : LABELS.settingsRejected;
+    } else {
+      // 503 (engine busy) and anything unexpected: one honest retry line
+      status.dataset.kind = "error";
+      status.textContent = response.status === 503 ? LABELS.settingsBusy : LABELS.settingsFailed;
+    }
+  } catch {
+    status.dataset.kind = "error";
+    status.textContent = LABELS.unreachable;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+settingsToggleEl.addEventListener("click", () => {
+  const open = settingsPanelEl.hidden;
+  settingsPanelEl.hidden = !open;
+  settingsToggleEl.setAttribute("aria-expanded", String(open));
+  if (open) loadSettings(); // fetch on demand, fresh every time the panel opens
 });
 
 // -------------------------------------------------------------------- start

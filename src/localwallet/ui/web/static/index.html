@@ -11,8 +11,20 @@
 <body>
 <header class="bar">
   <h1 class="brand">Local Wallet</h1>
+  <!-- TCK-WEB-005: honest scan status, driven ONLY by the typed /state snapshot's
+       scan_state field (never inferred from dots). Hidden until a snapshot says so. -->
+  <p id="scan-chip" class="chip" role="status" aria-live="polite" hidden></p>
   <p id="conn-status" class="status" role="status" aria-live="polite" data-state="connecting">Connecting…</p>
+  <button id="settings-toggle" class="btn btn-ghost" type="button" aria-expanded="false" aria-controls="settings-panel">Settings</button>
 </header>
+
+<!-- TCK-WEB-005: settings panel — rows are built by app.js from GET /settings
+     (textContent-only). Fetched on demand each time the panel opens; values
+     live only in this DOM: never logged, never persisted client-side. -->
+<section id="settings-panel" class="settings" aria-label="Settings" hidden>
+  <p id="settings-status" class="settings-status" role="status" aria-live="polite"></p>
+  <ul id="settings-list" class="settings-list"></ul>
+</section>
 
 <main id="scroller" class="transcript-region">
   <ol id="transcript" class="transcript" aria-label="Wallet conversation">
