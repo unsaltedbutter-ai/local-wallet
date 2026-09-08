@@ -468,24 +468,52 @@ _STUB_NODE_STATUS_ENVELOPE: Final[str] = json.dumps(
 #: says so and offers no fabricated findings.
 NODE_STATUS_DETECTION_DISABLED: Final[str] = "disabled"
 
-#: User-facing narration lines for the send flow (TCK-P2-004). Every value
-#: they carry comes verbatim from the handler result dict — the UI computes
-#: nothing (integer division/formatting of result values only, the same
-#: display-truncation class as txid shortening).
-_CARD_HEADER_LINE: Final[str] = (
-    "Pending transaction — review it carefully, then say 'confirm' or 'cancel':"
+#: User-facing narration lines for the send flow (TCK-P2-004; card
+#: redesign TCK-UX-002 per docs/ux-tx-card-feedback.md — every string here
+#: is the designer-approved copy quoted VERBATIM from that doc's appendix
+#: block; every VALUE they carry comes verbatim from the handler result
+#: dict — the UI computes nothing (integer formatting of result values
+#: only, the same display-truncation class as txid shortening)).
+_CARD_ASK_LINE: Final[str] = (
+    'Pending — say "sign" to review it on your device, or "cancel" to discard.'
+)
+#: Variant-A tail (card.offer, doc §2.0/§2.2): the proactive speed offer.
+#: Fires ONLY when the create_tx envelope carried no fee_target
+#: (display-only key ``fee_target_defaulted``). Hard copy rule (§2.2.3):
+#: the offer is a wh-question — never a polar (yes/no) one, because
+#: "yes"→CONFIRM and "no"→DENY would answer a yes/no offer with the
+#: precisely wrong meaning. The keep-word is "sign" (GATE-MERGE shipped).
+_CARD_OFFER_TAIL: Final[str] = (
+    'How important is this one? Say "faster" to confirm sooner (a slightly '
+    'higher fee) or "slower" to save money (it may take longer) — or say '
+    '"sign" to keep this rate · '
+)
+#: Variant-B tail (card.details_tail): a speed preference is already known
+#: (the request carried one, or the offer was answered) — never re-asked;
+#: the offer is one-shot by construction.
+_CARD_DETAILS_TAIL: Final[str] = "full breakdown: /details"
+#: FLOW-REQUOTE lead line (card.requote_lead, doc §2.3); same-rung
+#: re-quotes ("medium" answered to medium) carry no direction word.
+_CARD_REQUOTE_LEAD: Final[str] = (
+    "Re-quoted at the {direction} rate — review the new fee below:"
+)
+_CARD_REQUOTE_LEAD_SAME_RUNG: Final[str] = "Re-quoted — review the new fee below:"
+_CARD_RATE_CEILING: Final[str] = (
+    "That's already the fastest recommended rate (next-block target). "
+    'Say "sign" to proceed or "cancel" to discard.'
+)
+_CARD_RATE_FLOOR: Final[str] = (
+    "That's already the cheapest recommended rate — we never quote below "
+    'the network minimum. Say "sign" to proceed or "cancel" to discard.'
 )
 _CANCELLED_LINE: Final[str] = "Transaction cancelled."
-_CONFIRMED_LINE: Final[str] = (
-    "Approved. Next step: sign — reply 'sign' to hand the transaction to your signer."
-)
 _GUIDANCE_STILL_PENDING: Final[str] = (
-    "The transaction is still pending — say 'confirm' to approve it or "
-    "'cancel' to discard it."
+    'Still pending — say "sign" to send it to your device, or "cancel" '
+    "to discard it."
 )
 _GUIDANCE_AMBIGUOUS: Final[str] = (
-    "That was ambiguous — say 'confirm' to approve the pending transaction "
-    "or 'cancel' to discard it."
+    'That was ambiguous — say "sign" to proceed with the pending '
+    "transaction, or \"cancel\" to discard it."
 )
 
 
@@ -501,9 +529,18 @@ class SendSession:
     dual-key wiring (ADR-0013): the gate decision always describes the
     SAME turn as the ``confirm_tx`` envelope, and an LLM "yes" can never
     substitute for it.
+
+    ``card_render`` is the TCK-UX-002 ``/details`` cache: the full
+    nine-line card render (the classic, value-verbatim format) belonging
+    to the LAST rendered pending card. The on-screen default is the brief
+    merged view; ``/details`` reprints this cached full render verbatim
+    while a transaction pends (ADR-0020 transcript-command channel). The
+    lines are the card's own display material (address/amounts — printed
+    to the terminal anyway, never logged); the model cannot see them.
     """
 
     gate_decision: GateDecision = GateDecision.NOT_A_DECISION
+    card_render: list[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1022,6 +1059,40 @@ def _eta_for(
     }
 
 
+#: Speed-rung positions on the estimator's three-target ladder (the ORDER
+#: only — rates themselves always come from the estimator, never here).
+_FEE_LADDER_ORDER: Final[dict[str, int]] = {"fast": 0, "medium": 1, "slow": 2}
+
+
+def _requote_notice(current_target: str | None, target: FeeTarget) -> str | None:
+    """Ceiling/floor guard for a re-quote request (§2.3 outcome map).
+
+    Asking faster than the fastest rung (fast→fast) or slower than the
+    cheapest rung already AT the network minimum (slow→slow) is refused —
+    the staged record untouched. A same-rung ``medium`` is the legal
+    no-op-ish rebuild (identical numbers, fresh ``tx_ref``/TTL, offer
+    retired), and every other rung move re-quotes. ``None`` ⇒ no refusal.
+    """
+    if current_target is None:
+        return None
+    if current_target == FeeTarget.FAST.value and target is FeeTarget.FAST:
+        return "ceiling"
+    if current_target == FeeTarget.SLOW.value and target is FeeTarget.SLOW:
+        return "floor"
+    return None
+
+
+def _requote_direction(current_target: str | None, target: FeeTarget) -> str | None:
+    """The re-quote lead line's direction word (display-only): ``"faster"``
+    / ``"slower"`` when the rung moved, ``None`` for a same-rung rebuild.
+    """
+    if current_target is None or current_target == target.value:
+        return None
+    if _FEE_LADDER_ORDER.get(target.value, 1) < _FEE_LADDER_ORDER.get(current_target, 1):
+        return "faster"
+    return "slower"
+
+
 def _pending_tx_facts(
     flow: TxFlow,
     *,
@@ -1121,15 +1192,24 @@ def _tx_pending_result(
     """The ``tx_pending`` refusal result, carrying the pending card fields.
 
     Surfaced when ``create_tx`` arrives while a transaction is already
-    pending (ADR-0013: at most one pending transaction; a stale one is
-    recovered explicitly, never reaped). The pending card is re-shown
-    from the flow's own record so the user can act on it; rate fields
-    are unknown on re-show (``usd_cents=None``) and ``expires_in_s`` is
-    the REMAINING ttl (flow's clock, floored at 0) — a re-shown card
-    never claims more lifetime than the confirm gate will grant (a
-    pending expired by the clock is refused at confirm anyway).
+    pending for a DIFFERENT destination (a same-destination re-quote
+    replaces instead — §2.1). A stale pending is recovered explicitly
+    (ADR-0013), never reaped. The pending card is re-shown from the
+    flow's own record so the user can act on it; rate fields are unknown
+    on re-show (``usd_cents=None``) and ``expires_in_s`` is the REMAINING
+    ttl (flow's clock, floored at 0) — a re-shown card never claims more
+    lifetime than the confirm gate will grant (a pending expired by the
+    clock is refused at confirm anyway). The card view is variant B
+    (``fee_target_defaulted=False``): the flow record cannot know whether
+    the staged target came from an omitted param or a stated preference,
+    and the offer is deliberately a one-shot on the fresh card (§2.0) —
+    unrecognized chatter never re-pitches it.
     """
-    result: dict[str, object] = {"error": "tx_pending"}
+    result: dict[str, object] = {
+        "error": "tx_pending",
+        "fee_target_defaulted": False,
+        "fee_requote": False,
+    }
     pending = flow.pending
     if pending is not None:
         eta = _eta_for(
@@ -1175,10 +1255,20 @@ def _make_create_tx_handler(
 
     Pipeline (every step fail-closed; nothing stages unless ALL succeed):
 
-    1. Pending guard: with a transaction already pending the handler
-       refuses with ``{"error": "tx_pending", ...}`` plus the pending
-       card fields (re-shown from the flow) — before any network or
-       store work.
+    1. Pending guard: with a transaction already pending, an *identical*
+       recipient + ``amount_sats`` envelope is a dispatcher-owned
+       **re-quote** (FLOW-REQUOTE, TCK-UX-002 / ADR-0013 amendment): the
+       pipeline runs again at the requested ``fee_target`` and
+       :meth:`TxFlow.create` REPLACES the staged record on success — new
+       ``tx_ref``, fresh TTL, still exactly one pending, the old reference
+       inert. Anything that would change the money destination (different
+       recipient, or a USD amount that cannot be compared to the staged
+       sats) still refuses with ``{"error": "tx_pending", ...}`` plus the
+       pending card fields — before any network or store work. A re-quote
+       whose rung is already the pending's rung refuses with
+       ``rate_notice`` ceiling/floor on top of the pending fields (the
+       ladder has rungs, not arbitrary rates — §2.3); a same-rung
+       ``medium`` is a legal no-op-ish rebuild (§2.3, fresh ref/TTL).
     2. Amount resolution: ``amount_sats`` is taken direct;
        ``amount_usd`` requires the price oracle (:meth:`PriceOracle.fresh`).
        A price failure on the USD path refuses the whole request with
@@ -1191,8 +1281,11 @@ def _make_create_tx_handler(
     3. Fee rate: ``fee_target`` maps onto :class:`FeeTarget`; when the
        model omits it the handler applies **MEDIUM** by default
        (documented decision, TCK-P2-004: a send with no stated urgency
-       gets the half-hour target, never the cheapest/slowest). A failed
-       fee lookup surfaces as ``chain_unavailable``.
+       gets the half-hour target, never the cheapest/slowest). The
+       omitted-vs-explicit distinction is display-only state — the result
+       carries ``fee_target_defaulted`` so the card can offer the speed
+       choice exactly once (§2.0); the flow semantics are unchanged. A
+       failed fee lookup surfaces as ``chain_unavailable``.
     4. UTXO snapshot: read from the store; when the wallet has never
        scanned (no sync cursor) the scan runs once lazily first (same
        path as ``get_balance``), then the snapshot is re-read.
@@ -1228,11 +1321,38 @@ def _make_create_tx_handler(
         if not isinstance(params, CreateTxParams):
             return {"error": "internal", "detail": "create_tx params shape mismatch"}
 
-        # 1. Pending guard (before any network/store work).
-        if flow.state is TxFlowStatus.CREATED:
+        # 1. Pending guard (before any network/store work). A create_tx
+        #    quoting the SAME recipient and sats amount as the staged
+        #    record is a dispatcher-owned re-quote (FLOW-REQUOTE, §2.1):
+        #    the destination money does not move, only the rung. Anything
+        #    else while a tx pends still refuses with the re-shown card
+        #    (at-most-one-pending, no interleaved destructive flows).
+        staged = flow.pending if flow.state is TxFlowStatus.CREATED else None
+        requote = (
+            staged is not None
+            and params.recipient == staged.recipient
+            and params.amount_sats is not None
+            and params.amount_sats == staged.amount_sats
+        )
+        if staged is not None and not requote:
             return _tx_pending_result(
                 flow, seconds_since_last_block_fn=seconds_since_last_block_fn
             )
+
+        # 3 (resolved early — pure, no I/O): fee target for the
+        # ceiling/floor guard below and the ladder estimate below.
+        target = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.MEDIUM
+        if requote and staged is not None:
+            notice = _requote_notice(staged.fee_target, target)
+            if notice is not None:
+                # Refused BEFORE any network/store work; the staged
+                # record is untouched (same ref, same remaining TTL).
+                return {
+                    **_tx_pending_result(
+                        flow, seconds_since_last_block_fn=seconds_since_last_block_fn
+                    ),
+                    "rate_notice": notice,
+                }
 
         # 2. Amount resolution (sats direct; USD via the price oracle).
         rate = None
@@ -1255,8 +1375,7 @@ def _make_create_tx_handler(
         rate_age_s = int(rate.age_s()) if rate is not None else None
         rate_fetched_at = rate.fetched_at if rate is not None else None
 
-        # 3. Fee rate (MEDIUM default when the model omits fee_target).
-        target = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.MEDIUM
+        # 3 (cont.). Fee rate ladder (MEDIUM default when omitted).
         try:
             fee_rate = fee_estimator.estimate(target).sat_per_vb
         except ChainError as exc:
@@ -1402,7 +1521,7 @@ def _make_create_tx_handler(
 
         eta = _eta_for(target.value, seconds_since_last_block_fn=seconds_since_last_block_fn)
 
-        return {
+        result: dict[str, object] = {
             "tx_ref": pending.tx_ref,
             "amount_sats": pending.amount_sats,
             "recipient": pending.recipient,
@@ -1416,9 +1535,21 @@ def _make_create_tx_handler(
             "rate_age_s": rate_age_s,
             "rate_fetched_at": rate_fetched_at,
             "fee_target": pending.fee_target,
+            # Display-only card-view selectors (TCK-UX-002; NOT flow
+            # state): variant A of the card tail when the envelope carried
+            # no fee_target (the one-shot speed offer), and the re-quote
+            # lead-line marker/direction when this result replaced a
+            # pending record (§2.0/§2.3).
+            "fee_target_defaulted": params.fee_target is None,
+            "fee_requote": requote,
             "expires_in_s": PENDING_TTL_S,
             **({} if eta is None else eta),
         }
+        if requote and staged is not None:
+            direction = _requote_direction(staged.fee_target, target)
+            if direction is not None:
+                result["requote_direction"] = direction
+        return result
 
     return handler
 
@@ -2739,9 +2870,11 @@ def _repl(
     and to the ETA fact (TCK-P5-002).
 
     Transcript commands (OQ14, ADR-0020): lines beginning with ``/`` are
-    deterministic UI commands, never model intents — ``/export <path>``
-    writes a redacted transcript, ``/scrub`` clears the in-memory
-    transcript/summary, ``/help`` lists them. There is no protocol change.
+    deterministic UI commands, never model intents — ``/details`` reprints
+    the last full confirmation-card render (TCK-UX-002), ``/export
+    <path>`` writes a redacted transcript, ``/scrub`` clears the
+    in-memory transcript/summary, ``/help`` lists them. There is no
+    protocol change.
     """
     while True:
         watch_count = _drain_watch(watcher, output_fn, client=client)
@@ -2757,7 +2890,9 @@ def _repl(
         if line.lower() in ("exit", "quit"):
             return
         if line.startswith("/"):
-            _handle_transcript_command(line, loop, output_fn)
+            _handle_transcript_command(
+                line, loop, output_fn, flow=flow, session=session
+            )
             continue
         _run_turn(
             loop, flow, session, line, output_fn, client=client, table=table
@@ -2766,23 +2901,47 @@ def _repl(
 
 #: Fallback wording for an unparseable ``/`` command (value-free).
 _TRANSCRIPT_HELP: Final[str] = (
-    "Commands: /export <path> — write a redacted session transcript; "
+    "Commands: /details — reprint the pending transaction's full card; "
+    "/export <path> — write a redacted session transcript; "
     "/scrub — clear the in-memory transcript; /help — show this."
 )
+#: ``/details`` with no cached card (nothing has pended this session —
+#: value-free).
+_DETAILS_NONE: Final[str] = "No pending transaction to show a full breakdown for."
 
 
 def _handle_transcript_command(
-    command: str, loop: AgentLoop, output_fn: Callable[[str], None]
+    command: str,
+    loop: AgentLoop,
+    output_fn: Callable[[str], None],
+    *,
+    flow: TxFlow | None = None,
+    session: SendSession | None = None,
 ) -> None:
-    """Handle an OQ14 transcript CLI command (``/export``, ``/scrub``, ``/help``).
+    """Handle an OQ14 transcript CLI command (``/details``, ``/export``,
+    ``/scrub``, ``/help``).
 
     Deterministic UI features, NOT model intents (ADR-0020): no protocol,
-    grammar, or prompt change. Output is short and plain.
+    grammar, or prompt change. Output is short and plain. ``/details``
+    (TCK-UX-002) reprints the cached FULL nine-line confirmation card
+    verbatim, reachable ONLY while a transaction is pending (CREATED) —
+    the flow's live-pending gate is the single check, so a spent/abandoned
+    card can never be re-shown as if live. It is a deterministic UI
+    command, never a spoken decision: the word "details" is deliberately
+    NOT in the gate's whitelists, so it can never confirm anything.
     """
     parts = command.split(maxsplit=1)
     cmd = parts[0].lower()
     if cmd == "/help":
         output_fn(_TRANSCRIPT_HELP)
+        return
+    if cmd == "/details":
+        pending = flow is not None and flow.state is TxFlowStatus.CREATED
+        if not pending or session is None or not session.card_render:
+            output_fn(_DETAILS_NONE)
+            return
+        for line in session.card_render:
+            output_fn(line)
         return
     if cmd == "/scrub":
         loop.scrub()
@@ -2839,6 +2998,13 @@ def _run_turn(
       envelope dispatches to; the model can never reach here without the
       user typing "retry", and an LLM "retry" is never consulted). Every
       other state and every other utterance takes the unchanged pipeline.
+    - GATE-MERGE (TCK-UX-002, ADR-0013 amendment): when the turn's
+      ``confirm_tx`` succeeds, the device handoff (``sign_tx`` handler,
+      code-built envelope from the dispatcher-owned confirmed ref) runs in
+      the SAME turn — the card asks once ("sign"), the state machine keeps
+      CONFIRMED/SIGNED internally, and broadcast stays a separately gated
+      turn. An LLM "yes" never counts: the chain only follows a dual-key
+      confirm that already passed.
     - FACTS (TCK-P2-004 SR fix, extended to the full lifecycle in
       TCK-P3-005): the flow's current state is injected as the turn's
       FACTS block (:func:`_flow_facts`) — the pending card while
@@ -2875,6 +3041,7 @@ def _run_turn(
                 turns_used=0,
             ),
             output_fn,
+            session=session,
         )
         return
     session.gate_decision = (
@@ -2895,7 +3062,42 @@ def _run_turn(
     facts = _flow_facts(
         flow, seconds_since_last_block_fn=seconds_since_last_block_fn
     )
-    _print_turn(loop.run(line, facts), output_fn)
+    turn = loop.run(line, facts)
+    _print_turn(turn, output_fn, session=session)
+    # GATE-MERGE (TCK-UX-002, ADR-0013 amendment): a successful confirm
+    # chains straight into the device handoff IN THE SAME TURN — the
+    # card's ask word "sign" completes "review + hand to device" in one
+    # user step (the CONFIRMED/SIGNED states stay distinct; only the
+    # prompts merged). The envelope is CODE-built from the dispatcher-
+    # owned confirmed tx_ref (never model- or user-supplied) and dispatched
+    # straight to the sign_tx handler; the handler's own flow gate and the
+    # re-validation hard stop are unchanged, and nothing broadcasts here —
+    # broadcast keeps its own separately-gated turn.
+    envelope = turn.envelope
+    confirmed = flow.confirmed
+    if (
+        envelope is not None
+        and envelope.intent is IntentName.CONFIRM_TX
+        and flow.state is TxFlowStatus.CONFIRMED
+        and confirmed is not None
+    ):
+        sign_envelope = Envelope(
+            v=0,
+            intent=IntentName.SIGN_TX,
+            params=SignTxParams(tx_ref=confirmed.tx_ref),
+        )
+        sign_result = table[IntentName.SIGN_TX](sign_envelope)
+        _print_turn(
+            AgentTurnResult(
+                status=AgentTurnStatus.OK,
+                envelope=sign_envelope,
+                result=sign_result,
+                user_message=None,
+                turns_used=0,
+            ),
+            output_fn,
+            session=session,
+        )
     if cancelled:
         output_fn(sanitize_tool_output(_CANCELLED_LINE))
         return
@@ -2911,7 +3113,12 @@ def _run_turn(
             output_fn(sanitize_tool_output(guidance))
 
 
-def _print_turn(turn: AgentTurnResult, output_fn: Callable[[str], None]) -> None:
+def _print_turn(
+    turn: AgentTurnResult,
+    output_fn: Callable[[str], None],
+    *,
+    session: SendSession | None = None,
+) -> None:
     """Print one agent turn according to its status and intent.
 
     Every printed value comes verbatim from the handler result dict —
@@ -2920,6 +3127,11 @@ def _print_turn(turn: AgentTurnResult, output_fn: Callable[[str], None]) -> None
     :func:`~localwallet.agent.context.sanitize_tool_output` immediately
     before printing (SR-006: the envelope grammar permits ``\\uXXXX`` so
     ESC/bidi control characters must never reach the terminal).
+
+    ``session`` (TCK-UX-002) carries the ``/details`` full-card render
+    cache: a confirmation card printed through this turn is cached (full
+    classic render) for the ``/details`` reprint while the flow stays in
+    ``CREATED``. ``None`` (direct calls/tests) renders without caching.
     """
     if turn.status is AgentTurnStatus.CLARIFIED:
         output_fn(sanitize_tool_output(turn.user_message or _GENERIC_FAILURE))
@@ -2946,7 +3158,7 @@ def _print_turn(turn: AgentTurnResult, output_fn: Callable[[str], None]) -> None
     elif envelope.intent is IntentName.NEW_ADDRESS:
         _print_new_address(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.CREATE_TX:
-        _print_create_tx(turn.result or {}, output_fn)
+        _print_create_tx(turn.result or {}, output_fn, session=session)
     elif envelope.intent is IntentName.CONFIRM_TX:
         _print_confirm_tx(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.SIGN_TX:
@@ -3067,15 +3279,32 @@ def _print_new_address(result: Mapping[str, object], output_fn: Callable[[str], 
     )
 
 
-def _print_create_tx(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
-    """Narrate a ``create_tx`` outcome (TCK-P2-004 confirmation-card UX).
+def _print_create_tx(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    *,
+    session: SendSession | None = None,
+) -> None:
+    """Narrate a ``create_tx`` outcome (TCK-P2-004 card UX; TCK-UX-002
+    brief redesign per docs/ux-tx-card-feedback.md §1/§2).
 
-    Success → the confirmation card. ``tx_pending`` → the refusal line
-    plus the pending card re-rendered from the result's own fields.
-    ``insufficient_funds`` → a friendly line built from the structured
-    ``needed_sats``/``available_sats`` keys (user-facing amounts, per
-    ADR-0012 — never a log-bound detail string). Everything else goes
-    through :func:`_error_line` (value-free details).
+    Success → the BRIEF card (ask line + To/Pay/Fee/From + one conditional
+    tail), with the full nine-line render cached on ``session`` for
+    ``/details``. A re-quote (``fee_requote``) leads with
+    ``card.requote_lead`` (§2.3) and renders variant B — the re-quote
+    envelope carried an explicit ``fee_target``, so the offer is retired.
+    ``tx_pending`` (a create at a DIFFERENT destination while one pends) →
+    the still-pending guide line + the same brief card re-rendered from
+    the result's own fields (variant B: the flow record cannot know the
+    target was defaulted — the offer is a fresh-card one-shot, §2.0); a
+    ``rate_notice`` on top (ceiling/floor, §2.3) prints just that line —
+    the staged card stays valid on screen. ``insufficient_funds`` → the
+    friendly line built from the structured ``needed_sats``/
+    ``available_sats`` keys (user-facing amounts, per ADR-0012 — never a
+    log-bound detail string); a re-quote that pushes the wallet short at
+    the higher rung lands here and the ORIGINAL pending is intact
+    (commit-only-on-success, §2.1). Everything else goes through
+    :func:`_error_line` (value-free details).
     """
     error = result.get("error")
     if error == "insufficient_funds":
@@ -3087,18 +3316,107 @@ def _print_create_tx(result: Mapping[str, object], output_fn: Callable[[str], No
         )
         return
     if error == "tx_pending":
-        output_fn(
-            sanitize_tool_output(
-                "A transaction is already pending — confirm or cancel it first."
-            )
-        )
-        _print_confirmation_card(result, output_fn)
+        notice = result.get("rate_notice")
+        if notice == "ceiling":
+            output_fn(sanitize_tool_output(_CARD_RATE_CEILING))
+            return
+        if notice == "floor":
+            output_fn(sanitize_tool_output(_CARD_RATE_FLOOR))
+            return
+        output_fn(sanitize_tool_output(_GUIDANCE_STILL_PENDING))
+        _print_brief_card(result, output_fn, session)
         return
     if error is not None:
         output_fn(sanitize_tool_output(_error_line(result, "Could not create the transaction")))
         return
-    output_fn(sanitize_tool_output(_CARD_HEADER_LINE))
-    _print_confirmation_card(result, output_fn)
+    if result.get("fee_requote"):
+        direction = result.get("requote_direction")
+        lead = (
+            _CARD_REQUOTE_LEAD.replace("{direction}", str(direction))
+            if isinstance(direction, str) and direction
+            else _CARD_REQUOTE_LEAD_SAME_RUNG
+        )
+        output_fn(sanitize_tool_output(lead))
+    _print_brief_card(result, output_fn, session)
+
+
+def _card_sats(result: Mapping[str, object], key: str) -> str | None:
+    """Thousands-separated sats value, or ``None`` when absent/not-an-int
+    (the fail-closed rule: never a fabricated ``0`` — TCK-SEC-004 change 4
+    class; the merged brief lines DROP an optional segment whose value is
+    unavailable; the raw field survives in the /details full render)."""
+    value = result.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return f"{value:,}"
+
+
+def _print_brief_card(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    session: SendSession | None = None,
+) -> None:
+    """Render the brief default card (doc §1): ask line, then To / Pay /
+    Fee / From, then ONE conditional tail — variant A (``card.offer``,
+    when the envelope omitted ``fee_target``) or variant B
+    (``card.details_tail``), never both. Four data lines + ask + tail, all
+    drawn from the SAME handler result dict — nothing recomputed, nothing
+    model-generated; the Fee line absorbs size + the verbatim ``chain/
+    eta.py`` hedge, and Expires/Ref demote to the full ``/details`` view
+    (the sign/broadcast-time re-prints carry the ref onward — §1 Ref row).
+    The full classic nine-line render of the same result is cached on
+    ``session`` for ``/details``.
+    """
+    if session is not None:
+        full: list[str] = []
+        _print_confirmation_card(result, full.append)
+        session.card_render = full
+    output_fn(sanitize_tool_output(_CARD_ASK_LINE))
+    output_fn(sanitize_tool_output(f"To: {result.get('recipient', '')}"))
+    pay = "Pay: unavailable"
+    amount = _card_sats(result, "amount_sats")
+    if amount is not None:
+        pay = f"Pay: {amount} sats"
+        usd_cents = result.get("usd_cents")
+        if isinstance(usd_cents, int):
+            pay += f" (${usd_cents // 100}.{usd_cents % 100:02d}"
+            rate_age = result.get("rate_age_s")
+            if rate_age is not None:
+                pay += f" · rate age {rate_age}s"
+            if result.get("rate_stale"):
+                pay += " · stale"
+            pay += ")"
+    output_fn(sanitize_tool_output(pay))
+    fee_sats = _card_sats(result, "fee_sats")
+    fee = "Fee: unavailable" if fee_sats is None else f"Fee: {fee_sats} sats"
+    if fee_sats is not None:
+        rate = _card_sats(result, "fee_rate_sat_vb")
+        if rate is not None:
+            fee += f" · {rate} sat/vB"
+        vsize = _card_sats(result, "vsize")
+        if vsize is not None:
+            fee += f" × {vsize} vB"
+        target_word = result.get("fee_target")
+        if isinstance(target_word, str) and target_word:
+            fee += f" · {target_word}"
+        eta_wording = result.get("eta_wording")
+        if isinstance(eta_wording, str) and eta_wording:
+            # Verbatim chain/eta.py hedge appended — never re-punctuated.
+            fee += f" — ETA {eta_wording}"
+    output_fn(sanitize_tool_output(fee))
+    sources = result.get("inputs_count")
+    if isinstance(sources, int) and not isinstance(sources, bool):
+        from_line = f"From: your wallet ({sources:,} {'source' if sources == 1 else 'sources'})"
+    else:
+        from_line = "From: your wallet (sources unavailable)"
+    change = _card_sats(result, "change_sats")
+    if change is not None:
+        from_line += f" · {change} sats come back as change"
+    output_fn(sanitize_tool_output(from_line))
+    if result.get("fee_target_defaulted"):
+        output_fn(sanitize_tool_output(_CARD_OFFER_TAIL + _CARD_DETAILS_TAIL))
+    else:
+        output_fn(sanitize_tool_output(_CARD_DETAILS_TAIL))
 
 
 def _print_confirmation_card(
@@ -3172,9 +3490,13 @@ def _print_confirm_tx(result: Mapping[str, object], output_fn: Callable[[str], N
 
     A refusal is the UX: the flow's own value-free message is surfaced
     verbatim ("pending transaction expired", "confirmation gate not
-    satisfied…", "tx_ref does not match…"). A confirmed flow prints the
-    Phase 3 handoff note. The PSBT payload from the result is never
-    printed.
+    satisfied…", "tx_ref does not match…"). SUCCESS prints nothing: the
+    GATE-MERGE (TCK-UX-002, ADR-0013 amendment) chains the device handoff
+    in the same turn, and its §10 narration (export line / guidance /
+    signed-verified line — the sign-time re-print of the ref-derived
+    filename, on which the card's Ref demotion leans) is what the user
+    reads; the old "Approved. Next step: sign" seam line is retired
+    (doc §3). The PSBT payload from the result is never printed.
     """
     error = result.get("error")
     if error == "confirm_refused":
@@ -3186,7 +3508,7 @@ def _print_confirm_tx(result: Mapping[str, object], output_fn: Callable[[str], N
         output_fn(sanitize_tool_output(_error_line(result, "Could not confirm the transaction")))
         return
     if result.get("status") == "confirmed":
-        output_fn(sanitize_tool_output(_CONFIRMED_LINE))
+        # The chained sign handoff narrates this turn (_run_turn).
         return
     output_fn(sanitize_tool_output(_GENERIC_FAILURE))  # pragma: no cover — handler-shaped
 

@@ -1,0 +1,16 @@
+{
+  "id": "golden-031",
+  "prompt": "sign",
+  "facts": {
+    "pending_tx_ref": "7eabb444f7c045d49779199af2cf325f",
+    "pending_tx_amount_sats": 60000,
+    "pending_tx_recipient": "bc1qy3dvdjcfsm5mfjs0y6c9pk9s6uqmr3g6r2209e",
+    "pending_tx_expires_in_s": 540
+  },
+  "expectation": {
+    "intent": "confirm_tx",
+    "params": {
+      "tx_ref": "7eabb444f7c045d49779199af2cf325f"
+    }
+  }
+}

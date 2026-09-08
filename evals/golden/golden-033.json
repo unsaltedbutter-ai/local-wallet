@@ -1,0 +1,12 @@
+{
+  "id": "golden-033",
+  "prompt": "send 60000 sats to bc1qy3dvdjcfsm5mfjs0y6c9pk9s6uqmr3g6r2209e, no hurry, save money",
+  "expectation": {
+    "intent": "create_tx",
+    "params": {
+      "recipient": "bc1qy3dvdjcfsm5mfjs0y6c9pk9s6uqmr3g6r2209e",
+      "amount_sats": 60000,
+      "fee_target": "slow"
+    }
+  }
+}

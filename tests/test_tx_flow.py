@@ -5,9 +5,11 @@ BROADCAST extension TCK-P3-004).
 The suite pins:
 
 1. **Flow transitions** — the full table from the flow module docstring:
-   happy path IDLE→CREATED→CONFIRMED, create-while-pending refusal, wrong
-   ``tx_ref`` refusal, cancel/reset/expiry transitions, and re-entry from
-   every terminal state; plus the Phase 3 extension CONFIRMED→SIGNED→
+   happy path IDLE→CREATED→CONFIRMED, the CREATED→CREATED replacement
+   re-quote (TCK-UX-002: new ``tx_ref``, old ref inert, TTL reset) and the
+   CONFIRMED/SIGNED/BROADCAST create refusal, wrong ``tx_ref`` refusal,
+   cancel/reset/expiry transitions, and re-entry from every terminal
+   state; plus the Phase 3 extension CONFIRMED→SIGNED→
    BROADCAST (matching-``tx_ref`` only, no skip paths — broadcast from
    CONFIRMED is refused, re-sign after SIGNED is refused, re-broadcast
    after BROADCAST is refused) and the exhaustive state×transition table.
@@ -138,13 +140,54 @@ def test_pending_tx_is_frozen():
         pending.amount_sats = 1  # type: ignore[misc]
 
 
-def test_create_while_pending_is_refused_value_free():
+def test_create_from_created_replaces_pending_requote():
+    """FLOW-REQUOTE (TCK-UX-002, ADR-0013 amendment): ``create`` from
+    CREATED is a dispatcher-owned REPLACEMENT, not a refusal — still
+    exactly one pending, but with a NEW ``tx_ref`` and a fresh
+    ``created_at`` (TTL reset). The old reference goes inert."""
+    flow, ticks = make_flow()
+    stage(flow)
+    ticks[-1] = T0 + 42
+    second = stage(flow, fee_target="fast", fee_rate_sat_vb=3, fee_sats=423)
+    assert flow.state is TxFlowStatus.CREATED
+    assert flow.pending is second
+    assert second.tx_ref == "ref-2", "replacement stamps a fresh identity"
+    assert second.created_at == T0 + 42, "replacement re-reads the clock"
+
+
+def test_replaced_pending_old_ref_confirm_fails_closed():
+    """The old ``tx_ref`` of a replaced pending is inert: a confirm quoting
+    it fails the verbatim-match check (fail closed) and the NEW pending
+    survives untouched — the invariant the replacement policy preserves."""
     flow, _ = make_flow()
     first = stage(flow)
-    with pytest.raises(FlowError, match="already pending"):
-        stage(flow)
+    replacement = stage(flow)
+    assert first.tx_ref != replacement.tx_ref
+    with pytest.raises(FlowError, match="does not match"):
+        flow.confirm(first.tx_ref, gate_decision=GateDecision.CONFIRM, at=T0 + 1)
     assert flow.state is TxFlowStatus.CREATED
-    assert flow.pending is first, "the original pending is untouched"
+    assert flow.pending is replacement
+
+
+def test_replaced_pending_can_be_confirmed_by_new_ref():
+    flow, _ = make_flow()
+    stage(flow)
+    replacement = stage(flow)
+    confirmed = flow.confirm(replacement.tx_ref, gate_decision=GateDecision.CONFIRM, at=T0 + 1)
+    assert confirmed is replacement
+    assert flow.state is TxFlowStatus.CONFIRMED
+
+
+def test_create_from_created_cannot_skip_the_gate():
+    """A replacement resets to CREATED semantics: the freshly staged
+    pending still requires the dual-key confirm (the replace is NOT a
+    confirm path), and non-CREATED live records (CONFIRMED/SIGNED/
+    BROADCAST) still refuse create outright."""
+    flow, _ = make_flow()
+    stage(flow)
+    with pytest.raises(FlowError, match="gate"):
+        flow.confirm("ref-2", gate_decision=GateDecision.NOT_A_DECISION, at=T0 + 1)
+    assert flow.state is TxFlowStatus.CREATED
 
 
 def test_confirm_wrong_tx_ref_refused_state_stays_created():
@@ -559,7 +602,13 @@ def test_flow_state_table_exhaustive():
         assert flow.state is state
         return flow
 
-    allowed_create = {TxFlowStatus.IDLE, TxFlowStatus.CANCELLED, TxFlowStatus.EXPIRED}
+    allowed_create = {
+        TxFlowStatus.IDLE,
+        TxFlowStatus.CANCELLED,
+        TxFlowStatus.EXPIRED,
+        # FLOW-REQUOTE (TCK-UX-002): replacement from CREATED (new tx_ref).
+        TxFlowStatus.CREATED,
+    }
     for state in TxFlowStatus:
         # create
         flow = fresh(state)
@@ -653,13 +702,90 @@ def test_create_from_every_allowed_state():
 
 CONFIRM_WHITELIST = [
     "yes", "y", "yes please", "confirm", "confirmed", "confirm it",
-    "send it", "send", "approve", "approved", "do it",
+    "send it", "send", "sign", "approve", "approved", "do it",
 ]
 DENY_WHITELIST = [
     "no", "n", "no thanks", "cancel", "cancel it", "abort", "stop",
     "don't", "dont", "deny", "reject",
 ]
 FILLER = ["please", "the", "it", "tx", "transaction"]
+
+
+# GATE-MERGE (TCK-UX-002): "sign" joins the CONFIRM set as a single token
+# (the card's ask word). It classifies CONFIRM standalone and combined
+# with fillers, exactly like "send"/"approve".
+@pytest.mark.parametrize(
+    "utterance",
+    ["sign", "Sign!", "  sign ", "sign please", "sign the tx", "please sign it"],
+)
+def test_sign_is_a_confirm_decision(utterance: str):
+    assert ConfirmGate.classify(utterance) is GateDecision.CONFIRM
+
+
+def test_sign_mixed_with_deny_is_ambiguous():
+    """Adding "sign" preserves the fail-closed asymmetry: a confirm+deny
+    mix is AMBIGUOUS (never silently confirmed)."""
+    assert ConfirmGate.classify("sign cancel") is GateDecision.AMBIGUOUS
+    assert ConfirmGate.classify("cancel sign") is GateDecision.AMBIGUOUS
+
+
+# ---------------------------------------------------------------- collision audit
+#
+# docs/ux-tx-card-feedback.md §2.2: the speed offer names the words
+# "faster"/"slower" (and the importance prose maps onto the same ladder).
+# Every candidate answer word must be structurally incapable of advancing
+# the flow, and the only whitelist change the card UX makes is admitting
+# "sign" to CONFIRM. Designer audit: ZERO collisions — pinned here.
+
+#: Every word the card/offer copy could plausibly be answered with that is
+#: NOT a decision (doc §2.2.1's full candidate list + the offer's own
+#: vocabulary). None may ever classify CONFIRM or DENY or AMBIGUOUS.
+OFFER_ANSWER_WORDS = [
+    "fast", "faster", "slow", "slower", "speed", "hurry", "rush",
+    "important", "save", "money", "cheap", "asap", "medium", "details",
+]
+
+
+@pytest.mark.parametrize("word", OFFER_ANSWER_WORDS)
+def test_offer_answer_words_never_decide(word: str):
+    """Each fee-choice/importance word, alone, classifies NOT_A_DECISION —
+    the flow cannot advance past CREATED on a speed utterance (§2.2.1)."""
+    assert ConfirmGate.classify(word) is GateDecision.NOT_A_DECISION
+    assert ConfirmGate.classify(word.upper()) is GateDecision.NOT_A_DECISION
+
+
+def test_fee_choice_words_are_absent_from_every_whitelist():
+    """The hard disjointness pin (post-"sign"): the speed/importance
+    vocabulary appears in NO gate set — not CONFIRM, not DENY, not FILLER
+    — so no phrasing of a speed answer can ever become a decision."""
+    fee_words = {"fast", "faster", "slow", "slower", "important", "save"}
+    gate_sets = (
+        ConfirmGate.CONFIRM_PHRASES
+        | ConfirmGate.CONFIRM_TOKENS
+        | ConfirmGate.DENY_PHRASES
+        | ConfirmGate.DENY_TOKENS
+        | ConfirmGate.FILLER_TOKENS
+    )
+    assert fee_words & gate_sets == frozenset()
+
+
+def test_sign_never_collides_with_deny_or_filler():
+    """"sign" joins ONLY the CONFIRM set; "cancel sign" stays ambiguous,
+    and the DENY whitelist is byte-identical to its pre-UX-002 content."""
+    assert "sign" in ConfirmGate.CONFIRM_TOKENS
+    assert "sign" in ConfirmGate.CONFIRM_PHRASES
+    assert "sign" not in ConfirmGate.DENY_TOKENS
+    assert "sign" not in ConfirmGate.DENY_PHRASES
+    assert "sign" not in ConfirmGate.FILLER_TOKENS
+
+
+def test_mixed_speed_and_decision_words_fail_closed():
+    """Doc §2.2.2: "no hurry" / "yes faster" mix a decision token with an
+    unknown token → the early fail-closed return wins → NOT_A_DECISION
+    (the app re-asks; neither cancels nor confirms)."""
+    assert ConfirmGate.classify("no hurry") is GateDecision.NOT_A_DECISION
+    assert ConfirmGate.classify("yes faster") is GateDecision.NOT_A_DECISION
+    assert ConfirmGate.classify("sign slower") is GateDecision.NOT_A_DECISION
 
 
 @pytest.mark.parametrize("utterance", CONFIRM_WHITELIST)
@@ -918,9 +1044,11 @@ def test_gate_property_deny_union_shuffle_is_deny():
 
 
 def test_gate_tokens_and_phrases_match_the_adr():
-    """The whitelists are pinned: a drift here is an ADR-0013 change."""
+    """The whitelists are pinned: a drift here is an ADR-0013 change
+    ("sign" joined the CONFIRM set with the TCK-UX-002 GATE-MERGE
+    amendment; every other member is byte-identical)."""
     assert ConfirmGate.CONFIRM_PHRASES == frozenset(CONFIRM_WHITELIST)
     assert ConfirmGate.DENY_PHRASES == frozenset(DENY_WHITELIST)
-    assert ConfirmGate.CONFIRM_TOKENS == frozenset({"yes", "y", "confirm", "confirmed", "send", "approve", "approved"})
+    assert ConfirmGate.CONFIRM_TOKENS == frozenset({"yes", "y", "confirm", "confirmed", "send", "sign", "approve", "approved"})
     assert ConfirmGate.DENY_TOKENS == frozenset({"no", "n", "cancel", "abort", "stop", "don't", "dont", "deny", "reject"})
     assert ConfirmGate.FILLER_TOKENS == frozenset(FILLER)

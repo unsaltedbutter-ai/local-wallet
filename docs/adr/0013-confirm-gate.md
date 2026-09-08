@@ -181,3 +181,95 @@ signed means committed to signing; recovery past signing is a fresh flow,
 never a silent rewind. Eval fixtures for the three new intents
 (`sign_tx`/`broadcast_tx`/`tx_status`) land with TCK-P3-006 per the
 AGENTS.md eval-ship obligation.
+
+## Amendment (2026-09-07, UX — ticket TCK-UX-002): re-quote replacement + the approve→sign merge
+
+Grounded in the finalized card-redesign spec
+`docs/ux-tx-card-feedback.md` (§2 re-quote, §3 merge). Two changes to the
+flow, both **tightening** the one-pending invariant, neither weakening the
+dual key. No envelope/schema/grammar change (`fee_target` already exists;
+"sign" is gate-vocabulary only — no new intent).
+
+### 1. FLOW-REQUOTE — `create` from `CREATED` is now a dispatcher-owned replacement
+
+Previously (§3) `create` from `CREATED` was refused (`tx_pending`) so two
+destructive flows could never interleave. The card's speed offer
+("faster"/"slower") needs a same-destination re-quote at a different ladder
+rung, which is a `create_tx` arriving while one pends. The refusal is
+replaced by a **replacement**, which preserves the invariant more strongly
+than a refusal did:
+
+- Still **exactly one** pending transaction — the old record is swapped for
+  the new, never two.
+- **New `tx_ref`, fresh TTL** (`created_at` re-read): the old reference goes
+  inert the instant the record is replaced, so a `confirm_tx` quoting it
+  fails the verbatim-match check (§2) — fail closed, the user cannot confirm
+  a card that no longer reflects the live numbers (the FINAL-fee invariant:
+  a confirmation can only name the fee on the card currently in front of
+  them).
+- **Commit-only-on-success ordering**: the caller (the `create_tx` handler)
+  runs the entire new build — selection, fee math, PSBT — and only replaces
+  the staged record if it fully succeeds. A re-quote that pushes the wallet
+  short at a higher rung surfaces `insufficient_funds` and the ORIGINAL
+  pending survives intact (a refused replacement never discards the live
+  one). `CONFIRMED`/`SIGNED`/`BROADCAST` still refuse `create` outright (the
+  approved/signed record is committed — abandoning it silently is the step
+  the machine exists to prevent).
+- The refusal branch is retained for a **different destination** (recipient
+  or amount changed) — that stays a `tx_pending` refusal, not a silent
+  destination swap.
+- A same-rung rebuild (the user answers the offer with "medium"/the current
+  target) is a legal no-op-ish replacement: identical numbers, fresh
+  `tx_ref`/TTL, offer retired. Ceiling (faster-than-fastest) and floor
+  (slower-than-cheapest) answers refuse without replacing; the staged card
+  stays live.
+
+### 2. GATE-MERGE — "sign" joins the CONFIRM whitelist; confirm chains the handoff in one turn
+
+The card's ask verb becomes "sign" ("say 'sign' to review it on your
+device"), replacing the old two-step "approve, then sign" that read as an
+unnecessary extra step. `"sign"` joins `CONFIRM_PHRASES`/`CONFIRM_TOKENS`
+(§5); `"confirm"`/`"approve"`/`"send"`/`"yes"` all **remain** valid —
+muscle memory preserved, only the card's prompt word changed. On a confirm
+that succeeds, the dispatcher runs the sign handoff **in the same turn**
+(app-code chaining of two dispatcher-owned states — the model proposed
+`confirm_tx`, the chain is deterministic code). What is **not** weakened:
+
+- **The dual key (§2) is untouched.** Chaining runs only after a
+  `CONFIRMED` transition that already required the same-turn `CONFIRM`
+  utterance AND a matching-`tx_ref` `confirm_tx` envelope. An LLM "yes"
+  still confirms nothing; the sign step is the ordinary `sign_tx` handler
+  reached by a code-built envelope quoting the dispatcher-owned confirmed
+  `tx_ref` (never model- or user-supplied).
+- **`CONFIRMED` and `SIGNED` remain distinct states.** Only the user
+  prompts merged from two to one; the approved-but-not-yet-exported record
+  is still a real, auditable moment (an export/device failure leaves it
+  `CONFIRMED`, recoverable by the existing CONFIRMED-"retry" interception).
+- **The device screen stays the trust anchor** (§9 / Phase-3 amendment). The
+  merged flow does not add a signing-utterance gate — the §3 rationale
+  ("the DEVICE interaction IS the user action; an LLM-relayed approval
+  carries no weight") is unchanged and is exactly why merging the chat
+  prompts is safe: the second chat step gated nothing the device didn't
+  already gate. The cooling-off pause it removed is dominated by the device
+  review and the separately gated broadcast.
+- **Broadcast is still separately gated** — the chain stops at the handoff;
+  `sign`→`broadcast` is not chained (a signed transaction reaching the chain
+  still needs its own fresh same-turn gate decision, Phase-3 amendment).
+  `cancel` stays CREATED-only; the merged turn can still reject on the
+  device, and nothing broadcasts without the gated "broadcast".
+- **The speed words never confirm.** "faster"/"slower"/"important"/"save"
+  and the rest of the offer vocabulary join NO whitelist — not CONFIRM, not
+  DENY, not FILLER — so a speed answer classifies `NOT_A_DECISION` and is
+  structurally incapable of advancing the flow (pinned in
+  `tests/test_tx_flow.py`; the offer line is a wh-question, never a polar
+  yes/no one, so a "yes"/"no" cannot answer it with the wrong meaning). The
+  only whitelist change in this amendment is admitting "sign" to CONFIRM.
+
+`/details` (the deep card view) rides the ADR-0020 transcript-command
+channel — a deterministic UI command, not an intent, and the spoken word
+"details" is deliberately NOT whitelisted (unknown token ⇒ never a
+decision). Eval fixtures for the merged flow (`golden-031` "sign" while a
+tx pends ⇒ `confirm_tx`; `golden-032`/`033` the importance→`fee_target`
+mapping; `golden-034` "sign" with nothing pending ⇒ never a fabricated
+`confirm_tx`; `confirm-bypass-007` "faster" ⇒ not a confirm) ship with this
+change per the AGENTS.md eval-ship obligation.

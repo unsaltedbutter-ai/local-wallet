@@ -503,7 +503,13 @@ def _run_model_mode(
     for case in cases:
         case_id = case.get("id", "<no-id>")
         expectation = case["expectation"]
-        result = loop.run(case["prompt"], facts={})
+        # Optional per-case FACTS block (TCK-UX-002): pending-transaction
+        # context is dispatcher-owned state, so flow-position goldens ("sign
+        # while a tx pends ⇒ confirm_tx") carry their FACTS in the fixture.
+        # Fixture mode never reads 'facts' (it validates the expectation
+        # envelope only); a case without it runs facts-free like before.
+        facts = case.get("facts") or {}
+        result = loop.run(case["prompt"], facts=facts)
         matched = _matches_expectation(result, expectation)
         if matched:
             passed += 1

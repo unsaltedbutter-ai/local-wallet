@@ -5,8 +5,8 @@ extraction suite (PROJECT.md §7.10).
 
 ## Layout
 
-- `golden/*.json` — one JSON file per golden case (30 cases,
-  `golden-001..golden-030`). Each is `{"id", "prompt", "expectation"}`
+- `golden/*.json` — one JSON file per golden case (34 cases,
+  `golden-001..golden-034`). Each is `{"id", "prompt", "expectation"}`
   where `expectation` is an exact envelope (`{"intent", "params"}`), a
   structural predicate (`{"intent", "text_nonempty"|"question_nonempty"}`),
   or an `intent_in` predicate (`{"intent_in": [..]}` with optional

@@ -17,7 +17,7 @@ States and the transition table (``TxFlowStatus``)::
     IDLE ──create──> CREATED ──confirm(ok)──> CONFIRMED ──mark_signed──> SIGNED ──broadcast──> BROADCAST
                        │  │  └─confirm(expired)──> EXPIRED ──reset──> IDLE
                        │  └────cancel────────────> CANCELLED ─reset──> IDLE
-                       └────create──> refused (FlowError, state unchanged)
+                       └────create──> CREATED (replacement re-quote, new tx_ref — TCK-UX-002)
     IDLE/CANCELLED/EXPIRED ──create──> CREATED
     CREATED ──reset──> refused (confirm or cancel first — explicit, not janitor)
     IDLE ──reset──> IDLE (no-op)
@@ -28,11 +28,17 @@ States and the transition table (``TxFlowStatus``)::
     sign from CREATED/SIGNED/IDLE/... ──> refused (FlowError, state unchanged)
     broadcast from CONFIRMED/IDLE/BROADCAST/... ──> refused (FlowError)
 
-One pending transaction at a time: ``create`` from CREATED is refused
-(value-free FlowError), so two destructive flows can never interleave.
-A stale pending transaction is not silently reaped: from CREATED, ``create``
-stays refused and ``confirm`` reports expiry (transitioning to EXPIRED) —
-the explicit recovery paths are confirm / cancel, never an implicit reset.
+One pending transaction at a time — and ``create`` from ``CREATED`` keeps
+that invariant even harder than a refusal did (FLOW-REQUOTE, TCK-UX-002 /
+ADR-0013 amendment): the dispatcher may REPLACE the staged record with a
+fresh one (new ``tx_ref``, TTL reset). There is still never more than one
+pending transaction, the old ``tx_ref`` goes inert with the record it named
+(a ``confirm_tx`` quoting it fails the verbatim-match check — fail closed),
+and callers commit only after the new build fully succeeds (the handler
+validates the replacement BEFORE discarding the old pending).
+A stale pending transaction is not silently reaped: ``confirm`` reports
+expiry (transitioning to EXPIRED) — the explicit recovery paths are
+confirm / cancel (or an intentional replacement), never an implicit reset.
 
 THE CONFIRM GATE (dual-key rule, ADR-0013): moving CREATED → CONFIRMED
 requires BOTH keys on the same turn —
@@ -72,6 +78,16 @@ the same dispatcher-owned discipline extends past CONFIRMED —
   there is no chat-level undo past that point (the signed transaction
   simply is not broadcast if something fails; recovery is a fresh flow).
 
+GATE-MERGE (TCK-UX-002, ADR-0013 amendment): the confirmation card's ask
+verb is "sign", and the dispatcher chains the device handoff in the SAME
+turn a confirm succeeds (app wiring, :func:`localwallet.app._run_turn`).
+This merges the *user prompts* from two to one; it changes nothing here:
+``CONFIRMED`` and ``SIGNED`` stay distinct auditable states, the dual key
+still guards confirm, the device screen is still the trust anchor for
+signing (the chained handoff is the ordinary ``sign_tx`` handler path —
+code-invoked with the dispatcher-owned ``tx_ref``), and broadcast keeps
+its own fresh same-turn gate decision.
+
 :func:`ConfirmGate.classify` is a conservative, whitelist-exact classifier:
 
 - Normalize: lowercase; split on whitespace; strip ASCII punctuation from
@@ -90,12 +106,18 @@ the same dispatcher-owned discipline extends past CONFIRMED —
 Whitelists (exact, case/punctuation-insensitive at token edges)::
 
     CONFIRM phrases: yes, y, yes please, confirm, confirmed, confirm it,
-                     send it, send, approve, approved, do it
+                     send it, send, sign, approve, approved, do it
     DENY phrases:    no, n, no thanks, cancel, cancel it, abort, stop,
                      don't, dont, deny, reject
     FILLER tokens:   please, the, it, tx, transaction
 
-"ok" is deliberately NOT whitelisted (too ambiguous alone): "ok" and
+"sign" joined the CONFIRM whitelist with the TCK-UX-002 GATE-MERGE
+(ADR-0013 amendment): the confirmation card's ask verb is "sign" ("say
+'sign' to review it on your device"), so the word is a confirmation
+utterance — never a signing-utterance gate. The offer words the card
+names ("faster"/"slower") deliberately join NO whitelist: they classify
+``NOT_A_DECISION`` and are structurally incapable of confirming (pinned
+by tests). "ok" is deliberately NOT whitelisted (too ambiguous alone): "ok" and
 near-misses like "ok send" classify NOT_A_DECISION, the flow stays CREATED,
 and the app re-asks. ``AMBIGUOUS`` is reserved for mixed confirm+deny
 signals — the only fuzzy-adjacent case — because both a yes and a no were
@@ -256,9 +278,11 @@ class ConfirmGate:
 
     #: Full whitelist phrases (matched against the joined, normalized token
     #: sequence — covers multi-word entries like "do it" whose first word is
-    #: not itself whitelisted).
+    #: not itself whitelisted). "sign" joined with the TCK-UX-002 GATE-MERGE
+    #: (ADR-0013 amendment): the card's ask verb — a CONFIRMATION utterance
+    #: whose handoff the dispatcher runs in the same turn.
     CONFIRM_PHRASES: Final[frozenset[str]] = frozenset(
-        {"yes", "y", "yes please", "confirm", "confirmed", "confirm it", "send it", "send", "approve", "approved", "do it"}
+        {"yes", "y", "yes please", "confirm", "confirmed", "confirm it", "send it", "send", "sign", "approve", "approved", "do it"}
     )
     DENY_PHRASES: Final[frozenset[str]] = frozenset(
         {"no", "n", "no thanks", "cancel", "cancel it", "abort", "stop", "don't", "dont", "deny", "reject"}
@@ -267,7 +291,7 @@ class ConfirmGate:
     #: Single tokens that carry a decision on their own (the one-word
     #: members of the phrase whitelists above).
     CONFIRM_TOKENS: Final[frozenset[str]] = frozenset(
-        {"yes", "y", "confirm", "confirmed", "send", "approve", "approved"}
+        {"yes", "y", "confirm", "confirmed", "send", "sign", "approve", "approved"}
     )
     DENY_TOKENS: Final[frozenset[str]] = frozenset(
         {"no", "n", "cancel", "abort", "stop", "don't", "dont", "deny", "reject"}
@@ -407,23 +431,36 @@ class TxFlow:
 
         Stamps ``tx_ref`` (via ``id_factory``) and ``created_at`` (via
         ``clock``) onto the handler-supplied, already-validated business
-        fields; the flow owns pending-tx identity so the confirmation card,
+        fields; the flow owns pending-identity so the confirmation card,
         the ``confirm_tx`` envelope, and the gate all reference the same
         immutable record.
 
+        From ``CREATED`` this is a dispatcher-owned REPLACEMENT
+        (FLOW-REQUOTE, TCK-UX-002 / ADR-0013 amendment): the staged record
+        is swapped for the new one — new ``tx_ref``, fresh ``created_at``
+        (TTL reset), still exactly one pending. The old reference goes
+        inert the moment the record is replaced (a confirm quoting it
+        fails the verbatim-match check). The CALLER owns the
+        commit-only-on-success ordering: nothing is replaced until the new
+        build has fully validated (the create handler runs all money math
+        before calling this method).
+
         Raises:
-            FlowError: a transaction is already in flight — value-free
-                message. From CREATED: confirm or cancel it first. From
-                CONFIRMED/SIGNED/BROADCAST the approved/signed record is
-                still live: starting a second flow here would silently
-                abandon it (the silent step the machine exists to prevent)
-                — finish the lifecycle or :meth:`reset` explicitly first.
-                A stale pending is NOT auto-reaped here: confirm it
-                (reports expiry) or cancel it explicitly.
+            FlowError: a transaction is already in flight PAST the gate —
+                value-free message. From CONFIRMED/SIGNED/BROADCAST the
+                approved/signed record is still live: starting a second
+                flow here would silently abandon it (the silent step the
+                machine exists to prevent) — finish the lifecycle or
+                :meth:`reset` explicitly first. A stale pending is NOT
+                auto-reaped: confirm it (reports expiry) or cancel it
+                explicitly.
         """
-        if self._state not in (TxFlowStatus.IDLE, TxFlowStatus.CANCELLED, TxFlowStatus.EXPIRED):
-            if self._state is TxFlowStatus.CREATED:
-                raise FlowError("a transaction is already pending — confirm or cancel it first")
+        if self._state not in (
+            TxFlowStatus.IDLE,
+            TxFlowStatus.CANCELLED,
+            TxFlowStatus.EXPIRED,
+            TxFlowStatus.CREATED,
+        ):
             raise FlowError(
                 "a transaction is already in flight — finish or reset the current flow first"
             )

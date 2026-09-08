@@ -266,18 +266,20 @@ def test_ac1_tampered_psbt_caught_before_broadcast_at_wiring_level(
 def test_ac2_full_lifecycle_file_signer_production_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Composite AC-2 story: create → dual-key confirm → file sign (export →
-    signed-file-missing → device places the file → sign again → revalidate)
-    → broadcast (mock POST 201 + txid) → status (confirmed at height) with a
-    store history row — one continuous e2e through the REAL REPL handlers,
-    using the PRODUCTION-path fake model (FactsQuotingGenerate) that quotes
-    every ref/txid from the injected FACTS block (never the flow object)."""
+    """Composite AC-2 story (GATE-MERGE shape): create → dual-key confirm →
+    SAME-TURN chained device handoff (export → signed-file-missing; the
+    device places the file) → "sign it" (import → revalidate) → broadcast
+    (mock POST 201 + txid) → status (confirmed at height) with a store
+    history row — one continuous e2e through the REAL REPL handlers, using
+    the PRODUCTION-path fake model (FactsQuotingGenerate) that quotes every
+    ref/txid from the injected FACTS block (never the flow object). One
+    fewer model turn than the pre-merge two-step (approve, then sign)."""
     addr0 = derive_fixture_addresses(1)[0]
     transfer = tmp_path / "transfer"
     state: dict = {}
     handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]}, state=state)
     fake = FactsQuotingGenerate(
-        ["create", "confirm", "sign", "sign", "broadcast", "status", "history"]
+        ["create", "confirm", "sign", "broadcast", "status", "history"]
     )
 
     code, outputs, flow = _run_send_repl(
@@ -286,15 +288,14 @@ def test_ac2_full_lifecycle_file_signer_production_path(
         handler,
         [
             f"send 60000 sats to {SEND_RECIPIENT}",
-            "yes please",
-            "sign it",
-            "sign it again",
+            "yes please",  # confirm → SAME-TURN chained export
+            "sign it",  # device placed the file → import → SIGNED
             "broadcast it",
             "what's the status?",
             "show my transactions",
             "exit",
         ],
-        ["create", "confirm", "sign", "sign", "broadcast", "status", "history"],
+        ["create", "confirm", "sign", "broadcast", "status", "history"],
         generate=fake,
         extra_env={"LOCALWALLET_SIGNER_DIR": str(transfer)},
         before_line=_device_sign_before_line(transfer),
@@ -302,13 +303,13 @@ def test_ac2_full_lifecycle_file_signer_production_path(
 
     assert code == 0
     joined = "\n".join(outputs)
-    # Confirmation card + dual-key confirm (production FACTS path).
-    assert "Pending transaction — review it carefully" in joined
-    assert "Approved." in joined
-    # Sign turn 1: export + file-missing handoff.
+    # Confirmation card (brief, ask word "sign") + dual-key confirm.
+    assert 'Pending — say "sign" to review it on your device' in joined
+    assert "Approved." not in joined  # retired seam line
+    # Chained handoff on the confirm turn: export + file-missing.
     assert "Exported to " in joined
     assert "(say: signed localwallet-signed-" in joined
-    # Sign turn 2: import → revalidate → SIGNED, txid quoted verbatim.
+    # Import turn: revalidate → SIGNED, txid quoted verbatim.
     signed_files = list(transfer.glob("localwallet-signed-*.psbt.b64"))
     assert len(signed_files) == 1
     expected_txid = _extract_signed_tx(
@@ -322,8 +323,9 @@ def test_ac2_full_lifecycle_file_signer_production_path(
     assert f"Sent! txid {expected_txid} — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
     assert f"Confirmed at height {STATUS_HEIGHT}." in joined
-    # The status turn quoted broadcast_txid from the FACTS (production path).
-    assert f"broadcast_txid: {expected_txid}" in fake.prompts[5]
+    # The status turn quoted broadcast_txid from the FACTS (production
+    # path): create / confirm(+chain) / sign / broadcast / STATUS.
+    assert f"broadcast_txid: {expected_txid}" in fake.prompts[4]
     # Store history row: outbound, unconfirmed, the approved fee.
     store_path = tmp_path / "store.db"
     from localwallet.store import Store
@@ -416,11 +418,12 @@ def test_ac3_device_absent_and_locked_guidance_then_retry(
     """AC-3 device-absent + device-locked: the first sign turn narrates the
     code-owned §10 guidance (absent: "plug in"; locked: "enter your
     PIN/passphrase"), the flow is left CONFIRMED (the device never signs
-    while absent/locked — zero signtx calls), and the retry ("sign it
-    again") succeeds through to broadcast. The captured flow-state sequence
-    before each REPL line proves the CONFIRMED-preservation invariant:
-    IDLE → CREATED → CONFIRMED → CONFIRMED (after the error) → SIGNED →
-    BROADCAST."""
+    while absent/locked — zero signtx calls), and the retry ("sign it")
+    succeeds through to broadcast. GATE-MERGE shape: the error rides the
+    CONFIRM turn's chained handoff (the flow stays CONFIRMED). The captured
+    flow-state sequence before each REPL line proves the
+    CONFIRMED-preservation invariant: IDLE → CREATED → CONFIRMED (the
+    error turn left it CONFIRMED) → SIGNED → BROADCAST."""
     from localwallet.signer.hwi import HwiUsbSigner as RealHwiUsbSigner
 
     addr0 = derive_fixture_addresses(1)[0]
@@ -434,7 +437,7 @@ def test_ac3_device_absent_and_locked_guidance_then_retry(
             fp, account_path, commands_module=commands
         ),
     )
-    fake = FactsQuotingGenerate(["create", "confirm", "sign", "sign", "broadcast"])
+    fake = FactsQuotingGenerate(["create", "confirm", "sign", "broadcast"])
     my_flow = TxFlow()
     seen: list = []
 
@@ -447,13 +450,12 @@ def test_ac3_device_absent_and_locked_guidance_then_retry(
         handler,
         [
             f"send 60000 sats to {SEND_RECIPIENT}",
-            "yes please",
-            "sign it",
-            "sign it again",
+            "yes please",  # confirm + chained handoff → the error phase
+            "sign it",  # device present now → sign → SIGNED
             "broadcast it",
             "exit",
         ],
-        ["create", "confirm", "sign", "sign", "broadcast"],
+        ["create", "confirm", "sign", "broadcast"],
         generate=fake,
         extra_env={"LOCALWALLET_SIGNER": "hwi"},
         flow=my_flow,
@@ -473,12 +475,14 @@ def test_ac3_device_absent_and_locked_guidance_then_retry(
     assert "Signed and verified ✓" in joined
     assert f"Sent! txid {_flow_txid(flow)} — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
-    # Exact state-machine sequence across the turns (preservation invariant).
+    # Exact state-machine sequence across the turns (preservation
+    # invariant): the confirm turn's CHAINED handoff hit the error phase
+    # and left the flow CONFIRMED (index 2 below is the state the
+    # sign-retry turn starts from).
     assert seen == [
         TxFlowStatus.IDLE,
         TxFlowStatus.CREATED,
-        TxFlowStatus.CONFIRMED,
-        TxFlowStatus.CONFIRMED,  # the error turn left it CONFIRMED
+        TxFlowStatus.CONFIRMED,  # the chained-error turn left it CONFIRMED
         TxFlowStatus.SIGNED,
         TxFlowStatus.BROADCAST,
     ]
@@ -540,14 +544,13 @@ def test_ac3_broadcast_5xx_then_retry(
         handler,
         [
             f"send 60000 sats to {SEND_RECIPIENT}",
-            "yes please",
-            "sign it",
-            "sign it again",
+            "yes please",  # confirm + chained export
+            "sign it",  # device placed the file → import → SIGNED
             "broadcast it",
             "broadcast it again",
             "exit",
         ],
-        ["create", "confirm", "sign", "sign", "broadcast", "broadcast"],
+        ["create", "confirm", "sign", "broadcast", "broadcast"],
         extra_env={"LOCALWALLET_SIGNER_DIR": str(transfer)},
         before_line=before_line,
     )

@@ -2661,6 +2661,12 @@ def _run_send_repl(
     :func:`_send_generate` seam wholesale (production-path tests); when
     ``before_line`` is given it runs just before each input line is
     returned (e.g. to advance an injected clock mid-session).
+
+    TCK-UX-002: a confirm chains straight into the device handoff, so a
+    confirmed test turn exports the unsigned PSBT — the harness defaults
+    ``LOCALWALLET_SIGNER_DIR`` to a tmp folder (tests that drive the file
+    signer deliberately override it) so no test ever writes into the
+    repo's default ./psbt-transfer.
     """
     store_path = _store_path(tmp_path)
     _preset_store(store_path)
@@ -2669,7 +2675,11 @@ def _run_send_repl(
     monkeypatch.delenv("LOCALWALLET_LLM_MODEL", raising=False)
     monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "0")
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
-    for name, value in (extra_env or {}).items():
+    env: dict[str, str | None] = {
+        "LOCALWALLET_SIGNER_DIR": str(tmp_path / "transfer-harness"),
+    }
+    env.update(extra_env or {})
+    for name, value in env.items():
         if value is None:
             monkeypatch.delenv(name, raising=False)
         else:
@@ -2696,8 +2706,120 @@ def _run_send_repl(
 
 
 def _card_refs(outputs: list[str]) -> list[str]:
-    """All ``Ref:`` values shown by confirmation cards, in order."""
+    """All ``Ref:`` values shown by FULL card reprints (``/details``),
+    in order. The TCK-UX-002 brief card deliberately has no Ref line —
+    refs reach a human via ``/details`` and the sign-time filename
+    re-print (doc §1 Ref-row: the demotion leans on those re-prints)."""
     return [line.split("Ref: ", 1)[1] for line in outputs if line.startswith("Ref: ")]
+
+
+#: The exact brief-card line sequence for the canonical fixture send
+#: (60,000 sats @ $20,000/BTC, medium default, 100,000-sat coin): every
+#: value verbatim from the handler result, thousands separators and the
+#: verbatim chain/eta.py hedge (TCK-UX-002 §1 variant A).
+BRIEF_CARD_LINES: Final[list[str]] = [
+    'Pending — say "sign" to review it on your device, or "cancel" to discard.',
+    f"To: {SEND_RECIPIENT}",
+    "Pay: 60,000 sats ($12.00 · rate age 0s)",
+    "Fee: 282 sats · 2 sat/vB × 141 vB · medium — ETA ~60-70 min — estimate only, not a guarantee",
+    "From: your wallet (1 source) · 39,718 sats come back as change",
+    (
+        'How important is this one? Say "faster" to confirm sooner (a slightly higher fee) '
+        'or "slower" to save money (it may take longer) — or say "sign" to keep this rate '
+        "· full breakdown: /details"
+    ),
+]
+
+#: Variant B (a speed preference was stated / the offer was answered):
+#: same lines, tail collapses to the details link only.
+BRIEF_CARD_LINES_VARIANT_B: Final[list[str]] = [
+    *BRIEF_CARD_LINES[:5],
+    "full breakdown: /details",
+]
+
+
+def test_brief_card_full_line_sequence_variant_a() -> None:
+    """The renderer's default (variant A) card, line-for-line pinned:
+    ask → To → Pay → Fee (absorbs size + verbatim ETA hedge) → From
+    (sources + change reassurance) → ONE conditional tail."""
+    lines: list[str] = []
+    app_module._print_brief_card(
+        {
+            "recipient": SEND_RECIPIENT,
+            "amount_sats": 60_000,
+            "usd_cents": 1_200,
+            "rate_age_s": 0,
+            "fee_sats": 282,
+            "fee_rate_sat_vb": 2,
+            "vsize": 141,
+            "fee_target": "medium",
+            "eta_wording": "~60-70 min — estimate only, not a guarantee",
+            "inputs_count": 1,
+            "change_sats": 39_718,
+            "fee_target_defaulted": True,
+        },
+        lines.append,
+    )
+    assert lines == BRIEF_CARD_LINES
+
+
+def test_brief_card_variant_b_tail_no_preference_asked_twice() -> None:
+    """``fee_target_defaulted`` False (stated preference or answered
+    offer): the card stops asking — tail is the /details link alone."""
+    lines: list[str] = []
+    app_module._print_brief_card(
+        {
+            "recipient": SEND_RECIPIENT,
+            "amount_sats": 60_000,
+            "usd_cents": 1_200,
+            "rate_age_s": 0,
+            "fee_sats": 282,
+            "fee_rate_sat_vb": 2,
+            "vsize": 141,
+            "fee_target": "medium",
+            "eta_wording": "~60-70 min — estimate only, not a guarantee",
+            "inputs_count": 1,
+            "change_sats": 39_718,
+            "fee_target_defaulted": False,
+        },
+        lines.append,
+    )
+    assert lines == BRIEF_CARD_LINES_VARIANT_B
+    assert "How important" not in "\n".join(lines)
+
+
+def test_brief_card_plurals_and_optional_segments() -> None:
+    """Multi-source pluralization; absent optional fields DROP their
+    segment (no ``unavailable`` noise spliced into merged lines, no
+    fabricated 0); no change ⇒ no change reassurance clause; no USD ⇒
+    no rate parenthetical (the accepted re-show degrade)."""
+    lines: list[str] = []
+    app_module._print_brief_card(
+        {
+            "recipient": "bc1qtest",
+            "amount_sats": 250_000,
+            "fee_sats": 300,
+            "inputs_count": 2,
+        },
+        lines.append,
+    )
+    assert lines[2] == "Pay: 250,000 sats"
+    assert lines[3] == "Fee: 300 sats"
+    assert lines[4] == "From: your wallet (2 sources)"
+    assert lines[5] == "full breakdown: /details"  # defaulted key absent → variant B
+    assert "unavailable" not in "\n".join(lines)
+
+
+def test_brief_card_absent_amounts_fail_closed_markers() -> None:
+    """The TCK-SEC-004 change-4 class carries over: a primary value that
+    would print as an optional segment's base renders the explicit
+    ``unavailable`` marker, never a fabricated zero."""
+    lines: list[str] = []
+    app_module._print_brief_card({}, lines.append)
+    assert "Pay: unavailable" in lines
+    assert "Fee: unavailable" in lines
+    assert "From: your wallet (sources unavailable)" in lines
+    assert not any(line.startswith(("Pay: 0", "Fee: 0")) for line in lines)
 
 
 def test_confirmation_card_never_fabricates_absent_values() -> None:
@@ -2764,8 +2886,11 @@ def test_confirmation_card_full_payload_is_byte_identical_to_previous_format() -
 def test_send_flow_happy_path_card_then_dual_key_confirm(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """'send 60000 sats …' → card with EXACT selection values → 'yes
-    please' + model confirm_tx (real tx_ref) → Approved + CONFIRMED."""
+    """'send 60000 sats …' → BRIEF card (variant A offer — no stated speed
+    preference) with EXACT selection values → 'yes please' + model
+    confirm_tx (real tx_ref) → CONFIRMED, and the GATE-MERGE chain hands
+    the tx to the signer in the SAME turn (the old two-step seam line is
+    gone; the handoff narration replaces it)."""
     addr0 = derive_fixture_addresses(1)[0]
     recorded: list[httpx.Request] = []
     handler = _send_chain_handler(recorded, utxos_by_addr={addr0: [SEND_UTXO]})
@@ -2779,27 +2904,27 @@ def test_send_flow_happy_path_card_then_dual_key_confirm(
     )
 
     assert code == 0
+    # Card lines, EXACT — every value verbatim from the handler result.
+    assert BRIEF_CARD_LINES[0] in outputs  # the ask line
+    pay_fee_from = outputs[outputs.index(BRIEF_CARD_LINES[0]) + 1 : outputs.index(BRIEF_CARD_LINES[0]) + 5]
+    assert pay_fee_from == BRIEF_CARD_LINES[1:5]
+    assert BRIEF_CARD_LINES[5] in outputs  # the one-shot offer tail
     joined = "\n".join(outputs)
-    # Card lines, exact values verbatim from the handler result dict.
-    assert "Pending transaction — review it carefully" in joined
-    assert f"Amount: {SEND_AMOUNT_SATS} sats ($12.00 · rate age 0s)" in joined
-    assert f"To: {SEND_RECIPIENT}" in joined
-    assert f"Fee: {SEND_FEE_SATS} sats (2 sat/vB, medium target)" in joined
-    assert f"Size: {SEND_VSIZE} vB" in joined
-    assert "Inputs: 1" in joined
-    assert f"Change: {SEND_CHANGE_SATS} sats" in joined
-    assert "Expires: ~10 min" in joined
     # Independent money-math cross-checks of the card figures.
     assert SEND_FEE_SATS == SEND_VSIZE * 2  # fee == vsize × rate
     assert SEND_AMOUNT_SATS + SEND_FEE_SATS + SEND_CHANGE_SATS == 100_000
     # Dual-key confirm: same-turn "yes please" + matching tx_ref.
-    assert (
-        "Approved. Next step: sign — reply 'sign' to hand the transaction to your signer."
-        in joined
-    )
     assert flow.state is TxFlowStatus.CONFIRMED
     assert flow.pending is None
+    # GATE-MERGE (TCK-UX-002): confirm chains into the device handoff in
+    # the same turn — the file signer's export narration is what the user
+    # reads; the retired two-step line never prints.
+    assert "Exported to " in joined
+    assert "Approved. Next step: sign" not in joined
     assert "Not confirmed" not in joined
+    # The sign-time re-print survives (the card's Ref demotion leans on
+    # it): the expected signed filename carries the tx_ref prefix.
+    assert f"localwallet-signed-{flow.confirmed.tx_ref[:8]}" in joined
     # The chain saw the lazy scan + fees + prices; the PSBT never prints.
     assert any(r.url.path.endswith("/v1/fees/recommended") for r in recorded)
     assert any(r.url.path.endswith("/v1/prices") for r in recorded)
@@ -2834,6 +2959,8 @@ def test_send_flow_handler_result_card_fields(
         "rate_age_s",
         "rate_fetched_at",
         "fee_target",
+        "fee_target_defaulted",
+        "fee_requote",
         "expires_in_s",
         "eta_blocks",
         "eta_minutes",
@@ -2847,6 +2974,11 @@ def test_send_flow_handler_result_card_fields(
     assert result["rate_stale"] is False
     assert result["rate_age_s"] == 0
     assert result["fee_target"] == "medium"  # MEDIUM default when omitted
+    # Display-only plumbing (TCK-UX-002 §2.0): the omitted-vs-defaulted
+    # distinction survives to render time ONLY as this result key — the
+    # flow record still carries just the resolved target.
+    assert result["fee_target_defaulted"] is True  # envelope omitted it
+    assert result["fee_requote"] is False
     assert result["expires_in_s"] == 600
     # Narration-only ETA (TCK-P5-002): MEDIUM base = 6 blocks × 10 min.
     assert result["eta_blocks"] == 6
@@ -2947,7 +3079,7 @@ def test_send_flow_dual_key_user_yes_model_respond_stays_pending(
     )
     joined = "\n".join(outputs)
     assert "Noted." in joined  # the model's respond passed through
-    assert "The transaction is still pending — say 'confirm'" in joined
+    assert 'Still pending — say "sign" to send it to your device' in joined
     assert flow.state is TxFlowStatus.CREATED
     assert flow.pending is not None
     assert "Approved." not in joined
@@ -2967,8 +3099,10 @@ def test_send_flow_deny_cancels_and_allows_new_create(
         handler,
         [
             f"send 60000 sats to {SEND_RECIPIENT}",
+            "/details",  # reprint the full card → surfaces its Ref line
             "no thanks",
             f"send 60000 sats to {SEND_RECIPIENT}",
+            "/details",
             "exit",
         ],
         ["create", "respond", "create"],
@@ -3008,11 +3142,50 @@ def test_send_flow_expired_pending_refuses_confirm(
     assert flow.pending is None
 
 
-def test_send_flow_duplicate_pending_reshows_card(
+def test_send_flow_different_destination_while_pending_refuses(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """'send …' while a transaction is already pending → tx_pending
-    refusal plus the SAME pending card re-shown (same tx_ref)."""
+    """A second send at a DIFFERENT amount while one pends still refuses
+    (the re-quote is same-destination only — money never silently
+    switches): still-pending guide + the SAME pending re-shown (same
+    tx_ref via the /details reprint)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    other = json.dumps(
+        {
+            "v": 0,
+            "intent": "create_tx",
+            "params": {"recipient": SEND_RECIPIENT, "amount_sats": 61_000},
+        }
+    )
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            f"send 61000 sats to {SEND_RECIPIENT}",
+            "/details",
+            "exit",
+        ],
+        ["create", other],
+    )
+    joined = "\n".join(outputs)
+    assert 'Still pending — say "sign" to send it to your device' in joined
+    refs = _card_refs(outputs)
+    assert refs == [flow.pending.tx_ref]  # the SAME pending transaction
+    assert flow.pending.amount_sats == SEND_AMOUNT_SATS
+    assert flow.state is TxFlowStatus.CREATED
+
+
+def test_send_flow_identical_reissue_is_a_same_rung_requote(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FLOW-REQUOTE at the REPL: an identical recipient+amount create_tx
+    while CREATED is a dispatcher-owned REPLACEMENT, not a refusal —
+    same-rung (both-defaulted medium) rebuild: plain re-quote lead, fresh
+    tx_ref, and the offer STILL shown (the user never stated a speed
+    preference, so ``fee_target_defaulted`` stays true — §2.0 trigger)."""
     addr0 = derive_fixture_addresses(1)[0]
     handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
     _code, outputs, flow = _run_send_repl(
@@ -3021,17 +3194,435 @@ def test_send_flow_duplicate_pending_reshows_card(
         handler,
         [
             f"send 60000 sats to {SEND_RECIPIENT}",
+            "/details",
             f"send 60000 sats to {SEND_RECIPIENT}",
+            "/details",
             "exit",
         ],
         ["create", "create"],
     )
     joined = "\n".join(outputs)
-    assert "A transaction is already pending — confirm or cancel it first." in joined
+    assert app_module._CARD_REQUOTE_LEAD_SAME_RUNG in joined
+    assert "Still pending" not in joined  # not a refusal anymore
     refs = _card_refs(outputs)
-    assert len(refs) == 2
-    assert refs[0] == refs[1]  # the SAME pending transaction re-shown
+    assert len(refs) == 2 and refs[0] != refs[1]  # replaced: new identity
+    assert refs[1] == flow.pending.tx_ref
     assert flow.state is TxFlowStatus.CREATED
+    # The re-quoted card re-offers the choice (both envelopes defaulted).
+    assert joined.count(BRIEF_CARD_LINES[5]) == 2
+
+
+# --------------------------------------------------- FLOW-REQUOTE mechanics
+#
+# (TCK-UX-002 deliverable 3; doc §2.1/§2.3.) Table-level for determinism:
+# the ladder moves, ceiling/floor refusals, commit-only-on-success, and
+# the inert old ref — everything the dispatcher-owned replacement must
+# guarantee on the money path.
+
+
+def _requote_envelope(fee_target: str | None):
+    """A same-destination create_tx envelope at an explicit (or omitted)
+    rung — what the model emits for "faster"/"slower"/"medium"."""
+    body: dict[str, Any] = {"recipient": SEND_RECIPIENT, "amount_sats": SEND_AMOUNT_SATS}
+    if fee_target is not None:
+        body["fee_target"] = fee_target
+    return validate_payload(json.dumps({"v": 0, "intent": "create_tx", "params": body}))
+
+
+def _send_table(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    utxo: dict[str, Any],
+    *,
+    clock: Any = None,
+):
+    addr0 = derive_fixture_addresses(1)[0]
+    table, store, _wallet, client, _recorded, flow, session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [utxo]}),
+        flow=TxFlow(clock=clock) if clock is not None else None,
+    )
+    return table, store, client, flow, session
+
+
+def test_faster_requote_replaces_pending_fresh_ref_ttl_and_inert_old(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """medium → "faster" (fast): coin selection RE-RUNS at the new rung —
+    fee/vsize/change/ETA all refresh together, NEW tx_ref + fresh TTL,
+    variant B (explicit target retires the offer); the OLD ref is inert
+    (confirm fails the verbatim-match), and the NEW ref confirms under
+    the dual key."""
+    ticks = {"now": 1_000.0}
+    table, store, client, flow, session = _send_table(
+        monkeypatch, tmp_path, SEND_UTXO, clock=lambda: ticks["now"]
+    )
+    first = table[IntentName.CREATE_TX](_requote_envelope(None))
+    assert first["fee_target_defaulted"] is True and first["fee_requote"] is False
+
+    ticks["now"] = 1_050.0  # time passes between the rungs
+    faster = table[IntentName.CREATE_TX](_requote_envelope("fast"))
+    assert faster.get("error") is None
+    assert faster["fee_requote"] is True
+    assert faster["requote_direction"] == "faster"
+    assert faster["fee_target"] == "fast"
+    assert faster["fee_target_defaulted"] is False  # explicit → offer retired
+    # The ladder is estimator-driven: fast rung = 3 sat/vB on this fixture.
+    assert faster["fee_rate_sat_vb"] == 3
+    assert faster["fee_sats"] == faster["vsize"] * 3 > first["fee_sats"]
+    assert faster["change_sats"] < first["change_sats"]  # money math re-ran
+    assert faster["eta_minutes"] < first["eta_minutes"]  # ETA refreshed too
+    # NEW ref + FRESH TTL (created_at re-read from the flow clock).
+    assert faster["tx_ref"] != first["tx_ref"]
+    assert faster["expires_in_s"] == 600
+    assert flow.pending is not None and flow.pending.created_at == 1_050.0
+    assert flow.pending.tx_ref == faster["tx_ref"]
+
+    # The old ref is inert — fail closed even with a same-turn CONFIRM.
+    session.gate_decision = GateDecision.CONFIRM
+    stale = table[IntentName.CONFIRM_TX](
+        validate_payload(
+            json.dumps({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": first["tx_ref"]}})
+        )
+    )
+    assert stale["error"] == "confirm_refused"
+    assert "does not match" in str(stale["detail"])
+    assert flow.state is TxFlowStatus.CREATED
+
+    fresh = table[IntentName.CONFIRM_TX](
+        validate_payload(
+            json.dumps({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": faster["tx_ref"]}})
+        )
+    )
+    assert fresh["status"] == "confirmed"
+    client.close()
+    store.close()
+
+
+def test_slower_and_same_rung_medium_requotes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Explicit medium onto a defaulted medium is the legal same-rung
+    rebuild (identical numbers, NO direction word, fresh ref, §2.3);
+    medium → "slower" (slow) then moves down the ladder ("slower")."""
+    table, store, client, flow, _session = _send_table(
+        monkeypatch, tmp_path, SEND_UTXO
+    )
+    first = table[IntentName.CREATE_TX](_requote_envelope(None))
+    medium = table[IntentName.CREATE_TX](_requote_envelope("medium"))
+    assert "requote_direction" not in medium  # same-rung: no direction word
+    assert medium["fee_sats"] == first["fee_sats"]  # identical numbers
+    assert medium["tx_ref"] != first["tx_ref"]  # fresh identity anyway
+    assert medium["fee_target_defaulted"] is False  # explicit → offer retired
+    slower = table[IntentName.CREATE_TX](_requote_envelope("slow"))
+    assert slower["requote_direction"] == "slower"
+    assert slower["fee_rate_sat_vb"] == 1
+    assert slower["fee_sats"] < first["fee_sats"]
+    assert flow.state is TxFlowStatus.CREATED
+    client.close()
+    store.close()
+
+
+def test_requote_ceiling_and_floor_refuse_pending_intact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """"faster" when already fast → ceiling refusal; "slower" when already
+    slow → floor. The staged record is UNTOUCHED (same ref, same money),
+    and no replacement is even attempted (§2.3)."""
+    table, store, client, flow, _session = _send_table(
+        monkeypatch, tmp_path, SEND_UTXO
+    )
+    fast = table[IntentName.CREATE_TX](_requote_envelope("fast"))
+    ceiling = table[IntentName.CREATE_TX](_requote_envelope("fast"))
+    assert ceiling["error"] == "tx_pending"
+    assert ceiling["rate_notice"] == "ceiling"
+    assert ceiling["tx_ref"] == fast["tx_ref"]  # the pending re-shown intact
+    assert flow.pending.tx_ref == fast["tx_ref"]
+
+    slow = table[IntentName.CREATE_TX](_requote_envelope("slow"))
+    assert slow["tx_ref"] != fast["tx_ref"]  # fast→slow DOES move (down)
+    floor = table[IntentName.CREATE_TX](_requote_envelope("slow"))
+    assert floor["rate_notice"] == "floor"
+    assert flow.pending.tx_ref == slow["tx_ref"]
+    client.close()
+    store.close()
+
+
+def test_requote_insufficient_funds_keeps_original_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Commit-only-on-success ordering (§2.1, ticket-mandated): a "faster"
+    re-quote whose higher fee pushes the wallet short surfaces the
+    existing insufficient_funds line and the ORIGINAL pending survives —
+    the replacement is validated BEFORE the old record is discarded."""
+    table, store, client, flow, session = _send_table(
+        monkeypatch, tmp_path, SEND_UTXO
+    )
+    # 99,700 of a 100,000 coin: finalizes at 2 sat/vB (residue folded,
+    # fee 300) but NOT at 3 sat/vB (would need 100,030 sats).
+    near = validate_payload(
+        json.dumps(
+            {
+                "v": 0,
+                "intent": "create_tx",
+                "params": {"recipient": SEND_RECIPIENT, "amount_sats": 99_700},
+            }
+        )
+    )
+    original = table[IntentName.CREATE_TX](near)
+    assert original.get("error") is None
+    assert original["change_sats"] is None
+    assert original["fee_sats"] == 300
+
+    fast = table[IntentName.CREATE_TX](
+        validate_payload(
+            json.dumps(
+                {
+                    "v": 0,
+                    "intent": "create_tx",
+                    "params": {
+                        "recipient": SEND_RECIPIENT,
+                        "amount_sats": 99_700,
+                        "fee_target": "fast",
+                    },
+                }
+            )
+        )
+    )
+    assert fast == {
+        "error": "insufficient_funds",
+        "needed_sats": 100_030,
+        "available_sats": 100_000,
+    }
+    # The ORIGINAL pending is intact — same identity, still confirmable.
+    assert flow.state is TxFlowStatus.CREATED
+    assert flow.pending is not None and flow.pending.tx_ref == original["tx_ref"]
+    session.gate_decision = GateDecision.CONFIRM
+    confirmed = table[IntentName.CONFIRM_TX](
+        validate_payload(
+            json.dumps(
+                {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": original["tx_ref"]}}
+            )
+        )
+    )
+    assert confirmed["status"] == "confirmed"
+    client.close()
+    store.close()
+
+
+def test_requote_narration_and_ceiling_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The renderer wires the §2.3 copy: direction-bearing lead +
+    variant-B card after a faster re-quote; ceiling/floor results print
+    ONLY the notice line (the staged card stays valid on screen)."""
+    lines: list[str] = []
+    app_module._print_create_tx(
+        {
+            "tx_ref": "r2",
+            "amount_sats": 60_000,
+            "recipient": "bc1qtest",
+            "fee_sats": 423,
+            "fee_rate_sat_vb": 3,
+            "vsize": 141,
+            "change_sats": 39_577,
+            "inputs_count": 1,
+            "fee_target": "fast",
+            "eta_wording": "~10-20 min — estimate only, not a guarantee",
+            "fee_target_defaulted": False,
+            "fee_requote": True,
+            "requote_direction": "faster",
+            "expires_in_s": 600,
+        },
+        lines.append,
+    )
+    assert lines[0] == "Re-quoted at the faster rate — review the new fee below:"
+    assert lines[1] == app_module._CARD_ASK_LINE
+    assert "Fee: 423 sats · 3 sat/vB × 141 vB · fast — ETA ~10-20 min — estimate only, not a guarantee" in lines
+    assert lines[-1] == "full breakdown: /details"  # variant B — offer retired
+
+    ceiling: list[str] = []
+    app_module._print_create_tx(
+        {"error": "tx_pending", "rate_notice": "ceiling"}, ceiling.append
+    )
+    assert ceiling == [app_module._CARD_RATE_CEILING]
+    floor: list[str] = []
+    app_module._print_create_tx(
+        {"error": "tx_pending", "rate_notice": "floor"}, floor.append
+    )
+    assert floor == [app_module._CARD_RATE_FLOOR]
+
+
+# ------------------------------------------------ GATE-MERGE (TCK-UX-002)
+#
+# "sign" joins the CONFIRM whitelist and the dispatcher chains
+# confirm→device-handoff in ONE turn. Pins: the merged happy path, the
+# MUST-NOT-WEAKEN list (dual key intact — a gate word without a
+# confirm_tx envelope confirms nothing; a confirm_tx with an invented
+# tx_ref is refused even on a CONFIRM-classified turn; speed words never
+# confirm), and broadcast stays separately gated.
+
+
+def test_gate_merge_sign_word_confirms_and_chains_in_one_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """THE merged flow: user says "sign" at CREATED — the gate classifies
+    it CONFIRM (whitelist), the model emits confirm_tx (the card asked
+    for the device, so sign_tx is not the right envelope; the flow-state
+    gate refuses it anyway), and the dispatcher chains the handoff in the
+    SAME turn. No separate 'sign' utterance is needed; broadcast is NOT
+    reached (separately gated)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "sign", "exit"],
+        ["create", "confirm"],
+    )
+    joined = "\n".join(outputs)
+    assert app_module._CARD_ASK_LINE in joined
+    # One user utterance carried review + device handoff (file signer:
+    # the export IS the handoff; the sign-time ref re-print rides it).
+    assert "Exported to " in joined
+    assert f"localwallet-signed-{flow.confirmed.tx_ref[:8]}" in joined
+    assert flow.state is TxFlowStatus.CONFIRMED
+    assert flow.signed is None and flow.txid is None  # broadcast NOT reached
+    assert "Not confirmed" not in joined
+    assert "Approved." not in joined  # retired seam line
+
+
+def test_gate_merge_gate_word_without_envelope_confirms_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """MUST NOT WEAKEN: "sign" satisfies the GATE key, but with no
+    same-turn confirm_tx envelope (the model responds) the dual key is
+    incomplete — the flow stays CREATED with a still-pending guide."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "sign", "exit"],
+        ["create", "respond"],
+    )
+    joined = "\n".join(outputs)
+    assert flow.state is TxFlowStatus.CREATED
+    assert flow.pending is not None
+    assert 'Still pending — say "sign"' in joined
+    assert "Exported to " not in joined
+
+
+def test_gate_merge_invented_tx_ref_refused_even_on_sign_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """MUST NOT WEAKEN (red-team shape): "sign" classifies CONFIRM, but a
+    confirm_tx quoting an INVENTED tx_ref still fails the verbatim-match —
+    CREATED is preserved and nothing is handed to the device."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    bogus = json.dumps(
+        {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": "delegated-not"}}
+    )
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "sign", "exit"],
+        ["create", bogus],
+    )
+    joined = "\n".join(outputs)
+    assert "Not confirmed — tx_ref does not match the pending transaction." in joined
+    assert flow.state is TxFlowStatus.CREATED
+    assert "Exported to " not in joined
+
+
+def test_gate_merge_sign_word_wrong_envelope_fails_closed_at_flow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A model that misreads the card's ask word and emits sign_tx while
+    CREATED is refused by the FLOW's state gate (signing cannot skip the
+    confirm) — value-free refusal, flow untouched."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    premature_sign = json.dumps(
+        {"v": 0, "intent": "sign_tx", "params": {"tx_ref": "pending-not-confirmed"}}
+    )
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "sign", "exit"],
+        ["create", premature_sign],
+    )
+    joined = "\n".join(outputs)
+    assert "Not signed — no confirmed transaction to sign." in joined
+    assert flow.state is TxFlowStatus.CREATED
+    assert "Exported to " not in joined
+
+
+def test_gate_merge_speed_words_never_confirm_even_with_envelope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§2.2.1 end-to-end: "faster" classifies NOT_A_DECISION, so even a
+    model-emitted confirm_tx quoting the REAL pending ref is refused —
+    the turn cannot advance past CREATED. (The correct model behaviour —
+    a re-quote — is the FLOW-REQUOTE section's territory.)"""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "faster", "exit"],
+        ["create", "confirm"],  # confirm quotes the live pending ref
+    )
+    joined = "\n".join(outputs)
+    assert "Not confirmed — confirmation gate not satisfied" in joined
+    assert flow.state is TxFlowStatus.CREATED
+    assert "Exported to " not in joined
+
+
+# ----------------------------------------------------------- /details view
+
+def test_details_reprints_full_card_and_gates_on_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``/details`` (ADR-0020 channel, doc §1): reprints the cached FULL
+    nine-line card verbatim (Size/Inputs/Expires/Ref — everything the
+    brief view merges or demotes) while a tx pends; after the pending is
+    cancelled the view is gone (no stale card). The spoken word
+    "details" is NOT gate-whitelisted (see test_tx_flow collision pins)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    _code, outputs, _flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "/details",
+            "no thanks",
+            "/details",
+            "exit",
+        ],
+        ["create", "respond"],
+    )
+    while_pending = "\n".join(outputs)
+    # The full nine-line classic render, verbatim (the brief card's
+    # stricter sibling — same data, two depths).
+    assert f"Amount: {SEND_AMOUNT_SATS} sats ($12.00 · rate age 0s)" in while_pending
+    assert f"Size: {SEND_VSIZE} vB" in while_pending
+    assert "Inputs: 1" in while_pending
+    assert "Expires: ~10 min" in while_pending
+    refs = _card_refs(outputs)
+    assert len(refs) == 1  # exactly the one /details reprint
+    assert "Transaction cancelled." in while_pending
+    # After the DENY-cancel, /details reports nothing pending (the brief
+    # card scrolled off; the cache is not a live-transaction oracle).
+    assert app_module._DETAILS_NONE in outputs
+    assert outputs.count(app_module._DETAILS_NONE) == 1
 
 
 def test_send_flow_insufficient_funds_friendly_line_no_flow_entry(
@@ -3088,7 +3679,7 @@ def test_send_flow_amount_usd_resolves_via_fresh_price(
     )
     joined = "\n".join(outputs)
     # $12 @ 20000 USD/BTC → exactly 60000 sats → identical card figures.
-    assert f"Amount: {SEND_AMOUNT_SATS} sats ($12.00 · rate age 0s)" in joined
+    assert "Pay: 60,000 sats ($12.00 · rate age 0s)" in joined
     assert flow.state is TxFlowStatus.CREATED
 
 
@@ -3169,9 +3760,12 @@ def test_send_flow_price_disabled_sats_path_still_sends(
         extra_env={"LOCALWALLET_PRICE_ENABLED": "0"},
     )
     joined = "\n".join(outputs)
-    assert f"Amount: {SEND_AMOUNT_SATS} sats" in joined
+    assert "Pay: 60,000 sats" in joined
     assert "rate age" not in joined
-    assert f"Fee: {SEND_FEE_SATS} sats (2 sat/vB, medium target)" in joined
+    assert (
+        "Fee: 282 sats · 2 sat/vB × 141 vB · medium "
+        "— ETA ~60-70 min — estimate only, not a guarantee" in joined
+    )
     assert flow.state is TxFlowStatus.CREATED
 
 
@@ -3190,8 +3784,8 @@ def test_send_flow_ambiguous_gate_guidance_state_unchanged(
         ["create", "respond"],
     )
     joined = "\n".join(outputs)
-    assert "That was ambiguous — say 'confirm'" in joined
-    assert "or 'cancel'" in joined
+    assert 'That was ambiguous — say "sign" to proceed' in joined
+    assert 'or "cancel" to discard it.' in joined
     assert flow.state is TxFlowStatus.CREATED
     assert flow.pending is not None
 
@@ -3256,7 +3850,9 @@ def test_send_flow_confirm_production_path_quotes_tx_ref_from_facts(
     block (the verbatim-quote contract) and emits ``confirm_tx`` with
     it. The full happy path (card → FACTS → confirm_tx → dual key →
     CONFIRMED) works without the old seam; the same-turn 'yes please'
-    still supplies the gate's key."""
+    still supplies the gate's key. GATE-MERGE: the confirm chains into
+    the device handoff in the SAME turn (the file-signer export line
+    replaces the retired two-step 'Approved' line)."""
     addr0 = derive_fixture_addresses(1)[0]
     handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
     fake = FactsQuotingGenerate(["create", "confirm"])
@@ -3264,7 +3860,12 @@ def test_send_flow_confirm_production_path_quotes_tx_ref_from_facts(
         monkeypatch,
         tmp_path,
         handler,
-        [f"send 60000 sats to {SEND_RECIPIENT}", "yes please", "exit"],
+        [
+            f"send 60000 sats to {SEND_RECIPIENT}",
+            "/details",  # the full-card reprint carries the Ref line
+            "yes please",
+            "exit",
+        ],
         ["create", "confirm"],
         generate=fake,
     )
@@ -3278,12 +3879,12 @@ def test_send_flow_confirm_production_path_quotes_tx_ref_from_facts(
     match = re.search(r"^pending_tx_ref: (\S+)$", fake.prompts[1], re.MULTILINE)
     assert match is not None
     fact_ref = match.group(1)
-    card_ref = next(
-        line.split("Ref: ", 1)[1] for line in outputs if line.startswith("Ref: ")
-    )
+    (card_ref,) = _card_refs(outputs)
     assert fact_ref == card_ref  # FACTS value == the printed card's ref
-    assert "Pending transaction — review it carefully" in joined
-    assert "Approved. Next step: sign — reply 'sign'" in joined
+    assert app_module._CARD_ASK_LINE in joined
+    # Merged flow: the handoff narration is what the user reads (no seam).
+    assert "Exported to " in joined
+    assert "Approved." not in joined
     assert flow.state is TxFlowStatus.CONFIRMED
     assert flow.pending is None
     assert "Not confirmed" not in joined
@@ -3357,8 +3958,11 @@ def test_send_flow_facts_show_remaining_expiry(
     assert f"pending_tx_recipient: {SEND_RECIPIENT}" in fake.prompts[1]
     # Turn 3 runs 50s after staging: less remaining than turn 2.
     assert "pending_tx_expires_in_s: 550" in fake.prompts[2]
-    # The confirm quoted the FACTS ref → dual-key confirm completed.
-    assert "Approved." in joined
+    # The confirm quoted the FACTS ref → dual-key confirm completed, and
+    # (GATE-MERGE) chained straight into the device handoff in the same
+    # turn — the file-signer export narration replaces the old seam line.
+    assert "Exported to " in joined
+    assert "Approved." not in joined
     assert flow.state is TxFlowStatus.CONFIRMED
 
 
@@ -3382,8 +3986,9 @@ def test_send_flow_eta_reaches_card_and_model_facts(
     )
 
     joined = "\n".join(outputs)
-    # The confirmation card carries the ETA line (value-free honest wording).
-    assert "ETA: ~60-70 min — estimate only, not a guarantee" in joined
+    # The brief card's Fee line carries the ETA hedge VERBATIM (the
+    # standalone ETA line survives in the /details full render).
+    assert " — ETA ~60-70 min — estimate only, not a guarantee" in joined
     # The CREATED-turn FACTS inject the ETA fact so the model can narrate it
     # verbatim (the card is terminal output the model never sees).
     assert "pending_tx_eta_minutes: 60" in fake.prompts[1]
@@ -3394,9 +3999,11 @@ def test_send_flow_eta_reaches_card_and_model_facts(
 def test_send_flow_reshowed_card_shows_remaining_expiry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """FIX 3 (expiry honesty): re-showing the pending card 500s after
-    staging advertises the REMAINING ttl (~1 min), not the nominal
-    600s/10 min."""
+    """FIX 3 (expiry honesty) survives the brief redesign: a re-show 500 s
+    after staging (via a DIFFERENT-destination refusal — an identical one
+    would be a fresh re-quote) advertises the REMAINING ttl, not the
+    nominal 600 s/10 min. Expires is demoted off the brief card, so the
+    honest remaining TTL is read off the cached full render (/details)."""
     addr0 = derive_fixture_addresses(1)[0]
     handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
     clock = {"now": 1000.0}
@@ -3404,28 +4011,36 @@ def test_send_flow_reshowed_card_shows_remaining_expiry(
 
     def before_line() -> None:
         reads["n"] += 1
-        if reads["n"] == 2:  # just before the SECOND send attempt
+        if reads["n"] == 2:  # just before the SECOND (different) send
             clock["now"] = 1500.0  # 500 s have passed
 
+    other = json.dumps(
+        {
+            "v": 0,
+            "intent": "create_tx",
+            "params": {"recipient": SEND_RECIPIENT, "amount_sats": 61_000},
+        }
+    )
     _code, outputs, flow = _run_send_repl(
         monkeypatch,
         tmp_path,
         handler,
         [
             f"send 60000 sats to {SEND_RECIPIENT}",
-            f"send 60000 sats to {SEND_RECIPIENT}",
+            f"send 61000 sats to {SEND_RECIPIENT}",  # refusal + re-show
+            "/details",
             "exit",
         ],
-        ["create", "create"],
+        ["create", other],
         flow=TxFlow(clock=lambda: clock["now"]),
         before_line=before_line,
     )
 
     joined = "\n".join(outputs)
-    assert "A transaction is already pending — confirm or cancel it first." in joined
-    # First card: the full ttl; the re-shown card: 100 s ≈ 1 min left.
-    assert "Expires: ~10 min" in joined
+    assert 'Still pending — say "sign"' in joined
+    # The cached full render of the re-shown card: ~100 s ≈ 1 min left.
     assert "Expires: ~1 min" in joined
+    assert "Expires: ~10 min" not in joined
     assert flow.state is TxFlowStatus.CREATED
 
 
@@ -3458,7 +4073,7 @@ def test_repl_transcript_export_scrub_commands(
     joined = "\n".join(outputs)
     assert "Transcript exported" in joined
     assert "Transcript cleared." in joined
-    assert "Commands: /export" in joined
+    assert "Commands: /details" in joined
     text = export_path.read_text(encoding="utf-8")
     assert "local-wallet session export" in text
     assert "bc1q" not in text
@@ -3637,21 +4252,25 @@ def test_send_lifecycle_file_signer_full_happy_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """PRODUCTION-PATH full lifecycle with the file signer: send → card →
-    dual-key confirm → sign (export; signed_file_missing) → device places
-    the signed file → sign again (import → revalidate → SIGNED) →
-    broadcast (POST hits the mock) → status quotes broadcast_txid from
-    FACTS → confirmed-at-height narration → history shows the outbound
-    row. The broadcast POST carries exactly the re-validated transaction."""
+    dual-key confirm → (GATE-MERGE) SAME-TURN chained device handoff (the
+    confirm exports; signed_file_missing) → device places the signed file
+    → "sign it" (import → revalidate → SIGNED) → broadcast (POST hits the
+    mock) → status quotes broadcast_txid from FACTS → confirmed-at-height
+    narration → history shows the outbound row. The broadcast POST carries
+    exactly the re-validated transaction. NOTE: the merged flow needs ONE
+    fewer model step than the old two-step (approve, then sign) flow —
+    the export rides the confirm turn, never a separate model call."""
     addr0 = derive_fixture_addresses(1)[0]
     transfer = tmp_path / "transfer"
     state: dict[str, Any] = {}
     handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]}, state=state)
     fake = FactsQuotingGenerate(
-        ["create", "confirm", "sign", "sign", "broadcast", "status", "history"]
+        ["create", "confirm", "sign", "broadcast", "status", "history"]
     )
 
     def before_line() -> None:
-        # Device simulation between the two sign turns (see helper).
+        # Device simulation between the confirm-chained export and the
+        # import turn (see helper).
         if transfer.exists():
             unsigned = sorted(transfer.glob("localwallet-unsigned-*.psbt.b64"))
             signed_existing = list(transfer.glob("localwallet-signed-*.psbt.b64"))
@@ -3674,15 +4293,14 @@ def test_send_lifecycle_file_signer_full_happy_path(
         handler,
         [
             f"send 60000 sats to {SEND_RECIPIENT}",
-            "yes please",
-            "sign it",
-            "sign it again",
+            "yes please",  # confirm → chained export (no separate sign turn)
+            "sign it",  # device placed the file → import → SIGNED
             "broadcast it",
             "what's the status?",
             "show my transactions",
             "exit",
         ],
-        ["create", "confirm", "sign", "sign", "broadcast", "status", "history"],
+        ["create", "confirm", "sign", "broadcast", "status", "history"],
         generate=fake,
         extra_env={"LOCALWALLET_SIGNER_DIR": str(transfer)},
         before_line=before_line,
@@ -3690,13 +4308,13 @@ def test_send_lifecycle_file_signer_full_happy_path(
 
     assert code == 0
     joined = "\n".join(outputs)
-    # --- sign turn 1: export + file-missing handoff line (§10) ----------
+    # --- chained handoff on the CONFIRM turn: export + file-missing (§10) --
     assert "Exported to " in joined
     assert "(say: signed localwallet-signed-" in joined
     exported = sorted(transfer.glob("localwallet-unsigned-*.psbt.b64"))
     assert len(exported) == 1
     assert (transfer / (exported[0].name + ".sha256")).exists()  # ADR-0014 sidecar
-    # --- sign turn 2: import → revalidate → SIGNED ----------------------
+    # --- import turn: revalidate → SIGNED ---------------------------------
     signed_files = list(transfer.glob("localwallet-signed-*.psbt.b64"))
     assert len(signed_files) == 1  # the device simulation placed it
     expected_txid = _extract_signed_tx(
@@ -3718,7 +4336,7 @@ def test_send_lifecycle_file_signer_full_happy_path(
     assert flow.state is TxFlowStatus.BROADCAST
     assert flow.txid == expected_txid
     # --- status: the model quoted broadcast_txid from the FACTS ---------
-    status_prompt = fake.prompts[5]
+    status_prompt = fake.prompts[4]  # create/confirm/sign/broadcast/STATUS
     assert f"broadcast_txid: {expected_txid}" in status_prompt
     assert "Confirmed at height 870001." in joined
     # --- history: the outbound row (store upsert after broadcast) -------
@@ -3741,9 +4359,12 @@ def test_send_lifecycle_hwi_signer_locked_retry_then_broadcast(
 ) -> None:
     """HWI path with a fake commands module: candidate gate + post-open
     account-key bind (master-fp enumeration never gates, TCK-HW-002) →
-    DeviceLockedError mid-flow → §10 guidance line → bare 'retry'
-    (DETERMINISTICALLY INTERCEPTED at CONFIRMED — no model call for it) →
-    sign → revalidate → broadcast. Flow discipline throughout."""
+    GATE-MERGE: the confirm turn's CHAINED device handoff hits
+    DeviceLockedError mid-flow → §10 guidance line (flow stays CONFIRMED) →
+    bare 'retry' (DETERMINISTICALLY INTERCEPTED at CONFIRMED — no model
+    call for it, TCK-HW-002) → sign → revalidate → broadcast. Flow
+    discipline throughout; the merged flow removes the old separate
+    'sign it' turn (the handoff now rides the confirm)."""
     from localwallet.signer.hwi import HwiUsbSigner as RealHwiUsbSigner
 
     addr0 = derive_fixture_addresses(1)[0]
@@ -3758,8 +4379,8 @@ def test_send_lifecycle_hwi_signer_locked_retry_then_broadcast(
         ),
     )
     # 'retry' at CONFIRMED never reaches the model (TCK-HW-002): the plan
-    # has no fourth step for it — 'broadcast it' consumes "broadcast".
-    fake = FactsQuotingGenerate(["create", "confirm", "sign", "broadcast"])
+    # has no step for it — 'broadcast it' consumes "broadcast".
+    fake = FactsQuotingGenerate(["create", "confirm", "broadcast"])
 
     _code, outputs, flow = _run_send_repl(
         monkeypatch,
@@ -3767,49 +4388,49 @@ def test_send_lifecycle_hwi_signer_locked_retry_then_broadcast(
         handler,
         [
             f"send 60000 sats to {SEND_RECIPIENT}",
-            "yes please",
-            "sign it",
-            "retry",
+            "yes please",  # confirm → chained sign → locked → CONFIRMED
+            "retry",  # intercepted re-sign → SIGNED
             "broadcast it",
             "exit",
         ],
-        ["create", "confirm", "sign", "broadcast"],
+        ["create", "confirm", "broadcast"],
         generate=fake,
         extra_env={"LOCALWALLET_SIGNER": "hwi"},
     )
 
     joined = "\n".join(outputs)
-    # First attempt: the locked device error surfaces its guidance VERBATIM
-    # (code-owned §10 text). The retry: the fake device signs; revalidation
-    # passes; the broadcast completes the lifecycle (end state below).
+    # First attempt (the chained handoff): the locked-device error surfaces
+    # its guidance VERBATIM (code-owned §10 text). The retry: the fake
+    # device signs; revalidation passes; the broadcast completes.
     assert "Enter your PIN/passphrase on the device, then say 'retry'." in joined
     assert "Signed and verified ✓ txid " in joined
-    assert commands.sign_calls == 2  # the locked attempt + the retry
+    assert commands.sign_calls == 2  # the locked (chained) attempt + the retry
     assert commands.rec["closed"] is True  # device handle released both times
     assert f"Sent! txid {_flow_txid(flow)} — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
-    # The retry turn was model-free: five REPL utterances before 'exit',
-    # the model saw four of them — and no prompt was ASKED about 'retry'
+    # The retry turn was model-free: four REPL utterances before 'exit',
+    # the model saw three — and no prompt was ASKED about 'retry'
     # (a re-injected history line is mid-prompt, never the final turn).
-    assert len(fake.prompts) == 4
+    assert len(fake.prompts) == 3
     assert not any(p.endswith("user: retry\n\nenvelope:") for p in fake.prompts)
 
 
 def test_retry_at_confirmed_resigns_deterministically_without_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """TCK-HW-002 pin: at ``CONFIRMED`` a bare ``"retry"`` (stripped,
-    case-insensitive) re-invokes the sign_tx handler DIRECTLY with the
-    dispatcher-owned confirmed tx_ref — the model is never consulted for
-    that turn — and the full sign pipeline (gate → bind → device sign →
-    revalidate → SIGNED) runs. Confirmed by the model-call count: five
-    REPL utterances before 'exit', the model saw four."""
+    """TCK-HW-002 pin (GATE-MERGE-aware): the confirm's CHAINED handoff
+    hits the locked device (flow stays CONFIRMED); at ``CONFIRMED`` a bare
+    ``"retry"`` (stripped, case-insensitive) re-invokes the sign_tx handler
+    DIRECTLY with the dispatcher-owned confirmed tx_ref — the model is
+    never consulted for that turn — and the full sign pipeline (gate →
+    bind → device sign → revalidate → SIGNED) runs. Confirmed by the
+    model-call count: the retry never reaches the model."""
     from localwallet.signer.hwi import HwiUsbSigner as RealHwiUsbSigner
 
     addr0 = derive_fixture_addresses(1)[0]
     handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
     fingerprint = _fixture_parsed().hd_key.my_fingerprint.hex()
-    commands = _FakeDeviceCommands(fingerprint)
+    commands = _FakeDeviceCommands(fingerprint, fail_first_sign=True)
     monkeypatch.setattr(
         app_module,
         "HwiUsbSigner",
@@ -3817,7 +4438,7 @@ def test_retry_at_confirmed_resigns_deterministically_without_model(
             fp, account_path, commands_module=commands
         ),
     )
-    fake = FactsQuotingGenerate(["create", "confirm"])
+    fake = FactsQuotingGenerate(["create", "confirm", "broadcast"])
 
     _code, outputs, flow = _run_send_repl(
         monkeypatch,
@@ -3825,7 +4446,7 @@ def test_retry_at_confirmed_resigns_deterministically_without_model(
         handler,
         [
             f"send 60000 sats to {SEND_RECIPIENT}",
-            "yes please",
+            "yes please",  # confirm + chained handoff → locked → CONFIRMED
             "  Retry  ",  # exact-utterance test: stripped + case-insensitive
             "broadcast it",
             "exit",
@@ -3837,12 +4458,12 @@ def test_retry_at_confirmed_resigns_deterministically_without_model(
 
     joined = "\n".join(outputs)
     assert f"Signed and verified ✓ txid {_flow_txid(flow)}." in joined
-    assert flow.state is TxFlowStatus.SIGNED
-    assert commands.sign_calls == 1
-    # The retry turn was model-free; 'broadcast it' was NOT (plan shifted
-    # by one: create, confirm, broadcast = 3 prompts for 4 live utterances).
-    # (Prompt-COUNT proves the bypass: a CONFIRMED sign via the model would
-    # have needed a fourth call — and the plan is exhausted past step 3.)
+    assert flow.state is TxFlowStatus.BROADCAST
+    # signtx ran twice: the failed chained handoff + the intercepted retry.
+    assert commands.sign_calls == 2
+    # The retry turn was model-free; the model saw send/confirm/broadcast
+    # (3 prompts for 4 live utterances). Prompt-COUNT proves the bypass: a
+    # CONFIRMED re-sign via the model would have needed a fourth call.
     assert len(fake.prompts) == 3
 
 

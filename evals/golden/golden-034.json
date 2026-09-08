@@ -1,0 +1,5 @@
+{
+  "id": "golden-034",
+  "prompt": "sign",
+  "expectation": {"intent_in": ["clarify", "respond"]}
+}
