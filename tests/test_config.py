@@ -9,6 +9,8 @@ is TCK-ONB-003's job and deliberately not exercised here.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from localwallet.chain.config import ChainConfig
@@ -17,6 +19,7 @@ from localwallet.store.db import Store, StoreError
 
 ENV_URL = "https://env-node.local:3006/api"
 STORED_URL = "https://my-node.home:3006/api"
+FILE_URL = "https://file-node.local:3006/api"
 
 
 # ---------------------------------------------------------- precedence matrix
@@ -243,3 +246,142 @@ def test_ladder_consumes_the_store_settings_api() -> None:
             {key: store.get_setting(key) for key in (MIN, MAX, VB)},
         )
     assert got == CoinSelectionSettings(20_000, 500_000, 1)
+
+
+# =============================================================================
+# TCK-CFG-002: config-file rung (env > file > stored > default)
+# =============================================================================
+
+from pathlib import Path
+
+
+def _write_config(tmp_path: Path, data: dict) -> Path:
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def _write_raw(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "config.json"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_config_file_absent_is_zero_change(tmp_path: Path) -> None:
+    missing = tmp_path / "does-not-exist.json"
+    got = Settings.from_env(config_path=missing)
+    assert got.gap_limit == ""
+    assert got.price_enabled is True
+    assert got.request_timeout_s == 10.0
+    assert got.chain_base_url == ""
+
+
+def test_file_populates_gap_limit_and_other_scalars(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        {"gap_limit": "42", "price_enabled": False, "request_timeout_s": 5.5},
+    )
+    got = Settings.from_env(config_path=path)
+    assert got.gap_limit == "42"  # str field carries the DECIMAL STRING
+    assert got.price_enabled is False
+    assert got.request_timeout_s == 5.5
+
+
+def test_env_beats_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _write_config(tmp_path, {"gap_limit": "42", "price_enabled": False})
+    monkeypatch.setenv("LOCALWALLET_GAP_LIMIT", "7")
+    monkeypatch.setenv("LOCALWALLET_PRICE_ENABLED", "1")
+    got = Settings.from_env(config_path=path)
+    assert got.gap_limit == "7"  # env wins
+    assert got.price_enabled is True  # env wins over the file's False
+
+
+def test_chain_base_url_file_beats_stored(tmp_path: Path) -> None:
+    path = _write_config(tmp_path, {"chain_base_url": FILE_URL})
+    settings = Settings.from_env(config_path=path)
+    # resolve still takes stored injected by the caller; file rides the
+    # env-or-file slot merged by from_env.
+    assert resolve_chain_base_url(settings.chain_base_url, STORED_URL) == FILE_URL
+
+
+def test_full_ladder_env_file_stored_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_config(tmp_path, {"chain_base_url": FILE_URL})
+
+    # no env, no stored -> file beats the public default:
+    assert (
+        resolve_chain_base_url(Settings.from_env(config_path=path).chain_base_url, None)
+        == FILE_URL
+    )
+    # env beats file (and stored):
+    monkeypatch.setenv("LOCALWALLET_CHAIN_BASE_URL", ENV_URL)
+    assert (
+        resolve_chain_base_url(
+            Settings.from_env(config_path=path).chain_base_url, STORED_URL
+        )
+        == ENV_URL
+    )
+    # file beats stored (env unset):
+    monkeypatch.delenv("LOCALWALLET_CHAIN_BASE_URL")
+    assert (
+        resolve_chain_base_url(
+            Settings.from_env(config_path=path).chain_base_url, STORED_URL
+        )
+        == FILE_URL
+    )
+    # stored beats None -> default stays the caller's job:
+    assert resolve_chain_base_url("", STORED_URL) == STORED_URL
+    assert resolve_chain_base_url("", None) is None
+
+
+def test_coin_settings_file_beats_stored(tmp_path: Path) -> None:
+    # coin settings are str fields -> JSON strings in the file.
+    path = _write_config(tmp_path, {MIN: "7000"})
+    settings = Settings.from_env(config_path=path)
+    got = resolve_coin_selection_settings(
+        {
+            MIN: settings.utxo_target_min_sats,
+            MAX: settings.utxo_target_max_sats,
+            VB: settings.consolidate_below_sat_vb,
+        },
+        {MIN: "9000", MAX: "30000"},  # stored rung
+    )
+    assert got.target_min_sats == 7_000  # file beats stored
+    assert got.target_max_sats == 30_000  # stored beats default
+    assert got.consolidate_below_sat_vb == 2  # default
+
+
+@pytest.mark.parametrize(
+    ("content", "probe"),
+    [
+        ("not json{", "not valid JSON"),
+        ("[1, 2]", "must be a JSON object"),
+        ('{"unknown_key": 1}', "unknown config key: unknown_key"),
+        ('{"price_enabled": "yes"}', "config key price_enabled must be a boolean"),
+        ('{"gap_limit": 42}', "config key gap_limit must be a string"),
+        ('{"request_timeout_s": "10"}', "config key request_timeout_s must be a number"),
+        ('{"max_retries": 3.5}', "config key max_retries must be an integer"),
+    ],
+)
+def test_malformed_config_refuses_startup_value_free(
+    tmp_path: Path, content: str, probe: str
+) -> None:
+    path = _write_raw(tmp_path, content)
+    with pytest.raises(ValueError) as excinfo:
+        Settings.from_env(config_path=path)
+    message = str(excinfo.value)
+    assert probe in message
+    # value-free: the offending value is never echoed.
+    for value in ("42", "yes", "10", "3.5", "1, 2"):
+        assert value not in message
+
+
+def test_malformed_file_refuses_even_when_env_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Fail-closed: the WHOLE file is validated regardless of env override.
+    path = _write_raw(tmp_path, '{"gap_limit": 42}')
+    monkeypatch.setenv("LOCALWALLET_GAP_LIMIT", "5")
+    with pytest.raises(ValueError):
+        Settings.from_env(config_path=path)

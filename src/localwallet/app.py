@@ -3709,7 +3709,15 @@ def run(
         output_fn(f"No model configured: set {MODEL_PATH_ENV_VAR} or pass --stub-llm.")
         return 2
 
-    settings = Settings.from_env()
+    # TCK-CFG-002: load settings from env + the config file. A malformed
+    # config file (bad JSON / wrong type / unknown key) raises ValueError
+    # here — refuse startup with a value-free line (exit 2) BEFORE any store
+    # side effects, mirroring the gap_limit/zpub config-error paths below.
+    try:
+        settings = Settings.from_env()
+    except ValueError as exc:
+        output_fn(f"Configuration error: {exc}")
+        return 2
 
     # TCK-CFG-001 preflight: resolve + validate LOCALWALLET_GAP_LIMIT
     # (fail-closed, value-free — the same spirit as the zpub config-error

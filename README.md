@@ -82,13 +82,42 @@ Run tests and evals with the venv's interpreter:
 .venv/bin/python evals/run_evals.py        # fixture mode — no model required
 ```
 
-## Configuration (env vars)
+## Configuration
 
-- **`LOCALWALLET_GAP_LIMIT`** — dev knob: overrides the per-scan address gap
-  limit (default 20, ADR-0009). An integer `1..1000`; a malformed value
-  refuses startup. A small value (e.g. `2`) makes scans fast, but a gap that
-  is too small can **miss allocated-but-unused addresses** — if you suspect
-  funds on addresses you handed out, widen the gap and rescan per ADR-0009.
+Every keyed setting resolves through one ladder (TCK-CFG-002):
+
+| Rung | Source | Example |
+|------|--------|---------|
+| 1 (highest) | env var `LOCALWALLET_*` | `LOCALWALLET_GAP_LIMIT=30` |
+| 2 | config file `~/.localwallet/config.json` | `{"gap_limit": "30"}` |
+| 3 | stored setting (DB) | `/set gap_limit 30` |
+| 4 (lowest) | shipped default | gap 20 |
+
+### Config file
+
+The optional JSON file at **`~/.localwallet/config.json`** sets the same
+scalar fields as the `LOCALWALLET_*` env vars (lowercase field names —
+`gap_limit`, `chain_base_url`, `request_timeout_s`, `price_enabled`, …).
+The `~/.localwallet/` per-user path keeps config private to the user and
+survives reinstalls — no repo writes. An absent file changes nothing; env
+always wins over the file.
+
+Values are type-checked per field (boolean / integer / number / string), so
+use real JSON types. The **`gap_limit`** worked example — the per-scan
+address gap limit (default 20, ADR-0009), an integer `1..1000`:
+
+```json
+{ "gap_limit": "30" }
+```
+
+A small gap (e.g. `2`) makes scans fast, but a gap that is too small can
+**miss allocated-but-unused addresses** — if you suspect funds on addresses
+you handed out, widen the gap and rescan per ADR-0009.
+
+**Fail-closed:** malformed JSON, an unknown key, or a value of the wrong
+type refuses startup with a value-free error (the offending value is never
+echoed) — even if an env var would have overridden it. Fix the file and
+restart.
 
 ## Docs
 

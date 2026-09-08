@@ -1,7 +1,18 @@
 """Settings holder for local-wallet.
 
-Loaded from env vars prefixed ``LOCALWALLET_`` via ``from_env()``. Stdlib only.
-No secrets are stored or logged here.
+Loaded via ``from_env()``: env vars prefixed ``LOCALWALLET_`` override the
+shipped defaults, and a user-editable JSON config file
+(:data:`CONFIG_FILE_PATH`) fills the rung between env and the store-backed
+settings. Stdlib only. No secrets are stored or logged here.
+
+Every keyed setting resolves through ONE documented ladder (TCK-CFG-002)::
+
+    env (LOCALWALLET_*)  >  config file (~/.localwallet/config.json)  >  stored (DB)  >  shipped default
+
+The config-file rung is merged inside ``from_env()`` (env > file; a file key
+is ignored only when the same key's env var is set). The stored rung is NOT
+read here — it enters through the ``resolve_*`` functions as a plain argument
+(see below), so this module stays stdlib-only and store-free.
 
 **Stdlib-only constraint (lint-enforced discipline for this module):** this
 module must never import :mod:`localwallet.store` (or anything doing I/O).
@@ -14,9 +25,11 @@ through :func:`resolve_chain_base_url` as a plain argument: the startup wiring
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import Final
 
 # ---------------------------------------------------------------------------
@@ -60,6 +73,72 @@ COIN_SETTING_DEFAULTS: Final[Mapping[str, int]] = {
     UTXO_TARGET_MAX_SETTING: 10_000_000,
     CONSOLIDATE_BELOW_SAT_VB_SETTING: 2,
 }
+
+#: Path of the user-editable config file (TCK-CFG-002): ``~/.localwallet/``
+#: is the per-user config dir for a packaged CLI app (no repo writes, survives
+#: reinstalls, private to the user). The file holds the same scalar fields as
+#: the ``LOCALWALLET_*`` env vars (lowercase field names), slotting between
+#: env and the store-backed settings in the ONE ladder. Absent file = no
+#: change. Malformed content is a value-free startup refusal (fail closed).
+CONFIG_FILE_PATH: Final[Path] = Path.home() / ".localwallet" / "config.json"
+
+
+def _field_kind(field) -> type:
+    """Expected JSON type for a Settings field (bool/int/float, else str)."""
+    if isinstance(field.default, bool):
+        return bool
+    if isinstance(field.default, int):
+        return int
+    if isinstance(field.default, float):
+        return float
+    return str
+
+
+def _load_config_file(path: Path, known: tuple) -> dict[str, object]:
+    """Read and strictly validate the config file, or ``{}`` when absent.
+
+    Fail-closed and value-free (TCK-CFG-002): malformed JSON, a non-object
+    root, an unknown key, or a value of the wrong JSON type for its field all
+    raise :class:`ValueError` naming only the key + problem kind — never the
+    offending value. The whole file is validated even if env overrides a key,
+    so a corrupt file always refuses startup rather than silently dropping a
+    rung (ADR-0009 spirit).
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise ValueError("config file could not be read") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("config file is not valid JSON") from exc
+    if not isinstance(data, dict):
+        # ValueError, not TypeError: a wrong-typed config file is a user
+        # config error (fail-closed, value-free), not a programmer misuse.
+        raise ValueError("config file must be a JSON object")  # noqa: TRY004
+    by_name = {f.name: f for f in known}
+    out: dict[str, object] = {}
+    for name, value in data.items():
+        field = by_name.get(name)
+        if field is None:
+            raise ValueError(f"unknown config key: {name}")
+        kind = _field_kind(field)
+        if kind is bool:
+            if not isinstance(value, bool):
+                raise ValueError(f"config key {name} must be a boolean")
+        elif kind is int:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"config key {name} must be an integer")
+        elif kind is float:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"config key {name} must be a number")
+            value = float(value)
+        elif not isinstance(value, str):
+            raise ValueError(f"config key {name} must be a string")
+        out[name] = value
+    return out
 
 
 @dataclass
@@ -108,7 +187,8 @@ class Settings:
     # ADR-0018) polling is cheap and private either way.
     watch_interval_s: float = 60.0
     #: Dev knob (TCK-CFG-001): the per-scan address gap limit override
-    #: (``LOCALWALLET_GAP_LIMIT``), as a DECIMAL STRING. Empty string = unset
+    #: (``LOCALWALLET_GAP_LIMIT`` or the ``gap_limit`` config-file key), as a
+    #: DECIMAL STRING. Empty string = unset
     #: (use the DB ``gap_limit`` setting, else :data:`~localwallet.wallet.scan.DEFAULT_GAP_LIMIT`
     #: of 20 — ADR-0009). Kept as a string so ``from_env`` needs no special
     #: coercion: the app validates + bounds it (fail-closed, value-free) at
@@ -130,8 +210,10 @@ class Settings:
     consolidate_below_sat_vb: str = ""
 
     @classmethod
-    def from_env(cls) -> Settings:
-        """Build a Settings instance, overriding defaults from LOCALWALLET_* env vars.
+    def from_env(
+        cls, config_path: str | Path | None = None
+    ) -> Settings:
+        """Build a Settings instance from env vars and the optional config file.
 
         Recognized variables: ``LOCALWALLET_ESPLORA_BASE_URL``,
         ``LOCALWALLET_CHAIN_BASE_URL``,
@@ -150,6 +232,16 @@ class Settings:
         Boolean fields accept ``0``/``1`` or ``true``/``false``/``yes``/``no``
         (any case); anything else raises :class:`ValueError` (fail closed —
         config errors are programmer errors).
+
+        Precedence per keyed setting (the ONE ladder, TCK-CFG-002)::
+
+            env LOCALWALLET_*  >  config file  >  stored (DB, via resolve_*)  >  shipped default
+
+        ``config_path`` defaults to :data:`CONFIG_FILE_PATH`. The config file
+        uses the lowercase field names (``gap_limit``, ``chain_base_url``,
+        …) with per-field JSON types (bool/int/float/string); a key already
+        set by env is left to env. A malformed file raises :class:`ValueError`
+        (value-free) — fail closed. An absent file is a no-op.
         """
         def _coerce(name: str, value: str):
             field = next(f for f in fields(cls) if f.name == name)
@@ -174,6 +266,13 @@ class Settings:
             raw = os.environ.get(env_name)
             if raw is not None:
                 values[field.name] = _coerce(field.name, raw)
+        # Config-file rung: fills in any key env did not set (env > file).
+        # Strict fail-closed parse of the WHOLE file regardless of env.
+        path = Path(config_path) if config_path is not None else CONFIG_FILE_PATH
+        for name, value in _load_config_file(path, fields(cls)).items():
+            env_name = f"LOCALWALLET_{name.upper()}"
+            if os.environ.get(env_name) is None:
+                values[name] = value
         return cls(**values)
 
 
@@ -182,11 +281,16 @@ def resolve_chain_base_url(
 ) -> str | None:
     """Resolve the chain backend selection (ADR-0023 precedence; TCK-ONB-002).
 
-    Pure function — no env reads, no I/O, no store import. Precedence::
+    Pure function — no env reads, no I/O, no store import. The first argument
+    is the value already merged by ``Settings.from_env`` — env and config-file
+    (TCK-CFG-002) collapsed into one rung (env wins over file inside the
+    merge). Precedence::
 
-        env LOCALWALLET_CHAIN_BASE_URL  >  stored choice  >  None
+        env  >  config file  >  stored choice  >  None
 
-    Each rung treats ``None``, the empty string, and whitespace-only as
+    i.e. the caller injects ``Settings.chain_base_url`` (env-or-file) as
+    ``env_value`` and the stored value as ``stored_value``. Each rung treats
+    ``None``, the empty string, and whitespace-only as
     *unset* (an exported empty var is indistinguishable from an absent one —
     both mean "no override"). The winning value is returned stripped; a
     whitespace-only setting never resolves to a usable URL, so it falls
@@ -229,9 +333,12 @@ def resolve_coin_selection_settings(
 
     Pure function — no env reads, no I/O, no store import (same shape as
     :func:`resolve_chain_base_url`; the ladder logic mirrors the gap_limit
-    resolution in ``wallet.scan._resolve_gap_limit``). Precedence per key::
+    resolution in ``wallet.scan._resolve_gap_limit``). The first mapping is
+    the values already merged by ``Settings.from_env`` — env and config-file
+    (TCK-CFG-002) collapsed into one rung (env wins over file inside the
+    merge). Precedence per key::
 
-        env LOCALWALLET_<KEY>  >  stored settings key  >  shipped default
+        env  >  config file  >  stored settings key  >  shipped default
 
     Fail-closed: every non-empty rung must be a plain ASCII decimal integer
     within the key's :data:`COIN_SETTING_BOUNDS`, and the resolved pair must
