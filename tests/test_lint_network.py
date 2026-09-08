@@ -130,6 +130,49 @@ def test_lint_still_flags_network_imports_in_other_packages(tmp_path):
     assert flagged == {"wallet.py", "store.py"}
 
 
+# ------------------------------------------------- ADR-0024 ui/web exception
+
+
+def test_lint_exception_names_exactly_the_web_server_dir():
+    """The web-server exception is exactly the ui/web/ package (ADR-0024 §10,
+    pinned by TCK-WEB-001): a directory list mirroring NODE_NETWORK_DIRS."""
+    assert LINT.WEB_SERVER_DIRS == ("ui/web",)
+
+
+def test_lint_allows_inbound_loopback_imports_inside_ui_web(tmp_path):
+    """ui/web/** may import the stdlib HTTP server (INBOUND loopback listen);
+    the exception is scoped to the package (ADR-0024 decision 10)."""
+    web_dir = tmp_path / "ui" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "server.py").write_text(
+        "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
+        "import socketserver\n",
+        encoding="utf-8",
+    )
+    assert LINT.check_tree(tmp_path) == []
+
+
+def test_lint_does_not_exempt_a_sibling_file_named_web(tmp_path):
+    """The ui/web exception is a DIRECTORY, not a name prefix: a sibling
+    ``ui/web.py`` (or a sibling package dir) stays flagged."""
+    ui_dir = tmp_path / "ui"
+    ui_dir.mkdir()
+    (ui_dir / "web.py").write_text("from http.server import ThreadingHTTPServer\n", encoding="utf-8")
+    (ui_dir / "webby").mkdir()
+    (ui_dir / "webby" / "srv.py").write_text("import httpx\n", encoding="utf-8")
+    violations = LINT.check_tree(tmp_path)
+    assert {v.path.name for v in violations} == {"web.py", "srv.py"}
+
+
+def test_lint_web_exception_is_not_an_outbound_pass(tmp_path):
+    """The exception text names the inbound-loopback rationale (ADR-0024 §10
+    records it); outside ui/web/, http imports still fire everywhere."""
+    (tmp_path / "transport.py").write_text("import http\n", encoding="utf-8")
+    violations = LINT.check_tree(tmp_path)
+    assert len(violations) == 1
+    assert violations[0].module == "http"
+
+
 # ------------------------------------------------- TCK-SEC-003 ban extensions
 
 

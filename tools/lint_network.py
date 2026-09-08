@@ -4,11 +4,15 @@
 Only ``src/localwallet/chain/`` may import network modules (or shell out),
 plus exactly ONE additional file: ``src/localwallet/agent/remote_runtime.py``
 (the ADR-0007 TEMPORARY remote-LLM debug bridge — see
-:data:`AGENT_LLM_TRANSPORT_FILES`) and the whole ``src/localwallet/node/``
-package (the ADR-0016 localhost node doctor — see :data:`NODE_NETWORK_DIRS`).
-Everything else outside ``chain/`` — including every other ``agent/`` file and
-``evals/`` — stays banned. The node doctor is a localhost-only Phase 4 privacy
-upgrade (no public-network calls); see docs/adr/0016-localhost-node-io.md.
+:data:`AGENT_LLM_TRANSPORT_FILES`), the whole ``src/localwallet/node/``
+package (the ADR-0016 localhost node doctor — see :data:`NODE_NETWORK_DIRS`),
+and the ``src/localwallet/ui/web/`` package (the ADR-0024 localhost web UI —
+see :data:`WEB_SERVER_DIRS`). Everything else outside ``chain/`` — including
+every other ``agent/`` file and ``evals/`` — stays banned. The node doctor is
+a localhost-only Phase 4 privacy upgrade (no public-network calls); see
+docs/adr/0016-localhost-node-io.md. The web-server exception is for INBOUND
+loopback listening (the stdlib HTTP server); it authorizes no outbound calls
+— outbound network access stays in ``chain/``; see docs/adr/0024-web-ui.md.
 
 Dynamic imports are re-checked: ``importlib.import_module(...)`` and
 ``__import__(...)`` can smuggle a banned module past the static
@@ -50,6 +54,13 @@ AGENT_LLM_TRANSPORT_FILES: Final[tuple[str, ...]] = ("agent/remote_runtime.py",)
 # leaves the machine. Directory names are relative to the lint root (SRC_ROOT).
 # Amend only via a new ADR.
 NODE_NETWORK_DIRS: Final[tuple[str, ...]] = ("node",)
+
+# ADR-0024 (localhost web UI): the ui/web/ package runs the stdlib HTTP
+# server — INBOUND loopback I/O (listening on 127.0.0.1), NOT outbound
+# network access. The exception authorizes the server transport only; every
+# outbound call stays in chain/ (decision 10). Directory names are relative
+# to the lint root (SRC_ROOT). Amend only via a new ADR + test pins.
+WEB_SERVER_DIRS: Final[tuple[str, ...]] = ("ui/web",)
 
 # Top-level module names that imply network or shell access. Matched by their
 # *top-level* component, so dotted forms (``xmlrpc.client``,
@@ -213,13 +224,16 @@ def check_tree(root: Path) -> list[Violation]:
 
     Files under ``root/chain/`` are exempt from the network/shell ban, as are
     the ADR-0007 remote-LLM transport file (:data:`AGENT_LLM_TRANSPORT_FILES`,
-    relative to ``root``) and the ADR-0016 node-doctor package
-    (:data:`NODE_NETWORK_DIRS`, directories relative to ``root``).
+    relative to ``root``), the ADR-0016 node-doctor package
+    (:data:`NODE_NETWORK_DIRS`, directories relative to ``root``), and the
+    ADR-0024 web-server package (:data:`WEB_SERVER_DIRS` — inbound loopback
+    only).
     """
     violations: list[Violation] = []
     chain_dir = root / "chain"
     transport_files = {root / rel for rel in AGENT_LLM_TRANSPORT_FILES}
     node_dirs = [root / rel for rel in NODE_NETWORK_DIRS]
+    web_dirs = [root / rel for rel in WEB_SERVER_DIRS]
     for path in sorted(root.rglob("*.py")):
         if path in transport_files:
             continue  # ADR-0007 temporary bridge — the one agent/ exception
@@ -227,6 +241,8 @@ def check_tree(root: Path) -> list[Violation]:
             continue  # chain/ is the canonical networked module
         if any(_is_under(path, nd) for nd in node_dirs):
             continue  # ADR-0016 localhost node doctor — loopback-only
+        if any(_is_under(path, wd) for wd in web_dirs):
+            continue  # ADR-0024 localhost web server — INBOUND loopback only
         _check_file(path, violations)
     return violations
 
@@ -245,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"{rel}:{v.lineno}: forbidden import '{v.module}' outside chain/ "
                 f"(exceptions: {AGENT_LLM_TRANSPORT_FILES[0]}, ADR-0007; "
-                f"{NODE_NETWORK_DIRS[0]}/, ADR-0016)"
+                f"{NODE_NETWORK_DIRS[0]}/, ADR-0016; {WEB_SERVER_DIRS[0]}/, ADR-0024)"
             )
     return 1
 

@@ -38,7 +38,10 @@ implements no protocol, wallet, chain, or tx-engine logic itself:
   ``--stub-llm``), run the startup scan (or ``--rescan``; env opt-out
   via ``LOCALWALLET_AUTO_SCAN=0``) and the chat REPL. The REPL owns the
   :class:`TxFlow` / :class:`SendSession` pair and classifies every user
-  utterance against the confirm gate at the top of each turn.
+  utterance against the confirm gate at the top of each turn. The REPL
+  is the CLI transport over the queue-driven engine pump
+  (:func:`_pump`, ADR-0024 §3); the threaded engine entry point for the
+  web UI (WEB-002) is :func:`start_engine`.
 
 Invariants honored here:
 
@@ -64,14 +67,16 @@ import argparse
 import base64
 import json
 import os
+import queue
 import re
 import sqlite3
 import sys
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from string import punctuation
-from typing import Final
+from typing import Any, Final
 
 from embit import finalizer
 from embit.psbt import PSBT
@@ -2354,6 +2359,257 @@ def _drain_watch(
         return 0
 
 
+# ------------------------------------------------- engine pump (TCK-WEB-001, ADR-0024 §3)
+
+#: Event kinds. The CLI sink renders ``text``/``progress`` exactly as the
+#: pre-web REPL wrote them (output_fn line / raw stdout char); the web
+#: transport (WEB-002) maps them onto SSE frames.
+EVENT_TEXT: Final[str] = "text"
+EVENT_PROGRESS: Final[str] = "progress"
+EVENT_TURN_END: Final[str] = "turn_end"
+
+
+@dataclass(frozen=True)
+class EngineEvent:
+    """One engine output event with a strictly monotonic id (never reused,
+    never reordered). The id is the ring-buffer/replay key WEB-002 consumes.
+    """
+
+    id: int
+    kind: str
+    payload: str
+
+
+class EventEmitter:
+    """Monotonic-id event sink — the transport-agnostic output end of the
+    pump. :meth:`text` is the ``output_fn``-shaped closure every engine
+    layer keeps calling unchanged; ``emit`` covers progress/turn markers.
+    Sinks must be fast and thread-safe-for-one-writer (the engine thread is
+    the only emitter); buffering/replay lives above this seam (WEB-002).
+    """
+
+    def __init__(self, sink: Callable[[EngineEvent], None]) -> None:
+        self._sink = sink
+        self._next_id = 0
+
+    def emit(self, kind: str, payload: str = "") -> EngineEvent:
+        event = EngineEvent(id=self._next_id + 1, kind=kind, payload=payload)
+        self._next_id += 1
+        self._sink(event)
+        return event
+
+    def text(self, payload: str) -> None:
+        """``output_fn``-shaped adapter: every engine line becomes an event."""
+        self.emit(EVENT_TEXT, payload)
+
+
+def cli_sink(output_fn: Callable[[str], None]) -> Callable[[EngineEvent], None]:
+    """The CLI rendering of the event stream — byte-identical to the old
+    REPL: text lines go to ``output_fn``, progress chars (scan dots, the
+    closing newline) straight to ``sys.stdout`` flushed, markers invisible.
+    """
+
+    def sink(event: EngineEvent) -> None:
+        if event.kind == EVENT_TEXT:
+            output_fn(event.payload)
+        elif event.kind == EVENT_PROGRESS:
+            sys.stdout.write(event.payload)
+            sys.stdout.flush()
+
+    return sink
+
+
+def cli_emitter(output_fn: Callable[[str], None]) -> EventEmitter:
+    """An :class:`EventEmitter` that reproduces the pre-web CLI exactly."""
+    return EventEmitter(cli_sink(output_fn))
+
+
+class _QuitSentinel:
+    """Terminal command: stops the pump BETWEEN turns (never-cancel)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "QUIT"
+
+
+#: Push this on the command queue to end a session (ADR-0024 §3: turns are
+#: never cancelled — QUIT is honored only once the in-flight turn completed).
+QUIT: Final[_QuitSentinel] = _QuitSentinel()
+
+
+@dataclass
+class _PumpError:
+    """A feeder-side exception carried on the queue to be re-raised ON the
+    engine thread, exactly where the old inline ``input_fn`` call raised it
+    (preserves the CLI's exception semantics: EOFError ends the session,
+    anything else — StopIteration, injected KeyboardInterrupt — propagates).
+    """
+
+    exc: BaseException
+
+
+@dataclass
+class EngineContext:
+    """Everything the pump runs on, constructed ON the engine thread."""
+
+    loop: AgentLoop
+    flow: TxFlow
+    session: SendSession
+    table: DispatchTable
+    watcher: IncomingWatcher | None = None
+    client: EsploraClient | None = None
+
+
+@dataclass
+class EngineHandle:
+    """The transport's view of the engine thread (WEB-002 consumes this):
+    submit strings, read events from the sink, ``shutdown`` ends the session
+    after the in-flight turn. ``error`` carries a bootstrap failure.
+    """
+
+    commands: queue.Queue[Any]
+    emitter: EventEmitter
+    thread: threading.Thread | None = None
+    error: BaseException | None = None
+
+    def submit(self, line: str) -> None:
+        """Enqueue one user line / transcript command (bytes only — the
+        transport never touches the flow, the store, or a handler)."""
+        self.commands.put(line)
+
+    def shutdown(self) -> None:
+        """End the session AFTER the current turn completes (never-cancel)."""
+        self.commands.put(QUIT)
+
+
+def start_engine(
+    bootstrap: Callable[[], EngineContext],
+    sink: Callable[[EngineEvent], None],
+) -> EngineHandle:
+    """Start the dedicated engine thread (ADR-0024 §3, threaded mode).
+
+    ``bootstrap`` runs ON the engine thread — the Store (sqlite3 default
+    ``check_same_thread=True``) and the lazy Llama runtime MUST be created
+    inside it — and the pump then serves ``handle.commands`` there. The
+    CLI path (:func:`_repl`) runs the same pump with the main thread as the
+    engine; WEB-002's server supplies ``bootstrap`` over the real wiring.
+    """
+    handle = EngineHandle(commands=queue.Queue(), emitter=EventEmitter(sink))
+
+    def body() -> None:
+        try:
+            ctx = bootstrap()
+        # Deliberate: the bootstrap's failure travels VERBATIM to the thread
+        # joiner via handle.error (narrowing would hide e.g. a SystemExit
+        # raised during state construction).
+        except BaseException as exc:  # noqa: BLE001 — engine-thread bootstrap
+            handle.error = exc
+            return
+        _pump(
+            ctx.loop,
+            handle.emitter.text,
+            handle.commands,
+            flow=ctx.flow,
+            session=ctx.session,
+            table=ctx.table,
+            watcher=ctx.watcher,
+            client=ctx.client,
+            emitter=handle.emitter,
+        )
+
+    handle.thread = threading.Thread(target=body, name="engine", daemon=True)
+    handle.thread.start()
+    return handle
+
+
+def _stdin_feeder(
+    input_fn: Callable[[str], str],
+    commands: queue.Queue[Any],
+    ready: threading.Event,
+    stop: threading.Event,
+) -> None:
+    """CLI feeder: turns ``input_fn("you> ")`` lines into queue commands.
+
+    The ``ready``/``stop`` handshake paces reads so the prompt is printed
+    only after the previous turn's output AND the between-turns watch drain
+    completed — the exact order of the old single-threaded loop (the
+    feeder thread prints nothing itself; ``input_fn`` does). EOF becomes
+    QUIT; any other exception travels as :class:`_PumpError` and is
+    re-raised on the engine thread.
+    """
+    while not stop.is_set():
+        ready.wait()
+        ready.clear()
+        if stop.is_set():
+            return
+        try:
+            line = input_fn("you> ")
+        except EOFError:
+            commands.put(QUIT)
+            return
+        # Deliberate: EVERY feeder exception (StopIteration, injected
+        # KeyboardInterrupt included) travels on the queue to be re-raised
+        # on the engine thread, preserving the pre-pump CLI exception
+        # semantics exactly (ADR-0024 §3).
+        except BaseException as exc:  # noqa: BLE001 — forward to engine thread
+            commands.put(_PumpError(exc))
+            return
+        commands.put(line)
+
+
+def _pump(
+    loop: AgentLoop,
+    output_fn: Callable[[str], None],
+    commands: queue.Queue[Any],
+    *,
+    flow: TxFlow,
+    session: SendSession,
+    table: DispatchTable,
+    watcher: IncomingWatcher | None = None,
+    client: EsploraClient | None = None,
+    emitter: EventEmitter | None = None,
+    ready: threading.Event | None = None,
+) -> None:
+    """The transport-agnostic turn pump (ADR-0024 §3): blocking
+    ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
+
+    The only input is ``commands`` and the only output is ``output_fn`` (an
+    :meth:`EventEmitter.text` closure). Turns are never cancelled: every
+    dequeued command runs to completion and ``QUIT`` is honored between
+    turns; each processed turn ends with a ``turn_end`` marker (ids carry
+    the ordering WEB-002's ring buffer replays). The between-turns watch
+    drain (ADR-0019) is preserved. ``ready`` is the CLI feeder's pacing
+    hook (None for queue-native transports).
+    """
+    while True:
+        watch_count = _drain_watch(watcher, output_fn, client=client)
+        if watch_count:
+            loop.record_event("watch_events", watch_count)
+        if ready is not None:
+            ready.set()
+        command = commands.get()
+        if isinstance(command, _PumpError):
+            raise command.exc
+        if command is QUIT:
+            return
+        line = command.strip()
+        if not line:
+            continue
+        if line.lower() in ("exit", "quit"):
+            return
+        if line.startswith("/"):
+            _handle_transcript_command(
+                line, loop, output_fn, flow=flow, session=session
+            )
+        else:
+            _run_turn(
+                loop, flow, session, line, output_fn, client=client, table=table
+            )
+        if emitter is not None:
+            emitter.emit(EVENT_TURN_END)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Console entry point; delegates to :func:`run`."""
     return run(argv)
@@ -2648,25 +2904,6 @@ def _resolve_or_create_wallet(
     return store.create_wallet(name="default", descriptor=descriptor.descriptor)
 
 
-def _scan_progress_tick() -> None:
-    """One progress tick for the startup/``--rescan`` scan (TCK-UX-001).
-
-    Strict zero-argument callable — the shape ``scan_wallet``/
-    ``rescan_wallet`` invoke once per probed address. Value-free by
-    construction: it writes a single ``.`` onto the wrapping progress
-    line (started by :data:`SCAN_PROGRESS_NOTICE`) and never receives or
-    renders any address/index/amount data.
-    """
-    sys.stdout.write(".")
-    sys.stdout.flush()
-
-
-def _end_scan_progress_line() -> None:
-    """Close the progress-dot line: one newline + flush (TCK-UX-001)."""
-    sys.stdout.write("\n")
-    sys.stdout.flush()
-
-
 def _startup_scan(
     store: Store,
     client: EsploraClient,
@@ -2675,6 +2912,7 @@ def _startup_scan(
     rescan_requested: bool,
     output_fn: Callable[[str], None],
     gap_limit: int | None = None,
+    emitter: EventEmitter | None = None,
 ) -> None:
     """Run the startup scan (or ``--rescan`` repair scan); never fatal.
 
@@ -2686,12 +2924,36 @@ def _startup_scan(
     narration lines follow exactly as before. The background watcher's
     probe (``_make_watch_probe``) passes no callback and stays silent.
 
+    TCK-WEB-001 (packaging prerequisite, ADR-0024 §12): the dots flow
+    through the engine's event stream — ``progress`` events on the given
+    ``emitter``, a CLI emitter by default, so stdout stays byte-identical
+    for the terminal while a non-CLI transport receives them as events
+    instead of leaking them onto the console.
+
     A chain/scan/store failure prints a scrubbed warning (scan, chain,
     store, and key error strings are value-free by contract) and the
     REPL still starts — handlers surface the resulting store-empty
     states per turn. The summary lines carry counts and the tip height
     only — never addresses or amounts.
     """
+    if emitter is None:
+        emitter = cli_emitter(output_fn)
+
+    def dot() -> None:
+        """One progress tick (TCK-UX-001): a bare ``.`` as a progress event.
+
+        Strict zero-argument callable — the shape ``scan_wallet``/
+        ``rescan_wallet`` invoke once per probed address. Value-free by
+        construction: the CLI emitter writes it onto the wrapping progress
+        line (started by :data:`SCAN_PROGRESS_NOTICE`); it never receives or
+        renders any address/index/amount data.
+        """
+        emitter.emit(EVENT_PROGRESS, ".")
+
+    def end_line() -> None:
+        """Close the progress-dot line: one newline (TCK-UX-001)."""
+        emitter.emit(EVENT_PROGRESS, "\n")
+
     auto_scan = os.environ.get(AUTO_SCAN_ENV_VAR, "").strip() != "0"
     if rescan_requested:
         output_fn(SCAN_PROGRESS_NOTICE)
@@ -2701,7 +2963,7 @@ def _startup_scan(
                 client,
                 wallet,
                 gap_limit=gap_limit,
-                progress_fn=_scan_progress_tick,
+                progress_fn=dot,
             )
         except (
             ChainError,
@@ -2710,10 +2972,10 @@ def _startup_scan(
             StoreError,
             sqlite3.Error,
         ) as exc:
-            _end_scan_progress_line()
+            end_line()
             output_fn(f"warning: rescan failed: {exc} — continuing with cached state.")
             return
-        _end_scan_progress_line()
+        end_line()
         output_fn(_rescan_summary_line(summary))
         return
     if not auto_scan:
@@ -2725,7 +2987,7 @@ def _startup_scan(
             client,
             wallet,
             gap_limit=gap_limit,
-            progress_fn=_scan_progress_tick,
+            progress_fn=dot,
         )
     except (
         ChainError,
@@ -2734,10 +2996,10 @@ def _startup_scan(
         StoreError,
         sqlite3.Error,
     ) as exc:
-        _end_scan_progress_line()
+        end_line()
         output_fn(f"warning: startup scan failed: {exc} — continuing with cached state.")
         return
-    _end_scan_progress_line()
+    end_line()
     output_fn(
         f"Startup scan complete: {summary.utxo_count} UTXOs · "
         f"tip height {summary.tip_height}."
@@ -2852,8 +3114,17 @@ def _repl(
     watcher: IncomingWatcher | None = None,
     client: EsploraClient | None = None,
     table: DispatchTable,
+    emitter: EventEmitter | None = None,
 ) -> None:
-    """Read user lines until EOF/exit and print each turn's outcome.
+    """The CLI transport over the engine pump (TCK-WEB-001, ADR-0024 §3).
+
+    Reads user lines until EOF/exit and prints each turn's outcome — with
+    the SAME queue-driven :func:`_pump` the threaded engine runs, this main
+    thread being the engine (CLI behavior unchanged, including the
+    between-turns :func:`_drain_watch` tick and the exact prompt/output
+    order; :func:`_stdin_feeder` paces the reads via the ready/stop
+    handshake). ``emitter`` overrides the CLI event routing (harness/web
+    seam); by default output flows through :func:`cli_emitter`.
 
     ``table`` is the allowlist dispatch table the loop runs on — forwarded
     to :func:`_run_turn` for the deterministic CONFIRMED-retry re-sign
@@ -2862,41 +3133,37 @@ def _repl(
 
     The flow/session pair is owned by this loop's caller (:func:`run`);
     every turn runs through :func:`_run_turn` so the confirm gate sees
-    the raw utterance before the model does. Between turns the background
-    watch (ADR-0019) is drained: a due poll cycle runs and its events are
-    narrated before the next prompt (and their value-free count is recorded
-    into the session summary, R13). ``client`` is forwarded to the drain so
-    each cycle can compute the time-since-block narration suffix (NOTE-2)
-    and to the ETA fact (TCK-P5-002).
-
-    Transcript commands (OQ14, ADR-0020): lines beginning with ``/`` are
-    deterministic UI commands, never model intents — ``/details`` reprints
-    the last full confirmation-card render (TCK-UX-002), ``/export
-    <path>`` writes a redacted transcript, ``/scrub`` clears the
-    in-memory transcript/summary, ``/help`` lists them. There is no
-    protocol change.
+    the raw utterance before the model does. Transcript commands (OQ14,
+    ADR-0020) are handled by the pump (deterministic UI, never model
+    intents). There is no protocol change.
     """
-    while True:
-        watch_count = _drain_watch(watcher, output_fn, client=client)
-        if watch_count:
-            loop.record_event("watch_events", watch_count)
-        try:
-            line = input_fn("you> ")
-        except EOFError:
-            return
-        line = line.strip()
-        if not line:
-            continue
-        if line.lower() in ("exit", "quit"):
-            return
-        if line.startswith("/"):
-            _handle_transcript_command(
-                line, loop, output_fn, flow=flow, session=session
-            )
-            continue
-        _run_turn(
-            loop, flow, session, line, output_fn, client=client, table=table
+    commands: queue.Queue[Any] = queue.Queue()
+    ready = threading.Event()
+    stop = threading.Event()
+    if emitter is None:
+        emitter = cli_emitter(output_fn)
+    threading.Thread(
+        target=_stdin_feeder,
+        args=(input_fn, commands, ready, stop),
+        name="repl-stdin",
+        daemon=True,
+    ).start()
+    try:
+        _pump(
+            loop,
+            emitter.text,
+            commands,
+            flow=flow,
+            session=session,
+            table=table,
+            watcher=watcher,
+            client=client,
+            emitter=emitter,
+            ready=ready,
         )
+    finally:
+        stop.set()
+        ready.set()
 
 
 #: Fallback wording for an unparseable ``/`` command (value-free).

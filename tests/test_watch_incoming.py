@@ -230,13 +230,26 @@ def test_incoming_tx_without_address_amount_recorded_but_not_surfaced():
 
 
 def test_poller_is_tick_driven_and_spawns_no_thread():
-    """Pin the single-threaded design (ADR-0019): tick is synchronous, no sleep."""
+    """Pin the watcher's own tick design (ADR-0019 §2, as amended by
+    ADR-0024): ``tick`` is synchronous (no sleep) and the WATCHER spawns no
+    poller thread.
+
+    The old pin asserted ``threading.enumerate() == 1`` (the whole process
+    was one thread). That exact form is retired as planned work for the
+    threaded world (ADR-0019 amendment / ADR-0024 §3): the CLI REPL now
+    runs the queue pump with a stdin feeder thread, and engine-thread mode
+    lives behind ``app.start_engine`` (pinned in tests/test_engine_pump.py).
+    The load-bearing half stays: a tick must not spawn anything — asserted
+    as a thread-set DELTA around the call, which is transport-mode
+    agnostic. The dedup/surfacing pins are unchanged.
+    """
     import threading
 
     watcher = IncomingWatcher(probe=lambda: [_watched()], interval_s=60.0)
-    assert len(threading.enumerate()) == 1  # main thread only; no poller thread
+    before = set(threading.enumerate())
     events = watcher.tick()  # no real sleeps, returns immediately
     assert len(events) == 1
+    assert set(threading.enumerate()) == before  # the watcher spawns no thread
 
 
 # ---------------------------------------------------------------- interval / off gating

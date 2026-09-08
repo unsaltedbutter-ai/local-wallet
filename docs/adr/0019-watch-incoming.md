@@ -1,7 +1,8 @@
 # ADR-0019: `watch_incoming` — tick-driven polling, surfacing, and privacy
 
-- **Status:** Accepted
-- **Date:** 2026-09-03
+- **Status:** Accepted; §2 amended by ADR-0024 (web-world threading) — see
+  the Amendment section at the end.
+- **Date:** 2026-09-03 (amended 2026-09-07)
 - **Decides:** The Phase 5 (TCK-P5-001) `watch_incoming` first slice: the
   polling loop + thread model, how incoming txs are surfaced (and whether a
   new model intent is introduced), the mempool time-since-block helper, and
@@ -64,7 +65,9 @@ thread or event queue — the returned list IS the "events list the CLI drains
 and prints". The single-threaded design is pinned by a test (no poller
 thread exists; `tick` is synchronous and deterministic). A true background
 thread with its own store connection is explicitly deferred; revisit only if
-real-time (no-user-interaction) surfacing is required.
+real-time (no-user-interaction) surfacing is required. *(Superseded for the
+threaded world by the ADR-0024 amendment at the end of this document; the CLI
+keeps this design.)*
 
 ### 3. Polling reuses the SINGLE config-selected EsploraClient
 
@@ -155,3 +158,32 @@ user's addresses — a larger privacy cost than on-demand queries. Decision:
   confirmed-transition, interval/off config matrix, malformed env fails
   closed, time-since-block integer math + tolerant parsing, tick-driven
   pin, app probe + narration.
+
+## Amendment (2026-09-07, ADR-0024 decision 9): web-world threading
+
+The single-threaded tick-driven poller of ADR-0019 §2 remains the CLI-world
+design, but is superseded for the threaded world by ADR-0024's threading
+model: a **single state-owning engine thread** owns all state (store, flow,
+watcher dedup, agent loop); **stateless transport threads** (HTTP/SSE)
+marshal bytes only; and chain I/O runs on a **dedicated worker with no store
+access**, posting immutable result sets to the engine, which is the **only**
+persister (`Store.persist_scan_result`, the single atomic transaction). The
+watch poll — like the startup scan — is chain I/O and therefore runs on that
+worker in the web world (ADR-0022), not on the engine thread and not on a
+transport thread.
+
+ADR-0019 §2's "A true background thread with its own store connection is
+explicitly deferred" and its single-threaded no-poller-thread pin are
+**retired as planned work** for the threaded world: the dedicated chain
+worker has **no store access** (so "its own store connection" is not what it
+does — the engine persists), and the no-poller-thread test pin in
+**`tests/test_watch_incoming.py`** (the "single-threaded design (ADR-0019):
+tick is synchronous, no sleep / no poller thread" test, which asserted
+`threading.enumerate() == 1`) is superseded by the worker model and retired
+as of TCK-WEB-001/ADR-0024: the pin is re-scoped to the thread DELTA around
+`tick()` (the watcher itself must still spawn nothing), and engine-thread
+mode is covered by the pump harness in `tests/test_engine_pump.py`. The CLI
+retains the between-turns tick where no background thread is needed
+(ADR-0022 decides the exact split); the privacy decision (§6), the dedup
+map, and the surfacing (dispatcher-owned facts, quoted verbatim, never
+logged or passed to the model) are unchanged.
