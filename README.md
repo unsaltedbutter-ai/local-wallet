@@ -48,10 +48,22 @@ seed phrases in the app.
   you approved.
 - **Mainnet-only.** Testnet keys and addresses are refused at parse.
 
-## Quick start
+## Install
 
-Requires **Python 3.12+** (never 3.14 — hwilib/protobuf break on it). Create a
-venv and install:
+Requires **Python 3.12+** (never 3.14 — hwilib/protobuf break on it). The
+one-shot installer clones the repo, sets up a venv, and is idempotent:
+
+```sh
+curl -fsSL https://unsaltedbutter.ai/install | bash
+```
+
+It detects your OS/arch, ensures a compatible Python, and can download the
+hash-pinned model (optional). See [docs/install.md](docs/install.md) for
+manual steps, uninstall, and troubleshooting.
+
+## Quick start (development)
+
+Create a venv and install:
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
