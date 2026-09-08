@@ -26,26 +26,32 @@ const settingsListEl = document.getElementById("settings-list");
 // One map for every user-facing string this file injects (designer pass —
 // button labels live in index.html markup, likewise for rewording).
 const LABELS = {
-  resyncGap: "Reconnected — some earlier events may be missing.",
+  resyncGap: "Reconnected — some earlier messages may be missing.",
   queuedTag: "queued",
-  unreachable: "Could not reach the wallet server. Is it still running?",
+  unreachable:
+    "Could not reach the wallet server — is it still running? Check the terminal where you started it.",
   // scan chip (TCK-WEB-005) — honest states straight from /state's scan_state
-  scanLoading: "Wallet loading — balances may be stale until the first scan completes.",
-  scanSkipped: "Scanning skipped.",
+  scanLoading:
+    "Wallet loading — balances may be incomplete until the first scan finishes.",
+  scanSkipped: "First scan failed — balances may be incomplete.",
   // settings panel (TCK-WEB-005)
   settingsLoading: "Loading…",
   settingsUnavailable: "Could not load settings — the wallet is busy or unreachable.",
   settingsApply: "Apply",
   settingsSaving: "Saving…",
   settingsApplied: "Applied.",
-  settingsRejected: "Rejected.",
+  settingsRejected: "Rejected — no reason given.",
   settingsRejectedPrefix: "Rejected:",
   settingsBusy: "The wallet is busy — try again.",
   settingsFailed: "Could not save — try again.",
   settingsRestart: "Takes effect after restart.",
-  settingsEmptyIsDefault: "Empty = public default.",
+  // split per docs/ux-web-copy.md §3: short form in the field, full
+  // privacy-disclosure line under it
+  settingsEmptyPlaceholder: "Empty = public default",
+  settingsEmptyIsDefault:
+    "Empty = public default — its operator can link your queries to your IP.",
   settingsEnvOverride: "Set via environment variable — edit there or remove it.",
-  settingsRange: (min, max) => `Must be a whole number between ${min} and ${max}.`,
+  settingsRange: (min, max) => `Enter a whole number between ${min} and ${max}.`,
 };
 
 // Which buttons the typed /state snapshot shows, per flow position. The
@@ -296,7 +302,10 @@ async function listen() {
       const response = await fetch("/events", { headers, cache: "no-store" });
       if (response.status === 401) {
         state.stopped = true;
-        setStatus("unauthorized", "Not authorized — reload this page.");
+        setStatus(
+          "unauthorized",
+          "This page's session no longer matches the wallet — reload this page.",
+        );
         return;
       }
       if (!response.ok || !response.body) throw new Error(String(response.status));
@@ -386,7 +395,7 @@ function settingRow(entry, index) {
     input.min = String(entry.min);
     input.max = String(entry.max);
   }
-  if (entry.type === "url") input.placeholder = LABELS.settingsEmptyIsDefault;
+  if (entry.type === "url") input.placeholder = LABELS.settingsEmptyPlaceholder;
   const btn = el("button", "btn btn-secondary setting-apply", LABELS.settingsApply);
   btn.type = "button";
   btn.dataset.settingKey = entry.key;
@@ -511,7 +520,10 @@ if (!token) {
   // The island is server-injected; absence means this file was not served
   // by the wallet server. Nothing here can work without it.
   state.stopped = true;
-  setStatus("down", "No session token — open the page served by local-wallet.");
+  setStatus(
+    "down",
+    "This page wasn't opened from your wallet — start local-wallet and open the address it prints.",
+  );
   inputEl.disabled = true;
   sendBtn.disabled = true;
 } else {
