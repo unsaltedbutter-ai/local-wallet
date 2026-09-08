@@ -254,7 +254,9 @@ def test_happy_scan_request_ordering_is_sequential_and_deterministic(
     store: Store,
 ) -> None:
     """Branch 0 before branch 1, indices ascending, txs before utxos per
-    branch, tip first — exactly one txs + one utxo call per window address."""
+    branch, tip first — one txs call per window address, one utxo call
+    per address whose txs result was non-empty (TCK-SCAN-001: empty
+    history ⇒ no UTXO fetch)."""
     chain = FakeChain(txs=_used_at({2: "cc" * 32}, 0))
     scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
 
@@ -262,11 +264,61 @@ def test_happy_scan_request_ordering_is_sequential_and_deterministic(
     expected = [
         ("tip", None),
         *[("txs", ADDRS[0][i]) for i in range(23)],  # window 0..22 (2 + gap 20)
-        *[("utxo", ADDRS[0][i]) for i in range(23)],
+        ("utxo", ADDRS[0][2]),  # the ONLY branch-0 address with txs
         *[("txs", ADDRS[1][i]) for i in range(20)],
-        *[("utxo", ADDRS[1][i]) for i in range(20)],
+        # branch 1 fully empty: zero utxo calls (TCK-SCAN-001)
     ]
     assert chain.requests == expected
+
+
+def test_fresh_wallet_skips_utxo_fetch_for_empty_addresses(store: Store) -> None:
+    """TCK-SCAN-001 call-count pin: fresh 2-branch wallet at the default
+    gap 20 — every probe returns an empty history. Before the skip:
+    81 calls (1 tip + 40 txs + 40 utxo). After: 41 (1 tip + 40 txs + 0
+    utxo). Persist/reconcile semantics are unchanged — every probed
+    address is still derived and stored (window rows, cursor,
+    derivation) and the progress callback still ticks once per probe."""
+    wid = _wallet_id(store)
+    chain = FakeChain()
+    ticks: list[None] = []
+    summary = scan_wallet(
+        store, chain.client(), store.get_wallet_by_name("main"), progress_fn=lambda: ticks.append(None)
+    )
+
+    kinds = [kind for kind, _ in chain.requests]
+    assert kinds.count("tip") == 1
+    assert kinds.count("txs") == 40  # 20 probes per branch (gap-stop)
+    assert kinds.count("utxo") == 0
+    assert len(chain.requests) == 41
+    assert len(ticks) == 40  # TCK-UX-001: dots unchanged, one per probe
+    assert (summary.branches[0].scanned, summary.branches[1].scanned) == (20, 20)
+    # Byte-identical persistence except for the skipped HTTP calls:
+    assert [a.index for a in store.get_addresses(wid, 0)] == list(range(20))
+    assert [a.index for a in store.get_addresses(wid, 1)] == list(range(20))
+    assert all(a.status == "unused" for a in store.get_addresses(wid, 0))
+    assert store.get_utxos_for_wallet(wid) == []
+    assert summary.utxo_count == 0
+
+
+def test_funded_address_still_gets_utxo_fetch(store: Store) -> None:
+    """TCK-SCAN-001 counter-pin: usage at index 0 of branch 0 — its utxo
+    IS fetched (and only its, gap-20 fresh wallet: 1 tip + 41 txs +
+    1 utxo = 43 calls) and the snapshot lands."""
+    wid = _wallet_id(store)
+    chain = FakeChain(
+        txs=_used_at({0: "aa" * 32}, 0),
+        utxos={ADDRS[0][0]: [utxo_entry("aa" * 32, 0, 5_000)]},
+    )
+    summary = scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
+
+    utxo_calls = [a for kind, a in chain.requests if kind == "utxo"]
+    assert utxo_calls == [ADDRS[0][0]]
+    assert len([1 for kind, _ in chain.requests if kind == "txs"]) == 41  # 21 + 20
+    assert len(chain.requests) == 1 + 41 + 1 == 43
+    assert summary.utxo_count == 1
+    assert [(u.txid, u.value_sats) for u in store.get_utxos_for_wallet(wid)] == [
+        ("aa" * 32, 5_000)
+    ]
 
 
 # ------------------------------------------------------- gap policy / R3 warn
@@ -347,6 +399,7 @@ def test_utxo_snapshot_replaces_stale_cache(store: Store) -> None:
     ]
     store.replace_utxos_for_wallet(wid, junk)
     chain = FakeChain(
+        txs=_used_at({0: "aa" * 32, 7: "dd" * 32}, 0),  # funded addrs have txs
         utxos={
             ADDRS[0][0]: [
                 utxo_entry("aa" * 32, 0, 50_000),
@@ -383,7 +436,11 @@ def test_malformed_utxo_payload_fails_closed_and_keeps_old_snapshot(
     wid = _wallet_id(store)
     junk = [UtxoRecord(wid, "f" * 64, 0, "bc1qjunk", 999, 1, 10)]
     store.replace_utxos_for_wallet(wid, junk)
-    chain = FakeChain(utxos={ADDRS[0][0]: [broken]})
+    # The malformed utxo endpoint must still be probed: give its address a
+    # transaction so the TCK-SCAN-001 empty-history skip does not apply.
+    chain = FakeChain(
+        txs=_used_at({0: "aa" * 32}, 0), utxos={ADDRS[0][0]: [broken]}
+    )
     with pytest.raises(ScanError):
         scan_wallet(store, chain.client(), store.get_wallet_by_name("main"))
     assert store.get_utxos_for_wallet(wid) == junk  # snapshot untouched
@@ -752,11 +809,13 @@ def test_ceiling_terminates_walk_and_marks_truncated(store: Store) -> None:
     indexes0 = [a.index for a in store.get_addresses(wid, 0)]
     assert indexes0 == list(range(_MAX_WINDOW_ADDRESSES))
 
-    # Probe budget as a consequence: ≤ ceiling txs + ceiling utxo per branch.
+    # Probe budget as a consequence: ≤ ceiling txs + ceiling utxo per
+    # branch. Fully-used branch 0: utxo fetched for every window address.
+    # Empty branch 1: TCK-SCAN-001 skip — zero utxo calls.
     txs_calls = [a for kind, a in chain.requests if kind == "txs"]
     utxo_calls = [a for kind, a in chain.requests if kind == "utxo"]
     assert len(txs_calls) == _MAX_WINDOW_ADDRESSES + 20  # b0 ceiling + b1 gap-stop
-    assert len(utxo_calls) == _MAX_WINDOW_ADDRESSES + 20
+    assert len(utxo_calls) == _MAX_WINDOW_ADDRESSES  # b0 only (b1 never fetched)
     # Every branch-0 probe is inside the ceiling window.
     assert set(txs_calls[:_MAX_WINDOW_ADDRESSES]) == set(ADDRS_FULL[0])
 
@@ -829,7 +888,9 @@ def test_rescan_is_bounded_by_the_same_ceiling(store: Store) -> None:
     txs_calls = [a for kind, a in chain.requests if kind == "txs"]
     utxo_calls = [a for kind, a in chain.requests if kind == "utxo"]
     assert len(txs_calls) <= _MAX_WINDOW_ADDRESSES + 20
-    assert len(utxo_calls) <= _MAX_WINDOW_ADDRESSES + 20
+    # TCK-SCAN-001: only branch 0 (fully used) has utxo fetches; the
+    # empty branch 1's gap-window is never fetched.
+    assert len(utxo_calls) == _MAX_WINDOW_ADDRESSES
 
 
 # ------------------------------------------------ progress callback (TCK-UX-001)

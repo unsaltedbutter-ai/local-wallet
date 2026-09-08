@@ -245,14 +245,23 @@ class AssertionTransport:
             return httpx.Response(200, json=PRICES)
         parts = path.rstrip("/").split("/")
         kind = parts[-1] if parts else ""
+        addr0 = derive_addresses(WalletDescriptor.from_key(ZPUB).parsed, 0, 0, 1)[0].address
         if kind == "utxo":
             # Fund the first receive address with one 100_000-sat UTXO so the
             # create_tx path can select coins (proving fees+price fire).
-            addr0 = derive_addresses(WalletDescriptor.from_key(ZPUB).parsed, 0, 0, 1)[0].address
             return httpx.Response(200, json=[{"txid": "d" * 64, "vout": 0, "value": 100_000,
                                               "status": {"confirmed": True}}]
                                   if request.url.path.endswith(f"/{addr0}/utxo") else [])
         if kind == "txs":
+            # Chain-truthful mirror (TCK-SCAN-001): the scan only fetches
+            # /utxo for addresses with history, so the funded address must
+            # serve its funding transaction here.
+            if request.url.path.endswith(f"/{addr0}/txs"):
+                return httpx.Response(200, json=[{
+                    "txid": "d" * 64,
+                    "vout": [{"scriptpubkey_address": addr0, "value": 100_000}],
+                    "status": {"confirmed": True},
+                }])
             return httpx.Response(200, json=[])
         return httpx.Response(404, json=None)
 

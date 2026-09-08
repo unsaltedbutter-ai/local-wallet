@@ -32,3 +32,6 @@
 
 ## MW-8: Phase 6 packaging prerequisites (later)
 - [ ] Apple Developer account (signed/notarized macOS builds) + Windows box (driver/packaging matrix, OQ10).
+
+## MW-10: Web-UI manual matrix (after TCK-WEB-004)
+- [ ] localhost matrix: macOS/Windows/Linux × VPN/proxy/firewall-on; both `localhost` and `127.0.0.1` URLs; multi-tab; kill-and-reconnect replay (Last-Event-ID); confirm/cancel/sign buttons vs CLI parity.

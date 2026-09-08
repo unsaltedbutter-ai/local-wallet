@@ -17,9 +17,15 @@ key instead of trusting cached rows — its history is fetched with
 stops after ``gap_limit`` consecutive unused addresses, so the scanned
 window is ``[0, last_used_index + gap_limit]``: usage at index 3 with the
 default gap of 20 stops at index 23. Afterwards the UTXO endpoint is
-queried for every window address and the union becomes the new
-wallet-wide UTXO snapshot (replaced wholesale inside the atomic persist —
-the previous set is fully replaced).
+queried for every window address whose ``/txs`` result was non-empty and
+the union becomes the new wallet-wide UTXO snapshot (replaced wholesale
+inside the atomic persist — the previous set is fully replaced).
+Addresses with an empty history are skipped (TCK-SCAN-001): an address
+with no transactions (confirmed *or* mempool — the txs listing includes
+unconfirmed entries) cannot hold UTXOs, so their ``/utxo`` fetch would
+always return ``[]``. Every probed address is still derived, windowed,
+and persisted exactly as before — only the redundant HTTP call is
+dropped (fresh 2-branch wallet at gap 20: 40 utxo calls saved per scan).
 
 Any address that can still hold a live UTXO appears inside the window:
 its funding transaction shows up in its history, marks it used, and
@@ -28,8 +34,8 @@ on addresses cached beyond the current window.
 
 Ordering (rate-limit friendly): strictly sequential; per branch indices
 ascend, transactions are fetched before UTXOs, branch 0 runs before
-branch 1. Exactly one txs call and one utxo call per scanned window
-address.
+branch 1. Exactly one txs call per scanned window address, and one utxo
+call per window address whose txs result was non-empty (TCK-SCAN-001).
 
 Absolute per-branch window ceiling (TCK-SEC-002): the gap-limited walk
 above is unbounded when usage itself is attacker-driven — an observer of
@@ -174,7 +180,8 @@ class BranchScanSummary:
     """Per-branch outcome of one scan."""
 
     branch: int
-    #: Number of window addresses queried (txs + utxos each).
+    #: Number of window addresses probed (txs each; utxo only for
+    #: addresses with a non-empty txs result, TCK-SCAN-001).
     scanned: int
     #: Highest index scanned (the stop index).
     window_last_index: int
@@ -345,7 +352,7 @@ def _run_scan(
 
     for branch in BRANCHES:
         existing = {r.index: r for r in store.get_addresses(wallet_id, branch)}
-        final_map, branch_truncated = _walk_history(
+        final_map, branch_truncated, funded = _walk_history(
             client,
             descriptor.parsed,
             branch,
@@ -357,7 +364,7 @@ def _run_scan(
         )
         used_indices, max_used_index, last_index = _summarize_walk(final_map, raw_txs)
         utxo_records.extend(
-            _scan_utxos(client, wallet_id, branch, final_map)
+            _scan_utxos(client, wallet_id, branch, final_map, funded)
         )
 
         next_index = (
@@ -486,14 +493,17 @@ def _walk_history(
     gap: int,
     rebuild: bool,
     progress_fn: Callable[[], None] | None = None,
-) -> tuple[dict[int, str], bool]:
+) -> tuple[dict[int, str], bool, set[str]]:
     """Walk one branch ascending until ``gap`` consecutive unused addresses.
 
-    Returns ``(final_map, truncated)`` — the ``{index: address}`` window
-    map and whether the walk stopped at the absolute window ceiling
+    Returns ``(final_map, truncated, funded)`` — the ``{index: address}``
+    window map, whether the walk stopped at the absolute window ceiling
     (``_MAX_WINDOW_ADDRESSES``) instead of the gap condition (TCK-SEC-002:
     usage is attacker-derivable, so the walk is absolutely bounded; the
-    ceiling — not ``used + gap`` — is the hard stop). At most
+    ceiling — not ``used + gap`` — is the hard stop), and the set of
+    addresses whose ``/txs`` result was non-empty (``funded``: the only
+    addresses that can hold UTXOs — the caller skips their ``/utxo``
+    fetch otherwise, TCK-SCAN-001). At most
     ``_MAX_WINDOW_ADDRESSES`` indices (0 .. ceiling − 1) are ever derived
     or probed, so the per-branch request budget is
     ≤ ``_MAX_WINDOW_ADDRESSES`` txs + ``_MAX_WINDOW_ADDRESSES`` utxo
@@ -512,6 +522,7 @@ def _walk_history(
     """
     deriver = BranchDeriver(parsed, branch)
     final_map: dict[int, str] = {}
+    funded: set[str] = set()
     consecutive_unused = 0
     index = 0
     while True:
@@ -529,17 +540,18 @@ def _walk_history(
         # Validate the whole payload before acting on any of it.
         validated = [_parse_tx_entry(entry) for entry in entries]
         if validated:
+            funded.add(address)
             for raw in validated:
                 raw_txs.setdefault(raw.txid, raw)
             consecutive_unused = 0
         else:
             consecutive_unused += 1
         if consecutive_unused >= gap:
-            return final_map, False
+            return final_map, False, funded
         if index + 1 >= _MAX_WINDOW_ADDRESSES:
             # Absolute ceiling reached with usage still live: stop walking
             # and report truncation (the caller marks the scan result).
-            return final_map, True
+            return final_map, True, funded
         index += 1
 
 
@@ -585,10 +597,21 @@ def _scan_utxos(
     wallet_id: int,
     branch: int,
     final_map: dict[int, str],
+    funded: set[str],
 ) -> list[UtxoRecord]:
-    """Fetch and strictly validate UTXOs for every window address."""
+    """Fetch and strictly validate UTXOs for the window's *funded* addresses.
+
+    ``funded`` is the set of addresses whose ``/txs`` walk result was
+    non-empty; an address with no transactions (confirmed or mempool —
+    the txs listing includes unconfirmed entries) cannot hold UTXOs, so
+    its ``/utxo`` fetch is skipped outright (TCK-SCAN-001: fresh-wallet
+    startup halves the call count; the skipped fetch would always
+    return ``[]`` against a truthful Esplora).
+    """
     records: list[UtxoRecord] = []
     for _, address in sorted(final_map.items()):
+        if address not in funded:
+            continue
         payload = client.get_address_utxos(address)
         for position, entry in enumerate(payload):
             txid, vout, value, confirmed, height = _parse_utxo_entry(

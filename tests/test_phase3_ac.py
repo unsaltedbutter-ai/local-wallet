@@ -332,8 +332,11 @@ def test_ac2_full_lifecycle_file_signer_production_path(
         wallet_row = store.get_wallet_by_name("default")
         assert wallet_row is not None
         rows = store.get_txs_for_wallet(wallet_row.id)
+        # The funded UTXO's funding tx rides along in history (the mock
+        # chain serves the truthful mirror, TCK-SCAN-001).
         assert [(r.txid, r.height, r.direction) for r in rows] == [
-            (expected_txid, None, "out")
+            (expected_txid, None, "out"),
+            ("d" * 64, None, "in"),
         ]
     # History narration shows the outbound row.
     assert f"tx {expected_txid[:12]}… out unconfirmed" in joined
