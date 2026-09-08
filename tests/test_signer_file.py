@@ -140,6 +140,17 @@ class TestExport:
             signer.export_unsigned(signed, "abc12345")
         assert "different content" in str(exc.value)
 
+    def test_binary_sibling_tampered_refused_on_same_text(self, signer, folder):
+        # The .b64 text matches (idempotent path passes), so only a tampered
+        # binary sibling can trip the mismatch — reaching file.py:316-320.
+        signed = sign_psbt(build_unsigned())
+        signer.export_unsigned(signed, "abc12345")
+        binary = folder / "localwallet-unsigned-abc12345.psbt"
+        binary.write_bytes(b"psbt\xff\x00tampered")
+        with pytest.raises(SignerError) as exc:
+            signer.export_unsigned(signed, "abc12345")
+        assert "different content" in str(exc.value)
+
     def test_creates_directory_if_missing(self, tmp_path: Path):
         target = tmp_path / "does" / "not" / "exist"
         assert not target.exists()
