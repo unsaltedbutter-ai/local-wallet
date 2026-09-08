@@ -1,9 +1,9 @@
 # ADR-0022: Non-blocking startup scan — dedicated chain worker, engine-only persistence, and cache freshness
 
 - **Status:** Accepted (revised per the web-architecture consult 2026-09-07;
-  drafted TOGETHER with ADR-0024 so the threading models agree; implementation
-  ticket TCK-SCAN-002/003).
-- **Date:** 2026-09-07
+  reconciliation recorded 2026-09-08; drafted TOGETHER with ADR-0024 so the
+  threading models agree; implementation ticket TCK-SCAN-002/003).
+- **Date:** 2026-09-07 (reconciled 2026-09-08)
 - **Decides:** How the startup scan runs **non-blocking** in BOTH the CLI and
   the web worlds, and how cache-served answers during the first scan are honestly
   freshness-flagged. The original cooperative-chunked design is rejected in
@@ -50,7 +50,8 @@ worker removes chain I/O from the engine thread entirely.
 
 ## Decision
 
-1. **The startup scan is non-blocking in BOTH the CLI and web worlds.** The scan
+1. **The startup scan is non-blocking in BOTH the CLI and web worlds, superseding
+   the blocking startup-scan behavior of ADR-0019's startup/load path.** The scan
    runs concurrently with the app being usable; the CLI prompt becomes live before
    the scan finishes (in the CLI, the between-turns drain can still observe scan
    progress), and in the web world the UI stays responsive throughout.
@@ -82,8 +83,10 @@ worker removes chain I/O from the engine thread entirely.
 
 5. **Freshness flag on cache-served answers during the first scan.** While the
    first scan has not completed, an answer served from the (possibly empty or
-   partial) cache carries a **deterministic, tool-owned freshness flag**
-   (`stale=true` in the handler result / FACTS). The flag is:
+   partial) cache carries a **deterministic, tool-owned freshness flag** — the
+   handler result / FACTS key `freshness`, with the closed values `'fresh'` (the
+   first scan has completed) or `'stale'` (the first scan is still running). The
+   flag is:
 
    - **tool-owned** — produced by code from the scan's completion state, never by
      the model;
@@ -115,6 +118,20 @@ worker removes chain I/O from the engine thread entirely.
    The `confirm_tx`/`sign_tx`/`broadcast_tx` lifecycle is unaffected: it is
    gated by the ADR-0013 state machine regardless.
 
+7. **ADR-0019 §2 no-poller-thread test pin retired here as PLANNED work.** The
+   `tests/test_watch_incoming.py` pin that asserted a single-threaded design
+   (`threading.enumerate() == 1` — "tick is synchronous, no sleep / no poller
+   thread") was already retired for the threaded world by ADR-0019's 2026-09-07
+   amendment (landed from ADR-0024 decision 9). This ADR records the retirement
+   as **PLANNED work executed by TCK-SCAN-003** and reconciles, not contradicts,
+   that amendment: the pin is re-scoped to the thread **delta** around `tick()`
+   (the watcher itself must still spawn nothing — it only reads `poll_due`/`tick`
+   from whatever thread drives it), engine-thread mode is covered by the pump
+   harness in `tests/test_engine_pump.py`, and the dedicated chain worker holds
+   no store access (it is not ADR-0019's deferred "thread with its own store
+   connection"). CLI-world polls keep the between-turns tick where no background
+   thread is needed (ADR-0024 decision 9 / decision 4 above decide the split).
+
 ## Why cooperative-chunking lost (consult F1)
 
 The original design resumed the scan across REPL ticks to preserve ADR-0019's
@@ -140,6 +157,14 @@ as-is), `tests/` (worker no-store-access pin, engine-only-persist pin, freshness
 flag matrix, `create_tx`-refuses-pre-first-scan, CLI prompt-live-before-scan,
 dots-between-turns), and evals (stale-flag narration fixtures: the model must not
 author a freshness claim).
+
+**Pins that change (decision 7):** the `threading.enumerate() == 1` no-poller-thread
+pin in `tests/test_watch_incoming.py` is re-scoped to the thread delta around
+`tick()` (the watcher spawns nothing) and engine-thread mode is covered by
+`tests/test_engine_pump.py`; the new worker no-store-access and engine-only-persist
+pins replace any "worker with its own connection" assumption. The CLI startup
+prompt-liveness and the `create_tx` refusal are new pins; the stale-flag narration
+fixture is an eval gate.
 
 **Halves:** the **CLI half** ships with TCK-SCAN-003 (app.py + scan.py split +
 tests + evals; REPL prompt live <1 s; stale-flagged answers; `create_tx` blocked
