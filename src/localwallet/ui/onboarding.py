@@ -207,20 +207,24 @@ WEB_SETUP_HINT: Final[str] = (
 #: Refusal + redirect when the key prompt receives seed-word-shaped input.
 KEY_SEED_REFUSAL: Final[str] = (
     "That looks like seed words — please never share those with anyone, "
-    "and this app could not use them anyway: it is watch-only and works "
-    "with your xpub or zpub only. Type 'help' and I'll point you at where "
-    "to find it, or 'exit' to quit."
+    "and this app is HARDWARE-WALLET-ONLY: it never handles seed phrases "
+    "or private keys, and it could not use them anyway. It works only "
+    "with the public key (xpub or zpub) from a hardware wallet (e.g. Jade "
+    "or Coldcard — see docs/device-notes.md). Type 'help' and I'll point "
+    "you at where to find it, or 'exit' to quit."
 )
 
 #: The "I don't know where to get that" help answer (pre-model: the AI
 #: itself is not running yet, so the guidance is code-owned).
 KEY_HELP: Final[str] = (
-    "Your xpub or zpub comes from the wallet that holds your bitcoin: a "
-    "hardware wallet's settings usually have 'export public key' or "
-    "'account descriptor', and software wallets have a 'show account xpub/"
-    "zpub' screen (never the seed words). It is ONE long string starting "
-    "with xpub, ypub, or zpub. Paste it here when you have it, type 'help' "
-    "to see this again, or 'exit' to quit."
+    "Your xpub or zpub comes from the hardware wallet that holds your "
+    "bitcoin: a Jade, Coldcard, or similar device's settings usually have "
+    "'export public key' or 'account descriptor' — the public key, never "
+    "the seed words. This app is HARDWARE-WALLET-ONLY: it only ever works "
+    "with a hardware wallet's public key, never a seed phrase or private "
+    "key. It is ONE long string starting with xpub, ypub, or zpub. Paste "
+    "it here when you have it, type 'help' to see this again, or 'exit' "
+    "to quit."
 )
 
 #: Shown after a failed key parse (the parser's own value-free reason line

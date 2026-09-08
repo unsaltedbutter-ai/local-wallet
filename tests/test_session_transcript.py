@@ -209,10 +209,10 @@ class TestRedaction:
         assert txid not in out
 
     def test_redacts_12_word_mnemonic(self) -> None:
-        seed = " ".join(["abandon"] * 12)
+        seed = " ".join(["bacon"] * 12)  # canonical test phrase (bacon x12)
         out = redact_transcript(f"my backup phrase: {seed}")
         assert "<seed>" in out
-        assert "abandon" not in out
+        assert "bacon" not in out
 
     def test_redacts_24_word_mnemonic(self) -> None:
         seed = " ".join(["zoo"] * 24)

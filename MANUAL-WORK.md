@@ -28,13 +28,14 @@
 - [x] **Done 2026-09-07** — official pinned-GGUF record: 26/53 = 49.1% (golden 21/30, redteam 5/23), exit 1 from the ENFORCED gate — recorded and ACCEPTED as the outcome (misses are model-quality limits; redteam "misses" are the by-design structural-gate case). Runs landed with TCK-P6-001/AGT-001 (a63e24e/46e80d9). Do not re-adjudicate or tune prompts/temperature to chase it.
 
 ## MW-7: Post-fix export redaction spot-check (TCK-SEC-001) — fully OFFLINE, no real key needed
+- [x] **Done 2026-09-08 — AUTOMATABLE, executed.** Canonical test phrase = `bacon `×12 (12 BIP39-shaped words). Steps below ran end-to-end in stub mode with the fixture zpub and a throwaway DB; the exported file rendered the pasted phrase as `<seed>`, amounts as `<amount>`, addresses as `<addr>`, while the terminal kept showing real values (redaction is export-only). Detector check: the seed regex is shape-based (exactly 12/24 whitespace-separated lowercase 3–8-char words), NOT wordlist-based — `bacon`×12 matches and redacts to `<seed>`, no detector change needed.
 Steps:
 1. `cd ~/local-wallet`
 2. Start the CLI in stub mode with the public fixture key and a throwaway DB (nothing touches your real wallet):
    `LOCALWALLET_STORE_PATH=/tmp/mw7.db .venv/bin/python -m localwallet.ui.cli --stub-llm --zpub $(python3 -c "from tests.test_e2e_skeleton import ZPUB; print(ZPUB)")`
-3. At the prompt, ask for a send — stub mode has a canned create_tx: type `send 100000 sats to bc1qexampledummyrecipientaddress0000000000` (any text with an amount works; the stub builds the envelope).
+3. At the prompt, paste the canonical test phrase `bacon bacon bacon bacon bacon bacon bacon bacon bacon bacon bacon bacon` as a chat message FIRST, then ask for a send — stub mode has a canned create_tx: type `send 100000 sats to bc1qexampledummyrecipientaddress0000000000` (any text with an amount works; the stub builds the envelope).
 4. Run `/export`.
-5. Verify in the exported file: amounts render as `<amount>`, txids as `<txid>`, addresses as `<addr>`, and paste a 12-word test phrase (e.g. from BIP39 docs) into the chat first — it must render as `<seed>`.
+5. Verify in the exported file: the phrase renders as `<seed>`, amounts as `<amount>`, txids as `<txid>`, addresses as `<addr>`.
 6. Also confirm the terminal still shows real values (redaction is for the export only).
 7. `rm -rf /tmp/mw7.db*` when done.
 

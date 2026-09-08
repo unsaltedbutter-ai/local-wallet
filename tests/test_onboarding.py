@@ -45,7 +45,7 @@ from tests.test_e2e_skeleton import XPRV, ZPUB
 TESTNET_GENESIS = "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"
 GOOD_URL = "https://mempool.mine.example:4000/api"
 LOCAL_URL = "http://127.0.0.1:3006"
-SEED_LINE = "abandon " * 11 + "about"  # 12 BIP39-shaped words
+SEED_LINE = "bacon " * 12  # 12 BIP39-shaped words (canonical test phrase)
 
 
 # ----------------------------------------------------------------- harness
@@ -272,7 +272,7 @@ def test_fresh_user_full_flow_five_steps(tmp_path: Path, monkeypatch) -> None:
     assert state["model"] == 1
     # Nothing sensitive echoed: neither key is ever printed.
     assert ZPUB not in joined
-    assert "abandon" not in joined
+    assert "bacon" not in joined
 
 
 def test_key_ask_help_seed_and_private_key_refusals(tmp_path: Path, monkeypatch) -> None:
@@ -293,11 +293,19 @@ def test_key_ask_help_seed_and_private_key_refusals(tmp_path: Path, monkeypatch)
     assert "Watch key rejected:" in joined  # descriptor layer, value-free
     assert ob.KEY_RETRY_HINT in joined
     assert ob.NODE_ASK in joined  # key accepted → steps 2+ ran
-    assert "abandon" not in joined  # seed words never echoed
+    assert "bacon" not in joined  # seed words never echoed
     assert XPRV not in joined  # key material never echoed
     assert ob.SKIP_ACK in joined  # "1" = explicit public pick
     assert stored is None  # public is a non-choice: nothing stored
     assert state["model"] == 0  # the whole session never reached the model
+
+    # Hardware-wallet-only guidance pin (user direction 2026-09-08): the
+    # seed refusal/help must point to a hardware wallet and never suggest
+    # a software-wallet seed import.
+    assert "HARDWARE-WALLET-ONLY" in joined
+    assert "hardware wallet" in joined
+    assert "software wallet" not in ob.KEY_HELP
+    assert "import" not in ob.KEY_HELP
 
 
 def test_headless_launch_never_blocks(tmp_path: Path, monkeypatch) -> None:

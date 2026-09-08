@@ -11,7 +11,7 @@
 - `chain/` is the only module with network access. No network imports anywhere else — the spec makes this lint-enforced.
 - The LLM never touches money logic, network calls, or secrets. It only emits intent envelopes; treat all model output as untrusted input. Validation is three layers (GBNF grammar → pydantic → business rules), then allowlist dispatch. Any failure = reject, one re-prompt, then `clarify`.
 - Closed intent protocol: intents are a fixed enum mapped to handlers via a dispatch table. No `eval`, no codegen from model output; unknown intents are rejected, never executed.
-- Watch-only: the app handles xpubs only — never xprvs or seed phrases (seed phrases are refused in chat, with guidance). Zero secrets in process, disk, or logs; never log xpubs, addresses, or amounts.
+- Watch-only: the app handles xpubs only — never xprvs or seed phrases (seed phrases are refused in chat, with hardware-wallet-only guidance). Zero secrets in process, disk, or logs; never log xpubs, addresses, or amounts.
 - Destructive flows are dispatcher-owned state machines (`create_tx → confirm_tx → sign_tx → broadcast_tx`). The model cannot skip or reorder steps, and an LLM "yes" never counts as user confirmation.
 - Signed PSBTs are re-parsed and re-validated against the intended transaction before broadcast. Any mismatch is a hard stop.
 - Addresses and amounts are quoted verbatim from tool output — the model never generates or "corrects" them.
