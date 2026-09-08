@@ -23,11 +23,15 @@ Thin stdlib HTTP/SSE transport over the engine pump (:func:`localwallet.app`
 * **Security (§6):** binds 127.0.0.1 only, ephemeral port; a random
   per-launch token gates EVERY endpoint via the ``X-Auth-Token`` header (the
   401 path deliberately does NOT send ``WWW-Authenticate`` — a browser would
-  pop a native credential prompt); the token never appears in URLs, logs,
-  error bodies, or /state — it reaches the client only through the JSON
-  island injected into the served index.html. No CORS headers, no
-  ``Set-Cookie``, access logging suppressed entirely. The full
-  Host/Origin/CSP hardening matrix is TCK-WEB-003.
+  pop a native credential prompt); a ``Host`` allowlist (``_require_host``) is
+  the DNS-rebinding primary defense, with a proportionate same-origin check
+  on POSTs (``_require_same_origin``) as belt-braces (no cookies ⇒ CSRF is
+  structurally moot). The token never appears in URLs, logs, error bodies, or
+  /state — it reaches the client only through the JSON island injected into
+  the served index.html. A Content-Security-Policy header (ADR-0024 §7,
+  ``csp_header``) allows NO inline script except that island (a per-response
+  nonce), no eval, same-origin styles/connect only. No CORS headers, no
+  ``Set-Cookie``, access logging suppressed entirely.
 * **HTTP/1.0 (§2):** the stdlib default, ACCEPTED and PINNED, not "fixed" —
   each browser request gets its own connection, which is exactly the
   request/response + one-long-lived-SSE shape we need. No chunked encoding
@@ -49,7 +53,6 @@ import queue
 import secrets
 import socket
 import threading
-import time
 import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -58,7 +61,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Final
 
-from localwallet.app import EngineEvent, EngineHandle, start_engine
+from localwallet.app import (
+    STATE_SCHEMA_TRANSPORT_ONLY,
+    EngineEvent,
+    EngineHandle,
+    start_engine,
+)
 
 #: Loopback bind (ADR-0024 §1): never 0.0.0.0, and not configurable — the
 #: loopback-only invariant is structural, not a default.
@@ -80,14 +88,38 @@ SEND_TIMEOUT_S: Final[float] = 30.0
 RING_SIZE: Final[int] = 2048
 QUEUE_MAXSIZE: Final[int] = 512
 
-#: The transcript command GET /state queues as its serialization ping. It is
-#: an UNKNOWN slash-command, so the pump routes it to
-#: ``app._handle_transcript_command``'s deterministic help fallback — no
-#: model, no side effect; its completion marker (like any processed command)
-#: proves the engine drained the queue up to our request. The visible echo
-#: of the help line is the honest cost of F5 serialization until the pump
-#: grows typed snapshot commands (WEB-005).
-STATE_PING_COMMAND: Final[str] = "/state"
+#: Hosts the server will answer for (ADR-0024 §6, DNS-rebinding primary
+#: defense). The port is ephemeral/variable so the comparison is on the
+#: HOSTNAME ONLY (port stripped); the bound interface is 127.0.0.1 and the
+#: canonical launch URL uses it, but ``localhost`` is a first-class alias a
+#: user may type. A public name that rebinds to 127.0.0.1 presents its OWN
+#: host header and is refused here — independent of the token layer.
+ALLOWED_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "localhost"})
+
+#: Content-Security-Policy for the shell + island (ADR-0024 §7). ``{nonce}`` is
+#: substituted per-response: the injected token island is the ONE inline script
+#: and carries a fresh nonce. NO ``unsafe-inline``, NO ``unsafe-eval``; same-
+#: origin module scripts + stylesheet only. ``default-src 'none'`` closes every
+#: other fetch; ``connect-src 'self'`` is the fetch+SSE stream;
+#: ``base-uri``/``form-action``/``frame-ancestors`` are the standard belt braces.
+CSP_TEMPLATE: Final[str] = (
+    "default-src 'none'; "
+    "script-src 'self'{nonce}; "
+    "style-src 'self'; "
+    "connect-src 'self'; "
+    "img-src 'self'; "
+    "font-src 'self'; "
+    "base-uri 'none'; "
+    "form-action 'none'; "
+    "frame-ancestors 'none'"
+)
+
+
+def csp_header(nonce: str | None = None) -> str:
+    """The CSP for one response. With a ``nonce`` the inline token island is
+    allowed via ``'nonce-…'``; without one (static assets, JSON) the strict
+    no-inline policy applies — ``'self'`` scripts only."""
+    return CSP_TEMPLATE.format(nonce=f" 'nonce-{nonce}'" if nonce else "")
 
 
 class _ClientGone(Exception):
@@ -103,6 +135,11 @@ class _Subscriber:
 
     events: queue.Queue[EngineEvent | None]
     dead: bool = False
+    #: The oldest retained event id, set when this connection's ``Last-Event-ID``
+    #: predates the ring (a gap the backlog cannot bridge) → the connection owner
+    #: emits one explicit ``resync`` frame before replay (TCK-WEB-003). ``None``
+    #: for a fresh (no-cursor) connection or a cursor inside the retained window.
+    resync_from: int | None = None
 
 
 class _Bus:
@@ -119,8 +156,9 @@ class _Bus:
     bounded queue — so even a full-ring backlog with a stale cursor cannot
     overflow a fresh subscriber into dead-on-arrival (the old livelock).
     A cursor predating the ring still gets everything retained, in order
-    (an honest partial replay beats a spurious gap; the explicit
-    too-far-behind signal stays WEB-003's).
+    (an honest partial replay), AND now also an explicit ``resync`` signal
+    stashed on the subscriber so the client can hard-resync — the gap is
+    never silent (TCK-WEB-003).
     """
 
     def __init__(self, ring_size: int = RING_SIZE, maxsize: int = QUEUE_MAXSIZE) -> None:
@@ -155,13 +193,25 @@ class _Bus:
         here on lands in ``sub.events``. Serialized against ``publish`` by
         ``_lock``, so the two sets are contiguous and disjoint — gap-free,
         duplicate-free — and a full-ring backlog can never overflow the
-        bounded live queue during replay (no dead-on-arrival livelock)."""
+        bounded live queue during replay (no dead-on-arrival livelock).
+
+        If ``replay_after`` is a real cursor (``>= 1``) that predates the
+        retained window (events were evicted before it), ``sub.resync_from``
+        is set to the oldest retained id so the connection owner emits ONE
+        explicit ``resync`` frame before the (partial) replay — the client
+        hard-resyncs from ``/state`` instead of silently trusting a gap
+        (TCK-WEB-003). A fresh (no-cursor) connection is NOT flagged: it is
+        not resuming, so an honest full-backlog replay is correct, not a loss."""
         sub = _Subscriber(events=queue.Queue(maxsize=self._maxsize))
         with self._lock:
             if self.closed:
                 sub.dead = True
                 return sub, []
             replay = [e for e in self._ring if e.id > replay_after]
+            if replay_after >= 1 and self._ring:
+                oldest = self._ring[0].id
+                if oldest > replay_after + 1:
+                    sub.resync_from = oldest
             self._subs.append(sub)
             return sub, replay
 
@@ -206,6 +256,20 @@ def sse_frame(event: EngineEvent) -> bytes:
     lines = [f"id: {event.id}", f"event: {event.kind}"]
     lines += [f"data: {chunk}" for chunk in event.payload.split("\n")]
     return ("\n".join(lines) + "\n\n").encode("utf-8")
+
+
+def resync_frame(oldest_event_id: int) -> bytes:
+    """The too-far-behind signal (TCK-WEB-003): a named ``resync`` event sent
+    when a reconnect's ``Last-Event-ID`` predates the retained ring, so the
+    client hard-resyncs (refetch ``/state`` / reload the transcript) rather than
+    silently trusting a gap. Deliberately carries NO ``id:`` line — the client's
+    cursor is not advanced by a transport signal; the replayed events that
+    follow carry their own ids. A comment frame is NOT used: the client drops
+    comment lines during parse, so a named event is the only shape its
+    ``fetch`` reader can detect. Value-free (an event id is transport metadata,
+    already exposed in /state)."""
+    body = json.dumps({"reason": "too_far_behind", "oldest_event_id": oldest_event_id})
+    return f"event: resync\ndata: {body}\n\n".encode()
 
 
 # ----------------------------------------------------------------- HTTP surface
@@ -264,15 +328,28 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             return
 
-    def _send_json(self, status: int, payload: Mapping[str, Any]) -> None:
-        self._respond(status, "application/json", json.dumps(payload).encode())
+    def _send_json(
+        self, status: int, payload: Mapping[str, Any], *, csp: str | None = None
+    ) -> None:
+        self._respond(
+            status,
+            "application/json",
+            json.dumps(payload).encode(),
+            csp=csp if csp is not None else csp_header(),
+        )
 
-    def _respond(self, status: int, ctype: str, body: bytes) -> None:
+    def _respond(
+        self, status: int, ctype: str, body: bytes, *, csp: str | None = None
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
+        if csp is not None:
+            # ADR-0024 §7: no inline script except the nonce-carrying island,
+            # no eval. Sent on every HTML/asset/JSON response.
+            self.send_header("Content-Security-Policy", csp)
         self.end_headers()
         if body:
             self.wfile.write(body)
@@ -291,11 +368,59 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(401, {"error": "unauthorized"})
         return False
 
+    @staticmethod
+    def _host_of(value: str) -> str:
+        """Lowercased hostname with any port stripped (IPv6 de-bracketed).
+
+        The port is ephemeral/variable (ADR-0024 §1) so the Host allowlist is
+        a NAME comparison; brackets on an IPv6 literal are removed to match the
+        bare ``::1``-style forms. Never raises; an empty/garbage value yields
+        ``""`` and is refused by the caller.
+        """
+        host = value.strip().lower()
+        if host.startswith("["):  # IPv6 literal [::1]:port
+            end = host.find("]")
+            return host[1:end] if end != -1 else host[1:]
+        return host.rsplit(":", 1)[0] if ":" in host else host
+
+    def _require_host(self) -> bool:
+        """Host allowlist — the DNS-rebinding PRIMARY defense (ADR-0024 §6).
+
+        A page that resolves a public name to 127.0.0.1 still presents that
+        name in ``Host``; refusing any host outside the loopback allowlist
+        kills the drive-by before the token even matters (an independent layer
+        from the token header). Missing/hostile Host → 400, value-free (the
+        offending host is never echoed back)."""
+        if self._host_of(self.headers.get("Host", "")) in ALLOWED_HOSTS:
+            return True
+        self._send_json(400, {"error": "host not allowed"})
+        return False
+
+    def _require_same_origin(self) -> bool:
+        """Same-origin check on state-changing requests (defense-in-depth).
+
+        No cookies exist (ADR-0024 §6) so a cross-site request cannot ride
+        ambient credentials and CSRF is structurally moot — a hostile page
+        cannot present the per-launch token header. This check is therefore
+        proportionate belt-braces, not the auth boundary: when a browser
+        DOES send ``Origin`` (it does on POST), it must be a loopback origin
+        matching the allowlist. Absent ``Origin`` (non-browser clients) passes.
+        """
+        origin = self.headers.get("Origin")
+        if origin is None or self._host_of(urllib.parse.urlparse(origin).netloc) in (
+            ALLOWED_HOSTS
+        ):
+            return True
+        self._send_json(403, {"error": "cross-origin"})
+        return False
+
     def _path(self) -> str:
         return urllib.parse.urlparse(self.path).path  # query NEVER carries the token
 
     # -- GET ----------------------------------------------------------------
     def do_GET(self) -> None:
+        if not self._require_host():
+            return
         if not self._require_token():
             return
         path = self._path()
@@ -312,6 +437,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- POST ---------------------------------------------------------------
     def do_POST(self) -> None:
+        if not self._require_host():
+            self._drain_body()
+            return
+        if not self._require_same_origin():
+            self._drain_body()
+            return
         if not self._require_token():
             self._drain_body()
             return
@@ -393,6 +524,10 @@ class _Handler(BaseHTTPRequestHandler):
         # FIRST — bounded by client backpressure, NOT by the live queue's
         # cap — then live events flow via queue.get() below.
         try:
+            if sub.resync_from is not None:
+                # Cursor predates the retained ring: one explicit resync
+                # signal, THEN the honest partial backlog (TCK-WEB-003).
+                self.wfile.write(resync_frame(sub.resync_from))
             for event in replay:
                 self.wfile.write(sse_frame(event))
             self._pump_sse(sub)
@@ -416,21 +551,23 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- state --------------------------------------------------------------
     def _state(self) -> None:
-        # Reads serialize through the engine queue (consult F5): a snapshot
-        # request is QUEUED as a typed line (STATE_PING_COMMAND — a
-        # deterministic transcript no-op, never the model) and we wait for
-        # any engine event past our queue point before answering. The
-        # snapshot itself is pure transport state published BY the engine
-        # thread (the bus cursor) — the store/flow are never touched from a
-        # transport thread, and the token is never in it.
-        marker_seen = self.bus.last_id
-        self.engine.submit(STATE_PING_COMMAND)
-        deadline = time.monotonic() + self.state_timeout_s
-        while time.monotonic() < deadline:
-            if self.bus.last_id > marker_seen or self.engine.error is not None:
-                break
-            time.sleep(0.01)
-        self._send_json(200, self.bus.snapshot())
+        # Reads serialize through the engine queue (consult F5). The transport
+        # asks the engine for a TYPED, value-free snapshot (flow position +
+        # watch status, TCK-WEB-003) via StateSnapshotRequest — it never touches
+        # the flow/store itself. The engine answers between turns; a busy engine
+        # past the timeout is not a stall: we fall back to the transport-only
+        # shape (schema state/0), which the client already tolerates (it keys off
+        # the transport fields, present in BOTH shapes). The token is never here.
+        base = self.bus.snapshot()
+        # A dead/errored engine will never drain the queue — answer at once with
+        # the transport-only shape (the old STATE_PING fast-fail, preserved).
+        typed = None if self.engine.error is not None else self.engine.request_state(
+            self.state_timeout_s
+        )
+        if typed is None:
+            self._send_json(200, {**base, "schema": STATE_SCHEMA_TRANSPORT_ONLY})
+            return
+        self._send_json(200, {**base, **typed})
 
     # -- static -------------------------------------------------------------
     def _static(self, rel: str, inject_token: bool = False) -> None:
@@ -441,17 +578,30 @@ class _Handler(BaseHTTPRequestHandler):
             return
         body = target.read_bytes()
         ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        nonce: str | None = None
         if inject_token and ctype == "text/html":
-            body = inject_token_island(body.decode("utf-8"), self.token).encode("utf-8")
-        self._respond(200, ctype, body)
+            # Fresh per-response nonce (ADR-0024 §7): ONLY the token island
+            # script carries it; the CSP that follows allows exactly it.
+            nonce = secrets.token_urlsafe(16)
+            body = inject_token_island(
+                body.decode("utf-8"), self.token, nonce=nonce
+            ).encode("utf-8")
+        self._respond(200, ctype, body, csp=csp_header(nonce))
 
 
-def inject_token_island(html: str, token: str) -> str:
+def inject_token_island(html: str, token: str, *, nonce: str = "") -> str:
     """Template-inject the per-launch JSON island before ``</head>`` (or
     ``</body>``, or the front as last resort) — the ONLY channel by which the
-    token reaches the client (never a URL, log, error body, or /state).
-    WEB-003's CSP lands a script nonce for this inline island."""
-    island = "<script>window.__LOCALWALLET__ = " + json.dumps({"token": token}) + ";</script>"
+    token reaches the client (never a URL, log, error body, or /state). The
+    inline island script carries the per-response ``nonce`` that
+    :func:`csp_header` whitelists (ADR-0024 §7); a blank nonce (the default,
+    used by the isolated unit tests / a no-CSP context) emits a bare script."""
+    attr = f' nonce="{nonce}"' if nonce else ""
+    island = (
+        f"<script{attr}>window.__LOCALWALLET__ = "
+        + json.dumps({"token": token})
+        + ";</script>"
+    )
     lowered = html.lower()
     for marker in ("</head>", "</body>"):
         idx = lowered.rfind(marker)
@@ -504,9 +654,10 @@ class WebServer:
         state_timeout_s: float = STATE_TIMEOUT_S,
         send_timeout_s: float = SEND_TIMEOUT_S,
         queue_maxsize: int = QUEUE_MAXSIZE,
+        ring_size: int = RING_SIZE,
     ) -> None:
         self.token = secrets.token_urlsafe(32)
-        self.bus = _Bus(maxsize=queue_maxsize)
+        self.bus = _Bus(ring_size=ring_size, maxsize=queue_maxsize)
         self.handle = start_engine(bootstrap, self.bus.publish)
         handler = partial(
             _Handler,

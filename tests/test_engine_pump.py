@@ -308,6 +308,84 @@ def test_start_engine_bootstrap_and_turn_run_on_the_engine_thread(
     assert events[-1].kind == EVENT_TURN_END
 
 
+# -------------------------------------------------- typed /state snapshot (WEB-003)
+
+
+def test_state_snapshot_request_is_answered_on_the_engine_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A StateSnapshotRequest serializes through the SAME command queue and is
+    answered ON the engine thread (never via ``_run_turn``, so it is not a model
+    turn) and produces NO output events (no chat line, no help echo)."""
+    monkeypatch.setattr(app, "_run_turn", lambda *a, **k: None)
+    build_threads: list[int] = []
+    real_build = app.build_state_snapshot
+
+    def spy_build(flow, session, watcher):
+        build_threads.append(threading.get_ident())
+        return real_build(flow, session, watcher)
+
+    monkeypatch.setattr(app, "build_state_snapshot", spy_build)
+    events: list[EngineEvent] = []
+    handle = app.start_engine(
+        lambda: app.EngineContext(
+            loop=_make_loop(), flow=TxFlow(), session=app.SendSession(),
+            table={IntentName.RESPOND: app._respond_handler},
+        ),
+        events.append,
+    )
+    assert handle.thread is not None
+    snap = handle.request_state(5.0)
+    handle.shutdown()
+    handle.thread.join(10)
+
+    assert snap == {
+        "schema": "state/1",
+        "flow_state": "idle",
+        "pending_present": False,
+        "gate_decision": "not_a_decision",
+        "watch": {"configured": False, "enabled": False},
+    }
+    # Answered by the ENGINE thread, not the caller (main):
+    assert build_threads == [handle.thread.ident]
+    assert handle.thread.ident != threading.main_thread().ident
+    # A snapshot is a reply, not a transcript turn — no events were emitted:
+    assert events == []
+
+
+def test_request_state_times_out_when_the_engine_never_drains() -> None:
+    """No engine thread draining the queue (e.g. a dead bootstrap) is not a
+    hang: ``request_state`` returns ``None`` at the timeout so the transport
+    falls back to the transport-only shape (GET /state keeps answering)."""
+    handle = app.EngineHandle(
+        commands=queue.Queue(), emitter=app.EventEmitter(lambda _e: None)
+    )
+    started = time.monotonic()
+    assert handle.request_state(0.2) is None
+    assert time.monotonic() - started < 2.0  # returned at the timeout, not a stall
+
+
+def test_build_state_snapshot_is_value_free() -> None:
+    """The only facts are enum NAMES + booleans; a pending record's recipient/
+    amount/tx_ref/psbt can never appear (no value-bearing field is read)."""
+    from localwallet.tx.flow import PendingTx
+
+    flow = TxFlow()
+    pending = PendingTx(
+        tx_ref="REFSECRET", created_at=0.0, amount_sats=654321,
+        recipient="bc1qLEAK", fee_target=None, fee_rate_sat_vb=1, fee_sats=1000,
+        change_sats=None, psbt_base64="cHNidP8LEAK", inputs_count=1, vsize=100,
+    )
+    flow._state = app.TxFlowStatus.CREATED
+    flow._pending = pending
+    snap = app.build_state_snapshot(flow, app.SendSession(), None)
+    assert snap["flow_state"] == "created"
+    assert snap["pending_present"] is True
+    dumped = repr(snap)
+    for leak in ("REFSECRET", "654321", "bc1qLEAK", "cHNidP8"):
+        assert leak not in dumped
+
+
 def test_store_built_off_the_engine_thread_is_refused(tmp_path: Path) -> None:
     """The ``check_same_thread`` guard is real: state constructed on the
     WRONG thread fails closed inside the bootstrap (surfaced on

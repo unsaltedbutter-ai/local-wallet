@@ -2378,6 +2378,19 @@ EVENT_TEXT: Final[str] = "text"
 EVENT_PROGRESS: Final[str] = "progress"
 EVENT_TURN_END: Final[str] = "turn_end"
 
+#: Command token the web transport stamps on a typed ``/state`` snapshot
+#: request (TCK-WEB-003). Recognized ONLY as the ``command`` label of a
+#: :class:`StateSnapshotRequest` (below) — it is never a model turn and never
+#: a chat line, so nothing sensitive can ride it.
+STATE_SNAPSHOT_COMMAND: Final[str] = "/state"
+
+#: ``/state`` snapshot schema tags (value-free; a fixed literal, never data).
+#: ``state/1`` = typed snapshot (flow + watch); ``state/0`` = the minimal
+#: transport-only shape served while the engine is busy (the client tolerates
+#: BOTH — it is written to key off the transport fields, which are unchanged).
+STATE_SCHEMA: Final[str] = "state/1"
+STATE_SCHEMA_TRANSPORT_ONLY: Final[str] = "state/0"
+
 
 @dataclass(frozen=True)
 class EngineEvent:
@@ -2471,6 +2484,48 @@ class EngineContext:
     client: EsploraClient | None = None
 
 
+@dataclass(frozen=True)
+class StateSnapshotRequest:
+    """A typed ``/state`` read queued THROUGH the engine pump (TCK-WEB-003).
+
+    The transport never touches the flow/store/watcher directly (ADR-0024 §3:
+    all state reads route through the engine thread); it drops this request on
+    the command queue and the ENGINE thread answers it between turns
+    (never-cancel), so a busy engine simply delays the reply rather than
+    racing a transport thread over shared state. The reply is a value-free,
+    validated snapshot — never a model turn, never a chat line.
+    """
+
+    command: str
+    reply: queue.Queue[dict[str, object]]
+
+
+def build_state_snapshot(
+    flow: TxFlow,
+    session: SendSession,
+    watcher: IncomingWatcher | None,
+) -> dict[str, object]:
+    """The value-free ``/state`` snapshot, built ON the engine thread.
+
+    Deliberately minimal and validated-by-construction: the only facts are the
+    dispatcher-owned flow position (a closed :class:`TxFlowStatus` enum name),
+    whether a transaction pends (a boolean), the last turn's gate classification
+    (a closed :class:`GateDecision` enum name) and whether a watcher is
+    configured/enabled (booleans). No address, amount, txid, ``tx_ref`` or key
+    material CAN appear — every value is an enum NAME or a boolean, never data.
+    """
+    return {
+        "schema": STATE_SCHEMA,
+        "flow_state": flow.state.value,
+        "pending_present": flow.pending is not None,
+        "gate_decision": session.gate_decision.value,
+        "watch": {
+            "configured": watcher is not None,
+            "enabled": bool(watcher is not None and watcher.enabled),
+        },
+    }
+
+
 @dataclass
 class EngineHandle:
     """The transport's view of the engine thread (WEB-002 consumes this):
@@ -2487,6 +2542,22 @@ class EngineHandle:
         """Enqueue one user line / transcript command (bytes only — the
         transport never touches the flow, the store, or a handler)."""
         self.commands.put(line)
+
+    def request_state(self, timeout: float) -> dict[str, object] | None:
+        """Read a typed, value-free ``/state`` snapshot THROUGH the pump.
+
+        A transport thread cannot touch the flow/watcher (ADR-0024 §3), so it
+        queues a :class:`StateSnapshotRequest` and blocks on its reply; the
+        engine thread answers between turns. Returns ``None`` if the engine is
+        busy past ``timeout`` or has errored — the caller falls back to the
+        transport-only shape (never a stall, never a lie).
+        """
+        reply: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+        self.commands.put(StateSnapshotRequest(STATE_SNAPSHOT_COMMAND, reply))
+        try:
+            return reply.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
     def shutdown(self) -> None:
         """End the session AFTER the current turn completes (never-cancel)."""
@@ -2603,6 +2674,12 @@ def _pump(
             raise command.exc
         if command is QUIT:
             return
+        if isinstance(command, StateSnapshotRequest):
+            # Typed value-free /state read (TCK-WEB-003), answered ON the engine
+            # thread — no model, no output event, no chat line; the transport
+            # blocks on this reply (or falls back to transport-only on timeout).
+            command.reply.put(build_state_snapshot(flow, session, watcher))
+            continue
         line = command.strip()
         if not line:
             continue

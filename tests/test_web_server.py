@@ -49,7 +49,7 @@ from localwallet import app
 from localwallet.agent.loop import AgentLoop
 from localwallet.app import EngineContext, EngineEvent
 from localwallet.protocol import IntentName
-from localwallet.tx.flow import TxFlow
+from localwallet.tx.flow import TxFlow, TxFlowStatus
 from localwallet.ui.web import server as webserver
 from localwallet.ui.web.server import serve_web, sse_frame
 from tests.test_e2e_skeleton import ZPUB
@@ -631,6 +631,239 @@ def test_no_cors_no_cookies_on_any_response(serve: Any) -> None:
             assert name != "set-cookie", name  # no session, ever §6
 
 
+# -------------------------------------------- WEB-003 security (§6/§7): Host/
+# Origin/CSP/nonce + drive-by matrix
+
+
+def _host(server: Any, method: str, path: str, host: str, **kw: Any) -> tuple[int, bytes]:
+    """A request with an EXPLICIT Host header (http.client would otherwise
+    always send 127.0.0.1:<port>) — drives the DNS-rebinding path."""
+    conn = _conn(server.httpd.server_address[1])
+    headers = dict(kw.pop("headers", {}))
+    if (token := kw.pop("token", None)) is not None:
+        headers["X-Auth-Token"] = token
+    body = kw.pop("body", None)
+    payload = json.dumps(body).encode() if body is not None else None
+    if payload is not None:
+        headers.setdefault("Content-Type", "application/json")
+    conn.putrequest(method, path, skip_host=True)
+    conn.putheader("Host", host)
+    for k, v in headers.items():
+        conn.putheader(k, v)
+    conn.endheaders(payload)
+    response = conn.getresponse()
+    data = response.read()
+    conn.close()
+    return response.status, data
+
+
+def test_dns_rebinding_host_is_refused_before_the_token(serve: Any) -> None:
+    """ADR-0024 §6: a public name that rebinds to 127.0.0.1 presents its OWN
+    Host header; the allowlist refuses it independently of (and BEFORE) the
+    token layer, with a value-free body (the offending host is never echoed)."""
+    server = serve()
+    for path, method, body in (("/state", "GET", None), ("/", "GET", None),
+                               ("/turn", "POST", {"text": "hi"}),
+                               ("/events", "GET", None)):
+        status, data = _host(
+            server, method, path, "evil.example", token=server.token, body=body
+        )
+        assert status == 400, path
+        assert b"host not allowed" in data
+        assert b"evil.example" not in data  # value-free (never echoes the host)
+        assert server.token.encode() not in data
+    # A Host with the ephemeral port is fine (name comparison, port stripped):
+    port = server.httpd.server_address[1]
+    for host in (f"127.0.0.1:{port}", f"localhost:{port}", "127.0.0.1", "localhost"):
+        status, _data = _host(server, "GET", "/state", host, token=server.token)
+        assert status == 200, host
+
+
+def test_dns_rebinding_cross_product_matrix_blocks_every_drive_by(
+    serve: Any, echo_turns: list[str]
+) -> None:
+    """Consult F10 drive-by matrix: a malicious page whose name rebinds to
+    127.0.0.1 and knows nothing about the per-launch token. Each defense layer
+    is INDEPENDENT — remove any one and the others still refuse the drive-by.
+
+    * A public Host is refused BEFORE the token (Host allowlist, §6).
+    * A cross-origin POST is refused even WITH a valid token (origin check).
+    * A wrong token is refused even with a good Host/Origin (token gate, §6).
+    * No response ever carries CORS grant headers or a cookie (§6).
+    * A legit same-origin turn still works (the matrix is not a blanket Denial)."""
+    server = serve()
+    port = server.httpd.server_address[1]
+
+    # (1) Public (rebound) Host → 400, regardless of a VALID token.
+    for path, method, body in (("/", "GET", None), ("/state", "GET", None),
+                               ("/turn", "POST", {"text": "x"})):
+        status, data = _host(
+            server, method, path, f"rebound-to-loopback.example:{port}",
+            token=server.token, body=body,
+        )
+        assert status == 400, path
+        assert b"rebound-to-loopback" not in data and server.token.encode() not in data
+    # (2) Loopback Host but a cross-origin POST Origin → 403 even with token.
+    status, headers, data, _r = _request(
+        server, "POST", "/turn", {"text": "x"}, token=server.token,
+        headers={"Origin": "http://attacker.example"},
+    )
+    assert status == 403
+    assert echo_turns == []  # never reached the pump
+    # (3) Good Host+Origin but a WRONG token → 401 (token layer stands alone).
+    status, headers, _d, _r = _request(
+        server, "POST", "/turn", {"text": "x"}, token="nope",
+        headers={"Origin": f"http://127.0.0.1:{port}"},
+    )
+    assert status == 401
+    assert echo_turns == []
+    # (4) A legit same-origin turn DOES work.
+    status, _h, _d, _r = _request(
+        server, "POST", "/turn", {"text": "hi"}, token=server.token,
+        headers={"Origin": f"http://localhost:{port}"},
+    )
+    assert status == 202
+    # (5) None of the refused responses granted CORS or set a cookie.
+    assert not any(k.startswith("access-control-") for k in headers)
+    assert "set-cookie" not in headers
+
+
+def test_cross_origin_post_is_refused_same_origin_and_ignored_when_absent(
+    serve: Any, echo_turns: list[str]
+) -> None:
+    """Defense-in-depth (no cookies ⇒ CSRF is structurally moot): a POST that
+    DOES carry Origin must be same-loopback; a hostile origin is refused with
+    the token still valid (the check is independent), while a browser-omitting
+    Origin (curl / same-origin nav) still works through the full pump."""
+    server = serve(heartbeat_s=30.0)
+    status, _h, data, _r = _request(
+        server, "POST", "/turn", {"text": "x"}, token=server.token,
+        headers={"Origin": "http://evil.example"},
+    )
+    assert status == 403 and b"cross-origin" in data
+    assert echo_turns == []  # the hostile utterance never reached the pump
+    # Same-origin (loopback) origin passes:
+    status, _h, _d, _r = _request(
+        server, "POST", "/turn", {"text": "ok"}, token=server.token,
+        headers={"Origin": "http://127.0.0.1"},
+    )
+    assert status == 202
+    # Absent Origin (the http.client default) passes too:
+    status, _h, _d, _r = _request(
+        server, "POST", "/turn", {"text": "again"}, token=server.token
+    )
+    assert status == 202
+    assert echo_turns == ["ok", "again"]
+
+
+def test_csp_header_and_island_nonce_on_html_static_and_json(
+    tmp_path: Path, serve: Any
+) -> None:
+    """ADR-0024 §7: a CSP with NO unsafe-inline/unsafe-eval on HTML/asset/JSON
+    responses; the injected token island carries a per-response nonce that the
+    document's CSP whitelists; a plain asset gets the no-inline policy."""
+    static = tmp_path / "csp-static"
+    static.mkdir(parents=True, exist_ok=True)
+    (static / "index.html").write_text(
+        "<html><head></head><body>hi</body></html>", "utf-8"
+    )
+    (static / "app.js").write_text("console.log(1)", "utf-8")
+    server = serve(static_dir=static)
+
+    status, headers, body, _r = _request(server, "GET", "/", token=server.token)
+    assert status == 200
+    csp = headers["content-security-policy"]
+    assert "script-src 'self' 'nonce-" in csp
+    assert "unsafe-inline" not in csp and "unsafe-eval" not in csp
+    assert "connect-src 'self'" in csp
+    # The island nonce MATCHES the one in the CSP, and is not the token:
+    text = body.decode()
+    import re as _re
+    island_nonce = _re.search(r'<script nonce="([^"]+)"', text)
+    assert island_nonce is not None
+    nonce = island_nonce.group(1)
+    assert nonce in csp and nonce != server.token
+    assert "window.__LOCALWALLET__" in text  # island still delivers the token
+
+    # A second fetch uses a DIFFERENT nonce (per-response, not per-launch):
+    _s2, h2, b2, _r2 = _request(server, "GET", "/", token=server.token)
+    other = _re.search(r'<script nonce="([^"]+)"', b2.decode()).group(1)
+    assert other != nonce and other in h2["content-security-policy"]
+
+    # Static asset: strict no-inline script policy, no nonce needed.
+    _s3, h3, _d3, _r3 = _request(server, "GET", "/static/app.js", token=server.token)
+    assert h3["content-security-policy"].startswith("default-src 'none';")
+    assert "nonce" not in h3["content-security-policy"]
+
+    # JSON error path also carries CSP (defense-in-depth).
+    _s4, h4, _d4, _r4 = _request(server, "GET", "/nope", token=server.token)
+    assert "content-security-policy" in h4
+
+
+# ---------------------------------------------------------------- SSE resync
+
+
+def test_subscriber_is_flagged_only_when_cursor_predates_the_ring() -> None:
+    """subscribe() distinguishes a GAP (a real cursor older than the retained
+    window) from an honest full-backlog replay (fresh connection) and from a
+    cursor still inside the window — only the first carries ``resync_from``."""
+    bus = webserver._Bus(ring_size=4, maxsize=64)
+    for i in range(1, 9):  # ids 1..8 published; ring keeps 5,6,7,8 (oldest=5)
+        bus.publish(EngineEvent(id=i, kind="text", payload=f"e{i}"))
+    # Cursor 2 predates oldest 5 (events 3,4 are gone) → gap:
+    sub, replay = bus.subscribe(2)
+    assert sub.resync_from == 5
+    assert [e.id for e in replay] == [5, 6, 7, 8]  # honest partial, no dupes
+    # Cursor 4 is exactly oldest-1 → the immediate next IS retained → NO gap:
+    sub2, _ = bus.subscribe(4)
+    assert sub2.resync_from is None
+    # Cursor 6 is inside the window → no gap:
+    sub3, _ = bus.subscribe(6)
+    assert sub3.resync_from is None
+    # A fresh connection (cursor 0, no Last-Event-ID) is NOT a loss → no flag:
+    sub4, replay4 = bus.subscribe(0)
+    assert sub4.resync_from is None
+    assert [e.id for e in replay4] == [5, 6, 7, 8]
+
+
+def test_resync_frame_shape() -> None:
+    """The signal is a named ``resync`` event (the client's fetch reader can
+    detect a named event; it DROPS comment lines during parse) and carries NO
+    ``id:`` line so it never advances the client's cursor past the gap."""
+    frame = webserver.resync_frame(9).decode()
+    assert frame.startswith("event: resync\ndata: ")
+    assert frame.endswith("\n\n")
+    assert "\nid: " not in frame and not frame.startswith("id:")
+    body = json.loads(frame.split("data: ", 1)[1].split("\n", 1)[0])
+    assert body == {"reason": "too_far_behind", "oldest_event_id": 9}
+
+
+def test_stale_cursor_sse_gets_one_resync_frame_before_partial_replay(
+    serve: Any,
+) -> None:
+    """End-to-end: a reconnect whose Last-Event-ID predates the (wrapped) ring
+    receives ONE resync frame, THEN the retained backlog — gap is never silent
+    and the client still gets everything still held (§5 replay = recovery)."""
+    server = serve(heartbeat_s=60.0, ring_size=4)
+    for i in range(1, 9):  # only 5..8 retained after the wrap
+        server.bus.publish(EngineEvent(id=i, kind="text", payload=f"e{i}"))
+    stale = _Stream(server, last_event_id=2)
+    stale.read_head()
+    buf = stale.read_until(b"data: e8\n\n")
+    assert buf.startswith(b"event: resync\n")  # the explicit signal comes FIRST
+    assert b'"oldest_event_id": 5' in buf
+    # The retained backlog follows; the lost 3,4 are NOT silently pretended:
+    ids = [int(x) for x in re.findall(rb"\nid: (\d+)\n", buf)]
+    assert ids == [5, 6, 7, 8]
+    stale.close()
+    # A fresh connection gets the backlog with NO resync (not a loss):
+    fresh = _Stream(server)
+    fresh.read_head()
+    fresh_buf = fresh.read_until(b"data: e8\n\n")
+    assert b"event: resync" not in fresh_buf
+    fresh.close()
+
+
 def test_malformed_requests_are_clean_json_errors(serve: Any) -> None:
     server = serve()
     status, _h, data, _r = _request(
@@ -653,6 +886,10 @@ def test_malformed_requests_are_clean_json_errors(serve: Any) -> None:
 def test_state_snapshot_serializes_through_the_engine_queue(
     serve: Any, echo_turns: list[str]
 ) -> None:
+    """GET /state answers with the TYPED, value-free snapshot (TCK-WEB-003)
+    AND keeps the transport fields it always had — the client must tolerate
+    both the pre-WEB-003 transport-only shape (``schema`` ``state/0``) and the
+    rich ``state/1`` one, so BOTH key sets stay present in the rich shape."""
     server = serve(heartbeat_s=60.0, state_timeout_s=10.0)
     stream = _Stream(server)
     stream.read_head()
@@ -665,15 +902,90 @@ def test_state_snapshot_serializes_through_the_engine_queue(
     assert response.version == 10  # HTTP/1.0 (the pinned transport, §2)
     assert headers["content-type"] == "application/json"
     snapshot = json.loads(data)
+    # Transport fields unchanged (both shapes carry them — the tolerance key):
     assert snapshot["last_event_id"] > 0  # engine-published cursor (F5)
-    assert set(snapshot) == {"last_event_id", "buffered_events", "subscribers"}
+    assert {"last_event_id", "buffered_events", "subscribers"} <= set(snapshot)
+    # Typed, value-free engine snapshot now rides the same response:
+    assert snapshot["schema"] == "state/1"
+    assert snapshot["flow_state"] == "idle"
+    assert snapshot["pending_present"] is False
+    assert snapshot["gate_decision"] == "not_a_decision"
+    assert snapshot["watch"] == {"configured": False, "enabled": False}
+    # Value-free: no address/amount/xpub/txid-shaped value anywhere in the body.
     assert server.token.encode() not in data  # never via /state
-    # The snapshot request itself went through the pump as a typed line —
-    # the queued STATE_PING_COMMAND round-trips the engine (busy turns are
-    # honored first; the marker is what releases the wait):
-    assert echo_turns == ["before"]  # the "/state" line is a transcript
-    # command, never an LLM turn — _run_turn (echoed above) never saw it.
+    # The snapshot request is NOT a user turn — the pump answers it on the
+    # engine thread through the typed StateSnapshotRequest branch (never
+    # _run_turn, never the model), so the echoed turn list is untouched:
+    assert echo_turns == ["before"]
     stream.close()
+
+
+def test_state_falls_back_to_transport_shape_when_engine_busy(
+    serve: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A busy engine (the typed read times out) is not a stall: GET /state
+    still answers 200 with the transport-only ``state/0`` shape (the pre-
+    WEB-003 contract the client already handles). No value can leak because
+    none was computed."""
+    server = serve(state_timeout_s=10.0)
+    monkeypatch.setattr(server.handle, "request_state", lambda _t: None)
+    status, _h, data, _r = _request(server, "GET", "/state", token=server.token)
+    assert status == 200
+    snapshot = json.loads(data)
+    assert snapshot["schema"] == "state/0"
+    assert {"last_event_id", "buffered_events", "subscribers"} <= set(snapshot)
+    assert "flow_state" not in snapshot  # minimal shape carries no engine facts
+    assert server.token.encode() not in data
+
+
+def test_state_answers_immediately_when_the_engine_died(
+    serve: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the OLD STATE_PING wait broke early on ``engine.error`` so a
+    dead bootstrap never stalled GET /state. The typed path preserves it — it
+    must NOT block the full ``state_timeout_s`` waiting on a queue that will
+    never drain; it answers at once with the transport-only shape."""
+    server = serve(state_timeout_s=999.0)  # absurd timeout: proves no wait
+    monkeypatch.setattr(server.handle, "error", RuntimeError("bootstrap died"))
+    started = time.monotonic()
+    status, _h, data, _r = _request(server, "GET", "/state", token=server.token)
+    assert status == 200 and time.monotonic() - started < 5.0
+    assert json.loads(data)["schema"] == "state/0"
+    assert str(server.token) not in data.decode()
+
+
+def test_state_snapshot_never_carries_values(
+    serve: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The typed snapshot is value-free BY CONSTRUCTION even with a live
+    pending transaction: only enum names + booleans are exposed — the pending
+    record's recipient/amount/tx_ref/psbt never reach the wire. The handler
+    partial binds THIS handle object, so patching its method is what the
+    transport actually calls."""
+    server = serve(state_timeout_s=10.0)
+
+    class _Pending:  # duck-typed flow.pending, packed with sensitive fields
+        recipient = "bc1qattrrust"  # would-be leak
+        amount_sats = 100_000
+        tx_ref = "SECRETREF"
+        psbt_base64 = "cHNidP8SECRET"
+
+    class _BusyFlow:
+        state = TxFlowStatus.CREATED
+        pending = _Pending()
+
+    snapshot = app.build_state_snapshot(_BusyFlow(), app.SendSession(), None)
+    monkeypatch.setattr(server.handle, "request_state", lambda _t: snapshot)
+
+    status, _h, data, _r = _request(server, "GET", "/state", token=server.token)
+    assert status == 200
+    assert snapshot["flow_state"] == "created"
+    assert snapshot["pending_present"] is True  # a BOOL, never the pending data
+    text = data.decode("latin-1")
+    for secret in ("bc1qattrrust", "100000", "SECRETREF", "cHNidP8"):
+        assert secret not in text
+    assert str(server.token) not in text
+
 
 
 # --------------------------------------------------------- run() wiring §5

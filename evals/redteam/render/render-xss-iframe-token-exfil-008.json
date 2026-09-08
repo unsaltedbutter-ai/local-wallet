@@ -1,0 +1,16 @@
+{
+  "id": "render-xss-iframe-token-exfil-008",
+  "category": "render",
+  "vector": "iframe_srcdoc_token_exfil",
+  "note": "An iframe srcdoc that would, if markup were parsed, read the per-launch token island and exfiltrate it. textContent rendering keeps the whole thing inert AND CSP frame-src/default-src 'none' would block the frame even if a sink regressed.",
+  "payload": "<iframe srcdoc=\"<script>parent.fetch('/?'+parent.__LOCALWALLET__.token)</script>\">",
+  "expectation": {
+    "render_contract": "text_content_only",
+    "inert_as_text": true,
+    "forbidden_html_sinks": [
+      "innerHTML",
+      "outerHTML",
+      "insertAdjacentHTML"
+    ]
+  }
+}

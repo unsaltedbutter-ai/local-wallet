@@ -80,6 +80,17 @@ if TYPE_CHECKING:
 
 _GOLDEN_DIR = Path(__file__).resolve().parent / "golden"
 _REDTEAM_DIR = Path(__file__).resolve().parent / "redteam"
+# The XSS render-contract red-team set lives in its OWN subdir (never picked
+# up by the non-recursive redteam glob above) and is validated by a distinct
+# runner that models ADR-0024 §7's textContent-only contract, not an intent.
+_RENDER_DIR = _REDTEAM_DIR / "render"
+
+#: The HTML-string sinks the render contract names verbatim (ADR-0024 §7,
+#: web-builder.md "NEVER innerHTML, outerHTML, insertAdjacentHTML, or template-
+#: string markup"). Writing any of them turns a value into EXECUTABLE markup;
+#: the contract forbids all three (the static client audit adds document.write /
+#: eval / inline handlers on top of this fixture-level pin).
+_HTML_SINKS = frozenset({"innerHTML", "outerHTML", "insertAdjacentHTML"})
 
 #: Env var supplying the default GGUF model path (matches agent/runtime.py).
 _MODEL_PATH_ENV_VAR = "LOCALWALLET_MODEL_PATH"
@@ -263,6 +274,76 @@ def _validate_negative_expectation(expectation: object) -> None:
         raise ValueError("must_reject_or_clarify must be a boolean")
 
 
+# --------------------------------------------------------- XSS render fixtures
+
+
+def render_text_content(value: str) -> dict[str, object]:
+    """A deterministic model of the browser ``textContent`` render path
+    (ADR-0024 §7 — the ACTUAL XSS defense, since there is no browser in CI).
+
+    Assigning ``node.textContent = value`` creates exactly ONE text node whose
+    ``.data`` is the verbatim string and which has NO element children — the
+    HTML is never parsed, so markup/event handlers/``javascript:`` URLs stay
+    inert text. This function returns that shape so the runner can assert the
+    contract on the payload WITHOUT executing it: the hostile string must be
+    recoverable verbatim (nothing stripped, "corrected", or turned into nodes).
+    """
+    return {"node_type": "#text", "data": value, "children": []}
+
+
+def _validate_render_expectation(expectation: object) -> None:
+    """Structurally validate one render fixture's expectation (fixture mode).
+
+    Render cases assert the RENDER contract (textContent-only, nothing
+    executes), not a model intent, so there is no envelope to schema-validate —
+    the pinned shape is instead: ``render_contract`` is exactly
+    ``"text_content_only"``, ``inert_as_text`` is ``True``, and
+    ``forbidden_html_sinks`` is a non-empty list drawn from the executable-sink
+    set and containing every one of them (a fixture that forgot a sink would
+    let a regression slip). No intent/must_not keys are valid here.
+
+    Raises:
+        ValueError / TypeError on a malformed render expectation.
+    """
+    if not isinstance(expectation, dict):
+        raise TypeError(f"render expectation must be an object, got {type(expectation).__name__}")
+    for bad in ("intent", "intent_in", "params", "must_not_intent", "must_reject_or_clarify"):
+        if bad in expectation:
+            raise ValueError(f"render expectation cannot carry intent-key '{bad}'")
+    if expectation.get("render_contract") != "text_content_only":
+        raise ValueError("render expectation must pin render_contract='text_content_only'")
+    if expectation.get("inert_as_text") is not True:
+        raise ValueError("render expectation must assert inert_as_text=True")
+    sinks = expectation.get("forbidden_html_sinks")
+    if not isinstance(sinks, list) or not sinks:
+        raise ValueError("forbidden_html_sinks must be a non-empty list")
+    for sink in sinks:
+        if sink not in _HTML_SINKS:
+            raise ValueError(f"unknown HTML sink {sink!r}")
+    if not _HTML_SINKS.issubset(set(sinks)):
+        raise ValueError("forbidden_html_sinks must list every executable sink")
+
+
+def _render_case_is_inert(case: dict[str, object]) -> tuple[bool, str]:
+    """Assert a render fixture's payload STAYS inert through the textContent
+    model: it survives verbatim as a single text node, no element child appears,
+    and the payload actually contains hostile markup (so the fixture is a real
+    red-team sample, not a no-op). Returns ``(ok, reason)``."""
+    payload = case.get("payload")
+    if not isinstance(payload, str) or not payload:
+        return False, "payload must be a non-empty string"
+    node = render_text_content(payload)
+    if node["data"] != payload:
+        return False, "textContent model must carry the value verbatim"
+    if node["children"] != [] or node["node_type"] != "#text":
+        return False, "textContent must produce exactly one element-free text node"
+    # A genuine XSS fixture must contain markup metacharacters that would be
+    # live if written through an HTML sink (this keeps the corpus honest).
+    if not any(ch in payload for ch in ("<", ">", '"', "\x00", "\x1b")):
+        return False, "payload carries no HTML/control metacharacter (not a red-team sample)"
+    return True, ""
+
+
 def _allowed_intents(expectation: dict[str, object]) -> list[str]:
     """The intents a golden expectation permits, in declaration order."""
     intents = expectation.get("intent_in")
@@ -310,13 +391,16 @@ def _params_ok(spec: object, intent: str, params: dict[str, object]) -> bool:
 
 
 def _run_fixture_mode(
-    golden: list[dict[str, object]], redteam: list[dict[str, object]]
+    golden: list[dict[str, object]],
+    redteam: list[dict[str, object]],
+    render: list[dict[str, object]] = (),
 ) -> int:
     table = _StubTable()
     failures: list[str] = []
     print("FIXTURE MODE (no model)")
     print(f"golden cases: {len(golden)}")
     print(f"redteam cases: {len(redteam)}")
+    print(f"render cases: {len(render)}")
     print()
 
     # Golden: every expectation must build a schema-valid envelope that
@@ -366,14 +450,31 @@ def _run_fixture_mode(
         except (ValueError, TypeError) as exc:
             failures.append(f"{case_id}: malformed redteam expectation: {exc}")
 
+    # Render: XSS red-team fixtures pin the ADR-0024 §7 textContent-only
+    # contract — structurally validate the expectation, THEN prove the payload
+    # stays inert through the deterministic textContent render model.
+    for case in render:
+        case_id = case.get("id", "<no-id>")
+        expectation = case.get("expectation")
+        try:
+            _validate_render_expectation(expectation)
+        except (ValueError, TypeError) as exc:
+            failures.append(f"{case_id}: malformed render expectation: {exc}")
+            continue
+        ok, reason = _render_case_is_inert(case)
+        if not ok:
+            failures.append(f"{case_id}: render contract violated: {reason}")
+
+    total = len(golden) + len(redteam) + len(render)
     for line in failures:
         print(f"  FAIL  {line}")
     print()
     if failures:
-        print(f"RESULT: {len(golden) + len(redteam) - len(failures)}/{len(golden) + len(redteam)} valid — FAILED")
+        print(f"RESULT: {total - len(failures)}/{total} valid — FAILED")
         return 1
     print(f"  {len(golden)}/{len(golden)} golden fixtures validated: OK")
     print(f"  {len(redteam)}/{len(redteam)} redteam expectations validated: OK")
+    print(f"  {len(render)}/{len(render)} render (XSS) fixtures validated: OK")
     print()
     print("RESULT: all fixtures valid (exit 0)")
     return 0
@@ -556,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
         print("error: no golden cases found under evals/golden", file=sys.stderr)
         return 1
     redteam = _load_cases(_REDTEAM_DIR)
+    render = _load_cases(_RENDER_DIR)
 
     if args.model:
         runtime, notice = select_runtime(args.model_path)
@@ -568,9 +670,11 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if notice is not None:
             print(notice, file=sys.stderr)
+        # Render fixtures are NOT model prompts (they pin the browser render
+        # contract); model mode runs golden + red-team, exactly as before.
         return _run_model_mode(golden + redteam, runtime)
 
-    return _run_fixture_mode(golden, redteam)
+    return _run_fixture_mode(golden, redteam, render)
 
 
 if __name__ == "__main__":
