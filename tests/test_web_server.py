@@ -5,8 +5,11 @@ Everything runs against a REAL server on 127.0.0.1:0 and a REAL engine
 patterns — ``_run_turn`` replaced by an echo so turns are deterministic and
 model-free). Pins, per the ticket's done-when list:
 
-* token gate (401 without ``X-Auth-Token`` on EVERY endpoint) and the
-  HTTP/1.0 transport (stay-and-document, §2);
+* token gate (401 without ``X-Auth-Token`` on every DATA-BEARING endpoint)
+  and the HTTP/1.0 transport (stay-and-document, §2);
+* TCK-WEB-007 bootstrap: the shell (``GET /``, ``/index.html``) and
+  ``GET /static/*`` serve WITHOUT the token (the island in the page IS the
+  token delivery), Host allowlist + CSP still enforced on them first;
 * POST /turn and /action route through the FULL pump pipeline as typed
   lines (no handler/flow bypass — structural source pin + behavior pin);
 * event fan-out to all subscribers with monotonic ids;
@@ -211,10 +214,11 @@ def test_every_endpoint_requires_token_and_replies_http_1_0(serve: Any) -> None:
     server = serve()
     port = server.httpd.server_address[1]
     assert port != 0  # ephemeral port bound (never fixed/predictable)
+    # DATA-BEARING endpoints only — the shell/static are the token-island
+    # bootstrap (TCK-WEB-007) and are pinned open below.
     cases = [
         ("GET", "/state", None),
         ("GET", "/settings", None),
-        ("GET", "/", None),
         ("POST", "/turn", {"text": "hi"}),
         ("POST", "/action", {"utterance": "confirm"}),
         ("POST", "/settings", {"key": "gap_limit", "value": "5"}),
@@ -241,6 +245,7 @@ def test_token_never_travels_in_a_url_or_appears_in_logs(
 ) -> None:
     server = serve()
     _request(server, "GET", "/state")  # 401
+    _request(server, "GET", "/")  # 200 — island page carries the token IN BODY only
     _request(server, "GET", "/nope", token="wrong-token")  # 404
     _request(server, "POST", "/turn", {"text": "hello"}, token=server.token)
     stream = _Stream(server)
@@ -590,6 +595,48 @@ def test_token_island_is_injected_into_served_index(tmp_path: Path, serve: Any) 
     assert status == 413
 
 
+def test_browser_bootstrap_serves_shell_and_static_without_token(
+    tmp_path: Path, serve: Any
+) -> None:
+    """TCK-WEB-007: the token is DELIVERED by the island inside index.html, so
+    a real browser's FIRST navigation (no token — it cannot have one yet) must
+    get 200 + island, never a 401 deadlock. Static assets are public too (no
+    user data in the shell); the gated endpoints are unmoved."""
+    static = tmp_path / "static"
+    static.mkdir()
+    (static / "index.html").write_text(
+        "<html><head><title>w</title></head><body>hi</body></html>", "utf-8"
+    )
+    (static / "app.js").write_text("console.log(1)", "utf-8")
+    server = serve(static_dir=static)
+    for path in ("/", "/index.html"):
+        status, headers, data, _r = _request(server, "GET", path)  # NO token
+        assert status == 200, path
+        body = data.decode()
+        assert "window.__LOCALWALLET__" in body  # island is the delivery
+        assert server.token in body  # token rides the island, the only channel
+        assert "content-security-policy" in headers  # CSP still on the shell
+    # Static asset without token; traversal refusal survives the exemption:
+    status, _h, data, _r = _request(server, "GET", "/static/app.js")
+    assert status == 200 and data == b"console.log(1)"
+    conn = _conn(server.httpd.server_address[1])
+    conn.putrequest("GET", "/static/../../etc/passwd")
+    conn.endheaders()
+    assert conn.getresponse().status == 404
+    conn.close()
+    # Host allowlist still runs FIRST on the public paths (400, not 200/401):
+    for path in ("/", "/static/app.js"):
+        status, data = _host(server, "GET", path, "evil.example")  # no token
+        assert status == 400, path
+        assert b"evil.example" not in data and server.token.encode() not in data
+    # Gated endpoints keep the exact old behavior (401, value-free) — and the
+    # token the page just delivered drives them (the real browser flow):
+    status, _h, data, _r = _request(server, "GET", "/state")
+    assert status == 401 and server.token.encode() not in data
+    status, _h, _d, _r = _request(server, "GET", "/state", token=server.token)
+    assert status == 200
+
+
 def test_island_injection_fallbacks() -> None:
     inj = webserver.inject_token_island
     token = "tk"
@@ -669,6 +716,7 @@ def test_dns_rebinding_host_is_refused_before_the_token(serve: Any) -> None:
     token layer, with a value-free body (the offending host is never echoed)."""
     server = serve()
     for path, method, body in (("/state", "GET", None), ("/", "GET", None),
+                               ("/static/app.js", "GET", None),  # TCK-WEB-007: static too
                                ("/settings", "GET", None),
                                ("/turn", "POST", {"text": "hi"}),
                                ("/settings", "POST", {"key": "gap_limit", "value": "5"}),
@@ -704,6 +752,7 @@ def test_dns_rebinding_cross_product_matrix_blocks_every_drive_by(
 
     # (1) Public (rebound) Host → 400, regardless of a VALID token.
     for path, method, body in (("/", "GET", None), ("/state", "GET", None),
+                               ("/static/app.js", "GET", None),  # TCK-WEB-007: static too
                                ("/settings", "GET", None),
                                ("/turn", "POST", {"text": "x"}),
                                ("/settings", "POST", {"key": "gap_limit", "value": "5"})):

@@ -23,9 +23,17 @@ Thin stdlib HTTP/SSE transport over the engine pump (:func:`localwallet.app`
   (``_Handler.handle``); sentinel shutdown with ``block_on_close=False`` so
   parked SSE threads never hang close (F4.4).
 * **Security (§6):** binds 127.0.0.1 only, ephemeral port; a random
-  per-launch token gates EVERY endpoint via the ``X-Auth-Token`` header (the
+  per-launch token gates every DATA-BEARING endpoint (``/events``, ``/state``,
+  ``/turn``, ``/action``, ``/settings``) via the ``X-Auth-Token`` header (the
   401 path deliberately does NOT send ``WWW-Authenticate`` — a browser would
-  pop a native credential prompt); a ``Host`` allowlist (``_require_host``) is
+  pop a native credential prompt). The shell (``GET /``, ``/index.html``) and
+  ``GET /static/*`` are the deliberate token EXEMPTION (TCK-WEB-007): the
+  token reaches the client ONLY through the island injected into that page, so
+  gating the delivery mechanism is a bootstrap deadlock — and the exemption is
+  safe because the static shell carries no user data. The security surface
+  stays: the Host allowlist runs FIRST on every request INCLUDING static
+  (DNS-rebinding defense unweakened), CSP on every response, no CORS, no
+  cookies, and every data-bearing endpoint still token-gated; a ``Host`` allowlist (``_require_host``) is
   the DNS-rebinding primary defense, with a proportionate same-origin check
   on POSTs (``_require_same_origin``) as belt-braces (no cookies ⇒ CSRF is
   structurally moot). The token never appears in URLs, logs, error bodies, or
@@ -423,19 +431,29 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if not self._require_host():
             return
+        path = self._path()
+        # TCK-WEB-007 bootstrap exemption: the shell and its assets are served
+        # BEFORE the token check — the token is DELIVERED by the island inside
+        # index.html, so gating that page is a deadlock (a first browser
+        # navigation cannot present a token it has not yet received). Safe
+        # because the static shell carries no user data; the security surface
+        # is the Host allowlist (checked FIRST, above, for static too —
+        # DNS-rebinding defense unweakened), CSP on every response, no CORS,
+        # no cookies, and the token-gated data-bearing endpoints below.
+        if path in ("/", "/index.html"):
+            self._static("index.html", inject_token=True)
+            return
+        if path.startswith("/static/"):
+            self._static(path[len("/static/") :])
+            return
         if not self._require_token():
             return
-        path = self._path()
         if path == "/events":
             self._events()
         elif path == "/state":
             self._state()
         elif path == "/settings":
             self._settings_get()
-        elif path in ("/", "/index.html"):
-            self._static("index.html", inject_token=True)
-        elif path.startswith("/static/"):
-            self._static(path[len("/static/") :])
         else:
             self._send_json(404, {"error": "not found"})
 

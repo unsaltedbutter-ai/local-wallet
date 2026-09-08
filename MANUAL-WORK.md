@@ -63,7 +63,7 @@ Report any deviation with the exact URL/tab/step.
 ## MW-11: Web-UI browser check (developer smoke — lighter than MW-10) — steps
 One browser, ~5 minutes. Same setup as MW-10 step 1-2 (`LOCALWALLET_ZPUB="<zpub>" ... --web`, open the printed URL).
 - [ ] Page loads under CSP: open DevTools → Console — NO CSP violation errors (the only inline script is the server-injected token island with a nonce).
-- [ ] Token island works: no 401; opening the URL in a SECOND browser profile (no token… token is in the page, so just verify a fresh normal reload stays authorized).
+- [ ] Token island works: no 401 on page load IS the expected bootstrap now (TCK-WEB-007: `/` + `/static/*` serve token-free; the island in the page delivers the token to the gated endpoints); opening the URL in a SECOND browser profile (no token… token is in the page, so just verify a fresh normal reload stays authorized).
 - [ ] A full turn renders (narration streams as text, not HTML — view a balance reply; addresses appear complete, selectable, never mid-hash-truncated).
 - [ ] Action buttons fire the canonical utterances (click Confirm → the transcript shows the literal word "confirm" echoed as your message).
 - [ ] Kill-the-server reload replays via Last-Event-ID (same as MW-10).
