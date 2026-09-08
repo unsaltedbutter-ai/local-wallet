@@ -14,7 +14,7 @@ from localwallet.chain.esplora import (
     balance_from_utxos,
 )
 from localwallet.chain.eta import EtaEstimate, estimate_eta
-from localwallet.chain.fees import FeeEstimate, FeeEstimator, FeeTarget
+from localwallet.chain.fees import FeeEstimate, FeeEstimator, FeeSource, FeeTarget
 from localwallet.chain.price import (
     ConfigDisabled,
     PriceOracle,
@@ -37,6 +37,7 @@ __all__ = [
     "EtaEstimate",
     "FeeEstimate",
     "FeeEstimator",
+    "FeeSource",
     "FeeTarget",
     "IncomingEvent",
     "IncomingWatcher",

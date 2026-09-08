@@ -95,3 +95,65 @@ opt-in, and how to behave offline.
   out, (b) a Phase 4 backend does not expose `/v1/prices`, or (c) product
   wants multi-currency/multi-source aggregation. Any change re-runs the OQ4
   decision rather than silently extending this one.
+
+## Amendment (2026-09-08, TCK-FEE-001): floor-follower fee bidding
+
+User feature request (2026-09-07 live run): a `fast` send bid 2 sat/vB
+while the last 5 blocks confirmed down to ~0.34 sat/vB and the projected
+next block bottomed at ~0.3–0.57 sat/vB — a systematic overpay from
+`fastestFee` (Core's block-1 estimate). The observed case must bid
+**no more than 1 sat/vB**.
+
+**Decision — the fee estimator (`chain/fees.py`) is now two-layer:**
+
+1. **Floor-follower (primary).** The bid is the minimum integer sat/vB at
+   or above the observed floor for the target — `ceil(max(terms))`, never
+   more (no padding above the ceil; that ceil IS the sanity bound). All
+   terms come from endpoint data; no fee constants are hardcoded:
+
+   - `FAST = ceil(max(minimumFee, B₀, R₅))`
+   - `MEDIUM = ceil(max(B₂, R₅))`
+   - `SLOW   = ceil(max(B₆, R₅))`
+
+   where `Bᵢ` is the `feeRange[0]` bottom (lowest fee quantile) of
+   `mempool-blocks[i]` from `GET /v1/fees/mempool-blocks` (the projected
+   next blocks; shallower projections clamp to the deepest available
+   block), and `R₅` is the **recent-blocks floor** — the lowest
+   `extras.feeRange[0]` bottom across the last 5 confirmed blocks from
+   `GET /v1/blocks/{tip}` (tip via the existing tip endpoint). `R₅` is why
+   a transiently-empty mempool can't produce a bid that misses when blocks
+   are actually full (the user's live case: 0.34 > 0.3, so the blocks —
+   not the projection — set the floor). `minimumFee` ("min fee to get into
+   the next block") floors `FAST` only; `MEDIUM`/`SLOW` target later
+   blocks and may bid below it. The parser **enforces** projected bottoms
+   to be non-increasing with depth (a payload that breaks the order fails
+   closed to the fallback) and all three terms share `R₅`, so
+   `FAST ≥ MEDIUM ≥ SLOW` is a code invariant over accepted payloads — not
+   a data-source assumption (security-review follow-up, 2026-09-08). The
+   rule is a floor-follower, not a cap: a congested
+   next block (high `B₀`) lifts `FAST` with it. The user's observed case
+   yields exactly `ceil(max(1, 0.3, 0.34)) = 1` sat/vB.
+2. **Recommended fallback.** Any failure on the new surfaces — transport,
+   HTTP, or strict shape validation (non-list, empty `feeRange`, missing
+   `extras`, fewer than 5 confirmed blocks or no projected blocks,
+   depth-increasing projected bottoms, bool/string/negative/**zero**/
+   NaN/Infinity bottoms, per the §6 payload-hardening style) — degrades to
+   the original §1 mapping (`fastestFee`/`halfHourFee`/`hourFee`). The
+   source is recorded on every
+   `FeeEstimate` (`FeeSource.FLOOR_FOLLOWER` vs `FeeSource.RECOMMENDED`)
+   so the narration can stay honest; the fee line keeps its verbatim rate
+   quote and "estimate only, not a guarantee" hedge (the ETA wording,
+   ADR-0020, unchanged). A malformed/failed `/v1/fees/recommended` itself
+   still raises `ChainError` (fail closed — there is no lower layer), so
+   `create_tx` still surfaces `chain_unavailable` exactly as before.
+
+**Rate limits (R11):** the whole set is one combined refresh under the
+existing `fee_cache_ttl_s` (4 small GETs: recommended, mempool-blocks,
+tip, recent blocks); a degraded refresh is cached too (no endpoint
+hammering). Fees stay integer sats/vB end to end; the tx engine's
+min-relay floor (ADR-0012 §3) still applies underneath. Protocol values
+(`create_tx.fee_target`) are unchanged. Endpoint shapes pinned against
+live mempool.space on 2026-09-08: `mempool-blocks` carries 7-quantile
+ascending `feeRange` per projected block; `/v1/blocks` (no height)
+carries NO fee stats — the block fee data lives under `extras.feeRange`
+on `/v1/blocks/{height}`.
