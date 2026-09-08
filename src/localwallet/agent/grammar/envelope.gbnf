@@ -22,7 +22,11 @@
 #                create_tx   -> {"recipient": string} then EXACTLY ONE of
 #                               {"amount_sats": <int>} |
 #                               {"amount_usd": <decimal number>},
-#                               then OPTIONAL {"fee_target": fast|medium|slow}
+#                               then AT MOST ONE of
+#                               {"fee_target": fast|medium|slow} |
+#                               {"fee_rate_sat_vb": <int>} (mutually
+#                               exclusive fee knobs, TCK-FEE-002; semantic
+#                               bound 1..10000 at the schema layer)
 #                confirm_tx  -> {"tx_ref": string}
 #                sign_tx     -> {"tx_ref": string} then OPTIONAL
 #                               {"signer": "file"|"hwi"}
@@ -60,6 +64,9 @@
 #     schema-legal JSON numbers but grammar-rejected — the same safe
 #     narrowing direction as above; the model emits plain decimals.
 #     The integer form ("10" for 10.00 USD) is admitted.
+#   - fee_rate_sat_vb: plain integer sat/vB, no leading zeros, no sign, no
+#     exponent (a single "0" admitted so the schema floor rejects it —
+#     same narrowing style as sats-int).
 #
 # CROSS-REFERENCE: this grammar maps 1:1 to the pydantic envelope schema v0
 # and MUST be updated together with it (docs/adr/0002-envelope-spec.md and
@@ -129,12 +136,13 @@ params-new-address ::= "{" ws "}" ws "}" ws | "{" ws "\"branch\"" ws ":" ws bran
 # branch: single digit, 0 (receive chain) or 1 (change chain).
 branch-digit ::= "0" | "1"
 
-# intent "create_tx" -> params {"recipient": string, (amount_sats | amount_usd)[, "fee_target"]}
+# intent "create_tx" -> params {"recipient": string, (amount_sats | amount_usd)[, (fee_target | fee_rate_sat_vb)]}
 # Keys in FIXED order: recipient first, then exactly one amount key
 # (alternation at the amount-pair level — both amounts at once is
-# syntactically impossible), then an OPTIONAL fee_target tail. The optional
-# tail is a named two-branch rule so no other key can slip in and the order
-# recipient < amount < fee_target stays strict.
+# syntactically impossible), then an OPTIONAL fee-knob tail. The optional
+# tail is a named three-branch rule (bare / fee_target / fee_rate_sat_vb)
+# so no other key can slip in, at most ONE fee knob can appear, and the
+# order recipient < amount < fee-knob stays strict.
 create-tx ::= "\"intent\"" ws ":" ws "\"create_tx\"" ws "," ws "\"params\"" ws ":" ws params-create-tx
 
 params-create-tx ::= "{" ws recipient-kv ws "," ws amount-pair ws create-tx-tail
@@ -147,12 +155,24 @@ amount-sats-kv ::= "\"amount_sats\"" ws ":" ws sats-int
 
 amount-usd-kv ::= "\"amount_usd\"" ws ":" ws usd-num
 
-create-tx-tail ::= "}" ws "}" ws | "," ws fee-target-kv ws "}" ws "}" ws
+# The two fee knobs are MUTUALLY EXCLUSIVE by alternation (TCK-FEE-002):
+# a tail is either a fee_target, or a fee_rate_sat_vb, or nothing — both
+# at once is syntactically impossible (the schema layer re-checks).
+create-tx-tail ::= "}" ws "}" ws | "," ws fee-target-kv ws "}" ws "}" ws | "," ws fee-rate-kv ws "}" ws "}" ws
 
 fee-target-kv ::= "\"fee_target\"" ws ":" ws fee-target
 
 # fee target: the closed enum, quoted literals only.
 fee-target ::= "\"fast\"" | "\"medium\"" | "\"slow\""
+
+fee-rate-kv ::= "\"fee_rate_sat_vb\"" ws ":" ws fee-rate-int
+
+# fee rate: JSON integer sat/vB, 1-5 digits no leading zero (a single "0"
+# is legal JSON and admitted here; the schema rejects it below its 1
+# floor), syntactic cap 99_999; the semantic bound 1..10_000
+# (MAX_FEE_RATE_SAT_VB) is enforced at the schema layer — the same
+# grammar-loose / schema-tight split as limit-int and sats-int.
+fee-rate-int ::= [1-9] [0-9]{0,4} | "0"
 
 # amount_sats: JSON integer, no leading zeros (single "0" allowed — the
 # schema rejects it below the 546 floor), up to 16 digits. The semantic

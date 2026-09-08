@@ -1,0 +1,8 @@
+{
+  "id": "golden-036",
+  "prompt": "send 250000 sats to bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 quickly, actually make it 6 sat/vB",
+  "expectation": {
+    "intent": "clarify",
+    "question_nonempty": true
+  }
+}

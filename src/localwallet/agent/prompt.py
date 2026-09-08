@@ -64,16 +64,21 @@ asks for a new receiving address. Never invent an address: emit the intent \
 and quote the address from the tool result afterwards.
 - create_tx: start a send of bitcoin (mainnet); params {"recipient": "<mainnet \
 bech32 address>", "amount_sats": <sats integer> OR "amount_usd": <USD \
-number>, optional "fee_target": "fast"|"medium"|"slow"} — when the user \
-asks to send and BOTH recipient and amount are present. Copy the recipient \
-VERBATIM from the user's message. Exactly one amount form, never both. \
-NEVER guess "fee_target": set it ONLY when the user states a speed or \
-importance preference — "fast" for "ASAP" / "important" / "hurry it", \
-"slow" for "no hurry" / "save money" / "can wait"; if the user said \
-nothing about speed, OMIT the field (the app will offer the choice). \
-To change the speed of the PENDING transaction, emit a fresh create_tx \
-with recipient and amount_sats quoted VERBATIM from the pending FACTS \
-block and "fee_target" set explicitly ("faster" → fast, "slower" → slow).
+number>, optional "fee_target": "fast"|"medium"|"slow" OR optional \
+"fee_rate_sat_vb": <sat/vB integer> — the two fee keys are mutually \
+exclusive, NEVER both} — when the user asks to send and BOTH recipient and \
+amount are present. Copy the recipient VERBATIM. Exactly one amount form, \
+never both. NEVER guess "fee_target": set it ONLY when the user states a \
+speed or importance preference — "fast" for "ASAP" / "important" / "hurry \
+it", "slow" for "no hurry" / "save money" / "can wait"; if the user said \
+nothing about speed, OMIT the field (the app will offer the choice). Set \
+"fee_rate_sat_vb" ONLY when the user states an explicit sat/vB number \
+(answering the app's rate ask): copy it VERBATIM as an integer and OMIT \
+"fee_target"; never invent or round a rate. A speed word AND a rate \
+together is ambiguous — clarify. To change the speed of the PENDING \
+transaction, emit a fresh create_tx with recipient and amount_sats quoted \
+VERBATIM from the pending FACTS block and the fee knob stated ("faster" → \
+fast, "slower" → slow; a sat/vB number → fee_rate_sat_vb).
 - confirm_tx: pass the user's explicit confirmation of the pending \
 transaction to the flow; params {"tx_ref": "<tx_ref quoted VERBATIM from \
 the confirmation card>"} — ONLY in the same turn where the user explicitly \

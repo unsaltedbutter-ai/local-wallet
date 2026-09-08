@@ -1286,6 +1286,10 @@ def _make_create_tx_handler(
        ``rate_notice`` ceiling/floor on top of the pending fields (the
        ladder has rungs, not arbitrary rates — §2.3); a same-rung
        ``medium`` is a legal no-op-ish rebuild (§2.3, fresh ref/TTL).
+       A re-quote carrying an explicit ``fee_rate_sat_vb`` (TCK-FEE-002,
+       the answer to the ceiling ask) is NOT bound by the rung guard —
+       it replaces through the same commit-only-on-success path at the
+       user-quoted literal rate.
     2. Amount resolution: ``amount_sats`` is taken direct;
        ``amount_usd`` requires the price oracle (:meth:`PriceOracle.fresh`).
        A price failure on the USD path refuses the whole request with
@@ -1295,8 +1299,13 @@ def _make_create_tx_handler(
        there degrades to ``usd_cents=None`` and never blocks the send.
        A stale-but-served rate (ADR-0011 ladder) is marked ``rate_stale``
        with its age; the rate's fetch timestamp is included either way.
-    3. Fee rate: ``fee_target`` maps onto :class:`FeeTarget`; when the
-       model omits it the handler applies **MEDIUM** by default
+    3. Fee rate: the two fee knobs are mutually exclusive at the schema
+       layer (ADR-0012 amendment, TCK-FEE-002). An explicit
+       ``fee_rate_sat_vb`` is used VERBATIM as the bid — no estimator call,
+       no rung is recorded (``fee_target=None``, no fabricated ETA), and the
+       card retires the speed offer like any stated preference. Otherwise
+       ``fee_target`` maps onto :class:`FeeTarget`; when the model omits it
+       the handler applies **MEDIUM** by default
        (documented decision, TCK-P2-004: a send with no stated urgency
        gets the half-hour target, never the cheapest/slowest). The
        omitted-vs-explicit distinction is display-only state — the result
@@ -1357,9 +1366,18 @@ def _make_create_tx_handler(
             )
 
         # 3 (resolved early — pure, no I/O): fee target for the
-        # ceiling/floor guard below and the ladder estimate below.
-        target = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.MEDIUM
-        if requote and staged is not None:
+        # ceiling/floor guard below and the ladder estimate below. An
+        # explicit user-quoted rate (fee_rate_sat_vb, schema-exclusive with
+        # fee_target) resolves to NO rung: the literal rate is used and the
+        # rung guard is skipped (that IS the ceiling-ask answer, UX-004 →
+        # TCK-FEE-002).
+        target = (
+            None
+            if params.fee_rate_sat_vb is not None
+            else FeeTarget(params.fee_target) if params.fee_target
+            else FeeTarget.MEDIUM
+        )
+        if requote and staged is not None and target is not None:
             notice = _requote_notice(staged.fee_target, target)
             if notice is not None:
                 # Refused BEFORE any network/store work; the staged
@@ -1392,11 +1410,17 @@ def _make_create_tx_handler(
         rate_age_s = int(rate.age_s()) if rate is not None else None
         rate_fetched_at = rate.fetched_at if rate is not None else None
 
-        # 3 (cont.). Fee rate ladder (MEDIUM default when omitted).
-        try:
-            fee_rate = fee_estimator.estimate(target).sat_per_vb
-        except ChainError as exc:
-            return {"error": "chain_unavailable", "detail": str(exc)}
+        # 3 (cont.). Fee rate: the literal user-quoted sat/vB rate when
+        # present (no estimator call — the user's number is quoted verbatim
+        # and is the whole point of the ceiling-ask answer), else the ladder
+        # (MEDIUM default when neither knob is given).
+        if params.fee_rate_sat_vb is not None:
+            fee_rate = params.fee_rate_sat_vb
+        else:
+            try:
+                fee_rate = fee_estimator.estimate(target).sat_per_vb
+            except ChainError as exc:
+                return {"error": "chain_unavailable", "detail": str(exc)}
 
         # 4. UTXO snapshot with the lazy first scan.
         try:
@@ -1526,7 +1550,7 @@ def _make_create_tx_handler(
                 psbt_base64=psbt_base64,
                 inputs_count=len(inputs),
                 vsize=selection.estimated_vsize,
-                fee_target=target.value,
+                fee_target=target.value if target is not None else None,
                 change_sats=selection.change_sats,
             )
         except FlowError:
@@ -1536,7 +1560,9 @@ def _make_create_tx_handler(
                 flow, seconds_since_last_block_fn=seconds_since_last_block_fn
             )
 
-        eta = _eta_for(target.value, seconds_since_last_block_fn=seconds_since_last_block_fn)
+        # Explicit-rate records carry no rung ⇒ no rung-derived ETA (the ETA
+        # estimator is target-based; failing closed beats fabricating one).
+        eta = _eta_for(pending.fee_target, seconds_since_last_block_fn=seconds_since_last_block_fn)
 
         result: dict[str, object] = {
             "tx_ref": pending.tx_ref,
@@ -1554,18 +1580,27 @@ def _make_create_tx_handler(
             "fee_target": pending.fee_target,
             # Display-only card-view selectors (TCK-UX-002; NOT flow
             # state): variant A of the card tail when the envelope carried
-            # no fee_target (the one-shot speed offer), and the re-quote
-            # lead-line marker/direction when this result replaced a
-            # pending record (§2.0/§2.3).
-            "fee_target_defaulted": params.fee_target is None,
+            # neither fee knob (the one-shot speed offer — a user-quoted
+            # explicit rate IS a stated speed preference, TCK-FEE-002),
+            # and the re-quote lead-line marker/direction when this result
+            # replaced a pending record (§2.0/§2.3).
+            "fee_target_defaulted": params.fee_target is None and params.fee_rate_sat_vb is None,
             "fee_requote": requote,
             "expires_in_s": PENDING_TTL_S,
             **({} if eta is None else eta),
         }
         if requote and staged is not None:
-            direction = _requote_direction(staged.fee_target, target)
-            if direction is not None:
-                result["requote_direction"] = direction
+            if params.fee_rate_sat_vb is not None:
+                # Explicit-rate re-quote: no rungs to compare — direction is
+                # the literal rate vs the staged record's (display-only).
+                if fee_rate > staged.fee_rate_sat_vb:
+                    result["requote_direction"] = "faster"
+                elif fee_rate < staged.fee_rate_sat_vb:
+                    result["requote_direction"] = "slower"
+            else:
+                direction = _requote_direction(staged.fee_target, target)
+                if direction is not None:
+                    result["requote_direction"] = direction
         return result
 
     return handler
@@ -4022,10 +4057,13 @@ def _print_confirmation_card(
     if "fee_sats" in result:
         fee_line = f"Fee: {result['fee_sats']} sats"
         fee_parts: list[str] = []
-        if "fee_rate_sat_vb" in result:
+        if result.get("fee_rate_sat_vb") is not None:
             fee_parts.append(f"{result['fee_rate_sat_vb']} sat/vB")
-        if "fee_target" in result:
-            fee_parts.append(f"{result['fee_target']} target")
+        # None/absent ⇒ no segment: an explicit-rate record carries no rung
+        # (TCK-FEE-002) — never render "None target".
+        target_word = result.get("fee_target")
+        if isinstance(target_word, str) and target_word:
+            fee_parts.append(f"{target_word} target")
         if fee_parts:
             fee_line += f" ({', '.join(fee_parts)})"
     else:

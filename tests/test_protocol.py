@@ -56,6 +56,7 @@ from localwallet.protocol.envelope import (
     _MAX_FAILURE_CHARS,
     MAX_AMOUNT_SATS,
     MAX_AMOUNT_USD,
+    MAX_FEE_RATE_SAT_VB,
     MAX_TX_REF_CHARS,
     MIN_AMOUNT_SATS,
     MIN_AMOUNT_USD,
@@ -383,8 +384,11 @@ def test_node_status_rejects_any_params_key():
         {"recipient": MAINNET_P2WPKH, "amount_usd": 100.0},
         {"recipient": MAINNET_P2WPKH, "amount_usd": 10},  # integer JSON number
         {"recipient": MAINNET_P2WPKH, "amount_usd": 0.01, "fee_target": "slow"},
+        # TCK-FEE-002: explicit user-quoted rate (exclusive with fee_target)
+        {"recipient": MAINNET_P2WPKH, "amount_sats": 250_000, "fee_rate_sat_vb": 5},
+        {"recipient": MAINNET_P2WPKH, "amount_usd": 12.5, "fee_rate_sat_vb": 10_000},
     ],
-    ids=["sats-min", "sats-fast", "sats-medium", "sats-slow", "usd-float", "usd-int-json", "usd-min-fee"],
+    ids=["sats-min", "sats-fast", "sats-medium", "sats-slow", "usd-float", "usd-int-json", "usd-min-fee", "sats-rate", "usd-rate-ceiling"],
 )
 def test_accept_create_tx_param_combinations(params: dict):
     envelope = validate_payload({"v": 0, "intent": "create_tx", "params": params})
@@ -411,6 +415,54 @@ def test_accept_create_tx_amount_boundaries():
         {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_usd": 1_000_000}}
     )
     assert ok_usd_int.params.amount_usd == 1_000_000.0
+
+
+def test_accept_create_tx_fee_rate_boundaries():
+    """TCK-FEE-002 fee_rate_sat_vb bounds: the closed interval 1..MAX_FEE_RATE_SAT_VB.
+
+    The ceiling mirrors the tx-engine rate guard (``tx/dust.py``
+    ``_validate_rate`` refuses > 10_000 sat/vB as caller error) — the schema
+    admits nothing the money path could not consume. Round-trip fidelity
+    (None-valued optional dropped) is exercised by the accept matrix.
+    """
+    from localwallet.tx.dust import _MAX_RATE_SAT_VB
+
+    assert MAX_FEE_RATE_SAT_VB == _MAX_RATE_SAT_VB
+    lo = validate_payload(
+        {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_rate_sat_vb": 1}}
+    )
+    assert lo.params.fee_rate_sat_vb == 1
+    hi = validate_payload(
+        {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_rate_sat_vb": MAX_FEE_RATE_SAT_VB}}
+    )
+    assert hi.params.fee_rate_sat_vb == MAX_FEE_RATE_SAT_VB
+
+
+def test_create_tx_fee_knob_exclusivity_is_schema_layer():
+    """``fee_target`` + ``fee_rate_sat_vb`` together: rejected, value-free.
+
+    Enforced by the pydantic model (covers every producer; the GBNF tail
+    makes it syntactically impossible for a constrained decode) so an
+    ambiguous fee intent reaches the loop as a schema failure → re-prompt
+    → ``clarify`` — the handler never picks a winner. Either knob alone is
+    valid (see the accept matrix).
+    """
+    exc = expect_rejected(
+        {
+            "v": 0,
+            "intent": "create_tx",
+            "params": {
+                "recipient": MAINNET_P2WPKH,
+                "amount_sats": 546,
+                "fee_target": "fast",
+                "fee_rate_sat_vb": 5,
+            },
+        }
+    )
+    joined = "; ".join(exc.failures)
+    assert "mutually exclusive" in joined
+    # value-free: the rate and the recipient are never echoed into failures
+    assert "5" not in joined and MAINNET_P2WPKH not in joined
 
 
 def test_accept_create_tx_exponent_json_is_schema_legal():
@@ -965,6 +1017,15 @@ REJECT_MATRIX = [
     ("create_tx_fee_target_case", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_target": "FAST"}}),
     ("create_tx_fee_target_number", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_target": 1}}),
     ("create_tx_fee_target_null", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_target": None}}),
+    # TCK-FEE-002: fee_rate_sat_vb strict-int pattern + bounds + exclusivity
+    ("create_tx_rate_and_target_both", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_target": "fast", "fee_rate_sat_vb": 5}}),
+    ("create_tx_rate_string", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_rate_sat_vb": "5"}}),
+    ("create_tx_rate_bool", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_rate_sat_vb": True}}),
+    ("create_tx_rate_float", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_rate_sat_vb": 5.5}}),
+    ("create_tx_rate_null", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_rate_sat_vb": None}}),
+    ("create_tx_rate_zero", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_rate_sat_vb": 0}}),
+    ("create_tx_rate_negative", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_rate_sat_vb": -1}}),
+    ("create_tx_rate_over_max", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "fee_rate_sat_vb": MAX_FEE_RATE_SAT_VB + 1}}),
     ("create_tx_extra_key", {"v": 0, "intent": "create_tx", "params": {"recipient": MAINNET_P2WPKH, "amount_sats": 546, "memo": "hi"}}),
     ("create_tx_wrong_intent_key", {"v": 0, "intent": "create_tx", "params": {"tx_ref": "abc", "amount_sats": 546}}),
     ("confirm_tx_empty", {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": ""}}),

@@ -3229,6 +3229,24 @@ def _requote_envelope(fee_target: str | None):
     return validate_payload(json.dumps({"v": 0, "intent": "create_tx", "params": body}))
 
 
+def _rate_envelope(fee_rate_sat_vb: int):
+    """A same-destination create_tx envelope with the USER-QUOTED literal
+    rate (TCK-FEE-002) — the answer to the ceiling ask."""
+    return validate_payload(
+        json.dumps(
+            {
+                "v": 0,
+                "intent": "create_tx",
+                "params": {
+                    "recipient": SEND_RECIPIENT,
+                    "amount_sats": SEND_AMOUNT_SATS,
+                    "fee_rate_sat_vb": fee_rate_sat_vb,
+                },
+            }
+        )
+    )
+
+
 def _send_table(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3343,6 +3361,157 @@ def test_requote_ceiling_and_floor_refuse_pending_intact(
     floor = table[IntentName.CREATE_TX](_requote_envelope("slow"))
     assert floor["rate_notice"] == "floor"
     assert flow.pending.tx_ref == slow["tx_ref"]
+    client.close()
+    store.close()
+
+
+def test_explicit_rate_fresh_create_bids_the_literal_rate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-FEE-002: a create_tx carrying fee_rate_sat_vb bids the USER-QUOTED
+    rate, not the ladder — no estimator call at all — and stages with NO
+    rung (fee_target None, no fabricated ETA, offer retired like any stated
+    preference). The fixture's medium rung is 2 sat/vB; 5 proves the override."""
+    addr0 = derive_fixture_addresses(1)[0]
+    table, store, _wallet, client, recorded, flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]})
+    )
+    result = table[IntentName.CREATE_TX](_rate_envelope(5))
+    assert result.get("error") is None
+    assert result["fee_rate_sat_vb"] == 5
+    assert result["fee_sats"] == result["vsize"] * 5  # the literal bid, verbatim
+    assert result["fee_target"] is None  # explicit rate: no rung recorded
+    assert result["fee_target_defaulted"] is False  # stated preference → offer retired
+    assert "eta_minutes" not in result  # rung-based ETA fails closed, never fabricated
+    assert result["fee_requote"] is False
+    # The estimator was NEVER consulted (the price oracle still was, for display).
+    assert not any(r.url.path.endswith("/v1/fees/recommended") for r in recorded)
+    pending = flow.pending
+    assert pending is not None
+    assert pending.fee_rate_sat_vb == 5 and pending.fee_target is None
+    # Full card render survives the None rung (no "None target" line ever).
+    lines: list[str] = []
+    app_module._print_confirmation_card(result, lines.append)
+    assert not any("None target" in ln for ln in lines)
+    assert any("5 sat/vB" in ln for ln in lines)
+    client.close()
+    store.close()
+
+
+def test_ceiling_answer_with_explicit_rate_rebuilds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The UX-004 loop closes end to end (TCK-FEE-002): at the top rung a
+    third "faster" refuses with the ceiling ask; the ANSWER — a same-
+    destination re-quote with fee_rate_sat_vb — bypasses the rung guard and
+    rebuilds through the SAME FLOW-REQUOTE path: commit-only-on-success,
+    fresh tx_ref/TTL, direction "faster", OLD ref inert, NEW ref confirmable."""
+    ticks = {"now": 1_000.0}
+    table, store, client, flow, session = _send_table(
+        monkeypatch, tmp_path, SEND_UTXO, clock=lambda: ticks["now"]
+    )
+    fast = table[IntentName.CREATE_TX](_requote_envelope("fast"))
+    assert fast["fee_rate_sat_vb"] == 3  # ladder's top rung on this fixture
+    ceiling = table[IntentName.CREATE_TX](_requote_envelope("fast"))
+    assert ceiling["error"] == "tx_pending" and ceiling["rate_notice"] == "ceiling"
+
+    ticks["now"] = 1_060.0
+    answered = table[IntentName.CREATE_TX](_rate_envelope(5))
+    assert answered.get("error") is None  # the ask's answer DOES rebuild
+    assert answered["fee_requote"] is True
+    assert answered["requote_direction"] == "faster"  # 5 > the staged 3 sat/vB
+    assert answered["fee_rate_sat_vb"] == 5
+    assert answered["fee_sats"] > fast["fee_sats"]  # money math re-ran
+    assert answered["tx_ref"] != fast["tx_ref"] and answered["expires_in_s"] == 600
+    assert flow.pending.tx_ref == answered["tx_ref"] and flow.pending.created_at == 1_060.0
+
+    # The superseded ref stays inert — fail closed even with a same-turn CONFIRM.
+    session.gate_decision = GateDecision.CONFIRM
+    stale = table[IntentName.CONFIRM_TX](
+        validate_payload(
+            json.dumps({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": fast["tx_ref"]}})
+        )
+    )
+    assert stale["error"] == "confirm_refused"
+    fresh = table[IntentName.CONFIRM_TX](
+        validate_payload(
+            json.dumps({"v": 0, "intent": "confirm_tx", "params": {"tx_ref": answered["tx_ref"]}})
+        )
+    )
+    assert fresh["status"] == "confirmed"
+    client.close()
+    store.close()
+
+
+def test_explicit_rate_requote_direction_and_equal_rate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Explicit-rate re-quotes derive direction from the LITERAL rates
+    (no rungs to compare): 1 sat/vB onto the defaulted 2 sat/vB reads
+    "slower"; re-quoting the SAME rate is the legal no-op-ish rebuild
+    (identical numbers, no direction word, fresh ref — §2.3 precedent)."""
+    table, store, client, flow, _session = _send_table(monkeypatch, tmp_path, SEND_UTXO)
+    first = table[IntentName.CREATE_TX](_requote_envelope(None))  # medium → 2 sat/vB
+    down = table[IntentName.CREATE_TX](_rate_envelope(1))
+    assert down["requote_direction"] == "slower"
+    assert down["fee_sats"] < first["fee_sats"]
+    same = table[IntentName.CREATE_TX](_rate_envelope(1))
+    assert "requote_direction" not in same  # equal rate: no direction word
+    assert same["fee_sats"] == down["fee_sats"]  # identical numbers
+    assert same["tx_ref"] != down["tx_ref"]  # fresh identity anyway
+    assert flow.state is TxFlowStatus.CREATED
+    client.close()
+    store.close()
+
+
+def test_explicit_rate_requote_failure_keeps_original_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Commit-only-on-success holds on the explicit-rate path: a rate whose
+    higher fee pushes the wallet short surfaces insufficient_funds and the
+    ORIGINAL pending survives — the rung-guard bypass never half-replaces."""
+    table, store, client, flow, session = _send_table(monkeypatch, tmp_path, SEND_UTXO)
+    near = validate_payload(
+        json.dumps(
+            {
+                "v": 0,
+                "intent": "create_tx",
+                "params": {"recipient": SEND_RECIPIENT, "amount_sats": 99_700},
+            }
+        )
+    )
+    original = table[IntentName.CREATE_TX](near)  # 2 sat/vB, residue folded, fee 300
+    assert original.get("error") is None
+    too_high = validate_payload(
+        json.dumps(
+            {
+                "v": 0,
+                "intent": "create_tx",
+                "params": {
+                    "recipient": SEND_RECIPIENT,
+                    "amount_sats": 99_700,
+                    "fee_rate_sat_vb": 3,  # would need 100_030 sats
+                },
+            }
+        )
+    )
+    refused = table[IntentName.CREATE_TX](too_high)
+    assert refused == {
+        "error": "insufficient_funds",
+        "needed_sats": 100_030,
+        "available_sats": 100_000,
+    }
+    assert flow.state is TxFlowStatus.CREATED
+    assert flow.pending is not None and flow.pending.tx_ref == original["tx_ref"]
+    session.gate_decision = GateDecision.CONFIRM
+    confirmed = table[IntentName.CONFIRM_TX](
+        validate_payload(
+            json.dumps(
+                {"v": 0, "intent": "confirm_tx", "params": {"tx_ref": original["tx_ref"]}}
+            )
+        )
+    )
+    assert confirmed["status"] == "confirmed"
     client.close()
     store.close()
 

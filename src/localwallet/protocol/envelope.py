@@ -19,9 +19,13 @@ Canonical envelope contract v0 — the model-emitted wire format::
   the default; 1 = change chain, rarely user-requested but allowed);
   ``create_tx`` → ``{"recipient": str, 14..100 chars}`` plus EXACTLY ONE of
   ``{"amount_sats": int, 546..21e15}`` | ``{"amount_usd": number,
-  0.01..1_000_000}``, plus optional ``{"fee_target": "fast"|"medium"|"slow"}``
-  (the send entry point of the dispatcher-owned destructive flow — the
-  semantic recipient check is a mainnet witness-v0 P2WPKH address, layer 3);
+  0.01..1_000_000}``, plus AT MOST ONE of optional
+  ``{"fee_target": "fast"|"medium"|"slow"}`` | ``{"fee_rate_sat_vb": int,
+  1..10_000}`` — the two fee knobs are MUTUALLY EXCLUSIVE (a stated speed
+  rung or a user-quoted literal sat/vB rate, never both; TCK-FEE-002,
+  ADR-0012 amendment) (the send entry point of the dispatcher-owned
+  destructive flow — the semantic recipient check is a mainnet witness-v0
+  P2WPKH address, layer 3);
   ``confirm_tx`` → ``{"tx_ref": str, 1..64 chars}`` (references the pending
   transaction created by ``create_tx``; content is matched against the
   dispatcher-owned flow state, not here);
@@ -101,6 +105,7 @@ __all__ = [
     "INTENT_REGISTRY",
     "MAX_AMOUNT_SATS",
     "MAX_AMOUNT_USD",
+    "MAX_FEE_RATE_SAT_VB",
     "MAX_QUESTION_CHARS",
     "MAX_RECIPIENT_CHARS",
     "MAX_TEXT_CHARS",
@@ -158,6 +163,18 @@ MAX_AMOUNT_SATS: Final[int] = 21_000_000_000_000_000
 MIN_AMOUNT_USD: Final[float] = 0.01
 MAX_AMOUNT_USD: Final[float] = 1_000_000.0
 
+#: Accepted bounds of ``create_tx`` params ``fee_rate_sat_vb`` (schema layer).
+#: Floor is 1 sat/vB (the min-relay band; real min-relay/dust math is
+#: computed from script size in :mod:`localwallet.tx.dust`, never here —
+#: this is a coarse transport bound). The ceiling mirrors the tx engine's
+#: own rate guard: :func:`localwallet.tx.dust._validate_rate` refuses any
+#: rate above 10_000 sat/vB (1000x min-relay) as caller error, so the
+#: envelope admits nothing the money path would reject anyway. A rate
+#: inside 1..10_000 is a USER-QUOTED value (they answer the estimator's
+#: ceiling ask), relayable on mainnet, and far below any supply-scale
+#: absurdity — 10_000 sat/vB is a 100_000-vB transaction costing 1 BTC.
+MAX_FEE_RATE_SAT_VB: Final[int] = 10_000
+
 #: Maximum accepted length of ``confirm_tx`` / ``sign_tx`` / ``broadcast_tx``
 #: params ``tx_ref`` (characters).
 MAX_TX_REF_CHARS: Final[int] = 64
@@ -186,6 +203,7 @@ _KNOWN_LOC_FIELDS: Final[frozenset[str]] = frozenset(
         "amount_sats",
         "amount_usd",
         "fee_target",
+        "fee_rate_sat_vb",
         "tx_ref",
         "signer",
         "txid",
@@ -358,7 +376,7 @@ class NewAddressParams(_OmitNoneDump):
 
 
 class CreateTxParams(_OmitNoneDump):
-    """Params for ``create_tx``: recipient + exactly one amount + optional fee.
+    """Params for ``create_tx``: recipient + exactly one amount + one fee knob.
 
     Contract (Phase 2 v0 extension, ADR-0013):
 
@@ -381,13 +399,22 @@ class CreateTxParams(_OmitNoneDump):
     - ``fee_target``: optional enum literal ``"fast"|"medium"|"slow"``
       (omitted ⇒ the handler applies its default); explicit ``null`` is
       rejected — omission is expressed by leaving the key out, mirroring
-      ``limit``/``branch``.
+      ``limit``/``branch``. MUTUALLY EXCLUSIVE with ``fee_rate_sat_vb``.
+    - ``fee_rate_sat_vb``: optional TRUE JSON integer only (the strict-int
+      pattern from ``amount_sats``: strings/bools/floats/null rejected),
+      ``1..MAX_FEE_RATE_SAT_VB``. A USER-QUOTED explicit sat/vB rate (the
+      answer to the estimator's top-rung "tell me a rate in sat/vB" ask,
+      TCK-UX-004 → TCK-FEE-002): the handler bids this literal rate
+      instead of consulting the estimator ladder. MUTUALLY EXCLUSIVE with
+      ``fee_target`` — presenting both is ambiguous fee intent and is
+      rejected (one re-prompt, then ``clarify``; never guessed).
     """
 
     recipient: str = Field(min_length=MIN_RECIPIENT_CHARS, max_length=MAX_RECIPIENT_CHARS)
     amount_sats: int | None = Field(default=None, ge=MIN_AMOUNT_SATS, le=MAX_AMOUNT_SATS)
     amount_usd: float | None = Field(default=None, ge=MIN_AMOUNT_USD, le=MAX_AMOUNT_USD)
     fee_target: Literal["fast", "medium", "slow"] | None = None
+    fee_rate_sat_vb: int | None = Field(default=None, ge=1, le=MAX_FEE_RATE_SAT_VB)
 
     @field_validator("amount_sats", mode="before")
     @classmethod
@@ -430,11 +457,40 @@ class CreateTxParams(_OmitNoneDump):
             raise ValueError("fee_target must be 'fast', 'medium', or 'slow' when present")
         return value
 
+    @field_validator("fee_rate_sat_vb", mode="before")
+    @classmethod
+    def _fee_rate_sat_vb_must_be_true_int(cls, value: object) -> object:
+        """Close pydantic's lax coercions for ``fee_rate_sat_vb`` (see ``limit``).
+
+        Also rejects explicit ``null``: omission is expressed by leaving the
+        key out (mirrors ``amount_sats``/``fee_target``); a half-hearted
+        ``"fee_rate_sat_vb": null`` is a malformed fee intent, not an
+        omission.
+        """
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        raise ValueError("fee_rate_sat_vb must be an integer when present")
+
     @model_validator(mode="after")
     def _exactly_one_amount(self) -> CreateTxParams:
         """Enforce the amount XOR at the schema layer (layer 3 re-checks)."""
         if (self.amount_sats is None) == (self.amount_usd is None):
             raise ValueError("exactly one of amount_sats or amount_usd must be present")
+        return self
+
+    @model_validator(mode="after")
+    def _fee_knobs_are_exclusive(self) -> CreateTxParams:
+        """``fee_target`` and ``fee_rate_sat_vb`` must not both be present.
+
+        The rung (estimator-mapped speed preference) and the literal user-
+        quoted rate are two ways to say one thing; both at once is ambiguous
+        fee intent — rejected here so the loop re-prompts once and falls back
+        to ``clarify`` rather than guessing which one the user meant (the
+        GBNF tail alternation already makes it syntactically impossible for
+        a grammar-constrained decode; this covers every other producer).
+        """
+        if self.fee_target is not None and self.fee_rate_sat_vb is not None:
+            raise ValueError("fee_target and fee_rate_sat_vb are mutually exclusive")
         return self
 
 

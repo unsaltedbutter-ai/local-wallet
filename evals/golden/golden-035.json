@@ -1,0 +1,12 @@
+{
+  "id": "golden-035",
+  "prompt": "rebuild the pending send of 250000 sats to bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 at 6 sat/vB",
+  "expectation": {
+    "intent": "create_tx",
+    "params": {
+      "recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+      "amount_sats": 250000,
+      "fee_rate_sat_vb": 6
+    }
+  }
+}

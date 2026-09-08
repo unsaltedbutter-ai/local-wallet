@@ -257,3 +257,39 @@ patched-then-signed PSBT is byte-for-byte the verdict on the unpatched
 one (pinned by `tests/test_psbt_master_fp.py`). The canonical
 Sparrow-import fixture (TCK-P2-006) is re-pinned for the added
 change-derivation bytes.
+
+## Amendment (TCK-FEE-002, 2026-09-08): explicit sat/vB rate override in `create_tx`
+
+TCK-UX-004 made the estimator's top-rung "faster" refusal *ask* the user for
+an explicit rate ("tell me a rate in sat/vB and I'll rebuild the transaction
+at that rate"). This adds the field that answer flows into — a schema
+extension, NOT a confirm-gate change (the destructive flow is untouched;
+still `create_tx → confirm_tx → sign_tx → broadcast_tx`, dual-key gate as
+before), so it lives here with the fee policy.
+
+In-policy now (`protocol/envelope.py`, `app.py`, grammar, prompt in lockstep):
+
+1. `create_tx` accepts an optional `fee_rate_sat_vb` — a TRUE JSON integer
+   (`bool`/`string`/`float`/`null` rejected at layer 2), bounded
+   `1..MAX_FEE_RATE_SAT_VB` (`10_000`). The floor `1` is the min-relay band;
+   the ceiling MIRRORS the tx engine's own rate guard (`tx/dust.py`
+   `_validate_rate` refuses any rate `> 10_000` sat/vB — 1000× min-relay — as
+   caller error), so the envelope admits nothing the money path would reject
+   anyway. The real dust/min-relay decision stays computed from script size
+   in `tx/dust.py`; these are coarse schema transport bounds, never the dust
+   rule.
+2. `fee_rate_sat_vb` is MUTUALLY EXCLUSIVE with `fee_target` — enforced at
+   the GBNF tail (single alternation: a bare tail, a `fee_target`, or a
+   `fee_rate_sat_vb`, never both) AND the pydantic model (covers non-grammar
+   producers). Presenting both is ambiguous fee intent: rejected → one
+   re-prompt → `clarify`. The handler never picks a winner.
+3. When `fee_rate_sat_vb` is present the handler bids that literal rate and
+   does NOT call the estimator. It is a user-quoted value, taken VERBATIM
+   (the model may only copy a number the user stated; the prompt forbids
+   inventing/converting/rounding). No rung is recorded (`fee_target=None`,
+   no fabricated ETA), and the card retires the one-shot speed offer exactly
+   as a stated `fee_target` would.
+4. The override routes through the SAME FLOW-REQUOTE replacement path
+   (commit-only-on-success, fresh `tx_ref`/TTL, old ref inert); a re-quote
+   carrying it simply bypasses the rung ceiling/floor guard — that bypass is
+   the ceiling ask's resolution, reached only after the handler offered it.

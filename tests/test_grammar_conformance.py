@@ -436,6 +436,17 @@ ACCEPT = [
     # ---- Phase 4 (TCK-P4-003): node_status drift pin (empty params)
     '{"v":0,"intent":"node_status","params":{}}',
     '{\n "v" : 0 ,\n "intent" : "node_status" ,\n "params" : { }\n}',
+    # ---- TCK-FEE-002: explicit fee_rate_sat_vb tail (fee_target's exclusive sibling)
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":546,"fee_rate_sat_vb":1}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":546,"fee_rate_sat_vb":10000}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_usd":10.5,"fee_rate_sat_vb":7}}',
+    # grammar-legal rate the schema later bounds: 0 (below the floor) and a
+    # 5-digit 99999 (above MAX_FEE_RATE_SAT_VB=10000) — grammar admits,
+    # schema rejects (same loose-grammar/tight-schema split as limit/sats)
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":546,"fee_rate_sat_vb":0}}',
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":546,"fee_rate_sat_vb":99999}}',
+    # whitespace around the new tail
+    '{\n "v" : 0 ,\n "intent" : "create_tx" ,\n "params" : { "recipient" : "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx" , "amount_sats" : 546 , "fee_rate_sat_vb" : 5 }\n}',
 ]
 
 REJECT = [
@@ -502,6 +513,29 @@ REJECT = [
     '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_target":"FAST"}}',
     "create_tx params extra key",
     '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"memo":"x"}}',
+    # ---- TCK-FEE-002: fee-rate tail drift pins
+    "create_tx BOTH fee_target and fee_rate_sat_vb (exclusive tail alternation; schema re-checks)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_target":"fast","fee_rate_sat_vb":5}}',
+    "create_tx BOTH fee knobs, rate first (order recipient < amount < single fee knob)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_rate_sat_vb":5,"fee_target":"fast"}}',
+    "create_tx fee_rate_sat_vb before the amount (strict key order)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","fee_rate_sat_vb":5,"amount_sats":1000}}',
+    "create_tx fee_rate_sat_vb 6 digits (5-digit syntactic cap; schema ceiling is semantic)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_rate_sat_vb":100000}}',
+    "create_tx fee_rate_sat_vb decimal (integer sat/vB only)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_rate_sat_vb":1.5}}',
+    "create_tx fee_rate_sat_vb exponent notation (conservative grammar narrowing)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_rate_sat_vb":1e2}}',
+    "create_tx fee_rate_sat_vb negative (no sign in the number rules)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_rate_sat_vb":-5}}',
+    "create_tx fee_rate_sat_vb leading zero",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_rate_sat_vb":05}}',
+    "create_tx fee_rate_sat_vb null (omission is expressed by leaving the key out)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_rate_sat_vb":null}}',
+    "create_tx fee_rate_sat_vb quoted string",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":1000,"fee_rate_sat_vb":"5"}}',
+    "create_tx fee_rate_sat_vb with neither amount (tail requires an amount first)",
+    '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","fee_rate_sat_vb":5}}',
     "create_tx null amount",
     '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":null}}',
     "confirm_tx params extra key (decision params rejected: gate is app code, ADR-0013)",
@@ -602,6 +636,8 @@ def test_grammar_parses_without_unsupported_constructs(matcher: GbnfMatcher):
         "create-tx-tail",
         "fee-target-kv",
         "fee-target",
+        "fee-rate-kv",
+        "fee-rate-int",
         "sats-int",
         "usd-num",
         "confirm-tx",
