@@ -4,7 +4,10 @@ What the store is
 -----------------
 A thin, typed persistence layer over a single SQLite database (WAL). It backs
 Phase 1: wallet profiles, per-branch derivation state, derived addresses,
-UTXO cache, transaction cache, sync cursor, and application settings. All SQL
+UTXO cache, transaction cache, sync cursor, and application settings — plus
+(schema v2, TCK-UTXO-001) outpoint-keyed coin labels: closed-set tags + one
+free-text note per coin, stored in their own table so they survive the scan
+snapshot's DELETE+re-INSERT. All SQL
 lives inside this module; callers use the typed accessor methods and row
 records from :mod:`localwallet.store.models`. No raw SQL outside ``store/``.
 
@@ -19,32 +22,41 @@ No-secrets / no-value-logging policy
 ------------------------------------
 Watch-only: the store holds **no secrets** (no xprvs, no seed phrases) — only
 public watch data. Addresses, txids and amounts are legitimately *stored in
-the database*, but they are **never placed into log/exception text**. Every
-:class:`StoreError` message carries only table/operation context — never a
-value. This module deliberately performs no ``logging``; errors are raised for
-the caller to handle, with scrubbed messages.
+the database*, but they are **never placed into log/exception text**. Coin
+label text is the same class of user data (design doc §1.1): stored verbatim,
+never echoed into a message. Every :class:`StoreError` message carries only
+table/operation context — never a value. This module deliberately performs no
+``logging``; errors are raised for the caller to handle, with scrubbed
+messages.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from localwallet.store.models import (
+    COIN_NOTE_MAX_CHARS,
+    COIN_TAGS,
     AddressRecord,
+    CoinLabelRecord,
     DerivationRecord,
     TxRecord,
     UtxoRecord,
     WalletRecord,
+    normalize_coin_tags,
 )
 
 # Current schema version, tracked via ``PRAGMA user_version``. Bump this and
 # add an up-migration whenever the schema changes; never down-migrate.
-SCHEMA_VERSION = 1
+# v2 (TCK-UTXO-001): the ``coin_labels`` table (docs/ux-utxo-notes-design.md
+# §1.3) — outpoint-keyed, deliberately SEPARATE from the UTXO snapshot so
+# user labels survive every rescan.
+SCHEMA_VERSION = 2
 
 _BUSY_TIMEOUT_MS = 5000
 
@@ -72,7 +84,7 @@ class StoreIntegrityError(StoreError):
 
 
 class _MigrateError(StoreError):
-    """Raised when the on-disk schema cannot be (safely) brought to v1."""
+    """Raised when the on-disk schema cannot be (safely) brought up to date."""
 
 
 def _utcnow() -> str:
@@ -93,6 +105,36 @@ def _wrap_integrity(exc: sqlite3.IntegrityError) -> StoreIntegrityError:
 def _wrap(exc: sqlite3.Error) -> StoreError:
     """Convert any other sqlite error into a value-free StoreError."""
     return StoreError("store operation failed")
+
+
+_TXID_HEX_CHARS = frozenset("0123456789abcdef")
+
+
+def _check_label_txid(txid: object) -> None:
+    """Fail-closed shape check for a coin-label txid (value-free error).
+
+    Mirrors the envelope layer's rule (exactly 64 lowercase hex): a label is
+    keyed by outpoint, so a malformed id is a caller bug, refused before disk.
+    The offending value is never echoed into the message.
+    """
+    if (
+        not isinstance(txid, str)
+        or len(txid) != 64
+        or any(c not in _TXID_HEX_CHARS for c in txid)
+    ):
+        raise StoreError("coin label txid must be 64 lowercase hex characters")
+
+
+def _check_label_vout(vout: object) -> None:
+    """Fail-closed shape check for a coin-label vout (non-negative int)."""
+    if not isinstance(vout, int) or isinstance(vout, bool) or vout < 0:
+        raise StoreError("coin label vout must be a non-negative integer")
+
+
+def _check_label_outpoint(txid: object, vout: object) -> None:
+    """Validate a full (txid, vout) outpoint used as a coin_labels key."""
+    _check_label_txid(txid)
+    _check_label_vout(vout)
 
 
 # ----------------------------------------------------------------- shared SQL
@@ -139,6 +181,31 @@ _TX_UPSERT_SQL = (
 _SYNC_STATE_UPSERT_SQL = (
     "INSERT INTO sync_state (wallet_id, key, value) VALUES (?, ?, ?) "
     "ON CONFLICT(wallet_id, key) DO UPDATE SET value = excluded.value"
+)
+
+# coin_labels (schema v2, TCK-UTXO-001) — outpoint-keyed per-coin tags + note.
+# ``tags`` is a canonical-comma-joined closed-set string (NOT NULL — an
+# unlabeled coin has NO row, per §1.3, never an empty-string row); ``note`` is
+# verbatim free text, nullable. The (wallet_id, txid, vout) primary key lives
+# on the OUTPOINT, independent of the ephemeral utxos snapshot. FK cascade ties
+# it to the wallet (delete the wallet → its labels go too).
+_COIN_LABELS_DDL = """
+            CREATE TABLE IF NOT EXISTS coin_labels (
+                wallet_id  INTEGER NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+                txid       TEXT NOT NULL,
+                vout       INTEGER NOT NULL,
+                tags       TEXT NOT NULL,
+                note       TEXT,
+                PRIMARY KEY (wallet_id, txid, vout)
+            );
+"""
+
+_COIN_LABEL_UPSERT_SQL = (
+    "INSERT INTO coin_labels (wallet_id, txid, vout, tags, note) "
+    "VALUES (?, ?, ?, ?, ?) "
+    "ON CONFLICT(wallet_id, txid, vout) DO UPDATE SET "
+    "tags = excluded.tags, "
+    "note = excluded.note"
 )
 
 
@@ -193,6 +260,24 @@ class Store(AbstractContextManager["Store"]):
         return self._wal_mode
 
     def _migrate(self) -> None:
+        """Bring the on-disk schema up to :data:`SCHEMA_VERSION` via
+        ``PRAGMA user_version``-gated, incremental up-migrations.
+
+        Versioned-init contract (follows the v1 pattern, extended for the
+        single real v1→v2 step the coin-labels ticket needs):
+
+        * ``current > SCHEMA_VERSION`` — a DB from a NEWER build: fail closed,
+          never open/interpret an unknown schema (no down-migration exists).
+        * ``current == 0`` — a brand-new (or legacy-unversioned) file: build
+          the FULL current schema from scratch and stamp the version.
+        * ``0 < current < SCHEMA_VERSION`` — an existing versioned DB: run the
+          ordered up-migration steps for exactly the versions above ``current``
+          (here the v1→v2 add of ``coin_labels``) and re-stamp. A version with
+          no registered migration path is refused (fail closed).
+
+        All steps run inside one transaction: a half-applied migration can
+        never leave a DB stamped at the new version with the table missing.
+        """
         conn = self._conn
         current = conn.execute("PRAGMA user_version").fetchone()[0]
         if current > SCHEMA_VERSION:
@@ -201,17 +286,48 @@ class Store(AbstractContextManager["Store"]):
                 "database schema is newer than this build supports; "
                 "refusing to open (upgrade the application first)"
             )
-        if current < SCHEMA_VERSION:
-            if current != 0:
-                # We only know how to build schema 0 -> 1; anything else is an
-                # unexpected older schema. No down-migrations exist.
-                raise _MigrateError(
-                    "database schema is an unsupported older version; "
-                    "refusing to migrate (no down-migration path in v1)"
-                )
+        if current == SCHEMA_VERSION:
+            return  # already at the target schema (normal reopen)
+        if current == 0:
+            # Brand-new (or a legacy un-versioned file that is in fact empty):
+            # build the full current schema from scratch.
             with self._transaction():
                 self._create_schema()
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            return
+        # Existing versioned DB below the target: apply the ordered
+        # ``_migrate_v<from>_to_v<from+1>`` steps still pending. A gap in the
+        # ladder has no known-safe repair, so it is refused (fail closed, no
+        # down-migration path).
+        with self._transaction():
+            for version in range(current, SCHEMA_VERSION):
+                step = self._MIGRATIONS.get(version)
+                if step is None:
+                    raise _MigrateError(
+                        f"database schema version {version} has no known "
+                        "up-migration; refusing to migrate"
+                    )
+                step(self, conn)
+            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+        """v1→v2 (TCK-UTXO-001): add the outpoint-keyed ``coin_labels`` table.
+
+        Purely additive — existing v1 rows are untouched. The table lives in a
+        SEPARATE structure from ``utxos`` on purpose (design doc §1.3): the UTXO
+        snapshot is DELETE+re-INSERTed by every scan, so labels stored on the
+        UTXO row would die on the next sync. Outpoint-keyed (wallet_id, txid,
+        vout) rows survive rescans unchanged and stay on record after the coin
+        is spent (§1.2: capture is post-broadcast; a spent coin's history is a
+        fact the user keeps).
+        """
+        conn.executescript(_COIN_LABELS_DDL)
+
+    #: Up-migration ladder keyed by the version it migrates FROM. Extend (never
+    #: reorder or delete) as schema version bumps; a missing rung fails closed.
+    _MIGRATIONS: ClassVar[dict[int, Callable[[sqlite3.Connection], None]]] = {
+        1: _migrate_v1_to_v2,
+    }
 
     def _create_schema(self) -> None:
         conn = self._conn
@@ -278,6 +394,7 @@ class Store(AbstractContextManager["Store"]):
             );
             """
         )
+        conn.executescript(_COIN_LABELS_DDL)
 
     def close(self) -> None:
         self._conn.close()
@@ -563,6 +680,141 @@ class Store(AbstractContextManager["Store"]):
         ).fetchall()
         return [UtxoRecord.from_row(r) for r in rows]
 
+    # ---------------------------------------------------------- coin labels
+    #
+    # TCK-UTXO-001 (docs/ux-utxo-notes-design.md §1.3/§1.4): per-OUTPOINT
+    # closed-set tags + one free-text note. These typed accessors are the ONLY
+    # sanctioned writers (the chain_base_url / gap_limit precedent): tag-set
+    # and note-length validation live here, fail-closed, before anything
+    # reaches disk; error messages are value-free (label text is user data,
+    # same class as an address — never echoed into exceptions/logs). Labels
+    # are consumed by DETERMINISTIC code only and NEVER enter model context.
+
+    def set_coin_label(
+        self,
+        wallet_id: int,
+        txid: str,
+        vout: int,
+        tags: Iterable[str] = (),
+        note: str | None = None,
+    ) -> CoinLabelRecord | None:
+        """Set (replace) one coin's tags + note; returns the stored row.
+
+        Multi-tag is allowed (the §1.4 partition classes combine; lineage
+        unions input tag sets). An empty tag list stores "no tags"; a blank
+        (``""``) note clears the note field while keeping the tags. With
+        NEITHER tags nor a note the whole row is DELETED — a bare re-label
+        clears (§1.3: "no /label with no tags and no note clears"), and an
+        unlabeled coin is *no row*, never an empty row.
+
+        Raises value-free :class:`StoreError` for an unknown tag, an
+        over-long/blank-but-present note, or a malformed outpoint;
+        :class:`StoreIntegrityError` for a FK violation (no such wallet).
+        """
+        _check_label_outpoint(txid, vout)
+        try:
+            canonical = normalize_coin_tags(tags)
+        except ValueError as exc:
+            raise StoreError("coin tags must come from the closed tag set") from exc
+        if note is not None:
+            if not isinstance(note, str):
+                raise StoreError("coin note must be text")
+            if len(note) > COIN_NOTE_MAX_CHARS:
+                raise StoreError("coin note exceeds the maximum length")
+            note = note or None
+        if not canonical and note is None:
+            self.clear_coin_label(wallet_id, txid, vout)
+            return None
+        record = CoinLabelRecord(wallet_id, txid, vout, canonical, note)
+        try:
+            with self._transaction():
+                self._conn.execute(_COIN_LABEL_UPSERT_SQL, record.to_row())
+        except sqlite3.IntegrityError as exc:
+            raise _wrap_integrity(exc) from exc
+        except sqlite3.Error as exc:
+            raise _wrap(exc) from exc
+        return record
+
+    def get_coin_label(self, wallet_id: int, txid: str, vout: int) -> CoinLabelRecord | None:
+        """The label row for one outpoint, or ``None`` (unlabeled)."""
+        row = self._conn.execute(
+            "SELECT * FROM coin_labels WHERE wallet_id = ? AND txid = ? AND vout = ?",
+            (wallet_id, txid, vout),
+        ).fetchone()
+        return CoinLabelRecord.from_row(row) if row is not None else None
+
+    def get_coin_labels(self, wallet_id: int) -> list[CoinLabelRecord]:
+        """Every label row for a wallet (unspent AND spent coins — rows keyed
+        by outpoint survive rescans and stay after a coin is spent, §1.2)."""
+        rows = self._conn.execute(
+            "SELECT * FROM coin_labels WHERE wallet_id = ? ORDER BY txid, vout",
+            (wallet_id,),
+        ).fetchall()
+        return [CoinLabelRecord.from_row(r) for r in rows]
+
+    def clear_coin_label(self, wallet_id: int, txid: str, vout: int) -> None:
+        """Delete one coin's label row (idempotent: no row = already clear)."""
+        _check_label_outpoint(txid, vout)
+        try:
+            with self._transaction():
+                self._conn.execute(
+                    "DELETE FROM coin_labels WHERE wallet_id = ? AND txid = ? AND vout = ?",
+                    (wallet_id, txid, vout),
+                )
+        except sqlite3.Error as exc:
+            raise _wrap(exc) from exc
+
+    def propagate_coin_lineage(
+        self,
+        wallet_id: int,
+        txid: str,
+        output_vouts: Sequence[int],
+        spent_inputs: Sequence[tuple[str, int]],
+    ) -> None:
+        """Lineage-on-broadcast (design doc §1.3): our transaction's outputs
+        inherit the UNION of its wallet inputs' tag sets.
+
+        Conservative taint: a coin made by mixing carries both classes and
+        thereafter counts on both sides of the selection partition (kyc-side
+        is the fail-safe direction). Notes are display-only history and are
+        NEVER inherited; only tags are. Inputs without rows contribute
+        nothing — a union with no tags writes no row at all (unlabeled stays
+        unlabeled). Idempotent: an existing output row's tags merge into the
+        same union and its note is preserved.
+
+        Validation is fail-closed and value-free; the whole write is one
+        transaction (never a partially-inherited coin).
+        """
+        _check_label_txid(txid)
+        for in_txid, in_vout in spent_inputs:
+            _check_label_outpoint(in_txid, in_vout)
+        for vout in output_vouts:
+            _check_label_vout(vout)
+        input_tags: set[str] = set()
+        for in_txid, in_vout in spent_inputs:
+            row = self.get_coin_label(wallet_id, in_txid, in_vout)
+            if row is not None:
+                input_tags.update(row.tags)
+        if not input_tags:
+            return  # unlabeled inputs → unlabeled outputs (no rows written)
+        with self._atomic():
+            for vout in output_vouts:
+                tag_set = set(input_tags)
+                existing = self.get_coin_label(wallet_id, txid, vout)
+                if existing is not None:
+                    tag_set.update(existing.tags)
+                tags = tuple(tag for tag in COIN_TAGS if tag in tag_set)
+                self._conn.execute(
+                    _COIN_LABEL_UPSERT_SQL,
+                    (
+                        wallet_id,
+                        txid,
+                        vout,
+                        ",".join(tags),
+                        existing.note if existing is not None else None,
+                    ),
+                )
+
     # --------------------------------------------------------- transactions
 
     def upsert_txs(self, records: Sequence[TxRecord]) -> None:
@@ -623,6 +875,11 @@ class Store(AbstractContextManager["Store"]):
         the transaction: addresses, derivation, UTXO replace, transactions,
         sync state — no order dependencies exist (every row references only
         the pre-existing wallet row).
+
+        Coin labels (schema v2) are DELIBERATELY absent from this write-set:
+        the UTXO snapshot replace touches only the ``utxos`` table, so
+        outpoint-keyed ``coin_labels`` rows survive every rescan unchanged
+        (and remain after the coin is spent) — see :meth:`set_coin_label`.
         """
         snapshot = list(utxo_snapshot)
         with self._atomic():

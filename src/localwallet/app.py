@@ -143,6 +143,8 @@ from localwallet.signer.hwi import DeviceError, HwiUsbSigner
 from localwallet.store import (
     ADDRESS_ALLOCATED,
     BRANCH_CHANGE,
+    COIN_NOTE_MAX_CHARS,
+    COIN_TAGS,
     DIR_IN,
     DIR_OUT,
     DIR_SELF,
@@ -598,10 +600,19 @@ class SendSession:
     while a transaction pends (ADR-0020 transcript-command channel). The
     lines are the card's own display material (address/amounts — printed
     to the terminal anyway, never logged); the model cannot see them.
+
+    ``last_broadcast_txid`` / ``label_hint_txid`` (TCK-UTXO-001, design doc
+    §1.2/§1.3) are the ``/label`` session state: the most recent tx THIS
+    wallet broadcast (what ``last`` resolves to) and the tx the one-line
+    post-broadcast capture hint was already shown for (never repeated for
+    the same tx within the session). Terminal-channel display data —
+    labels themselves never enter model context.
     """
 
     gate_decision: GateDecision = GateDecision.NOT_A_DECISION
     card_render: list[str] | None = None
+    last_broadcast_txid: str | None = None
+    label_hint_txid: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2157,6 +2168,36 @@ def _make_broadcast_tx_handler(
         except (StoreError, sqlite3.Error) as exc:
             # Bookkeeping must not undo the broadcast: warn, stay BROADCAST.
             result["store_warning"] = f"could not record the transaction in history ({exc})"
+
+        # 5. Coin-label lineage (TCK-UTXO-001, design doc §1.3): our outputs
+        #    inherit the UNION of the wallet's spent inputs' tag sets — a
+        #    mixed-lineage coin carries both classes (the fail-safe side for
+        #    the deterministic partition check). Which outputs are ours is the
+        #    revalidated positional contract: change rides LAST when present
+        #    (tx/psbt.py + the sign-time revalidation), and this SIGNED record
+        #    is byte-frozen, so vout = count-1 is ours exactly when
+        #    change_sats is set. A send whose recipient is our own receive
+        #    address inherits nothing there (ponytail: honest-bounds edge —
+        #    the coin appears unlabeled on the next rescan and /label covers
+        #    it; full script-ownership matching is the provenance view's
+        #    problem, not this capture path's). Purely local bookkeeping —
+        #    labeling never causes network I/O — and it must never undo a
+        #    completed broadcast, so EVERY failure is contained value-free.
+        if confirmed is not None and confirmed.change_sats is not None:
+            try:
+                signed_psbt = PSBT.parse(base64.b64decode(signed.psbt_base64))
+                spent_inputs = tuple(
+                    (bytes(reversed(vin.txid)).hex(), vin.vout)
+                    for vin in signed_psbt.tx.vin
+                )
+                store.propagate_coin_lineage(
+                    wallet_id, txid, (len(signed_psbt.tx.vout) - 1,), spent_inputs
+                )
+            except Exception:  # noqa: BLE001 — containment: embit/store errors vary; missed tag-inheritance is annotation loss, never a money or broadcast failure
+                result.setdefault(
+                    "store_warning",
+                    "coin tag inheritance did not record — use /label after the next scan",
+                )
         return result
 
     return handler
@@ -3505,7 +3546,7 @@ def _pump(
             break
         if line.startswith("/"):
             _handle_transcript_command(
-                line, loop, output_fn, flow=flow, session=session
+                line, loop, output_fn, flow=flow, session=session, store=store
             )
         else:
             _run_turn(
@@ -3729,6 +3770,7 @@ def run(
             client=wiring.client,
             table=wiring.table,
             scan=wiring.scan,
+            store=wiring.store,
         )
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
@@ -4194,6 +4236,7 @@ def _repl(
     table: DispatchTable,
     emitter: EventEmitter | None = None,
     scan: ScanFlow | None = None,
+    store: Store | None = None,
 ) -> None:
     """The CLI transport over the engine pump (TCK-WEB-001, ADR-0024 §3).
 
@@ -4216,7 +4259,9 @@ def _repl(
     every turn runs through :func:`_run_turn` so the confirm gate sees
     the raw utterance before the model does. Transcript commands (OQ14,
     ADR-0020) are handled by the pump (deterministic UI, never model
-    intents). There is no protocol change.
+    intents); ``store`` rides along for the ``/label`` coin-label command
+    (TCK-UTXO-001 — engine-thread-only access, same pin as the WEB-005
+    settings pair). There is no protocol change.
     """
     commands: queue.Queue[Any] = queue.Queue()
     ready = threading.Event()
@@ -4242,6 +4287,7 @@ def _repl(
             emitter=emitter,
             ready=ready,
             scan=scan,
+            store=store,
         )
     finally:
         stop.set()
@@ -4251,12 +4297,79 @@ def _repl(
 #: Fallback wording for an unparseable ``/`` command (value-free).
 _TRANSCRIPT_HELP: Final[str] = (
     "Commands: /details — reprint the pending transaction's full card; "
+    "/label — list or set your own coin tags and notes; "
     "/export <path> — write a redacted session transcript; "
     "/scrub — clear the in-memory transcript; /help — show this."
 )
 #: ``/details`` with no cached card (nothing has pended this session —
 #: value-free).
 _DETAILS_NONE: Final[str] = "No pending transaction to show a full breakdown for."
+
+# ------------------------------------------------------------- /label (UTXO-001)
+#
+# Coin tags and notes are USER-AUTHORED facts about the user's own coins, on
+# the deterministic transcript channel (ADR-0020, like /details): they never
+# reach the model, the gate, or the dispatcher (design doc §1.1/§4.4). The
+# copy below is code-owned and static except for the values echoed verbatim
+# from the store's typed writer (txid, stored tags, stored note — terminal
+# display, same class as /details printing addresses). Display always frames
+# them as the user's claim ("your note" / "you marked") — we verify nothing (§9).
+
+#: §1.4 closed tag set → the strings the user sees (display-only mapping;
+#: ids are what the deterministic selection layer consumes, TCK-UTXO-002).
+_LABEL_TAG_DISPLAY: Final[dict[str, str]] = {
+    "kyc": "KYC",
+    "exchange": "exchange",
+    "p2p": "peer to peer",
+    "purchase": "purchase",
+    "consolidation": "consolidation",
+}
+#: §1.2 command shape (terminal UI; never a model-facing string).
+_LABEL_USAGE: Final[str] = (
+    'Usage: /label [last | <txid>] [tag words] ["your own words" after a |]'
+    " — bare /label lists your coins."
+)
+#: §4.3 label.unknown_tag — cause + the closed set + the free-note way out.
+_LABEL_UNKNOWN_TAG: Final[str] = (
+    "I don't know that label. Known ones: "
+    + ", ".join(COIN_TAGS)
+    + ' — or type your own words after "|" for a note.'
+)
+#: §4.3 label.nothing_last (value-free).
+_LABEL_NOTHING_LAST: Final[str] = (
+    'Nothing to label yet — "last" is the most recent payment you\'ve sent.'
+)
+#: §4.3 label.error_store — cause + next step, value-free.
+_LABEL_ERROR_STORE: Final[str] = (
+    'I couldn\'t save that note — the database is busy; say "retry".'
+)
+#: §4.3 label.cleared.
+_LABEL_CLEARED: Final[str] = "Cleared your note for that transaction's coins."
+#: Fail-closed target shapes (value-free; the command is terminal-only so a
+#: malformed txid is named plainly, never quoted back).
+_LABEL_BAD_TXID: Final[str] = (
+    'That doesn\'t look like a transaction id — 64 hex characters, or use "last".'
+)
+_LABEL_NO_TARGET: Final[str] = (
+    "Nothing to label for that transaction yet — its coins show up after a scan."
+)
+_LABEL_NO_WALLET: Final[str] = "No wallet is open yet — nothing to label."
+_LABEL_NOTE_TOO_LONG: Final[str] = (
+    f"That note is too long — {COIN_NOTE_MAX_CHARS} characters maximum. "
+    'Shorten the text after the "|".'
+)
+_LABEL_STORE_UNAVAILABLE: Final[str] = "Labels are unavailable — no wallet store is open."
+_LABEL_NO_COINS: Final[str] = "No coins to show yet — the wallet has no unspent outputs."
+#: §4.3 label.list_head — the honesty frame (§9) on every listing.
+_LABEL_LIST_HEAD: Final[str] = (
+    "Your unspent coins — tags are what YOU marked (we never verify anything):"
+)
+#: §4.3 card.broadcast_hint — the ONE post-broadcast capture hint (§1.2):
+#: printed when no gate is armed (flow is terminal BROADCAST), static
+#: code-owned string, never repeated within the session for the same tx.
+_LABEL_BROADCAST_HINT: Final[str] = (
+    'Want to remember what this was? Type /label last [tag] ["note"]'
+)
 
 
 def _handle_transcript_command(
@@ -4266,9 +4379,10 @@ def _handle_transcript_command(
     *,
     flow: TxFlow | None = None,
     session: SendSession | None = None,
+    store: Store | None = None,
 ) -> None:
-    """Handle an OQ14 transcript CLI command (``/details``, ``/export``,
-    ``/scrub``, ``/help``).
+    """Handle an OQ14 transcript CLI command (``/details``, ``/label``,
+    ``/export``, ``/scrub``, ``/help``).
 
     Deterministic UI features, NOT model intents (ADR-0020): no protocol,
     grammar, or prompt change. Output is short and plain. ``/details``
@@ -4278,6 +4392,11 @@ def _handle_transcript_command(
     card can never be re-shown as if live. It is a deterministic UI
     command, never a spoken decision: the word "details" is deliberately
     NOT in the gate's whitelists, so it can never confirm anything.
+
+    ``/label`` (TCK-UTXO-001) lists/sets/clears the user's OWN coin tags
+    and notes on the same channel — never model context, never a gate
+    answer, never an envelope; the store's typed accessors are the only
+    writers and own the fail-closed validation.
     """
     parts = command.split(maxsplit=1)
     cmd = parts[0].lower()
@@ -4291,6 +4410,9 @@ def _handle_transcript_command(
             return
         for line in session.card_render:
             output_fn(line)
+        return
+    if cmd == "/label":
+        _handle_label_command(parts[1] if len(parts) > 1 else "", store, session, output_fn)
         return
     if cmd == "/scrub":
         loop.scrub()
@@ -4312,6 +4434,187 @@ def _handle_transcript_command(
         output_fn(f"Transcript exported ({lines} lines, redacted).")
         return
     output_fn(_TRANSCRIPT_HELP)
+
+
+def _active_wallet_id(store: Store | None, output_fn: Callable[[str], None]) -> int | None:
+    """Resolve the active wallet id for a transcript command, or ``None``
+    after printing the value-free reason (no store / no wallet open)."""
+    if store is None:
+        output_fn(_LABEL_STORE_UNAVAILABLE)
+        return None
+    try:
+        wallet = store.get_active_wallet()
+    except (StoreError, sqlite3.Error):
+        output_fn(_LABEL_ERROR_STORE)
+        return None
+    if wallet is None:
+        output_fn(_LABEL_NO_WALLET)
+        return None
+    return wallet.id
+
+
+def _label_tag_line(tags: Sequence[str]) -> str:
+    """Render a stored tag id list as the user-facing display strings (§1.4)."""
+    return ", ".join(_LABEL_TAG_DISPLAY.get(tag, tag) for tag in tags)
+
+
+def _label_echo(txid: str, tags: Sequence[str], note: str | None) -> str:
+    """One §4.3 label.set line — txid verbatim, tags/note echoed AS STORED
+    (canonical order from the typed writer). Terminal display only."""
+    shown = f"Noted on transaction {txid}"
+    if tags:
+        shown += f" — your coin tags: {_label_tag_line(tags)}"
+    if note:
+        shown = f'{shown}{" ·" if tags else " —"} your note: "{note}"'
+    return shown
+
+
+def _list_coin_labels(store: Store, wallet_id: int, output_fn: Callable[[str], None]) -> None:
+    """Bare ``/label``: list tags/notes for the wallet's UNSPENT coins (§1.3).
+
+    Terminal-only, value-VERBATIM display is fine here (same class as the
+    /details card — addresses/amounts go to the human, never the model).
+    Unlabeled coins fall back to ``(unlabeled)`` — no row, matching the
+    §5 provenance view's existing fallback shape.
+    """
+    try:
+        utxos = store.get_utxos_for_wallet(wallet_id)
+        labels = {(r.txid, r.vout): r for r in store.get_coin_labels(wallet_id)}
+    except (StoreError, sqlite3.Error):
+        output_fn(_LABEL_ERROR_STORE)
+        return
+    if not utxos:
+        output_fn(_LABEL_NO_COINS)
+        return
+    output_fn(_LABEL_LIST_HEAD)
+    for u in utxos:
+        rec = labels.get((u.txid, u.vout))
+        tags = rec.tags if rec is not None else ()
+        note = rec.note if rec is not None else None
+        tail = "(unlabeled)" if not tags and not note else _label_echo(u.txid, tags, note)
+        output_fn(sanitize_tool_output(f"{u.txid}:{u.vout}  {u.value_sats} sats — {tail}"))
+
+
+def _handle_label_command(
+    rest: str,
+    store: Store | None,
+    session: SendSession | None,
+    output_fn: Callable[[str], None],
+) -> None:
+    """Implement ``/label`` (design doc §1.2, TCK-UTXO-001) — deterministic,
+    transcript-channel, NEVER model-facing.
+
+    Grammar::
+
+        /label                                → list tags/notes for unspent coins
+        /label [last | <txid>] [tag words] [| free note]
+
+    ``last`` resolves to the most recent tx this wallet BROADCAST this session
+    (``session.last_broadcast_txid``); ``<txid>`` is a full 64-hex id. Both
+    label the wallet-owned outputs the store knows about for that txid (its
+    unspent coins from that tx under ``utxos`` PLUS any recorded
+    ``coin_labels`` outpoints). A bare ``/label <target>`` with no tags and
+    no note clears (§1.3). All validation is fail-closed: unknown tag → the
+    §1.4 refusal listing the closed set; over-long note → a length-cap
+    refusal; malformed txid → refused. The typed store accessor is the sole
+    writer; the model is not consulted and label text never enters a
+    prompt/envelope/FACTS (§1.1/§7.10).
+
+    The store is the sole source of truth for which outpoints are ours: a
+    target txid resolves to the wallet's unspent outputs from that tx PLUS any
+    coin_labels rows for it (so a just-broadcast change coin is labelable
+    before the next rescan, and a retained spent-coin label can be edited).
+    A txid with no known coin says so value-free (§1.2).
+    """
+    tokens = rest.split("|", 1)
+    head = tokens[0].strip()
+    note = tokens[1].strip() if len(tokens) == 2 else None
+    if note == "":
+        note = None
+
+    # Bare /label → list (no target, no writes).
+    if head == "":
+        if store is None:
+            output_fn(_LABEL_STORE_UNAVAILABLE)
+            return
+        wallet_id = _active_wallet_id(store, output_fn)
+        if wallet_id is not None:
+            _list_coin_labels(store, wallet_id, output_fn)
+        return
+
+    words = head.split()
+    target = words[0] if words else ""
+    tag_words = words[1:] if words else []
+
+    if target.lower() == "last":
+        txid = session.last_broadcast_txid if session is not None else None
+        if txid is None:
+            output_fn(_LABEL_NOTHING_LAST)
+            return
+    else:
+        txid = target
+        if len(txid) != 64 or any(c not in "0123456789abcdef" for c in txid.lower()):
+            # A tag word with no target ("forgot the last/<txid>") is the most
+            # common slip → usage; anything else is a malformed id.
+            output_fn(_LABEL_USAGE if txid.lower() in COIN_TAGS else _LABEL_BAD_TXID)
+            return
+        txid = txid.lower()
+
+    if store is None:
+        output_fn(_LABEL_STORE_UNAVAILABLE)
+        return
+    wallet_id = _active_wallet_id(store, output_fn)
+    if wallet_id is None:
+        return
+
+    # Fail-closed tag validation against the closed set (case-insensitive in;
+    # the canonical ids out). Unknown word → the §1.4 refusal, nothing stored.
+    tag_ids: list[str] = []
+    for word in tag_words:
+        cid = word.lower()
+        if cid not in COIN_TAGS:
+            output_fn(_LABEL_UNKNOWN_TAG)
+            return
+        tag_ids.append(cid)
+
+    if note is not None and len(note) > COIN_NOTE_MAX_CHARS:
+        output_fn(_LABEL_NOTE_TOO_LONG)
+        return
+
+    # Which of THIS transaction's outputs are ours? Both wallet-owned unspent
+    # rows (coins this tx CREATED for us — the utxos snapshot holds only our
+    # own coins) and recorded label rows (the change coin of a just-broadcast
+    # send, written by the lineage helper before any rescan). A txid with no
+    # recorded coin is not labelable yet — §1.2 "says so".
+    try:
+        utxos = store.get_utxos_for_wallet(wallet_id)
+        label_rows = store.get_coin_labels(wallet_id)
+    except (StoreError, sqlite3.Error):
+        output_fn(_LABEL_ERROR_STORE)
+        return
+    our_vouts = sorted(
+        {u.vout for u in utxos if u.txid == txid}
+        | {r.vout for r in label_rows if r.txid == txid}
+    )
+    if not our_vouts:
+        output_fn(_LABEL_NO_TARGET)
+        return
+
+    cleared = not tag_ids and note is None
+    try:
+        for vout in our_vouts:
+            # A bare re-label replaces; no tags + no note clears (§1.3).
+            rec = store.set_coin_label(wallet_id, txid, vout, tag_ids, note)
+        if cleared:
+            output_fn(_LABEL_CLEARED)
+        elif rec is not None:
+            output_fn(sanitize_tool_output(_label_echo(txid, rec.tags, rec.note)))
+    except StoreError:
+        # The store's own fail-closed validation (should be pre-caught above);
+        # a residual StoreError is surfaced value-free, nothing is asserted
+        # saved. sqlite is guarded by Store's transaction handling.
+        output_fn(_LABEL_ERROR_STORE)
+        return
 
 
 def _run_turn(
@@ -4531,7 +4834,7 @@ def _print_turn(
     elif envelope.intent is IntentName.SIGN_TX:
         _print_sign_tx(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.BROADCAST_TX:
-        _print_broadcast_tx(turn.result or {}, output_fn)
+        _print_broadcast_tx(turn.result or {}, output_fn, session=session)
     elif envelope.intent is IntentName.TX_STATUS:
         _print_tx_status(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.NODE_STATUS:
@@ -4999,7 +5302,12 @@ def _print_sign_tx(result: Mapping[str, object], output_fn: Callable[[str], None
     output_fn(sanitize_tool_output(_GENERIC_FAILURE))  # pragma: no cover — handler-shaped
 
 
-def _print_broadcast_tx(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+def _print_broadcast_tx(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    *,
+    session: SendSession | None = None,
+) -> None:
     """Narrate a ``broadcast_tx`` outcome (TCK-P3-005).
 
     Success → "Sent! txid <txid> — tracking…" with the txid verbatim from
@@ -5008,6 +5316,14 @@ def _print_broadcast_tx(result: Mapping[str, object], output_fn: Callable[[str],
     Refusals and other errors surface value-free; a ``store_warning`` is
     printed after the success line (bookkeeping failed, broadcast didn't).
     The tx hex never appears in any line.
+
+    A success also carries the TCK-UTXO-001 capture state (design doc §1.2):
+    the txid becomes ``session.last_broadcast_txid`` (what ``/label last``
+    resolves to), and ONE static, code-owned hint line
+    (``card.broadcast_hint``) prints — never narration, never a gate input
+    (the flow is terminal BROADCAST here, no gate armed, so the hint is
+    unanswerable by a gate word), never repeated for the same tx within the
+    session. ``session=None`` (direct-call tests) renders without the hint.
     """
     error = result.get("error")
     if error == "broadcast_refused":
@@ -5031,12 +5347,16 @@ def _print_broadcast_tx(result: Mapping[str, object], output_fn: Callable[[str],
         )
         return
     if result.get("status") == "broadcast":
-        output_fn(
-            sanitize_tool_output(f"Sent! txid {result.get('txid', '')} — tracking…")
-        )
+        txid = str(result.get("txid", ""))
+        output_fn(sanitize_tool_output(f"Sent! txid {txid} — tracking…"))
         warning = result.get("store_warning")
         if isinstance(warning, str) and warning.strip():
             output_fn(sanitize_tool_output(f"warning: {warning}"))
+        if session is not None and txid:
+            session.last_broadcast_txid = txid
+            if session.label_hint_txid != txid:
+                session.label_hint_txid = txid
+                output_fn(_LABEL_BROADCAST_HINT)
         return
     output_fn(sanitize_tool_output(_GENERIC_FAILURE))  # pragma: no cover — handler-shaped
 
