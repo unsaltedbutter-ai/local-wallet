@@ -9,7 +9,11 @@
   (user goal: get users the most private setup possible), replacing the
   post-load placement of the prior revision. The ask stays skippable and
   non-blocking; the opt-in, validation, and precedence machinery is
-  unchanged.
+  unchanged. **Amended 2026-09-09 (TCK-ONB-006): on a first run with no
+  backend choice anywhere, the ask is no longer skippable-in-passing —
+  it is MANDATORY pre-scan and the startup scan waits for it (see
+  §Amendment 2 below and ADR-0022 amendment 1); the non-blocking rule
+  survives for everything EXCEPT the scan's start.**
 - **Date:** 2026-09-07
 - **Decides:** How the user chooses their chain backend at first run: the
   first-run conversation flow (greeting → xpub ask → skippable node ask
@@ -355,6 +359,81 @@ app; you'd want one to keep that link private. When you have one, the
 app connects to its mempool.space-style address. Want to try setting
 one up now, or continue without?
 ```
+
+## Amendment 2 (2026-09-09, TCK-ONB-006): the ask becomes mandatory pre-scan
+
+User report 2026-09-09: entering a zpub on a fresh install immediately
+started probing addresses against public mempool.space — before the node
+ask had been answered, or even read. "We should require the user to give us
+a server. Tell them it can be a bitcoind, or an electrum server, or a
+private mempool. We should say if they don't have one they can use the
+public mempool.space but be clear that this leaks their transaction
+information and wallet addresses." Decisions 1/2's "never gates anything"
+turned out to gate the one thing it shouldn't: the wallet's first address
+query. This amendment supersedes the skippable-in-passing posture **for
+the startup scan only**; everything else — accessibility (the public
+option stays available forever), validation, precedence, no-silent-fallback
+— stands unchanged.
+
+1. **Unresolved means unresolved.** The backend is *resolved* when a URL
+   sits on any rung of the decision-3 ladder (env > config file > stored)
+   **or** an explicit public opt-in is recorded: settings key
+   `chain_backend_choice="public"` (`BACKEND_CHOICE_SETTING`/`_PUBLIC` in
+   `ui/onboarding.py`), written by the warned conversation only —
+   deliberately NOT in the web `/settings` allowlist, because consent to
+   the leak happens where the leak is named. The empty stored rung means
+   "never chose", never "chose public"; today's implicit-public
+   representation was "nothing at all", which could not carry a consent
+   record — hence this explicit one (single source of truth:
+   `app._backend_resolved`).
+2. **While unresolved, no address query runs** (ADR-0022 amendment 1):
+   the startup scan holds at `awaiting_backend`, the lazy in-handler scan
+   and watch drain stand down with it, cache reads are `stale`-flagged and
+   `create_tx` keeps refusing. The user report's leak is closed at the
+   choke point, not by copy.
+ 3. **The ask is mandatory pre-scan while unresolved** on launches that can
+    carry it: the interactive CLI re-arms the node-ask branch at startup on
+    EVERY unresolved launch (fresh wallet or a returning wallet whose ask
+    was never answered; regardless of `AUTO_SCAN` — a scan opt-out is not
+    a server consent, security-review finding 1) until it resolves, and
+    the web UI holds the scan too, pointing at the terminal (requirement 5
+    keeps the browser free of consent surfaces). A headless scripted
+    launch stays exactly as before — never blocked, never deferred (the
+    command line is the operator's decision; decision 1's "never gating
+    first use" survives there).
+4. **Copy superseded (awaiting §9 re-sign-off; constants authoritative):**
+   block (a) is rewritten per the report — it names the server kinds
+   plainly (Bitcoin Core with the mempool.space app / an Electrum server /
+   a private mempool.space server), states the v1 Esplora-over-http(s)
+   limit and that `ssl://`-style Electrum addresses come later (decision 7
+   unchanged), and states the public option's cost in plain words: the
+   operator sees every address checked, can link them and to the IP, and
+   watches when transactions move. New first-run-only blocks: `LOAD_WAIT`
+   replaces step 3's narration while the scan is held (nothing "loading"
+   is claimed); `ASK_WAITS_ACK` answers "not now"; `PUBLIC_CHOSEN_ACK`
+   (+`PUBLIC_LOADING_NOW` when it starts the held scan) answers an
+   explicit public pick; `DEFERRED_RESTART` is appended to confirmation
+   (d) when the wallet is still unloaded. §9 voice: calm, honest,
+   value-free — the public path is stated as a legitimate choice with a
+   named price, never as a verdict.
+ 5. **Skip ≠ consent.** "Not now"/silence is NOT a public opt-in: it
+    records nothing, and the wallet simply stays unloaded (ask stays open
+    in-session; re-armed next launch). Only an explicit public answer
+    (``1``/``public``, word set `_PUBLIC_WORDS`) records the opt-in and
+    releases the held scan — onto the public server the user just accepted.
+    ("default" is dropped from the vocabulary, security-review finding 3:
+    the amended ask never lists it and public is no longer an implicit
+    default but a warned choice, so the word would overclaim consent; it
+    now falls through as ordinary chat.) An own-server
+    choice records the stored rung but does NOT fire an in-session scan
+    (decision 4's promise in new clothes: the live client is still the
+    pre-choice one; loading through it would be the silent fallback this
+    ADR forbids); the copy says the load comes after the restart, matching
+    the ADR-0018 config-only semantics decision 5 already shipped.
+6. **Reverts record too.** `/setup`'s explicit-public revert clears the
+   stored URL *and* writes the public marker — otherwise the cleared rung
+   would read "never chose" and the next launch would re-arm the ask (and
+   hold the scan) behind the user's back.
 
 ## Alternatives considered
 

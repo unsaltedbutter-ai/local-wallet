@@ -2,7 +2,9 @@
 
 - **Status:** Accepted (revised per the web-architecture consult 2026-09-07;
   reconciliation recorded 2026-09-08; drafted TOGETHER with ADR-0024 so the
-  threading models agree; implementation ticket TCK-SCAN-002/003).
+  threading models agree; implementation ticket TCK-SCAN-002/003; amended
+  2026-09-09 by ADR-0023 amendment 2 / TCK-ONB-006 — the first-run scan
+  exception in §Amendment 1 below).
 - **Date:** 2026-09-07 (reconciled 2026-09-08)
 - **Decides:** How the startup scan runs **non-blocking** in BOTH the CLI and
   the web worlds, and how cache-served answers during the first scan are honestly
@@ -51,7 +53,9 @@ worker removes chain I/O from the engine thread entirely.
 ## Decision
 
 1. **The startup scan is non-blocking in BOTH the CLI and web worlds, superseding
-   the blocking startup-scan behavior of ADR-0019's startup/load path.** The scan
+   the blocking startup-scan behavior of ADR-0019's startup/load path.**
+   (Amendment 1 adds the first-run exception: the scan stays non-blocking
+   once it may run, but on an unresolved backend it may not run at all.) The scan
    runs concurrently with the app being usable; the CLI prompt becomes live before
    the scan finishes (in the CLI, the between-turns drain can still observe scan
    progress), and in the web world the UI stays responsive throughout.
@@ -131,6 +135,68 @@ worker removes chain I/O from the engine thread entirely.
    no store access (it is not ADR-0019's deferred "thread with its own store
    connection"). CLI-world polls keep the between-turns tick where no background
    thread is needed (ADR-0024 decision 9 / decision 4 above decide the split).
+
+## Amendment 1 (2026-09-09, TCK-ONB-006): the first-run scan exception
+
+A user report dated 2026-09-09 fixed the privacy hole this ADR's eagerness
+opened: pasting a zpub on a fresh install began the startup scan
+*immediately*, against the public mempool.space default — the wallet's
+addresses went to a third-party operator **before the user had any say
+about the backend** (user-confirmed rationale: addresses must not leak to
+the public default before an explicit choice). Non-blocking-ness is kept;
+what changes is *what it is non-blocking against*.
+
+**The exception (decided here, implemented in `app.py`):** when NO backend
+choice exists on any rung — env > config file > stored URL (the
+`resolve_chain_base_url` ladder) **nor the explicit public opt-in record**
+(ADR-0023 amendment 2's `chain_backend_choice="public"` settings row,
+written only by the warned onboarding conversation; a stored-but-empty rung
+means "never chose", NOT "chose public") — the startup-scan gate is armed
+in a new pre-state `awaiting_backend`: the `ScanFlow` holds its plan (and
+on an `AUTO_SCAN=0` launch, where no plan exists to hold, the gate exists
+precisely to stand the lazy paths down — see Scope below) and the worker
+fetches NOTHING until the backend branch resolves. Every run that
+has a choice on any rung behaves exactly as decided above (or opted out
+of, `AUTO_SCAN=0`) — unchanged.
+
+- The gate's closed enum grows by one additive member
+  (`disabled/awaiting_backend/pending/running/done/skipped`); the `state/1`
+  snapshot tag is NOT bumped (TCK-WEB-005's additive rule), and the shipped
+  client renders unknown states as "no chip".
+- While `awaiting_backend`: `in_progress` and `first_scan_incomplete` are
+  TRUE, so decisions 5/6 apply verbatim — cache reads are `stale`-flagged,
+  `create_tx` refuses (sends were never possible pre-first-scan anyway),
+  the lazy in-handler scan and the watch drain stand down. No chain call of
+  any kind leaves the process: address leak and tx-timing leak both wait.
+- **Release paths.** An explicit public consent (the warned pick, recorded
+  then released in-session) starts the held fetch on the public client —
+  which is exactly what the user accepted. An OWN-SERVER choice does NOT
+  fire the scan: the live client was built at bootstrap from the old
+  resolution (ADR-0018 config-only), and fetching through the public
+  default after the user named their own server would be precisely
+  decision 4's forbidden silent fallback — the load waits for the next
+  launch, and the copy says so. The plan is re-built from the store at
+  release time (engine thread, network-free), so addresses allocated
+  during the wait are included.
+- **Scope of the exception.** It applies to launches where the choice CAN
+  be made or pointed at: the interactive CLI (mandatory pre-scan ask,
+  ADR-0023 amendment 2) and the web UI (scan held; the launch hint names
+  the wait — ADR-0023 keeps the browser consent-free, requirement 5). A
+  headless scripted launch is not blocked and not deferred either way —
+  the command line itself is the operator's decision (ADR-0023's
+  never-block-the-script rule predates this amendment and survives it);
+  the operator who wants the deferred posture sets a rung or runs the CLI
+  conversation once. `AUTO_SCAN=0` is NOT an escape hatch (security-review
+  finding 1): opting out of the AUTOMATIC scan is not consent to an
+  unchosen server, so on interactive/web launches the hold arms whenever
+  the backend is unresolved regardless of AUTO_SCAN — there the gate exists
+  to stand the lazy in-handler scan and the watch drain down (nothing was
+  planned to defer), and a release is a user-initiated load, not an auto
+  scan. `AUTO_SCAN=0` keeps its lazy-handler semantics only where no hold
+  applies: resolved launches (any transport) and headless scripted
+  launches (the carve-out above).
+- The freshness machinery is untouched: `awaiting_backend` reuses the
+  same tool-owned `stale` flag and the same completion cursor semantics.
 
 ## Why cooperative-chunking lost (consult F1)
 

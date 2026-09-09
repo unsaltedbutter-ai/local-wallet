@@ -42,6 +42,9 @@ from localwallet.wallet.descriptor import WalletDescriptor
 # Public fixture key material ONLY (the canonical suite zpub, one fixed seed).
 from tests.test_e2e_skeleton import XPRV, ZPUB
 
+# The web test-door seam (wake the pump's watch drain via a real /state).
+from tests.test_web_server import _request
+
 TESTNET_GENESIS = "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"
 GOOD_URL = "https://mempool.mine.example:4000/api"
 LOCAL_URL = "http://127.0.0.1:3006"
@@ -64,6 +67,21 @@ def _fake_client() -> EsploraClient:
         timeout_s=5.0,
         max_retries=0,
         transport=httpx.MockTransport(_tip_or_empty_handler),
+    )
+
+
+def _counting_client(calls: list[int]) -> EsploraClient:
+    """A fake backend that COUNTS every chain request — the TCK-ONB-006
+    leak pin: the count must stay 0 until a backend choice resolves."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return _tip_or_empty_handler(request)
+
+    return EsploraClient(
+        base_url="https://mempool.space/api",
+        timeout_s=5.0,
+        max_retries=0,
+        transport=httpx.MockTransport(handler),
     )
 
 
@@ -228,13 +246,30 @@ def _report_regtest() -> LocalNodeReport:
     )
 
 
+def _public_marker(tmp_path: Path) -> str | None:
+    """The explicit-public record (:data:`ob.BACKEND_CHOICE_SETTING`) —
+    ``None`` until a warned public consent is written (TCK-ONB-006)."""
+    store = Store(str(tmp_path / "onb.db"))
+    try:
+        return store.get_setting(ob.BACKEND_CHOICE_SETTING)
+    finally:
+        store.close()
+
+
 # ------------------------------------------------- fresh-user full flow
 
 
 def test_fresh_user_full_flow_five_steps(tmp_path: Path, monkeypatch) -> None:
-    """Steps 1→5 end to end: greeting+key ask → node ask + load narration →
-    guide (ask stays open) → 2 → URL → (d); the choice lands in the store;
-    only the ONE chat turn after the flow closes touches the model."""
+    """Steps 1→5 end to end ON A DEFERRED first run (TCK-ONB-006, ADR-0022
+    amendment 1): greeting+key ask → node ask + LOAD_WAIT (nothing is
+    loading — the scan is HELD for the choice) → guide (ask stays open) →
+    2 → URL → (d); the choice lands in the store; the held scan NEVER fires
+    through the (public-default) live client in-session — an own-server
+    choice takes effect next launch (ADR-0018/decision 4: no fetch through
+    a server the user just refused), so LOAD_COMPLETE waits for that
+    restart. Only the ONE chat turn after the flow closes touches the
+    model."""
+    calls: list[int] = []
     code, rec, stored, state = _drive(
         monkeypatch,
         tmp_path,
@@ -243,25 +278,33 @@ def test_fresh_user_full_flow_five_steps(tmp_path: Path, monkeypatch) -> None:
         interactive=True,
         auto_scan=True,
         backend_check=lambda _url: True,
+        client=lambda **_kw: _counting_client(calls),
     )
     assert code == 0
     joined = rec.joined
     assert joined.count(ob.GREETING) == 1
     assert ob.NODE_ASK in joined
-    assert ob.LOAD_NARRATION in joined  # SCAN-003 main variant
+    assert ob.LOAD_WAIT in joined  # deferred variant (ONB-006), not…
+    assert ob.LOAD_NARRATION not in joined  # …the "already loading" promise
     assert ob.GUIDE in joined  # (f) — then the ask stayed open
     assert ob.URL_PROMPT in joined  # (b)
     assert ob.CONFIRMED in joined  # (d)
     assert ob.EFFECTS_NEXT_LAUNCH in joined
-    assert ob.LOAD_COMPLETE in joined  # step 4, on the successful first scan
+    assert ob.DEFERRED_RESTART in joined  # the load waits for the restart
+    assert ob.LOAD_COMPLETE not in joined  # nothing loaded this session
+    assert "Startup scan complete" not in joined
+    assert calls == []  # THE leak pin: zero chain requests — before the
+    # choice AND after an own-server choice (it must never load through
+    # the public default it just refused)
     assert stored == GOOD_URL
+    assert _public_marker(tmp_path) is None  # an own URL is not the marker
     assert state["probes"] == 1
     # The conversation's spine is ordered (step-4 narration is async and
     # intentionally not pinned here).
     order = [
         joined.index(ob.GREETING),
         joined.index(ob.NODE_ASK),
-        joined.index(ob.LOAD_NARRATION),
+        joined.index(ob.LOAD_WAIT),
         joined.index(ob.GUIDE),
         joined.index(ob.URL_PROMPT),
         joined.index(ob.CONFIRMED),
@@ -295,8 +338,13 @@ def test_key_ask_help_seed_and_private_key_refusals(tmp_path: Path, monkeypatch)
     assert ob.NODE_ASK in joined  # key accepted → steps 2+ ran
     assert "bacon" not in joined  # seed words never echoed
     assert XPRV not in joined  # key material never echoed
-    assert ob.SKIP_ACK in joined  # "1" = explicit public pick
-    assert stored is None  # public is a non-choice: nothing stored
+    # "1" is now an EXPLICIT public CONSENT (TCK-ONB-006), not a shrug:
+    # its ack re-names the leak, and the opt-in record is what makes the
+    # next launch's backend "resolved".
+    assert ob.PUBLIC_CHOSEN_ACK in joined
+    assert ob.SKIP_ACK not in joined
+    assert stored is None  # the URL rung stays empty — public IS the default
+    assert _public_marker(tmp_path) == ob.BACKEND_CHOICE_PUBLIC
     assert state["model"] == 0  # the whole session never reached the model
 
     # Hardware-wallet-only guidance pin (user direction 2026-09-08): the
@@ -377,23 +425,233 @@ def test_env_preset_skips_onboarding(tmp_path: Path, monkeypatch) -> None:
     assert "your own node on another machine" in rec.joined
 
 
+# ------------------------------------------------ the deferred first scan
+#            (TCK-ONB-006 — ADR-0022 amendment 1 / ADR-0023 amendment 2)
+
+
+def test_first_run_makes_zero_chain_calls_before_the_choice(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """THE leak pin (user report 2026-09-09): with no rung resolved, an
+    interactive first run holds the startup scan — ordinary chat runs, the
+    backend is asked NOTHING, and no consent record is written. The wallet
+    stays honestly unloaded."""
+    calls: list[int] = []
+    code, rec, stored, state = _drive(
+        monkeypatch, tmp_path, lines=["what is bitcoin?", "exit"],
+        interactive=True, auto_scan=True,
+        client=lambda **_kw: _counting_client(calls),
+    )
+    assert code == 0
+    assert state["model"] == 1  # the chat line reached the model normally
+    assert calls == []  # zero requests to any backend, start to finish
+    assert "Startup scan complete" not in rec.joined
+    assert ob.LOAD_WAIT in rec.joined  # the honest "nothing is loading yet"
+    assert stored is None
+    assert _public_marker(tmp_path) is None
+
+
+def test_not_now_first_run_is_not_a_consent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """"Not now" while the scan is held: the ask names what stays off, the
+    ask stays OPEN, nothing is consented-to-recorded, nothing is fetched.
+    (Skip ≠ public — the distinction TCK-ONB-006 draws.)"""
+    calls: list[int] = []
+    code, rec, stored, state = _drive(
+        monkeypatch, tmp_path, lines=["not now", "exit"],
+        interactive=True, auto_scan=True,
+        client=lambda **_kw: _counting_client(calls),
+    )
+    assert code == 0
+    assert state["model"] == 0  # the skip answer is deterministic code
+    assert ob.ASK_WAITS_ACK in rec.joined
+    assert ob.SKIP_ACK not in rec.joined  # the "public for now" wording lies here
+    assert calls == []
+    assert "Startup scan complete" not in rec.joined
+    assert stored is None
+    assert _public_marker(tmp_path) is None
+
+
+def test_public_consent_releases_the_deferred_scan(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Explicit public pick (with the leak copy): the opt-in record lands,
+    the held scan starts on the public client the user just accepted, and
+    the load narration completes (steps 3→4 through the deferral)."""
+    calls: list[int] = []
+    code, rec, stored, state = _drive(
+        monkeypatch, tmp_path, lines=["what is bitcoin?", "1", "exit"],
+        interactive=True, auto_scan=True,
+        client=lambda **_kw: _counting_client(calls),
+    )
+    assert code == 0
+    assert state["model"] == 1  # chat ran while the ask was open
+    assert ob.PUBLIC_CHOSEN_ACK in rec.joined
+    assert ob.PUBLIC_LOADING_NOW in rec.joined  # consent really started it
+    assert "Startup scan complete" in rec.joined
+    assert ob.LOAD_COMPLETE in rec.joined  # step 4 rides the released scan
+    assert len(calls) > 0  # the scan fired — AFTER the recorded choice
+    assert stored is None  # the URL rung stays empty…
+    assert _public_marker(tmp_path) == ob.BACKEND_CHOICE_PUBLIC  # …the marker carries the consent
+
+
+def test_second_run_after_public_consent_scans_immediately(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The recorded consent makes the NEXT launch resolved: immediate scan,
+    no ask, no deferral copy — 'every other run scans unchanged'."""
+    _drive(  # run 1: consent in passing.
+        monkeypatch, tmp_path, lines=["1", "exit"],
+        interactive=True, auto_scan=True,
+    )
+    code, rec, stored, _ = _drive(  # run 2: same store, never asked again.
+        monkeypatch, tmp_path, lines=["exit"],
+        interactive=True, auto_scan=True,
+    )
+    assert code == 0
+    assert ob.NODE_ASK not in rec.joined
+    assert ob.LOAD_WAIT not in rec.joined
+    assert "Startup scan complete" in rec.joined
+    assert stored is None
+
+
+@pytest.mark.parametrize("auto_scan", [True, False])
+def test_returning_unresolved_wallet_stays_deferred_and_rearms(
+    tmp_path: Path, monkeypatch, auto_scan: bool
+) -> None:
+    """A wallet that was created but whose ask was NEVER answered (e.g. the
+    user quit mid-ask) is still unresolved: the scan keeps waiting and the
+    mandatory ask re-arms at startup — the deferral is never a silent
+    dead-end, and it never leaks to the default behind the user's back.
+    Re-arms REGARDLESS of AUTO_SCAN (security review F1: a scan opt-out
+    is not a server consent)."""
+    _preset_wallet(tmp_path)  # existing wallet, nothing stored, no marker
+    calls: list[int] = []
+    code, rec, _stored, _ = _drive(
+        monkeypatch, tmp_path, lines=["exit"],
+        interactive=True, auto_scan=auto_scan,
+        client=lambda **_kw: _counting_client(calls),
+    )
+    assert code == 0
+    assert ob.NODE_ASK in rec.joined  # re-armed: the ask is mandatory pre-scan
+    assert ob.LOAD_WAIT in rec.joined
+    assert calls == []
+    assert "Startup scan complete" not in rec.joined
+
+
+def test_setup_public_consent_unblocks_deferred_scan_on_fresh_wallet(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The /setup path resolves the held scan too (single source of truth):
+    on a deferred fresh wallet, /setup → explicit public → record + release
+    → the load completes in-session."""
+    calls: list[int] = []
+    code, rec, stored, state = _drive(
+        monkeypatch, tmp_path, lines=["/setup", "1", "exit"],
+        interactive=True, auto_scan=True,
+        client=lambda **_kw: _counting_client(calls),
+    )
+    assert code == 0
+    assert state["model"] == 0  # every line deterministic
+    assert "Startup scan complete" in rec.joined
+    assert len(calls) > 0
+    assert stored is None
+    assert _public_marker(tmp_path) == ob.BACKEND_CHOICE_PUBLIC
+
+
+# --------------------------------------------- the ack's honesty (review F2/F3)
+
+
+def _consent_ack_lines(tmp_path: Path, *, started: bool) -> list[str]:
+    """One explicit public consent through a flow whose release hook
+    REPORTS success (``started=True``) or failure (a broken plan stood the
+    scan down — F2)."""
+    store = Store(str(tmp_path / f"release-{started}.db"))
+    try:
+        flow = ob.OnboardingFlow(
+            store=store,
+            check_backend=lambda _u: True,
+            deferred=True,
+            public_chosen=lambda: started,
+        )
+        out: list[str] = []
+        assert flow.handle_line("1", out.append)
+        return out
+    finally:
+        store.close()
+
+
+def test_public_loading_line_requires_an_actual_start(tmp_path: Path) -> None:
+    """Security review F2: "Loading your wallet from it now." may only
+    print when the release report says the held scan REALLY started — a
+    failed plan (mark_skipped, nothing loads this session) must not buy
+    the claim. The consent ack itself always prints (the record stands
+    either way)."""
+    started = _consent_ack_lines(tmp_path, started=True)
+    assert ob.PUBLIC_CHOSEN_ACK in started
+    assert ob.PUBLIC_LOADING_NOW in started
+    stalled = _consent_ack_lines(tmp_path, started=False)
+    assert ob.PUBLIC_CHOSEN_ACK in stalled
+    assert ob.PUBLIC_LOADING_NOW not in stalled
+
+
+def test_default_is_no_longer_a_consent_word(tmp_path: Path) -> None:
+    """Security review F3: "default" named the free public default the
+    amendment deleted and is NOT among the options the ask presents — it
+    records nothing, fires no release, and falls through as ordinary chat
+    (the held ask stays open, so a later "1"/"2" still resolves it)."""
+    store = Store(str(tmp_path / "vocab.db"))
+    try:
+        releases: list[int] = []
+        flow = ob.OnboardingFlow(
+            store=store,
+            check_backend=lambda _u: True,
+            deferred=True,
+            public_chosen=lambda: releases.append(1) or True,
+        )
+        out: list[str] = []
+        assert flow.handle_line("default", out.append) is False
+        assert out == []  # the deterministic channel consumed nothing
+        assert releases == []  # no release, no consent
+        assert store.get_setting(ob.BACKEND_CHOICE_SETTING) is None
+        assert not flow.done  # the ask is still open
+    finally:
+        store.close()
+
+
 # ------------------------------------------------------- the ask branch
 
 
-def test_node_ask_skipped_keeps_public(tmp_path: Path, monkeypatch) -> None:
-    """"not now" → (e): public default retained (nothing stored), banner
-    stays the honest public wording, the ask is over for the session."""
+def test_auto_scan_zero_does_not_escape_the_hold(tmp_path: Path, monkeypatch) -> None:
+    """Security review F1 (the blocker): AUTO_SCAN=0 used to disarm the
+    deferral — an unresolved launch then ran with the gate ``disabled``:
+    the mandatory ask never re-armed and the FIRST get_balance lazily
+    probed the public default with no ask and no consent record,
+    indefinitely. The hold is now armed on EVERY unresolved interactive
+    launch regardless of AUTO_SCAN: the balance turn answers from the
+    empty cache with ZERO chain calls, "not now" gets the honest wait
+    copy (skip ≠ consent — the plain (e) ack would claim a scan-less
+    session had already chosen), and nothing is recorded."""
+    calls: list[int] = []
     code, rec, stored, state = _drive(
-        monkeypatch, tmp_path, lines=["not now", "exit"], interactive=True,
+        monkeypatch, tmp_path,
+        lines=["what's my balance?", "not now", "exit"],
+        interactive=True,  # _drive default: auto_scan=False (AUTO_SCAN=0)
+        client=lambda **_kw: _counting_client(calls),
     )
     assert code == 0
-    assert ob.SKIP_ACK in rec.joined
+    assert state["model"] == 1  # the balance question ran as an ordinary turn
+    assert calls == []  # THE leak pin: the lazy in-handler scan stood down
+    assert ob.NODE_ASK in rec.joined  # the ask re-arms — scan-less or not
+    assert ob.LOAD_WAIT in rec.joined
+    assert ob.ASK_WAITS_ACK in rec.joined
+    assert ob.SKIP_ACK not in rec.joined  # nothing was consented to
+    assert "Startup scan complete" not in rec.joined
     assert stored is None
-    assert PRIVACY_INDICATOR in rec.joined  # public banner, unchanged
-    assert state["probes"] == 0
-    # AUTO_SCAN=0: the load narration promises nothing when no load runs.
-    assert ob.LOAD_NARRATION not in rec.joined
-    assert ob.LOAD_COMPLETE not in rec.joined
+    assert _public_marker(tmp_path) is None
+    assert PRIVACY_INDICATOR in rec.joined  # banner still names the fallback
+    assert ob.LOAD_NARRATION not in rec.joined  # nothing "loading" is claimed
 
 
 def test_node_ask_answer_may_arrive_later(tmp_path: Path, monkeypatch) -> None:
@@ -439,7 +697,7 @@ def test_url_rejected_doctor_pointer_then_explicit_public(
     assert code == 0
     assert rec.joined.count(ob.VALIDATION_FAIL) == 2
     assert '"node status"' in rec.joined  # the doctor pointer (copy (c))
-    assert ob.SKIP_ACK in rec.joined
+    assert ob.PUBLIC_CHOSEN_ACK in rec.joined  # explicit consent (ONB-006)
     assert stored is None  # the failed URL was NEVER saved
     assert state["probes"] == 2  # retry re-probed the same candidate
 
@@ -530,7 +788,8 @@ def test_startup_scan_failure_never_narrates_load_complete(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Honest step 4: the load-complete line rides ONLY a successful first
-    scan persist; the failure path keeps its scrubbed warning."""
+    scan persist — including a scan released by a public CONSENT (the
+    deferred first-run path) — never on the failure's scrubbed warning."""
 
     def failing_client(**_kw: Any) -> EsploraClient:
         return EsploraClient(
@@ -541,7 +800,7 @@ def test_startup_scan_failure_never_narrates_load_complete(
         )
 
     code, rec, _stored, _ = _drive(
-        monkeypatch, tmp_path, lines=["skip", "exit"],
+        monkeypatch, tmp_path, lines=["1", "exit"],
         interactive=True, auto_scan=True, client=failing_client,
     )
     assert code == 0
@@ -645,6 +904,108 @@ def test_web_launch_gets_hint_only(tmp_path: Path, monkeypatch) -> None:
     capture2["server"].stop()
     thread2.join(15)
     assert ob.WEB_SETUP_HINT not in "\n".join(outputs2)
+
+
+def test_web_first_run_defers_the_scan(tmp_path: Path, monkeypatch) -> None:
+    """TCK-ONB-006 on the web path: with no rung resolved the startup scan
+    is HELD — zero chain requests, no completion narration — and the hint
+    says the honest thing: balances wait until a backend is chosen (the
+    browser has no consent surface; the terminal ask or a saved Settings
+    address, effective next launch, unblocks the load)."""
+    calls: list[int] = []
+    for var in (
+        "LOCALWALLET_MODEL_PATH",
+        "LOCALWALLET_LLM_BASE_URL",
+        "LOCALWALLET_LLM_MODEL",
+        "LOCALWALLET_CHAIN_BASE_URL",
+        app_module.ZPUB_ENV_VAR,
+        app_module.UI_ENV_VAR,
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(tmp_path / "web-defer.db"))
+    monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "1")
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
+    monkeypatch.setattr(
+        app_module, "EsploraClient", lambda **_kw: _counting_client(calls)
+    )
+
+    outputs: list[str] = []
+    capture: dict[str, Any] = {}
+    gate = threading.Event()
+    thread = threading.Thread(
+        target=lambda: capture.update(
+            code=run(
+                ["--stub-llm", "--zpub", ZPUB, "--web"],
+                output_fn=outputs.append,
+                on_web_server=lambda server: (capture.update(server=server), gate.set()),
+            )
+        ),
+        daemon=True,
+    )
+    thread.start()
+    assert gate.wait(30), "web server never started"
+    capture["server"].stop()
+    thread.join(15)
+    assert capture.get("code") == 0
+    joined = "\n".join(outputs)
+    assert ob.WEB_SETUP_HINT in joined  # the updated copy (balances wait)
+    assert "Startup scan complete" not in joined  # and it tells the truth
+    assert calls == []  # the held scan never touched the public default
+
+
+def test_web_auto_scan_zero_watch_never_probes_the_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Security review F1(b) at the web door: with AUTO_SCAN=0 the gate
+    used to read ``disabled`` and the between-turns watch drain then ran
+    its scan through the public default — while WEB_SETUP_HINT claimed the
+    app had NOT looked up the wallet. The held gate is armed regardless of
+    AUTO_SCAN and stands the drain down too: zero requests, so the hint is
+    true in exactly that state."""
+    calls: list[int] = []
+    for var in (
+        "LOCALWALLET_MODEL_PATH",
+        "LOCALWALLET_LLM_BASE_URL",
+        "LOCALWALLET_LLM_MODEL",
+        "LOCALWALLET_CHAIN_BASE_URL",
+        app_module.ZPUB_ENV_VAR,
+        app_module.UI_ENV_VAR,
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(tmp_path / "web-watch.db"))
+    monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "0")  # the formerly-leaky combo
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0.05")  # watch ON
+    monkeypatch.setattr(
+        app_module, "EsploraClient", lambda **_kw: _counting_client(calls)
+    )
+
+    outputs: list[str] = []
+    capture: dict[str, Any] = {}
+    gate = threading.Event()
+    thread = threading.Thread(
+        target=lambda: capture.update(
+            code=run(
+                ["--stub-llm", "--zpub", ZPUB, "--web"],
+                output_fn=outputs.append,
+                on_web_server=lambda server: (capture.update(server=server), gate.set()),
+            )
+        ),
+        daemon=True,
+    )
+    thread.start()
+    assert gate.wait(30), "web server never started"
+    server = capture["server"]
+    threading.Event().wait(0.2)  # let the interval mature
+    # The drain runs BETWEEN pump commands — wake the pump exactly like the
+    # shipped UI's /state poll does (an idle never-woken pump would hide the
+    # leak the buggy build actually ran on the first real request).
+    _request(server, "GET", "/state", token=server.token)
+    threading.Event().wait(0.3)
+    server.stop()
+    thread.join(15)
+    assert capture.get("code") == 0
+    assert ob.WEB_SETUP_HINT in "\n".join(outputs)
+    assert calls == []  # the watch drain stood down behind the held gate
 
 
 # ---------------------------------------------------------- chain probe unit

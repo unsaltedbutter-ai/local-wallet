@@ -189,7 +189,13 @@ from localwallet.tx.revalidate import (
     revalidate_signed_psbt,
 )
 from localwallet.tx.selection import InsufficientFundsError, SelectionError, select_coins
-from localwallet.ui.onboarding import WEB_SETUP_HINT, OnboardingFlow, ask_watch_key
+from localwallet.ui.onboarding import (
+    BACKEND_CHOICE_PUBLIC,
+    BACKEND_CHOICE_SETTING,
+    WEB_SETUP_HINT,
+    OnboardingFlow,
+    ask_watch_key,
+)
 from localwallet.wallet import scan as wallet_scan
 from localwallet.wallet.derivation import BranchDeriver
 from localwallet.wallet.descriptor import (
@@ -418,6 +424,23 @@ def privacy_indicator(settings: Settings) -> str:
     if mode == BACKEND_MODE_OWN_NODE_REMOTE:
         return PRIVACY_INDICATOR_OWN_NODE_REMOTE
     return PRIVACY_INDICATOR
+
+#: TCK-BACKEND-001 (ADR-0018 amendment): the honest, value-free warning
+#: printed ONCE at startup when ``Settings.tls_verify`` resolves to
+#: ``False`` (self-hosted https backend with a private-CA / self-signed
+#: cert). Disabling TLS verification weakens transport AUTHENTICATION, so
+#: this line is unskippable in narration — it states the concrete risk (a
+#: network-path observer can see the queried addresses and tamper with
+#: responses) and the safer alternative, and never echoes any URL/host.
+#: Printed regardless of which backend is configured: the same downgrade
+#: risk applies to the public default.
+TLS_UNVERIFIED_WARNING: Final[str] = (
+    "Warning: TLS certificate verification for the chain backend is "
+    "DISABLED. Whoever controls the network path can observe your queried "
+    "addresses and tamper with the responses. Prefer a certificate your "
+    "system already trusts (add the CA to the OS trust store) over "
+    "LOCALWALLET_TLS_VERIFY=0 / tls_verify=false."
+)
 
 #: ADR-0009 UI surfacing for ``sync_state["out_of_window_detected"]``:
 #: printed at startup when the store carries a non-empty warning payload.
@@ -2685,6 +2708,25 @@ def _has_completed_scan(store: Store, wallet_id: int) -> bool:
         return False
 
 
+def _backend_resolved(effective_backend: str | None, store: Store) -> bool:
+    """THE single source of truth for "a chain backend has been chosen"
+    (TCK-ONB-006; ADR-0022 amendment 1 + ADR-0023 amendment 2). Resolved =
+    a URL on any rung of the resolution ladder (env > config file > stored
+    — exactly what :func:`resolve_chain_base_url` returns), OR an explicit
+    public opt-in record (:data:`BACKEND_CHOICE_SETTING`, written only by
+    the warned onboarding conversation). An UNSET stored rung means "never
+    chose", NOT "chose public" — that's why the marker exists. Fail closed:
+    an unreadable record counts as unresolved (defer + ask, never
+    leak-by-accident). While unresolved, a first-run startup scan holds at
+    ``awaiting_backend`` and the onboarding ask (re-)arms."""
+    if effective_backend is not None:
+        return True
+    try:
+        return store.get_setting(BACKEND_CHOICE_SETTING) == BACKEND_CHOICE_PUBLIC
+    except (StoreError, sqlite3.Error):
+        return False
+
+
 def _freshness(store: Store, wallet_id: int, gate: StartupScan | None) -> str:
     """The deterministic, TOOL-owned ``freshness`` flag (ADR-0022 decision 5).
 
@@ -2706,23 +2748,32 @@ class StartupScan:
 
     A tiny closed state machine owned by the ENGINE thread: only the pump
     (engine) flips it via :meth:`mark_running`/:meth:`mark_done`/
-    :meth:`mark_skipped`; the chain worker never touches it (it delivers its
-    result through the command queue). Handlers only read it. ``disabled`` is
-    the "no startup scan configured" state (``AUTO_SCAN=0`` or a table built
-    without a gate) — the pre-split lazy behavior applies and no
-    ``create_tx`` block is imposed.
+    :meth:`mark_skipped` (and :meth:`ScanFlow.set_startup_deferred`/
+    :meth:`ScanFlow.release_backend` for the TCK-ONB-006 pair); the chain
+    worker never touches it (it delivers its result through the command
+    queue). Handlers only read it. ``disabled`` is the "no startup scan
+    configured" state (``AUTO_SCAN=0`` or a table built without a gate) —
+    the pre-split lazy behavior applies and no ``create_tx`` block is
+    imposed. ``awaiting_backend`` (TCK-ONB-006, ADR-0022 amendment 1) is
+    the first-run EXCEPTION: a startup scan IS configured but HELD until
+    the backend choice resolves — no chain call may happen before the
+    user picked (or accepted) a server.
 
-    ``first_scan_incomplete`` (pending or running) is the load-bearing gate:
-    ``create_tx`` refuses while it is set (value movement waits for the
-    first scan), the lazy in-handler scan stands down (the worker owns the
-    chain), and cache reads are ``stale``-flagged. Once the scan completes
+    ``first_scan_incomplete`` (awaiting/pending/running) is the
+    load-bearing gate: ``create_tx`` refuses while it is set (value
+    movement waits for the first scan), the lazy in-handler scan stands
+    down (the worker owns the chain — and while awaiting, NOTHING does),
+    and cache reads are ``stale``-flagged. Once the scan completes
     (``done``) or is skipped after a failure (``skipped``), it clears.
     """
 
     __slots__ = ("_state",)
 
-    def __init__(self, *, enabled: bool) -> None:
-        self._state = "pending" if enabled else "disabled"
+    def __init__(self, *, enabled: bool, deferred: bool = False) -> None:
+        if not enabled:
+            self._state = "disabled"
+        else:
+            self._state = "awaiting_backend" if deferred else "pending"
 
     @property
     def enabled(self) -> bool:
@@ -2730,16 +2781,19 @@ class StartupScan:
 
     @property
     def state(self) -> str:
-        """The gate's state as a CLOSED enum name (TCK-WEB-005): exactly one
-        of ``disabled``/``pending``/``running``/``done``/``skipped``. The web
-        ``/state`` snapshot exposes this string and nothing else about the
-        scan — it is a name, never data (no progress/counts: a percentage
-        would leak wallet size through the door of a progress bar)."""
+        """The gate's state as a CLOSED enum name (TCK-WEB-005; the
+        ``awaiting_backend`` member added by TCK-ONB-006 is additive under
+        the unchanged ``state/1`` snapshot tag): exactly one of
+        ``disabled``/``awaiting_backend``/``pending``/``running``/``done``/
+        ``skipped``. The web ``/state`` snapshot exposes this string and
+        nothing else about the scan — it is a name, never data (no
+        progress/counts: a percentage would leak wallet size through the
+        door of a progress bar)."""
         return self._state
 
     @property
     def in_progress(self) -> bool:
-        return self._state in ("pending", "running")
+        return self._state in ("awaiting_backend", "pending", "running")
 
     @property
     def complete(self) -> bool:
@@ -2748,8 +2802,9 @@ class StartupScan:
     @property
     def first_scan_incomplete(self) -> bool:
         """Stale-flag predicate: a startup scan is configured but its first
-        scan has not completed (pending or running)."""
-        return self._state in ("pending", "running")
+        scan has not completed (awaiting a backend choice, pending, or
+        running)."""
+        return self._state in ("awaiting_backend", "pending", "running")
 
     def mark_running(self) -> None:
         self._state = "running"
@@ -2926,6 +2981,58 @@ class ScanFlow:
         self._startup_plan = plan
         self._rescan = rescan
         self.gate = StartupScan(enabled=True)
+
+    def set_startup_deferred(self, *, rescan: bool = False) -> None:
+        """TCK-ONB-006 (ADR-0022 amendment 1, the first-run exception): arm
+        the startup scan in HELD state — the gate reads ``awaiting_backend``
+        and NO chain call ever leaves the process until the backend choice
+        resolves via :meth:`release_backend`. Staleness semantics are
+        identical to ``pending``: cache reads are stale-flagged,
+        ``create_tx`` refuses, the lazy in-handler scan and the watch drain
+        stand down (nothing may probe a server the user never picked).
+        Engine-thread wiring call. Armed REGARDLESS of AUTO_SCAN
+        (security review F1): on an AUTO_SCAN=0 launch nothing was ever
+        planned — the hold exists to keep the lazy handlers and the watch
+        drain stood down until the choice resolves."""
+        self._rescan = rescan
+        self.gate = StartupScan(enabled=True, deferred=True)
+
+    def release_backend(self) -> bool:
+        """TCK-ONB-006: the backend choice resolved (an explicit public
+        consent was recorded — the ONLY in-session release; an own-server
+        choice takes effect next launch per ADR-0018, so it never fires a
+        fetch through the old public client). Plan NOW on the engine thread
+        (fresh store reads) and start the held startup scan. No-op unless
+        the gate is ``awaiting_backend``.
+
+        Returns whether the load actually started (security review F2): the
+        consent ack may only claim "loading now" when this says ``True`` —
+        a no-op or a failed plan (scan stood down) says ``False``."""
+        if self.gate.state != "awaiting_backend":
+            return False
+        try:
+            plan = wallet_scan.plan_scan(
+                self._store,
+                self._wallet,
+                gap_limit=self._gap_limit,
+                rebuild=self._rescan,
+            )
+        except (
+            ChainError,
+            wallet_scan.ScanError,
+            WatchKeyError,
+            StoreError,
+            sqlite3.Error,
+        ):
+            # Planning is store-reads-only and network-free; a failure here
+            # can only be a broken store — stand the startup scan down
+            # exactly like the wiring-time planning failure did, and let the
+            # handlers' lazy path (now unlocked) retry per turn.
+            self.gate.mark_skipped()
+            return False
+        self.set_startup(plan, rescan=self._rescan)
+        self.begin()
+        return self.gate.state in ("pending", "running")
 
     # ------------------------------------------------------ non-blocking startup
 
@@ -3998,6 +4105,14 @@ def _wire(
 
     output_fn(f"Privacy notice: {privacy_indicator(settings)}")
 
+    # TCK-BACKEND-001 (ADR-0018 amendment): unskippable honesty line, once
+    # per launch, iff the operator deliberately turned transport
+    # verification off (env > config file > fail-closed default — no stored
+    # rung, so this reads EXACTLY the value the chain client resolved from
+    # its own Settings.from_env() pass; the two can never disagree).
+    if not settings.tls_verify:
+        output_fn(TLS_UNVERIFIED_WARNING)
+
     # Background watch (Phase 5, TCK-P5-001; ADR-0019, ADR-0022 decision 4).
     # Tick-driven in the CLI: the watcher holds no thread and shares no
     # sqlite object across threads; the REPL runs a due poll cycle between
@@ -4026,8 +4141,32 @@ def _wire(
     # opted-out / failed-to-plan fallback. Planning is store-reads-only and
     # network-free, so it stays on the engine thread; the fetch runs on the
     # worker once the pump starts the flow.
+    #
+    # TCK-ONB-006 (ADR-0022 amendment 1, the FIRST-RUN EXCEPTION): when no
+    # backend choice exists on ANY rung (env > config file > stored >
+    # explicit-public record), an interactive or web launch HOLDS the gate
+    # at ``awaiting_backend`` until the backend branch resolves —
+    # user-confirmed 2026-09-09: wallet addresses must never reach the
+    # public default before an explicit choice. The hold is INDEPENDENT of
+    # AUTO_SCAN (security review F1, the blocker): turning off the
+    # AUTOMATIC scan is not consent to an unchosen server — the held gate
+    # stands the lazy in-handler scan and the watch drain down too, so an
+    # AUTO_SCAN=0 launch stays leak-free while unresolved and the
+    # mandatory ask re-arms on EVERY unresolved interactive launch (a
+    # consent-released load is user-initiated, not an auto scan). Every
+    # run with a resolved choice scans immediately (or stays lazy-
+    # opted-out), unchanged. A headless scripted launch keeps ADR-0023's
+    # never-blocked contract: no ask can appear there, so it behaves
+    # exactly as before the amendment — the command line is the operator's
+    # explicit decision (the documented carve-out; ADR-0022 amendment 1).
     auto_scan = os.environ.get(AUTO_SCAN_ENV_VAR, "").strip() != "0"
-    if rescan or auto_scan:
+    backend_choice_resolved = _backend_resolved(effective_backend, store)
+    defer_startup = (
+        not backend_choice_resolved and (cli_interactive or web_mode)
+    )
+    if defer_startup:
+        scan.set_startup_deferred(rescan=rescan)
+    elif rescan or auto_scan:
         output_fn(SCAN_PROGRESS_NOTICE)
         try:
             scan.set_startup(
@@ -4061,25 +4200,30 @@ def _wire(
     # persists the result (the scan can take minutes; the REPL may not).
     output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
-    # TCK-ONB-003 (ADR-0023) + TCK-ONB-005: the backend conversation — CLI
-    # transport ONLY, built for EVERY interactive CLI launch. It arms at
-    # startup ONLY for the first-run branch (nothing resolved a backend —
-    # env > config file > stored all empty, a preset ladder rung is an
-    # operator decision the conversation must not overwrite or re-ask —
-    # AND the wallet profile was created THIS run; returning users never
-    # see the startup ask). Otherwise it stays DORMANT (handle_line
-    # consumes nothing, ordinary chat reaches the model untouched) until
-    # the /setup transcript command arms the same branch via
-    # begin_setup. The web transport never receives the flow at all
+    # TCK-ONB-003 (ADR-0023) + TCK-ONB-005 + TCK-ONB-006: the backend
+    # conversation — CLI transport ONLY, built for EVERY interactive CLI
+    # launch. It arms at startup whenever the backend is UNRESOLVED and the
+    # ask is load-bearing for this launch: the wallet profile was created
+    # THIS run (the first-run ask) or the startup scan is being held for it
+    # (an unresolved returning wallet that never answered — the mandatory
+    # pre-scan ask re-arms until it resolves; ADR-0023 amendment 2). A
+    # preset ladder rung (env/config file) is an operator decision the
+    # conversation must not overwrite or re-ask, and a resolved returning
+    # user never sees the startup ask. Otherwise it stays DORMANT
+    # (handle_line consumes nothing, ordinary chat reaches the model
+    # untouched) until the /setup transcript command arms the same branch
+    # via begin_setup. The web transport never receives the flow at all
     # (requirement 5: no onboarding surface in the browser; /setup there
     # prints the one-line pointer). Construction and narration are pure
     # store/console I/O — the model is never involved.
     onboarding: OnboardingFlow | None = None
     if web_mode:
-        if effective_backend is None:
+        if not backend_choice_resolved:
             output_fn(WEB_SETUP_HINT)
     elif cli_interactive:
-        first_run = effective_backend is None and created_here
+        ask_at_startup = (
+            not backend_choice_resolved and (created_here or defer_startup)
+        )
         onboarding = OnboardingFlow(
             store=store,
             check_backend=backend_check_fn
@@ -4099,13 +4243,25 @@ def _wire(
                 else (node_detect_fn or (lambda: detect_local_nodes(settings)))
             ),
             loopback_host=_loopback_host_of,
-            armed=first_run,
+            armed=ask_at_startup,
+            deferred=defer_startup,
+            # Explicit public consent (recorded by the flow itself) is the
+            # ONLY in-session release of the held scan — an own-server save
+            # waits for the next launch (ADR-0018 config-only; the live
+            # client is the old one and must never fetch on a refused
+            # backend). No-op unless the gate is actually awaiting, and it
+            # REPORTS whether the load started (the flow gates its
+            # "loading now" line on that answer, security review F2).
+            public_chosen=scan.release_backend,
         )
-        if first_run:
-            for line in onboarding.opening_lines(load_started=scan.gate.enabled):
+        if ask_at_startup:
+            for line in onboarding.opening_lines(
+                load_started=scan.gate.enabled, deferred=defer_startup
+            ):
                 output_fn(line)
             # Step 4 fires when the FIRST startup scan persists successfully
-            # (one-shot; never on scan failure — the load did not complete).
+            # (one-shot; never on scan failure — the load did not complete)
+            # — including a DEFERRED scan released by a public consent.
             scan.on_first_scan_done = onboarding.emit_load_complete
 
     session = SendSession()

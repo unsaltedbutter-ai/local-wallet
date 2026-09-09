@@ -15,14 +15,25 @@ in the browser, only :data:`WEB_SETUP_HINT`):
   guidance (watch-only invariant, AGENTS.md) and re-asked; private/testnet
   keys are refused by the same gated parser the startup path uses
   (value-free).
-- :class:`OnboardingFlow` — the step-2 node ask (copy (a)) offered while
-  the startup scan runs, kept OPEN across ordinary chat turns: a URL line
-  or ``2`` enters step 5 (URL prompt (b), validation, confirmation (d) /
-  failure copy (c) with doctor guidance and an explicit public choice),
-  ``1``/skip answers with (e), "what's a node?" reads (f). Anything else
-  falls through to the model untouched. Steps 3/4 narration rides
-  :meth:`opening_lines` / :meth:`emit_load_complete` (non-blocking variant,
-  ADR-0022 / TCK-SCAN-003 landed).
+- :class:`OnboardingFlow` — the step-2 node ask (copy (a)), the MANDATORY
+  pre-scan decision on any launch whose backend is unresolved (TCK-ONB-006,
+  ADR-0022 amendment 1 / ADR-0023 amendment 2): while the startup scan is
+  deferred the wallet stays unloaded until the ask resolves — a URL line or
+  ``2`` enters step 5 (URL prompt (b), validation, confirmation (d) / failure
+  copy (c) with doctor guidance), an EXPLICIT public pick (``1``/``public``)
+   records the opt-in (:data:`BACKEND_CHOICE_SETTING`) and releases the held
+   scan through the ``public_chosen`` hook (which REPORTS whether the load
+   actually started — the "loading now" line rides on that answer only),
+   and "not now" is NOT consent — the copy says what waits and the ask
+   stays open. The hold is armed on EVERY unresolved interactive launch
+   regardless of AUTO_SCAN (security review F1: turning off the automatic
+   scan is not consent to an unchosen server), so the plain skip answer
+   (e) only remains where nothing is held — a resolved launch whose /setup
+   ask is a pure re-choice. "What's a node?" reads (f). Anything else
+   falls through to the model untouched. Steps 3/4
+  narration rides :meth:`opening_lines` / :meth:`emit_load_complete`
+  (non-blocking variant, ADR-0022 / TCK-SCAN-003 landed; the deferred
+  variant LOAD_WAIT replaces it while the scan is held).
 - :meth:`OnboardingFlow.begin_setup` — the ``/setup`` transcript command
   (TCK-ONB-005, ADR-0023 step 5 run against an EXISTING wallet): the flow
   exists DORMANT on every interactive CLI launch and /setup arms it. A
@@ -57,11 +68,18 @@ from localwallet.store import Store, StoreError
 from localwallet.wallet.descriptor import WatchKeyError, parse_wallet_key
 
 __all__ = [
+    "ASK_WAITS_ACK",
+    "BACKEND_CHOICE_PUBLIC",
+    "BACKEND_CHOICE_SETTING",
+    "DEFERRED_RESTART",
     "GREETING",
     "LOAD_COMPLETE",
     "LOAD_NARRATION",
+    "LOAD_WAIT",
     "NODE_ASK",
     "NON_ESPLORA_URL",
+    "PUBLIC_CHOSEN_ACK",
+    "PUBLIC_LOADING_NOW",
     "SETUP_CURRENT",
     "SETUP_KEEP_CURRENT",
     "SETUP_KEPT",
@@ -94,29 +112,46 @@ GREETING: Final[str] = (
     "don't know where to get that, let me know and I will guide you."
 )
 
-#: Step 2 — the node ask, copy block (a), offered right after the xpub
-#: while the scan runs; never blocking, silence keeps the public default.
-#: Reused verbatim on re-offers.
+#: Step 2 — the node ask, copy block (a) AS AMENDED by TCK-ONB-006 (ADR-0023
+#: amendment 2, user direction 2026-09-09): the server options are named
+#: plainly (Bitcoin Core / Electrum server / private mempool.space), the
+#: public option carries the leak in plain words, and on an unresolved
+#: launch this ask now precedes the scan (nothing is checked until it
+#: answers). Reused verbatim on re-offers and by /setup.
 NODE_ASK: Final[str] = (
-    "One thing worth knowing: for maximum privacy, you should use your "
-    "own Bitcoin node — something running Bitcoin Core, or an electrum "
-    "server, or a private mempool.space server. Start9 and Umbrel and "
-    "MyNode are great options for a standalone way to run these services, "
-    "but you can run Bitcoin Core on most computers. One honest limit for "
-    "today: the app connects to a mempool.space-style address, which all "
-    "of those boxes offer — a plain Bitcoin Core install by itself doesn't "
-    "give the app one yet.\n"
+    "A decision that's yours to make: which server should the app ask "
+    "about your wallet's addresses? Your own server — Bitcoin Core (with "
+    "the mempool.space app), an Electrum server, or a private "
+    "mempool.space server; Start9, Umbrel and MyNode run all of these — "
+    "means only your own machine ever sees which addresses you check. The "
+    "public mempool.space server needs no setup, but be clear about its "
+    "price: whoever runs it sees every address you check, can link those "
+    "addresses together and to your IP, and watches when your "
+    "transactions move.\n"
     "\n"
-    "You can pick either, and skipping is a fine answer:\n"
+    "One honest limit for today: the app connects to an Esplora-style "
+    "http(s) address — the mempool.space app — which those boxes all "
+    "offer; a plain Bitcoin Core install doesn't serve one yet, and "
+    "ssl://-style Electrum addresses come in a later version.\n"
     "\n"
-    "1. Public server (default) — nothing to set up. A public server sees "
-    "which addresses you check, and can link them to your IP.\n"
-    "2. Your own node — only your own machine sees which addresses you "
-    "check.\n"
+    "1. Public mempool.space server — nothing to set up, with the leak "
+    "above.\n"
+    "2. Your own server — paste its address or take me through it.\n"
     "\n"
     "If you're not sure what any of this means, ask me \"what's a node?\" "
     "and I'll explain."
 )
+
+#: The TCK-ONB-006 backend-resolution marker (ADR-0023 amendment 2): with
+#: no URL on any ladder rung, an explicit public pick is ONLY "a backend
+#: choice exists" once it is recorded — an unset stored rung means "never
+#: chose", not "chose public". Written through the store's generic settings
+#: table by this module (the only writer), read by ``app._backend_resolved``
+#: (the single source of truth for scan gating + ask arming). Deliberately
+#: NOT in the web ``/settings`` allowlist: consenting to the public server
+#: happens in the warned conversation, never by silent API write.
+BACKEND_CHOICE_SETTING: Final[str] = "chain_backend_choice"
+BACKEND_CHOICE_PUBLIC: Final[str] = "public"
 
 #: Step 3 — load narration, the MAIN (non-blocking) variant: TCK-SCAN-003
 #: has landed, so the honest promise "you can keep asking me questions" is
@@ -125,6 +160,51 @@ LOAD_NARRATION: Final[str] = (
     "I'm loading your wallet right now. While I look through its history "
     "you can keep asking me questions — I'll give you the most up-to-date "
     "information I have."
+)
+
+#: Step 3 while the startup scan is DEFERRED (TCK-ONB-006, ADR-0022
+#: amendment 1): replaces :data:`LOAD_NARRATION` — nothing has been loaded
+#: or checked yet, so it promises nothing except the honest wait.
+LOAD_WAIT: Final[str] = (
+    "Until you choose, I haven't checked a single address against the "
+    "network — your balance and history read empty, and sending stays "
+    "off. There's no rush: say 1 or 2 whenever you're ready and I'll load "
+    "your wallet the moment you do. Ask me anything else in the meantime."
+)
+
+#: "Not now" while the scan is deferred: skipping is NOT a public consent
+#: (ADR-0023 amendment 2) — what waits is said plainly, and the ask stays
+#: OPEN so a later answer this session still resolves it.
+ASK_WAITS_ACK: Final[str] = (
+    "Understood — I won't use a server you haven't chosen. Your wallet "
+    "stays unloaded and no address goes anywhere for checks; the two "
+    "choices above stay open whenever you're ready, and I'll ask again "
+    "next launch."
+)
+
+#: Explicit public pick with nothing stored: consent recorded WITH the leak
+#: named once more, then the held scan is released.
+PUBLIC_CHOSEN_ACK: Final[str] = (
+    "Understood — the public mempool.space server it is, chosen with "
+    "eyes open: whoever runs it sees the addresses we check and when "
+    "your transactions move. You can switch to your own server any "
+    "time with /setup."
+)
+
+#: Appended to :data:`PUBLIC_CHOSEN_ACK` only when the release hook reports
+#: that the pick ACTUALLY started the deferred startup scan (security
+#: review F2: a failed plan stands the scan down and nothing loads).
+PUBLIC_LOADING_NOW: Final[str] = "Loading your wallet from it now."
+
+#: An own-server choice saved WHILE the startup scan was deferred
+#: (TCK-ONB-006): the live client is still the public default (ADR-0018
+#: config-only), and loading from it would leak exactly what the choice
+#: refuses — so the load waits for the restart the honesty line promises.
+DEFERRED_RESTART: Final[str] = (
+    "Your server is saved, and your wallet is still unloaded — I won't "
+    "check its addresses against a server you didn't choose just to fill "
+    "the gap. Quit and start the app again: from that launch, everything "
+    "loads from the server you set up."
 )
 
 #: Step 4 — load completes (the "should" is signed-off verbatim; never
@@ -206,14 +286,22 @@ NODE_SYNCING: Final[str] = (
     "or pick the public server instead."
 )
 
-#: The web transport's one-line hint (requirement 5: no onboarding surface
-#: in the browser; ADR-0023 says nothing about web, so the fallback the
-#: ticket prescribes: existing behavior + a pointer to run the CLI once).
+#: The web transport's launch hint, shown whenever the backend is
+#: unresolved — and since TCK-ONB-006 (ADR-0022 amendment 1) the web
+#: first-run scan is DEFERRED too: nothing is looked up before a choice,
+#: so the hint says what waits and why (requirement 5 stands: the browser
+#: gets no conversation, only this pointer; there is still no public
+#: consent surface on the web — the warned conversation is CLI-only).
 WEB_SETUP_HINT: Final[str] = (
-    "Tip: no backend choice is saved yet — the app uses the public server "
-    "(the notice above is honest about what that means). Run the terminal "
-    "app once to pick your own node or keep the default; the choice is "
-    "saved for this web UI too."
+    "No server choice has been made yet, so the app has NOT looked up "
+    "your wallet — no address has gone to any server, and balances and "
+    "history stay empty until a backend is chosen. Run the terminal app "
+    "once to decide: your own server (Bitcoin Core with the "
+    "mempool.space app, an Electrum server, or a private mempool.space "
+    "install) or the public mempool.space server, whose operator can see "
+    "the addresses you check and when your transactions move. Saving a "
+    "backend address in Settings works too; either choice takes effect "
+    "on the next launch."
 )
 
 # --- /setup re-entry copy (TCK-ONB-005; implementation-time, value-free) ---
@@ -319,7 +407,6 @@ _SKIP_WORDS: Final[frozenset[str]] = frozenset(
         "1",
         "public",
         "public server",
-        "default",
         "skip",
         "not now",
         "no",
@@ -332,9 +419,14 @@ _SKIP_WORDS: Final[frozenset[str]] = frozenset(
 )
 #: The subset of the skip words that NAMES the public server: on /setup
 #: over a stored choice it is an explicit revert (clears the stored rung),
-#: not a mere "keep current".
+#: not a mere "keep current". Security review F3: "default" is RETIRED
+#: from the vocabulary — the amended ask lists "1"/"public", never
+#: "default", and durable public consent may only ride on words the
+#: warned conversation actually presents (the free default the word named
+#: no longer exists: while unresolved nothing is current). "default" now
+#: falls through as ordinary chat and records nothing.
 _PUBLIC_WORDS: Final[frozenset[str]] = frozenset(
-    {"1", "public", "public server", "default"}
+    {"1", "public", "public server"}
 )
 _OWN_NODE_WORDS: Final[frozenset[str]] = frozenset(
     {"2", "own node", "my node", "switch to my node", "i have a node", "yes"}
@@ -437,19 +529,27 @@ class OnboardingFlow:
     """The step-2..5 conversation state machine for one CLI session.
 
     Constructed by ``_wire`` for EVERY interactive CLI launch
-    (TCK-ONB-005), but ARMED at startup only for the first-run branch
-    (no chain backend on any rung — env > config file > stored — AND the
-    wallet profile created THIS run; ADR-0023: step 1 is skipped when the
-    key was supplied, and returning users never see the startup ask).
-    Otherwise it is DORMANT: :meth:`handle_line` consumes nothing (ordinary
-    chat reaches the model untouched) until the ``/setup`` transcript
-    command arms the same backend branch via :meth:`begin_setup` — node ask
-    → URL entry → validation → write, with the overwrite gate on top of a
-    stored choice.
+    (TCK-ONB-005), but ARMED at startup when the backend is UNRESOLVED and
+    either the wallet profile was created THIS run (the first-run ask,
+    ADR-0023 step 2: step 1 is skipped when the key was supplied) or the
+    startup scan is being HELD for this ask (TCK-ONB-006, ADR-0023
+    amendment 2: the ask is mandatory pre-scan, so it is re-asked on every
+    launch until it resolves — a returning wallet that never answered is
+    still unresolved). Otherwise it is DORMANT: :meth:`handle_line`
+    consumes nothing (ordinary chat reaches the model untouched) until
+    the ``/setup`` transcript command arms the same backend branch via
+    :meth:`begin_setup` — node ask → URL entry → validation → write, with
+    the overwrite gate on top of a stored choice.
 
     Dependencies are injected callables so the whole flow is testable with
     zero network: ``check_backend`` (the chain probe), ``node_report``
-    (loopback detection), ``loopback_host`` (host extraction, ADR-0016 gate).
+    (loopback detection), ``loopback_host`` (host extraction, ADR-0016 gate),
+    and ``public_chosen`` (TCK-ONB-006: invoked after an explicit public
+    consent is recorded, so the app can release a deferred startup scan —
+    a "not now" never reaches it; it RETURNS whether the load actually
+    started, and the "loading now" line is gated on that answer — security
+    review F2). ``deferred`` states whether the scan is being held for this
+    ask (it changes what the skip and confirmation branches promise).
     ``store`` receives the typed ``set_chain_base_url`` write on success —
     the ONLY sanctioned writer (ONB-002), and it is NEVER called with a
     URL that failed validation (decision 4: no silent public fallback —
@@ -465,6 +565,8 @@ class OnboardingFlow:
         node_report: Callable[[], LocalNodeReport] | None = None,
         loopback_host: Callable[[str], str | None] | None = None,
         armed: bool = True,
+        deferred: bool = False,
+        public_chosen: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
         self._check_backend = check_backend
@@ -474,14 +576,20 @@ class OnboardingFlow:
         self._last_failed: str | None = None
         self._armed = armed
         self._had_choice = False
+        self._deferred = deferred
+        self._public_chosen = public_chosen
 
     @property
     def done(self) -> bool:
         return self._state is _AskState.DONE
 
-    def opening_lines(self, *, load_started: bool) -> list[str]:
-        """Step 2 ask + step 3 narration, printed once at startup (the scan
-        began with the key, so the narration is honest only while it runs)."""
+    def opening_lines(self, *, load_started: bool, deferred: bool = False) -> list[str]:
+        """Step 2 ask + step 3 narration, printed once at startup. With the
+        scan HELD (TCK-ONB-006) the honest step-3 line is :data:`LOAD_WAIT`
+        — nothing is loading yet; :data:`LOAD_NARRATION` only fits a scan
+        that actually started."""
+        if deferred:
+            return [NODE_ASK, LOAD_WAIT]
         lines = [NODE_ASK]
         if load_started:
             lines.append(LOAD_NARRATION)
@@ -565,12 +673,26 @@ class OnboardingFlow:
             return True
         if key in _SKIP_WORDS:
             if not self._had_choice:
-                output_fn(SKIP_ACK)  # nothing stored: public IS current
+                if key in _PUBLIC_WORDS:
+                    # An EXPLICIT public pick is a backend choice: record it
+                    # and release any held scan (TCK-ONB-006).
+                    self._accept_public(output_fn)
+                    self._state = _AskState.DONE
+                elif self._deferred:
+                    # "Not now" is NOT public consent while the scan waits
+                    # on the answer (ADR-0023 amendment 2): say what stays
+                    # off, keep the ask OPEN (a later 1/2 still resolves it
+                    # this session; the ask re-arms next launch).
+                    output_fn(ASK_WAITS_ACK)
+                else:
+                    output_fn(SKIP_ACK)  # nothing stored, nothing held:
+                    self._state = _AskState.DONE  # public IS current (e)
             elif key in _PUBLIC_WORDS:
                 self._revert_to_public(output_fn)  # an EXPLICIT public pick
+                self._state = _AskState.DONE
             else:
                 output_fn(SETUP_KEEP_CURRENT)  # skip ≠ public (choice held)
-            self._state = _AskState.DONE
+                self._state = _AskState.DONE
             return True
         if key.startswith(_GUIDE_PREFIXES):
             output_fn(GUIDE)
@@ -609,16 +731,46 @@ class OnboardingFlow:
 
     # ------------------------------------------------------------- validation
 
+    def _accept_public(self, output_fn: Callable[[str], None]) -> None:
+        """Explicit public consent with no stored choice (TCK-ONB-006):
+        record :data:`BACKEND_CHOICE_SETTING` (an unset stored rung means
+        "never chose", not "chose public" — the marker is what makes the
+        NEXT launch's backend resolved), then release the held startup
+        scan through the app's hook. The record write is best-effort: the
+        session's consent stands either way; a failed write just means the
+        ask re-appears next launch (fail-closed toward asking, never
+        toward leaking)."""
+        was_deferred = self._deferred
+        try:
+            self._store.set_setting(BACKEND_CHOICE_SETTING, BACKEND_CHOICE_PUBLIC)
+        except StoreError:
+            pass
+        started = self._public_chosen() if self._public_chosen is not None else False
+        output_fn(PUBLIC_CHOSEN_ACK)
+        if was_deferred and started:
+            # Honest ONLY because the release reported that it actually
+            # started the load (security review F2: a failed plan stands
+            # the scan down — nothing is loading this session, and the
+            # line would be a claim about money-work that never began).
+            output_fn(PUBLIC_LOADING_NOW)
+        self._deferred = False
+
     def _revert_to_public(self, output_fn: Callable[[str], None]) -> None:
         """/setup over a stored choice, public picked EXPLICITLY (``1``/
         ``public``): clear the stored rung through the typed writer (the
-        ``""``-clears convention, ONB-002). A failed write keeps the stored
-        choice and says so — the ack is never a lie either way."""
+        ``""``-clears convention, ONB-002) AND record the public marker —
+        without it the cleared rung would read "never chose" next launch
+        and the ask would re-arm. A failed write keeps the stored choice
+        and says so — the ack is never a lie either way."""
         try:
             self._store.set_chain_base_url("")
         except StoreError:
             output_fn(SETUP_KEEP_CURRENT)
         else:
+            try:
+                self._store.set_setting(BACKEND_CHOICE_SETTING, BACKEND_CHOICE_PUBLIC)
+            except StoreError:
+                pass
             output_fn(SETUP_REVERTED)
 
     def _validate(self, url: str, output_fn: Callable[[str], None]) -> bool:
@@ -644,6 +796,12 @@ class OnboardingFlow:
             return True
         output_fn(CONFIRMED)
         output_fn(EFFECTS_NEXT_LAUNCH)
+        if self._deferred:
+            # TCK-ONB-006: the held scan does NOT start on this choice —
+            # the live client is the old (public-default) one, and loading
+            # through it would leak what the user just refused. The scan
+            # runs from the server they chose at the next launch.
+            output_fn(DEFERRED_RESTART)
         self._state = _AskState.DONE
         return True
 

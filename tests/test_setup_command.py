@@ -64,14 +64,20 @@ BAD_URL = "https://typo.example/api"
 def test_setup_happy_path_stores_and_promises_next_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Existing wallet, nothing stored: /setup → 2 → valid URL → (d) + the
-    honest next-launch line; choice lands in the stored rung; the startup
-    first-run conversation NEVER replays (no greeting, ask printed once)."""
+    """Existing wallet, nothing on the STORED rung: /setup → 2 → valid URL →
+    (d) + the honest next-launch line; choice lands in the stored rung; the
+    startup first-run conversation NEVER replays (no greeting, ask printed
+    once). The env rung here exists to RESOLVE the launch (security review
+    F1: an unresolved interactive launch now holds its scan and re-arms the
+    mandatory ask at startup regardless of AUTO_SCAN — /setup on top of it
+    would double-ask); a resolved launch keeps the flow DORMANT until
+    /setup."""
     _preset_wallet(tmp_path)
     code, rec, stored, state = _drive(
         monkeypatch, tmp_path,
         lines=["/setup", "2", GOOD_URL, "exit"],
         interactive=True,
+        chain_env=GOOD_URL,
         backend_check=lambda _u: True,
     )
     assert code == 0
@@ -90,15 +96,23 @@ def test_setup_happy_path_stores_and_promises_next_launch(
 def test_setup_skip_keeps_current_and_stores_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """"/setup then skip: ack (e), nothing stored, nothing probed, model 0."""
-    _preset_wallet(tmp_path)
-    code, rec, stored, state = _drive(
+    """"/setup then skip where (e) is TRUE: a recorded public consent makes
+    the launch resolved, so the public server really IS current. (Security
+    review F1 moved the scan-less UNRESOLVED skip out of this branch —
+    that launch holds the scan and answers ASK_WAITS_ACK.) Nothing
+    changes, nothing probed, model 0; the stored URL rung stays empty (the
+    marker, not a URL, carries the public choice)."""
+    _drive(  # run 1: the warned consent that records the public marker.
+        monkeypatch, tmp_path, lines=["1", "exit"], interactive=True
+    )
+    code, rec, stored, state = _drive(  # run 2: resolved, dormant, /setup.
         monkeypatch, tmp_path,
         lines=["/setup", "not now", "exit"],
         interactive=True,
     )
     assert code == 0
-    assert ob.SKIP_ACK in rec.joined  # nothing stored → public IS current
+    assert ob.SKIP_ACK in rec.joined  # public IS current — by that choice
+    assert ob.ASK_WAITS_ACK not in rec.joined  # nothing is held here
     assert stored is None
     assert state["probes"] == 0
     assert state["model"] == 0
@@ -121,7 +135,9 @@ def test_setup_reject_bad_url_retry_then_explicit_public(
     joined = rec.joined
     assert joined.count(ob.VALIDATION_FAIL) == 2  # original + retry
     assert "typo.example" not in joined  # value-free: never echoed
-    assert ob.SKIP_ACK in joined
+    # An explicit public pick with NOTHING stored is a CONSENT, not a shrug
+    # (TCK-ONB-006): the ack re-names the leak and the opt-in record lands.
+    assert ob.PUBLIC_CHOSEN_ACK in joined
     assert stored is None  # a failed URL is NEVER written
     assert state["probes"] == 2
     assert state["model"] == 0
@@ -231,6 +247,14 @@ def test_setup_explicit_public_reverts_stored_choice(
     assert ob.SETUP_REVERTED in rec.joined
     assert ob.SETUP_KEEP_CURRENT not in rec.joined
     assert stored is None  # cleared → public default next launch
+    # TCK-ONB-006: the revert must ALSO write the explicit-public record —
+    # an unset stored rung reads "never chose", which would re-arm the
+    # mandatory ask (and hold the scan) on the next launch.
+    check = Store(str(tmp_path / "onb.db"))
+    try:
+        assert check.get_setting(ob.BACKEND_CHOICE_SETTING) == ob.BACKEND_CHOICE_PUBLIC
+    finally:
+        check.close()
     assert state["model"] == 0
 
 
@@ -266,7 +290,10 @@ def test_setup_ssl_url_at_the_ask_is_consumed_too(
 ) -> None:
     """The scheme refusal is channel-wide: pasting ssl:// while the ask is
     open (where first run used to hand it to the model) gets the same
-    statement — nothing probed, nothing saved, ask stays open."""
+    statement — nothing probed, nothing saved, ask stays open. The skip
+    that follows lands on the HELD launch's honest answer (ASK_WAITS_ACK,
+    security review F1 — an unresolved launch waits, scan-less or not),
+    still not the plain (e) ack."""
     _preset_wallet(tmp_path)
     code, rec, stored, state = _drive(
         monkeypatch, tmp_path,
@@ -276,7 +303,8 @@ def test_setup_ssl_url_at_the_ask_is_consumed_too(
     assert code == 0
     assert ob.NON_ESPLORA_URL in rec.joined
     assert "evil-star" not in rec.joined
-    assert ob.SKIP_ACK in rec.joined  # then the ordinary skip still reads
+    assert ob.ASK_WAITS_ACK in rec.joined  # held: skipping is not consent
+    assert ob.SKIP_ACK not in rec.joined
     assert stored is None
     assert state["probes"] == 0
     assert state["model"] == 0
@@ -327,11 +355,13 @@ def test_doctor_none_found_points_at_setup() -> None:
 def test_dormant_flow_consumes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The always-build regression pin: a returning-user launch carries a
-    DORMANT flow, and the ask's own vocabulary ("2", "not now", a pasted
-    URL) is ordinary chat until /setup arms it — every line reaches the
-    model exactly as before the flow existed."""
-    _preset_wallet(tmp_path)
+    """The always-build regression pin: a RESOLVED returning-user launch
+    carries a DORMANT flow, and the ask's own vocabulary ("2", "not now",
+    a pasted URL) is ordinary chat until /setup arms it — every line
+    reaches the model exactly as before the flow existed. (An UNRESOLVED
+    returning launch is no longer dormant at all — security review F1: the
+    mandatory ask re-arms there, pinned in test_onboarding.)"""
+    _preset_wallet(tmp_path, base_url=GOOD_URL)  # resolved: stored rung set
     code, rec, stored, state = _drive(
         monkeypatch, tmp_path,
         lines=["2", "not now", GOOD_URL, "exit"],
@@ -341,7 +371,7 @@ def test_dormant_flow_consumes_nothing(
     assert code == 0
     assert state["model"] == 3  # all three lines ran as turns
     assert ob.NODE_ASK not in rec.joined  # startup stayed silent
-    assert stored is None  # the pasted URL was chat, not a setup write
+    assert stored == GOOD_URL  # the pasted URL was chat, not a setup write
     assert state["probes"] == 0
 
 

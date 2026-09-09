@@ -498,8 +498,10 @@ def test_state_snapshot_carries_scan_state_as_enum_name_and_bool(
     wallet_store,
 ) -> None:
     """TCK-WEB-005 pin: the web ``/state`` snapshot exposes the startup-scan
-    state as the CLOSED gate name (disabled/pending/running/done/skipped) and
-    the DURABLE first-scan fact as a bool (the completed-scan cursor — it
+    state as the CLOSED gate name (disabled/awaiting_backend/pending/running/
+    done/skipped — the first member added by TCK-ONB-006 is purely additive
+    under the unchanged state/1 tag) and the DURABLE first-scan fact as a
+    bool (the completed-scan cursor — it
     covers the AUTO_SCAN=0 lazy path and survives restarts, unlike the
     per-session gate). NOTHING else about the scan rides the snapshot: no
     progress/counts — a percentage is a ratio against the wallet's address
@@ -514,6 +516,24 @@ def test_state_snapshot_carries_scan_state_as_enum_name_and_bool(
 
         assert snap()["scan_state"] == "disabled"
         assert snap()["first_scan_complete"] is False
+
+        # TCK-ONB-006 (ADR-0022 amendment 1): the HELD first-run scan is
+        # its own honest name in the same closed enum — and it gates like
+        # ``pending`` (stale flags, create_tx refusal, watch stand-down),
+        # because nothing may probe an unchosen backend.
+        flow.set_startup_deferred()
+        assert snap()["scan_state"] == "awaiting_backend"
+        assert flow.gate.in_progress
+        assert flow.gate.first_scan_incomplete
+        assert flow.gate.enabled
+        assert not flow.pending  # nothing was ever submitted to the worker
+        assert flow.release_backend() is True  # the held scan released (F2:
+        # the consent ack's "loading now" line rides on this answer). The
+        # plan is built and the gate moves to pending — no queue attached
+        # in this unit, so the pump's begin() would start the fetch.
+        assert snap()["scan_state"] == "pending"
+        assert flow.release_backend() is False  # a no-op must claim nothing
+        assert snap()["scan_state"] == "pending"
 
         flow.gate = _gate("running")
         assert snap()["scan_state"] == "running"
@@ -537,6 +557,23 @@ def test_state_snapshot_carries_scan_state_as_enum_name_and_bool(
         # A scan-less pump (scan=None, e.g. CLI bare harness): disabled/False.
         bare = app.build_state_snapshot(app.TxFlow(), app.SendSession(), None)
         assert bare["scan_state"] == "disabled" and bare["first_scan_complete"] is False
+    finally:
+        worker.stop()
+
+
+def test_release_backend_reports_a_failed_plan_closed(wallet_store) -> None:
+    """Security review F2, the failure branch: when release-time planning
+    fails (broken store), the scan stands DOWN (gate ``skipped``, lazy
+    paths unlocked) and the release reports ``False`` — the consent ack
+    then never claims a load that did not begin."""
+    store, wallet, _wd = wallet_store
+    worker = app.ChainWorker(None)
+    try:
+        flow = app.ScanFlow(store, wallet, worker, gap_limit=None)
+        flow.set_startup_deferred()
+        store.close()  # planning is store-only; this now raises sqlite3
+        assert flow.release_backend() is False
+        assert flow.gate.state == "skipped"
     finally:
         worker.stop()
 
