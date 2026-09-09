@@ -156,6 +156,18 @@ Server-Sent Events carry turn progress, watch events, and state. Decisions:
   token; every request (including the SSE stream) must present it in a header
   (`X-Auth-Token`). The token is the only credential and it is **per-launch** —
   it dies with the process.
+  - *Why the token stays (security review 2026-09-08 — KEEP, re-asked by the
+  user):* loopback bind ≠ user-only access — every local user/process reaches
+  the port. A hostile WEBPAGE is already blocked tokenlessly (its cross-origin
+  POSTs carry `Origin: https://evil.com` → refused; no CORS ⇒ it cannot read
+  anything; Host allowlist covers rebinding). A NON-BROWSER local client sends
+  no `Origin`, so without the token it could drive the FULL send flow
+  (create → confirm → sign → broadcast): the dual-key gate does not defend when
+  one client controls both POSTs, and the file-signer rung completes with zero
+  user interaction. The token is therefore the SOLE credential on that axis.
+  UX cost is zero (island auto-injection). A tokenless read-only `GET /state`
+  was evaluated and rejected: no gain (pages can't read cross-origin anyway),
+  just a second weaker auth policy.
 - **Host allowlist (DNS-rebinding primary defense).** The server validates the
   `Host` header against a small allowlist (`127.0.0.1`, `localhost`, and the
   literal loopback IP on which the server is bound). This is the primary defense
