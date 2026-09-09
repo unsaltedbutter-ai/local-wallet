@@ -188,9 +188,13 @@ STATE_ADVICE: dict[NodeStateKind, NodeStateAdvice] = {
             "This machine is not running a node this app could detect. Your "
             "data is currently served by a public explorer."
         ),
+        # TCK-ONB-005: the old wording pointed at options "below" that are
+        # never rendered — it now names what actually exists: the /setup
+        # transcript command (ADR-0023) or keeping the default.
         next_step=(
-            "Pick a setup option below to move your data on to your own machine "
-            "for privacy."
+            "Run /setup in this app to choose your own Esplora-compatible "
+            "server (Umbrel/Start9/mempool.space self-hosted), or keep the "
+            "public default."
         ),
     ),
     NodeStateKind.CORE_SYNCING: NodeStateAdvice(

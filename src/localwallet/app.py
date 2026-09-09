@@ -48,7 +48,9 @@ implements no protocol, wallet, chain, or tx-engine logic itself:
   first-run onboarding conversation when fresh + interactive + no backend
   on any rung (:class:`~localwallet.ui.onboarding.OnboardingFlow`,
   TCK-ONB-003 — deterministic, code-owned, never model context; the
-  step-2 ask stays open across ordinary chat turns), and run the chat
+  step-2 ask stays open across ordinary chat turns), the same backend
+  branch re-armed mid-session by the ``/setup`` transcript command on
+  every other interactive CLI launch (TCK-ONB-005), and run the chat
   REPL. The REPL owns the :class:`TxFlow` / :class:`SendSession` pair and
   classifies every user utterance against the confirm gate at the top of
   each turn. The REPL is the CLI transport over the queue-driven engine
@@ -3578,12 +3580,20 @@ def _pump(
             break
         if line.startswith("/"):
             _handle_transcript_command(
-                line, loop, output_fn, flow=flow, session=session, store=store
+                line,
+                loop,
+                output_fn,
+                flow=flow,
+                session=session,
+                store=store,
+                onboarding=onboarding,
             )
         elif onboarding is not None and onboarding.handle_line(line, output_fn):
-            # TCK-ONB-003: consumed on the deterministic onboarding channel
-            # (the node ask's own vocabulary) — never model context, never
-            # the dispatcher. Everything else below stays an ordinary turn.
+            # TCK-ONB-003/005: consumed on the deterministic onboarding
+            # channel (the node ask's own vocabulary; armed only by the
+            # first-run startup ask or a /setup command) — never model
+            # context, never the dispatcher. A dormant flow consumes
+            # nothing. Everything else below stays an ordinary turn.
             pass
         else:
             _run_turn(
@@ -3894,9 +3904,11 @@ class _Wiring:
     watcher: IncomingWatcher | None
     worker: ChainWorker
     scan: ScanFlow
-    #: TCK-ONB-003: the first-run conversation for THIS session, or ``None``
-    #: (any non-first-run launch, and every web launch — the browser never
-    #: gets an onboarding surface, only :data:`WEB_SETUP_HINT`).
+    #: TCK-ONB-003/005 (ADR-0023): the backend conversation for THIS session
+    #: — armed at startup on a first-run CLI launch, DORMANT on every other
+    #: interactive CLI launch (the /setup command arms it), and always
+    #: ``None`` for web (the browser never gets an onboarding surface, only
+    #: :data:`WEB_SETUP_HINT`).
     onboarding: OnboardingFlow | None = None
 
 
@@ -4049,19 +4061,25 @@ def _wire(
     # persists the result (the scan can take minutes; the REPL may not).
     output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
-    # TCK-ONB-003 (ADR-0023): the first-run conversation — CLI transport
-    # ONLY, and only when nothing resolved a backend (env > config file >
-    # stored all empty — a preset ladder rung is an operator decision the
-    # conversation must not overwrite or re-ask) AND the wallet profile was
-    # created THIS run (returning users never see the startup ask). The web
-    # transport gets the one-line hint instead (requirement 5: no
-    # onboarding surface in the browser). Construction and narration are
-    # pure store/console I/O — the model is never involved.
+    # TCK-ONB-003 (ADR-0023) + TCK-ONB-005: the backend conversation — CLI
+    # transport ONLY, built for EVERY interactive CLI launch. It arms at
+    # startup ONLY for the first-run branch (nothing resolved a backend —
+    # env > config file > stored all empty, a preset ladder rung is an
+    # operator decision the conversation must not overwrite or re-ask —
+    # AND the wallet profile was created THIS run; returning users never
+    # see the startup ask). Otherwise it stays DORMANT (handle_line
+    # consumes nothing, ordinary chat reaches the model untouched) until
+    # the /setup transcript command arms the same branch via
+    # begin_setup. The web transport never receives the flow at all
+    # (requirement 5: no onboarding surface in the browser; /setup there
+    # prints the one-line pointer). Construction and narration are pure
+    # store/console I/O — the model is never involved.
     onboarding: OnboardingFlow | None = None
     if web_mode:
         if effective_backend is None:
             output_fn(WEB_SETUP_HINT)
-    elif cli_interactive and effective_backend is None and created_here:
+    elif cli_interactive:
+        first_run = effective_backend is None and created_here
         onboarding = OnboardingFlow(
             store=store,
             check_backend=backend_check_fn
@@ -4081,12 +4099,14 @@ def _wire(
                 else (node_detect_fn or (lambda: detect_local_nodes(settings)))
             ),
             loopback_host=_loopback_host_of,
+            armed=first_run,
         )
-        for line in onboarding.opening_lines(load_started=scan.gate.enabled):
-            output_fn(line)
-        # Step 4 fires when the FIRST startup scan persists successfully
-        # (one-shot; never on scan failure — the load did not complete).
-        scan.on_first_scan_done = onboarding.emit_load_complete
+        if first_run:
+            for line in onboarding.opening_lines(load_started=scan.gate.enabled):
+                output_fn(line)
+            # Step 4 fires when the FIRST startup scan persists successfully
+            # (one-shot; never on scan failure — the load did not complete).
+            scan.on_first_scan_done = onboarding.emit_load_complete
 
     session = SendSession()
     # The confirmation-ETA mempool hint (TCK-P5-002): consulted per create_tx
@@ -4457,12 +4477,23 @@ def _repl(
 _TRANSCRIPT_HELP: Final[str] = (
     "Commands: /details — reprint the pending transaction's full card; "
     "/label — list or set your own coin tags and notes; "
+    "/setup — choose which server answers the app about your addresses "
+    "(public default or your own Esplora-compatible server); "
     "/export <path> — write a redacted session transcript; "
     "/scrub — clear the in-memory transcript; /help — show this."
 )
 #: ``/details`` with no cached card (nothing has pended this session —
 #: value-free).
 _DETAILS_NONE: Final[str] = "No pending transaction to show a full breakdown for."
+#: ``/setup`` where NO flow is armed (TCK-ONB-005): the backend branch
+#: needs the terminal command loop, so web-chat/headless submissions of the
+#: command get the pointer instead (the choice itself is CLI- or
+#: web-settings-owned; structurally CLI-only by construction).
+_SETUP_CLI_ONLY: Final[str] = (
+    "Backend setup runs in the terminal app: start local-wallet at a "
+    "terminal and type /setup. (In the web UI, the Settings panel edits "
+    "the same choice.)"
+)
 
 # ------------------------------------------------------------- /label (UTXO-001)
 #
@@ -4539,9 +4570,10 @@ def _handle_transcript_command(
     flow: TxFlow | None = None,
     session: SendSession | None = None,
     store: Store | None = None,
+    onboarding: OnboardingFlow | None = None,
 ) -> None:
     """Handle an OQ14 transcript CLI command (``/details``, ``/label``,
-    ``/export``, ``/scrub``, ``/help``).
+    ``/setup``, ``/export``, ``/scrub``, ``/help``).
 
     Deterministic UI features, NOT model intents (ADR-0020): no protocol,
     grammar, or prompt change. Output is short and plain. ``/details``
@@ -4556,11 +4588,25 @@ def _handle_transcript_command(
     and notes on the same channel — never model context, never a gate
     answer, never an envelope; the store's typed accessors are the only
     writers and own the fail-closed validation.
+
+    ``/setup`` (TCK-ONB-005, ADR-0023 step 5 against an EXISTING wallet)
+    arms the onboarding flow's backend branch for the command loop: the
+    lines that FOLLOW the command ride the same deterministic channel the
+    first-run ask already uses (never the model). CLI-only by
+    construction: the pump hands it the session's flow, and only
+    interactive CLI wiring builds one — anywhere else it prints the
+    honest pointer (:data:`_SETUP_CLI_ONLY`).
     """
     parts = command.split(maxsplit=1)
     cmd = parts[0].lower()
     if cmd == "/help":
         output_fn(_TRANSCRIPT_HELP)
+        return
+    if cmd == "/setup":
+        if onboarding is None:
+            output_fn(_SETUP_CLI_ONLY)
+            return
+        onboarding.begin_setup(output_fn)
         return
     if cmd == "/details":
         pending = flow is not None and flow.state is TxFlowStatus.CREATED

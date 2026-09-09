@@ -1,4 +1,4 @@
-"""First-run onboarding conversation (TCK-ONB-003, ADR-0023).
+"""First-run onboarding conversation (TCK-ONB-003, ADR-0023) + /setup re-entry.
 
 Deterministic, CODE-OWNED terminal conversation — the model never sees any
 of it and the user's onboarding lines never reach the model (the same
@@ -23,6 +23,14 @@ in the browser, only :data:`WEB_SETUP_HINT`):
   falls through to the model untouched. Steps 3/4 narration rides
   :meth:`opening_lines` / :meth:`emit_load_complete` (non-blocking variant,
   ADR-0022 / TCK-SCAN-003 landed).
+- :meth:`OnboardingFlow.begin_setup` — the ``/setup`` transcript command
+  (TCK-ONB-005, ADR-0023 step 5 run against an EXISTING wallet): the flow
+  exists DORMANT on every interactive CLI launch and /setup arms it. A
+  stored choice is shown first (mode framing, value-free) and an explicit
+  ``y`` is required before it can be overwritten; ``n`` exits with no
+  change. Non-http(s) schemes (``ssl://`` and the electrum kinds) are
+  refused plainly — v1 speaks Esplora over http(s) only (ADR-0023
+  decision 7, TCK-ONB-004 backlog) — and the entry re-prompts.
 - Validation is the ADR-0023 decision-5 gate: the ``chain/`` probe
   (Esplora shape + mainnet genesis, ADR-0021) plus — loopback URLs only,
   per the ADR-0016 contract — the node doctor's IBD facts; a syncing node
@@ -53,6 +61,12 @@ __all__ = [
     "LOAD_COMPLETE",
     "LOAD_NARRATION",
     "NODE_ASK",
+    "NON_ESPLORA_URL",
+    "SETUP_CURRENT",
+    "SETUP_KEEP_CURRENT",
+    "SETUP_KEPT",
+    "SETUP_OVERWRITE",
+    "SETUP_REVERTED",
     "URL_PROMPT",
     "WEB_SETUP_HINT",
     "OnboardingFlow",
@@ -202,6 +216,68 @@ WEB_SETUP_HINT: Final[str] = (
     "saved for this web UI too."
 )
 
+# --- /setup re-entry copy (TCK-ONB-005; implementation-time, value-free) ---
+#
+# The stored URL is NEVER echoed, even though it is the user's own config:
+# every line below frames the current choice by MODE ("your own server" vs
+# "the public server"), matching the privacy banner's classification — the
+# surfaces can then never disagree, and a screenshot of the chat leaks
+# nothing. The node ask (a), URL prompt (b), failure (c), confirmation (d)
+# and next-launch honesty line are REUSED VERBATIM from the ADR-0023 blocks.
+
+#: Shown by /setup when a choice is already stored (before anything else).
+SETUP_CURRENT: Final[str] = (
+    "You already have a backend choice saved — right now the app asks "
+    "your own server, not a public one."
+)
+
+#: The overwrite gate: an explicit y/n inside the /setup loop, required
+#: BEFORE the new choice can replace the stored one (value-free).
+SETUP_OVERWRITE: Final[str] = (
+    "Type y to set up a different server, or n to keep this one and "
+    "finish. Nothing changes until a new address has been checked out and "
+    "saved."
+)
+
+#: Declining the overwrite gate (also "back"/"cancel"): exit, no change.
+SETUP_KEPT: Final[str] = (
+    "Kept — your current backend choice stands, untouched."
+)
+
+#: Skipping the privacy ask while a choice is stored: keeps CURRENT, which
+#: is NOT what :data:`SKIP_ACK` claims — hence this separate line.
+SETUP_KEEP_CURRENT: Final[str] = (
+    "No problem — the app keeps using the backend it has now, untouched. "
+    "Nothing was changed."
+)
+
+#: Picking the public server explicitly (/setup with a stored choice):
+#: clears the stored rung; honesty about the session riding the old backend
+#: (ADR-0018 config-only) lives in this line's own wording.
+SETUP_REVERTED: Final[str] = (
+    "Set — from your next launch the app uses the public server again; "
+    "this session keeps the backend it started with. Your saved address "
+    "has been removed."
+)
+
+#: A URL whose scheme v1 cannot speak (ssl:// and the other Electrum-
+#: protocol kinds, ADR-0023 decision 7 / TCK-ONB-004): plain statement, no
+#: probe, nothing saved — and the entry re-prompts (never a dead end).
+NON_ESPLORA_URL: Final[str] = (
+    "That's not an address this app can use yet: right now it connects "
+    "only to Esplora-protocol servers over http(s) — the web address of a "
+    "mempool.space app. Electrum servers (ssl:// and the like) are planned "
+    "for a later version. Nothing was probed and nothing was saved. Type "
+    "an http(s) address, or 1 for the public server."
+)
+
+#: /setup refuses DORMANT when the stored rung cannot be read (no gate can
+#: be promised over an unseen choice; value-free, retryable).
+_SETUP_STORE_ERROR: Final[str] = (
+    "I couldn't read your saved backend choice — the database is busy; "
+    "try /setup again."
+)
+
 # --- key-ask guidance (step 1 side branches; code-owned, value-free) -----
 
 #: Refusal + redirect when the key prompt receives seed-word-shaped input.
@@ -254,9 +330,17 @@ _SKIP_WORDS: Final[frozenset[str]] = frozenset(
         "continue without it",
     }
 )
+#: The subset of the skip words that NAMES the public server: on /setup
+#: over a stored choice it is an explicit revert (clears the stored rung),
+#: not a mere "keep current".
+_PUBLIC_WORDS: Final[frozenset[str]] = frozenset(
+    {"1", "public", "public server", "default"}
+)
 _OWN_NODE_WORDS: Final[frozenset[str]] = frozenset(
     {"2", "own node", "my node", "switch to my node", "i have a node", "yes"}
 )
+_CONFIRM_YES: Final[frozenset[str]] = frozenset({"y", "yes"})
+_CONFIRM_NO: Final[frozenset[str]] = frozenset({"n", "no"})
 _HELP_WORDS: Final[frozenset[str]] = frozenset(
     {"help", "where", "where do i find it", "where do i get that", "idk"}
 )
@@ -273,9 +357,12 @@ _GUIDE_PREFIXES: Final[tuple[str, ...]] = (
 class _AskState(Enum):
     """Where the step-2/5 conversation stands (closed set)."""
 
-    OPEN = "open"        # node ask unanswered — stays open across chat turns
+    OPEN = "open"  # node ask unanswered — stays open across chat turns
     URL_ASK = "url_ask"  # copy (b) shown; the next line is a URL candidate
-    DONE = "done"        # confirmed (d) or skipped (e); chat is plain again
+    DONE = "done"  # confirmed (d) or skipped (e); chat is plain again
+    #: /setup only (TCK-ONB-005): a stored choice was shown; the next line
+    #: must be the deterministic y/n before the ask even appears.
+    SETUP_CONFIRM = "setup_confirm"
 
 
 def _norm(line: str) -> str:
@@ -292,6 +379,18 @@ def _looks_like_seed(line: str) -> bool:
 
 def _is_url_candidate(line: str) -> bool:
     return line.strip().lower().startswith(("http://", "https://"))
+
+
+def _is_other_scheme_url(line: str) -> bool:
+    """A bare URL with a scheme v1 cannot speak — ``ssl://host:50001`` and
+    the other Electrum-protocol shapes (ADR-0023 decision 7: Esplora over
+    http(s) only; TCK-ONB-004 owns the future adapter). Scheme token
+    immediately before ``://`` (no spaces): free prose merely MENTIONING a
+    URL ("why is https://x slow?") stays ordinary chat."""
+    low = line.strip().lower()
+    if "://" not in low or low.startswith(("http://", "https://")):
+        return False
+    return " " not in low.split("://", 1)[0]
 
 
 def ask_watch_key(
@@ -335,13 +434,18 @@ def ask_watch_key(
 
 
 class OnboardingFlow:
-    """The step-2..5 conversation state machine for one first-run CLI session.
+    """The step-2..5 conversation state machine for one CLI session.
 
-    Constructed by ``_wire`` ONLY when: CLI transport, interactive launch, no
-    chain backend on any rung (env > config file > stored), and the wallet
-    profile was created THIS run (ADR-0023: step 1 skipped when the key was
-    supplied; returning users never see the startup ask — skipped asks are
-    re-offered by the chat-time triggers, deferred, see ticket return notes).
+    Constructed by ``_wire`` for EVERY interactive CLI launch
+    (TCK-ONB-005), but ARMED at startup only for the first-run branch
+    (no chain backend on any rung — env > config file > stored — AND the
+    wallet profile created THIS run; ADR-0023: step 1 is skipped when the
+    key was supplied, and returning users never see the startup ask).
+    Otherwise it is DORMANT: :meth:`handle_line` consumes nothing (ordinary
+    chat reaches the model untouched) until the ``/setup`` transcript
+    command arms the same backend branch via :meth:`begin_setup` — node ask
+    → URL entry → validation → write, with the overwrite gate on top of a
+    stored choice.
 
     Dependencies are injected callables so the whole flow is testable with
     zero network: ``check_backend`` (the chain probe), ``node_report``
@@ -360,6 +464,7 @@ class OnboardingFlow:
         check_backend: Callable[[str], bool],
         node_report: Callable[[], LocalNodeReport] | None = None,
         loopback_host: Callable[[str], str | None] | None = None,
+        armed: bool = True,
     ) -> None:
         self._store = store
         self._check_backend = check_backend
@@ -367,6 +472,8 @@ class OnboardingFlow:
         self._loopback_host = loopback_host
         self._state = _AskState.OPEN
         self._last_failed: str | None = None
+        self._armed = armed
+        self._had_choice = False
 
     @property
     def done(self) -> bool:
@@ -386,6 +493,37 @@ class OnboardingFlow:
         complete)."""
         output_fn(LOAD_COMPLETE)
 
+    def begin_setup(self, output_fn: Callable[[str], None]) -> None:
+        """The ``/setup`` transcript-command entry (TCK-ONB-005): run the
+        ADR-0023 backend branch against an EXISTING wallet.
+
+        A stored choice is shown first (mode framing, value-free — the
+        stored URL is never echoed) and an explicit ``y`` at the overwrite
+        gate is required BEFORE the branch can reach a write; ``n``/back
+        exits with no change. With nothing stored the ask leads directly
+        (a skip keeps the current public default). The live client is NOT
+        touched — the write rides the ADR-0018 config-only ladder and is
+        honest about taking effect next launch.
+        """
+        self._last_failed = None
+        try:
+            current = self._store.get_chain_base_url()
+        except StoreError:
+            # Cannot see the stored rung → cannot promise the gate — fail
+            # closed DORMANT, nothing changes (value-free).
+            output_fn(_SETUP_STORE_ERROR)
+            return
+        self._armed = True
+        if current is not None:
+            self._had_choice = True
+            output_fn(SETUP_CURRENT)
+            output_fn(SETUP_OVERWRITE)
+            self._state = _AskState.SETUP_CONFIRM
+        else:
+            self._had_choice = False
+            output_fn(NODE_ASK)
+            self._state = _AskState.OPEN
+
     def handle_line(
         self, line: str, output_fn: Callable[[str], None]
     ) -> bool:
@@ -394,17 +532,44 @@ class OnboardingFlow:
         ``True`` = consumed on the deterministic channel (never reaches the
         model); ``False`` = ordinary chat (the ask stays open — answers may
         arrive at any point, decision: 'after step 4 it is an ordinary turn
-        of chat' in reverse: ordinary turns run mid-ask).
+        of chat' in reverse: ordinary turns run mid-ask). A flow never
+        armed (dormant ``/setup``-capable session) consumes NOTHING.
         """
-        if self._state is _AskState.DONE:
+        if not self._armed or self._state is _AskState.DONE:
             return False
         text = line.strip()
         if not text:
             return False
         key = _norm(text)
 
+        if self._state is _AskState.SETUP_CONFIRM:
+            # The overwrite gate: only the deterministic y/n answers it;
+            # anything else re-prompts INSIDE the gate (never a model
+            # turn, never a skip through).
+            if key in _CONFIRM_YES:
+                output_fn(NODE_ASK)
+                self._state = _AskState.OPEN
+            elif key in _CONFIRM_NO or key in _BACK_WORDS:
+                output_fn(SETUP_KEPT)
+                self._state = _AskState.DONE
+            else:
+                output_fn(SETUP_OVERWRITE)
+            return True
+        if _is_other_scheme_url(text):
+            # ssl://-style Electrum-protocol address: v1 cannot speak it
+            # (ADR-0023 decision 7; adapter = TCK-ONB-004 backlog) — said
+            # plainly, never probed, never saved, the entry re-prompts.
+            # Both the ask state and the URL-entry state take this line
+            # (a first-run paste gets the same honest treatment).
+            output_fn(NON_ESPLORA_URL)
+            return True
         if key in _SKIP_WORDS:
-            output_fn(SKIP_ACK)
+            if not self._had_choice:
+                output_fn(SKIP_ACK)  # nothing stored: public IS current
+            elif key in _PUBLIC_WORDS:
+                self._revert_to_public(output_fn)  # an EXPLICIT public pick
+            else:
+                output_fn(SETUP_KEEP_CURRENT)  # skip ≠ public (choice held)
             self._state = _AskState.DONE
             return True
         if key.startswith(_GUIDE_PREFIXES):
@@ -443,6 +608,18 @@ class OnboardingFlow:
         return False
 
     # ------------------------------------------------------------- validation
+
+    def _revert_to_public(self, output_fn: Callable[[str], None]) -> None:
+        """/setup over a stored choice, public picked EXPLICITLY (``1``/
+        ``public``): clear the stored rung through the typed writer (the
+        ``""``-clears convention, ONB-002). A failed write keeps the stored
+        choice and says so — the ack is never a lie either way."""
+        try:
+            self._store.set_chain_base_url("")
+        except StoreError:
+            output_fn(SETUP_KEEP_CURRENT)
+        else:
+            output_fn(SETUP_REVERTED)
 
     def _validate(self, url: str, output_fn: Callable[[str], None]) -> bool:
         """Decision-5 validation: chain probe + (loopback only) doctor's
