@@ -5,6 +5,7 @@ network); we verify it is syntactically valid, sourceable, and that the
 OS/arch detection behaves on this host.
 """
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -33,3 +34,38 @@ def test_install_sh_detect_os_arch():
         "linux/arm64",
         "linux/x86_64",
     }, f"detect_os_arch returned unsupported pair: {pair!r}"
+
+
+def _resolve(dirpath, env=None):
+    return _run(
+        "bash",
+        "-c",
+        'source "$1"; cd "$2"; resolve_repo; printf "%s|%s" "$REPO" "$MODE"',
+        "sh",
+        INSTALL_SH,
+        str(dirpath),
+        env=env,
+    )
+
+
+def test_install_sh_resolve_inplace(tmp_path):
+    (tmp_path / "pyproject.toml").touch()
+    (tmp_path / "src" / "localwallet" / "__init__.py").parent.mkdir(parents=True)
+    (tmp_path / "src" / "localwallet" / "__init__.py").touch()
+    res = _resolve(tmp_path)
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == f"{tmp_path}|inplace"
+
+
+def test_install_sh_resolve_neutral_dir_clone(tmp_path):
+    target = tmp_path / "managed"
+    res = _resolve(tmp_path, env={**os.environ, "INSTALL_ROOT": str(target)})
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == f"{target}|clone"
+
+
+def test_install_sh_resolve_foreign_pyproject_refuses(tmp_path):
+    (tmp_path / "pyproject.toml").touch()
+    res = _resolve(tmp_path)
+    assert res.returncode == 2, (res.returncode, res.stdout, res.stderr)
+    assert "not local-wallet" in res.stderr

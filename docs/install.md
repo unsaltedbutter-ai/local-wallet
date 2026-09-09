@@ -4,6 +4,16 @@ local-wallet is a Python 3.12 project installed straight from its GitHub repo
 (`github.com/unsaltedbutter-ai/local-wallet`) via `uv`. There is no PyPI
 package; `install.sh` clones the repo and does an editable install for you.
 
+`install.sh` has two modes, detected automatically:
+
+- **curl | bash (managed clone):** run from any directory (the one-command
+  path below) — it clones the repo to `~/.local/share/local-wallet` and
+  installs there.
+- **Already cloned (in-place):** `cd` into your local-wallet checkout and run
+  `./install.sh` — it detects the checkout and sets up the `.venv` and install
+  right there, without cloning again. This matches the repo's own dev
+  convention.
+
 > **Verified 2026-09-08:** Python 3.14.6, hwi 3.2.0, protobuf 4.25.9, embit
 > 0.8.0, llama-cpp-python 0.3.35 (3.14 wheel available).
 
@@ -112,6 +122,13 @@ directory. If you installed `uv` only for this project, remove it separately
   for a manual install, make sure your venv was created from 3.12 or 3.13.
 - **Offline re-run** — the update step (`git pull`) is best-effort: if you are
   offline it warns and continues with the existing clone, then reinstalls.
+- **"this directory has a pyproject.toml but is not local-wallet"** — `install.sh`
+  detected a `pyproject.toml` in `$PWD` but no `src/localwallet`, so it refused
+  (exit 2) rather than risk installing another project. Run it from the
+  local-wallet checkout or a neutral directory.
+- **In-place mode ignores `INSTALL_ROOT`** — `INSTALL_ROOT` only applies to the
+  clone (`curl | bash`) mode; when you run `./install.sh` inside a checkout, the
+  repo and venv stay in that checkout.
 - **`uv` not found after install** — the official installer puts it at
   `~/.local/bin/uv`. Add `~/.local/bin` to your `PATH` or log out/in.
 - **Model download interrupted** — `download_model.py` is resumable (Range

@@ -58,7 +58,8 @@ curl -fsSL https://unsaltedbutter.ai/install | bash
 ```
 
 It detects your OS/arch, ensures a compatible Python, and can download the
-hash-pinned model (optional). See [docs/install.md](docs/install.md) for
+hash-pinned model (optional). Already cloned the repo? Run `./install.sh`
+inside it — it will set up in place. See [docs/install.md](docs/install.md) for
 manual steps, uninstall, and troubleshooting.
 
 ## Quick start (development)

@@ -21,7 +21,6 @@ UV_INSTALLER="https://astral.sh/uv/install.sh"
 MODEL="gemma-4-E2B-it-Q4_K_M"
 
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
-REPO="${INSTALL_ROOT:-$DATA_HOME/local-wallet}"
 
 info() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m==>\033[0m %s\n' "$*" >&2; }
@@ -69,7 +68,33 @@ ensure_python() {
   [ -n "$PY" ] || die "could not resolve Python 3.12"
 }
 
+# Resolves the repo to operate on. Two modes:
+#   in-place — $PWD is a local-wallet checkout (has pyproject.toml AND
+#              src/localwallet/__init__.py): operate on it directly, skipping
+#              clone/pull, and install the venv at $PWD/.venv (matching the
+#              repo's dev convention). INSTALL_ROOT is ignored here.
+#   clone    — any other directory: clone to $INSTALL_ROOT (default
+#              $DATA_HOME/local-wallet), byte-for-byte as before.
+# Refuses (exit 2) a foreign pyproject.toml rather than guessing at the repo.
+resolve_repo() {
+  MODE=clone
+  if [ -f "$PWD/pyproject.toml" ] && [ -f "$PWD/src/localwallet/__init__.py" ]; then
+    MODE=inplace
+    REPO="$PWD"
+    return
+  fi
+  if [ -f "$PWD/pyproject.toml" ]; then
+    printf '\033[1;31mFATAL:\033[0m this directory has a pyproject.toml but is not local-wallet; run from the local-wallet checkout or a neutral directory\n' >&2
+    exit 2
+  fi
+  REPO="${INSTALL_ROOT:-$DATA_HOME/local-wallet}"
+}
+
 ensure_repo() {
+  if [ "$MODE" = "inplace" ]; then
+    info "running in-place from $REPO (no clone/pull)"
+    return
+  fi
   if [ -d "$REPO/.git" ]; then
     info "updating existing clone in $REPO"
     ( cd "$REPO" && git pull --ff-only ) \
@@ -128,6 +153,7 @@ EOF
 
 main() {
   info "detected $(detect_os_arch)"
+  resolve_repo
   ensure_uv
   ensure_python
   ensure_repo
