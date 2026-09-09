@@ -64,6 +64,29 @@ const LABELS = {
   watchkeyRejected: "The key was not accepted — check it and try again.",
   watchkeyBusy: "The wallet is busy — try again.",
   watchkeyFailed: "Could not connect — try again.",
+  // settings watch-key row (TCK-WEB-008) — placeholder copy for the
+  // designer pass (docs/ux-first-run-web.md); strings live ONLY here.
+  settingsSectionWatchKey: "Wallet",
+  settingsSectionNetwork: "Network & scanning",
+  watchKeyRowUnknown: "Status unknown — reconnecting…",
+  watchKeyRowAbsent: "No watch key connected yet — enter it in the form above.",
+  watchKeyRowConnected: "Connected.",
+  watchKeyRowLaunchKey:
+    "Connected — the key was supplied when the wallet started, so it can't be shown here.",
+  watchKeyReveal: "Show",
+  watchKeyHide: "Hide",
+  watchKeyCopy: "Copy full key",
+  watchKeyCopied: "Full key copied.",
+  watchKeyCopyFailed: "Copy failed — the full key is shown; select and copy it.",
+  watchKeyReplace: "Replace watch key",
+  watchKeyReplaceCancel: "Cancel",
+  watchKeyReplaceYes: "Replace",
+  watchKeyReplaceConfirm:
+    "The cached data belongs to the current wallet; replacing re-scans for the new one. Replace the watch key?",
+  watchKeyReplaceLabel: "New public account key",
+  watchKeyReplaceApply: "Apply new key",
+  watchKeyReplaceUnsupported:
+    "A running session keeps its current key — quit and start Local Wallet again to set up a new wallet.",
 };
 
 // Which buttons the typed /state snapshot shows, per flow position. The
@@ -91,6 +114,17 @@ const state = {
   everConnected: false, // first /state comes from boot; later ones from reconnect
   stopped: false,       // true on 401/no-token: stop reconnecting
   backoffMs: 500,
+  // TCK-WEB-008: /state freshness (a slow first snapshot must never re-show
+  // a form the engine has already outgrown), the terminal dismiss on accept,
+  // the derived presence for the settings row, and the key the USER supplied
+  // in THIS page session (memory only — never persisted, never logged; a
+  // key supplied at launch never reaches the client at all, so it cannot be
+  // shown: the row then says so).
+  stateSeq: 0,
+  watchKeyDismissed: false,
+  watchKeyPresent: null, // null = unknown | true | false (typed state/1 only)
+  sessionWatchKey: "",
+  settingsAutoShown: false, // first-run auto-open episode armed/active
 };
 
 // ---------------------------------------------------------------- utilities
@@ -225,15 +259,50 @@ function applyState(snap) {
 // the shipped client keys off known fields and ignores the rest). While it
 // is up, chat is disabled — there is no wallet to talk to yet. The panel's
 // own submit (POST /watchkey) clears it; we NEVER infer provisioning from
-// local state, only from the engine's next snapshot.
+// local state, only from the engine's next snapshot — with one TCK-WEB-008
+// exception: a 200 ``accepted`` is the ENGINE'S OWN confirmation that the
+// key parsed, gated and persisted, so the form DISMISSES on the spot (the
+// user fix: no lingering card while the pump is busy with the post-provision
+// banner). A terminal dismiss is never re-shown by a stale snapshot, and the
+// ongoing refreshes below still re-sync everything else.
 function applyWatchKeyGate(snap) {
-  const needs = !!snap && snap.schema === "state/1" && snap.needs_watch_key === true;
+  const typed = !!snap && snap.schema === "state/1";
+  let needs = typed && snap.needs_watch_key === true;
+  if (state.watchKeyDismissed) needs = false;
+  if (typed) state.watchKeyPresent = !needs;
   const wasNeeded = !watchkeyPanelEl.hidden;
   watchkeyPanelEl.hidden = !needs;
   const mute = needs;
   inputEl.disabled = mute;
   sendBtn.disabled = mute;
   if (needs && !wasNeeded) watchkeyInputEl.focus(); // once, on reveal — not every refresh
+  // TCK-WEB-008 fix 3: an unset wallet opens the settings panel on its own
+  // (the row inside explains what is missing) and the panel closes itself
+  // once the key lands. A configured launch never opens; a state/0 (unknown)
+  // never fires either direction.
+  if (needs && !state.settingsAutoShown) {
+    state.settingsAutoShown = true;
+    openSettings();
+  } else if (typed && !needs && state.settingsAutoShown) {
+    state.settingsAutoShown = false;
+    closeSettings();
+  }
+}
+
+// The terminal success path of a watch-key submit (TCK-WEB-008 fix 1): hide
+// the whole form card, hand focus back to chat, keep the transcript + status.
+function dismissWatchKeyForm(key) {
+  state.sessionWatchKey = key; // memory only: powers the settings-row reveal/copy
+  state.watchKeyDismissed = true;
+  state.watchKeyPresent = true;
+  watchkeyInputEl.value = ""; // the key lives nowhere else after this line
+  watchkeyPanelEl.hidden = true;
+  inputEl.disabled = false;
+  sendBtn.disabled = false;
+  if (state.settingsAutoShown) {
+    state.settingsAutoShown = false; // the auto-open episode is over
+    closeSettings();
+  }
 }
 
 // The scan chip reflects ONLY the typed snapshot's scan_state (additive under
@@ -252,10 +321,16 @@ function applyScanChip(snap) {
 }
 
 async function refreshState() {
+  // Newest-wins (TCK-WEB-008): a snapshot that started before a provisioning
+  // submit can land AFTER it (a busy engine serializes reads); applying that
+  // stale answer would re-show the dismissed form, so only the newest reply
+  // may touch the DOM.
+  const seq = ++state.stateSeq;
   try {
     const response = await fetch("/state", { headers: authHeaders(), cache: "no-store" });
     if (!response.ok) return;
-    applyState(await response.json());
+    const snap = await response.json();
+    if (seq === state.stateSeq) applyState(snap);
   } catch {
     // server unreachable: leave visibility as-is; the stream status shows it
   }
@@ -446,9 +521,170 @@ function settingRow(entry, index) {
   return li;
 }
 
+function headingRow(text) {
+  return el("li", "setting-heading", text);
+}
+
+// Display-only shortening (TCK-WEB-008 fix 2): the COPY and the reveal show
+// the FULL key — a display truncation is head…tail, never mid-hash-where-it-
+// matters, and never the copied value.
+function truncateKey(key) {
+  return key.length <= 24 ? key : key.slice(0, 12) + "…" + key.slice(-8);
+}
+
+async function copyText(text) {
+  // Loopback http://127.0.0.1 IS a secure context (browser rule), so the
+  // clipboard API is normally there; any failure falls back to on-screen
+  // full reveal — the user fix demands a copyable value, however it lands.
+  await navigator.clipboard.writeText(text);
+}
+
+// The settings watch-key row. Presence comes ONLY from the typed /state
+// truth (same source as the form gate); the revealable VALUE exists only if
+// THIS page session supplied the key (the server deliberately never sends
+// key material back anywhere — ADR-0024, pinned by the server tests).
+function watchKeyRow() {
+  const li = el("li", "setting setting-watchkey");
+  li.appendChild(el("p", "setting-key", "watch_key"));
+  const value = el("p", "watchkey-value");
+  li.appendChild(value);
+  const actions = el("div", "watchkey-actions");
+  li.appendChild(actions);
+  const status = el("p", "setting-status");
+  status.setAttribute("role", "status");
+  li.appendChild(status);
+  const box = el("div", "watchkey-replace"); // replace-confirm / replace-apply stages
+  box.hidden = true;
+  li.appendChild(box);
+
+  let revealed = false;
+  const renderValue = () => {
+    const key = state.sessionWatchKey;
+    value.textContent =
+      key && revealed ? key : LABELS.watchKeyRowConnected + " " + truncateKey(key);
+  };
+
+  if (state.watchKeyPresent === null) {
+    value.textContent = LABELS.watchKeyRowUnknown;
+    return li;
+  }
+  if (state.watchKeyPresent !== true) {
+    value.textContent = LABELS.watchKeyRowAbsent;
+    return li;
+  }
+  if (state.sessionWatchKey) {
+    renderValue();
+    const reveal = el("button", "btn btn-secondary btn-small", LABELS.watchKeyReveal);
+    reveal.type = "button";
+    reveal.addEventListener("click", () => {
+      revealed = !revealed;
+      renderValue();
+      reveal.textContent = revealed ? LABELS.watchKeyHide : LABELS.watchKeyReveal;
+    });
+    const copy = el("button", "btn btn-secondary btn-small", LABELS.watchKeyCopy);
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      try {
+        await copyText(state.sessionWatchKey);
+        status.dataset.kind = "ok";
+        status.textContent = LABELS.watchKeyCopied;
+      } catch {
+        status.dataset.kind = "error";
+        status.textContent = LABELS.watchKeyCopyFailed;
+      }
+      if (!revealed) {
+        // the full value is on screen either way: manual select-copy works
+        revealed = true;
+        renderValue();
+        reveal.textContent = LABELS.watchKeyHide;
+      }
+    });
+    actions.append(reveal, copy);
+  } else {
+    // Keyed launch: the value never came through this page, and the server
+    // answers no endpoint that carries it — say so honestly, never guess.
+    value.textContent = LABELS.watchKeyRowLaunchKey;
+  }
+  const replace = el("button", "btn btn-secondary btn-small", LABELS.watchKeyReplace);
+  replace.type = "button";
+  replace.addEventListener("click", () => replaceStage("confirm"));
+  actions.appendChild(replace);
+
+  // EDIT flow (TCK-WEB-008 fix 2): button → inline confirm (the cached data
+  // belongs to the CURRENT wallet; replacing re-scans for the new one) →
+  // new-key input → POST /watchkey. The endpoint is the ONLY channel; the
+  // engine owns the verdict (mid-session replace is refused today, 409/503 —
+  // a value-free reason we relay verbatim, plus the honest restart line).
+  function replaceStage(stage) {
+    status.textContent = "";
+    status.dataset.kind = "";
+    box.replaceChildren();
+    box.hidden = false;
+    if (stage === "confirm") {
+      box.appendChild(el("p", "watchkey-warning", LABELS.watchKeyReplaceConfirm));
+      const yes = el("button", "btn btn-danger btn-small", LABELS.watchKeyReplaceYes);
+      yes.type = "button";
+      yes.addEventListener("click", () => replaceStage("apply"));
+      const no = el("button", "btn btn-secondary btn-small", LABELS.watchKeyReplaceCancel);
+      no.type = "button";
+      no.addEventListener("click", () => {
+        box.hidden = true;
+        box.replaceChildren();
+      });
+      box.append(yes, no);
+      return;
+    }
+    const line = el("div", "setting-line");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "setting-input";
+    input.spellcheck = false;
+    input.autocomplete = "off";
+    input.maxLength = 200;
+    input.setAttribute("aria-label", LABELS.watchKeyReplaceLabel);
+    const apply = el("button", "btn btn-primary btn-small", LABELS.watchKeyReplaceApply);
+    apply.type = "button";
+    apply.addEventListener("click", async () => {
+      const key = input.value.trim();
+      if (!key || apply.disabled) return;
+      apply.disabled = true;
+      status.dataset.kind = "";
+      status.textContent = LABELS.watchkeySaving;
+      const { code, data } = await postWatchKey(key);
+      apply.disabled = false;
+      if (code === 200 && data && data.status === "accepted") {
+        // The engine re-wired onto the new key: adopt it for reveal/copy and
+        // rebuild the panel rows from scratch (fresh /state + re-render).
+        state.sessionWatchKey = key;
+        state.watchKeyPresent = true;
+        loadSettings();
+        refreshState();
+      } else {
+        const reason =
+          code === 0
+            ? LABELS.unreachable
+            : data && typeof data.error === "string"
+              ? LABELS.watchkeyRejectedPrefix + " " + data.error
+              : LABELS.watchkeyFailed;
+        status.dataset.kind = "error";
+        status.textContent = reason;
+        box.replaceChildren(el("p", "setting-hint", LABELS.watchKeyReplaceUnsupported));
+      }
+    });
+    line.append(input, apply);
+    box.appendChild(line);
+  }
+  return li;
+}
+
 async function loadSettings() {
+  // The watch-key section renders from the typed /state truth alone — it
+  // stays honest even when GET /settings is unavailable (a first-run engine
+  // has no settings store yet). The server-owned rows follow under their
+  // own heading (TCK-WEB-008 fix 4: coherent grouping/labels).
+  const watchSection = [headingRow(LABELS.settingsSectionWatchKey), watchKeyRow()];
   settingsStatusEl.textContent = LABELS.settingsLoading;
-  settingsListEl.replaceChildren();
+  settingsListEl.replaceChildren(...watchSection);
   try {
     const response = await fetch("/settings", { headers: authHeaders(), cache: "no-store" });
     const data = response.ok ? await response.json().catch(() => null) : null;
@@ -462,8 +698,11 @@ async function loadSettings() {
       // an entry without a string key is unrenderable: skip it, keep the rest
       if (entry && typeof entry.key === "string") rows.push(settingRow(entry, rows.length));
     }
-    settingsListEl.replaceChildren(...rows);
-    if (rows.length === 0) settingsStatusEl.textContent = LABELS.settingsUnavailable;
+    if (rows.length > 0) {
+      settingsListEl.append(headingRow(LABELS.settingsSectionNetwork), ...rows);
+    } else {
+      settingsStatusEl.textContent = LABELS.settingsUnavailable;
+    }
   } catch {
     settingsStatusEl.textContent = LABELS.settingsUnavailable;
   }
@@ -534,25 +773,34 @@ settingsListEl.addEventListener("click", async (event) => {
   }
 });
 
+function openSettings() {
+  if (settingsPanelEl.hidden) {
+    settingsPanelEl.hidden = false;
+    settingsToggleEl.setAttribute("aria-expanded", "true");
+    loadSettings(); // fetch on demand, fresh every time the panel opens
+  }
+}
+
+function closeSettings() {
+  if (!settingsPanelEl.hidden) {
+    settingsPanelEl.hidden = true;
+    settingsToggleEl.setAttribute("aria-expanded", "false");
+  }
+}
+
 settingsToggleEl.addEventListener("click", () => {
-  const open = settingsPanelEl.hidden;
-  settingsPanelEl.hidden = !open;
-  settingsToggleEl.setAttribute("aria-expanded", String(open));
-  if (open) loadSettings(); // fetch on demand, fresh every time the panel opens
+  if (settingsPanelEl.hidden) openSettings();
+  else closeSettings();
 });
 
 // ------------------------------------------------- first-run watch key (001)
 // The key string rides ONLY to POST /watchkey (token/Host/Origin-gated, like
 // every mutation); ALL validation is the engine's existing parse+gate path.
 // We relay the server's value-free status line verbatim — the submitted key
-// is never re-rendered, cleared into the transcript, or logged.
-
-async function submitWatchKey() {
-  const key = watchkeyInputEl.value.trim();
-  if (!key || watchkeySubmitEl.disabled) return;
-  watchkeySubmitEl.disabled = true;
-  watchkeyStatusEl.dataset.kind = "";
-  watchkeyStatusEl.textContent = LABELS.watchkeySaving;
+// is never re-rendered, cleared into the transcript, or logged. ONE fetch
+// path (TCK-WEB-008): the first-run form and the settings replace flow are
+// the same POST /watchkey — no second endpoint, no client-side verdict.
+async function postWatchKey(key) {
   try {
     const response = await fetch("/watchkey", {
       method: "POST",
@@ -560,36 +808,50 @@ async function submitWatchKey() {
       body: JSON.stringify({ key }),
     });
     const data = await response.json().catch(() => null);
-    if (response.status === 200 && data && data.status === "accepted") {
-      watchkeyInputEl.value = ""; // the key lives nowhere after this line
-      watchkeyStatusEl.dataset.kind = "ok";
-      watchkeyStatusEl.textContent = LABELS.watchkeyConnected;
-    } else if (
-      (response.status === 400 || response.status === 409) &&
-      data &&
-      typeof data.error === "string"
-    ) {
-      // Rejection reasons are value-free by the engine's contract — safe to
-      // quote; we add nothing, and nothing here can echo the submitted key.
-      watchkeyStatusEl.dataset.kind = "error";
-      watchkeyStatusEl.textContent = LABELS.watchkeyRejectedPrefix + " " + data.error;
-    } else if (response.status === 503) {
-      watchkeyStatusEl.dataset.kind = "error";
-      watchkeyStatusEl.textContent = LABELS.watchkeyBusy;
-    } else {
-      watchkeyStatusEl.dataset.kind = "error";
-      watchkeyStatusEl.textContent = LABELS.watchkeyFailed;
-    }
+    return { code: response.status, data };
   } catch {
+    return { code: 0, data: null }; // transport failure: caller shows unreachable
+  }
+}
+
+async function submitWatchKey() {
+  const key = watchkeyInputEl.value.trim();
+  if (!key || watchkeySubmitEl.disabled) return;
+  watchkeySubmitEl.disabled = true;
+  watchkeyStatusEl.dataset.kind = "";
+  watchkeyStatusEl.textContent = LABELS.watchkeySaving;
+  const { code, data } = await postWatchKey(key);
+  if (code === 200 && data && data.status === "accepted") {
+    // TCK-WEB-008 fix 1: the engine just confirmed the key — dismiss the
+    // form card NOW (no waiting on the next /state round-trip, which can
+    // stall behind the post-provision banner), and keep "Connected." where
+    // it survives: the transcript + the connection status.
+    watchkeyStatusEl.textContent = "";
+    dismissWatchKeyForm(key);
+    appendSystem(LABELS.watchkeyConnected);
+  } else if (
+    (code === 400 || code === 409) &&
+    data &&
+    typeof data.error === "string"
+  ) {
+    // Rejection reasons are value-free by the engine's contract — safe to
+    // quote; we add nothing, and nothing here can echo the submitted key.
+    watchkeyStatusEl.dataset.kind = "error";
+    watchkeyStatusEl.textContent = LABELS.watchkeyRejectedPrefix + " " + data.error;
+  } else if (code === 0) {
     watchkeyStatusEl.dataset.kind = "error";
     watchkeyStatusEl.textContent = LABELS.unreachable;
-  } finally {
-    watchkeySubmitEl.disabled = false;
-    // Re-read the engine's truth either way: on success the form disappears
-    // when the next snapshot stops saying needs_watch_key (never on our own
-    // echo); on failure chat stays exactly as gated.
-    refreshState();
+  } else if (code === 503) {
+    watchkeyStatusEl.dataset.kind = "error";
+    watchkeyStatusEl.textContent = LABELS.watchkeyBusy;
+  } else {
+    watchkeyStatusEl.dataset.kind = "error";
+    watchkeyStatusEl.textContent = LABELS.watchkeyFailed;
   }
+  watchkeySubmitEl.disabled = false;
+  // Re-read the engine's truth either way: the snapshot re-syncs button/scan
+  // state, and (post-dismiss, TCK-WEB-008) can no longer resurrect the form.
+  refreshState();
 }
 
 watchkeySubmitEl.addEventListener("click", submitWatchKey);

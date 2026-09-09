@@ -85,6 +85,20 @@ def test_real_client_has_no_inline_handlers_or_eval_or_javascript_urls() -> None
     assert 'src="/static/app.js"' in index_html
 
 
+# TCK-WEB-008 mechanical pins on the shipped client (static, browser-free):
+# the watch-key form dismisses on the engine's own accept (never waits on a
+# /state round-trip), a stale snapshot cannot re-show it, and the settings
+# replace flow rides the ONE existing POST /watchkey channel — no second,
+# handler-shaped endpoint.
+def test_client_dismisses_the_form_on_accept_and_reuses_watchkey_endpoint() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    assert "dismissWatchKeyForm" in code
+    assert "watchKeyDismissed" in code  # terminal dismiss: stale /state can't undo it
+    # exactly ONE fetch to /watchkey (postWatchKey), shared by form + replace:
+    assert code.count('fetch("/watchkey"') == 1
+    assert "replaceStage" in code and "watchKeyRow" in code
+
+
 @pytest.mark.parametrize(
     "path", sorted(_RENDER_DIR.glob("*.json")), ids=lambda p: p.stem
 )

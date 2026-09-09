@@ -224,6 +224,46 @@ body {
 
 .setting-apply { padding: var(--sp-2) var(--sp-4); }
 
+/* TCK-WEB-008: settings consolidation — section headings, the watch-key row
+   and its controls. Tokens only, like every other rule in this file. */
+.setting-heading {
+  font-size: var(--fs-xs);
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--c-text-muted);
+  margin-block-start: var(--sp-2);
+}
+
+.btn-small {
+  padding: var(--sp-1) var(--sp-3);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+}
+
+.setting-watchkey .setting-key { margin: 0; }
+
+.watchkey-value {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+}
+
+.watchkey-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.watchkey-replace {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.watchkey-replace > .btn { align-self: flex-start; }
+
 .setting-hint {
   margin: 0;
   font-size: var(--fs-xs);
