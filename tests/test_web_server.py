@@ -222,6 +222,8 @@ def test_every_endpoint_requires_token_and_replies_http_1_0(serve: Any) -> None:
         ("POST", "/turn", {"text": "hi"}),
         ("POST", "/action", {"utterance": "confirm"}),
         ("POST", "/settings", {"key": "gap_limit", "value": "5"}),
+        # TCK-LAUNCH-001: the first-run watch-key entry is data-bearing too.
+        ("POST", "/watchkey", {"key": "zpub-some-key"}),
     ]
     for method, path, body in cases:
         status, headers, data, response = _request(server, method, path, body)
@@ -991,6 +993,54 @@ def test_state_snapshot_serializes_through_the_engine_queue(
     stream.close()
 
 
+def test_state_reports_awaiting_backend_for_a_held_scan(tmp_path: Path) -> None:
+    """TCK-ONB-006 (ADR-0022 amendment 1) through the real HTTP door: a
+    HELD first-run scan surfaces the additive ``awaiting_backend`` value of
+    the closed ``scan_state`` enum — an enum NAME and a bool, no data
+    (the first-run wallet is unscanned; nothing may leak through the
+    status door either). The shipped client treats the unknown name as
+    'no chip' (app.js ignores values outside its map) — additive by the
+    TCK-WEB-005 tag rule, so ``state/1`` is unchanged."""
+
+    def bootstrap() -> EngineContext:
+        store = Store(str(tmp_path / "held.db"))
+        wallet = store.create_wallet(
+            "default", WalletDescriptor.from_key(ZPUB).descriptor
+        )
+        worker = app.ChainWorker(None)  # client unused: a held scan fetches nothing
+        held["worker"] = worker
+        flow = app.ScanFlow(store, wallet, worker, gap_limit=None)
+        flow.set_startup_deferred()
+        table = {
+            IntentName.RESPOND: app._respond_handler,
+            IntentName.CLARIFY: app._clarify_handler,
+        }
+        return EngineContext(
+            loop=AgentLoop(app.stub_generate, table),
+            flow=TxFlow(),
+            session=app.SendSession(),
+            table=table,
+            scan=flow,
+            store=store,
+        )
+
+    held: dict[str, app.ChainWorker] = {}
+    server = serve_web(bootstrap, static_dir=tmp_path / "static")
+    try:
+        status, _h, data, _r = _request(
+            server, "GET", "/state", token=server.token
+        )
+        assert status == 200
+        snapshot = json.loads(data)
+        assert snapshot["schema"] == "state/1"
+        assert snapshot["scan_state"] == "awaiting_backend"
+        assert snapshot["first_scan_complete"] is False
+        assert ZPUB not in data.decode()  # value-free like every other state
+    finally:
+        server.stop()
+        held["worker"].stop()
+
+
 def test_state_falls_back_to_transport_shape_when_engine_busy(
     serve: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1398,3 +1448,281 @@ def test_run_cli_default_unchanged_no_server(tmp_path: Path, monkeypatch) -> Non
     assert code == 0
     assert [t for t in threading.enumerate() if t.name == "engine"] == []
     assert not any(line.startswith("Web UI:") for line in outputs)
+
+
+# ================================= TCK-LAUNCH-001 first-run watch-key entry
+#
+# The real launch door: a WEB session started with NO key (flag/env/stored
+# all empty) serves the page's first-run form; POST /watchkey marshals the
+# key THROUGH the pump, the EXISTING parse+gate path runs on the engine
+# thread, and acceptance persists the wallet + continues the normal
+# post-xpub sequence (TCK-ONB-006: scan HELD at awaiting_backend — zero
+# chain calls until a backend is chosen). Every refusal is value-free.
+
+_SEED_PHRASE = " ".join(["bacon"] * 12)  # BIP39-shaped (redactor test fixture)
+
+
+def _launch_first_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    args: list[str] | None = None,
+) -> tuple[threading.Thread, list[str], dict[str, Any]]:
+    """Start a REAL web session with no key anywhere; returns
+    ``(thread, outputs, capture)`` with ``capture["server"]`` live. The
+    caller owns ``server.stop()`` + join. Chain I/O is impossible by
+    construction here (unprovisioned) — the fresh tmp store also proves
+    nothing was configured by an earlier run."""
+    import httpx  # local: the ONLY network-ish lib, mock transport only
+
+    store_path = tmp_path / "first-run.db"
+    for var in (
+        app.ZPUB_ENV_VAR,
+        app.UI_ENV_VAR,
+        "LOCALWALLET_MODEL_PATH",
+        "LOCALWALLET_LLM_BASE_URL",
+        "LOCALWALLET_LLM_MODEL",
+        "LOCALWALLET_CHAIN_BASE_URL",
+        "LOCALWALLET_WEB_PORT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
+    monkeypatch.setenv(app.AUTO_SCAN_ENV_VAR, "1")
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
+    calls: list[str] = []
+    capture: dict[str, Any] = {"calls": calls, "store_path": store_path}
+
+    real_client = app.EsploraClient
+
+    def handler(request: Any) -> Any:
+        calls.append(request.url.path)
+        return httpx.Response(599, json={})  # never legitimately reached
+
+    def counting_client(**kwargs: Any) -> Any:
+        # _wire always passes base_url/timeout_s/max_retries; keep those and
+        # only inject the mock transport so no call can leave the process.
+        kwargs["transport"] = httpx.MockTransport(handler)
+        kwargs.setdefault("timeout_s", 2.0)
+        kwargs.setdefault("max_retries", 0)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(app, "EsploraClient", counting_client)
+    outputs: list[str] = []
+    gate = threading.Event()
+
+    def on_server(server: Any) -> None:
+        capture["server"] = server
+        gate.set()
+
+    thread = threading.Thread(
+        target=lambda: capture.update(
+            code=app.run(
+                args if args is not None else ["--web"],
+                output_fn=outputs.append,
+                on_web_server=on_server,
+            )
+        ),
+        daemon=True,
+    )
+    thread.start()
+    assert gate.wait(30), "unprovisioned web server never started"
+    return thread, outputs, capture
+
+
+def _session_state(server: Any) -> dict[str, Any]:
+    status, _h, data, _r = _request(server, "GET", "/state", token=server.token)
+    assert status == 200
+    return json.loads(data)
+
+
+def test_first_run_state_shows_the_form_and_chat_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    thread, _outputs, capture = _launch_first_run(tmp_path, monkeypatch)
+    server = capture["server"]
+    try:
+        snap = _session_state(server)
+        assert snap["schema"] == "state/1"
+        assert snap["needs_watch_key"] is True  # additive flag → the form shows
+        # A typed line BEFORE the key cannot reach any handler/loop: the pump
+        # refuses it value-free (there is no wallet to talk to yet).
+        stream = _Stream(server)
+        stream.read_head()
+        status, _h, _d, _r = _request(
+            server, "POST", "/turn", {"text": "what's my balance?"},
+            token=server.token,
+        )
+        assert status == 202  # queued like every turn — the refusal rides the stream
+        frame = stream.read_until(b"event: turn_end")
+        assert app.WATCHKEY_REQUIRED_NOTICE.encode() in frame
+        assert ZPUB.encode() not in frame  # and NOTHING key-shaped
+        stream.close()
+        assert capture["calls"] == []  # refusal meant zero chain access
+    finally:
+        server.stop()
+        thread.join(15)
+
+
+def test_watchkey_accepts_persists_and_defers_the_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    thread, outputs, capture = _launch_first_run(tmp_path, monkeypatch)
+    server = capture["server"]
+    try:
+        status, _h, data, _r = _request(
+            server, "POST", "/watchkey", {"key": ZPUB}, token=server.token
+        )
+        assert status == 200
+        assert json.loads(data)["status"] == "accepted"
+        # The key was NEVER echoed back (value-free reply).
+        assert ZPUB.encode() not in data
+        # Persisted through the EXISTING store path: one wallet row, the
+        # canonical descriptor, active.
+        store = Store(str(capture["store_path"]))
+        try:
+            wallets = store.list_wallets()
+            active = store.get_active_wallet()
+        finally:
+            store.close()
+        assert len(wallets) == 1
+        assert active is not None and active.descriptor == (
+            WalletDescriptor.from_key(ZPUB).descriptor
+        )
+        # The normal post-xpub flow: TCK-ONB-006 holds the first scan at
+        # awaiting_backend (no backend was ever chosen) — the /state door
+        # says so and NOTHING left the process.
+        snap = _session_state(server)
+        assert "needs_watch_key" not in snap  # provisioned: form gone
+        assert snap["scan_state"] == "awaiting_backend"
+        assert snap["first_scan_complete"] is False
+        assert capture["calls"] == []
+        # The banner for this launch ran through the normal web sequence
+        # (privacy notice + the honest unresolved-backend hint).
+        joined = "\n".join(outputs)
+        assert "Privacy notice:" in joined
+        assert "No server choice has been made yet" in joined  # WEB_SETUP_HINT
+        # A second submit cannot replace the wallet (ADR-0010 single-wallet).
+        status, _h, data, _r = _request(
+            server, "POST", "/watchkey", {"key": ZPUB}, token=server.token
+        )
+        assert status == 409
+        assert json.loads(data)["status"] == "already"
+        assert len(Store(str(capture["store_path"])).list_wallets()) == 1
+    finally:
+        server.stop()
+        thread.join(15)
+
+
+@pytest.mark.parametrize(
+    ("bad_key", "needle"),
+    [
+        ("not-a-key-at-all", "not a valid extended key"),
+        pytest.param(
+            "vpub5ZJ3cDEGGk61yWWUHFHgmG3M4je4yFD3ebC6jWHsqV8Cxh2K5zz8c6X5Hk7FkUAB"
+            "FTjRkQBz3g84MYeRhjAdnq1QmrmyTRTrzs8rFVCJUyh",
+            "mainnet-only",
+            id="testnet-vpub",
+        ),
+        pytest.param(
+            "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKm"
+            "PGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi",
+            "watch-only",
+            id="private-xprv",
+        ),
+        pytest.param(_SEED_PHRASE, "hardware-wallet-only", id="seed-phrase"),
+    ],
+)
+def test_watchkey_refusals_are_value_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_key: str,
+    needle: str,
+) -> None:
+    thread, _outputs, capture = _launch_first_run(tmp_path, monkeypatch)
+    server = capture["server"]
+    try:
+        status, _h, data, _r = _request(
+            server, "POST", "/watchkey", {"key": bad_key}, token=server.token
+        )
+        assert status == 400
+        body = json.loads(data)
+        assert body["status"] == "rejected"
+        assert needle in body["error"]  # the layer's own reason, relayed
+        assert bad_key not in data.decode()  # NEVER echoed
+        # Nothing was persisted and the form stays armed (retriable):
+        store = Store(str(capture["store_path"]))
+        try:
+            assert store.list_wallets() == []
+        finally:
+            store.close()
+        assert _session_state(server)["needs_watch_key"] is True
+        assert capture["calls"] == []
+    finally:
+        server.stop()
+        thread.join(15)
+
+
+def test_watchkey_relaunch_uses_the_stored_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """User direction: "If they have given us a zpub we use that one."
+    Provision once, stop, relaunch bare (same store) — the second launch is
+    a NORMAL keyed web launch: no form, wallet row reused, never duplicated."""
+    thread, _outputs, capture = _launch_first_run(tmp_path, monkeypatch)
+    server = capture["server"]
+    status, _h, _d, _r = _request(
+        server, "POST", "/watchkey", {"key": ZPUB}, token=server.token
+    )
+    assert status == 200
+    server.stop()
+    thread.join(15)
+
+    thread2, outputs2, capture2 = _launch_first_run(tmp_path, monkeypatch)
+    server2 = capture2["server"]
+    try:
+        snap = _session_state(server2)
+        assert "needs_watch_key" not in snap  # provisioned at bootstrap
+        assert snap["scan_state"] == "awaiting_backend"  # ONB-006 still holds
+        joined = "\n".join(outputs2)
+        assert "Privacy notice:" in joined  # real wiring ran at launch
+        store = Store(str(capture["store_path"]))
+        try:
+            assert len(store.list_wallets()) == 1  # reused, not duplicated
+        finally:
+            store.close()
+    finally:
+        server2.stop()
+        thread2.join(15)
+
+
+def test_favicon_is_served_without_the_token() -> None:
+    """TCK-LAUNCH-001: browsers request /favicon.ico WITHOUT the auth
+    header (the console-404 stub). Served through the static handler,
+    token-exempt like the shell, Host/CSP gates still applied."""
+    server = serve_web(_bootstrap)  # default = the package's real static dir
+    try:
+        status, headers, data, _r = _request(server, "GET", "/favicon.ico")
+        assert status == 200
+        assert headers["content-type"].startswith("image/")
+        assert data[:4] == b"\x00\x00\x01\x00"  # a valid ICO header
+        assert "content-security-policy" in headers
+        status, _h, data, _r = _request(
+            server, "GET", "/favicon.ico", headers={"Host": "evil.example"}
+        )
+        assert status == 400  # the DNS-rebinding gate runs on static too
+        assert b"evil" not in data  # value-free refusal
+    finally:
+        server.stop()
+
+
+def test_watchkey_on_a_keyed_engine_is_refused(serve: Any) -> None:
+    """Fail-closed at the door that only exists for the first-run pump: a
+    provisioned/stub engine has NO WatchKeyProvision, so the pump refuses
+    the submit (never a store write, never a 200)."""
+    server = serve()
+    status, _h, data, _r = _request(
+        server, "POST", "/watchkey", {"key": ZPUB}, token=server.token
+    )
+    assert status == 503
+    assert json.loads(data)["status"] == "unavailable"
+    assert ZPUB.encode() not in data

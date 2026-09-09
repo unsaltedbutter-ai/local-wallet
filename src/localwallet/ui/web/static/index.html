@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Local Wallet</title>
+<link rel="icon" href="/favicon.ico" type="image/vnd.microsoft.icon">
 <link rel="stylesheet" href="/static/styles.css">
 <script type="module" src="/static/app.js"></script>
 <!-- the per-launch token island is injected here by the server (TCK-WEB-002) -->
@@ -27,6 +28,34 @@
 </section>
 
 <main id="scroller" class="transcript-region">
+  <!-- TCK-LAUNCH-001 first-run watch-key form: shown only when the typed
+       /state snapshot carries needs_watch_key (a fresh single-user wallet
+       with no key on env/flag/stored). The copy mirrors the seed-policy
+       sweep (hardware-wallet-only, never seed words); submission is a
+       fetch to POST /watchkey (CSP form-action 'none' forbids native
+       submit). No key material is ever echoed back. -->
+  <section id="watchkey-panel" class="watchkey" aria-labelledby="watchkey-title" hidden>
+    <h2 id="watchkey-title">Connect your wallet</h2>
+    <p class="watchkey-lede">
+      Enter the wallet's <strong>public account key</strong> — an
+      <code>xpub</code>, <code>ypub</code>, or <code>zpub</code> — to begin.
+      You'll find it in your hardware wallet's settings under “export public
+      key” or “account descriptor” (for example a Jade or Coldcard).
+    </p>
+    <p class="watchkey-warning">
+      This is <strong>not</strong> your seed words. This app is
+      hardware-wallet-only: it never accepts a seed phrase or a private key,
+      and it could not use one. Mainnet keys only — testnet keys are refused.
+      Please never share your seed words with anyone.
+    </p>
+    <div class="watchkey-line">
+      <label class="visually-hidden" for="watchkey-input">Public account key</label>
+      <input id="watchkey-input" type="text" spellcheck="false" autocomplete="off"
+             placeholder="zpub…" maxlength="200" required>
+      <button id="watchkey-submit" class="btn btn-primary" type="button">Connect</button>
+    </div>
+    <p id="watchkey-status" class="watchkey-status" role="status" aria-live="polite"></p>
+  </section>
   <ol id="transcript" class="transcript" aria-label="Wallet conversation">
     <li id="hint" class="turn turn-system">Messages you send and replies from your wallet appear here.</li>
   </ol>

@@ -409,3 +409,35 @@ body {
   .transcript-region { padding: var(--sp-3); }
   .btn { padding: var(--sp-3) var(--sp-4); }
 }
+
+/* ------------------------------------------------ first-run watch key (001) */
+
+.watchkey {
+  margin: 0 auto var(--sp-4);
+  padding: var(--sp-4);
+  max-inline-size: 46rem;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-1);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.watchkey h2 { margin: 0; font-size: var(--fs-lg); }
+.watchkey-lede, .watchkey-warning { margin: 0; color: var(--c-text-muted); }
+.watchkey-warning { font-size: var(--fs-sm); }
+.watchkey code { font-family: var(--font-mono); }
+.watchkey-line { display: flex; gap: var(--sp-2); }
+.watchkey-line input {
+  flex: 1;
+  min-inline-size: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  font-family: var(--font-mono);
+  font-size: var(--fs-md);
+}
+.watchkey-status { margin: 0; min-block-size: 1.2em; font-size: var(--fs-sm); }
+.watchkey-status[data-kind="ok"] { color: var(--c-ok); }
+.watchkey-status[data-kind="error"] { color: var(--c-danger); }

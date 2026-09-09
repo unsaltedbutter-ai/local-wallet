@@ -70,11 +70,33 @@ Create a venv and install:
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 ```
 
-Run the CLI (no model needed — uses a stub LLM):
+Run it — **the web UI is the default launch** (TCK-LAUNCH-001,
+ADR-0024 amendment):
 
 ```sh
-.venv/bin/python -m localwallet.ui.cli --stub-llm
+.venv/bin/python -m localwallet.ui.cli
 ```
+
+It starts a loopback-only server (127.0.0.1, random port + per-launch
+token), prints the URL and best-effort opens your browser. No model file?
+It starts anyway in **demo mode** (canned-data stub LLM, clearly bannered)
+— set `LOCALWALLET_MODEL_PATH` for the real local model. Never given a
+watch key? The page asks for your wallet's **public account key** (xpub /
+ypub / zpub) in a first-run form; give it once and later launches reuse
+it. Keys are gated on entry: mainnet-only, no private keys, seed phrases
+refused — this app is hardware-wallet-only.
+
+Terminal REPL instead?
+
+```sh
+.venv/bin/python -m localwallet.ui.cli --cli         # or: LOCALWALLET_UI=cli
+```
+
+Other launch knobs: `--zpub <key>` / `LOCALWALLET_ZPUB` override the
+stored key for one launch (flag > env > stored); `--stub-llm` runs the dev
+stub without the demo banner; `LOCALWALLET_WEB_PORT=8788` binds a fixed
+loopback port (default `0` = automatic — see ADR-0024 §6 amendment);
+`LOCALWALLET_STORE_PATH` points at the SQLite store.
 
 Run tests and evals with the venv's interpreter:
 

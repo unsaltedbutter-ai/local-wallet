@@ -2248,33 +2248,55 @@ def test_db_gap_limit_used_when_env_unset(
     assert len(utxo_probes) == 0  # TCK-SCAN-001: nothing to fetch
 
 
-def test_repl_without_zpub_fails_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_repl_without_zpub_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-LAUNCH-001 note: the store is pinned to an EMPTY tmp path —
+    the new stored-key rung means a headless CLI launch otherwise reuses
+    whatever wallet the repo-root default store carries (a real user's,
+    in a real run; in tests, never)."""
     monkeypatch.delenv(ZPUB_ENV_VAR, raising=False)
     code, outputs = _run_captured(
-        ["--stub-llm"], monkeypatch, lambda _req: None, []
+        ["--stub-llm"],
+        monkeypatch,
+        lambda _req: None,
+        [],
+        store_path=tmp_path / "empty.db",
     )
     assert code == 2
     assert "No watch key configured" in "\n".join(outputs)
     assert ZPUB_ENV_VAR in "\n".join(outputs)
 
 
-def test_repl_without_model_or_stub_flag_fails_cleanly(
-    monkeypatch: pytest.MonkeyPatch,
+def test_no_model_falls_back_to_the_demo_stub(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """TCK-LAUNCH-001 deliverable 3: no model configured is NO LONGER the
+    old exit-2 refusal — the launch falls back to the deterministic dev
+    stub with a VISIBLE banner naming the demo mode and the real-model env
+    var, and the session runs. (The deliberate ``--stub-llm`` flag prints
+    no banner — tested in tests/test_launch.py.)"""
     monkeypatch.delenv("LOCALWALLET_MODEL_PATH", raising=False)
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(tmp_path / "demo.db"))
+    monkeypatch.setenv(app_module.AUTO_SCAN_ENV_VAR, "0")
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
     recorded: list[httpx.Request] = []
     handler = _scan_handler(recorded)
     monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
 
     outputs: list[str] = []
-    code = run(["--zpub", ZPUB], input_fn=lambda _p: "exit", output_fn=outputs.append)
+    code = run(
+        ["--zpub", ZPUB],
+        input_fn=lambda _p: "exit",
+        output_fn=outputs.append,
+    )
 
-    assert code == 2
+    assert code == 0
     joined = "\n".join(outputs)
-    assert "No model configured" in joined
+    assert "demo mode (canned data)" in joined
     assert "LOCALWALLET_MODEL_PATH" in joined
-    assert "--stub-llm" in joined
-    assert recorded == []  # no chain I/O on the config-error path
+    assert "--stub-llm" not in joined  # the banner points at the model, not the flag
+    assert recorded == []  # AUTO_SCAN/monitor untouched: the exit turn scans nothing
 
 
 def test_store_path_into_a_file_fails_cleanly_exit_2(

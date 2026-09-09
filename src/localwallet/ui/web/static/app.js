@@ -22,6 +22,10 @@ const settingsToggleEl = document.getElementById("settings-toggle");
 const settingsPanelEl = document.getElementById("settings-panel");
 const settingsStatusEl = document.getElementById("settings-status");
 const settingsListEl = document.getElementById("settings-list");
+const watchkeyPanelEl = document.getElementById("watchkey-panel");
+const watchkeyInputEl = document.getElementById("watchkey-input");
+const watchkeySubmitEl = document.getElementById("watchkey-submit");
+const watchkeyStatusEl = document.getElementById("watchkey-status");
 
 // One map for every user-facing string this file injects (designer pass —
 // button labels live in index.html markup, likewise for rewording).
@@ -52,6 +56,14 @@ const LABELS = {
     "Empty = public default — its operator can link your queries to your IP.",
   settingsEnvOverride: "Set via environment variable — edit there or remove it.",
   settingsRange: (min, max) => `Enter a whole number between ${min} and ${max}.`,
+  // first-run watch-key form (TCK-LAUNCH-001) — the engine owns all key
+  // validation; we only relay its value-free status lines verbatim.
+  watchkeySaving: "Connecting…",
+  watchkeyConnected: "Connected.",
+  watchkeyRejectedPrefix: "Not accepted:",
+  watchkeyRejected: "The key was not accepted — check it and try again.",
+  watchkeyBusy: "The wallet is busy — try again.",
+  watchkeyFailed: "Could not connect — try again.",
 };
 
 // Which buttons the typed /state snapshot shows, per flow position. The
@@ -205,6 +217,23 @@ function applyState(snap) {
     btn.hidden = !visible.has(btn.dataset.action);
   }
   applyScanChip(snap);
+  applyWatchKeyGate(snap);
+}
+
+// TCK-LAUNCH-001 first-run: the watch-key form is shown ONLY on the typed
+// snapshot's additive ``needs_watch_key`` boolean (state/1 stays valid;
+// the shipped client keys off known fields and ignores the rest). While it
+// is up, chat is disabled — there is no wallet to talk to yet. The panel's
+// own submit (POST /watchkey) clears it; we NEVER infer provisioning from
+// local state, only from the engine's next snapshot.
+function applyWatchKeyGate(snap) {
+  const needs = !!snap && snap.schema === "state/1" && snap.needs_watch_key === true;
+  const wasNeeded = !watchkeyPanelEl.hidden;
+  watchkeyPanelEl.hidden = !needs;
+  const mute = needs;
+  inputEl.disabled = mute;
+  sendBtn.disabled = mute;
+  if (needs && !wasNeeded) watchkeyInputEl.focus(); // once, on reveal — not every refresh
 }
 
 // The scan chip reflects ONLY the typed snapshot's scan_state (additive under
@@ -510,6 +539,65 @@ settingsToggleEl.addEventListener("click", () => {
   settingsPanelEl.hidden = !open;
   settingsToggleEl.setAttribute("aria-expanded", String(open));
   if (open) loadSettings(); // fetch on demand, fresh every time the panel opens
+});
+
+// ------------------------------------------------- first-run watch key (001)
+// The key string rides ONLY to POST /watchkey (token/Host/Origin-gated, like
+// every mutation); ALL validation is the engine's existing parse+gate path.
+// We relay the server's value-free status line verbatim — the submitted key
+// is never re-rendered, cleared into the transcript, or logged.
+
+async function submitWatchKey() {
+  const key = watchkeyInputEl.value.trim();
+  if (!key || watchkeySubmitEl.disabled) return;
+  watchkeySubmitEl.disabled = true;
+  watchkeyStatusEl.dataset.kind = "";
+  watchkeyStatusEl.textContent = LABELS.watchkeySaving;
+  try {
+    const response = await fetch("/watchkey", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ key }),
+    });
+    const data = await response.json().catch(() => null);
+    if (response.status === 200 && data && data.status === "accepted") {
+      watchkeyInputEl.value = ""; // the key lives nowhere after this line
+      watchkeyStatusEl.dataset.kind = "ok";
+      watchkeyStatusEl.textContent = LABELS.watchkeyConnected;
+    } else if (
+      (response.status === 400 || response.status === 409) &&
+      data &&
+      typeof data.error === "string"
+    ) {
+      // Rejection reasons are value-free by the engine's contract — safe to
+      // quote; we add nothing, and nothing here can echo the submitted key.
+      watchkeyStatusEl.dataset.kind = "error";
+      watchkeyStatusEl.textContent = LABELS.watchkeyRejectedPrefix + " " + data.error;
+    } else if (response.status === 503) {
+      watchkeyStatusEl.dataset.kind = "error";
+      watchkeyStatusEl.textContent = LABELS.watchkeyBusy;
+    } else {
+      watchkeyStatusEl.dataset.kind = "error";
+      watchkeyStatusEl.textContent = LABELS.watchkeyFailed;
+    }
+  } catch {
+    watchkeyStatusEl.dataset.kind = "error";
+    watchkeyStatusEl.textContent = LABELS.unreachable;
+  } finally {
+    watchkeySubmitEl.disabled = false;
+    // Re-read the engine's truth either way: on success the form disappears
+    // when the next snapshot stops saying needs_watch_key (never on our own
+    // echo); on failure chat stays exactly as gated.
+    refreshState();
+  }
+}
+
+watchkeySubmitEl.addEventListener("click", submitWatchKey);
+watchkeyInputEl.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    submitWatchKey();
+  }
 });
 
 // -------------------------------------------------------------------- start

@@ -1,7 +1,10 @@
 # ADR-0024: Localhost web UI — opt-in browser front-end over the existing engine
 
 - **Status:** Accepted (decisions fixed by orchestrator + web-architecture consult
-  2026-09-07; implementation ticket TCK-WEB-000).
+  2026-09-07; implementation ticket TCK-WEB-000). **Amended 2026-09-09 by
+  TCK-LAUNCH-001: the web UI is the DEFAULT launch (see the amendment
+  section at the end); decisions 1 and 11 as originally written are
+  superseded on that point only — everything else stands.**
 - **Date:** 2026-09-07
 - **Decides:** The web-UI architecture: how a browser front-end talks to the
   existing single-threaded engine without violating the closed-intent, dual-key,
@@ -381,3 +384,75 @@ loading), not implemented by this ADR.
   surface must also restate the no-address/amount value-free rules, since an HTTP
   response is a new disclosure surface (mitigated by suppressing logs and
   token-gating).
+
+## Amendment (2026-09-09, TCK-LAUNCH-001): web-first default launch
+
+User direction 2026-09-09: local-wallet is a **simple single-user,
+single-wallet tool** and should launch as `.venv/bin/python -m
+localwallet.ui.cli` — always web, always able to start without model
+setup. This amends decisions 1 and 11 (and extends 6); the security model,
+threading model, transport, and render contract are unchanged.
+
+- **Web is the launch default; the CLI becomes the opt-out (supersedes
+  §1's "the CLI stays the default" and §11).** The entry point (`main`,
+  i.e. the console script and `python -m localwallet.ui.cli`) launches
+  the web UI unless the transport is explicitly chosen otherwise:
+  `LOCALWALLET_UI=cli` or `--cli` keeps the terminal REPL, `--web`
+  forces web; flags beat env, and only the exact env value `"cli"` opts
+  out. Programmatic `run()` callers (the entire existing test harness —
+  the ADR-0024 §3 seam-proof rule) keep the pre-flip CLI default via
+  `default_web=False`.
+- **Browser auto-open (best-effort, stdlib `webbrowser`):** the entry
+  launch opens the canonical token-free URL; failure (headless/SSH —
+  the NORMAL case, never an error state) prints one calm
+  "open <url> manually" line and the launch stands. Programmatic web
+  launches do not auto-open (tests would hijack a real browser).
+- **No-model fallback (amends the exit-2 config-error set):** no
+  configured model no longer refuses startup — the launch falls back to
+  the deterministic dev stub behind a VISIBLE banner ("demo mode
+  (canned data); set LOCALWALLET_MODEL_PATH for the real model").
+  `--stub-llm` remains the explicit dev choice and prints no banner.
+- **First-run watch-key entry in the browser (new authenticated
+  mutating endpoint `POST /watchkey`):** with no key on
+  `--zpub`/`LOCALWALLET_ZPUB`/store, the web launch starts
+  UNPROVISIONED — a placeholder engine whose pump refuses every user
+  line value-free and whose `/state` snapshot carries the additive
+  `needs_watch_key` boolean (`state/1` unchanged; the shipped client
+  ignores unknown fields). The page's form POSTs the key; a typed
+  `WatchKeyRequest` (sibling of `SettingsRequest`, ADR-0024 §3: the
+  transport marshals bytes only) runs the EXISTING parse+gate path on
+  the ENGINE thread — mainnet-only, watch-only, seed-phrase refusals
+  intact, value-free errors surfaced to the form — persists through the
+  existing store path, and the pump rebinds onto the real wiring so the
+  normal post-xpub sequence (TCK-ONB-006 `awaiting_backend` hold,
+  startup-scan planning, banner) is exactly the keyed launch's.
+  No new key-handling code exists anywhere in the transport.
+- **Watch-key persistence and precedence (documents what "given us a
+  zpub" means):** the accepted key was ALWAYS persisted — as the
+  canonical descriptor in the existing wallets table (ADR-0010's single
+  row; no new schema). A later launch reuses it. Precedence is
+  `--zpub` > `LOCALWALLET_ZPUB` > stored: the flag/env rungs keep
+  overriding for backward compatibility (a documented deviation from the
+  ticket's "stored > env > flag" sketch). A stored descriptor that no
+  longer parses reads as "never configured" (fail closed toward the
+  form/ask, never toward a leak).
+- **§6 fixed-port option (opt-in; ephemeral remains the shipped
+  default):** `LOCALWALLET_WEB_PORT` (env > config file `web_port`, no
+  stored rung; `0`/unset = ephemeral) binds a predictable port — the
+  stale-tab pain of §6's shutdown line becomes diagnosable (a bookmark
+  can work). This does NOT weaken the auth model: the port was never
+  part of it (decision 6's security-review paragraph — any local
+  process can enumerate loopback listeners), so a predictable port makes
+  the per-launch token MORE valuable, not less: it becomes the sole
+  secret where it always was the sole credential. A busy fixed port is
+  a clean value-free exit 2 naming the fix.
+- **favicon stub:** `/favicon.ico` serves the tracked 1×1 `.ico` from
+  `static/` through the token-exempt static handler (browsers request
+  it without the auth header; the console 404 was unavoidable before),
+  Host allowlist + CSP unchanged.
+- **§11 web banner is minimal:** privacy notice, background-watch line,
+  `Web UI: <url>`, `Token: <token>` (separate lines, §6), and the
+  browser-open line; the REPL-specific "type a message / Ctrl-D" hint
+  is CLI-only. The `/events` reconnect backoff (≤ 15 s cap, reset on a
+  live stream) already bounds the dead-server console-error spam; no
+  change (verified by a source pin, tests/test_launch.py).

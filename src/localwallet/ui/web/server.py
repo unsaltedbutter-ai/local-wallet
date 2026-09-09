@@ -22,9 +22,10 @@ Thin stdlib HTTP/SSE transport over the engine pump (:func:`localwallet.app`
   ``TCP_NODELAY``; every connection socket bounded by a read/write timeout
   (``_Handler.handle``); sentinel shutdown with ``block_on_close=False`` so
   parked SSE threads never hang close (F4.4).
-* **Security (§6):** binds 127.0.0.1 only, ephemeral port; a random
-  per-launch token gates every DATA-BEARING endpoint (``/events``, ``/state``,
-  ``/turn``, ``/action``, ``/settings``) via the ``X-Auth-Token`` header (the
+* **Security (§6):** binds 127.0.0.1 only, ephemeral port (fixed-port
+  opt-in via ``LOCALWALLET_WEB_PORT``, ADR-0024 §6 amendment); a random
+  per-launch token gates every DATA-BEARING endpoint (``/events``,
+  ``/state``, ``/turn``, ``/action``, ``/settings``, ``/watchkey``) via the ``X-Auth-Token`` header (the
   401 path deliberately does NOT send ``WWW-Authenticate`` — a browser would
   pop a native credential prompt). The shell (``GET /``, ``/index.html``) and
   ``GET /static/*`` are the deliberate token EXEMPTION (TCK-WEB-007): the
@@ -66,7 +67,6 @@ import threading
 import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Final
@@ -302,13 +302,14 @@ class _Handler(BaseHTTPRequestHandler):
         **injected: Any,
     ) -> None:
         # Server-owned state (bus/token/handle/ knobs) arrives via the
-        # functools.partial factory; instance attrs before super().__init__
-        # (which dispatches do_GET straight away).
+        # WebServer handler factory (a closure over the live server);
+        # instance attrs before super().__init__ (which dispatches do_GET
+        # straight away).
         for name, value in injected.items():
             setattr(self, name, value)
         super().__init__(request, client_address, server)
 
-    # Injected attributes (declared for reading; set from the partial above).
+    # Injected attributes (declared for reading; set by the factory).
     bus: _Bus
     token: str
     engine: EngineHandle
@@ -446,6 +447,14 @@ class _Handler(BaseHTTPRequestHandler):
         if path.startswith("/static/"):
             self._static(path[len("/static/") :])
             return
+        if path == "/favicon.ico":
+            # TCK-LAUNCH-001: browsers request this by convention WITHOUT
+            # the auth header (a root-level path, not /static/*), so the
+            # 404 was an unavoidable console error. Serve the tracked stub
+            # icon through the same static handler as every other asset
+            # (Host allowlist + CSP already applied above; carries no data).
+            self._static("favicon.ico")
+            return
         if not self._require_token():
             return
         if path == "/events":
@@ -469,7 +478,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._drain_body()
             return
         path = self._path()
-        if path not in ("/turn", "/action", "/settings"):
+        if path not in ("/turn", "/action", "/settings", "/watchkey"):
             self._drain_body()
             self._send_json(404, {"error": "not found"})
             return
@@ -477,11 +486,19 @@ class _Handler(BaseHTTPRequestHandler):
         if body is None:
             return  # 413 already sent
         if path == "/settings":
-            # The ONLY write endpoint: a single allowlisted key, validated
-            # fail-closed ON THE ENGINE THREAD (TCK-WEB-005). The transport
-            # never touches the store — it marshals the request through the
-            # pump queue like every other state access.
+            # The ONLY general write endpoint: a single allowlisted key,
+            # validated fail-closed ON THE ENGINE THREAD (TCK-WEB-005). The
+            # transport never touches the store — it marshals the request
+            # through the pump queue like every other state access.
             self._settings_post(body)
+            return
+        if path == "/watchkey":
+            # TCK-LAUNCH-001 first-run watch-key entry (the ONE other
+            # mutating endpoint): the transport marshals the key string
+            # THROUGH the pump (WatchKeyRequest); the EXISTING parse+gate
+            # path runs on the engine thread. No key material is ever
+            # parsed, stored, echoed, or logged here.
+            self._watchkey_post(body)
             return
         field = "text" if path == "/turn" else "utterance"
         try:
@@ -653,6 +670,39 @@ class _Handler(BaseHTTPRequestHandler):
         code = {"applied": 200, "rejected": 400}.get(status, 503)
         self._send_json(code, result)
 
+    def _watchkey_post(self, body: bytes) -> None:
+        # TCK-LAUNCH-001 first-run watch-key submit. The transport ONLY
+        # shape-checks the JSON (a string ``key``) and marshals it through
+        # the engine queue (``WatchKeyRequest``). ALL key validation —
+        # parse, mainnet-only gate, watch-only refusals, seed-phrase
+        # detection — is the EXISTING engine path (app.py), fail-closed, with
+        # value-free refusals; this module never imports a key parser. HTTP
+        # maps the closed engine status: accepted→200, rejected→400,
+        # already→409, store_error/unavailable/busy→503. The key never rides back.
+        try:
+            payload = json.loads(body)
+            key = payload["key"] if isinstance(payload, dict) else None
+        except (ValueError, KeyError, TypeError):
+            self._send_json(400, {"error": "expected JSON object with a 'key' string"})
+            return
+        if not isinstance(key, str):
+            self._send_json(400, {"error": "'key' must be a string"})
+            return
+        result = (
+            None
+            if self.engine.error is not None
+            else self.engine.request_watchkey(self.state_timeout_s, key)
+        )
+        if result is None:
+            # Dead/timeout engine: the never-cancel POST contract stands —
+            # the submit may still land; the client re-reads /state rather
+            # than assuming failure (never a silent double-submit).
+            self._send_json(503, {"error": "engine busy"})
+            return
+        status = result.get("status")
+        code = {"accepted": 200, "rejected": 400, "already": 409}.get(status, 503)
+        self._send_json(code, result)
+
     # -- static -------------------------------------------------------------
     def _static(self, rel: str, inject_token: bool = False) -> None:
         target = (self.static_dir / rel).resolve()
@@ -742,18 +792,31 @@ class WebServer:
     ) -> None:
         self.token = secrets.token_urlsafe(32)
         self.bus = _Bus(ring_size=ring_size, maxsize=queue_maxsize)
-        self.handle = start_engine(bootstrap, self.bus.publish)
-        handler = partial(
-            _Handler,
-            bus=self.bus,
-            token=self.token,
-            engine=self.handle,
-            static_dir=static_dir if static_dir is not None else _STATIC_DIR,
-            heartbeat_s=heartbeat_s,
-            state_timeout_s=state_timeout_s,
-            send_timeout_s=send_timeout_s,
-        )
+
+        def handler(
+            request: socket.socket, client_address: tuple[str, int], server: Any
+        ) -> _Handler:
+            # Lazy read of self.handle: the engine starts AFTER the bind
+            # below, and a request can only arrive after serve() — by then
+            # the handle exists. Binding FIRST means a failed bind (busy
+            # fixed port, TCK-LAUNCH-001) raises with NO engine thread
+            # left behind, instead of orphaning one that would keep wiring
+            # and pumping forever (daemon only at interpreter exit).
+            return _Handler(
+                request,
+                client_address,
+                server,
+                bus=self.bus,
+                token=self.token,
+                engine=self.handle,
+                static_dir=static_dir if static_dir is not None else _STATIC_DIR,
+                heartbeat_s=heartbeat_s,
+                state_timeout_s=state_timeout_s,
+                send_timeout_s=send_timeout_s,
+            )
+
         self.httpd = _Server((HOST, port), handler)
+        self.handle = start_engine(bootstrap, self.bus.publish)
         self._thread: threading.Thread | None = None
         self._stopped = threading.Event()
 

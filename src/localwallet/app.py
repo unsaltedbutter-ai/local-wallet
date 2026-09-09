@@ -30,10 +30,19 @@ implements no protocol, wallet, chain, or tx-engine logic itself:
   records the BROADCAST state plus a history row; ``tx_status`` quotes
   the explorer's confirmation status for a verbatim txid.
 - :func:`run` / :func:`main` — CLI wiring: read the watch-only key from
-  ``--zpub`` or ``LOCALWALLET_ZPUB``, parse + gate it (mainnet-only,
-  value-free errors → config-error exit 2); on an interactive first
+  ``--zpub``, ``LOCALWALLET_ZPUB``, or the STORED wallet row (the wallets
+  table's canonical descriptor carries the key — TCK-LAUNCH-001:
+  ``--zpub`` > env > stored), parse + gate it (mainnet-only, value-free
+  errors → config-error exit 2); on an interactive first
   launch with no key supplied, the ADR-0023 onboarding greeting asks for
-  it instead (:func:`localwallet.ui.onboarding.ask_watch_key`). Then open
+  it instead (:func:`localwallet.ui.onboarding.ask_watch_key`); on a WEB
+  launch with no key at all the first-run watch-key form serves it
+  (:class:`WatchKeyProvision` — the same parse+gate path, engine-pump
+  owned). The entry point (:func:`main`) launches the web UI by default
+  (TCK-LAUNCH-001, ADR-0024 amendment; ``--cli``/``LOCALWALLET_UI=cli``
+  keeps the REPL) and best-effort opens the browser; no configured model
+  falls back to the dev stub with a visible banner instead of exiting.
+  Then open
   the store (:class:`~localwallet.config.Settings` ``store_path``),
   inject the stored backend rung (ADR-0023 decision 3:
   ``env > config file > stored > public default``, resolved through
@@ -95,8 +104,9 @@ import sqlite3
 import sys
 import threading
 import time
+import webbrowser
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from pathlib import Path
 from string import punctuation
@@ -194,6 +204,7 @@ from localwallet.ui.onboarding import (
     BACKEND_CHOICE_SETTING,
     WEB_SETUP_HINT,
     OnboardingFlow,
+    _looks_like_seed,
     ask_watch_key,
 )
 from localwallet.wallet import scan as wallet_scan
@@ -204,7 +215,6 @@ from localwallet.wallet.descriptor import (
     ParsedKey,
     WalletDescriptor,
     WatchKeyError,
-    parse_wallet_key,
 )
 
 if TYPE_CHECKING:  # circular at runtime: ui.web.server imports this module
@@ -216,6 +226,7 @@ __all__ = [
     "DEFAULT_SIGNER_DIR",
     "GAP_LIMIT_ENV_VAR",
     "NODE_STATUS_DETECTION_DISABLED",
+    "NO_MODEL_DEMO_BANNER",
     "OUT_OF_WINDOW_NOTICE",
     "PRIVACY_INDICATOR",
     "PRIVACY_INDICATOR_OWN_NODE_LOCAL",
@@ -223,6 +234,8 @@ __all__ = [
     "SIGNER_DIR_ENV_VAR",
     "SIGNER_ENV_VAR",
     "UI_ENV_VAR",
+    "WATCHKEY_COMMAND",
+    "WEB_PORT_ENV_VAR",
     "ZPUB_ENV_VAR",
     "SendSession",
     "SignerSelection",
@@ -237,14 +250,41 @@ __all__ = [
 #: (``--zpub`` overrides it).
 ZPUB_ENV_VAR: Final[str] = "LOCALWALLET_ZPUB"
 
+#: Environment variable (and config-file key ``web_port``) fixing the web
+#: UI's loopback port (TCK-LAUNCH-001, ADR-0024 §6 amendment). Ladder:
+#: env > config file > default 0 = ephemeral OS-assigned (the shipped
+#: behavior). A fixed port is the user's opt-in convenience; per the
+#: amendment it makes the per-launch token MORE valuable, not less (the
+#: port was never the secret — the token is).
+WEB_PORT_ENV_VAR: Final[str] = "LOCALWALLET_WEB_PORT"
+
+#: TCP port bounds for the fixed-port knob (0 keeps the ephemeral default).
+WEB_PORT_MIN: Final[int] = 0
+WEB_PORT_MAX: Final[int] = 65535
+
+#: TCK-LAUNCH-001 no-model fallback: instead of the old exit-2 refusal, a
+#: launch with no ``LOCALWALLET_MODEL_PATH`` / remote bridge / ``--stub-llm``
+#: runs the deterministic dev stub so the tool ALWAYS launches. The banner
+#: is VISIBLE (printed through the transport's own output channel) and says
+#: exactly what is canned and how to get the real model. Value-free.
+NO_MODEL_DEMO_BANNER: Final[str] = (
+    "No model configured — running in demo mode (canned data); set "
+    "LOCALWALLET_MODEL_PATH for the real model."
+)
+
 #: Environment variable opting out of the startup scan (``"0"`` disables;
 #: any other value — including unset — keeps the default on).
 AUTO_SCAN_ENV_VAR: Final[str] = "LOCALWALLET_AUTO_SCAN"
 
 #: Environment variable selecting the UI transport (TCK-WEB-002, ADR-0024
-#: §1/§11): ``"web"`` serves the opt-in localhost web UI instead of the
-#: REPL. The CLI default is unchanged (unset/any other value = REPL); the
-#: ``--web`` flag overrides this.
+#: §1/§11, amended by TCK-LAUNCH-001): the ENTRY point (:func:`main`, i.e.
+#: ``python -m localwallet.ui.cli``) launches the localhost web UI by
+#: default; ``LOCALWALLET_UI=cli`` opts back into the REPL, ``--cli``
+#: overrides the env, and ``--web`` forces web. Only the exact value
+#: ``"cli"`` selects the terminal — any other value (or unset) keeps the
+#: launch default. Direct programmatic :func:`run` callers (tests,
+#: harnesses) keep the pre-flip CLI default unless they pass
+#: ``default_web=True``.
 UI_ENV_VAR: Final[str] = "LOCALWALLET_UI"
 
 #: Dev knob (TCK-CFG-001): overrides the per-scan address gap limit
@@ -402,6 +442,56 @@ def _env_gap_limit(settings: Settings) -> int | None:
             f"{GAP_LIMIT_MIN} and {GAP_LIMIT_MAX}"
         )
     return value
+
+
+def _open_browser(url: str) -> bool:
+    """Best-effort browser auto-open at web launch (TCK-LAUNCH-001,
+    stdlib :mod:`webbrowser` — no dependency, no subprocess of our own).
+
+    Headless/SSH boxes and browser-less environments are the NORMAL case,
+    not an error: every failure path (no registered browser —
+    ``webbrowser.get()`` raising — or a controller that crashes / returns
+    False) is contained here and reported to the caller as ``False``.
+    Never fatal, never raises. The URL is the token-free canonical launch
+    URL (ADR-0024 §6: the token never rides a URL).
+    """
+    try:
+        return webbrowser.open(url)
+    except Exception:  # noqa: BLE001 — best-effort BY CONTRACT (see docstring)
+        return False
+
+
+def _stored_watch_descriptor(store_path: str | None) -> WalletDescriptor | None:
+    """The watch key persisted in the store, if any (TCK-LAUNCH-001:
+    "if they have given us a zpub we use that one").
+
+    The EXISTING wallets-table row IS the persistence — the canonical
+    descriptor string embeds the account key — so no new schema/setting
+    lands here; :meth:`WalletDescriptor.from_descriptor_string` rebuilds
+    the gated descriptor (and its parsed key) from the stored row.
+    Single-wallet tool (ADR-0010): the active wallet row is the key.
+
+    Fail-closed quiet: no DB file (NEVER created just to look), unreadable
+    store, no active row, or a descriptor that no longer parses (corrupt)
+    all read as "never configured" — the caller falls through to the
+    first-run flow (web form / interactive ask / headless refusal), and a
+    genuinely broken store still surfaces through the real wiring's own
+    exit-2 line later. Value-free by contract: the key is never echoed.
+    """
+    if not store_path or not Path(store_path).is_file():
+        return None
+    store: Store | None = None
+    try:
+        store = Store(store_path)
+        wallet = store.get_active_wallet()
+        if wallet is None:
+            return None
+        return WalletDescriptor.from_descriptor_string(wallet.descriptor)
+    except (StoreError, sqlite3.Error, OSError, WatchKeyError):
+        return None
+    finally:
+        if store is not None:
+            store.close()
 
 
 def privacy_indicator(settings: Settings) -> str:
@@ -3226,6 +3316,151 @@ class _PumpError:
     exc: BaseException
 
 
+#: Command token the web transport stamps on a first-run watch-key submit
+#: (TCK-LAUNCH-001): recognized ONLY as the ``command`` label of a
+#: :class:`WatchKeyRequest`, it is never a model turn and never a chat line,
+#: so no key material can ride it into the dispatcher.
+WATCHKEY_COMMAND: Final[str] = "/watchkey"
+
+#: ``/watchkey`` reply schema tag (additive-tag rule as for ``state/1``).
+WATCHKEY_SCHEMA: Final[str] = "watchkey/1"
+
+#: Value-free reply lines for the closed watch-key outcomes. The submitted
+#: key NEVER appears in any of them (watch-only: keys never echo into
+#: errors/logs); parse refusals come from ``WatchKeyError`` verbatim, which
+#: is value-free by the descriptor layer's contract.
+_WATCHKEY_ALREADY: Final[str] = "a watch key is already configured"
+_WATCHKEY_SEED: Final[str] = (
+    "that looks like a seed phrase — this app is hardware-wallet-only and "
+    "never accepts seed words or private keys; provide the wallet's public "
+    "account key (zpub/xpub/ypub)"
+)
+_WATCHKEY_UNAVAILABLE: Final[str] = "watch key setup is not available"
+
+#: Shown (value-free) on a first-run web session for ANY user line until the
+#: watch key lands: the placeholder wiring has no handlers, no store, and no
+#: model, so a chat turn can only be refused, never run.
+WATCHKEY_REQUIRED_NOTICE: Final[str] = (
+    "No watch key configured yet — enter your wallet's public account key "
+    "(zpub/xpub/ypub) using the form on this page to begin."
+)
+
+
+@dataclass(frozen=True)
+class WatchKeyRequest:
+    """A typed first-run watch-key submit queued THROUGH the engine pump
+    (TCK-LAUNCH-001).
+
+    Sibling of :class:`SettingsRequest` / :class:`StateSnapshotRequest`: the
+    transport never parses, stores, or gates the key (ADR-0024 §3) — it
+    marshals the raw string onto the command queue and the ENGINE thread
+    runs the EXISTING parse+gate path (mainnet-only, testnet/private-key/
+    seed refusals intact) and persists the wallet via the existing store
+    path, then answers with a value-free closed status.
+    """
+
+    command: str
+    key: str
+    reply: queue.Queue[dict[str, object]]
+
+
+@dataclass
+class WatchKeyProvision:
+    """First-run watch-key provisioning for a web launch that started with
+    NO key (TCK-LAUNCH-001) — the engine thread's owner of that one step.
+
+    Holds every argument :func:`_wire` needs (all resolved and
+    config-validated at startup, BEFORE the transport split). ``provision``
+    runs the SAME gated path the CLI ``--zpub``/ask flow uses — parse +
+    gate the key, persist/reuse the wallet profile (the wallets-table
+    descriptor IS the persistence; no new schema) — by calling
+    :func:`_wire` itself, so the whole normal post-xpub sequence (banner,
+    ONB-006 ``awaiting_backend`` deferral, startup-scan planning) is
+    exactly what a keyed launch gets, because it IS :func:`_wire`.
+
+    The submitted key is a single-use argument: never stored on this
+    object, never logged, never echoed. ``wiring`` is set once on success;
+    later submits are refused value-free with :data:`_WATCHKEY_ALREADY`
+    (single-wallet tool, ADR-0010 — replacing a configured wallet is not
+    this endpoint's business).
+    """
+
+    settings: Settings
+    signer_selection: SignerSelection
+    env_gap: int | None
+    rescan: bool
+    flow: TxFlow | None
+    generate: ModelRuntime | GenerateFn | RemoteOpenAIRuntime
+    node_detect_fn: Callable[[], LocalNodeReport] | None
+    output_fn: Callable[[str], None]
+    wiring: _Wiring | None = None
+
+    def provision(self, key: str) -> dict[str, object]:
+        """Parse+gate ``key`` and wire the engine ON THE ENGINE THREAD.
+
+        Returns the value-free reply dict (``status`` is a closed enum:
+        ``accepted``/``rejected``/``already``/``store_error``; the pump adds
+        ``unavailable`` when no provision object exists). Every parse
+        or gate refusal (testnet key, private key, seed-shaped input,
+        malformed key) surfaces as ``rejected`` with the layer's own
+        value-free reason — the key NEVER rides back.
+        """
+        if self.wiring is not None:
+            return {
+                "schema": WATCHKEY_SCHEMA,
+                "status": "already",
+                "error": _WATCHKEY_ALREADY,
+            }
+        candidate = key.strip()
+        if _looks_like_seed(candidate):
+            # Seed-shaped BEFORE parse (the SAME sanctioned scrubber check
+            # the interactive key ask uses, onboarding._looks_like_seed): a
+            # seed phrase is refused with the hardware-wallet-only guidance
+            # and never handed to the key parser.
+            return {
+                "schema": WATCHKEY_SCHEMA,
+                "status": "rejected",
+                "error": _WATCHKEY_SEED,
+            }
+        try:
+            # The EXISTING gated parse+descriptor path (mainnet-only,
+            # watch-only, value-free WatchKeyErrors, ADR-0021) — no new
+            # key-handling code.
+            descriptor = WalletDescriptor.from_key(candidate)
+        except WatchKeyError as exc:
+            return {
+                "schema": WATCHKEY_SCHEMA,
+                "status": "rejected",
+                "error": str(exc),
+            }
+        try:
+            wiring = _wire(
+                parsed=descriptor.parsed,
+                descriptor=descriptor,
+                signer_selection=replace(
+                    self.signer_selection,
+                    fingerprint_hex=descriptor.parsed.hd_key.my_fingerprint.hex(),
+                ),
+                settings=self.settings,
+                env_gap=self.env_gap,
+                rescan=self.rescan,
+                flow=self.flow,
+                generate=self.generate,
+                node_detect_fn=self.node_detect_fn,
+                output_fn=self.output_fn,
+                web_mode=True,
+            )
+        except _WiringError as exc:
+            # Store-layer failure (the ONE line is the same value-free
+            # string the keyed launch prints before its exit 2). The key
+            # was valid but NOTHING was persisted — the form stays up,
+            # retriable, exactly like the settings path's refusals.
+            return {"schema": WATCHKEY_SCHEMA, "status": "store_error",
+                    "error": str(exc)}
+        self.wiring = wiring
+        return {"schema": WATCHKEY_SCHEMA, "status": "accepted"}
+
+
 @dataclass
 class EngineContext:
     """Everything the pump runs on, constructed ON the engine thread."""
@@ -3243,6 +3478,11 @@ class EngineContext:
     #: reads/writes (TCK-WEB-005). Only the pump thread may touch it — the
     #: web bootstrap constructs it ON the engine thread.
     store: Store | None = None
+    #: TCK-LAUNCH-001 first-run web provisioning: set when the launch had
+    #: NO watch key (flag/env/stored all empty) — the pump then holds every
+    #: user line and accepts only a :class:`WatchKeyRequest`, whose
+    #: successful handling rebinds the pump onto the real wiring.
+    provision: WatchKeyProvision | None = None
 
 
 @dataclass(frozen=True)
@@ -3522,6 +3762,23 @@ class EngineHandle:
         except queue.Empty:
             return None
 
+    def request_watchkey(self, timeout: float, key: str) -> dict[str, object] | None:
+        """Submit a first-run watch key THROUGH the pump (TCK-LAUNCH-001).
+
+        Same discipline as :meth:`request_settings`: the transport thread
+        never parses, gates, stores, or logs key material — it marshals the
+        raw string onto the command queue and the ENGINE thread runs the
+        existing parse+gate path and answers between turns. ``None`` on
+        timeout = never-cancel stands (the submit may still land; the client
+        RE-READS /state rather than assuming failure).
+        """
+        reply: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+        self.commands.put(WatchKeyRequest(WATCHKEY_COMMAND, key, reply))
+        try:
+            return reply.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
     def shutdown(self) -> None:
         """End the session AFTER the current turn completes (never-cancel)."""
         self.commands.put(QUIT)
@@ -3562,6 +3819,7 @@ def start_engine(
             emitter=handle.emitter,
             scan=ctx.scan,
             store=ctx.store,
+            provision=ctx.provision,
         )
 
     handle.thread = threading.Thread(target=body, name="engine", daemon=True)
@@ -3619,6 +3877,7 @@ def _pump(
     scan: ScanFlow | None = None,
     store: Store | None = None,
     onboarding: OnboardingFlow | None = None,
+    provision: WatchKeyProvision | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
     ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
@@ -3645,6 +3904,12 @@ def _pump(
     ``SettingsRequest`` are answered BETWEEN commands on this thread — the
     settings pair needs ``store`` (the engine-owned store); without it (CLI
     pumps, bare test pumps) the request is refused fail-closed.
+
+    First-run watch-key provisioning (TCK-LAUNCH-001): when ``provision`` is
+    given the engine started with NO wallet. A ``WatchKeyRequest`` runs the
+    existing parse+gate path on this thread and — on success — the pump
+    REBINDS onto the real wiring (the placeholder loop/table never runs a
+    turn); ordinary lines before that are refused value-free.
     """
     if scan is not None:
         scan.attach(commands)
@@ -3663,13 +3928,46 @@ def _pump(
             raise command.exc
         if command is QUIT:
             break
+        if isinstance(command, WatchKeyRequest):
+            # TCK-LAUNCH-001 first-run watch-key entry: the ENGINE thread
+            # runs the EXISTING parse+gate path (:class:`WatchKeyProvision`
+            # → _wire), never a model turn, and answers with a value-free
+            # status. On success the pump REBINDS onto the real wiring and
+            # starts the freshly armed startup scan — the normal post-xpub
+            # sequence continues from here exactly as a keyed launch.
+            command.reply.put(
+                {"schema": WATCHKEY_SCHEMA, "status": "unavailable",
+                 "error": _WATCHKEY_UNAVAILABLE}
+                if provision is None
+                else provision.provision(command.key)
+            )
+            if provision is not None and provision.wiring is not None:
+                wiring = provision.wiring
+                loop = wiring.loop
+                flow = wiring.flow
+                session = wiring.session
+                table = wiring.table
+                watcher = wiring.watcher
+                client = wiring.client
+                store = wiring.store
+                scan = wiring.scan
+                if scan is not None:
+                    scan.attach(commands)
+                    scan.begin()
+            continue
         if isinstance(command, StateSnapshotRequest):
             # Typed value-free /state read (TCK-WEB-003), answered ON the engine
             # thread — no model, no output event, no chat line; the transport
             # blocks on this reply (or falls back to transport-only on timeout).
             # TCK-WEB-005: the scan gate's closed state name + the durable
             # first-scan boolean ride the same snapshot (still enum/bool only).
-            command.reply.put(build_state_snapshot(flow, session, watcher, scan))
+            # TCK-LAUNCH-001: an additive ``needs_watch_key`` flag (a boolean,
+            # value-free) tells the first-run page to show its form; the
+            # shipped client ignores unknown fields, so ``state/1`` is intact.
+            snapshot = build_state_snapshot(flow, session, watcher, scan)
+            if provision is not None and provision.wiring is None:
+                snapshot["needs_watch_key"] = True
+            command.reply.put(snapshot)
             continue
         if isinstance(command, SettingsRequest):
             # Typed /settings read/single-key write (TCK-WEB-005), answered ON
@@ -3679,6 +3977,16 @@ def _pump(
             command.reply.put(
                 handle_settings_request(store, command.key, command.value)
             )
+            continue
+        if provision is not None and provision.wiring is None:
+            # TCK-LAUNCH-001 first-run: NO wallet exists yet, so the
+            # placeholder loop/table MUST never run a turn — every ordinary
+            # user line is refused with the value-free watch-key notice
+            # (there is nothing to ask about until the key lands). The
+            # transport's typed requests are handled above, untouched.
+            output_fn(WATCHKEY_REQUIRED_NOTICE)
+            if emitter is not None:
+                emitter.emit(EVENT_TURN_END)
             continue
         line = command.strip()
         if not line:
@@ -3713,9 +4021,18 @@ def _pump(
         scan.drain_until_complete(output_fn, emitter)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Console entry point; delegates to :func:`run`."""
-    return run(argv)
+def main(argv: Sequence[str] | None = None, **run_kwargs: Any) -> int:
+    """Console entry point (TCK-LAUNCH-001: the WEB-first launch).
+
+    The bare command (``python -m localwallet.ui.cli``) serves the
+    localhost web UI and best-effort opens the browser; ``--cli`` /
+    ``LOCALWALLET_UI=cli`` keeps the terminal REPL. Delegates to
+    :func:`run` — the programmatic default there is unchanged (CLI) so
+    existing harnesses/tests are untouched by the flip. ``run_kwargs``
+    forwards the test seams (``output_fn``/``on_web_server``/…) that
+    parking on the server would otherwise make unreachable from a test.
+    """
+    return run(argv, default_web=True, open_browser=True, **run_kwargs)
 
 
 def run(
@@ -3729,10 +4046,17 @@ def run(
     on_web_server: Callable[[WebServer], None] | None = None,
     interactive: bool | None = None,
     backend_check_fn: Callable[[str], bool] | None = None,
+    default_web: bool = False,
+    open_browser: bool = False,
 ) -> int:
-    """Wire the application from ``argv``/environment and run the REPL.
+    """Wire the application from ``argv``/environment and run the REPL
+    (programmatic default) or the web UI (the entry-point default,
+    TCK-LAUNCH-001 — see ``default_web``).
 
-    Configuration precedence: ``--zpub`` overrides ``LOCALWALLET_ZPUB``;
+    Configuration precedence: ``--zpub`` overrides ``LOCALWALLET_ZPUB``,
+    which overrides the STORED watch key (the wallets-table descriptor
+    from an earlier launch — TCK-LAUNCH-001); a web launch with no key on
+    any rung serves the first-run watch-key form instead of refusing;
     ``LOCALWALLET_GAP_LIMIT`` (validated fail-closed at startup, exit 2 on a
     malformed value) overrides the DB ``gap_limit`` setting for every scan,
     which in turn falls back to the default 20 (ADR-0009); ``--signer``
@@ -3797,9 +4121,12 @@ def run(
 
     Returns:
         Process exit code: ``0`` on normal exit (including ``exit``,
-        Ctrl-D, Ctrl-C), ``2`` on configuration errors (missing key,
-        refused key, store failure, no model). Configuration errors
-        never echo the key.
+        Ctrl-D, Ctrl-C), ``2`` on configuration errors (refused key,
+        store failure, malformed config, busy/unusable fixed port). No
+        configured model is NO LONGER an error — it falls back to the
+        stub with a visible banner (TCK-LAUNCH-001). A missing key is
+        exit 2 only for a headless CLI launch; web launches serve the
+        first-run form instead. Configuration errors never echo the key.
     """
     args = _parse_args(argv)
 
@@ -3808,9 +4135,20 @@ def run(
     # stdin counts as headless — the ADR-0023 rule that scripted launches
     # are NEVER blocked by a conversation). The web transport never gets the
     # onboarding conversation (requirement 5: terminal-only).
-    web_mode = bool(
-        args.web or os.environ.get(UI_ENV_VAR, "").strip().lower() == "web"
-    )
+    #
+    # TCK-LAUNCH-001 (ADR-0024 §11 amendment): the ENTRY point (main)
+    # launches the WEB UI by default. Flag wins over env over the default:
+    # ``--cli`` forces the REPL, ``--web`` forces the browser front,
+    # ``LOCALWALLET_UI=cli`` opts out of the web default, and only the
+    # EXACT value "cli" does. Direct programmatic ``run`` callers keep the
+    # pre-flip CLI default unless they pass ``default_web=True``.
+    env_ui = os.environ.get(UI_ENV_VAR, "").strip().lower()
+    if args.cli:
+        web_mode = False
+    elif args.web:
+        web_mode = True
+    else:
+        web_mode = env_ui == "web" or (default_web and env_ui != "cli")
     if interactive is None:
         try:
             is_interactive = sys.stdin.isatty()
@@ -3819,31 +4157,55 @@ def run(
     else:
         is_interactive = bool(interactive)
 
+    # TCK-CFG-002: load settings from env + the config file. A malformed
+    # config file (bad JSON / wrong type / unknown key) raises ValueError
+    # here — refuse startup with a value-free line (exit 2) BEFORE any store
+    # side effects, mirroring the gap_limit/zpub config-error paths below.
+    # (Moved ahead of the key resolution by TCK-LAUNCH-001: the STORED
+    # watch-key rung needs ``settings.store_path``.)
+    try:
+        settings = Settings.from_env()
+    except ValueError as exc:
+        output_fn(f"Configuration error: {exc}")
+        return 2
+
+    # Watch key precedence (TCK-LAUNCH-001, documented deviation from the
+    # ticket's "stored > env > flag" sketch — the flag/env rungs must keep
+    # overriding for backward compatibility): ``--zpub`` >
+    # ``LOCALWALLET_ZPUB`` > the STORED wallet row (the wallets-table
+    # descriptor carries the accepted key from whichever rung supplied it
+    # the first time any launch persisted a wallet — "if they have given
+    # us a zpub we use that one"). No key anywhere: a WEB launch continues
+    # UNPROVISIONED (the page's first-run form supplies it through the
+    # same parse+gate path); headless CLI keeps the exit-2 refusal; an
+    # interactive CLI first launch is GREETED and asked (ADR-0023 step 1,
+    # :func:`ask_watch_key` — validates through the same gated parser;
+    # None = the user exited).
     zpub = (args.zpub or os.environ.get(ZPUB_ENV_VAR, "")).strip()
-    if not zpub:
-        if web_mode or not is_interactive:
+    descriptor: WalletDescriptor | None = (
+        None if zpub else _stored_watch_descriptor(settings.store_path)
+    )
+    if not zpub and descriptor is None:
+        if web_mode:
+            pass  # first-run web flow: provisioning owns the key from here
+        elif not is_interactive:
             output_fn(f"No watch key configured: pass --zpub or set {ZPUB_ENV_VAR}.")
             return 2
-        # ADR-0023 step 1: an interactive first launch is GREETED and asked
-        # for the key instead of refused (headless keeps the exit-2 line
-        # above — a conversation never gates a scripted launch). The ask
-        # validates through the same gated parser as the startup path, so
-        # seed-shaped lines are refused with guidance and private/testnet
-        # keys fail value-free; None = the user exited.
-        asked = ask_watch_key(input_fn, output_fn)
-        if asked is None:
-            return 0
-        zpub = asked
-
-    try:
-        # Gated parse (mainnet-only gate enforced at parse time — flip per
-        # ADR-0021) plus the canonical wallet descriptor. Both raise
-        # value-free WatchKeyErrors.
-        parsed = parse_wallet_key(zpub)
-        descriptor = WalletDescriptor.from_key(zpub)
-    except WatchKeyError as exc:
-        output_fn(f"Watch key rejected: {exc}")
-        return 2
+        else:
+            asked = ask_watch_key(input_fn, output_fn)
+            if asked is None:
+                return 0
+            zpub = asked
+    if zpub:
+        try:
+            # Gated parse (mainnet-only gate enforced at parse time — flip
+            # per ADR-0021) plus the canonical wallet descriptor; the
+            # stored rung already came back through the same gate in
+            # _stored_watch_descriptor. Value-free WatchKeyErrors.
+            descriptor = WalletDescriptor.from_key(zpub)
+        except WatchKeyError as exc:
+            output_fn(f"Watch key rejected: {exc}")
+            return 2
 
     # Signer selection (TCK-P3-005): --signer overrides LOCALWALLET_SIGNER;
     # default "file". The HwiUsbSigner object itself is constructed lazily
@@ -3866,7 +4228,15 @@ def run(
         dir_path=Path(
             os.environ.get(SIGNER_DIR_ENV_VAR, "").strip() or DEFAULT_SIGNER_DIR
         ),
-        fingerprint_hex=parsed.hd_key.my_fingerprint.hex(),
+        # The account-key fingerprint from the parsed wallet key; the
+        # first-run WEB flow has no key yet, and WatchKeyProvision
+        # re-builds this with the real fingerprint at provisioning time —
+        # the placeholder never reaches a signer or the store.
+        fingerprint_hex=(
+            descriptor.parsed.hd_key.my_fingerprint.hex()
+            if descriptor is not None
+            else ""
+        ),
     )
 
     # Pre-flight (SR minor): if the remote debug bridge is opted into but no
@@ -3898,18 +4268,15 @@ def run(
     elif args.stub_llm:
         generate = stub_generate
     else:
-        output_fn(f"No model configured: set {MODEL_PATH_ENV_VAR} or pass --stub-llm.")
-        return 2
-
-    # TCK-CFG-002: load settings from env + the config file. A malformed
-    # config file (bad JSON / wrong type / unknown key) raises ValueError
-    # here — refuse startup with a value-free line (exit 2) BEFORE any store
-    # side effects, mirroring the gap_limit/zpub config-error paths below.
-    try:
-        settings = Settings.from_env()
-    except ValueError as exc:
-        output_fn(f"Configuration error: {exc}")
-        return 2
+        # TCK-LAUNCH-001 "always stub-llm": the tool ALWAYS launches
+        # without model-setup friction. No model configured is no longer a
+        # startup refusal — it falls back to the deterministic dev stub with
+        # a VISIBLE banner line naming the demo mode and the env var that
+        # turns on the real model. (The stub is the SAME ``--stub-llm``
+        # path; ``--stub-llm`` itself prints no banner — it is a deliberate
+        # choice, not a fallback.)
+        generate = stub_generate
+        output_fn(NO_MODEL_DEMO_BANNER)
 
     # TCK-CFG-001 preflight: resolve + validate LOCALWALLET_GAP_LIMIT
     # (fail-closed, value-free — the same spirit as the zpub config-error
@@ -3922,14 +4289,16 @@ def run(
         output_fn(f"Configuration error: {exc}")
         return 2
 
-    # TCK-WEB-002 (ADR-0024 §1/§11): the web UI is opt-in and shares every
-    # config decision above; the split is only at the input/output seam —
-    # _run_web runs the SAME wiring inside start_engine's engine-thread
-    # bootstrap (closing TCK-WEB-001's deferred deviation) and serves the
-    # loopback HTTP/SSE front instead of the REPL.
+    # TCK-WEB-002 (ADR-0024 §1/§11, default since TCK-LAUNCH-001): the web
+    # UI shares every config decision above; the split is only at the
+    # input/output seam — _run_web runs the SAME wiring inside
+    # start_engine's engine-thread bootstrap (closing TCK-WEB-001's
+    # deferred deviation) and serves the loopback HTTP/SSE front instead
+    # of the REPL. ``descriptor is None`` = first-run launch (no key on
+    # any rung): the server starts unprovisioned and the page's
+    # watch-key form completes the wiring through the pump.
     if web_mode:
         return _run_web(
-            parsed=parsed,
             descriptor=descriptor,
             signer_selection=signer_selection,
             settings=settings,
@@ -3940,11 +4309,13 @@ def run(
             node_detect_fn=node_detect_fn,
             output_fn=output_fn,
             on_web_server=on_web_server,
+            open_browser=open_browser,
         )
 
+    assert descriptor is not None  # CLI reaches here only with a key
     try:
         wiring = _wire(
-            parsed=parsed,
+            parsed=descriptor.parsed,
             descriptor=descriptor,
             signer_selection=signer_selection,
             settings=settings,
@@ -4198,7 +4569,12 @@ def _wire(
     # worker concurrently, the prompt is live while the dots still flow
     # between turns, and the completion narration lands when the engine
     # persists the result (the scan can take minutes; the REPL may not).
-    output_fn("Type a message — 'exit' or Ctrl-D quits.")
+    # TCK-LAUNCH-001 (ADR-0024 amendment): the hint names REPL affordances
+    # (typing 'exit', Ctrl-D) that DO NOT EXIST in the browser — the web
+    # launch banner stays minimal (privacy notice + watch line + URL); the
+    # page's own chrome is the user's prompt.
+    if not web_mode:
+        output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
     # TCK-ONB-003 (ADR-0023) + TCK-ONB-005 + TCK-ONB-006: the backend
     # conversation — CLI transport ONLY, built for EVERY interactive CLI
@@ -4302,8 +4678,7 @@ def _wire(
 
 def _run_web(
     *,
-    parsed: ParsedKey,
-    descriptor: WalletDescriptor,
+    descriptor: WalletDescriptor | None,
     signer_selection: SignerSelection,
     settings: Settings,
     env_gap: int | None,
@@ -4313,8 +4688,10 @@ def _run_web(
     node_detect_fn: Callable[[], LocalNodeReport] | None,
     output_fn: Callable[[str], None],
     on_web_server: Callable[[WebServer], None] | None = None,
+    open_browser: bool = False,
 ) -> int:
-    """The web launch (TCK-WEB-002, ADR-0024 §1/§3/§11).
+    """The web launch (TCK-WEB-002, ADR-0024 §1/§3/§11; default UI and
+    browser auto-open per the TCK-LAUNCH-001 amendment).
 
     The full startup wiring flows through :func:`start_engine` (closing
     TCK-WEB-001's deferred deviation): ``bootstrap`` runs ``_wire`` ON the
@@ -4322,20 +4699,71 @@ def _run_web(
     there — and the server owns the one engine instance behind the loopback
     HTTP/SSE front. Prints the launch URL and the per-launch token on
     SEPARATE lines (the token is copyable but NEVER embedded in a URL —
-    ADR-0024 §6); then parks until Ctrl-C. Exit codes mirror the CLI:
-    ``0`` normal, ``2`` wiring/config failure (surfaced from the bootstrap).
+    ADR-0024 §6); then best-effort opens the browser at the canonical URL
+    (``open_browser``: the entry-point launch; the printed lines stand on
+    their own when no browser exists) and parks until Ctrl-C.
+
+    ``descriptor is None`` is the TCK-LAUNCH-001 FIRST-RUN launch (no key
+    on flag/env/stored): the engine starts UNPROVISIONED (placeholder loop/
+    table the pump never lets a user line reach), the page shows the
+    watch-key form, and a successful ``POST /watchkey`` runs the existing
+    parse+gate path + :func:`_wire` ON the engine thread
+    (:class:`WatchKeyProvision`), after which the pump rebinds and the
+    normal post-xpub sequence (banner to this same terminal ``output_fn``,
+    ONB-006 ``awaiting_backend`` deferral, startup scan) is exactly the
+    keyed launch's.
+
+    Exit codes mirror the CLI: ``0`` normal, ``2`` wiring/config failure
+    (surfaced from the bootstrap; a busy fixed port names the fix).
     """
     # Late import: ui.web.server imports this module (no cycle at runtime).
     from localwallet.ui.web.server import serve_web
 
+    port = settings.web_port
+    if not WEB_PORT_MIN <= port <= WEB_PORT_MAX:
+        # Fail closed BEFORE binding (same spirit as the gap-limit
+        # preflight): value-free, names the knob, never echoes the number.
+        output_fn(
+            f"Configuration error: {WEB_PORT_ENV_VAR} must be a port "
+            f"between {WEB_PORT_MIN} and {WEB_PORT_MAX} ({WEB_PORT_MIN} "
+            "= an automatic free port)."
+        )
+        return 2
+
     booted = threading.Event()
     startup: dict[str, BaseException | None] = {"exc": None}
     wired: dict[str, _Wiring] = {}
+    # The first-run holder (the provisioned wiring never lands in `wired`;
+    # teardown reads it from here).
+    held: dict[str, WatchKeyProvision] = {}
 
     def bootstrap() -> EngineContext:
+        if descriptor is None:
+            # First-run web launch (see the docstring): placeholder
+            # engine — nothing here can touch a wallet that does not
+            # exist yet (the pump gates every user line).
+            provision = WatchKeyProvision(
+                settings=settings,
+                signer_selection=signer_selection,
+                env_gap=env_gap,
+                rescan=rescan,
+                flow=flow,
+                generate=generate,
+                node_detect_fn=node_detect_fn,
+                output_fn=output_fn,
+            )
+            held["provision"] = provision
+            booted.set()
+            return EngineContext(
+                loop=AgentLoop(stub_generate, {}),
+                flow=flow if flow is not None else TxFlow(),
+                session=SendSession(),
+                table={},
+                provision=provision,
+            )
         try:
             wiring = _wire(
-                parsed=parsed,
+                parsed=descriptor.parsed,
                 descriptor=descriptor,
                 signer_selection=signer_selection,
                 settings=settings,
@@ -4365,15 +4793,23 @@ def _run_web(
         )
 
     try:
-        server = serve_web(bootstrap)
+        server = serve_web(bootstrap, port=port)
     except OSError:
         # A bind failure (address/port unavailable) is the only startup
         # failure serve_web can raise. Exit 2 with the clean, VALUE-FREE
         # message — never echo the socket error (it carries the address),
-        # exactly how every other config-fatal path reports. The engine
-        # thread bootstrap may have spawned is a daemon: it dies with this
+        # exactly how every other config-fatal path reports. With a FIXED
+        # port the fix is nameable (TCK-LAUNCH-001). The engine thread
+        # bootstrap may have spawned is a daemon: it dies with this
         # exiting process, so there is nothing to tear down here.
-        output_fn("Could not start the web server.")
+        if port:
+            output_fn(
+                "Could not start the web server — that port is already "
+                f"in use. Set {WEB_PORT_ENV_VAR} to a free port (or "
+                "leave it unset for an automatic one) and start again."
+            )
+        else:
+            output_fn("Could not start the web server.")
         return 2
     try:
         # The engine bootstraps (banner + watch line + prompt state) before
@@ -4381,6 +4817,8 @@ def _run_web(
         # chain worker inside the pump (TCK-SCAN-003, ADR-0022) — turns
         # queued meanwhile are served in order, and the web UI's
         # freshness/progress surfacing of the same flow is TCK-WEB-005.
+        # On a first-run launch the bootstrap is a placeholder: it settles
+        # immediately and the real wiring happens at provisioning.
         booted.wait()
         exc = startup["exc"]
         if exc is not None:
@@ -4392,6 +4830,17 @@ def _run_web(
             return 2
         output_fn(f"Web UI: {server.url}")
         output_fn(f"Token: {server.token}")
+        if open_browser:
+            # TCK-LAUNCH-001: best-effort auto-open at the canonical
+            # (token-free) URL. Headless/SSH/browser-less launches are the
+            # NORMAL case: ONE calm manual-open line replaces the browser,
+            # never a traceback, never a fatal (the token island reaches the
+            # page from the URL alone).
+            output_fn("Opening your browser…")
+            if not _open_browser(server.url):
+                output_fn(
+                    f"Could not open a browser — open {server.url} manually."
+                )
         if on_web_server is not None:
             on_web_server(server)
         server.wait()
@@ -4405,6 +4854,9 @@ def _run_web(
         # the freshly printed URL instead of staring at a stale "Reconnecting".
         output_fn("Web UI stopped — the URL printed above is no longer reachable.")
         wiring = wired.get("wiring")
+        if wiring is None:
+            provision = held.get("provision")
+            wiring = provision.wiring if provision is not None else None
         if wiring is not None:
             # server.stop() pushed QUIT and joined the engine thread (whose
             # pump drained the startup scan to completion before returning);
@@ -4551,12 +5003,21 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "LOCALWALLET_SIGNER"
         ),
     )
-    parser.add_argument(
+    ui_group = parser.add_mutually_exclusive_group()
+    ui_group.add_argument(
         "--web",
         action="store_true",
         help=(
-            "serve the opt-in localhost web UI (ADR-0024) instead of the "
-            "REPL; overrides LOCALWALLET_UI=web"
+            "serve the localhost web UI (ADR-0024) — the launch default "
+            "since TCK-LAUNCH-001; overrides LOCALWALLET_UI=cli"
+        ),
+    )
+    ui_group.add_argument(
+        "--cli",
+        action="store_true",
+        help=(
+            "run the terminal REPL instead of the default web UI; "
+            "overrides LOCALWALLET_UI (equivalently: LOCALWALLET_UI=cli)"
         ),
     )
     return parser.parse_args(list(argv) if argv is not None else None)

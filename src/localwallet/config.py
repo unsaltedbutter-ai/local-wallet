@@ -223,6 +223,15 @@ class Settings:
     utxo_target_min_sats: str = ""
     utxo_target_max_sats: str = ""
     consolidate_below_sat_vb: str = ""
+    # --- Web UI launch (TCK-LAUNCH-001; ADR-0024 §6 amendment) ---
+    # Fixed loopback port for the web UI. Ladder is env > config file >
+    # shipped default ONLY (no stored rung — like tls_verify, the bind
+    # surface is an operator/host decision). Default ``0`` = the shipped
+    # ephemeral OS-assigned port. A predictable port makes the per-launch
+    # token MORE valuable, not less (ADR-0024 §6: the token is the sole
+    # credential; nothing about it weakens with a known port). The value
+    # never enters logs/errors (the app's port-failure line is value-free).
+    web_port: int = 0
 
     @classmethod
     def from_env(
@@ -242,7 +251,8 @@ class Settings:
         ``LOCALWALLET_WATCH_INTERVAL_S``, ``LOCALWALLET_GAP_LIMIT``,
         ``LOCALWALLET_UTXO_TARGET_MIN_SATS``,
         ``LOCALWALLET_UTXO_TARGET_MAX_SATS``,
-        ``LOCALWALLET_CONSOLIDATE_BELOW_SAT_VB``.
+        ``LOCALWALLET_CONSOLIDATE_BELOW_SAT_VB``,
+        ``LOCALWALLET_WEB_PORT``.
         Unknown variables are ignored.
 
         Boolean fields accept ``0``/``1`` or ``true``/``false``/``yes``/``no``
