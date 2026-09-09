@@ -27,6 +27,12 @@ class ChainConfig:
         timeout_s: Per-request timeout in seconds (applied to connect/read).
         max_retries: Number of retries after the initial attempt (0 disables
             retries entirely).
+        tls_verify: Verify the backend's TLS certificate (TCK-BACKEND-001;
+            ADR-0018 amendment). ``True`` (default, fail-closed); ``False``
+            builds the httpx client with verification OFF for self-hosted
+            https backends with a private-CA / self-signed cert — the app
+            then prints one honest warning line at startup (transport auth
+            is off: a network-path observer can see or alter requests).
 
     Raises:
         ValueError: If any value is out of range or malformed (fail closed at
@@ -37,6 +43,11 @@ class ChainConfig:
     base_url: str
     timeout_s: float
     max_retries: int
+    # Fail-closed default: a caller that never threads the setting (test
+    # fixtures, direct construction) keeps verification ON. Only an explicit
+    # ``False`` disables it, and that path is reserved for the app's startup
+    # warning (see :attr:`Settings.tls_verify`).
+    tls_verify: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_url, str) or not (
@@ -60,6 +71,16 @@ class ChainConfig:
             or self.max_retries < 0
         ):
             raise ValueError("max_retries must be a non-negative integer")
+        # Strict type-check (TCK-BACKEND-001): the ladder value must be a real
+        # bool by the time it reaches construction. ``from_env`` already
+        # coerces/refuses the env+file rungs, so a non-bool here is a
+        # programmer error — fail closed, never silently truthy-test a string.
+        if not isinstance(self.tls_verify, bool):
+            # ValueError (not TypeError), matching every other guard in this
+            # file and the root config._load_config_file (see its TRY004):
+            # a mis-typed config knob is treated as a config error, not a
+            # programmer type error, so the whole ladder surfaces one class.
+            raise ValueError("tls_verify must be a boolean")  # noqa: TRY004
 
     @classmethod
     def from_settings(cls, settings: Settings) -> ChainConfig:
@@ -93,4 +114,5 @@ class ChainConfig:
             base_url=base_url,
             timeout_s=settings.request_timeout_s,
             max_retries=settings.max_retries,
+            tls_verify=settings.tls_verify,
         )

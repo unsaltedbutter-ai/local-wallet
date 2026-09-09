@@ -343,6 +343,14 @@ class EsploraClient:
     Error strings never include full addresses or txids (log-scrubbing
     invariant). No API keys are used or sent.
 
+    TLS trust: certificate verification of https backends rides the same
+    ``Settings`` resolution as ``base_url`` — ``Settings.tls_verify``
+    (``LOCALWALLET_TLS_VERIFY`` / config-file key; env > file > fail-closed
+    ``True``; ADR-0018 amendment, TCK-BACKEND-001). ``False`` builds the
+    httpx client with verification OFF for a self-hosted backend with a
+    private-CA / self-signed cert; the app prints one honest startup warning
+    when that setting is active.
+
     Args:
         base_url: Esplora API root; when ``None`` it resolves through the
             single selection point ``ChainConfig.from_settings`` —
@@ -367,6 +375,12 @@ class EsploraClient:
             base_url=defaults.base_url if base_url is None else base_url,
             timeout_s=defaults.timeout_s if timeout_s is None else timeout_s,
             max_retries=defaults.max_retries if max_retries is None else max_retries,
+            # TLS trust rides the SAME resolution as base_url (ADR-0018
+            # amendment, TCK-BACKEND-001): no explicit argument — env >
+            # config-file > fail-closed default, so a self-hosted config
+            # gets URL and trust knob from one place. check_backend's probe
+            # inherits the same value through this construction path.
+            tls_verify=defaults.tls_verify,
         )
         # Trailing slash is normalized so the path joining below is exact.
         self._base_url = self._config.base_url.rstrip("/")
@@ -374,6 +388,12 @@ class EsploraClient:
             timeout=self._config.timeout_s,
             headers={"User-Agent": _USER_AGENT},
             transport=transport,
+            # httpx uses this for TLS verification of https backends; a
+            # self-hosted instance with a private/self-signed cert is reached
+            # ONLY when the user explicitly set this False (fail-closed
+            # default True). Ignored when a ``transport`` is injected (test
+            # seam carries its own SSL policy).
+            verify=self._config.tls_verify,
         )
 
     def close(self) -> None:
@@ -703,6 +723,11 @@ def check_backend(
     snappy; the caller may raise it.
 
     ``transport`` is the standard test seam; production passes ``None``.
+    TLS trust is NOT a parameter here: the probe shares the client's ladder
+    (env > config file > fail-closed default), so a self-hosted backend with
+    a self-signed cert is only reachable through an explicit
+    ``LOCALWALLET_TLS_VERIFY=0`` that also drives the real client — the check
+    and the wallet can never disagree on transport policy.
     """
     try:
         client = EsploraClient(

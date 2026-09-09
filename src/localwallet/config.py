@@ -156,6 +156,21 @@ class Settings:
     # client's path shapes are identical regardless of host. Validation is
     # fail-closed at client construction (ChainConfig), never mid-request.
     chain_base_url: str = ""
+    # TLS trust for the chain backend's https transport (TCK-BACKEND-001;
+    # ADR-0018 amendment). ``True`` (fail-closed shipped default) verifies the
+    # backend's certificate. ``False`` builds the httpx client with
+    # verification OFF — the deliberate escape hatch for self-hosted https
+    # backends serving a private-CA or self-signed cert (Start9 etc.), whose
+    # connections httpx otherwise refuses as ``ConnectError``. Ladder is
+    # env > config file > default ONLY — no stored rung (unlike
+    # ``chain_base_url``): downgrading transport security is a host/operator
+    # decision, never a UI-toggled setting, and every other boolean scalar
+    # here (price_enabled, node_detection_enabled) is env/file-only too. When
+    # this resolves False the app prints one honest value-free warning line at
+    # startup (app.TLS_UNVERIFIED_WARNING). Same construction path as
+    # ``chain_base_url`` (ChainConfig.from_settings → EsploraClient), so a
+    # self-hosted config gets both knobs from one place.
+    tls_verify: bool = True
     request_timeout_s: float = 10.0
     max_retries: int = 3
     network: str = "main"
@@ -223,6 +238,7 @@ class Settings:
         ``LOCALWALLET_FEE_CACHE_TTL_S``, ``LOCALWALLET_RPC_COOKIE_PATH``,
         ``LOCALWALLET_RPC_PORT``, ``LOCALWALLET_LOCAL_MEMPOOL_URL``,
         ``LOCALWALLET_NODE_DETECTION_ENABLED``,
+        ``LOCALWALLET_TLS_VERIFY``,
         ``LOCALWALLET_WATCH_INTERVAL_S``, ``LOCALWALLET_GAP_LIMIT``,
         ``LOCALWALLET_UTXO_TARGET_MIN_SATS``,
         ``LOCALWALLET_UTXO_TARGET_MAX_SATS``,

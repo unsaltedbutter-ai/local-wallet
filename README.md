@@ -120,6 +120,13 @@ type refuses startup with a value-free error (the offending value is never
 echoed) — even if an env var would have overridden it. Fix the file and
 restart.
 
+**Self-hosted https with a private / self-signed cert** (`tls_verify`,
+`LOCALWALLET_TLS_VERIFY`; default `true`, env > config file > default, no
+stored rung): verification off means whoever controls the network path can
+observe your queried addresses and tamper with responses, so prefer adding
+the CA to your OS trust store; if you must, set `"tls_verify": false` and
+accept the honest startup warning (ADR-0018 amendment).
+
 ## Docs
 
 - `docs/PROJECT.md` — full spec, architecture, and roadmap.

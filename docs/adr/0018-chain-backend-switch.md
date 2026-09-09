@@ -89,3 +89,37 @@ call sites must keep working.
   address/txs/utxo/tip queries to the configured instance; zero requests hit
   the public host while self-hosted; the unset/set/malformed selection matrix
   behaves as documented.
+
+## Amendment (2026-09-08, TCK-BACKEND-001): TLS trust for self-hosted https
+
+Self-hosted stacks that ship **self-signed / private-CA TLS certificates**
+(Start9's Embassy services are the motivating case, 2026-09 user report) made
+this ADR's config-only switch fail: httpx verifies certificates by default,
+and a failed handshake surfaces as `httpx.ConnectError` — the wallet's
+honest but unusable `tip-height request failed after N retries: network
+error (ConnectError)` — even though the backend is otherwise reachable. An
+https backend was therefore only switchable when it carried a
+publicly-trusted cert, which private-LAN services typically cannot get.
+
+Decision: `Settings.tls_verify` (`LOCALWALLET_TLS_VERIFY` env /
+`tls_verify` config-file key) extends this ADR's ladder philosophy to
+transport trust — **env > config file > shipped default, default
+`true` (fail-closed)**; malformed values refuse startup value-free like
+every other boolean scalar. Deliberately **no stored (DB) rung**, unlike
+`chain_base_url`: (a) downgrading transport authentication is a
+host/operator decision that should take a deliberate config edit plus a
+restart, never a UI-toggled setting; (b) the chain client resolves its own
+`Settings.from_env()` and is store-free by architectural rule (config.py
+never imports the store), so a stored rung could only desync the client's
+transport from the app's banners; (c) every other boolean scalar here is
+env/file-only too. The flag rides the SAME construction path as
+`chain_base_url` (`ChainConfig.from_settings` → one `EsploraClient` → one
+`httpx.Client(verify=...)`), so the onboarding backend probe
+(`check_backend`) and every wallet call share one transport policy.
+
+When the flag resolves `False`, the app prints one honest, unskippable,
+value-free startup warning (`TLS_UNVERIFIED_WARNING`): whoever controls the
+network path can observe the queried addresses and tamper with the
+responses. **The recommendation remains a properly-trusted certificate** —
+adding the private CA to the OS trust store keeps verification on and needs
+no app change; `verify=false` is the escape hatch, not the happy path.
