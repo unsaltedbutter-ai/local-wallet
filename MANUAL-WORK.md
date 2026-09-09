@@ -68,6 +68,7 @@ One browser, ~5 minutes. Same setup as MW-10 step 1-2 (`LOCALWALLET_ZPUB="<zpub>
 - [ ] Action buttons fire the canonical utterances (click Confirm → the transcript shows the literal word "confirm" echoed as your message).
 - [ ] Kill-the-server reload replays via Last-Event-ID (same as MW-10).
 - [ ] Connection-status transitions: stop the server → status shows reconnecting/unreachable wording; restart → recovers WITHOUT manual reload if the stream re-attaches (else reload — report which).
+- [ ] Stale tab from a previous launch shows its dead origin in the status — expected, relaunch and use the NEW printed URL.
 - [ ] XSS spot-check: in the CLI on the SAME throwaway DB it's hard to inject markup naturally — if impractical, rely on the automated `tests/test_web_render_contract.py` (run: `.venv/bin/python -m pytest tests/test_web_render_contract.py -q`).
 Feeds TCK-WEB-003/004 follow-ups; MW-10 is the thorough version. NEW 2026-09-08, also exercise: settings panel (gear/toggle — change gap_limit, see chain_base_url restart + env-override notes, out-of-range rejection), scan-status chip during startup ("wallet loading" until first scan completes), create_tx refused with the friendly line if you try to send pre-first-scan, kill-server reload replays with the "some earlier events may be missing" notice.
 

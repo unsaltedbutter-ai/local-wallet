@@ -1377,6 +1377,9 @@ def test_run_web_launch_lines_are_token_separate_and_turn_works(
     token_line = next(line for line in outputs if server.token in line)
     assert token_line != url_line  # SEPARATE lines: token never rides the URL
     assert server.token not in "".join(outputs[: outputs.index(url_line)])
+    # Teardown (server.stop() above) must announce the instance is dead so a
+    # stale tab from a prior launch is diagnosable. Value-free: no port/token.
+    assert any("no longer reachable" in line for line in outputs)
 
 
 def test_run_cli_default_unchanged_no_server(tmp_path: Path, monkeypatch) -> None:

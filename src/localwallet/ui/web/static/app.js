@@ -318,7 +318,7 @@ async function listen() {
       // transport failure: treat like a closed stream and retry
     }
     if (state.stopped) return;
-    setStatus("reconnecting", "Reconnecting…");
+    setStatus("reconnecting", `Reconnecting to ${location.origin} …`);
     await sleep(state.backoffMs + Math.floor(Math.random() * 250));
     state.backoffMs = Math.min(state.backoffMs * 2, 15000);
   }

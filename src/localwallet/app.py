@@ -4243,6 +4243,11 @@ def _run_web(
         pass  # clean exit on Ctrl-C (mirrors the CLI)
     finally:
         server.stop()
+        # The launch port and token are EPHEMERAL per launch (ADR-0024 §6):
+        # this instance is dead, so any tab left over from a previous launch
+        # can never reconnect. Say so (value-free) so the user knows to use
+        # the freshly printed URL instead of staring at a stale "Reconnecting".
+        output_fn("Web UI stopped — the URL printed above is no longer reachable.")
         wiring = wired.get("wiring")
         if wiring is not None:
             # server.stop() pushed QUIT and joined the engine thread (whose
