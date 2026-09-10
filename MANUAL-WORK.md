@@ -1,6 +1,19 @@
 # MANUAL-WORK.md — actions only you (the user) can run
 
-> Tick items off by telling the orchestrator the MW-id (e.g. "MW-2 done"). Nothing here blocks code work unless noted.
+> Tick items off by telling the orchestrator the MW-id (e.g. "MW-16 done"). Nothing here blocks code work unless noted.
+
+## WHAT THE ORCHESTRATOR IS WAITING ON (priority order — 2026-09-09 state)
+
+1. **MW-16 — backend live verification on your Start9 machine** (the newest code; highest value): bitcoind, electrum ssl, and your private mempool, incl. autodetect + credentials + no-restart switching.
+2. **MW-15 — live send/fee run** (fee floor-follower, ceiling ask, rate display, mix warning — all new since your last real send).
+3. **MW-12 → MW-13 → MW-14 — publishing chain**: GitHub push, then landing-page deploy, then installer smoke (ordered: the /install route needs the repo public first).
+4. **MW-10/MW-11 — web UI matrix** (refreshed for the new settings-first UI; do after MW-16 so you're testing the final backend flow).
+5. **MW-9 — on-chain broadcast** (whenever you're ready to move sats).
+6. MW-8 optional (.app packaging) — nothing needed unless you ask for it.
+
+Nothing else is blocking. Code-side, the only remaining ledger items are optional polish (ONB-003 re-offers, 3 documented LOW ceiling notes) and hardware-gated packaging.
+
+---
 
 ## MW-1: Grant orchestrator read-only shell commands
 - [x] **Superseded 2026-09-06** — the orchestrator's `permission.bash` was expanded far beyond the find/wc/ls allowlist (`"*": allow`); no fresh session needed for this item anymore.
@@ -39,14 +52,27 @@ Steps:
 6. Also confirm the terminal still shows real values (redaction is for the export only).
 7. `rm -rf /tmp/mw7.db*` when done.
 
+## MW-16: Backend live verification on your Start9 machine (NEW 2026-09-09 — the newest code)
+Launch is now just: `cd ~/local-wallet && .venv/bin/python -m localwallet.ui.cli` — the web UI opens in your browser automatically (add `LOCALWALLET_ZPUB="<zpub>"` or enter it in the page; no model path needed — it preloads the pinned model in the background and offers a Yes/No download if absent).
+Verify, reporting any failure verbatim:
+- [ ] **Private mempool (Esplora)**: in Settings → chain base, enter `https://evil-star.local:56191`. Start9's self-signed cert needs `LOCALWALLET_TLS_VERIFY=false` (env or `~/.localwallet/config.json`) — expect one honest warning line about unverified transport. Apply → NO restart needed: the client hot-swaps and a resync fires against your node.
+- [ ] **Electrum server**: `ssl://evil-star.local:50001` — accepted everywhere now (settings, /setup, stored). Probe = mainnet-genesis handshake.
+- [ ] **bitcoind**: `bitcoind://<host>:8332` with user/pass (or the "no credentials needed" checkbox / cookie). Core ≥ 22 required (older refuses, value-free). Note: scantxoutset scan shows unspent coins + their txs; fully-spent addresses' history is honestly absent (documented tradeoff).
+- [ ] **Autodetect**: a plain `http://<core-host>:8332` URL should classify itself as bitcoind (probe), `http://<mempool-host>` as mempool — you never specify the kind. Badges (mempool/electrum/bitcoind) light up accordingly.
+- [ ] **Credentials**: the "no credentials needed" checkbox + user/pass fields appear only for http/bitcoind URLs; GET /settings shows "configured", never the values.
+- [ ] **Resync now** button near chain base: full re-scan; coin tags/notes you set via /label SURVIVE it (pinned, but verify live).
+- [ ] **gap_limit apply** with a changed value triggers a resync; unchanged says so.
+- [ ] First query speed: the model preloads at launch ("loading" state in /state) — the FIRST question should no longer stall.
+- [ ] Model absent path: rename models/bin/*.gguf away, relaunch → "Model hasn't been downloaded. Want to download now?" card; No → clickable balance/address buttons that work without the model; Yes → inline progress bar.
+
 ## MW-8: Phase 6 packaging — RE-SCOPED 2026-09-08 (install.sh + GitHub is the distribution)
 - [ ] NOTHING needed for the current distribution path: `curl … | bash` install + source checkout requires NO Apple Developer account and NO signed builds.
 - OPTIONAL, only if you later want a double-clickable .app: Apple Developer account ($99/yr) for signed/notarized macOS builds (Gatekeeper warns on unsigned pyinstaller output) + a Windows box for the driver/packaging matrix (OQ10). Deferred until you ask for it — TCK-P6-002 stays pending on this, TCK-WEB-006 (frozen-build web UI) likewise.
 
 ## MW-10: Web-UI manual matrix — steps
 Setup (per OS/browser you're testing; use YOUR real zpub via env — it never lands in a committed file):
-1. `cd ~/local-wallet && LOCALWALLET_ZPUB="<zpub>" .venv/bin/python -m localwallet.ui.cli --web`
-2. The launch line prints a canonical URL + per-launch token — open exactly that URL (copy-paste; the token is in the page, not the URL).
+1. `cd ~/local-wallet && LOCALWALLET_ZPUB="<zpub>" .venv/bin/python -m localwallet.ui.cli` (web is the default; the browser opens itself; `--cli` for the terminal). Or enter the zpub in the page on first run.
+2. The launch prints a canonical URL + per-launch token — the browser opens itself; the token rides in the page, never the URL.
 Checklist — repeat per OS/browser row you care about (macOS Safari/Chrome, Windows Edge/Chrome, Linux Firefox):
 - [ ] Both `http://localhost:<port>/` and `http://127.0.0.1:<port>/` load (token island works, no 401). A DIFFERENT hostname (your LAN IP, a custom DNS name) must be REFUSED with `host not allowed` — that's the DNS-rebinding defense, not a bug.
 - [ ] With VPN/proxy/firewall ON: page still loads (it's loopback — proxies must not intercept localhost; if a proxy env var breaks it, that's a finding to report).
@@ -54,7 +80,7 @@ Checklist — repeat per OS/browser row you care about (macOS Safari/Chrome, Win
 - [ ] Buttons: create a send → Confirm / Cancel / Faster fee / Slower fee appear; Confirm sends the literal utterance (tooltip shows it); after confirm → Sign appears (GATE-MERGE chained turn); Retry after a signer error if you get one.
 - [ ] Multi-tab: open 2 tabs, act in one, both see all turns (shared session, event-sourced).
 - [ ] Kill-and-reconnect: Ctrl-C the server mid-session, restart with the SAME command, reload the tab → Last-Event-ID replay; force the too-far-behind path by letting many events accumulate while the tab is closed → you should see "Reconnected — some earlier messages may be missing."
-- [ ] Settings panel: change gap_limit (persists), out-of-range value rejected inline, chain_base_url shows "takes effect after restart" + the public-default/IP-disclosure hint.
+- [ ] Settings pane (now the first-run surface): zpub/chain-base/gap-limit in order; chain base Edit→Apply HOT-SWAPS (no restart) + fires a resync; badges mempool/electrum/bitcoind light per detected kind; Resync now works; out-of-range values rejected inline; empty apply names the public-leak tradeoff.
 - [ ] Scan chip visible while loading; create a send BEFORE the first scan finishes → friendly refusal line.
 - [ ] XSS spot-check: a narration containing `<img onerror>` (hard to produce naturally — skip if impractical; the automated render-contract tests cover it).
 - [ ] CLI parity: same actions in the plain CLI behave the same (confirm gate, card, wording).
@@ -70,7 +96,7 @@ One browser, ~5 minutes. Same setup as MW-10 step 1-2 (`LOCALWALLET_ZPUB="<zpub>
 - [ ] Connection-status transitions: stop the server → status shows reconnecting/unreachable wording; restart → recovers WITHOUT manual reload if the stream re-attaches (else reload — report which).
 - [ ] Stale tab from a previous launch shows its dead origin in the status — expected, relaunch and use the NEW printed URL.
 - [ ] XSS spot-check: in the CLI on the SAME throwaway DB it's hard to inject markup naturally — if impractical, rely on the automated `tests/test_web_render_contract.py` (run: `.venv/bin/python -m pytest tests/test_web_render_contract.py -q`).
-Feeds TCK-WEB-003/004 follow-ups; MW-10 is the thorough version. NEW 2026-09-08, also exercise: settings panel (gear/toggle — change gap_limit, see chain_base_url restart + env-override notes, out-of-range rejection), scan-status chip during startup ("wallet loading" until first scan completes), create_tx refused with the friendly line if you try to send pre-first-scan, kill-server reload replays with the "some earlier events may be missing" notice.
+Feeds TCK-WEB-003/004 follow-ups; MW-10 is the thorough version. NEW 2026-09-09, also exercise: settings pane merge (no separate Connect card), collapsed watch_key display when set, Resync now, header Balance quick-bar, model download Yes/No card + inline progress, scan chip incl. the awaiting-backend state (first run: NO scan fires until you pick a backend or accept the public tradeoff), kill-server reload replays with the "some earlier messages may be missing." notice.
 
 ## MW-12: Publish to GitHub (TCK-DIST-003 prepared everything)
 - [ ] Follow docs/publish.md exactly: sanity-check the flagged strings first — decide whether `notible.local` (your LAN hostname, in HANDOFF/TASKS/ADR-0007/remote_runtime) and `192.168.1.50` (tests only) stay or get scrubbed BEFORE the public push; fill the SECURITY.md email placeholder; then push to github.com/unsaltedbutter-ai/local-wallet and flip repo settings (default branch, Actions on, branch protection).
@@ -84,6 +110,6 @@ Feeds TCK-WEB-003/004 follow-ups; MW-10 is the thorough version. NEW 2026-09-08,
 ## MW-14: install.sh smoke on a clean machine (optional, after MW-12)
 - [ ] On any spare mac/Linux: `curl -fsSL https://unsaltedbutter.ai/install | bash` (or run ./install.sh from a fresh clone) with INSTALL_ROOT=<tmp>; confirm OS/arch detection, uv + Python 3.12 (<3.14) install, venv boot, model-download prompt defaults to NO, next-steps output. Report failures verbatim.
 
-## MW-15: Live run — new fee + UX behavior (the 2026-09-08 changes)
+## MW-15: Live run — new fee + UX behavior (refreshed 2026-09-09)
 - [ ] Start a send and check the new fee line: FAST should now bid near the mempool floor (your 0.3–0.5 sat/vB morning → expect 1 sat/vB, not 2) and the Pay line shows `@ $/BTC` instead of `rate age`. Say "faster" twice — the second time it should ASK for a sat/vB rate; answer with a number (e.g. "3") and the rebuild should go through the normal confirm flow. Also try an explicit rate from the start ("send 100000 sats to <addr> at 5 sat/vB"). Startup should NOT block: the prompt appears immediately with dots finishing in the background.
 - Report anything that looks wrong — fee estimator, ceiling ask, rate display, and scan behavior are all new today.
