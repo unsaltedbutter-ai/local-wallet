@@ -34,7 +34,10 @@ That one command:
    (or `$XDG_DATA_HOME/local-wallet` if you set `XDG_DATA_HOME`).
 5. Creates a `.venv` and installs the package editable with its `dev` extras
    (`uv venv` + `uv pip install -e '.[dev]'`).
-6. Optionally downloads the pinned GGUF model (prompted, default **No**).
+6. Optionally downloads the pinned GGUF model (prompted, default **No**). If the
+   model is already present and passes checksum verification it is skipped
+   entirely; a corrupt copy is re-downloaded (prompted, default **Yes**); a
+   partial `.part` download is resumed.
 7. Prints next steps.
 
 It is **idempotent**: re-running it updates the existing clone (`git pull`,
@@ -133,7 +136,8 @@ directory. If you installed `uv` only for this project, remove it separately
   `~/.local/bin/uv`. Add `~/.local/bin` to your `PATH` or log out/in.
 - **Model download interrupted** — `download_model.py` is resumable (Range
   requests) and always verifies the SHA-256 before installing, so a partial
-  file is never trusted.
+  file is never trusted. Re-running the installer resumes an interrupted
+  `.part` download instead of starting over.
 
 The installer never prints secrets — there are none involved (watch-only, and
 the model download is a public, hash-pinned file).

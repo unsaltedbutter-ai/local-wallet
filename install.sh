@@ -113,21 +113,82 @@ install_pkg() {
   ( cd "$REPO" && "$UV" pip install --python "$REPO/.venv/bin/python" -e '.[dev]' )
 }
 
+# Resolves the default model name from the manifest (the "default": true entry,
+# falling back to the first entry). Emits just the name; exits non-zero if the
+# manifest is missing or unreadable.
+default_model() {
+  "$REPO/.venv/bin/python" -c '
+import json, sys
+entries = json.load(open(sys.argv[1]))
+d = next((e for e in entries if e.get("default")), entries[0])
+print(d["name"])
+' "$REPO/models/manifest.json"
+}
+
+# Emits the on-disk state of the given model relative to $REPO/models/bin:
+#   absent   — neither the final .gguf nor a .part exists
+#   partial  — only a .part exists (download_model.py resumes it)
+#   present  — final .gguf exists and passes checksum verification
+#   corrupt  — final .gguf exists but fails checksum verification
+model_state() {
+  local name="$1"
+  local target="$REPO/models/bin/$name.gguf"
+  if [ -f "$target" ]; then
+    if ( cd "$REPO" && "$REPO/.venv/bin/python" models/download_model.py \
+          --check --model "$name" >/dev/null 2>&1 ); then
+      printf 'present'
+    else
+      printf 'corrupt'
+    fi
+  elif [ -f "$target.part" ]; then
+    printf 'partial'
+  else
+    printf 'absent'
+  fi
+}
+
+download_model() {
+  info "downloading and verifying the model (hash-pinned, ~3.1 GB)"
+  ( cd "$REPO" && "$REPO/.venv/bin/python" models/download_model.py \
+      --model "$MODEL" --write-hash )
+}
+
 maybe_model() {
   # Prompt only when stdin is an interactive terminal — never read from the
-  # piped script stream (curl | bash). Default is No.
+  # piped script stream (curl | bash). Fresh/partial default is No.
   if [ ! -t 0 ]; then
     info "non-interactive shell; skipping model download"
     return
   fi
+  MODEL="$(default_model)" \
+    || die "could not resolve default model from $REPO/models/manifest.json"
+  local ans state
+  state="$(model_state "$MODEL")"
+  case "$state" in
+    present)
+      info "model already present and verified; skipping download"
+      return
+      ;;
+    corrupt)
+      warn "existing model file failed checksum verification; re-downloading"
+      printf 'Re-download the ~3.1 GB model (%s) now? [Y/n] ' "$MODEL"
+      read -r ans
+      case "${ans:-}" in
+        [yY]|[yY][eE][sS]|"") download_model ;;
+        *) info "skipping model re-download (keeping the corrupt file)" ;;
+      esac
+      return
+      ;;
+    partial)
+      info "partial model download found; resuming it"
+      ;;
+  esac
+  # absent or partial: offer a fresh/resumed download, default No.
   printf 'Download the ~3.1 GB model (%s) now? [y/N] ' "$MODEL"
-  local ans
   read -r ans
   case "${ans:-}" in
     [yY]|[yY][eE][sS])
-      info "downloading and verifying the model (hash-pinned, ~3.1 GB)"
-      ( cd "$REPO" && "$REPO/.venv/bin/python" models/download_model.py \
-          --model "$MODEL" --write-hash )
+      download_model
       ;;
     *)
       info "skipping model download (run later: python models/download_model.py --model $MODEL)"
