@@ -111,7 +111,7 @@ from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from pathlib import Path
 from string import punctuation
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, TextIO
 
 from embit import finalizer
 from embit.psbt import PSBT
@@ -2972,6 +2972,150 @@ def cli_emitter(output_fn: Callable[[str], None]) -> EventEmitter:
     return EventEmitter(cli_sink(output_fn))
 
 
+# ------------------------------------------------------- app logging (TCK-APP-LOG-001)
+#
+# Everything the user should see routes through ``_Output``: narration to the
+# terminal (CLI, unchanged) or the SSE emitter (web); errors/warnings to the
+# console + the per-launch log file in BOTH modes (one code path). Log files
+# live in a ``logs/`` dir beside the store DB (derived at runtime from the
+# existing ``Settings.store_path`` — config.py untouched) and carry launch
+# metadata + errors/warnings only — never narration, never key material.
+
+#: Version-ish string for the launch-metadata log line (keep in sync with
+#: pyproject.toml / the chain client's ``_CLIENT_NAME``). Never key material.
+_APP_VERSION: Final[str] = "0.1.0"
+
+
+class _Log:
+    """Append-only per-launch error log (``logs/launch-YYYYMMDD-HHMMSS.log``
+    beside the store DB). Value-free by construction: only launch metadata and
+    error/warning lines, never narration or key material. Per-line size is
+    bounded; a directory-creation failure degrades to console-only with a
+    one-line note and is never fatal (``write`` no-ops without a handle)."""
+
+    _LINE_MAX: Final[int] = 1000
+
+    def __init__(self, store_path: str, mode: str) -> None:
+        self._fh: TextIO | None = None
+        try:
+            log_dir = Path(store_path).parent / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self._fh = open(  # noqa: SIM115 — long-lived per-launch handle
+                log_dir / f"launch-{time.strftime('%Y%m%d-%H%M%S')}.log",
+                "a",
+                encoding="utf-8",
+            )
+        except OSError:
+            self._fh = None
+            sys.stderr.write(
+                "note: could not open the error log (logs/) — errors print to "
+                "the console only.\n"
+            )
+            sys.stderr.flush()
+            return
+        self.write(
+            "INFO",
+            f"launch mode={mode} app=local-wallet/{_APP_VERSION}",
+        )
+
+    def write(self, level: str, line: str) -> None:
+        fh = self._fh
+        if fh is None:
+            return
+        try:
+            line = line.replace("\n", " ").strip()
+            if len(line) > self._LINE_MAX:
+                line = line[: self._LINE_MAX] + "…"
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {level} {line}\n")
+            fh.flush()
+        except OSError:
+            self._fh = None  # a broken log degrades to console-only, never fatal
+
+    def error(self, line: str) -> None:
+        self.write("ERROR", line)
+
+    def warning(self, line: str) -> None:
+        self.write("WARN", line)
+
+    def close(self) -> None:
+        fh, self._fh = self._fh, None
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+
+class _Output:
+    """Mode-aware output router (TCK-APP-LOG-001). ``__call__`` is the
+    narration channel (the ``output_fn``-shaped surface every engine layer
+    keeps calling): terminal in CLI mode, the SSE emitter in web mode.
+    ``error``/``warning`` write to the log file AND the console (stderr in
+    web, the terminal in CLI — unchanged); ``console`` is launch-critical
+    terminal output (URL/token/shutdown) in web mode. In web mode narration
+    is buffered until the engine emitter is bound (:meth:`bind_emitter`) so
+    the startup banner reaches the browser, then routes directly — all on the
+    engine thread (one emitter writer)."""
+
+    def __init__(
+        self,
+        *,
+        web: bool,
+        terminal: Callable[[str], None],
+        log: _Log,
+    ) -> None:
+        self._web = web
+        self._terminal = terminal
+        self._log = log
+        self._emitter: EventEmitter | None = None
+        self._buffered: list[str] = []
+
+    def bind_emitter(self, emitter: EventEmitter) -> None:
+        """Attach the engine emitter (once available) and flush any buffered
+        startup narration to it. Engine-thread only."""
+        self._emitter = emitter
+        for line in self._buffered:
+            emitter.text(line)
+        self._buffered.clear()
+
+    def __call__(self, line: str) -> None:  # narration
+        if not self._web:
+            self._terminal(line)
+        elif self._emitter is not None:
+            self._emitter.text(line)
+        else:
+            self._buffered.append(line)
+
+    def error(self, line: str) -> None:
+        self._log.error(line)
+        self._console(line)
+
+    def warning(self, line: str) -> None:
+        self._log.warning(line)
+        self._console(line)
+
+    def log_error(self, line: str) -> None:
+        """Log an error WITHOUT a console echo (for a line already written to
+        stderr by its own call site — preserves the CLI's original channel)."""
+        self._log.error(line)
+
+    def close(self) -> None:
+        """Close the per-launch log file (idempotent; safe after any exit)."""
+        self._log.close()
+
+    def console(self, line: str) -> None:
+        """Launch-critical terminal output: the terminal in BOTH modes, never
+        buffered, never logged (URL/token/shutdown lines)."""
+        self._terminal(line)
+
+    def _console(self, line: str) -> None:
+        if self._web:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+        else:
+            self._terminal(line)
+
+
 # ------------------------------------------- chain worker (TCK-SCAN-003, ADR-0022)
 
 
@@ -3954,6 +4098,11 @@ class EngineContext:
     #: queue and surfaces its state/progress; ``None`` = nothing to offer
     #: (a real model, remote bridge, or the explicit --stub-llm choice).
     model: ModelDownloadFlow | None = None
+    #: TCK-APP-LOG-001: the mode-aware output router (web mode only). When
+    #: present, :func:`start_engine` binds the engine emitter to it right
+    #: after bootstrap so startup narration reaches the SSE stream (and
+    #: provisioning narration routes there directly).
+    output: _Output | None = None
 
 
 @dataclass(frozen=True)
@@ -4382,6 +4531,11 @@ def start_engine(
         except BaseException as exc:  # noqa: BLE001 — engine-thread bootstrap
             handle.error = exc
             return
+        if ctx.output is not None:
+            # Bind the engine emitter to the router so buffered startup
+            # narration flushes to the SSE stream and provisioning narration
+            # routes there directly (single emitter writer: engine thread).
+            ctx.output.bind_emitter(handle.emitter)
         _pump(
             ctx.loop,
             handle.emitter.text,
@@ -4973,8 +5127,23 @@ def run(
     try:
         settings = Settings.from_env()
     except ValueError as exc:
-        output_fn(f"Configuration error: {exc}")
+        # Pre-log: settings (hence the store path) are unreadable, so the log
+        # location is unknowable — console-only (stderr in web, terminal in CLI).
+        line = f"Configuration error: {exc}"
+        if web_mode:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+        else:
+            output_fn(line)
         return 2
+
+    # TCK-APP-LOG-001: per-launch error log beside the store DB + the
+    # mode-aware output router. ``log``/``output`` are the SINGLE output
+    # channel from here down (narration → terminal/emitter; errors/warnings →
+    # console + log) so CLI stays unchanged and web narration reaches the
+    # browser instead of the terminal.
+    log = _Log(settings.store_path, "web" if web_mode else "cli")
+    output = _Output(web=web_mode, terminal=output_fn, log=log)
 
     # Watch key precedence (TCK-LAUNCH-001, documented deviation from the
     # ticket's "stored > env > flag" sketch — the flag/env rungs must keep
@@ -4996,7 +5165,7 @@ def run(
         if web_mode:
             pass  # first-run web flow: provisioning owns the key from here
         elif not is_interactive:
-            output_fn(f"No watch key configured: pass --zpub or set {ZPUB_ENV_VAR}.")
+            output.error(f"No watch key configured: pass --zpub or set {ZPUB_ENV_VAR}.")
             return 2
         else:
             asked = ask_watch_key(input_fn, output_fn)
@@ -5011,7 +5180,7 @@ def run(
             # _stored_watch_descriptor. Value-free WatchKeyErrors.
             descriptor = WalletDescriptor.from_key(zpub)
         except WatchKeyError as exc:
-            output_fn(f"Watch key rejected: {exc}")
+            output.error(f"Watch key rejected: {exc}")
             return 2
 
     # Signer selection (TCK-P3-005): --signer overrides LOCALWALLET_SIGNER;
@@ -5025,7 +5194,7 @@ def run(
         or SIGNER_KIND_FILE
     )
     if signer_kind not in _SIGNER_KINDS:
-        output_fn(
+        output.error(
             f"Invalid signer selection: use --signer file|hwi or set "
             f"{SIGNER_ENV_VAR}=file|hwi."
         )
@@ -5053,11 +5222,15 @@ def run(
     remote_base_url = os.environ.get(LLM_BASE_URL_ENV_VAR, "").strip()
     remote_model = os.environ.get(LLM_MODEL_ENV_VAR, "").strip()
     if remote_base_url and not remote_model:
-        print(
+        # Original channel preserved (stderr) + the same value-free line goes
+        # to the per-launch error log (TCK-APP-LOG-001 one code path).
+        line = (
             f"No model configured for the remote bridge: set {LLM_MODEL_ENV_VAR} "
-            f"alongside {LLM_BASE_URL_ENV_VAR}.",
-            file=sys.stderr,
+            f"alongside {LLM_BASE_URL_ENV_VAR}."
         )
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+        output.log_error(line)
         return 2
 
     generate: ModelRuntime | GenerateFn | RemoteOpenAIRuntime
@@ -5099,7 +5272,7 @@ def run(
             model_flow = ModelDownloadFlow(model_name=default[0])
         else:
             generate = stub_generate
-            output_fn(NO_MODEL_DEMO_BANNER)
+            output(NO_MODEL_DEMO_BANNER)
 
     # TCK-CFG-001 preflight: resolve + validate LOCALWALLET_GAP_LIMIT
     # (fail-closed, value-free — the same spirit as the zpub config-error
@@ -5109,7 +5282,7 @@ def run(
     try:
         env_gap = _env_gap_limit(settings)
     except ValueError as exc:
-        output_fn(f"Configuration error: {exc}")
+        output.error(f"Configuration error: {exc}")
         return 2
 
     # TCK-WEB-002 (ADR-0024 §1/§11, default since TCK-LAUNCH-001): the web
@@ -5131,6 +5304,7 @@ def run(
             generate=generate,
             node_detect_fn=node_detect_fn,
             output_fn=output_fn,
+            output=output,
             on_web_server=on_web_server,
             open_browser=open_browser,
             model=model_flow,
@@ -5148,18 +5322,18 @@ def run(
             flow=flow,
             generate=generate,
             node_detect_fn=node_detect_fn,
-            output_fn=output_fn,
+            output_fn=output,
             cli_interactive=is_interactive,
             backend_check_fn=backend_check_fn,
         )
     except _WiringError as exc:
-        output_fn(str(exc))
+        output.error(str(exc))
         return 2
 
     try:
         _repl(
             wiring.loop,
-            output_fn,
+            output,
             input_fn,
             flow=wiring.flow,
             session=wiring.session,
@@ -5182,6 +5356,7 @@ def run(
         close = getattr(generate, "close", None)
         if callable(close):
             close()
+        log.close()
     return 0
 
 
@@ -5329,7 +5504,7 @@ def _wire(
     # rung, so this reads EXACTLY the value the chain client resolved from
     # its own Settings.from_env() pass; the two can never disagree).
     if not settings.tls_verify:
-        output_fn(TLS_UNVERIFIED_WARNING)
+        output_fn.warning(TLS_UNVERIFIED_WARNING)
 
     # Background watch (Phase 5, TCK-P5-001; ADR-0019, ADR-0022 decision 4).
     # Tick-driven in the CLI: the watcher holds no thread and shares no
@@ -5401,7 +5576,7 @@ def _wire(
             sqlite3.Error,
         ) as exc:
             label = "rescan" if rescan else "startup scan"
-            output_fn(f"warning: {label} failed: {exc} — continuing with cached state.")
+            output_fn.warning(f"warning: {label} failed: {exc} — continuing with cached state.")
 
     if not scan.gate.enabled:
         # No startup scan will run (opted out, or planning failed): the
@@ -5534,6 +5709,7 @@ def _run_web(
     generate: ModelRuntime | GenerateFn | RemoteOpenAIRuntime,
     node_detect_fn: Callable[[], LocalNodeReport] | None,
     output_fn: Callable[[str], None],
+    output: _Output,
     on_web_server: Callable[[WebServer], None] | None = None,
     open_browser: bool = False,
     model: ModelDownloadFlow | None = None,
@@ -5578,7 +5754,7 @@ def _run_web(
     if not WEB_PORT_MIN <= port <= WEB_PORT_MAX:
         # Fail closed BEFORE binding (same spirit as the gap-limit
         # preflight): value-free, names the knob, never echoes the number.
-        output_fn(
+        output.error(
             f"Configuration error: {WEB_PORT_ENV_VAR} must be a port "
             f"between {WEB_PORT_MIN} and {WEB_PORT_MAX} ({WEB_PORT_MIN} "
             "= an automatic free port)."
@@ -5605,7 +5781,7 @@ def _run_web(
                 flow=flow,
                 generate=generate,
                 node_detect_fn=node_detect_fn,
-                output_fn=output_fn,
+                output_fn=output,
             )
             held["provision"] = provision
             booted.set()
@@ -5616,6 +5792,7 @@ def _run_web(
                 table={},
                 provision=provision,
                 model=model,
+                output=output,
             )
         try:
             wiring = _wire(
@@ -5628,7 +5805,7 @@ def _run_web(
                 flow=flow,
                 generate=generate,
                 node_detect_fn=node_detect_fn,
-                output_fn=output_fn,
+                output_fn=output,
                 web_mode=True,
             )
         except BaseException as exc:
@@ -5649,7 +5826,7 @@ def _run_web(
             flow=flow,
             generate=generate,
             node_detect_fn=node_detect_fn,
-            output_fn=output_fn,
+            output_fn=output,
             wiring=wiring,
         )
         held["provision"] = provision
@@ -5665,6 +5842,7 @@ def _run_web(
             store=wiring.store,
             provision=provision,
             model=model,
+            output=output,
         )
 
     try:
@@ -5678,13 +5856,13 @@ def _run_web(
         # bootstrap may have spawned is a daemon: it dies with this
         # exiting process, so there is nothing to tear down here.
         if port:
-            output_fn(
+            output.error(
                 "Could not start the web server — that port is already "
                 f"in use. Set {WEB_PORT_ENV_VAR} to a free port (or "
                 "leave it unset for an automatic one) and start again."
             )
         else:
-            output_fn("Could not start the web server.")
+            output.error("Could not start the web server.")
         return 2
     try:
         # The engine bootstraps (banner + watch line + prompt state) before
@@ -5697,7 +5875,7 @@ def _run_web(
         booted.wait()
         exc = startup["exc"]
         if exc is not None:
-            output_fn(
+            output.error(
                 str(exc)
                 if isinstance(exc, _WiringError)
                 else "Could not start the engine."
@@ -5750,6 +5928,7 @@ def _run_web(
         close = getattr(generate, "close", None)
         if callable(close):
             close()
+        output.close()
     return 0
 
 

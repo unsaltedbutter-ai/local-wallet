@@ -459,12 +459,13 @@ def test_app_never_selects_remote_runtime_without_env(
 
 
 def test_app_preflight_remote_env_without_model_exits_2(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
 ) -> None:
     """LOCALWALLET_LLM_BASE_URL set but no model → config error on stderr, exit 2."""
     from localwallet import app
 
     monkeypatch.setenv(LLM_BASE_URL_ENV_VAR, BASE_URL)
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(tmp_path / "store.db"))
     # LLM_MODEL deliberately left unset.
     code = app.run(
         ["--zpub", FIXTURE_ZPUB],

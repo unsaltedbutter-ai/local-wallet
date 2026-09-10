@@ -46,6 +46,51 @@ from tests.test_e2e_skeleton import XPRV, ZPUB
 from tests.test_web_server import _request
 
 TESTNET_GENESIS = "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"
+
+
+def _web_stream_contains(server: Any, needle: str, timeout: float = 10.0) -> bool:
+    """Whether the server's SSE stream delivered ``needle``. Web narration
+    routes to the emitter, not the terminal (TCK-APP-LOG-001), so the
+    one-line setup hint is read back through /events here. The engine binds
+    the emitter a moment after bootstrap returns, so this polls with fresh
+    connections (each replays the retained ring) up to ``timeout`` rather
+    than racing that single flush."""
+    import socket
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            s = socket.create_connection(
+                ("127.0.0.1", server.httpd.server_address[1]), timeout=2
+            )
+        except OSError:
+            time.sleep(0.05)
+            continue
+        s.sendall(
+            (
+                "GET /events HTTP/1.0\r\nHost: 127.0.0.1\r\n"
+                f"X-Auth-Token: {server.token}\r\n\r\n"
+            ).encode()
+        )
+        buf = b""
+        end = min(deadline, time.monotonic() + 2)
+        try:
+            while needle.encode() not in buf and time.monotonic() < end:
+                s.settimeout(max(0.1, end - time.monotonic()))
+                try:
+                    chunk = s.recv(65536)
+                except TimeoutError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+        finally:
+            s.close()
+        if needle.encode() in buf:
+            return True
+        time.sleep(0.05)
+    return False
 GOOD_URL = "https://mempool.mine.example:4000/api"
 LOCAL_URL = "http://127.0.0.1:3006"
 SEED_LINE = "bacon " * 12  # 12 BIP39-shaped words (canonical test phrase)
@@ -869,11 +914,12 @@ def test_web_launch_gets_hint_only(tmp_path: Path, monkeypatch) -> None:
     )
     thread.start()
     assert gate.wait(30), "web server never started"
+    assert _web_stream_contains(capture["server"], ob.WEB_SETUP_HINT)  # via /events
     capture["server"].stop()
     thread.join(15)
     assert capture.get("code") == 0
     joined = "\n".join(outputs)
-    assert ob.WEB_SETUP_HINT in joined  # the one-line pointer to the CLI
+    assert ob.WEB_SETUP_HINT not in joined  # narration → emitter, not terminal
     assert ob.NODE_ASK not in joined  # never the conversation, never the key ask
     assert ob.GREETING not in joined
 
@@ -901,6 +947,7 @@ def test_web_launch_gets_hint_only(tmp_path: Path, monkeypatch) -> None:
     )
     thread2.start()
     assert gate2.wait(30)
+    assert not _web_stream_contains(capture2["server"], ob.WEB_SETUP_HINT)
     capture2["server"].stop()
     thread2.join(15)
     assert ob.WEB_SETUP_HINT not in "\n".join(outputs2)
@@ -944,11 +991,12 @@ def test_web_first_run_defers_the_scan(tmp_path: Path, monkeypatch) -> None:
     )
     thread.start()
     assert gate.wait(30), "web server never started"
+    assert _web_stream_contains(capture["server"], ob.WEB_SETUP_HINT)
     capture["server"].stop()
     thread.join(15)
     assert capture.get("code") == 0
     joined = "\n".join(outputs)
-    assert ob.WEB_SETUP_HINT in joined  # the updated copy (balances wait)
+    assert ob.WEB_SETUP_HINT not in joined  # narration → emitter, not terminal
     assert "Startup scan complete" not in joined  # and it tells the truth
     assert calls == []  # the held scan never touched the public default
 
@@ -1001,10 +1049,11 @@ def test_web_auto_scan_zero_watch_never_probes_the_default(
     # leak the buggy build actually ran on the first real request).
     _request(server, "GET", "/state", token=server.token)
     threading.Event().wait(0.3)
+    assert _web_stream_contains(server, ob.WEB_SETUP_HINT)
     server.stop()
     thread.join(15)
     assert capture.get("code") == 0
-    assert ob.WEB_SETUP_HINT in "\n".join(outputs)
+    assert ob.WEB_SETUP_HINT not in "\n".join(outputs)  # narration → emitter
     assert calls == []  # the watch drain stood down behind the held gate
 
 

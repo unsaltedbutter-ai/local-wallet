@@ -479,12 +479,15 @@ def test_negative_content_length_is_bounded_4xx_and_frees_the_thread(
 
 
 def test_bind_failure_exits_2_with_clean_value_free_message(
-    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The INFO fix (app.py:3053): ``serve_web`` ran OUTSIDE the try, so a
     bind failure raised a traceback instead of the clean exit-2 contract.
     Now wrapped: exit 2 + a VALUE-FREE line (the socket error carries the
-    address, which must never leak)."""
+    address, which must never leak). Web errors go to stderr + the log file
+    (TCK-APP-LOG-001)."""
 
     def boom(*_a: Any, **_k: Any) -> Any:
         raise OSError(98, "address already in use: 127.0.0.1:55555")
@@ -493,13 +496,12 @@ def test_bind_failure_exits_2_with_clean_value_free_message(
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(tmp_path / "web.db"))
     monkeypatch.setenv(app.AUTO_SCAN_ENV_VAR, "0")
     monkeypatch.delenv(app.UI_ENV_VAR, raising=False)
-    outputs: list[str] = []
     code = app.run(
-        ["--stub-llm", "--zpub", ZPUB, "--web"], output_fn=outputs.append
+        ["--stub-llm", "--zpub", ZPUB, "--web"], output_fn=lambda _s: None
     )
     assert code == 2
-    assert "Could not start the web server." in outputs
-    joined = " ".join(outputs)
+    joined = capsys.readouterr().err
+    assert "Could not start the web server." in joined
     assert "address already in use" not in joined  # value-free (finding 4)
     assert "55555" not in joined and "Traceback" not in joined
 
@@ -1623,10 +1625,15 @@ def test_watchkey_accepts_persists_and_defers_the_scan(
         assert snap["first_scan_complete"] is False
         assert capture["calls"] == []
         # The banner for this launch ran through the normal web sequence
-        # (privacy notice + the honest unresolved-backend hint).
+        # (privacy notice + the honest unresolved-backend hint) — routed to
+        # the SSE emitter, NOT the terminal (TCK-APP-LOG-001).
         joined = "\n".join(outputs)
-        assert "Privacy notice:" in joined
-        assert "No server choice has been made yet" in joined  # WEB_SETUP_HINT
+        assert "Privacy notice:" not in joined
+        stream = _Stream(server)
+        stream.read_head()
+        frame = stream.read_until(b"No server choice has been made yet", timeout=15)
+        assert b"Privacy notice:" in frame
+        stream.close()
         # A second submit cannot replace the wallet (ADR-0010 single-wallet).
         status, _h, data, _r = _request(
             server, "POST", "/watchkey", {"key": ZPUB}, token=server.token
@@ -1710,7 +1717,13 @@ def test_watchkey_relaunch_uses_the_stored_key(
         assert "needs_watch_key" not in snap  # provisioned at bootstrap
         assert snap["scan_state"] == "awaiting_backend"  # ONB-006 still holds
         joined = "\n".join(outputs2)
-        assert "Privacy notice:" in joined  # real wiring ran at launch
+        # Real wiring ran at launch — its narration reached the SSE emitter,
+        # not the terminal (TCK-APP-LOG-001).
+        assert "Privacy notice:" not in joined
+        stream = _Stream(server2)
+        stream.read_head()
+        stream.read_until(b"Privacy notice:", timeout=15)
+        stream.close()
         store = Store(str(capture["store_path"]))
         try:
             assert len(store.list_wallets()) == 1  # reused, not duplicated

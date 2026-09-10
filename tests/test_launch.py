@@ -104,7 +104,10 @@ def test_bare_entry_launches_web(
         assert "Opening your browser…" in outputs
         # Minimal web banner: the REPL 'type a message' hint is NOT printed.
         assert not any(line.startswith("Type a message") for line in outputs)
-        assert any(line.startswith("Privacy notice:") for line in outputs)
+        # TCK-APP-LOG-001: user-facing narration routes to the SSE emitter,
+        # NOT the terminal — the privacy notice is absent from stdout here
+        # (its presence in the event stream is pinned in test_web_server.py).
+        assert not any(line.startswith("Privacy notice:") for line in outputs)
     finally:
         server.stop()
         thread.join(15)
@@ -351,7 +354,7 @@ def test_fixed_port_is_honored(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_busy_fixed_port_exits_2_naming_the_fix(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     port = _free_port()
     blocker = socket.socket()
@@ -359,12 +362,12 @@ def test_busy_fixed_port_exits_2_naming_the_fix(
     blocker.listen(1)
     monkeypatch.setenv("LOCALWALLET_WEB_PORT", str(port))
     try:
-        outputs: list[str] = []
         code = app.run(
-            ["--stub-llm", "--zpub", ZPUB, "--web"], output_fn=outputs.append
+            ["--stub-llm", "--zpub", ZPUB, "--web"], output_fn=lambda _s: None
         )
         assert code == 2
-        joined = "\n".join(outputs)
+        # Web errors go to stderr + the log file (TCK-APP-LOG-001).
+        joined = capsys.readouterr().err
         assert "already in use" in joined
         assert "LOCALWALLET_WEB_PORT" in joined  # names the fix
         assert str(port) not in joined  # value-free
@@ -372,14 +375,16 @@ def test_busy_fixed_port_exits_2_naming_the_fix(
         blocker.close()
 
 
-def test_out_of_range_port_is_a_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_out_of_range_port_is_a_config_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     monkeypatch.setenv("LOCALWALLET_WEB_PORT", "70000")
-    outputs: list[str] = []
     code = app.run(
-        ["--stub-llm", "--zpub", ZPUB, "--web"], output_fn=outputs.append
+        ["--stub-llm", "--zpub", ZPUB, "--web"], output_fn=lambda _s: None
     )
     assert code == 2
-    assert any(line.startswith("Configuration error:") for line in outputs)
+    # Web errors go to stderr + the log file (TCK-APP-LOG-001).
+    assert any(line.startswith("Configuration error:") for line in capsys.readouterr().err.splitlines())
 
 
 def test_web_port_ladder_env_over_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
