@@ -115,6 +115,7 @@ from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from pathlib import Path
 from string import punctuation
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final, TextIO
 
 from embit import finalizer
@@ -150,7 +151,14 @@ from localwallet.chain import (
     time_since_last_block,
 )
 from localwallet.chain.config import BITCOIND_SCHEME, ELECTRUM_SCHEME
-from localwallet.config import Settings, resolve_chain_base_url
+from localwallet.config import (
+    COIN_SETTING_BOUNDS,
+    COIN_SETTING_DEFAULTS,
+    COIN_SETTING_KEYS,
+    Settings,
+    resolve_chain_base_url,
+    resolve_coin_selection_settings,
+)
 from localwallet.node import LocalNodeReport, NodeStatus, detect_local_nodes
 from localwallet.node.doctor import NodeDoctor
 from localwallet.protocol import (
@@ -209,7 +217,12 @@ from localwallet.tx.revalidate import (
     TamperedPsbtError,
     revalidate_signed_psbt,
 )
-from localwallet.tx.selection import InsufficientFundsError, SelectionError, select_coins
+from localwallet.tx.selection import (
+    InsufficientFundsError,
+    SelectionError,
+    coin_partition,
+    select_coins,
+)
 from localwallet.ui.onboarding import (
     BACKEND_CHOICE_PUBLIC,
     BACKEND_CHOICE_SETTING,
@@ -931,6 +944,17 @@ _CARD_RATE_FLOOR: Final[str] = (
     "That's already the cheapest recommended rate — we never quote below "
     'the network minimum. Say "sign" to proceed or "cancel" to discard.'
 )
+#: Mix warning (TCK-UTXO-004, docs/ux-utxo-notes-design.md §4.3): a dedicated
+#: conditional line printed ONLY when the FINAL selection spans the KYC /
+#: not-KYC partitions — which happens only when no pure pool funds the amount
+#: (§2.1). Copy is verbatim from the doc's §4 block, code-owned, never
+#: model-authored. Honesty frame: "coins you marked" is the user's own claim
+#: (§1.1); we verify nothing. Gate audit (§4.4): the only actionable verb it
+#: names is the existing "cancel" — no new gate word.
+_CARD_MIX_WARNING: Final[str] = (
+    'Heads up: this mixes coins you marked KYC with coins you didn\'t — '
+    'say "cancel" if that\'s not what you want.'
+)
 _CANCELLED_LINE: Final[str] = "Transaction cancelled."
 _GUIDANCE_STILL_PENDING: Final[str] = (
     'Still pending — say "sign" to send it to your device, or "cancel" '
@@ -1226,6 +1250,7 @@ def build_dispatch_table(
             scan_fn,
             seconds_since_last_block_fn=seconds_since_last_block_fn,
             scan_gate=scan_gate,
+            settings=app_settings,
         ),
         IntentName.CONFIRM_TX: _make_confirm_tx_handler(tx_flow, send_session),
         IntentName.SIGN_TX: _make_sign_tx_handler(
@@ -1728,6 +1753,7 @@ def _make_create_tx_handler(
     *,
     seconds_since_last_block_fn: Callable[[], int | None] | None = None,
     scan_gate: StartupScan | None = None,
+    settings: Settings | None = None,
 ) -> Handler:
     """Create the ``create_tx`` handler: stage an unsigned pending transaction.
 
@@ -1937,14 +1963,60 @@ def _make_create_tx_handler(
         change_script = bytes(address_to_scriptpubkey(change_address).data)
 
         # 6. Selection + PSBT via the pure tx engine.
+        #
+        # 6a. Tag-aware join (TCK-UTXO-004, docs/ux-utxo-notes-design.md
+        # §4.1 — dispatcher-owned, model-free): coin_labels rows become the
+        # ONE plain boolean the selection layer reads (``kyc_side``; a
+        # mixed-lineage coin is kyc-side — the §1.3 fail-safe). Tag and note
+        # TEXT stops here: never model context, never logs, never tx/ (labels
+        # arrive as plain data, the same discipline as rate and settings —
+        # ADR-0012 amendment). Unlabeled coins stay untagged (other side), so
+        # a wallet without labels selects exactly as before the amendment.
+        try:
+            label_rows = store.get_coin_labels(wallet_id)
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+        selection_inputs: Sequence[Any] = utxos
+        kyc_outpoints = {
+            (row.txid, row.vout)
+            for row in label_rows
+            if coin_partition(row.tags)[0]
+        }
+        if kyc_outpoints:
+            # Only the kyc-side coins are re-wrapped: attribute-absent means
+            # other-side under the engine's duck-type contract.
+            selection_inputs = [
+                SimpleNamespace(**vars(utxo), kyc_side=True)
+                if (utxo.txid, utxo.vout) in kyc_outpoints
+                else utxo
+                for utxo in utxos
+            ]
+        # 6b. Coin-selection settings (doc §2.3 ladder) resolved PER
+        # SELECTION: the stored rung is read fresh here, so a settings-panel
+        # change lands on the next quote with no restart (the honest
+        # requires_restart False on those entries); the env/config-file rung
+        # is the startup Settings snapshot. A malformed value or a min>=max
+        # rung-cross refuses fail-closed — resolve's errors name keys and
+        # rungs only, never values (ADR-0009), so the detail is log-safe.
+        env_settings = settings if settings is not None else Settings()
+        try:
+            coin_policy = resolve_coin_selection_settings(
+                {key: getattr(env_settings, key, "") for key in COIN_SETTING_KEYS},
+                {key: store.get_coin_setting(key) for key in COIN_SETTING_KEYS},
+            )
+        except ValueError as exc:
+            return {"error": "selection_failed", "detail": str(exc)}
         try:
             selection = select_coins(
-                utxos,
+                selection_inputs,
                 amount_sats,
                 fee_rate,
                 9 + len(change_script),  # serialized change-output cost in vB
                 recipient_script,
                 change_script=change_script,
+                utxo_target_min_sats=coin_policy.target_min_sats,
+                utxo_target_max_sats=coin_policy.target_max_sats,
+                consolidate_below_sat_vb=coin_policy.consolidate_below_sat_vb,
             )
         except InsufficientFundsError as exc:
             # needed/available are user-facing UI figures (ADR-0012):
@@ -2060,6 +2132,15 @@ def _make_create_tx_handler(
             "vsize": pending.vsize,
             "change_sats": pending.change_sats,
             "inputs_count": pending.inputs_count,
+            # TCK-UTXO-004 (doc §4): display-only narration facts about the
+            # FINAL selection — the card's mix warning and consolidation
+            # clause render from these, so a re-quote (which re-runs
+            # selection and re-renders the card) can never silently change
+            # the tag-mix (§4.2: confirmation is only valid against the card
+            # the user is reading). Terminal/renderer material only: these
+            # keys never enter a FACTS block or the model transcript.
+            "mixed": selection.mixed,
+            "folded_count": selection.folded_count,
             "usd_cents": usd_cents,
             "rate_stale": rate_stale,
             "rate_age_s": rate_age_s,
@@ -4549,6 +4630,12 @@ _BACKEND_AUTH_USER_KEY: Final[str] = "backend_auth_user"
 _BACKEND_AUTH_PASS_KEY: Final[str] = "backend_auth_pass"
 _BACKEND_AUTH_NONE_KEY: Final[str] = "backend_auth_none"
 
+#: The closed set of credential keys an Apply may carry (``SettingsRequest.
+#: creds``) — anything else in the overlay is refused before ANY write.
+_BACKEND_AUTH_KEYS: Final[frozenset[str]] = frozenset(
+    {_BACKEND_AUTH_USER_KEY, _BACKEND_AUTH_PASS_KEY, _BACKEND_AUTH_NONE_KEY}
+)
+
 # --------------------------------- backend kind + hot-swap surfaces (TCK-BACKEND-002)
 
 #: The CLOSED enum of ``backend_kind`` values the settings/``/state``
@@ -4646,6 +4733,12 @@ _SETTINGS_KEYS: Final[frozenset[str]] = frozenset(
         _BACKEND_AUTH_USER_KEY,
         _BACKEND_AUTH_PASS_KEY,
         _BACKEND_AUTH_NONE_KEY,
+        # TCK-UTXO-003: the three coin-selection policy keys (doc §2.3/§3).
+        # The create_tx handler resolves env > stored > default on EVERY
+        # selection (live reader since TCK-UTXO-004's wiring), and the
+        # store's typed accessor pair (``get/set_coin_setting``) is the
+        # sanctioned writer behind ``_apply_setting_change``.
+        *COIN_SETTING_KEYS,
     }
 )
 
@@ -4666,6 +4759,14 @@ class SettingsRequest:
     key: str | None
     value: str | None
     reply: queue.Queue[dict[str, object]]
+    #: Optional credential overlay that RIDES a ``chain_base_url`` write
+    #: (TCK-ONB-004 M3 security-review LOW 2): the ``backend_auth_*`` keys
+    #: the web Apply submitted together with the address, as one map. The
+    #: engine writes them BEFORE the URL probe (so the probe tests the
+    #: login the user just typed) and REWINDS the prior record if the URL
+    #: write then fails — new creds are never committed against the old
+    #: URL. Every other request keeps this ``None``.
+    creds: Mapping[str, str] | None = None
 
 
 #: Command token the web transport stamps on the ``Resync now`` action
@@ -4816,7 +4917,37 @@ def _settings_entries(
     # TCK-ONB-004 M3: the backend credential keys ride the same surface as
     # SECRET entries — ``configured`` is the whole story a read may tell.
     entries.extend(_backend_auth_entries(store))
+    # TCK-UTXO-003: the three coin-selection policy keys (doc §2.3) ride the
+    # SAME gap-limit-style surface — stored rung value, shipped default,
+    # bounds and honest flags. They resolve per selection (TCK-UTXO-004
+    # wired the reader into the create_tx handler), so the honest
+    # ``requires_restart`` is False; the env rung's EXISTENCE flips
+    # ``env_override`` — its VALUE is never read or echoed here.
+    entries.extend(_coin_setting_entries(store))
     return entries
+
+
+def _coin_setting_entries(store: Store) -> list[dict[str, object]]:
+    """The coin-selection policy entries: stored rung (``None`` = unset →
+    default applies), shipped default and per-key bounds single-sourced from
+    :mod:`localwallet.config`, decimal-string values exactly like the
+    store's typed writers. Errors never echo a submitted value (the writers'
+    contract, unchanged here)."""
+    return [
+        {
+            "key": key,
+            "type": "int",
+            "value": store.get_coin_setting(key),
+            "default": str(COIN_SETTING_DEFAULTS[key]),
+            "min": COIN_SETTING_BOUNDS[key][0],
+            "max": COIN_SETTING_BOUNDS[key][1],
+            # Resolved fresh on every selection (create_tx handler): NO
+            # restart — the next quote already uses the new numbers.
+            "requires_restart": False,
+            "env_override": _env_overridden(f"LOCALWALLET_{key.upper()}"),
+        }
+        for key in COIN_SETTING_KEYS
+    ]
 
 
 def _backend_auth_entries(store: Store) -> list[dict[str, object]]:
@@ -4865,6 +4996,43 @@ def _backend_auth_entries(store: Store) -> list[dict[str, object]]:
     ]
 
 
+def _snapshot_backend_auth(
+    store: Store,
+) -> tuple[str | None, str | None, bool] | None:
+    """The credential record BEFORE a creds-carrying Apply (TCK-ONB-004 M3
+    security-review LOW 2) — the rewind target when the URL write fails, so
+    a refused Apply can never strand the NEW pair against the OLD URL (the
+    same snapshot/restore discipline the /setup credentials step keeps).
+    Unreadable store → ``None`` (nothing to rewind toward; the refusal line
+    is already the answer)."""
+    try:
+        return (
+            store.get_backend_auth_user(),
+            store.get_backend_auth_pass(),
+            store.get_backend_auth_none(),
+        )
+    except (StoreError, sqlite3.Error):
+        return None
+
+
+def _restore_backend_auth(
+    store: Store, snapshot: tuple[str | None, str | None, bool] | None
+) -> None:
+    """Best-effort rewind of the credential record to a prior snapshot.
+    Values that passed the typed writers once pass again; a store that
+    cannot even roll back is the same sqlite-loss failure the write path
+    already answers — every line on this surface stays value-free."""
+    if snapshot is None:
+        return
+    user, password, none_flag = snapshot
+    try:
+        store.set_backend_auth_none(none_flag)
+        store.set_backend_auth_user(user or "")
+        store.set_backend_auth_pass(password or "")
+    except (StoreError, sqlite3.Error):
+        pass
+
+
 def _apply_setting_change(store: Store, key: str, value: str) -> str | None:
     """Validate + persist ONE allowlisted change on the ENGINE thread.
 
@@ -4893,6 +5061,18 @@ def _apply_setting_change(store: Store, key: str, value: str) -> str | None:
             store.set_setting(key, str(gap))  # canonical decimal string
         except (StoreError, sqlite3.Error):
             return f"could not save {key}"
+        return None
+    if key in COIN_SETTING_KEYS:
+        # TCK-UTXO-003: the store's typed accessor pair is the ONLY
+        # sanctioned writer (bounds + min<max cross-check fail-closed AT
+        # WRITE, value-free — the gap_limit ponytail note is resolved;
+        # there is no second parser here). ``""`` clears the stored rung
+        # back to the shipped default; surrounding whitespace canonicalizes
+        # like every other scalar rung on this surface.
+        try:
+            store.set_coin_setting(key, value.strip())
+        except (StoreError, sqlite3.Error) as exc:
+            return str(exc)
         return None
     if key == _BACKEND_AUTH_NONE_KEY:
         # The checkbox as a closed write: "1" sets explicit no-credentials,
@@ -4935,6 +5115,7 @@ def handle_settings_request(
     key: str | None,
     value: str | None,
     backend: ChainBackendFlow | None = None,
+    creds: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Answer a :class:`SettingsRequest` ON THE ENGINE THREAD — the only
     thread that ever reads/writes the settings table for the web transport.
@@ -4963,6 +5144,16 @@ def handle_settings_request(
     write and the entry flags carry the next-launch honesty. Every wired
     reply (reads included) carries the additive ``backend_kind`` NAME for the
     client's badges (deliverable 10 — an enum name, value-free).
+
+    ``creds`` (TCK-ONB-004 M3 security-review LOW 2): a credential overlay
+    riding a ``chain_base_url`` write — one atomic Apply, ordered the honest
+    way. The pair lands on the store FIRST (the probe then tests exactly the
+    login the user typed), the URL write runs, and ANY failure after that
+    rewinds the prior credential record: an Apply that does not save the
+    address never leaves new creds against the old URL. On success both the
+    pair and the URL stand committed together. ``creds`` on any other key —
+    or carrying any key outside the closed credential trio — is refused
+    before a single write, value-free (the request is untrusted input).
     """
     unknown = {"schema": SETTINGS_SCHEMA, "status": "rejected", "error": "unknown setting"}
     if store is None:
@@ -4994,6 +5185,17 @@ def handle_settings_request(
         return _settings_reply({"status": "ok", "settings": [entry]}, kind)
     if key not in _SETTINGS_KEYS or not isinstance(value, str):
         return unknown
+    if creds is not None and (
+        key != _CHAIN_BASE_URL_KEY
+        or not isinstance(creds, dict)
+        or not all(
+            k in _BACKEND_AUTH_KEYS and isinstance(v, str)
+            for k, v in creds.items()
+        )
+    ):
+        # A creds overlay is ONLY ever honest riding its own URL Apply;
+        # refused as unknown-shape input before a single write.
+        return unknown
     if len(value) > MAX_SETTING_VALUE_CHARS:
         return _settings_reply(
             {
@@ -5004,11 +5206,34 @@ def handle_settings_request(
             kind,
         )
     extra: dict[str, object] = {}
+    auth_prior: tuple[str | None, str | None, bool] | None = None
+    if creds:
+        # The atomic Apply, part 1 (security-review LOW 2): land the pair
+        # through the SAME typed writers first — the URL probe resolves the
+        # store, so it tests the login the user just typed. A rejected cred
+        # SHAPE rewinds whatever the partial writes changed and never probes.
+        auth_prior = _snapshot_backend_auth(store)
+        for cred_key in (
+            _BACKEND_AUTH_NONE_KEY,
+            _BACKEND_AUTH_USER_KEY,
+            _BACKEND_AUTH_PASS_KEY,
+        ):
+            if cred_key not in creds:
+                continue
+            error = _apply_setting_change(store, cred_key, creds[cred_key])
+            if error is not None:
+                _restore_backend_auth(store, auth_prior)
+                return _settings_reply(
+                    {"status": "rejected", "key": key, "error": error}, kind
+                )
     if key == _CHAIN_BASE_URL_KEY and backend is not None:
         # The hot-swap path OWNS this write (probe → build → typed store
         # write → install) — the store's typed writer stays the only writer.
         error, extra = backend.apply(value)
         if error is not None:
+            # Part 2 of the atomic Apply: the address did NOT save, so the
+            # just-written pair is rewound (no new creds against the old URL).
+            _restore_backend_auth(store, auth_prior)
             return _settings_reply(
                 {"status": "rejected", "key": key, "error": error}, kind
             )
@@ -5017,6 +5242,7 @@ def handle_settings_request(
             store.get_setting(key) if key == wallet_scan.GAP_LIMIT_SETTING else None
         )
         if (error := _apply_setting_change(store, key, value)) is not None:
+            _restore_backend_auth(store, auth_prior)
             return _settings_reply(
                 {"status": "rejected", "key": key, "error": error}, kind
             )
@@ -5088,12 +5314,19 @@ class EngineHandle:
             return None
 
     def request_settings(
-        self, timeout: float, key: str | None = None, value: str | None = None
+        self,
+        timeout: float,
+        key: str | None = None,
+        value: str | None = None,
+        creds: Mapping[str, str] | None = None,
     ) -> dict[str, object] | None:
         """Read the allowlisted settings (``key is None``), read ONE key
         explicitly (``key`` set, ``value is None`` — the full public watch
         key), or apply ONE validated change THROUGH the pump (TCK-WEB-005,
-        TCK-WEB-008 follow-up (a)).
+        TCK-WEB-008 follow-up (a)). ``creds`` is the closed credential
+        overlay riding a ``chain_base_url`` write (TCK-ONB-004 M3
+        security-review LOW 2 — one atomic Apply, ordered probe-first);
+        the transport merely marshals it, ALL validation stays engine-side.
 
         Same discipline as :meth:`request_state`: the transport thread never
         touches the store; the ENGINE thread validates fail-closed, persists,
@@ -5102,7 +5335,9 @@ class EngineHandle:
         consult may still be answered after the caller gave up, so the client
         RE-READS via GET rather than assuming the write failed)."""
         reply: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
-        self.commands.put(SettingsRequest(SETTINGS_COMMAND, key, value, reply))
+        self.commands.put(
+            SettingsRequest(SETTINGS_COMMAND, key, value, reply, creds)
+        )
         try:
             return reply.get(timeout=timeout)
         except queue.Empty:
@@ -5620,7 +5855,7 @@ def _pump(
             # behind the in-flight scan) — the pump's ``client`` local (watch
             # drain + turn facts) rebinds on an immediate swap.
             reply = handle_settings_request(
-                store, command.key, command.value, backend
+                store, command.key, command.value, backend, command.creds
             )
             command.reply.put(reply)
             if backend is not None and reply.get("swapped") is True:
@@ -6684,6 +6919,7 @@ class ChainBackendFlow:
             scan.scan_now if scan is not None else (lambda: None),
             seconds_since_last_block_fn=lambda: _safe_time_since_last_block(client),
             scan_gate=scan.gate if scan is not None else None,
+            settings=w.settings,
         )
         w.table[IntentName.BROADCAST_TX] = _make_broadcast_tx_handler(
             w.flow, client, w.store, w.wallet.id
@@ -8358,6 +8594,13 @@ def _print_brief_card(
         full: list[str] = []
         _print_confirmation_card(result, full.append)
         session.card_render = full
+    # The mix warning rides ABOVE the ask line (doc §4.3 slot table): an
+    # unavoidable mix is a review-carefully moment, visible at a glance, and
+    # the pending re-show (`tx_pending`, whose flow record carries no mix
+    # flag) never contradicts the card the user is confirming against — the
+    # line describes the FINAL selection of the run that rendered it.
+    if result.get("mixed") is True:
+        output_fn(sanitize_tool_output(_CARD_MIX_WARNING))
     output_fn(sanitize_tool_output(_CARD_ASK_LINE))
     output_fn(sanitize_tool_output(f"To: {result.get('recipient', '')}"))
     pay = "Pay: unavailable"
@@ -8405,6 +8648,15 @@ def _print_brief_card(
     change = _card_sats(result, "change_sats")
     if change is not None:
         from_line += f" · {change} sats come back as change"
+    # Consolidation clause (TCK-UTXO-004, doc §2.2/§4.3): a step-5 fold
+    # appends to the From data line — a source-of-funds FACT, names no verb,
+    # presents no choice (the tail slot stays the speed offer's). Count
+    # only; the clause renders iff folded_count > 0 (absent key or 0 = the
+    # step did not fire, and a re-show that cannot know says nothing rather
+    # than lying). Plain words: no "consolidation"/"UTXO" jargon.
+    folded = result.get("folded_count")
+    if isinstance(folded, int) and not isinstance(folded, bool) and folded > 0:
+        from_line += f" · folding in {folded:,} small ones now to save fees later"
     output_fn(sanitize_tool_output(from_line))
     if result.get("fee_target_defaulted"):
         output_fn(sanitize_tool_output(_CARD_OFFER_TAIL + _CARD_DETAILS_TAIL))

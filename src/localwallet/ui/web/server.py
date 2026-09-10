@@ -677,10 +677,18 @@ class _Handler(BaseHTTPRequestHandler):
         # ONE key per write (the engine applies + re-reads it, or refuses with
         # a value-free error). HTTP maps the engine's closed status:
         # applied→200, rejected→400, anything else (unavailable)→503.
+        # An optional ``auth`` object (TCK-ONB-004 M3 security-review LOW 2)
+        # rides a ``chain_base_url`` write ONLY: the closed credential keys
+        # the web Apply submitted together with the address, so the engine
+        # probes with the new login and commits creds+URL atomically. The
+        # transport shape-checks (keys/values strings) and marshals; WHICH
+        # keys are legitimate, what they validate against, and whether the
+        # whole Apply lands is engine-owned and fail-closed.
         try:
             payload = json.loads(body)
             key = payload["key"] if isinstance(payload, dict) else None
             value = payload["value"] if isinstance(payload, dict) else None
+            auth = payload.get("auth") if isinstance(payload, dict) else None
         except (ValueError, KeyError, TypeError):
             self._send_json(
                 400, {"error": "expected JSON object with 'key' and 'value'"}
@@ -689,6 +697,17 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(key, str) or not isinstance(value, str):
             self._send_json(400, {"error": "'key' and 'value' must be strings"})
             return
+        if auth is not None and (
+            not isinstance(auth, dict)
+            or not all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in auth.items()
+            )
+        ):
+            self._send_json(
+                400, {"error": "'auth' must be an object of string values"}
+            )
+            return
         # (No value checks here: ALL validation — allowlist, type, bounds,
         # size cap — is engine-owned and fail-closed; the request body is
         # already size-bounded by _read_body. The transport never duplicates
@@ -696,7 +715,7 @@ class _Handler(BaseHTTPRequestHandler):
         result = (
             None
             if self.engine.error is not None
-            else self.engine.request_settings(self.state_timeout_s, key, value)
+            else self.engine.request_settings(self.state_timeout_s, key, value, auth)
         )
         if result is None:
             # Dead engine: no apply ever happened. A TIMEOUT is the never-

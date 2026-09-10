@@ -1020,7 +1020,7 @@ class OnboardingFlow:
             output_fn(VALIDATION_FAIL)
             self._last_failed = url
             return True
-        return self._finish(canonical, output_fn)
+        return self._finish(canonical, output_fn, snapshot)
 
     def _restore_creds(
         self, snapshot: tuple[str | None, str | None, bool] | None
@@ -1040,13 +1040,27 @@ class OnboardingFlow:
         except StoreError:
             pass
 
-    def _finish(self, canonical: str, output_fn: Callable[[str], None]) -> bool:
+    def _finish(
+        self,
+        canonical: str,
+        output_fn: Callable[[str], None],
+        cred_snapshot: tuple[str | None, str | None, bool] | None = None,
+    ) -> bool:
         """The save + swap tail shared by the address step and the
         credentials step: doctor's loopback IBD gate, the typed store write
-        of the probe's CANONICAL url, then the hot-swap honesty lines."""
+        of the probe's CANONICAL url, then the hot-swap honesty lines.
+
+        ``cred_snapshot`` (security-review M3 finding 1): when the caller
+        came through the credentials step the NEW pair is already written —
+        a refusal HERE (syncing node, store write) means the address never
+        SAVES, so the prior credential record is restored. Without this the
+        session would strand new creds against the OLD URL (next-launch 401
+        risk), contradicting the step's "restored unless the address then
+        SAVES" contract. The success paths keep the new pair."""
         self._cred_url = None
         syncing = self._syncing_node_line(canonical)
         if syncing is not None:
+            self._restore_creds(cred_snapshot)
             output_fn(syncing)
             self._last_failed = canonical
             return True
@@ -1055,6 +1069,7 @@ class OnboardingFlow:
         except StoreError:
             # Unreachable behind the probe (the writer's shape rules are a
             # subset the probe already enforced); fail closed, value-free.
+            self._restore_creds(cred_snapshot)
             output_fn(VALIDATION_FAIL)
             self._last_failed = canonical
             return True

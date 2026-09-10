@@ -3047,7 +3047,16 @@ def test_send_flow_handler_result_card_fields(
         "eta_blocks",
         "eta_minutes",
         "eta_wording",
+        # TCK-UTXO-004: display-only narration flags on the FINAL selection
+        # (mix warning + consolidation clause) — renderer material, never a
+        # FACTS/model field.
+        "mixed",
+        "folded_count",
     }
+    # An unlabeled single-coin send selects exactly as before the amendment:
+    # no mix, no fold (the flags default to the render-off shape).
+    assert result["mixed"] is False
+    assert result["folded_count"] == 0
     assert result["recipient"] == SEND_RECIPIENT
     assert result["fee_sats"] == result["vsize"] * result["fee_rate_sat_vb"]
     assert result["amount_sats"] == SEND_AMOUNT_SATS
@@ -5587,3 +5596,282 @@ def test_prompt_live_and_startup_failure_narrated_after_hint(
     # the honest chain-unavailable line, never a fabricated balance.
     assert "chain unavailable" in joined
     assert "Balance (mainnet):" not in joined
+
+
+# ============================ TCK-UTXO-004: tag/consolidation card narration
+#
+# docs/ux-utxo-notes-design.md §4: the create_tx handler joins coin_labels
+# onto the snapshot (dispatcher-side, plain booleans only — §4.1), resolves
+# the three policy settings PER SELECTION, and the brief card renders the mix
+# warning (§4.3, above the ask line) and the consolidation clause (on the
+# From data line) from the FINAL selection — so a re-quote can never
+# silently change the tag-mix (§4.2). All strings code-owned; nothing here
+# is model-visible (the flags ride the RESULT dict → renderer only).
+
+_MIX_WARNING_TEXT: Final[str] = (
+    'Heads up: this mixes coins you marked KYC with coins you didn\'t — '
+    'say "cancel" if that\'s not what you want.'
+)
+
+
+def _utxo(txid: str, value: int) -> dict[str, Any]:
+    return {"txid": txid, "vout": 0, "value": value, "status": {"confirmed": True}}
+
+
+def test_brief_card_mix_warning_sits_above_the_ask_line() -> None:
+    """(a) The mandatory mixing warning: a dedicated conditional line,
+    ABOVE the ask line (doc §4.3 slot table), verbatim code-owned copy —
+    the honesty frame is "coins you marked" (the user's claim, our echo)."""
+    lines: list[str] = []
+    app_module._print_brief_card(
+        {
+            "recipient": "bc1qtest",
+            "amount_sats": 100_000,
+            "fee_sats": 831,
+            "inputs_count": 3,
+            "change_sats": 169,
+            "mixed": True,
+            "folded_count": 0,
+        },
+        lines.append,
+    )
+    assert lines[0] == _MIX_WARNING_TEXT == app_module._CARD_MIX_WARNING
+    assert lines[1] == app_module._CARD_ASK_LINE
+    # No jargon, no new gate vocabulary beyond the existing "cancel" (§4.4).
+    assert "UTXO" not in lines[0] and "consolidat" not in lines[0].lower()
+
+
+def test_brief_card_consolidation_clause_on_the_from_line() -> None:
+    """(b) The fold clause rides the From data line (count only, doc §2.2):
+    after the sources count and the change segment — never the tail slot."""
+    lines: list[str] = []
+    app_module._print_brief_card(
+        {
+            "recipient": "bc1qtest",
+            "amount_sats": 110_000,
+            "fee_sats": 165,
+            "inputs_count": 3,
+            "change_sats": 9_835,
+            "mixed": False,
+            "folded_count": 2,
+        },
+        lines.append,
+    )
+    assert not any(line.startswith("Heads up") for line in lines)
+    assert lines[4] == (
+        "From: your wallet (3 sources) · 9,835 sats come back as change"
+        " · folding in 2 small ones now to save fees later"
+    )
+
+
+def test_brief_card_silent_when_flags_absent_or_zero() -> None:
+    """Absent/zero flags render NOTHING — the pre-amendment card is
+    byte-identical (and the pending re-show, whose flow record cannot know,
+    degrades silent rather than guessing)."""
+    lines: list[str] = []
+    app_module._print_brief_card(
+        {
+            "recipient": "bc1qtest",
+            "amount_sats": 1,
+            "fee_sats": 2,
+            "inputs_count": 1,
+            "mixed": False,
+            "folded_count": 0,
+        },
+        lines.append,
+    )
+    assert lines[0] == app_module._CARD_ASK_LINE  # no warning above it
+    assert lines[4] == "From: your wallet (1 source)"
+    assert "folding" not in "\n".join(lines)
+
+
+def test_requote_renarrates_the_mix_warning_present_and_absent() -> None:
+    """(c) FLOW-REQUOTE (§4.2): the new card describes the new final
+    selection — a re-quote that changes the mix flips the line's presence on
+    the rendered card (confirm is only valid against the card the user is
+    reading); no separate warning/refusal is added."""
+    base: dict[str, Any] = {
+        "tx_ref": "r2",
+        "amount_sats": 100_000,
+        "recipient": "bc1qtest",
+        "fee_sats": 627,
+        "fee_rate_sat_vb": 3,
+        "vsize": 209,
+        "change_sats": None,
+        "inputs_count": 2,
+        "fee_target": "fast",
+        "fee_target_defaulted": False,
+        "fee_requote": True,
+        "requote_direction": "faster",
+        "expires_in_s": 600,
+    }
+    mixed_out: list[str] = []
+    app_module._print_create_tx({**base, "mixed": True, "folded_count": 0}, mixed_out.append)
+    assert mixed_out[0].startswith("Re-quoted at the faster rate")
+    assert mixed_out[1] == app_module._CARD_MIX_WARNING  # re-narrated IN
+    pure_out: list[str] = []
+    app_module._print_create_tx({**base, "mixed": False, "folded_count": 0}, pure_out.append)
+    assert pure_out[0].startswith("Re-quoted at the faster rate")
+    assert pure_out[1] == app_module._CARD_ASK_LINE  # re-narrated OUT
+
+
+def test_tag_aware_selection_flips_the_mix_on_requote(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The full handler ride: labeled kyc coins + one untagged coin. At the
+    slow rung the pure kyc pool funds (no mix); the faster re-quote breaks
+    the pure pool's finalization and the full-set fallback SPANS partitions —
+    the result flags follow the final selection, and the label TEXT (tag and
+    note) never rides any result field or rendered line (never model
+    context, never output)."""
+    addrs = derive_fixture_addresses(3)
+    kyc_a, kyc_b, other = ("f" * 64, "a" * 64, "b" * 64)
+    table, store, wallet, client, _rec, flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(
+            rec,
+            utxos_by_addr={
+                addrs[0]: [_utxo(kyc_a, 60_000)],
+                addrs[1]: [_utxo(kyc_b, 40_500)],
+                addrs[2]: [_utxo(other, 500)],
+            },
+        )
+    )
+    try:
+        store.set_coin_label(wallet.id, kyc_a, 0, ["kyc"], "alice refund zebra")
+        store.set_coin_label(wallet.id, kyc_b, 0, ["exchange"])
+
+        def envelope(target: str) -> Envelope:
+            return validate_payload(
+                json.dumps(
+                    {
+                        "v": 0,
+                        "intent": "create_tx",
+                        "params": {
+                            "recipient": SEND_RECIPIENT,
+                            "amount_sats": 100_000,
+                            "fee_target": target,
+                        },
+                    }
+                )
+            )
+
+        slow = table[IntentName.CREATE_TX](envelope("slow"))  # 1 sat/vB
+        assert slow.get("error") is None, slow
+        assert slow["mixed"] is False  # the pure kyc pool funded
+        assert slow["folded_count"] == 0
+        fast = table[IntentName.CREATE_TX](envelope("fast"))  # 3 sat/vB
+        assert fast.get("error") is None, fast
+        assert fast["fee_requote"] is True and fast["requote_direction"] == "faster"
+        assert fast["mixed"] is True  # no pure pool funds; the fallback spans
+        assert fast["inputs_count"] == 3
+
+        slow_card: list[str] = []
+        app_module._print_brief_card(slow, slow_card.append)
+        fast_card: list[str] = []
+        app_module._print_brief_card(fast, fast_card.append)
+        assert slow_card[0] == app_module._CARD_ASK_LINE
+        assert fast_card[0] == app_module._CARD_MIX_WARNING
+
+        # Cardinal rule (§1.1): label text is display-frozen to /details —
+        # not in the narration, not in the handler result, not in FACTS.
+        joined = "\n".join([*slow_card, *fast_card])
+        assert "zebra" not in joined and "alice refund" not in joined
+        assert "zebra" not in json.dumps(slow) and "zebra" not in json.dumps(fast)
+        assert "kyc" not in json.dumps(_flow_facts_of(flow))
+    finally:
+        client.close()
+        store.close()
+
+
+def _flow_facts_of(flow: Any) -> dict[str, object]:
+    """The exact FACTS dict a next turn would inject (CREATED → pending
+    facts) — the negative pin: mix/label material has no path to the model."""
+    return app_module._flow_facts(flow)
+
+
+def test_low_fee_consolidation_narrates_the_fold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """(b) full ride: at the slow rung the two below-target coins fold into
+    the funding selection (step 5, store-set target min), the result counts
+    them, and the From line narrates the count — no mix, no warning."""
+    addrs = derive_fixture_addresses(3)
+    table, store, _wallet, client, _rec, _flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(
+            rec,
+            utxos_by_addr={
+                addrs[0]: [_utxo("a" * 64, 5_000), _utxo("b" * 64, 5_000)],
+                addrs[1]: [_utxo("c" * 64, 120_000)],
+                addrs[2]: [_utxo("d" * 64, 90_000)],
+            },
+        )
+    )
+    try:
+        # Stored rung only — no restart, no env: the settings resolve PER
+        # SELECTION (why the entries honestly say requires_restart False).
+        store.set_coin_setting("utxo_target_min_sats", "50000")
+        created = table[IntentName.CREATE_TX](
+            validate_payload(
+                json.dumps(
+                    {
+                        "v": 0,
+                        "intent": "create_tx",
+                        "params": {
+                            "recipient": SEND_RECIPIENT,
+                            "amount_sats": 110_000,
+                            "fee_target": "slow",
+                        },
+                    }
+                )
+            )
+        )
+        assert created.get("error") is None, created
+        assert created["mixed"] is False
+        assert created["folded_count"] == 2  # the two 5,000-sat coins
+        assert created["inputs_count"] == 3  # 120k funds + 2 folded
+        assert created["change_sats"] is not None
+        lines: list[str] = []
+        app_module._print_brief_card(created, lines.append)
+        assert lines[0] == app_module._CARD_ASK_LINE  # no warning
+        assert lines[4].endswith(" · folding in 2 small ones now to save fees later")
+        assert not any("consolidat" in line.lower() or "utxo" in line.lower() for line in lines)
+    finally:
+        client.close()
+        store.close()
+
+
+def test_malformed_selection_settings_refuse_the_selection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A malformed env rung (min above the default max) is caught fail-closed
+    at selection time too (the re-check inside resolve): the refusal names
+    the keys and the rule — VALUE-FREE, nothing stages."""
+    monkeypatch.setenv("LOCALWALLET_UTXO_TARGET_MIN_SATS", "15000000")  # > 10M default max
+    addrs = derive_fixture_addresses(1)
+    table, store, _wallet, client, _rec, flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(
+            rec, utxos_by_addr={addrs[0]: [SEND_UTXO]}
+        )
+    )
+    try:
+        result = table[IntentName.CREATE_TX](
+            validate_payload(
+                json.dumps(
+                    {
+                        "v": 0,
+                        "intent": "create_tx",
+                        "params": {
+                            "recipient": SEND_RECIPIENT,
+                            "amount_sats": SEND_AMOUNT_SATS,
+                        },
+                    }
+                )
+            )
+        )
+        assert result["error"] == "selection_failed"
+        assert "utxo_target_min_sats" in str(result["detail"])
+        assert "15000000" not in json.dumps(result)  # value-free
+        assert flow.pending is None
+    finally:
+        client.close()
+        store.close()

@@ -1088,10 +1088,12 @@ async function postSetting(key, value) {
   return response.json().catch(() => null);
 }
 
-// The ordered writes the chain-base Apply rung submits BEFORE the URL (so
-// the engine's probe — which resolves credentials from the store at call
-// time — sees them; "creds ride the probe and the built client"). The
-// checkbox wins outright when checked: explicit no-auth, pair wiped.
+// The credential overlay the chain-base Apply submits AS PART OF the URL
+// POST (TCK-ONB-004 M3 security-review LOW 2): the engine lands it, probes
+// with it — "creds ride the probe and the built client" — and rewinds the
+// prior record if the address is refused, so a rejected Apply never strands
+// new creds against the old URL. The checkbox wins outright when checked:
+// explicit no-auth, pair wiped.
 function credWrites(row) {
   const box = row.querySelector(".creds-none");
   if (!box) return [];
@@ -1345,26 +1347,23 @@ settingsListEl.addEventListener("click", async (event) => {
   status.textContent = LABELS.settingsSaving;
   const submitted = input.value.trim(); // emptiness test only — never re-echoed
   try {
+    // TCK-ONB-004 M3 (security-review LOW 2): the login no longer rides
+    // separate POSTs BEFORE the address — it rides the SAME Apply. The
+    // engine probes with the new creds first and commits creds+URL together
+    // only on success; a refused address rewinds the pair server-side.
+    let auth = null;
     if (isChain) {
-      // Credentials FIRST, address second (M3): the engine's Apply-time
-      // probe resolves them from the store, so ordering IS the UX —
-      // "Apply" tests the login you just typed. Any refused cred write
-      // stops before the URL is touched.
-      for (const [key, value] of credWrites(row)) {
-        const cred = await postSetting(key, value);
-        if (!cred || cred.status !== "applied") {
-          status.textContent =
-            cred && typeof cred.error === "string"
-              ? LABELS.settingsRejectedPrefix + " " + cred.error
-              : LABELS.settingsFailed;
-          return;
-        }
-      }
+      const writes = credWrites(row);
+      if (writes.length > 0) auth = Object.fromEntries(writes);
     }
     const response = await fetch("/settings", {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ key: btn.dataset.settingKey, value: submitted }),
+      body: JSON.stringify(
+        auth
+          ? { key: btn.dataset.settingKey, value: submitted, auth }
+          : { key: btn.dataset.settingKey, value: submitted }
+      ),
     });
     const data = await response.json().catch(() => null);
     if (response.status === 200 && data && data.status === "applied") {

@@ -794,3 +794,238 @@ class TestRewords2h:
             BACKEND_PROBE_FAIL
         )
         assert "unreachable" in BACKEND_PROBE_FAIL
+
+
+# ===================== security-review LOW findings 1+2: ordering rewinds
+#
+# Both findings were the same class: a credential write COMMITTED before the
+# URL write, so a later refusal (syncing-node gate, store-write failure, or
+# the web Apply's probe) left NEW creds stored against the OLD URL — a
+# next-launch 401 risk. The fix: the credential record is rewound on every
+# path where the address does not SAVE (restoring the state finding-1's own
+# docstring already promised), and the web Apply carries creds atomically —
+# probe FIRST with the new pair, commit both on success, rewind both on
+# refusal.
+
+NEW_USER = "new-user"
+NEW_PASSWORD = "n3w-p4ss"
+
+
+class TestSetupFinishRestoresCreds:
+    """Finding 1 (onboarding._finish): the two post-credential-write,
+    pre-save refusals — the syncing-node gate and the typed-writer StoreError
+    — restore the PRIOR credential record; the URL is never saved either way,
+    so no new creds ever stand against the old address."""
+
+    HTTP = TestSetupCredentials.HTTP
+
+    @staticmethod
+    def _store_with_prior(tmp_path: Path) -> Store:
+        store = Store(tmp_path / "ord.db")
+        store.set_backend_auth_user("old-user")  # the WORKING backend's login
+        store.set_backend_auth_pass("old-pass")
+        return store
+
+    def test_syncing_node_refusal_restores_the_prior_pair(self, tmp_path: Path) -> None:
+        from tests.test_onboarding import _report_syncing
+
+        store = self._store_with_prior(tmp_path)
+        calls: list[str] = []
+        try:
+            flow = ob.OnboardingFlow(
+                store=store,
+                check_backend=TestSetupCredentials._credentialed_probe(store, calls),
+                armed=True,
+                node_report=_report_syncing,
+                loopback_host=app._loopback_host_of,
+            )
+            out: list[str] = []
+            flow.handle_line(self.HTTP, out.append)  # fails → the cred step
+            flow.handle_line(f"{USER}:{PASSWORD}", out.append)
+            # The pair was accepted and the probe passed (Core-shape
+            # rewrite), but the loopback node is still IBD — the address
+            # does NOT save, so the pair must rewind.
+            assert any("syncing" in line.lower() for line in out)
+            assert store.get_chain_base_url() is None
+            assert store.get_backend_auth_user() == "old-user"
+            assert store.get_backend_auth_pass() == "old-pass"
+            joined = " ".join(out)
+            assert PASSWORD not in joined and "old-pass" not in joined
+        finally:
+            store.close()
+
+    def test_store_write_failure_restores_the_prior_pair(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = self._store_with_prior(tmp_path)
+        calls: list[str] = []
+        try:
+
+            def boom(_url: str) -> None:
+                raise StoreError("cannot write")
+
+            monkeypatch.setattr(store, "set_chain_base_url", boom)
+            flow = ob.OnboardingFlow(
+                store=store,
+                check_backend=TestSetupCredentials._credentialed_probe(store, calls),
+                armed=True,
+            )
+            out: list[str] = []
+            flow.handle_line(self.HTTP, out.append)
+            flow.handle_line(f"{USER}:{PASSWORD}", out.append)
+            assert ob.VALIDATION_FAIL in out
+            assert store.get_backend_auth_user() == "old-user"
+            assert store.get_backend_auth_pass() == "old-pass"
+            assert PASSWORD not in " ".join(out)
+        finally:
+            store.close()
+
+
+class _StubBackend:
+    """The ChainBackendFlow surface handle_settings_request touches: kind +
+    shadowed for the flags, an apply() that answers as scripted (and records
+    the calls, so "never probed" is observable)."""
+
+    kind = "esplora"
+    shadowed = False
+
+    def __init__(self, error: str | None = None) -> None:
+        self._error = error
+        self.calls: list[str] = []
+
+    def apply(self, url: str) -> tuple[str | None, dict[str, object]]:
+        self.calls.append(url)
+        return self._error, ({} if self._error else {"swapped": True, "resync": "started"})
+
+    def resync(self) -> str:  # pragma: no cover — not exercised here
+        return "unavailable"
+
+
+class TestCombinedApplyIsAtomic:
+    """Finding 2 (web Apply): URL + creds arrive as ONE SettingsRequest; the
+    engine lands the pair (typed writers), PROBES with it, and only on
+    success do creds+URL stand together. Any refusal rewinds the prior
+    credential record — the old URL keeps the old login, never a 401."""
+
+    URL = "bitcoind://node.local:8332"
+
+    def test_apply_probes_with_the_new_pair_and_commits_both(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+    ) -> None:
+        from tests.test_backend_hotswap import _drain, _FakeChain, _mk_wiring
+
+        wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+        store = wiring.store
+        try:
+            store.set_backend_auth_user("old-user")
+            store.set_backend_auth_pass("old-pass")
+            seen: dict[str, Any] = {}
+
+            def fake_build(settings: Any, auth: Any = None) -> Any:
+                seen["auth"] = auth
+                return _FakeChain(settings.chain_base_url)
+
+            monkeypatch.setattr(app, "_build_chain_client", fake_build)
+
+            def probe(url: str) -> str | None:
+                # A node that answers ONLY to the new pair, resolved from
+                # the store exactly as the production probe closure does —
+                # proof the Apply-time probe saw the NEW creds.
+                auth = _backend_auth(store)
+                if auth is not None and auth.user == USER and auth.password == PASSWORD:
+                    return url
+                return None
+
+            flow = app.ChainBackendFlow(wiring, probe)
+            reply = app.handle_settings_request(
+                store,
+                "chain_base_url",
+                self.URL,
+                flow,
+                creds={"backend_auth_user": USER, "backend_auth_pass": PASSWORD},
+            )
+            assert reply["status"] == "applied", reply
+            assert seen["auth"] == _BackendAuth(user=USER, password=PASSWORD)
+            assert store.get_chain_base_url() == self.URL  # committed
+            assert store.get_backend_auth_user() == USER  # committed together
+            assert store.get_backend_auth_pass() == PASSWORD
+            assert USER not in json.dumps(reply) and PASSWORD not in json.dumps(reply)
+            _drain(wiring, commands)
+        finally:
+            store.close()
+
+    def test_refused_url_rewinds_the_credential_record(self, tmp_path: Path) -> None:
+        store = Store(tmp_path / "atomic.db")
+        try:
+            store.set_backend_auth_user("old-user")
+            store.set_backend_auth_pass("old-pass")
+            store.set_backend_auth_none(True)  # prior record incl. the flag
+            backend = _StubBackend(error=BACKEND_PROBE_FAIL)
+            reply = app.handle_settings_request(
+                store,
+                "chain_base_url",
+                self.URL,
+                backend,
+                creds={"backend_auth_none": "", "backend_auth_user": NEW_USER},
+            )
+            assert reply["status"] == "rejected"
+            assert reply["error"] == BACKEND_PROBE_FAIL
+            assert backend.calls == [self.URL]  # the probe DID run (and failed)
+            # The rewind is COMPLETE: pair and the none-flag all stand prior.
+            assert store.get_backend_auth_none() is True
+            assert store.get_backend_auth_user() == "old-user"
+            assert store.get_backend_auth_pass() == "old-pass"
+            assert store.get_chain_base_url() is None
+            assert NEW_USER not in json.dumps(reply)
+        finally:
+            store.close()
+
+    def test_rejected_cred_shape_stops_before_the_probe(self, tmp_path: Path) -> None:
+        store = Store(tmp_path / "shape.db")
+        try:
+            store.set_backend_auth_user("old-user")
+            store.set_backend_auth_pass("old-pass")
+            backend = _StubBackend()
+            reply = app.handle_settings_request(
+                store,
+                "chain_base_url",
+                self.URL,
+                backend,
+                # "bad password" violates the typed writer's shape rules.
+                creds={"backend_auth_user": "okuser", "backend_auth_pass": "bad password"},
+            )
+            assert reply["status"] == "rejected"
+            assert backend.calls == []  # never probed
+            # Partial writes (the user landed first) are rewound with it.
+            assert store.get_backend_auth_user() == "old-user"
+            assert store.get_backend_auth_pass() == "old-pass"
+            assert store.get_chain_base_url() is None
+            assert "bad password" not in json.dumps(reply)
+        finally:
+            store.close()
+
+    def test_creds_never_ride_any_other_key_or_foreign_names(
+        self, tmp_path: Path
+    ) -> None:
+        store = Store(tmp_path / "foreign.db")
+        try:
+            # Overlay on a non-URL write: refused as unknown-shape input.
+            reply = app.handle_settings_request(
+                store, "gap_limit", "7", None, creds={"backend_auth_user": "x"}
+            )
+            assert reply == {
+                "schema": SETTINGS_SCHEMA,
+                "status": "rejected",
+                "error": "unknown setting",
+            }
+            assert store.get_setting("gap_limit") is None
+            # Foreign key inside the overlay: refused BEFORE any write — the
+            # overlay is the closed trio or nothing.
+            reply = app.handle_settings_request(
+                store, "chain_base_url", self.URL, None, creds={"gap_limit": "9"}
+            )
+            assert reply["error"] == "unknown setting"
+            assert store.get_setting("gap_limit") is None
+            assert store.get_chain_base_url() is None
+        finally:
+            store.close()

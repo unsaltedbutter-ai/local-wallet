@@ -46,6 +46,11 @@ from localwallet.app import (
     EventEmitter,
     StartupScan,
 )
+from localwallet.config import (
+    COIN_SETTING_BOUNDS,
+    COIN_SETTING_DEFAULTS,
+    COIN_SETTING_KEYS,
+)
 from localwallet.protocol import IntentName
 from localwallet.store import Store
 from localwallet.wallet import scan as wallet_scan
@@ -56,6 +61,8 @@ def env_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     """No env rungs: the stored rung is the whole story in these tests."""
     monkeypatch.delenv(app.GAP_LIMIT_ENV_VAR, raising=False)
     monkeypatch.delenv(app.CHAIN_BASE_URL_ENV_VAR, raising=False)
+    for coin_key in COIN_SETTING_KEYS:
+        monkeypatch.delenv(f"LOCALWALLET_{coin_key.upper()}", raising=False)
 
 
 def _entries(store: Store) -> dict[str, dict[str, Any]]:
@@ -88,6 +95,12 @@ def test_allowlist_is_exactly_the_live_db_keys(env_clean: None, tmp_path: Path) 
             "backend_auth_user",
             "backend_auth_pass",
             "backend_auth_none",
+            # TCK-UTXO-003: the coin-selection policy keys (doc §2.3) —
+            # writable + readable since their per-selection reader landed
+            # in the create_tx handler (TCK-UTXO-004).
+            "utxo_target_min_sats",
+            "utxo_target_max_sats",
+            "consolidate_below_sat_vb",
         }
         for secret_key in (
             "backend_auth_user",
@@ -120,6 +133,104 @@ def test_allowlist_is_exactly_the_live_db_keys(env_clean: None, tmp_path: Path) 
         assert watch["type"] == "watch_key"
         assert watch["configured"] is False
         assert watch["value"] is None
+    finally:
+        store.close()
+
+
+def test_coin_setting_entries_shape_and_defaults(env_clean: None, tmp_path: Path) -> None:
+    """TCK-UTXO-003: the three coin-selection keys ride the SAME surface as
+    gap_limit — type int, bounds + shipped default single-sourced from
+    config, stored rung None until set, ``requires_restart`` False (they
+    resolve per selection, TCK-UTXO-004 wired the reader) and
+    ``env_override`` False with no env rung (doc §2.3)."""
+    store = Store(tmp_path / "coin.db")
+    try:
+        entries = _entries(store)
+        for key in COIN_SETTING_KEYS:
+            lo, hi = COIN_SETTING_BOUNDS[key]
+            assert entries[key] == {
+                "key": key,
+                "type": "int",
+                "value": None,  # unset stored rung → the default applies
+                "default": str(COIN_SETTING_DEFAULTS[key]),
+                "min": lo,
+                "max": hi,
+                "requires_restart": False,  # resolved per selection, no restart
+                "env_override": False,
+            }, key
+    finally:
+        store.close()
+
+
+def test_coin_setting_writes_route_through_the_typed_writer(
+    env_clean: None, tmp_path: Path
+) -> None:
+    """No second parser: bounds AND the min<max cross-check are the store's
+    typed accessor pair (the only sanctioned writer); refusals are value-free
+    and leave the stored rung untouched (fail-closed, ADR-0009)."""
+    store = Store(tmp_path / "coinw.db")
+    try:
+        result = app.handle_settings_request(
+            store, "utxo_target_min_sats", "  200000 "
+        )
+        assert result["status"] == "applied"
+        assert store.get_coin_setting("utxo_target_min_sats") == "200000"
+        assert result["settings"][0]["value"] == "200000"  # re-read from truth
+
+        # Out of bounds (per-key min/max): refused, value-free, nothing stored.
+        result = app.handle_settings_request(store, "consolidate_below_sat_vb", "101")
+        assert result["status"] == "rejected"
+        assert "101" not in str(result)
+        assert store.get_coin_setting("consolidate_below_sat_vb") is None
+
+        # min >= max cross-check: raising the minimum to the (default)
+        # maximum is a malformed PAIR — in-bounds value, still refused
+        # value-free, minimum unchanged (a corrupt setting never silently
+        # flips policy — ADR-0009 verbatim).
+        result = app.handle_settings_request(store, "utxo_target_min_sats", "10000000")
+        assert result["status"] == "rejected"
+        assert "minimum" in str(result["error"])
+        assert store.get_coin_setting("utxo_target_min_sats") == "200000"
+
+        # Non-integer: refused.
+        assert (
+            app.handle_settings_request(store, "utxo_target_max_sats", "abc")[
+                "status"
+            ]
+            == "rejected"
+        )
+
+        # "" clears the stored rung back to the shipped default.
+        result = app.handle_settings_request(store, "utxo_target_min_sats", "")
+        assert result["status"] == "applied"
+        assert store.get_coin_setting("utxo_target_min_sats") is None
+        assert result["settings"][0]["value"] is None
+    finally:
+        store.close()
+
+
+def test_coin_setting_env_override_flag_is_honest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The env rung flips ``env_override`` on its own key ONLY, and its VALUE
+    never reaches the snapshot (existence, not content — the gap_limit
+    discipline). The stored rung stays writable/visible either way."""
+    for coin_key in COIN_SETTING_KEYS:
+        monkeypatch.delenv(f"LOCALWALLET_{coin_key.upper()}", raising=False)
+    monkeypatch.delenv(app.CHAIN_BASE_URL_ENV_VAR, raising=False)
+    monkeypatch.delenv(app.GAP_LIMIT_ENV_VAR, raising=False)
+    monkeypatch.setenv("LOCALWALLET_CONSOLIDATE_BELOW_SAT_VB", "5")
+    store = Store(tmp_path / "coinenv.db")
+    try:
+        entries = _entries(store)
+        assert entries["consolidate_below_sat_vb"]["env_override"] is True
+        assert entries["utxo_target_min_sats"]["env_override"] is False
+        assert entries["utxo_target_max_sats"]["env_override"] is False
+        # Existence only: the stored rung reads None as always — the env
+        # VALUE never rides any entry (the shipped default is a literal,
+        # not a read).
+        assert entries["consolidate_below_sat_vb"]["value"] is None
+        assert entries["consolidate_below_sat_vb"]["default"] == "2"
     finally:
         store.close()
 
@@ -219,7 +330,8 @@ def test_off_allowlist_never_reaches_the_store_and_is_not_echoed(
         for key in (
             "active_wallet_id",
             "fee_cache_ttl_s",  # env/config scalar with NO DB reader → refused
-            "utxo_target_min_sats",  # not implemented yet → refused
+            "utxo_target_min_sat",  # NOT a key (typo) — refused (UTXO-003's
+            # three real keys are allowlisted now; invented near-misses are not)
             "LOCALWALLET_STORE_PATH",
             "",
             "gap_limit ",  # trailing space is NOT the key (fail closed)

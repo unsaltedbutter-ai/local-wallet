@@ -1123,6 +1123,8 @@ def _settings_server(
     if monkeypatch is not None:  # hermetic env_override flags
         monkeypatch.delenv(app.GAP_LIMIT_ENV_VAR, raising=False)
         monkeypatch.delenv(app.CHAIN_BASE_URL_ENV_VAR, raising=False)
+        for coin_key in app.COIN_SETTING_KEYS:
+            monkeypatch.delenv(f"LOCALWALLET_{coin_key.upper()}", raising=False)
 
     def bootstrap() -> EngineContext:
         return EngineContext(
@@ -1169,6 +1171,12 @@ def test_settings_get_lists_the_allowlist_shape_only(
             "backend_auth_user",
             "backend_auth_pass",
             "backend_auth_none",
+            # TCK-UTXO-003: the coin-selection policy keys join the surface
+            # (bounds + defaults single-sourced from config; resolved per
+            # selection, so requires_restart False on all three).
+            "utxo_target_min_sats",
+            "utxo_target_max_sats",
+            "consolidate_below_sat_vb",
         }
         # The M3 never-echo pin: even the PASSWORD key's entry carries no
         # value anywhere in the reply bytes (the raw response is what the
@@ -1186,6 +1194,13 @@ def test_settings_get_lists_the_allowlist_shape_only(
         # CONFIG-only (ADR-0018) — the client is built at bootstrap.
         assert gap["requires_restart"] is False
         assert gap["env_override"] is False
+        # TCK-UTXO-003: a coin-policy entry — int type, config-sourced
+        # bounds/default, honest per-selection flags.
+        coin = entries["utxo_target_min_sats"]
+        assert coin["type"] == "int" and coin["value"] is None
+        assert coin["default"] == str(app.COIN_SETTING_DEFAULTS["utxo_target_min_sats"])
+        assert (coin["min"], coin["max"]) == app.COIN_SETTING_BOUNDS["utxo_target_min_sats"]
+        assert coin["requires_restart"] is False and coin["env_override"] is False
         chain = entries["chain_base_url"]
         assert chain["type"] == "url" and chain["value"] is None
         assert chain["requires_restart"] is True
@@ -1284,6 +1299,67 @@ def test_settings_post_writes_apply_and_refusals_are_value_free(
         entries = {e["key"]: e for e in json.loads(data)["settings"]}
         assert entries["gap_limit"]["value"] == "5"
         assert entries["chain_base_url"]["value"] == "http://127.0.0.1:3006/api"
+    finally:
+        server.stop()
+
+
+def test_settings_post_auth_overlay_rides_the_url_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TCK-ONB-004 M3 security-review LOW 2 (transport half): the web Apply
+    sends the login as ONE combined POST (key chain_base_url + value +
+    ``auth`` overlay) — no separate cred writes to strand. The engine
+    commits creds+URL together on success and rewinds the pair when the URL
+    write fails (the plain harness server here has no hot-swap controller,
+    which is the same ordered path); the transport shape-checks the overlay
+    and never interprets it."""
+    server = _settings_server(tmp_path, monkeypatch=monkeypatch)
+    try:
+        status, _h, data, _r = _request(
+            server, "POST", "/settings",
+            {
+                "key": "chain_base_url",
+                "value": "http://127.0.0.1:3006/api",
+                "auth": {"backend_auth_user": "rpc-user", "backend_auth_pass": "rpc-pass"},
+            },
+            token=server.token,
+        )
+        assert status == 200 and json.loads(data)["status"] == "applied"
+        status, _h, data, _r = _request(server, "GET", "/settings", token=server.token)
+        entries = {e["key"]: e for e in json.loads(data)["settings"]}
+        assert entries["chain_base_url"]["value"] == "http://127.0.0.1:3006/api"
+        assert entries["backend_auth_user"]["configured"] is True
+        assert entries["backend_auth_pass"]["configured"] is True
+        # Never-echo stands on every reply byte (the read is set/unset only).
+        assert b"rpc-user" not in data and b"rpc-pass" not in data
+
+        # Refused URL + new login: the engine rewinds the overlay — the old
+        # pair stays configured, the old URL stands, nothing echoes.
+        status, _h, _d, _r = _request(
+            server, "POST", "/settings",
+            {"key": "chain_base_url", "value": "ftp://x", "auth": {"backend_auth_user": "other-user"}},
+            token=server.token,
+        )
+        assert status == 400
+        status, _h, data, _r = _request(server, "GET", "/settings", token=server.token)
+        entries = {e["key"]: e for e in json.loads(data)["settings"]}
+        assert entries["chain_base_url"]["value"] == "http://127.0.0.1:3006/api"
+        assert entries["backend_auth_user"]["configured"] is True  # rewound, not blanked
+        assert b"other-user" not in data
+
+        # Malformed auth shapes: clean 400s at the transport, before the
+        # engine ever sees them.
+        for bad in (
+            {"auth": "not-an-object"},
+            {"auth": {"backend_auth_user": 5}},
+            {"auth": ["backend_auth_user"]},
+        ):
+            status, _h, _d, _r = _request(
+                server, "POST", "/settings",
+                {"key": "chain_base_url", "value": "http://127.0.0.1:3006/api", **bad},
+                token=server.token,
+            )
+            assert status == 400, bad
     finally:
         server.stop()
 
