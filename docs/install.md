@@ -116,6 +116,19 @@ directory. If you installed `uv` only for this project, remove it separately
 
 ## Troubleshooting
 
+### "pip install" inside the activated .venv resolves to the wrong Python
+The project venv is created by **uv**, which ships venvs **without pip** — a bare
+`pip` inside the activated venv falls through to your system Python (often ancient)
+and tries a user-site install. Symptom: "Defaulting to user installation because
+normal site-packages is not writeable" + resolution errors ignoring every modern
+pydantic version (Requires-Python >=3.8+ skipped).
+**Fix:** use `uv pip install -e '.[dev]'` (with the venv activated), or
+`.venv/bin/python -m pytest …`-style invocations, or just run `./install.sh`
+inside the checkout — it does the right thing. Always invoke via
+`.venv/bin/python …` rather than trusting the activated prompt.
+
+## Troubleshooting
+
 - **"unsupported OS / architecture"** — only macOS (arm64/x86_64) and Linux
   (x86_64) are supported. The installer refuses to guess on anything else.
 - **Python 3.14 problems** — verified 2026-09-08: `hwi` pins `protobuf
