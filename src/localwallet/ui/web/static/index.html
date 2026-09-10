@@ -19,16 +19,16 @@
   <button id="settings-toggle" class="btn btn-ghost" type="button" aria-expanded="false" aria-controls="settings-panel">Settings</button>
 </header>
 
-<!-- TCK-WEB-009 (h): header quick actions BELOW the top bar. Model-free
-     bypass actions riding the pump's canonical slash utterance through
-     POST /action (the same full-pipeline path every button takes). Both
-     ride "/balance": the engine offers no separate USD utterance and the
-     balance card carries the USD line, so the USD button is the same
-     deterministic turn (never an invented endpoint). Hidden pre-provision;
-     shown ONLY from the typed /state snapshot (never inferred). -->
-<nav id="quickbar" class="quickbar" aria-label="Quick balance actions" hidden>
-  <button type="button" class="btn btn-secondary btn-small" data-action="quick-btc" data-utterance="/balance" title='Sends "/balance"'>BTC Balance</button>
-  <button type="button" class="btn btn-secondary btn-small" data-action="quick-usd" data-utterance="/balance" title='Sends "/balance"'>USD Balance</button>
+<!-- TCK-WEB-009 (h): header balance action BELOW the top bar. Model-free
+     bypass action riding the pump's canonical slash utterance through
+     POST /action (the same full-pipeline path every button takes). Copy
+     pass 2 #14: ONE Balance button — the old BTC/USD pair sent the identical
+     "/balance" utterance (the engine offers no separate USD one and never
+     gets an invented endpoint); the card it renders carries BTC/sats + USD
+     + the rate timestamp. Hidden pre-provision; shown ONLY from the typed
+     /state snapshot (never inferred). -->
+<nav id="quickbar" class="quickbar" aria-label="Balance actions" hidden>
+  <button type="button" class="btn btn-secondary btn-small" data-action="quick-balance" data-utterance="/balance" title='Sends "/balance"'>Balance</button>
 </nav>
 
 <!-- TCK-WEB-009 (a): the settings pane is the ONLY first-run surface — the
@@ -73,10 +73,10 @@
          deterministic transcript commands dispatched by code, never
          classified by the LLM (there may be no model). -->
     <button type="button" class="btn btn-primary model-only" data-action="model-download" data-utterance="/download" hidden>Yes, download the model</button>
-    <button type="button" class="btn btn-secondary model-only" data-action="model-later" data-utterance="/later" hidden>No, show model-free actions</button>
+    <button type="button" class="btn btn-secondary model-only" data-action="model-later" data-utterance="/later" hidden>No — show what works without the model</button>
     <button type="button" class="btn btn-secondary quick-only" data-action="qa-balance" data-utterance="/balance" hidden>Show balance</button>
-    <button type="button" class="btn btn-secondary quick-only" data-action="qa-receive" data-utterance="/receive" hidden>Show receiving address</button>
-    <button type="button" class="btn btn-secondary quick-only" data-action="qa-address" data-utterance="/address" hidden>New address</button>
+    <button type="button" class="btn btn-secondary quick-only" data-action="qa-receive" data-utterance="/receive" title='Sends "/receive"' hidden>Show receiving address</button>
+    <button type="button" class="btn btn-secondary quick-only" data-action="qa-address" data-utterance="/address" title='Sends "/address" — allocates a fresh address instead of reusing the next unused one' hidden>Create new address</button>
     <button type="button" class="btn btn-secondary quick-only" data-action="qa-settings" hidden>Open settings</button>
   </section>
 </footer>

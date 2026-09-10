@@ -86,31 +86,63 @@ const LABELS = {
   watchkeyRejectedPrefix: "Not accepted:",
   watchkeyBusy: "The wallet is busy — try again.",
   watchkeyFailed: "Could not connect — try again.",
-  watchKeyRowUnknown: "Status unknown — reconnecting…",
+  watchKeyRowUnknown:
+    "Wallet status unknown — waiting for the server to reconnect…",
   watchKeyRowConnected: "Connected.",
   watchKeyEnvOverride:
     "The key was set via environment variable — a replacement takes " +
     "effect once that override is removed.",
   watchKeyReplaceConfirm:
-    "The cached data belongs to the current wallet; replacing discards " +
-    "any pending transaction and re-scans for the new wallet (the previous " +
-    "wallet's cache stays in the store, unused). Replace the watch key?",
+    "The cached balance and history belong to the current wallet; " +
+    "replacing discards any pending transaction and re-scans for the new " +
+    "one (the old wallet's data stays on this machine, unused). Replace " +
+    "the wallet's key?",
   watchKeyReplaceYes: "Replace",
   watchKeyReplaceCancel: "Cancel",
+  // copy pass 2 §1: the SET row's Edit→form replace mode (the rungs below
+  // this one are the existing 409-confirm/apply stages, unchanged).
+  watchkeyReplaceLede:
+    "Paste the public account key (xpub, ypub, or zpub) of the wallet you " +
+    "want to watch instead.",
+  watchKeyReplaceSubmit: "Replace wallet",
   // backend badges (TCK-WEB-009 e) — the words are the closed enum family
   // names the engine's backend_kind maps onto (bitcoind is reserved).
   badgeMempool: "mempool",
   badgeElectrum: "electrum",
   badgeBitcoind: "bitcoind",
+  // copy pass 2 #44: dim/lit is a state-carrying indicator, so it gets
+  // words — a legend line plus a dynamic title/aria-label per badge
+  // (recomposed by paintBackendBadges, the sole badge painter).
+  badgeLegend:
+    "The highlighted name is the kind of server the app asks about your " +
+    "addresses.",
+  badgeInUse:
+    "In use — the app checks your addresses against this kind of server.",
+  badgeIdle: "Not in use.",
+  badgeReserved:
+    "Not available yet — the app cannot connect to a plain Bitcoin Core " +
+    "address.",
   // Resync now (TCK-WEB-009 f) — POST /resync's closed statuses, value-free.
   resyncNow: "Resync now",
   resyncSaving: "Starting…",
-  resyncStarted: "Re-scan started — the scan chip above shows progress.",
+  resyncStarted:
+    "Re-scan started — watch the status line at the top of the page for progress.",
   resyncBusy: "Already scanning — try again once the current scan finishes.",
-  resyncUnavailable: "Re-scan is not available right now.",
+  resyncUnavailable:
+    "Re-scan is not available right now — nothing was changed. Try again " +
+    "once the wallet has finished loading.",
   // applied-write notes from the response's resync field (TCK-WEB-009 g):
   // gap-limit and chain-base writes report whether a resync followed.
-  resyncNoteStarted: "Saved — re-scanning with the new value; the scan chip above follows.",
+  resyncNoteStarted:
+    "Saved — re-scanning with the new value; the status line at the top follows.",
+  // copy pass 2 #52 (UNDER-WARN fix): an EMPTY chain-base apply that lands
+  // (the engine hot-swaps to the public default) must name the leak AS IT
+  // LANDS — the placeholder hint above the field is not the consent beat.
+  // Tested for emptiness only; the value itself is never echoed (value-free).
+  settingsEmptyApplied:
+    "Switched to the public mempool.space server — whoever runs it sees " +
+    "every address you check, can link those to your IP, and watches when " +
+    "your transactions move. Enter your own server's address to switch back.",
   resyncNoteBusy: "Saved — a scan is already running; it will use the new value.",
   resyncNoteDeferred: "Saved — the re-scan is queued behind the current scan.",
   resyncNoteSkipped:
@@ -198,6 +230,9 @@ const state = {
   // refetching right after a provisioning accept would 503).
   settings: null, // null | Map<key, entry>
   backendKind: "",
+  // copy pass 2 §1: the SET row's Edit⇄form toggle (client-side only — no
+  // request happens until the form's Replace-wallet submit).
+  watchKeyReplaceOpen: false,
 };
 
 // model_state (a closed enum name from /state) → which of the two model
@@ -464,6 +499,7 @@ function dismissWatchKeyForm(key) {
   state.watchKeyDismissed = true;
   state.watchKeyPresent = true;
   state.watchKeyNeeded = false;
+  state.watchKeyReplaceOpen = false; // applied → the row returns collapsed (§1)
   inputEl.disabled = false;
   sendBtn.disabled = false;
   quickbarEl.hidden = false;
@@ -743,15 +779,31 @@ function focusWatchInput() {
   if (watchForm && watchForm.input.isConnected) watchForm.input.focus();
 }
 
-// The settings pane's zpub section (TCK-WEB-009 a/b). Two states, both
-// rendered from typed /state truth plus the server's entry:
+// The watch-key entry input (shared by the ENTRY form and the §1 replace-mode
+// form — the same safe term in the aria-label, one builder, no fork).
+function watchKeyInput() {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.spellcheck = false;
+  input.autocomplete = "off";
+  input.maxLength = 200;
+  input.placeholder = "zpub…";
+  input.setAttribute("aria-label", LABELS.watchKeyInputLabel);
+  return input;
+}
+
+// The settings pane's zpub section (TCK-WEB-009 a/b; copy pass 2 §1). States,
+// all rendered from typed /state truth plus the server's entry:
 //  * ENTRY (wallet needs a key): the moved card, compacted — lede, warning,
 //    one input + Connect. Submit is the ONE POST /watchkey channel (the same
 //    path the replaced card used, replace/confirm rung kept); ALL key
 //    validation is the engine's parse+gate, refusals relayed value-free.
-//  * SET: a collapsed read-only display — the engine's truncated descriptor
-//    ("wpkh([e7f511…" style). No Show/Copy/Replace affordances (user
-//    direction): the full value is never needed in this pane anymore.
+//  * SET: a collapsed display (the engine's truncated descriptor,
+//    "wpkh([e7f511…" style) + an Edit button. No Show/Copy/Replace
+//    affordances (user direction): the full value is never needed here.
+//    Edit (same verb as the chain-base row) flips the row to the
+//    replace-mode form — no request; submit rides the same POST /watchkey,
+//    and the engine's 409 raises the existing confirm/apply rungs.
 function watchKeyRow(serverEntry) {
   const li = el("li", "setting setting-watchkey");
   li.appendChild(el("p", "setting-key", "watch_key"));
@@ -768,17 +820,12 @@ function watchKeyRow(serverEntry) {
     state.watchKeyNeeded ||
     (serverEntry ? serverEntry.configured !== true : state.watchKeyPresent !== true);
   if (needsEntry) {
+    state.watchKeyReplaceOpen = false; // the ENTRY form owns the row
     li.appendChild(el("p", "setting-hint", LABELS.watchkeyLede));
     li.appendChild(el("p", "setting-flag", LABELS.watchkeyWarning));
     const box = el("div", "watchkey-replace"); // confirm / apply rungs of a replace
     const line = el("div", "watchkey-line");
-    const input = document.createElement("input");
-    input.type = "text";
-    input.spellcheck = false;
-    input.autocomplete = "off";
-    input.maxLength = 200;
-    input.placeholder = "zpub…";
-    input.setAttribute("aria-label", LABELS.watchKeyInputLabel);
+    const input = watchKeyInput();
     const btn = el("button", "btn btn-primary btn-small", LABELS.watchKeyConnect);
     btn.type = "button";
     line.append(input, btn);
@@ -795,14 +842,56 @@ function watchKeyRow(serverEntry) {
     return li;
   }
 
-  // SET — collapsed display only.
+  if (state.watchKeyReplaceOpen) {
+    // §1 Edit rung of the replace cycle: flip to the form, replace-mode
+    // copy, no request. The submit is the SAME submitWatchKey path — the
+    // engine answers ``already`` (409) and raises the existing confirm rung
+    // (below it); a silent overwrite is engine-impossible. Cancel collapses
+    // back to the display; nothing sent. Always available.
+    li.appendChild(el("p", "setting-hint", LABELS.watchkeyReplaceLede));
+    li.appendChild(el("p", "setting-flag", LABELS.watchkeyWarning));
+    const box = el("div", "watchkey-replace"); // confirm / apply rungs
+    const line = el("div", "watchkey-line");
+    const input = watchKeyInput();
+    const submitBtn = el("button", "btn btn-primary btn-small", LABELS.watchKeyReplaceSubmit);
+    submitBtn.type = "button";
+    const no = el("button", "btn btn-secondary btn-small", LABELS.watchKeyReplaceCancel);
+    no.type = "button";
+    no.addEventListener("click", () => {
+      state.watchKeyReplaceOpen = false;
+      renderSettings();
+    });
+    line.append(input, submitBtn, no);
+    li.append(line, box, status);
+    submitBtn.addEventListener("click", () => submitWatchKey(input, submitBtn, status, box));
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        submitWatchKey(input, submitBtn, status, box);
+      }
+    });
+    watchForm = { input, submit: submitBtn };
+    return li;
+  }
+
+  // SET — collapsed display + the §1 Edit affordance.
   const display =
     serverEntry && typeof serverEntry.value === "string"
       ? serverEntry.value
       : state.sessionWatchKey
         ? truncateKey(state.sessionWatchKey)
         : LABELS.watchKeyRowConnected;
-  li.appendChild(el("p", "watchkey-value", display));
+  const line = el("div", "watchkey-line watchkey-display-line");
+  line.appendChild(el("p", "watchkey-value", display));
+  const editBtn = el("button", "btn btn-secondary btn-small", LABELS.settingsEdit);
+  editBtn.type = "button";
+  editBtn.addEventListener("click", () => {
+    state.watchKeyReplaceOpen = true;
+    renderSettings();
+    focusWatchInput(); // mirrors the chain-base Edit rung: focus where typing continues
+  });
+  line.appendChild(editBtn);
+  li.appendChild(line);
   if (serverEntry && serverEntry.env_override === true) {
     li.appendChild(el("p", "setting-flag", LABELS.watchKeyEnvOverride));
   }
@@ -843,9 +932,12 @@ function chainBaseRow(entry) {
   line.append(input, btn);
   li.appendChild(line);
 
+  // copy pass 2 #44: the legend is the visible text alternative to dim/lit,
+  // and each badge gets a dynamic title/aria in paintBackendBadges (the
+  // badges stay a plain group — a container role="img" would hide the
+  // per-badge names from screen readers).
+  li.appendChild(el("p", "setting-hint", LABELS.badgeLegend));
   const badges = el("div", "backend-badges");
-  badges.setAttribute("role", "img");
-  badges.setAttribute("aria-label", LABELS.badgeMempool + " " + LABELS.badgeElectrum + " " + LABELS.badgeBitcoind);
   for (const [family, labelText] of [
     ["mempool", LABELS.badgeMempool],
     ["electrum", LABELS.badgeElectrum],
@@ -853,6 +945,7 @@ function chainBaseRow(entry) {
   ]) {
     const badge = el("span", "backend-badge", labelText);
     badge.dataset.badge = family;
+    badge.setAttribute("role", "img"); // makes the aria-label authoritative
     badges.appendChild(badge);
   }
   li.appendChild(badges);
@@ -879,15 +972,24 @@ function chainBaseRow(entry) {
 
 // (e): dimmed by default (low-opacity token styling), highlighted only for
 // the family the current backend_kind belongs to. bitcoind stays dimmed —
-// reserved, the engine never emits that kind today.
+// reserved, the engine never emits that kind today. Copy pass 2 #44: the
+// dim/lit state is styling, so this sole painter also recomposes each
+// badge's title + aria-label (lit → in-use; dim → idle; the permanently-dim
+// bitcoind → the dedicated "not available yet" line, so it never reads as a
+// detection bug). The accessible name keeps the family word + the sentence.
 function paintBackendBadges() {
   for (const badge of settingsListEl.querySelectorAll(".backend-badge")) {
     const family = BADGE_FAMILIES[badge.dataset.badge];
-    if (family && state.backendKind && family.has(state.backendKind)) {
-      badge.dataset.active = "true";
-    } else {
-      badge.removeAttribute("data-active");
-    }
+    const active = !!(family && state.backendKind && family.has(state.backendKind));
+    if (active) badge.dataset.active = "true";
+    else badge.removeAttribute("data-active");
+    const words = active
+      ? LABELS.badgeInUse
+      : badge.dataset.badge === "bitcoind"
+        ? LABELS.badgeReserved
+        : LABELS.badgeIdle;
+    badge.title = words;
+    badge.setAttribute("aria-label", badge.textContent + " — " + words);
   }
 }
 
@@ -1051,17 +1153,30 @@ settingsListEl.addEventListener("click", async (event) => {
   }
   btn.disabled = true; // in-flight (engine probe included): no double-submit
   status.textContent = LABELS.settingsSaving;
+  const submitted = input.value.trim(); // emptiness test only — never re-echoed
   try {
     const response = await fetch("/settings", {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ key: btn.dataset.settingKey, value: input.value.trim() }),
+      body: JSON.stringify({ key: btn.dataset.settingKey, value: submitted }),
     });
     const data = await response.json().catch(() => null);
     if (response.status === 200 && data && data.status === "applied") {
-      status.dataset.kind = "ok";
-      const note =
-        typeof data.resync === "string" && RESYNC_NOTES.has(data.resync)
+      // Copy pass 2 #52: an EMPTY chain-base write that lands hot-swaps to
+      // the public server — the applied note must name the leak as it lands
+      // (ADR-0023 amendment 2 consent duty). Not when the engine says the
+      // value changed nothing ("unchanged") or the env override outranks it
+      // ("skipped"): there the switch is not happening now.
+      const switched =
+        data.resync === undefined ||
+        data.resync === "started" ||
+        data.resync === "busy" ||
+        data.resync === "deferred";
+      const emptyApplied = isChain && submitted === "" && switched;
+      status.dataset.kind = emptyApplied ? "warn" : "ok";
+      const note = emptyApplied
+        ? LABELS.settingsEmptyApplied
+        : typeof data.resync === "string" && RESYNC_NOTES.has(data.resync)
           ? RESYNC_NOTES.get(data.resync)
           : LABELS.settingsApplied;
       status.textContent = note;

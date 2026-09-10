@@ -304,6 +304,9 @@ body {
 
 .setting-status[data-kind="ok"]   { color: var(--c-ok); }
 .setting-status[data-kind="error"] { color: var(--c-danger); }
+/* copy pass 2 #52: the applied-empty leak note — a disclosure, not a
+   success chime and not an error (nothing failed). */
+.setting-status[data-kind="warn"] { color: var(--c-warn); }
 
 /* ------------------------------------------------------------ transcript */
 
@@ -483,6 +486,11 @@ body {
   font-family: var(--font-mono);
   font-size: var(--fs-sm);
 }
+
+/* SET row (copy pass 2 §1): the truncated display shares its line with the
+   Edit affordance; the value flexes and wraps, the button stays put. */
+.watchkey-display-line { align-items: baseline; }
+.watchkey-display-line .watchkey-value { flex: 1; min-inline-size: 0; }
 
 /* (e): backend badges — dimmed family chips; the active kind's chip takes
    the accent. bitcoind stays dimmed (reserved; the engine never emits it). */
