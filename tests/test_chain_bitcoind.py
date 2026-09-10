@@ -1372,17 +1372,18 @@ class TestProbeDispatch:
     def test_probe_true_on_a_mainnet_node(self, bitcoind: Any) -> None:
         server = bitcoind()
         settings = Settings(request_timeout_s=2.0, max_retries=0)
-        assert app_module._probe_chain_backend(server.url, settings) is True
+        # M3 contract: the canonical URL back (bitcoind:// stays itself).
+        assert app_module._probe_chain_backend(server.url, settings) == server.url
 
     def test_probe_false_wrong_chain(self, bitcoind: Any) -> None:
         server = bitcoind(chain="signet")
         settings = Settings(request_timeout_s=2.0, max_retries=0)
-        assert app_module._probe_chain_backend(server.url, settings) is False
+        assert app_module._probe_chain_backend(server.url, settings) is None
 
     def test_probe_false_auth_refused(self, bitcoind: Any) -> None:
         server = bitcoind(expect_credentials=("u", "right"))
         settings = Settings(request_timeout_s=2.0, max_retries=0)
-        assert app_module._probe_chain_backend(server.url, settings) is False  # no creds → 401
+        assert app_module._probe_chain_backend(server.url, settings) is None  # no creds → 401
 
     def test_probe_true_through_cookie_ladder(self, bitcoind: Any, tmp_path: Path) -> None:
         cookie = tmp_path / ".cookie"
@@ -1391,15 +1392,15 @@ class TestProbeDispatch:
         settings = Settings(
             request_timeout_s=2.0, max_retries=0, rpc_cookie_path=str(cookie)
         )
-        assert app_module._probe_chain_backend(server.url, settings) is True
+        assert app_module._probe_chain_backend(server.url, settings) == server.url
 
     def test_probe_false_dead_endpoint(self) -> None:
         settings = Settings(request_timeout_s=0.2, max_retries=0)
-        assert app_module._probe_chain_backend("bitcoind://127.0.0.1:1", settings) is False
+        assert app_module._probe_chain_backend("bitcoind://127.0.0.1:1", settings) is None
 
     def test_probe_false_malformed_url(self) -> None:
         settings = Settings(request_timeout_s=2.0, max_retries=0)
-        assert app_module._probe_chain_backend("bitcoind://", settings) is False
+        assert app_module._probe_chain_backend("bitcoind://", settings) is None
 
     def test_backend_kind_bitcoind_scheme(self) -> None:
         kind = app_module._backend_kind(
@@ -1413,7 +1414,9 @@ class TestProbeDispatch:
             )
             == app_module.BACKEND_KIND_BITCOIND
         )
-        # https stays esplora (M3 owns the autodetect swap of that branch)
+        # https stays Esplora-primary even after M3's autodetect: the
+        # Core shape is tried on http:// only (https RPC is inexpressible,
+        # M2 scope — the shape probe never pretends otherwise)
         assert (
             app_module._backend_kind(Settings(chain_base_url="https://x.example/api"), resolved=True)
             == app_module.BACKEND_KIND_MEMPOOL
@@ -1423,3 +1426,69 @@ class TestProbeDispatch:
             app_module._backend_kind(Settings(chain_base_url="bitcoin://z"), resolved=True)
             != app_module.BACKEND_KIND_BITCOIND
         )
+
+
+class TestHttpAutodetect:
+    """TCK-ONB-004 M3: the AMBIGUOUS ``http://`` rung. The probe answers in
+    Core RPC shape FIRST; a win returns the ``bitcoind://`` REWRITE as the
+    canonical URL to store — so ``backend_kind``, the client dispatch and
+    every badge ride the ONE unchanged scheme seam (the detection adds no
+    second kind-plumbing). Ports are never trusted for classification
+    (the fixture answers on an ephemeral port, which no heuristic maps to
+    Core); the shapes decide. Nothing here touches a real network: the
+    fixture is loopback."""
+
+    def test_http_answering_in_core_shape_stores_the_rewrite(self, bitcoind: Any) -> None:
+        server = bitcoind()  # open auth (no credentials demanded)
+        http_url = "http://" + server.url.partition("://")[2]
+        settings = Settings(request_timeout_s=2.0, max_retries=0)
+        detected = app_module._probe_chain_backend(http_url, settings)
+        assert detected == server.url  # bitcoind://host:port canonical
+
+    def test_http_wrong_chain_refuses_after_both_shapes(self, bitcoind: Any) -> None:
+        server = bitcoind(chain="signet")
+        http_url = "http://" + server.url.partition("://")[2]
+        settings = Settings(request_timeout_s=2.0, max_retries=0)
+        # The Core handshake gate refuses non-mainnet AT ENTRY; the Esplora
+        # fallback cannot read genesis off the RPC root either → the single
+        # value-free None refusal (what was TRIED is named by the caller's
+        # line, never by this answer).
+        assert app_module._probe_chain_backend(http_url, settings) is None
+
+    def test_http_core_probe_carries_the_credential_overlay(
+        self, bitcoind: Any
+    ) -> None:
+        server = bitcoind(expect_credentials=("rpcu", "rpcp"))
+        http_url = "http://" + server.url.partition("://")[2]
+        settings = Settings(request_timeout_s=2.0, max_retries=0)
+        # No stored login, no cookie here → the Core shape 401s → None
+        # (the Esplora fallback answers the same verdict).
+        assert app_module._probe_chain_backend(http_url, settings) is None
+        auth = app_module._BackendAuth(user="rpcu", password="rpcp")
+        assert app_module._probe_chain_backend(http_url, settings, auth) == server.url
+
+    def test_http_no_credentials_overlay_omits_the_header(self, bitcoind: Any) -> None:
+        # A server that demands auth CANNOT be satisfied by the omit-flag
+        # overlay (that is the honest 401 story); an OPEN server accepts it.
+        open_server = bitcoind()
+        http_url = "http://" + open_server.url.partition("://")[2]
+        settings = Settings(request_timeout_s=2.0, max_retries=0)
+        omit = app_module._BackendAuth(omit=True)
+        assert (
+            app_module._probe_chain_backend(http_url, settings, omit)
+            == open_server.url
+        )
+
+    def test_http_userinfo_is_never_probed_as_core(self, bitcoind: Any) -> None:
+        server = bitcoind(expect_credentials=("rpcu", "rpcp"))
+        hostport = server.url.partition("://")[2]
+        settings = Settings(request_timeout_s=2.0, max_retries=0)
+        # URL-embedded credentials do not reach the Core branch on the
+        # stored rung at all (they are refused there — logins ride the
+        # dedicated keys), and the Esplora branch fails closed on userinfo
+        # at construction WITHOUT a socket: the fixture saw nothing.
+        assert (
+            app_module._probe_chain_backend(f"http://rpcu:rpcp@{hostport}", settings)
+            is None
+        )
+        assert server.requests == []

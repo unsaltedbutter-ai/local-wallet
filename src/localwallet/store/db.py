@@ -71,6 +71,31 @@ _BUSY_TIMEOUT_MS = 5000
 #: :meth:`Store.set_chain_base_url`, which own the write validation.
 _CHAIN_BASE_URL_SETTING = "chain_base_url"
 
+#: Backend credential settings keys (TCK-ONB-004 M3; ADR-0018 M3 amendment).
+#: Private: access only through the typed pairs below — the ONLY sanctioned
+#: writers, so validation can never be skipped and the values can never grow
+#: unbounded or carry header-injection bytes. THREAT MODEL (documented,
+#: deliberate): the passwords live in the same local single-user SQLite file
+#: as the wallet descriptor and the backend URL — the same trust surface.
+#: A local Core/electrum login is low-sensitivity (it gates a node the user
+#: already runs); OS-keyring is future work (plan OQ-4). The values are
+#: never logged, never echoed in any refusal or settings read (the
+#: /settings surface exposes only whether each key is SET), and never sent
+#: anywhere but to the user's own backend.
+_BACKEND_AUTH_USER_SETTING = "backend_auth_user"
+_BACKEND_AUTH_PASS_SETTING = "backend_auth_pass"
+_BACKEND_AUTH_NONE_SETTING = "backend_auth_none"
+
+#: Shape cap for a stored credential (HTTP Basic user/password). A real
+#: Core rpcuser/rpcpassword is a short printable token; anything longer,
+#: non-ASCII, or whitespace-bearing is refused at the write (the SAME rule
+#: the ``bitcoind://`` URL userinfo has since M2 — percent-encode or keep it
+#: out of the store; a half-pair is caught by the app's resolver, which uses
+#: basic auth only when BOTH parts are set). Control characters (CR/LF
+#: included) are refused outright: these values are joined into an
+#: ``Authorization`` header.
+_MAX_BACKEND_AUTH_CHARS = 256
+
 # Coin-selection policy settings (TCK-UTXO-002, docs/ux-utxo-notes-design.md
 # §2.3): keys, bounds and shipped defaults are owned by localwallet.config
 # (the env > stored > default ladder lives there; config imports nothing from
@@ -960,12 +985,18 @@ class Store(AbstractContextManager["Store"]):
 
         Validation is fail-closed at write, before anything lands on disk
         (ADR-0023 decision 5): a non-empty value must be an http(s) Esplora
-        base URL or an ``ssl://host[:port]`` Electrum endpoint (TCK-BACKEND-002;
-        ADR-0018 M3 acceptance — the M1 adapter ships, the stored rung now
-        carries it), each with a host and no embedded credentials — mirroring
-        the ``ChainConfig`` construction check that stays as the last line of
-        defense. A whitespace-only write is refused (deliberate-but-blank is
-        malformed, never a silent clear); only the exact empty string clears
+        base URL, an ``ssl://host[:port]`` Electrum endpoint (TCK-BACKEND-002),
+        or a ``bitcoind://host[:port]`` Bitcoin Core RPC endpoint
+        (TCK-ONB-004 M3; ADR-0018 M3 amendment — the M2 adapter shipped, the
+        stored rung now carries it), each with a host and NO embedded
+        credentials — mirroring the ``ChainConfig`` construction check that
+        stays as the last line of defense, with ONE documented split:
+        ``ChainConfig`` permits ``bitcoind://user:pass@host`` on the
+        env/config-file rungs, the STORED rung never does (M3 carries
+        dedicated, never-echoed credential keys instead — see
+        :meth:`set_backend_auth_user`), so ``@`` is refused for every scheme
+        written here. A whitespace-only write is refused (deliberate-but-blank
+        is malformed, never a silent clear); only the exact empty string clears
         the choice. Errors are value-free: the URL (which may embed
         credentials) never appears in the message. NOTE: this writer checks
         the URL SHAPE only — reachability/mainnet proof is the app's probe
@@ -987,8 +1018,14 @@ class Store(AbstractContextManager["Store"]):
             self._check_electrum_base_url(candidate)
             self.set_setting(_CHAIN_BASE_URL_SETTING, candidate)
             return
+        if candidate.startswith("bitcoind://"):
+            self._check_bitcoind_base_url(candidate)
+            self.set_setting(_CHAIN_BASE_URL_SETTING, candidate)
+            return
         if not candidate.startswith(("http://", "https://")):
-            raise StoreError("chain base url must be an http(s) or ssl:// URL")
+            raise StoreError(
+                "chain base url must be an http(s), ssl:// or bitcoind:// URL"
+            )
         if any(c.isspace() for c in candidate):
             raise StoreError("chain base url must not contain whitespace")
         netloc = candidate.partition("://")[2].split("/", 1)[0]
@@ -1017,6 +1054,110 @@ class Store(AbstractContextManager["Store"]):
                 raise StoreError("electrum chain base url has an invalid port")
         elif not rest:
             raise StoreError("chain base url must have a host")
+
+    @staticmethod
+    def _check_bitcoind_base_url(candidate: str) -> None:
+        """Shape rules for a stored ``bitcoind://host[:port]`` Core RPC
+        endpoint (mirrors :meth:`ChainConfig._validate_bitcoind_url` MINUS
+        the userinfo allowance the env/config-file rungs keep — TCK-ONB-004
+        M3): a host, an optional NUMERIC in-range port, no path/query/
+        fragment (the RPC surface is a single POST root), and NO embedded
+        credentials (``@`` refused; the dedicated never-echoed
+        ``backend_auth_*`` keys carry logins instead)."""
+        rest = candidate[len("bitcoind://") :]
+        if any(c.isspace() for c in rest):
+            raise StoreError("chain base url must not contain whitespace")
+        if any(c in rest for c in "/?#"):
+            raise StoreError("bitcoind chain base url must not carry a path")
+        if "@" in rest:  # embedded credentials — never storable (M3 keys)
+            raise StoreError("chain base url must not embed credentials")
+        host, sep, port = rest.rpartition(":")
+        if sep:
+            if not host or not port.isdigit() or not 0 < int(port) < 65536:
+                raise StoreError("bitcoind chain base url has an invalid port")
+        elif not rest:
+            raise StoreError("chain base url must have a host")
+
+    # ---------------------------------- backend credentials (ONB-004 M3)
+    #
+    # The typed pair for each of the three credential keys above. Same
+    # key-value mechanism and ``""``-clears convention as chain_base_url;
+    # the values are secrets — the READ methods exist for the app's engine-
+    # thread credential resolver ONLY, and every settings SURFACE that can
+    # answer about these keys reports SET-vs-UNSET, never the value (see
+    # app._settings_entries). Validation is fail-closed at write, value-free
+    # at every step.
+
+    def get_backend_auth_user(self) -> str | None:
+        """Stored RPC login user, or ``None`` (unset rung)."""
+        return self.get_setting(_BACKEND_AUTH_USER_SETTING)
+
+    def set_backend_auth_user(self, user: str) -> None:
+        """Persist the RPC login user; ``""`` clears it.
+
+        Shape rules (value-free, shared with the password): at most
+        :data:`_MAX_BACKEND_AUTH_CHARS` characters, ASCII, no whitespace and
+        no control characters (the value is joined into an ``Authorization``
+        header; CR/LF there is header injection, refused at the door). A
+        user-without-password stays STORED as such — the app's resolver uses
+        basic auth only when BOTH parts exist, else the documented cookie/
+        no-auth ladder (plan §3 interplay).
+        """
+        self._check_backend_auth_value("backend auth user", user)
+        self._write_backend_auth(_BACKEND_AUTH_USER_SETTING, user)
+
+    def get_backend_auth_pass(self) -> str | None:
+        """Stored RPC login password, or ``None`` (unset rung). NEVER
+        returned by any settings/log surface — engine-thread resolver only."""
+        return self.get_setting(_BACKEND_AUTH_PASS_SETTING)
+
+    def set_backend_auth_pass(self, password: str) -> None:
+        """Persist the RPC login password; ``""`` clears it. Same shape
+        rules (and the same never-echoed contract) as
+        :meth:`set_backend_auth_user`."""
+        self._check_backend_auth_value("backend auth password", password)
+        self._write_backend_auth(_BACKEND_AUTH_PASS_SETTING, password)
+
+    def get_backend_auth_none(self) -> bool:
+        """Whether the explicit "no credentials needed" answer is stored."""
+        return self.get_setting(_BACKEND_AUTH_NONE_SETTING) == "1"
+
+    def set_backend_auth_none(self, on: bool) -> None:
+        """Persist the explicit no-credentials choice (the checkbox: omit
+        the ``Authorization`` header ENTIRELY, cookie file included);
+        ``False`` clears the record (back to the default ladder)."""
+        if not isinstance(on, bool):
+            raise StoreError("backend auth none flag must be a boolean")
+        self._write_backend_auth(_BACKEND_AUTH_NONE_SETTING, "1" if on else "")
+
+    @staticmethod
+    def _check_backend_auth_value(name: str, value: str) -> None:
+        """Fail-closed, value-free shape gate for a credential string
+        (empty = the clear write, checked by the caller's convention)."""
+        if not isinstance(value, str):
+            raise StoreError(f"{name} must be a string")
+        if not value:
+            return
+        if len(value) > _MAX_BACKEND_AUTH_CHARS:
+            raise StoreError(f"{name} is too long")
+        if not value.isascii() or any(
+            c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value
+        ):
+            raise StoreError(
+                f"{name} must be ASCII without whitespace or control characters"
+            )
+
+    def _write_backend_auth(self, key: str, value: str) -> None:
+        """Typed write for the credential pair: ``""`` deletes the row, any
+        other (already validated) value replaces it."""
+        candidate = value  # validated verbatim — NO strip: a credential's
+        # exact bytes are the point (surrounding space is refused above, so
+        # stripping could only mask a typo the user can see in their own file)
+        if not candidate:
+            with self._transaction():
+                self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            return
+        self.set_setting(key, candidate)
 
     # ------------------------------------ coin-selection policy settings (UTXO-002)
     #

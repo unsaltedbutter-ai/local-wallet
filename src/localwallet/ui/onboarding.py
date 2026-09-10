@@ -39,19 +39,29 @@ in the browser, only :data:`WEB_SETUP_HINT`):
   exists DORMANT on every interactive CLI launch and /setup arms it. A
   stored choice is shown first (mode framing, value-free) and an explicit
   ``y`` is required before it can be overwritten; ``n`` exits with no
-  change. ``ssl://`` Electrum-protocol addresses are ACCEPTED since
-  TCK-BACKEND-002 (the M1 adapter is live; the entry probes the handshake
-  + mainnet genesis before saving — user direction 9); the other foreign
+  change. Accepted since then, in order: ``ssl://`` Electrum-protocol
+  addresses (TCK-BACKEND-002) and — TCK-ONB-004 M3 — plain ``bitcoind://``
+  Core RPC addresses and the AUTO-DETECT of an ambiguous ``http://`` one
+  (the user never classifies; the entry probe answers in Core RPC shape
+  first, then Esplora shape, and a Core win STORES the ``bitcoind://``
+  rewrite so kind/badge/dispatch all ride the one scheme seam). Foreign
   schemes are still refused plainly (never probed, never stored, the entry
   re-prompts).
 - Validation is the ADR-0023 decision-5 gate: the ``chain/`` probe (Esplora
-  shape + mainnet genesis, or the Electrum handshake + genesis for
-  ``ssl://``; ADR-0021) plus — loopback URLs only, per the ADR-0016
-  contract — the node doctor's IBD facts; a syncing node is refused with
-  its progress quoted from tool output. A failed URL is NEVER saved and
-  never silently falls back; on success the store's typed writer
-  (:meth:`Store.set_chain_base_url`) is the only writer (ONB-002), and —
-  TCK-BACKEND-002, ADR-0018 amendment — the ``backend_saved`` hook
+  shape + mainnet genesis, the Electrum handshake + genesis for ``ssl://``,
+  or the Core handshake — ``chain == "main"`` + capability floor — for a
+  ``bitcoind://``/answering-http address; ADR-0021) plus — loopback URLs
+  only, per the ADR-0016 contract — the node doctor's IBD facts; a syncing
+  node is refused with its progress quoted from tool output. EVERY entry
+  enforces mainnet AT ENTRY through the real adapter's own handshake — the
+  probe is not a second opinion it can skip. A failed URL is NEVER saved
+  and never silently falls back; on an auth-capable candidate that failed,
+  the flow offers ONE bounded credentials step (TCK-ONB-004 M3: a
+  ``user:password`` pair or ``none`` rides the store's typed
+  never-echoed writers and re-probes; failure restores the prior record,
+  success keeps it). On success the store's typed writer
+  (:meth:`Store.set_chain_base_url`) is the only URL writer (ONB-002), and
+  — TCK-BACKEND-002, ADR-0018 amendment — the ``backend_saved`` hook
   hot-swaps the live client and fires the full resync IN-SESSION (no
   restart); only when an env/config-file rung shadows the stored one does
   the honest next-launch line return.
@@ -92,6 +102,8 @@ __all__ = [
     "SETUP_REVERTED",
     "SWITCHING_NOW",
     "SWITCH_AFTER_SCAN",
+    "URL_CRED_ASK",
+    "URL_CRED_REJECTED",
     "URL_PROMPT",
     "WEB_SETUP_HINT",
     "OnboardingFlow",
@@ -136,10 +148,13 @@ NODE_ASK: Final[str] = (
     "addresses together and to your IP, and watches when your "
     "transactions move.\n"
     "\n"
-    "One honest limit for today: the app connects to an Esplora-style "
-    "http(s) address — the mempool.space app, which those boxes all "
-    "offer — or to an Electrum server's ssl:// address; a plain Bitcoin "
-    "Core install serves neither yet.\n"
+    "One thing you do NOT have to know: which kind of server it is. Give "
+    "me an address — the mempool.space app's http(s) one, an Electrum "
+    "server's ssl:// one, or a plain Bitcoin Core RPC one (a plain http "
+    "address on the RPC port, or written with a bitcoind:// prefix) — and "
+    "the app checks what answers and sets itself up to match; a Core "
+    "login, if it wants one, is asked for separately. Mainnet only, as "
+    "ever.\n"
     "\n"
     "1. Public mempool.space server — nothing to set up, with the leak "
     "above.\n"
@@ -223,25 +238,58 @@ LOAD_COMPLETE: Final[str] = (
     "information for all of your questions.\nHow can I help you?"
 )
 
-#: Copy block (b) — URL entry after choosing 2.
+#: Copy block (b) — URL entry after choosing 2. (TCK-ONB-004 M3: the user
+#: never classifies the kind — the entry probe answers in Core RPC shape,
+#: then Esplora shape, and the app sets itself up to match what answered.)
 URL_PROMPT: Final[str] = (
     "Type the web address of your node's mempool.space app — its API "
-    "address is usually the same, with /api at the end. Nothing is saved, "
-    "and no address of your wallet goes to it, until the app has checked "
-    "that it answers correctly."
+    "address is usually the same, with /api at the end — or the address "
+    "of its Electrum (ssl://) or Bitcoin Core RPC endpoint. The app "
+    "figures out which kind answered. Nothing is saved, and no address "
+    "of your wallet goes to it, until the app has checked that it answers "
+    "correctly."
 )
 
 #: Copy block (c) — validation failure: plain cause, next step, nothing
 #: saved, never a silent public fallback. The family wording widened to
-#: cover ``ssl://`` Electrum servers (TCK-BACKEND-002 — they are now
-#: first-class candidates at this entry, so the honest cause names both).
+#: cover ``ssl://`` Electrum servers (TCK-BACKEND-002) and Bitcoin Core RPC
+#: (TCK-ONB-004 M3 — an http:// address that answers in Core shape is one
+#: of the shapes this entry tries, so the honest cause names all three).
 VALIDATION_FAIL: Final[str] = (
-    "That address didn't check out: it wasn't reachable, or it didn't "
-    "answer as a mainnet Esplora (mempool.space) or Electrum server. "
-    "Nothing was saved, and no address of your wallet was ever sent to "
-    "it. Ask \"node status\" to see what the app can detect on this "
-    "machine — then say \"retry\" with the same or a new address, or pick "
-    "the public server instead."
+    "That address didn't check out: it wasn't reachable, it didn't answer "
+    "as a mainnet Esplora (mempool.space-style), Electrum or Bitcoin Core "
+    "server, or it refused the login on file. Nothing was saved, and no "
+    "address of your wallet was ever sent to it. Ask \"node status\" to "
+    "see what the app can detect on this machine — then say \"retry\" "
+    "with the same or a new address, or pick the public server instead."
+)
+
+#: TCK-ONB-004 M3 — offered ONCE after a failed validation of an auth-
+#: capable candidate (``http://``/``bitcoind://``): the credentials step.
+#: The terminal cannot hide what is typed (said plainly — the honest
+#: difference from the web Settings pane, which uses a password field);
+#: the pair rides the store's typed never-echoed writers, is sent only to
+#: that server, and a failed re-check restores whatever login was on file
+#: before. Value-free like every other string here (the user's typed
+#: credential is never repeated back).
+URL_CRED_ASK: Final[str] = (
+    "If that server needs a login before it answers (Bitcoin Core usually "
+    "does), type it as user:password on one line and I'll check again — "
+    "one caution: this terminal does not hide what you type. The pair is "
+    "kept only in this app's local database, sent only to that server, "
+    "and never logged or repeated back. If it needs no login, type "
+    "'none'. Type 'back' to go back to the address step."
+)
+
+#: The credentials step's shape refusal (before anything is stored): the
+#: store's typed writer refused the pair (ASCII-only, no whitespace, no
+#: control characters — the same rules the ``bitcoind://`` URL userinfo
+#: carries). Value-free by construction: it names the RULES, never the
+#: submitted text (which may itself be a credential).
+URL_CRED_REJECTED: Final[str] = (
+    "That login didn't fit the rules: both sides of the colon must be "
+    "plain ASCII without spaces or control characters. Try again, type "
+    "'none' if the server needs no login, or 'back'."
 )
 
 #: Copy block (d) — confirmation after a successful own-node setup
@@ -377,17 +425,17 @@ SETUP_REVERTED: Final[str] = (
     "been removed."
 )
 
-#: A URL whose scheme NO entry point of this app can speak (neither the
-#: http(s) Esplora family nor the ``ssl://`` Electrum family —
-#: TCK-BACKEND-002 opened ssl://; ftp:// and friends stay foreign): plain
-#: statement, no probe, nothing saved — and the entry re-prompts (never a
-#: dead end).
+#: A URL whose scheme NO entry point of this app can speak — foreign
+#: schemes like ftp:// stay refused (http(s), ssl:// and bitcoind:// are
+#: the families the app speaks since TCK-ONB-004 M3, which also opened
+#: plain Core RPC addresses): plain statement, no probe, nothing saved —
+#: and the entry re-prompts (never a dead end).
 NON_ESPLORA_URL: Final[str] = (
-    "I can't use that address: this app speaks only Esplora servers over "
-    "http(s) — the web address of a mempool.space app — and Electrum "
-    "servers over ssl:// (a plain Bitcoin Core address is not one of "
-    "those). Nothing was probed and nothing was saved. Type an http(s) "
-    "or ssl:// address, or 1 for the public server."
+    "I can't use that address: this app speaks Esplora servers over "
+    "http(s) — the web address of a mempool.space app — Electrum servers "
+    "over ssl://, and Bitcoin Core over a plain http RPC address (or one "
+    "written with a bitcoind:// prefix). Nothing was probed and nothing "
+    "was saved. Type such an address, or 1 for the public server."
 )
 
 #: /setup refuses DORMANT when the stored rung cannot be read (no gate can
@@ -464,6 +512,13 @@ _OWN_NODE_WORDS: Final[frozenset[str]] = frozenset(
 )
 _CONFIRM_YES: Final[frozenset[str]] = frozenset({"y", "yes"})
 _CONFIRM_NO: Final[frozenset[str]] = frozenset({"n", "no"})
+#: TCK-ONB-004 M3: the closed answer vocabulary of the credentials step's
+#: "this server needs no login" branch. Bare "no" is deliberately NOT one
+#: of them (in the surrounding conversation it has meant the node-ask skip
+#: ever since ADR-0023 — the step re-prompts instead of guessing).
+_CRED_NONE_WORDS: Final[frozenset[str]] = frozenset(
+    {"none", "no credentials", "no credentials needed", "no auth", "no login"}
+)
 _HELP_WORDS: Final[frozenset[str]] = frozenset(
     {"help", "where", "where do i find it", "where do i get that", "idk"}
 )
@@ -486,6 +541,11 @@ class _AskState(Enum):
     #: /setup only (TCK-ONB-005): a stored choice was shown; the next line
     #: must be the deterministic y/n before the ask even appears.
     SETUP_CONFIRM = "setup_confirm"
+    #: TCK-ONB-004 M3: a validation of an auth-capable address failed; the
+    #: next line may be a ``user:password`` credential, ``none`` (explicit
+    #: no-login), a corrected address, or ``back``. ONE ask per failure —
+    #: a second failure does not re-ask (no credential ping-pong).
+    CRED_ASK = "cred_ask"
 
 
 def _norm(line: str) -> str:
@@ -500,23 +560,41 @@ def _looks_like_seed(line: str) -> bool:
     return "<seed>" in redact_transcript(line.lower())
 
 
+#: The schemes this app's entries accept (TCK-ONB-004 M3 closed the last
+#: gap: plain ``bitcoind://`` Core RPC, auto-detected ``http://`` Core
+#: endpoints). Stored URLs are canonical: an http:// candidate that answers
+#: in Core shape is saved as ``bitcoind://`` by the entry probe.
+_URL_SCHEMES: Final[tuple[str, ...]] = ("http://", "https://", "ssl://", "bitcoind://")
+
+
 def _is_url_candidate(line: str) -> bool:
     # TCK-BACKEND-002 (user direction 9): ``ssl://`` is a FIRST-CLASS
     # candidate now — the M1 Electrum adapter is live and the entry probes
     # it (handshake + mainnet genesis) before saving, same discipline as
-    # http(s).
-    return line.strip().lower().startswith(("http://", "https://", "ssl://"))
+    # http(s). TCK-ONB-004 M3 adds the explicit ``bitcoind://`` scheme.
+    return line.strip().lower().startswith(_URL_SCHEMES)
+
+
+def _scheme_can_auth(line: str) -> bool:
+    """Whether an address names a server family this app can hand a login
+    to (TCK-ONB-004 M3): the ambiguous ``http://`` rung (the Core RPC probe
+    runs against it) and the explicit ``bitcoind://`` scheme. ``https://``
+    is Esplora-primary (Core RPC is plain-http — M2 scope), and ``ssl://``
+    Electrum has no standard auth (plan OQ-5); for both, credentials are
+    inert, so the conversation never asks for them there."""
+    low = line.strip().lower()
+    return low.startswith(("http://", "bitcoind://"))
 
 
 def _is_other_scheme_url(line: str) -> bool:
-    """A bare URL with a scheme we still cannot speak — anything but the
-    http(s) Esplora family and the ``ssl://`` Electrum family (TCK-BACKEND-002
-    closed the ssl:// gap; the M1 adapter + the handshake genesis gate make
-    it a first-class candidate). Scheme token immediately before ``://``
-    (no spaces): free prose merely MENTIONING a URL ("why is https://x
-    slow?") stays ordinary chat."""
+    """A bare URL with a scheme we still cannot speak (ftp:// and
+    friends — the full accepted family is :data:`_URL_SCHEMES`;
+    TCK-ONB-004 M3 opened ``bitcoind://`` alongside the http(s)/ssl://
+    families). Scheme token immediately before ``://`` (no spaces): free
+    prose merely MENTIONING a URL ("why is https://x slow?") stays ordinary
+    chat."""
     low = line.strip().lower()
-    if "://" not in low or low.startswith(("http://", "https://", "ssl://")):
+    if "://" not in low or low.startswith(_URL_SCHEMES):
         return False
     return " " not in low.split("://", 1)[0]
 
@@ -603,7 +681,7 @@ class OnboardingFlow:
         self,
         *,
         store: Store,
-        check_backend: Callable[[str], bool],
+        check_backend: Callable[[str], str | None],
         node_report: Callable[[], LocalNodeReport] | None = None,
         loopback_host: Callable[[str], str | None] | None = None,
         armed: bool = True,
@@ -612,6 +690,9 @@ class OnboardingFlow:
         backend_saved: Callable[[str], str] | None = None,
     ) -> None:
         self._store = store
+        # TCK-ONB-004 M3 probe contract: candidate URL in, the CANONICAL URL
+        # to store back (auto-detect may rewrite http://→bitcoind://), or
+        # None for a value-free refusal.
         self._check_backend = check_backend
         self._node_report = node_report
         self._loopback_host = loopback_host
@@ -622,6 +703,9 @@ class OnboardingFlow:
         self._deferred = deferred
         self._public_chosen = public_chosen
         self._backend_saved = backend_saved
+        #: The candidate whose validation opened the credentials step
+        #: (:data:`_AskState.CRED_ASK` only; None the rest of the time).
+        self._cred_url: str | None = None
 
     @property
     def done(self) -> bool:
@@ -667,6 +751,7 @@ class OnboardingFlow:
         (env/config-file rung shadowing the stored one).
         """
         self._last_failed = None
+        self._cred_url = None
         try:
             current = self._store.get_chain_base_url()
         except StoreError:
@@ -716,6 +801,8 @@ class OnboardingFlow:
             else:
                 output_fn(SETUP_OVERWRITE)
             return True
+        if self._state is _AskState.CRED_ASK:
+            return self._handle_cred_line(text, key, output_fn)
         if _is_other_scheme_url(text):
             # A scheme NEITHER entry point speaks (ftp:// and friends —
             # TCK-BACKEND-002 opened ssl:// to the full probe+store+swap
@@ -842,29 +929,134 @@ class OnboardingFlow:
         self._deferred = False
 
     def _validate(self, url: str, output_fn: Callable[[str], None]) -> bool:
-        """Decision-5 validation: chain probe (http(s) Esplora shape, or the
-        ssl:// Electrum handshake + mainnet genesis since TCK-BACKEND-002 —
-        the injected probe dispatches by scheme) + (loopback only) doctor's
-        IBD facts; success is the typed store write, failure is copy (c) or
-        the syncing branch. NEVER saves on failure. A save that lands then
-        rides the engine's hot-swap hook (in-session switch + resync), or
-        the honest next-launch line when the swap declines."""
-        if not self._check_backend(url):
+        """Decision-5 validation: chain probe (http(s) Esplora shape +
+        mainnet genesis, the ssl:// Electrum handshake + genesis since
+        TCK-BACKEND-002, or the Core RPC handshake — ``chain == "main"`` +
+        capability floor — for ``bitcoind://`` and, since TCK-ONB-004 M3,
+        as the FIRST shape tried on an ambiguous ``http://``; the injected
+        probe dispatches the families and returns the CANONICAL URL to
+        store — an http:// endpoint answering in Core shape is saved as
+        ``bitcoind://``, so the detected kind rides the one scheme seam
+        every other surface uses) + (loopback only) doctor's IBD facts.
+        Success is the typed store write; failure is copy (c) or the
+        syncing branch — and, for an auth-capable candidate that has not
+        been given the credentials step yet, that ONE step (M3). NEVER
+        saves on failure. A save that lands rides the engine's hot-swap
+        hook (in-session switch + resync), or the honest next-launch line
+        when the swap declines."""
+        canonical = self._check_backend(url)
+        if canonical is None:
+            output_fn(VALIDATION_FAIL)
+            self._last_failed = url
+            if _scheme_can_auth(url):
+                # The ONE bounded credentials offer per failed validation
+                # (TCK-ONB-004 M3). A second failed check does NOT re-ask
+                # here (no credential ping-pong) — the next attempt from
+                # the URL rung gets a fresh offer with it.
+                self._cred_url = url
+                self._state = _AskState.CRED_ASK
+                output_fn(URL_CRED_ASK)
+            return True
+        return self._finish(canonical, output_fn)
+
+    def _handle_cred_line(
+        self, text: str, key: str, output_fn: Callable[[str], None]
+    ) -> bool:
+        """The credentials step (TCK-ONB-004 M3): ``user:password`` (store
+        the pair), a closed no-login word (store explicit none-credentials —
+        the header omitted entirely, cookie file never consulted), a
+        corrected address (validated straight away), or ``back``. The
+        candidate rides the store's typed NEVER-ECHOED writers and the SAME
+        production probe (which resolves credentials from the store at call
+        time — no second path); the prior credential record is restored
+        unless the address then SAVES, so a failed attempt can never strand
+        the working backend's login. Nothing on this channel reaches the
+        model; the typed credential is never repeated back."""
+        url = self._cred_url or ""
+        if key in _BACK_WORDS:
+            self._cred_url = None
+            self._state = _AskState.URL_ASK
+            output_fn(URL_PROMPT)
+            return True
+        if _is_url_candidate(text):
+            # A corrected address is welcome here — probe it with whatever
+            # credential the store currently holds (the prior record was
+            # restored when this step opened on failure… it wasn't written
+            # yet; either way the store is the single truth the probe sees).
+            self._cred_url = None
+            return self._validate(text, output_fn)
+        snapshot: tuple[str | None, str | None, bool] | None = None
+        try:
+            snapshot = (
+                self._store.get_backend_auth_user(),
+                self._store.get_backend_auth_pass(),
+                self._store.get_backend_auth_none(),
+            )
+            if key in _CRED_NONE_WORDS:
+                self._store.set_backend_auth_none(True)
+                self._store.set_backend_auth_user("")
+                self._store.set_backend_auth_pass("")
+            else:
+                user, sep, password = text.partition(":")
+                if not sep or not user.strip() or not password.strip():
+                    # Not a pair, not none, not back, not a URL: re-prompt
+                    # the closed step (never a model turn, never a guess).
+                    output_fn(URL_CRED_ASK)
+                    return True
+                self._store.set_backend_auth_none(False)
+                self._store.set_backend_auth_user(user.strip())
+                self._store.set_backend_auth_pass(password.strip())
+        except StoreError:
+            # Shape refusal (or a store that cannot take the write): roll
+            # back ANY partial application, keep the step open, value-free.
+            self._restore_creds(snapshot)
+            output_fn(URL_CRED_REJECTED)
+            return True
+        self._cred_url = None
+        canonical = self._check_backend(url) if url else None
+        if canonical is None:
+            self._restore_creds(snapshot)
+            self._state = _AskState.URL_ASK
             output_fn(VALIDATION_FAIL)
             self._last_failed = url
             return True
-        syncing = self._syncing_node_line(url)
+        return self._finish(canonical, output_fn)
+
+    def _restore_creds(
+        self, snapshot: tuple[str | None, str | None, bool] | None
+    ) -> None:
+        """Best-effort rewind of the credential record to a prior snapshot
+        (values that passed the typed writers once pass again; an
+        unrecoverable store here is the same sqlite-loss failure the save
+        path already answers — nothing sensitive can escape these value-free
+        lines)."""
+        if snapshot is None:
+            return
+        user, password, none_flag = snapshot
+        try:
+            self._store.set_backend_auth_none(none_flag)
+            self._store.set_backend_auth_user(user or "")
+            self._store.set_backend_auth_pass(password or "")
+        except StoreError:
+            pass
+
+    def _finish(self, canonical: str, output_fn: Callable[[str], None]) -> bool:
+        """The save + swap tail shared by the address step and the
+        credentials step: doctor's loopback IBD gate, the typed store write
+        of the probe's CANONICAL url, then the hot-swap honesty lines."""
+        self._cred_url = None
+        syncing = self._syncing_node_line(canonical)
         if syncing is not None:
             output_fn(syncing)
-            self._last_failed = url
+            self._last_failed = canonical
             return True
         try:
-            self._store.set_chain_base_url(url)
+            self._store.set_chain_base_url(canonical)
         except StoreError:
             # Unreachable behind the probe (the writer's shape rules are a
             # subset the probe already enforced); fail closed, value-free.
             output_fn(VALIDATION_FAIL)
-            self._last_failed = url
+            self._last_failed = canonical
             return True
         output_fn(CONFIRMED)
         # TCK-BACKEND-002 (ADR-0018 amendment): the engine hot-swaps the
@@ -872,7 +1064,11 @@ class OnboardingFlow:
         # follows the hook's ACTUAL outcome (never claims a switch the
         # shadowed ladder declined, and never promises a restart the swap
         # already performed).
-        outcome = self._backend_saved(url) if self._backend_saved is not None else "skipped"
+        outcome = (
+            self._backend_saved(canonical)
+            if self._backend_saved is not None
+            else "skipped"
+        )
         if outcome in ("swapped", "deferred"):
             self._deferred = False
             output_fn(SWITCHING_NOW if outcome == "swapped" else SWITCH_AFTER_SCAN)

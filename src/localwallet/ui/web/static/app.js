@@ -106,7 +106,8 @@ const LABELS = {
     "want to watch instead.",
   watchKeyReplaceSubmit: "Replace wallet",
   // backend badges (TCK-WEB-009 e) — the words are the closed enum family
-  // names the engine's backend_kind maps onto (bitcoind is reserved).
+  // names the engine's backend_kind maps onto (TCK-ONB-004 M3: every
+  // family in the closed enum is live and emittable now).
   badgeMempool: "mempool",
   badgeElectrum: "electrum",
   badgeBitcoind: "bitcoind",
@@ -119,9 +120,28 @@ const LABELS = {
   badgeInUse:
     "In use — the app checks your addresses against this kind of server.",
   badgeIdle: "Not in use.",
-  badgeReserved:
-    "Not available yet — the app cannot connect to a plain Bitcoin Core " +
-    "address.",
+  // TCK-ONB-004 M3: the bitcoind badge is a LIVE family now (Core RPC is
+  // selectable and auto-detected) — the old "not available yet" line was
+  // retired with the M2/M3 flip; every badge now shares in-use/idle words.
+  // Backend credentials (TCK-ONB-004 M3): the chain-base row's login block,
+  // shown while EDITING an http:// (ambiguous — could be Core RPC) or
+  // bitcoind:// address. The password never comes back from the server (the
+  // engine's entry says only SET/UNSET), so the fields start empty every
+  // render; typing is local-only, and a submitted value rides one POST and
+  // is never echoed by any reply.
+  credsHeading: "Server login — only if it asks for one",
+  credsHint:
+    "Kept in this app's local database on this machine, sent only to that " +
+    "server, never logged and never shown back here.",
+  credsUserLabel: "User",
+  credsPassLabel: "Password",
+  credsNoneLabel: "No credentials needed",
+  credsSavedNote: "A login record is saved for your server (the value is not shown).",
+  credsNoneSaved:
+    "Your server is saved as needing no login — the app sends none.",
+  credsClear: "Clear login",
+  credsCleared: "Login cleared — press Apply again to reconnect without it.",
+  credsNeedBoth: "Fill in both user and password, or neither.",
   // Resync now (TCK-WEB-009 f) — POST /resync's closed statuses, value-free.
   resyncNow: "Resync now",
   resyncSaving: "Starting…",
@@ -172,8 +192,9 @@ const FLOW_STATES = new Set([
 // BACKEND_KINDS). mempool/electrum/bitcoind are the badge families: every
 // http(s) Esplora-shaped backend (the public mempool.space default, a
 // self-hosted mempool /api install, a root-served electrs/esplora) is the
-// "mempool" family; ssl:// is electrum; bitcoind is reserved (never emitted
-// today — its badge stays dimmed by construction). "none"/unknown: all dim.
+// "mempool" family; ssl:// is electrum; bitcoind is the M2/M3 Core-RPC
+// adapter (emitted since the M3 stored rung — including the http://
+// auto-detect rewrite). "none"/unknown: all dim.
 // ponytail: one badge per family, not per enum name — a fourth "esplora"
 // badge only earns its pixels when the two ever behave differently here.
 const BADGE_FAMILIES = {
@@ -183,6 +204,13 @@ const BADGE_FAMILIES = {
 };
 const BACKEND_KINDS = new Set([
   "none", "electrum", "public", "mempool", "esplora", "bitcoind",
+]);
+// Keys the pane renders specially (own rows / own block) — everything else
+// on the allowlist falls through to the generic text row. The credential
+// trio (TCK-ONB-004 M3) belongs to the chain-base row's login block.
+const SPECIAL_SETTING_KEYS = new Set([
+  "watch_key", "chain_base_url", "gap_limit",
+  "backend_auth_user", "backend_auth_pass", "backend_auth_none",
 ]);
 
 // The closed resync statuses the settings/resync replies carry (app.py
@@ -964,30 +992,186 @@ function chainBaseRow(entry) {
   if (entry.env_override === true) {
     li.appendChild(el("p", "setting-flag", LABELS.settingsEnvOverride));
   }
+
+  // TCK-ONB-004 M3: the credentials block. The engine's secret entries
+  // report only SET/UNSET (never the value), so the fields start empty on
+  // every render; the checkbox mirrors the stored none-flag. Visibility:
+  // while EDITING an http:// (ambiguous — may be Core RPC) or bitcoind://
+  // address only; https answers as Esplora (creds inert) and ssl://
+  // Electrum has no standard auth — the fields never appear for those.
+  const credFlags = backendCredFlags();
+  if (credFlags.none) {
+    li.appendChild(el("p", "setting-flag creds-note", LABELS.credsNoneSaved));
+  } else if (credFlags.user || credFlags.pass) {
+    li.appendChild(el("p", "setting-flag creds-note", LABELS.credsSavedNote));
+  }
+  if (credFlags.none || credFlags.user || credFlags.pass) {
+    const clearLine = el("div", "setting-line setting-creds-clear-line");
+    const clearBtn = el("button", "btn btn-secondary btn-small", LABELS.credsClear);
+    clearBtn.type = "button";
+    clearBtn.addEventListener("click", () => {
+      const note = li.querySelector(".setting-status");
+      clearBackendCreds(clearBtn, note, li);
+    });
+    clearLine.appendChild(clearBtn);
+    li.appendChild(clearLine);
+  }
+  const creds = el("div", "setting-creds");
+  creds.hidden = true;
+  const noneLine = el("label", "setting-creds-none");
+  const noneBox = document.createElement("input");
+  noneBox.type = "checkbox";
+  noneBox.className = "creds-none";
+  noneBox.checked = credFlags.none;
+  noneLine.append(noneBox, document.createTextNode(" " + LABELS.credsNoneLabel));
+  const userIn = document.createElement("input");
+  userIn.type = "text";
+  userIn.className = "setting-input creds-user";
+  userIn.spellcheck = false;
+  userIn.autocomplete = "off";
+  userIn.maxLength = 256;
+  userIn.placeholder = LABELS.credsUserLabel;
+  userIn.setAttribute("aria-label", LABELS.credsUserLabel);
+  const passIn = document.createElement("input");
+  passIn.type = "password";
+  passIn.className = "setting-input creds-pass";
+  passIn.autocomplete = "new-password";
+  passIn.maxLength = 256;
+  passIn.placeholder = LABELS.credsPassLabel;
+  passIn.setAttribute("aria-label", LABELS.credsPassLabel);
+  const credsLine = el("div", "setting-line");
+  credsLine.append(userIn, passIn);
+  creds.append(noneLine, credsLine, el("p", "setting-hint", LABELS.credsHint));
+  li.appendChild(creds);
+  li.dataset.credsNoneInitial = credFlags.none ? "1" : "0";
+  input.addEventListener("input", () => updateCredsVisibility(li, input));
+
   const status = el("p", "setting-status");
   status.setAttribute("role", "status");
   li.appendChild(status);
   return li;
 }
 
+// What the engine's secret entries said at the last full read (the ONLY
+// credential facts the client may know: set/unset flags, never values).
+function backendCredFlags() {
+  const get = (key) => {
+    const entry = state.settings && state.settings.get(key);
+    return !!(entry && entry.configured === true);
+  };
+  return {
+    user: get("backend_auth_user"),
+    pass: get("backend_auth_pass"),
+    none: get("backend_auth_none"),
+  };
+}
+
+// The login block shows only while editing an auth-capable scheme.
+function updateCredsVisibility(row, input) {
+  const creds = row.querySelector(".setting-creds");
+  if (!creds) return;
+  const value = input.value.trim().toLowerCase();
+  creds.hidden = !(
+    input.readOnly === false &&
+    (value.startsWith("http://") || value.startsWith("bitcoind://"))
+  );
+}
+
+// One POST /settings write, parsed or null. Returns the engine's reply
+// object (its closed ``status`` is the truth the caller judges).
+async function postSetting(key, value) {
+  const response = await fetch("/settings", {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ key, value }),
+  });
+  return response.json().catch(() => null);
+}
+
+// The ordered writes the chain-base Apply rung submits BEFORE the URL (so
+// the engine's probe — which resolves credentials from the store at call
+// time — sees them; "creds ride the probe and the built client"). The
+// checkbox wins outright when checked: explicit no-auth, pair wiped.
+function credWrites(row) {
+  const box = row.querySelector(".creds-none");
+  if (!box) return [];
+  const user = row.querySelector(".creds-user");
+  const pass = row.querySelector(".creds-pass");
+  const wasNone = row.dataset.credsNoneInitial === "1";
+  if (box.checked) {
+    const writes = wasNone ? [] : [["backend_auth_none", "1"]];
+    if (wasNone || user.value || pass.value) {
+      writes.push(["backend_auth_user", ""], ["backend_auth_pass", ""]);
+    }
+    return writes;
+  }
+  const writes = wasNone ? [["backend_auth_none", ""]] : [];
+  if (user.value || pass.value) {
+    writes.push(["backend_auth_user", user.value], ["backend_auth_pass", pass.value]);
+  }
+  return writes;
+}
+
+// Local courtesy gate (the engine re-validates fail-closed regardless): a
+// pair is written TOGETHER or not at all — a half-typed login is refused
+// on the spot instead of silently falling back to the cookie ladder.
+function localCredProblem(row) {
+  const box = row.querySelector(".creds-none");
+  if (!box || box.checked) return "";
+  const user = row.querySelector(".creds-user");
+  const pass = row.querySelector(".creds-pass");
+  if ((user.value && !pass.value) || (pass.value && !user.value)) {
+    return LABELS.credsNeedBoth;
+  }
+  return "";
+}
+
+// Clear login: three "" writes (the typed-writer clear convention), then a
+// local flag flip — the note lines are the only visible state and the next
+// full read renders engine truth anyway.
+async function clearBackendCreds(btn, status, row) {
+  if (btn.disabled || state.stopped) return;
+  btn.disabled = true;
+  status.dataset.kind = "";
+  status.textContent = LABELS.settingsSaving;
+  try {
+    for (const key of ["backend_auth_user", "backend_auth_pass", "backend_auth_none"]) {
+      const data = await postSetting(key, "");
+      if (!data || data.status !== "applied") {
+        status.dataset.kind = "error";
+        status.textContent =
+          data && typeof data.error === "string"
+            ? LABELS.settingsRejectedPrefix + " " + data.error
+            : LABELS.settingsFailed;
+        return;
+      }
+    }
+    status.dataset.kind = "ok";
+    status.textContent = LABELS.credsCleared;
+    row.dataset.credsNoneInitial = "0";
+    row.querySelectorAll(".creds-note").forEach((note) => note.remove());
+    const clearLine = row.querySelector(".setting-creds-clear-line");
+    if (clearLine) clearLine.remove();
+  } catch {
+    status.dataset.kind = "error";
+    status.textContent = LABELS.unreachable;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 // (e): dimmed by default (low-opacity token styling), highlighted only for
-// the family the current backend_kind belongs to. bitcoind stays dimmed —
-// reserved, the engine never emits that kind today. Copy pass 2 #44: the
+// the family the current backend_kind belongs to. Copy pass 2 #44: the
 // dim/lit state is styling, so this sole painter also recomposes each
-// badge's title + aria-label (lit → in-use; dim → idle; the permanently-dim
-// bitcoind → the dedicated "not available yet" line, so it never reads as a
-// detection bug). The accessible name keeps the family word + the sentence.
+// badge's title + aria-label (lit → in-use; dim → idle). The accessible
+// name keeps the family word + the sentence.
 function paintBackendBadges() {
   for (const badge of settingsListEl.querySelectorAll(".backend-badge")) {
     const family = BADGE_FAMILIES[badge.dataset.badge];
     const active = !!(family && state.backendKind && family.has(state.backendKind));
     if (active) badge.dataset.active = "true";
     else badge.removeAttribute("data-active");
-    const words = active
-      ? LABELS.badgeInUse
-      : badge.dataset.badge === "bitcoind"
-        ? LABELS.badgeReserved
-        : LABELS.badgeIdle;
+    const words = active ? LABELS.badgeInUse : LABELS.badgeIdle;
     badge.title = words;
     badge.setAttribute("aria-label", badge.textContent + " — " + words);
   }
@@ -1048,7 +1232,11 @@ function renderSettings() {
       networkRows.push(settingRow(gap, inputSeq));
     }
     for (const entry of entries.values()) {
-      if (entry.key !== "watch_key" && entry.key !== "chain_base_url" && entry.key !== "gap_limit") {
+      // watch_key/chain_base_url/gap_limit have their own rows; the three
+      // secret credential entries (TCK-ONB-004 M3) render INSIDE the chain-
+      // base row's login block — a generic text row would beg for a value
+      // the server will never return.
+      if (!SPECIAL_SETTING_KEYS.has(entry.key)) {
         inputSeq += 1;
         networkRows.push(settingRow(entry, inputSeq));
       }
@@ -1137,15 +1325,17 @@ settingsListEl.addEventListener("click", async (event) => {
   const status = row.querySelector(".setting-status");
   const isChain = btn.dataset.settingKey === "chain_base_url";
   if (isChain && input.readOnly) {
-    // Edit rung: no request, no state change — just open the field.
+    // Edit rung: no request, no state change — just open the field (and,
+    // TCK-ONB-004 M3, the login block if the scheme can carry one).
     input.readOnly = false;
     input.focus();
     btn.textContent = LABELS.settingsApply;
     status.dataset.kind = "";
     status.textContent = "";
+    updateCredsVisibility(row, input);
     return;
   }
-  const problem = localSettingProblem(input);
+  const problem = localSettingProblem(input) || (isChain ? localCredProblem(row) : "");
   status.dataset.kind = "error";
   if (problem) {
     status.textContent = problem;
@@ -1155,6 +1345,22 @@ settingsListEl.addEventListener("click", async (event) => {
   status.textContent = LABELS.settingsSaving;
   const submitted = input.value.trim(); // emptiness test only — never re-echoed
   try {
+    if (isChain) {
+      // Credentials FIRST, address second (M3): the engine's Apply-time
+      // probe resolves them from the store, so ordering IS the UX —
+      // "Apply" tests the login you just typed. Any refused cred write
+      // stops before the URL is touched.
+      for (const [key, value] of credWrites(row)) {
+        const cred = await postSetting(key, value);
+        if (!cred || cred.status !== "applied") {
+          status.textContent =
+            cred && typeof cred.error === "string"
+              ? LABELS.settingsRejectedPrefix + " " + cred.error
+              : LABELS.settingsFailed;
+          return;
+        }
+      }
+    }
     const response = await fetch("/settings", {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
@@ -1188,6 +1394,31 @@ settingsListEl.addEventListener("click", async (event) => {
       if (isChain) {
         input.readOnly = true; // (d): applied → back to the read-only state
         btn.textContent = LABELS.settingsEdit;
+        // (M3): the login fields close with the row — the pair lives only
+        // in the engine's store now; refresh the local set/unset facts from
+        // what this Apply actually wrote (the next full read confirms
+        // engine truth; the values themselves never come back).
+        const creds = row.querySelector(".setting-creds");
+        if (creds) {
+          creds.hidden = true;
+          const user = row.querySelector(".creds-user");
+          const pass = row.querySelector(".creds-pass");
+          const box = row.querySelector(".creds-none");
+          if (!box.checked && user.value && pass.value) {
+            row.dataset.credsNoneInitial = "0";
+            if (!row.querySelector(".creds-note")) {
+              row.insertBefore(
+                el("p", "setting-flag creds-note", LABELS.credsSavedNote),
+                creds,
+              );
+            }
+          }
+          if (box.checked) {
+            row.dataset.credsNoneInitial = "1";
+          }
+          user.value = "";
+          pass.value = "";
+        }
       }
       if (state.settings && fresh && typeof fresh.key === "string") {
         state.settings.set(fresh.key, fresh);

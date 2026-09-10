@@ -249,6 +249,21 @@ body {
   color: var(--c-text-muted);
 }
 
+/* TCK-ONB-004 M3: the chain-base row's login block (checkbox + pair),
+   visible only while editing an http://-ambiguous or bitcoind:// address. */
+.setting-creds {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.setting-creds-none {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-sm);
+}
+
 /* TCK-WEB-008/009: settings sections, the watch-key row and its controls.
    Tokens only, like every other rule in this file. */
 .setting-heading {

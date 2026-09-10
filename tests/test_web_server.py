@@ -1160,7 +1160,24 @@ def test_settings_get_lists_the_allowlist_shape_only(
         assert snapshot["schema"] == "settings/1"
         assert snapshot["status"] == "ok"
         entries = {entry["key"]: entry for entry in snapshot["settings"]}
-        assert set(entries) == {"gap_limit", "chain_base_url", "watch_key"}
+        assert set(entries) == {
+            "gap_limit",
+            "chain_base_url",
+            "watch_key",
+            # TCK-ONB-004 M3: the credential keys join the read surface as
+            # SECRET entries — set/unset facts only, never the value.
+            "backend_auth_user",
+            "backend_auth_pass",
+            "backend_auth_none",
+        }
+        # The M3 never-echo pin: even the PASSWORD key's entry carries no
+        # value anywhere in the reply bytes (the raw response is what the
+        # browser gets — the check runs on `data` below).
+        for secret_key in ("backend_auth_user", "backend_auth_pass", "backend_auth_none"):
+            secret = entries[secret_key]
+            assert secret["type"] == "secret"
+            assert secret["value"] is None
+            assert secret["configured"] is False
         gap = entries["gap_limit"]
         assert gap["type"] == "int" and gap["value"] is None
         assert gap["default"] == str(app.wallet_scan.DEFAULT_GAP_LIMIT)
@@ -1886,7 +1903,7 @@ def test_download_progress_is_int_only_value_free_sse(tmp_path: Path) -> None:
                 v is None or isinstance(v, int) for v in payload.values()
             )
             assert b"/" not in raw  # no path-shaped string in any tick
-        stream.read_until(b"downloaded and verified")  # the ready line
+        stream.read_until(b"Downloaded and verified")  # the ready line (copy pass 2 #68)
         snap = _session_state(server)
         assert snap["model_state"] == "ready"
     finally:

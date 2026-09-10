@@ -68,16 +68,35 @@ def _entries(store: Store) -> dict[str, dict[str, Any]]:
 
 
 def test_allowlist_is_exactly_the_live_db_keys(env_clean: None, tmp_path: Path) -> None:
-    """The fail-closed list: the two writable DB keys today, each with name,
-    current value, type, bounds and honest flags — plus the READ-ONLY
-    ``watch_key`` entry (TCK-WEB-008 follow-up (a), TCK-LAUNCH-002). A key
-    whose DB rung has no reader would be a write into the void — refused
-    (absent), never invented; the watch key is deliberately NOT writable
-    through this surface (it is absent from the write allowlist below)."""
+    """The fail-closed list: the writable DB keys (gap_limit, chain_base_url
+    + the TCK-ONB-004 M3 credential trio), each with name, current value
+    (NEVER for secrets — configured flag only), type, bounds and honest
+    flags — plus the READ-ONLY ``watch_key`` entry (TCK-WEB-008 follow-up
+    (a), TCK-LAUNCH-002). A key whose DB rung has no reader would be a write
+    into the void — refused (absent), never invented; the watch key is
+    deliberately NOT writable through this surface (it is absent from the
+    write allowlist below)."""
     store = Store(tmp_path / "allow.db")
     try:
         entries = _entries(store)
-        assert set(entries) == {"gap_limit", "chain_base_url", "watch_key"}
+        assert set(entries) == {
+            "gap_limit",
+            "chain_base_url",
+            "watch_key",
+            # TCK-ONB-004 M3: the credential keys — writable AND readable,
+            # but the read answers SET/UNSET only (``type: "secret"``).
+            "backend_auth_user",
+            "backend_auth_pass",
+            "backend_auth_none",
+        }
+        for secret_key in (
+            "backend_auth_user",
+            "backend_auth_pass",
+            "backend_auth_none",
+        ):
+            secret = entries[secret_key]
+            assert secret["type"] == "secret" and secret["value"] is None
+            assert secret["configured"] is False  # nothing stored yet
         gap = entries["gap_limit"]
         assert gap == {
             "key": "gap_limit",

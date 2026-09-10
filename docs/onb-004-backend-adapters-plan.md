@@ -1,7 +1,7 @@
 # ONB-004 — Backend adapters plan (Electrum + bitcoind RPC + auto-detect/creds)
 
-- **Status:** M1+M2 IMPLEMENTED (TCK-ONB-004 M1 2026-09-09, M2 2026-09-10 —
-  status notes at §1/§2); M3 plan (pre-implementation)
+- **Status:** M1+M2+M3 IMPLEMENTED (TCK-ONB-004 M1 2026-09-09, M2 2026-09-10,
+  M3 2026-09-10 — status notes at §1/§2/§3)
 - **Branch:** dev/plan-run-1
 - **Tracks:** TCK-ONB-004 (ADR-0023 decision 7 backlog)
 - **Scope:** `src/localwallet/chain/`, `src/localwallet/ui/onboarding.py`, `/setup`, web settings, `src/localwallet/config.py`, tests. ADR-0018/0023 amendment on acceptance.
@@ -282,6 +282,49 @@ is low-sensitivity (it gates a node the user already runs). Stored plaintext is
 acceptable for v1; **never logged/echoed** (value-free), never sent on the public path.
 OS-keyring is future work (OQ-4). `tls_verify` stays env/file-only (no stored rung) —
 transport downgrade is an operator decision, unchanged (ADR-0018 amendment).
+
+### M3 status notes (implemented 2026-09-10)
+
+- Shipped as designed: the auto-detecting probe (scheme-first; `http://`
+  is the one ambiguous rung) returning the **canonical URL to store**, the
+  `http://`→`bitcoind://` Core-shape REWRITE as the whole kind-plumbing
+  (badge/dispatch/store ride the unchanged scheme seam), the stored
+  `bitcoind://host[:port]` rung (no userinfo — `@` refused for every
+  scheme the store writes), the three never-echoed typed credential keys
+  and their SECRET `configured`-only settings entries + clear write, the
+  `/setup` bounded credentials step with snapshot/restore (a failed
+  attempt can never strand the working backend's login), the checkbox's
+  `no_credentials` seam on `BitcoindClient`, and the M2 review LOW (cookie
+  bounded AT READ TIME, `read(cap+1)`). Entry-time mainnet is pinned for
+  all three families (`tests/test_chain_electrum.py::TestEntryProbe`,
+  `tests/test_chain_bitcoind.py::TestHttpAutodetect` + the wrong-chain
+  probe pins, the genesis proofs already pinned for `check_backend`).
+- Deviations, documented: (1) **the `http://` probe order is
+  Core-shape-first** (this milestone's ticket overrides §3's
+  Esplora-then-Core sketch; both shapes are tried and each enforces
+  mainnet in its own handshake, so order changes latency, not verdict —
+  a loopback Core answering the POST also answers an Esplora GET with
+  errors, so the shapes stay distinguishable either way); (2) **no
+  https-Core fallback** (§3's "if not Esplora-shaped, try Core" on
+  `https://`) — https RPC is inexpressible on the plain-http adapter
+  (M2's named-unsupported scope), so running that probe would only
+  double the failure latency; `https://` is Esplora-primary, period;
+  (3) **port heuristics dropped entirely** (§3's 8332/3006 bias) —
+  scheme + shape probe is the decision, ports are not trusted for
+  classification (documented at the probe); (4) `ssl://` never sees the
+  credential fields (§3's "accept but note" — plan OQ-5's rarely-used
+  answer resolved as: not asked, not sent; Electrum has no standard
+  auth); (5) the credential keys have **no env rung** (§3 sketched them
+  resolving "through the same `ChainConfig.from_settings`" — they
+  resolve through `app._backend_auth(store)` overlaying the constructor
+  seam instead, keeping `config.py`/`ChainConfig` store-free and
+  credential-free as ever).
+- Tests: `tests/test_onb004_m3.py` (55: store/never-echo/resolver/
+  overlay/`/setup`-step/cookie-cap/reword pins) + the fixture-backed
+  autodetect matrix in `test_chain_bitcoind.py` and the entry-genesis
+  pins in `test_chain_electrum.py`; the probe seam's contract moved from
+  bool to `canonical URL | None` across the existing suites (identical
+  verdicts asserted).
 
 ---
 

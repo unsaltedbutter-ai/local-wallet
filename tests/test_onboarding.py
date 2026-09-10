@@ -191,9 +191,13 @@ def _drive(
 
     state = {"probes": 0, "detects": 0, "model": 0}
 
-    def check(url: str) -> bool:
+    def check(url: str) -> str | None:
+        # M3 seam contract: candidate in, canonical URL out (None refuses).
+        # The test-facing ``backend_check`` keeps its old bool vocabulary;
+        # identity-rewrite stands for "the probe agreed it is what it is".
         state["probes"] += 1
-        return backend_check(url) if backend_check is not None else False
+        ok = backend_check(url) if backend_check is not None else False
+        return url if ok else None
 
     def detect() -> LocalNodeReport:
         state["detects"] += 1
@@ -626,7 +630,7 @@ def _consent_ack_lines(tmp_path: Path, *, started: bool) -> list[str]:
     try:
         flow = ob.OnboardingFlow(
             store=store,
-            check_backend=lambda _u: True,
+            check_backend=lambda _u: _u,
             deferred=True,
             public_chosen=lambda: started,
         )
@@ -661,7 +665,7 @@ def test_default_is_no_longer_a_consent_word(tmp_path: Path) -> None:
         releases: list[int] = []
         flow = ob.OnboardingFlow(
             store=store,
-            check_backend=lambda _u: True,
+            check_backend=lambda _u: _u,
             deferred=True,
             public_chosen=lambda: releases.append(1) or True,
         )

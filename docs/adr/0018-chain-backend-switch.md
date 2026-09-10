@@ -368,3 +368,102 @@ JSON-RPC client (`chain/bitcoind.py::BitcoindClient`); http(s) keeps
   collapses to `False` → the value-free `BACKEND_PROBE_FAIL` line, nothing
   stored, the old client untouched. Core is therefore selectable AND
   validated on the stored rung the moment its shape is accepted there.
+
+## Amendment (2026-09-10, TCK-ONB-004 M3): auto-detect + credentials UX
+
+Milestone 3 of docs/onb-004-backend-adapters-plan.md closes the entry UX
+that M1/M2 left open: the user supplies an ADDRESS, never a classification,
+and both CLI (`/setup`) and web-settings entries can carry a server login.
+
+Decisions:
+
+1. **Auto-detect is scheme-first, probe-decided, canonical-rewriting.**
+   `app._probe_chain_backend` (the ONE probe every entry shares) now answers
+   with the CANONICAL URL to store (or `None` for the single value-free
+   refusal):
+
+   ```
+   ssl://       -> Electrum (scheme is unambiguous; handshake forces genesis)
+   https://     -> Esplora/mempool (check_backend shape + genesis proof only;
+                  https Core RPC is inexpressible — unchanged M2 scope)
+   bitcoind://  -> explicit Core RPC choice (M2 scheme, now storable)
+   http://      -> AMBIGUOUS: probe Core SHAPE first (POST getblockchaininfo
+                  with the resolved credentials/cookie ladder), then the
+                  Esplora shape. First shape wins; a Core win STORES THE
+                  REWRITE (http://h:8332 -> bitcoind://h:8332).
+   ```
+
+   The rewrite is the whole design trick: the detected kind feeds
+   `backend_kind`, the client dispatch, the badges and the store through the
+   ONE scheme seam every prior milestone already used — M3 adds no second
+   kind-plumbing. Ports are NOT trusted for classification (no 8332/3006
+   heuristic steers the probe order — a port is a convention real
+   deployments break; scheme + shape probe is everything). Each shape probe
+   enforces mainnet AT ENTRY through its adapter's own handshake gate
+   (Esplora genesis-hash proof / `server.features` / `chain == "main"`) —
+   the probe is not a second opinion any entry can skip. Every failure at
+   every rung collapses to the same value-free `BACKEND_PROBE_FAIL` line
+   naming the three families tried; nothing is stored, no silent fallback
+   (ADR-0023 d4 unchanged).
+
+2. **The stored `bitcoind://` rung — without userinfo.** The store's typed
+   writer accepts `bitcoind://host[:port]` (host, optional numeric port, no
+   path/query/fragment); an embedded `@` stays refused for EVERY scheme it
+   writes (the env/config-file rungs keep M2's userinfo allowance — the
+   credential keys below are the stored rung's answer to it).
+
+3. **Credential storage: three dedicated, never-echoed DB settings**
+   (`backend_auth_user`, `backend_auth_pass`, `backend_auth_none`), written
+   only through the store's typed pairs (ASCII, no whitespace/control
+   characters — the values are joined into an `Authorization` header — ≤256
+   chars; `""`-clears; value-free refusals). **Threat model (documented,
+   deliberate):** value-free AT REST is impossible for a password, so the
+   pair lives inside the same local single-user SQLite file as the wallet
+   descriptor and the backend URL — the same trust surface; a local
+   Core/electrum login is low-sensitivity (it gates a node the user already
+   runs). OS-keyring remains future work (plan OQ-4). Credentials have NO
+   env/config-file rung: the stored pair is the only rung, and
+   `tls_verify` stays env/file-only exactly as before.
+
+4. **The web settings surface shows SET/UNSET, never the value.** The three
+   keys join the `/settings` allowlist as `type: "secret"` entries:
+   `value` is always `null` on every read (list AND single-key), each entry
+   carries a `configured` boolean, and an applied write re-reads the entry —
+   so the reply to POSTing a password says "set", never the password.
+   Clearing is the `""` write (the client's Clear-login action).
+
+5. **The interplay rule (single source: `app._backend_auth`).** Checkbox
+   SET (`backend_auth_none`) → the `Authorization` header is OMITTED
+   entirely, cookie file never consulted (the `BitcoindClient` gained an
+   explicit `no_credentials` construction seam; combining it with any
+   explicit pair is a programmer error, refused). Box UNSET + filled pair →
+   Basic auth (threaded through the M2 constructor seam; a URL-userinfo
+   rung entry still outranks it inside the client, matching ladder
+   precedence). Box UNSET + empty or HALF a pair → the documented M2
+   default ladder (URL userinfo → cookie file at `rpc_cookie_path`,
+   default `~/.bitcoin/.cookie` → no auth). Credentials are Core-only
+   surfaces: inert for Esplora, and not offered for `ssl://`/`https://`
+   (plan OQ-5's "rarely needed" resolved as: not asked, not sent). Creds
+   ride BOTH the Apply-time probe and the built client — the probe
+   resolves them from the store at call time, so the client-side Apply
+   orders credential writes BEFORE the URL write.
+
+6. **`/setup` gets one bounded credentials step.** After a failed
+   validation of an auth-capable candidate (`http://`, `bitcoind://`), the
+   conversation offers ONCE: `user:password` (typed in clear on the
+   terminal — said plainly in the copy), `none`, a corrected address, or
+   `back`. The candidate rides the same typed writers + the same
+   production probe; ANY re-probe failure restores the prior credential
+   snapshot, so a failed attempt can never strand the working backend's
+   login; only a saved address keeps the new record. `https://`/`ssl://`
+   failures never see the step (creds inert). The typed credential is
+   never repeated on any output line.
+
+7. **Engine-constant rewords (docs/ux-web-copy-2.md §2h rows 64/66/68/72/73)
+   applied** with the orchestrator's mandate; row 73's gloss
+   ("Esplora (mempool.space-style) http(s)") was applied with the
+   Bitcoin-Core-RPC clause M2 added KEPT (the designer doc predates M2's
+   shipped family list; dropping it would make the line false).
+
+Side note: the M2 review LOW closed here too — the cookie file read is now
+bounded AT READ TIME (`read(cap+1)`), not read-then-check.

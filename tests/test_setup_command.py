@@ -427,7 +427,7 @@ def test_setup_never_reaches_run_turn_through_the_pump(
 
     store = Store(str(tmp_path / "pump.db"))
     flow = ob.OnboardingFlow(
-        store=store, check_backend=lambda _url: True, armed=False
+        store=store, check_backend=lambda _url: _url, armed=False
     )
     loop = AgentLoop(
         recording_generate,

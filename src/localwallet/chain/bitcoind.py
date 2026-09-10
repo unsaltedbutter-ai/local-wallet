@@ -335,6 +335,7 @@ class BitcoindClient:
         rpc_user: str | None = None,
         rpc_password: str | None = None,
         rpc_cookie_path: str | Path | None = None,
+        no_credentials: bool = False,
     ) -> None:
         settings = Settings.from_env()
         defaults = ChainConfig.from_settings(settings)
@@ -348,13 +349,28 @@ class BitcoindClient:
         parsed = urlsplit(self._config.base_url)
         if parsed.scheme != "bitcoind":
             raise ValueError("BitcoindClient requires a bitcoind:// URL")
+        if not isinstance(no_credentials, bool):
+            raise ValueError("no_credentials must be a boolean")  # noqa: TRY004
+        if no_credentials and (
+            parsed.username is not None
+            or rpc_user is not None
+            or rpc_password is not None
+        ):
+            # Contradictory construction: an explicit login AND "omit the
+            # Authorization header entirely". The app's resolver never does
+            # this (its interplay rule: the checkbox wins over empty/absent
+            # fields, and a filled pair UNCHECKS the box); a caller that
+            # hits it is a programmer error — fail closed, value-free.
+            raise ValueError("no_credentials contradicts explicit credentials")
         self._host: str = parsed.hostname  # host presence: ChainConfig
         self._port: int = parsed.port or _DEFAULT_RPC_PORT
         # Auth source 1: user/pass — URL userinfo (the env/config-file rung
         # of the single selection point; percent-encoded parts are decoded
         # back to what Core's rpcuser/rpcpassword actually are), else the
-        # explicit constructor pair (the library seam; M3's settings keys
-        # will thread through it). Static for the client's life.
+        # explicit constructor pair (the library seam; TCK-ONB-004 M3's
+        # ``backend_auth_user``/``backend_auth_pass`` settings keys thread
+        # through it — never logged, never echoed). Static for the client's
+        # life.
         self._basic: str | None = None
         if parsed.username is not None:
             self._basic = self._encode_basic(
@@ -369,13 +385,22 @@ class BitcoindClient:
         # knows no other network). Read per request; a missing/unusable
         # line degrades to source 3 (no Authorization header at all — a
         # node that demands auth answers that honestly with a 401).
-        if rpc_cookie_path is not None:
-            cookie = str(rpc_cookie_path)
+        cookie_file: Path | None
+        if no_credentials:
+            # The settings checkbox (TCK-ONB-004 M3): explicit
+            # "no credentials needed" — auth source 3, the header is omitted
+            # for every request and the cookie file is NEVER consulted.
+            cookie_file = None
         else:
-            cookie = settings.rpc_cookie_path
-        self._cookie_file: Path | None = Path(cookie) if cookie.strip() else (
-            Path.home() / ".bitcoin" / ".cookie"
-        )
+            cookie = (
+                str(rpc_cookie_path)
+                if rpc_cookie_path is not None
+                else settings.rpc_cookie_path
+            )
+            cookie_file = Path(cookie) if cookie.strip() else (
+                Path.home() / ".bitcoin" / ".cookie"
+            )
+        self._cookie_file = cookie_file
         # Re-entrant: contract methods take it around a helper chain that
         # re-enters (_scan_snapshot → get_tip_height → gate). The lock
         # serializes every RPC exactly the way the electrum adapter
@@ -895,7 +920,13 @@ class BitcoindClient:
         cookie_file = self._cookie_file
         if cookie_file is not None:
             try:
-                data = cookie_file.read_bytes()
+                # BOUNDED AT READ TIME (TCK-ONB-004 M3, the M2 review LOW):
+                # read() with a size cap, not read-then-check — a gigabyte
+                # at the cookie path can never be slurbed into memory just
+                # to learn it is too big. cap+1 bytes distinguishes "exactly
+                # at the cap" from "over the cap".
+                with cookie_file.open("rb") as handle:
+                    data = handle.read(_MAX_COOKIE_BYTES + 1)
             except OSError:
                 data = b""
             if 0 < len(data) <= _MAX_COOKIE_BYTES:

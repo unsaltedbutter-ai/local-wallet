@@ -339,6 +339,31 @@ class TestHandshake:
             client.get_tip_height()
 
 
+class TestEntryProbe:
+    """TCK-ONB-004 M3: ``ssl://`` now reaches the /setup + settings entry
+    points, whose gate is ``app._probe_chain_backend``. M1's deviation 3
+    ("mainnet enforcement lives IN the adapter handshake because M1 exposes
+    no setup probe; M3's probe re-adds the check AT ENTRY") is closed here:
+    the probe forces the very same handshake, so a non-mainnet server is
+    refused AT ENTRY — value-free (the answer is a bare None: no host, no
+    hash, no server text)."""
+
+    def test_probe_accepts_mainnet_server_returns_canonical_url(
+        self, electrum: Any
+    ) -> None:
+        server = electrum(
+            script={"blockchain.headers.subscribe": [{"height": TIP}]}
+        )
+        settings = Settings(request_timeout_s=2.0, max_retries=0)
+        assert app_module._probe_chain_backend(server.url, settings) == server.url
+
+    def test_probe_refuses_testnet_genesis_at_entry(self, electrum: Any) -> None:
+        server = electrum(genesis=_TESTNET_GENESIS)
+        settings = Settings(request_timeout_s=2.0, max_retries=0)
+        assert app_module._probe_chain_backend(server.url, settings) is None
+        assert server.connects >= 1  # the refusal came FROM the handshake
+
+
 # ---------------------------------------------------- shape translation
 
 

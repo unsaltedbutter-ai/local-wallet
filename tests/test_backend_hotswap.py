@@ -66,8 +66,10 @@ NEW_URL = "https://mempool.mine.example:4000/api"
 SSL_URL = "ssl://evil-star.local:50001"
 
 
-def _probe_true(_url: str) -> bool:
-    return True
+def _probe_true(url: str) -> str | None:
+    # The M3 seam contract: candidate in, CANONICAL URL out (None refuses).
+    # Identity = "the probe agreed it already is what it looks like".
+    return url
 
 
 class _FakeChain:
@@ -123,7 +125,7 @@ def _mk_wiring(
     tests play by hand via ``_drain``)."""
     built: list[_FakeChain] = []
     monkeypatch.setattr(
-        app, "_build_chain_client", lambda settings: _built(built, settings)
+        app, "_build_chain_client", lambda settings, auth=None: _built(built, settings)
     )
 
     def _built(sink: list[_FakeChain], settings: Settings) -> _FakeChain:
@@ -197,9 +199,9 @@ def _mk_flow(
     call log (URLs it saw — never echoed by the refusal, pinned separately)."""
     seen: list[str] = []
 
-    def probe(url: str) -> bool:
+    def probe(url: str) -> str | None:
         seen.append(url)
-        return probe_ok
+        return url if probe_ok else None
 
     return ChainBackendFlow(wiring, probe), seen
 
@@ -538,7 +540,7 @@ def test_gap_limit_changed_fires_resync_unchanged_does_not(
     chain base (the same full resync); an unchanged apply starts NO scan and
     SAYS SO in the reply."""
     wiring, commands = _mk_wiring(tmp_path, monkeypatch)
-    flow = ChainBackendFlow(wiring, lambda _url: True)
+    flow = ChainBackendFlow(wiring, _probe_true)
     store = wiring.store
     reply = app.handle_settings_request(store, "gap_limit", "5", flow)
     assert reply["status"] == "applied"
@@ -566,7 +568,7 @@ def test_settings_write_path_surfaces_swap_fields(
     ``swapped``/``resync`` and the entry confirms from re-read tool truth;
     a refused probe answers the closed ``rejected`` status value-free."""
     wiring, commands = _mk_wiring(tmp_path, monkeypatch)
-    ok_flow = ChainBackendFlow(wiring, lambda _url: True)
+    ok_flow = ChainBackendFlow(wiring, _probe_true)
     reply = app.handle_settings_request(
         wiring.store, "chain_base_url", NEW_URL, ok_flow
     )
@@ -575,7 +577,7 @@ def test_settings_write_path_surfaces_swap_fields(
     assert reply["settings"][0]["value"] == NEW_URL
     assert reply["settings"][0]["requires_restart"] is False
     _drain(wiring, commands)
-    bad_flow = ChainBackendFlow(wiring, lambda _url: False)
+    bad_flow = ChainBackendFlow(wiring, lambda _url: None)
     reply = app.handle_settings_request(
         wiring.store, "chain_base_url", "https://sneaky.example/api", bad_flow
     )
@@ -658,11 +660,12 @@ def test_settings_path_accepts_ssl_and_installs_the_electrum_client(
 def test_probe_dispatches_by_scheme_reusing_the_m1_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_probe_chain_backend`` (the M3 setup-probe slot from the M1
-    amendment): http(s) rides ``check_backend`` (Esplora shape + genesis);
-    ssl:// constructs the Electrum adapter and forces ONE tip call — the
-    M1 handshake's genesis gate IS the mainnet proof; everything collapses
-    to False value-free, and the probe client is always closed."""
+    """``_probe_chain_backend`` (M3 contract): returns the CANONICAL URL to
+    store, or ``None`` to refuse. https:// rides ``check_backend`` (Esplora
+    shape + genesis) unchanged; ssl:// constructs the Electrum adapter and
+    forces ONE tip call — the M1 handshake's genesis gate IS the mainnet
+    proof; everything collapses to None value-free, and the probe client is
+    always closed."""
     settings = Settings(request_timeout_s=0.5, max_retries=3)
     calls: list[str] = []
     monkeypatch.setattr(
@@ -677,9 +680,9 @@ def test_probe_dispatches_by_scheme_reusing_the_m1_gate(
         return client
 
     monkeypatch.setattr(app, "ElectrumClient", fake_electrum)
-    assert app._probe_chain_backend(GOOD_URL, settings) is True
-    assert calls == [f"esplora:{GOOD_URL}"]
-    assert app._probe_chain_backend(SSL_URL, settings) is True
+    assert app._probe_chain_backend(GOOD_URL, settings) == GOOD_URL
+    assert calls == [f"esplora:{GOOD_URL}"]  # http+/api shape → Esplora branch
+    assert app._probe_chain_backend(SSL_URL, settings) == SSL_URL
     assert calls[-1] == f"electrum:{SSL_URL}:1"  # the snappy budget, M1 gate
     assert built[0].tip_calls == 1 and built[0].closed is True
 
@@ -687,7 +690,7 @@ def test_probe_dispatches_by_scheme_reusing_the_m1_gate(
         raise RuntimeError("ssl://boom")  # escaping surprise must collapse
 
     monkeypatch.setattr(app, "ElectrumClient", explode)
-    assert app._probe_chain_backend(SSL_URL, settings) is False
+    assert app._probe_chain_backend(SSL_URL, settings) is None
 
 
 # ------------------------------------------------ kind detection (direction 10)
@@ -754,7 +757,7 @@ def test_kind_and_flags_ride_the_settings_and_state_surfaces(
     backend is wired, and carry NOTHING when one is not."""
     wiring, _commands = _mk_wiring(tmp_path, monkeypatch, stored_url=GOOD_URL)
     wiring.settings.chain_base_url = GOOD_URL  # the boot fold the real wiring does
-    flow = ChainBackendFlow(wiring, lambda _url: True)
+    flow = ChainBackendFlow(wiring, _probe_true)
     reply = app.handle_settings_request(wiring.store, None, None, flow)
     assert reply["backend_kind"] == "mempool"
     snapshot = app.build_state_snapshot(

@@ -385,7 +385,7 @@ def _manifest_pin_for(path: Path) -> str | None:
 #: additive ``model_state`` field of the typed ``/state`` snapshot; CLI:
 #: the same lines + the 'yes'/'no' prompt intercept below). Value-free.
 MODEL_CARD_QUESTION: Final[str] = (
-    "Model hasn't been downloaded. Want to download now?"
+    "The AI model hasn't been downloaded yet. Want to download it now?"
 )
 MODEL_CARD_HINT: Final[str] = (
     "Answer 'yes' (or tap the button) to download it now, or 'no' to see "
@@ -393,13 +393,13 @@ MODEL_CARD_HINT: Final[str] = (
     "with /download."
 )
 MODEL_DL_STARTED: Final[str] = (
-    "Downloading the model now — verified against its pinned hash before "
-    "install; progress appears here."
+    "Downloading the model now — it will be checked against its official "
+    "fingerprint before it is installed. Progress shows here."
 )
 MODEL_DL_RUNNING: Final[str] = "The model download is already in progress."
 MODEL_DL_DONE: Final[str] = (
-    "Model downloaded and verified. It activates the NEXT time you start "
-    "local-wallet (this session keeps running without it)."
+    "Downloaded and verified. The model takes over the next time you start "
+    "the app — this session keeps running without it."
 )
 MODEL_DL_FAILED: Final[str] = (
     "Model download failed — nothing was installed (an unfinished partial "
@@ -467,7 +467,8 @@ MODEL_PRELOAD_NOTICE: Final[str] = (
 #: Value-free: no path, no hash, no filename (the manifest is public but
 #: the line stays scrubbed like every other warning).
 MODEL_INTEGRITY_WARNING: Final[str] = (
-    "model file failed its integrity check — re-download recommended"
+    "The model file failed its integrity check — it may be corrupted. "
+    "Run /download to fetch a fresh copy."
 )
 #: Per-launch-log line when the background LOAD itself failed (the state
 #: flips to ``failed`` and the next generate re-raises through the
@@ -4535,6 +4536,19 @@ MAX_SETTING_VALUE_CHARS: Final[int] = 2048
 #: ``set_chain_base_url``), which owns the write validation (TCK-ONB-002).
 _CHAIN_BASE_URL_KEY: Final[str] = "chain_base_url"
 
+#: The backend credential keys (TCK-ONB-004 M3; plan §3 storage section) —
+#: readable/writable ONLY through the store's typed pairs. The web
+#: settings SURFACE carries them as SECRET entries: GET answers only
+#: whether each key is SET (``configured``), never the value, and a write
+#: is never echoed back — the password rides one POST body to the engine
+#: thread and exists at rest only inside the local single-user DB file
+#: (the documented threat model: same trust surface as the wallet
+#: descriptor itself; OS-keyring is future work, plan OQ-4). Clearing is
+#: the ``""``-writes-delete convention shared with every typed writer.
+_BACKEND_AUTH_USER_KEY: Final[str] = "backend_auth_user"
+_BACKEND_AUTH_PASS_KEY: Final[str] = "backend_auth_pass"
+_BACKEND_AUTH_NONE_KEY: Final[str] = "backend_auth_none"
+
 # --------------------------------- backend kind + hot-swap surfaces (TCK-BACKEND-002)
 
 #: The CLOSED enum of ``backend_kind`` values the settings/``/state``
@@ -4600,8 +4614,8 @@ _PUBLIC_DEFAULT_HOST: Final[str] = (
 #: privacy by distinguishing "unreachable" from "wrong chain" over the wire).
 BACKEND_PROBE_FAIL: Final[str] = (
     "that backend did not check out: it is unreachable, or it does not "
-    "serve mainnet as an Esplora (http(s)) / Electrum (ssl://) / Bitcoin "
-    "Core RPC (bitcoind://) server — "
+    "serve mainnet as an Esplora (mempool.space-style) http(s), Electrum "
+    "(ssl://) or Bitcoin Core RPC (bitcoind://) server — "
     "nothing was saved and the current backend stays in service"
 )
 
@@ -4623,7 +4637,16 @@ RESYNC_STATUSES: Final[frozenset[str]] = frozenset(
 #: a write with no reader, so it is refused. Unknown future keys 404 here
 #: until their ladder ships.
 _SETTINGS_KEYS: Final[frozenset[str]] = frozenset(
-    {wallet_scan.GAP_LIMIT_SETTING, _CHAIN_BASE_URL_KEY}
+    {
+        wallet_scan.GAP_LIMIT_SETTING,
+        _CHAIN_BASE_URL_KEY,
+        # TCK-ONB-004 M3: the backend credential keys (SECRET entries —
+        # readable as SET/UNSET only, never value). They have live readers
+        # (the engine's credential resolver feeding probe + client build).
+        _BACKEND_AUTH_USER_KEY,
+        _BACKEND_AUTH_PASS_KEY,
+        _BACKEND_AUTH_NONE_KEY,
+    }
 )
 
 
@@ -4752,7 +4775,7 @@ def _settings_entries(
     plain store row, effective next launch, and the flag must say so.
     """
     shadowed = backend is not None and backend.shadowed
-    return [
+    entries: list[dict[str, object]] = [
         {
             "key": wallet_scan.GAP_LIMIT_SETTING,
             "type": "int",
@@ -4790,6 +4813,56 @@ def _settings_entries(
         # through the gated :class:`WatchKeyRequest` path (replace opt-in).
         _watch_key_entry(store),
     ]
+    # TCK-ONB-004 M3: the backend credential keys ride the same surface as
+    # SECRET entries — ``configured`` is the whole story a read may tell.
+    entries.extend(_backend_auth_entries(store))
+    return entries
+
+
+def _backend_auth_entries(store: Store) -> list[dict[str, object]]:
+    """The three credential entries for the settings read surface (TCK-ONB-
+    004 M3): ``type: "secret"``, ``value`` ALWAYS ``None`` — GET answers only
+    whether each key is SET (the client renders "a login is saved" + the
+    clear action, never the login or password). Unreadable store → all
+    ``False`` (fail quiet toward "nothing stored", the watch-key entry's
+    discipline; a surprise never echoes a partial value)."""
+    try:
+        configured = (
+            store.get_backend_auth_user() is not None,
+            store.get_backend_auth_pass() is not None,
+            store.get_backend_auth_none(),
+        )
+    except (StoreError, sqlite3.Error):
+        configured = (False, False, False)
+    return [
+        {
+            "key": key,
+            "type": "secret",
+            "value": None,  # NEVER the stored value — set/unset only.
+            "configured": flag,
+            "default": None,
+            "min": None,
+            "max": None,
+            # Honest effect: a credential change needs no restart — it takes
+            # effect when the server address is (re)Applied in-session (the
+            # probe + the rebuilt client resolve credentials at that moment),
+            # or at the next launch either way.
+            "requires_restart": False,
+            # Credentials have NO env/config-file rung (deliberate,
+            # ADR-0018 M3 amendment: the stored DB pair is their only rung) —
+            # the shadow flag is structurally False.
+            "env_override": False,
+        }
+        for key, flag in zip(
+            (
+                _BACKEND_AUTH_USER_KEY,
+                _BACKEND_AUTH_PASS_KEY,
+                _BACKEND_AUTH_NONE_KEY,
+            ),
+            configured,
+            strict=True,
+        )
+    ]
 
 
 def _apply_setting_change(store: Store, key: str, value: str) -> str | None:
@@ -4820,6 +4893,31 @@ def _apply_setting_change(store: Store, key: str, value: str) -> str | None:
             store.set_setting(key, str(gap))  # canonical decimal string
         except (StoreError, sqlite3.Error):
             return f"could not save {key}"
+        return None
+    if key == _BACKEND_AUTH_NONE_KEY:
+        # The checkbox as a closed write: "1" sets explicit no-credentials,
+        # "" clears the record (back to the documented default ladder).
+        # Anything else is refused WITHOUT echoing the submitted value.
+        text = value.strip()
+        if text not in ("", "1"):
+            return f"{key} must be 1 or empty"
+        try:
+            store.set_backend_auth_none(text == "1")
+        except (StoreError, sqlite3.Error) as exc:
+            return str(exc)
+        return None
+    if key in (_BACKEND_AUTH_USER_KEY, _BACKEND_AUTH_PASS_KEY):
+        # Shape validation (length/ASCII/no-control-chars, value-free) is
+        # the store's typed writer's — the ONLY sanctioned writer, never
+        # duplicated here. ``""`` clears; the reply's re-read entry says
+        # SET/UNSET, never the value.
+        try:
+            if key == _BACKEND_AUTH_USER_KEY:
+                store.set_backend_auth_user(value)
+            else:
+                store.set_backend_auth_pass(value)
+        except (StoreError, sqlite3.Error) as exc:
+            return str(exc)
         return None
     try:
         # ``""`` clears the stored rung (the set_chain_base_url convention);
@@ -5643,7 +5741,7 @@ def run(
     node_detect_fn: Callable[[], LocalNodeReport] | None = None,
     on_web_server: Callable[[WebServer], None] | None = None,
     interactive: bool | None = None,
-    backend_check_fn: Callable[[str], bool] | None = None,
+    backend_check_fn: Callable[[str], str | None] | None = None,
     default_web: bool = False,
     open_browser: bool = False,
 ) -> int:
@@ -5712,10 +5810,11 @@ def run(
             or scripted launch NEVER enters the first-run conversation and
             is never blocked by it; ``True`` drives the conversation with
             the injected ``input_fn``.
-        backend_check_fn: The step-5 URL-validation probe (test seam,
-            TCK-ONB-003): ``base_url -> serves mainnet in Esplora shape``.
-            Defaults to :func:`localwallet.chain.check_backend` (the only
-            networked module) on the resolved timeout settings.
+        backend_check_fn: The step-5 URL-validation probe AND M3 kind
+            classifier (test seam, TCK-ONB-003/TCK-ONB-004 M3):
+            ``base_url -> canonical backend URL to store, or None to
+            refuse``. Defaults to the bounded app-side probe (chain/ is the
+            only networked module) on the resolved timeout settings.
 
     Returns:
         Process exit code: ``0`` on normal exit (including ``exit``,
@@ -6081,8 +6180,66 @@ class _Wiring:
     swap: ChainBackendFlow | None = None
 
 
-def _build_chain_client(settings: Settings) -> ChainClient:
-    """Construct the config-selected chain backend (TCK-ONB-004 M1/M2).
+@dataclass(frozen=True)
+class _BackendAuth:
+    """A resolved backend-credential overlay (TCK-ONB-004 M3). Consumed
+    ONLY by the Bitcoin Core RPC surface (probe + client build): the
+    Electrum protocol has no standard auth and the Esplora API surface
+    takes none, so a stored pair is inert for those kinds (documented —
+    plan OQ-5's "rarely needed" answer applied: not sent, not lost).
+
+    * ``user``/``password``: the stored basic-auth pair (BOTH present or
+      the resolver returns ``None`` instead — a half pair is the documented
+      cookie-default path, never a silent partial login);
+    * ``omit``: the explicit "no credentials needed" checkbox — the
+      ``Authorization`` header is OMITTED entirely and the cookie file is
+      never consulted (the plan §3 semantics).
+    """
+
+    user: str | None = None
+    password: str | None = None
+    omit: bool = False
+
+
+def _backend_auth(store: Store) -> _BackendAuth | None:
+    """Resolve the stored credential rung (env/config-file URL userinfo and
+    the cookie default live INSIDE the adapters, under this overlay — the
+    ladder never double-applies). Interplay (ticket's documented rule):
+    checkbox SET → omit auth; box UNSET + filled pair → basic auth; box
+    UNSET + empty/half → ``None`` = the client's own default ladder (URL
+    userinfo if any, else the cookie file, else no auth — M2's behavior,
+    unchanged when nothing is stored). An unreadable store resolves to
+    ``None`` (fail quiet toward the documented default, fail CLOSED toward
+    never sending a half-guessed credential)."""
+    try:
+        if store.get_backend_auth_none():
+            return _BackendAuth(omit=True)
+        user = store.get_backend_auth_user()
+        password = store.get_backend_auth_pass()
+    except (StoreError, sqlite3.Error):
+        return None
+    if user and password:
+        return _BackendAuth(user=user, password=password)
+    return None
+
+
+def _bitcoind_auth_kwargs(auth: _BackendAuth | None) -> dict[str, object]:
+    """The BitcoindClient constructor kwargs for one resolved overlay
+    (``None`` = nothing stored: M2's default ladder rides untouched)."""
+    if auth is None:
+        return {}
+    if auth.omit:
+        return {"no_credentials": True}
+    if auth.user and auth.password:
+        return {"rpc_user": auth.user, "rpc_password": auth.password}
+    return {}
+
+
+def _build_chain_client(
+    settings: Settings, auth: _BackendAuth | None = None
+) -> ChainClient:
+    """Construct the config-selected chain backend (TCK-ONB-004 M1/M2;
+    the M3 ``auth`` overlay threads the stored credential keys).
 
     The URL SCHEME picks the adapter through the single selection point
     (:meth:`ChainConfig.from_settings`, ADR-0018 as amended): an
@@ -6102,12 +6259,17 @@ def _build_chain_client(settings: Settings) -> ChainClient:
         # Auth rides the SAME resolved settings: URL userinfo (the
         # env/config-file rung) for user/pass, ``settings.rpc_cookie_path``
         # for the cookie file ("" → the documented ~/.bitcoin/.cookie
-        # default; M3 wires the stored rung's dedicated keys).
+        # default); M3's stored rung (``backend_auth_user``/``_pass``/
+        # ``_none``, resolved by :func:`_backend_auth`) overlays through
+        # the constructor pair the M2 seam was left open for. URL userinfo
+        # outranks the stored pair inside the client — matching the ladder
+        # precedence the env rung already has.
         return BitcoindClient(
             base_url=config.base_url,
             timeout_s=config.timeout_s,
             max_retries=config.max_retries,
             rpc_cookie_path=settings.rpc_cookie_path,
+            **_bitcoind_auth_kwargs(auth),
         )
     client_cls = ElectrumClient if config.kind == "electrum" else EsploraClient
     return client_cls(
@@ -6117,68 +6279,133 @@ def _build_chain_client(settings: Settings) -> ChainClient:
     )
 
 
-def _probe_chain_backend(url: str, settings: Settings) -> bool:
-    """The ONE bounded, value-free readiness probe for a CANDIDATE backend
-    URL (TCK-BACKEND-002 deliverable 2; the M3 setup-probe slot left open by
-    the ADR-0018 M1 amendment): the scheme picks the family, mirroring
-    :func:`_build_chain_client`.
-
-    * http(s) → :func:`localwallet.chain.check_backend` — Esplora shape plus
-      the height-0 mainnet GENESIS proof (ADR-0021), its own documented
-      all-failures-collapse-to-False contract;
-    * ``ssl://`` → one :class:`ElectrumClient` tip call, which forces M1's
-      fail-closed HANDSHAKE (``server.version`` + ``server.features`` whose
-      ``genesis_hash`` must equal the mainnet constant — the gate is REUSED
-      verbatim, no second genesis check), then a bounded close.
-    * ``bitcoind://`` → one :class:`BitcoindClient` tip call (TCK-ONB-004
-      M2), which forces the adapter's handshake: ``getblockchaininfo``
-      whose ``chain`` must be ``"main"`` (ADR-0021) plus the
-      ``getnetworkinfo`` capability floor — the SAME gate the live client
-      runs, no second check; auth (user/pass URL or cookie file) is
-      exercised on the same call: a 401 collapses to ``False``.
-
-    Snappy budget (same rule as the setup probe): ONE attempt past the
-    initial, the shared per-request timeout; TLS trust rides the ladder
-    inside the clients, so a probe can never disagree with the transport
-    policy the real client would get. EVERY failure (construction,
-    transport, shape, wrong chain — anything) collapses to ``False``:
-    nothing escapes to the engine-thread caller, and no URL/host/status
-    ever rides the answer (the caller owns the one honest refusal line).
-    """
-    if url.startswith((ELECTRUM_SCHEME, BITCOIND_SCHEME)):
-        client: Any = None
-        try:
-            if url.startswith(BITCOIND_SCHEME):
-                client = BitcoindClient(
-                    base_url=url,
-                    timeout_s=settings.request_timeout_s,
-                    max_retries=min(settings.max_retries, 1),
-                    rpc_cookie_path=settings.rpc_cookie_path,
-                )
-            else:
-                client = ElectrumClient(
-                    base_url=url,
-                    timeout_s=settings.request_timeout_s,
-                    max_retries=min(settings.max_retries, 1),
-                )
-            client.get_tip_height()  # connect + handshake + mainnet genesis gate
-            return True
-        except Exception:  # noqa: BLE001 — the collapse-everything contract
-            return False
-        finally:
-            if client is not None:
-                try:
-                    client.close()
-                except Exception:  # noqa: BLE001, S110 — a dead probe cannot fail
-                    pass
+def _probe_tip(client_factory: Callable[[], Any]) -> bool:
+    """Run ONE candidate client through its own handshake (one tip call)
+    and bound the wreckage: construction, connect, shape, wrong chain, a
+    401 — ANYTHING collapses to ``False``, and the probe client is always
+    closed. The caller owns the one honest refusal line; nothing this
+    swallows ever escapes (value-free by construction)."""
+    client: Any = None
     try:
-        return check_backend(
-            url,
-            timeout_s=settings.request_timeout_s,
-            max_retries=min(settings.max_retries, 1),
-        )
-    except Exception:  # noqa: BLE001 — belt-braces: check_backend already collapses
+        client = client_factory()
+        client.get_tip_height()  # connect + handshake + mainnet gate
+        return True
+    except Exception:  # noqa: BLE001 — the collapse-everything contract
         return False
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001, S110 — a dead probe cannot fail
+                pass
+
+
+def _probe_chain_backend(
+    url: str, settings: Settings, auth: _BackendAuth | None = None
+) -> str | None:
+    """The ONE bounded, value-free readiness probe AND kind classifier for a
+    CANDIDATE backend URL (TCK-BACKEND-002 deliverable 2; the auto-detect
+    entry of TCK-ONB-004 M3 — the user never names the kind, the app "does
+    its best" per plan §3). Returns the CANONICAL URL to store — the input
+    unchanged unless the M3 classifier rewrote it — or ``None`` for a
+    refusal (every failure collapses identically to the caller's one honest
+    line; no host, status or detail ever rides the answer).
+
+    Classification (scheme first, probe decides only what the scheme cannot):
+
+    * ``ssl://`` → Electrum (the scheme is unambiguous): one
+      :class:`ElectrumClient` tip call forces M1's fail-closed HANDSHAKE
+      (``server.version`` + ``server.features`` whose ``genesis_hash`` must
+      equal the mainnet constant — the entry-time GENESIS gate is the
+      adapter's own, reused verbatim), then a bounded close. Stored as-is.
+    * ``bitcoind://`` → explicit Core RPC choice (M2 scheme, still
+      accepted): one :class:`BitcoindClient` tip call through the SAME
+      handshake the live client runs (``getblockchaininfo.chain == "main"``
+      + the Core-22 capability floor + the auth matrix — a 401 collapses to
+      refusal). The stored rung carries it WITHOUT userinfo (the store's
+      writer); credentials ride the dedicated ``backend_auth_*`` keys via
+      ``auth``. Stored as-is.
+    * ``https://`` → Esplora/mempool (existing ``check_backend`` shape
+      probe + height-0 GENESIS proof, ADR-0021). An https Core RPC is not
+      expressible on the plain-http ``bitcoind://`` transport (M2 scope),
+      so no Core branch runs against https. Stored as-is.
+    * ``http://`` → AMBIGUOUS — the only real detection case. Probe order
+      per this ticket: Core JSON-RPC SHAPE FIRST (a :class:`BitcoindClient`
+      against the ``bitcoind://`` rewrite of the URL, POST
+      ``getblockchaininfo`` with the resolved credentials — stored pair,
+      else the documented cookie ladder — over ``auth``), then the Esplora
+      shape (``check_backend``). First shape wins; a Core win STORES THE
+      REWRITE (``http://h:8332`` → ``bitcoind://h:8332``), so the detected
+      kind feeds ``backend_kind``, the client builder and every badge
+      through the ONE unchanged scheme-dispatch seam. Neither shape →
+      ``None`` (the caller's refusal names what was tried). URLs carrying
+      userinfo skip the Core branch (embedded credentials are refused on
+      the stored rung — logins ride the dedicated keys).
+    * anything else → ``None`` WITHOUT probing (a foreign scheme is said
+      plainly by the caller, never probed).
+
+    PORTS ARE NOT TRUSTED FOR CLASSIFICATION (M3 decision, plan §3's
+    "never bypass the probe" hardened): no 8332/3006 heuristic steers the
+    decision — scheme + shape probe is everything, because a port is a
+    convention any real deployment (proxies, Docker mappings, Start9 app
+    ports) breaks. The probe's two bounded attempts cost at most two
+    timeouts.
+
+    Snappy budget (same rule as ever): ONE attempt past the initial, the
+    shared per-request timeout; TLS trust rides the ladder inside the
+    clients, so a probe can never disagree with the transport policy the
+    real client would get.
+    """
+    text = url.strip()
+    if not text:
+        return None
+    timeout = settings.request_timeout_s
+    retries = min(settings.max_retries, 1)
+    if text.startswith(ELECTRUM_SCHEME):
+        return text if _probe_tip(
+            lambda: ElectrumClient(
+                base_url=text, timeout_s=timeout, max_retries=retries
+            )
+        ) else None
+    if text.startswith(BITCOIND_SCHEME):
+        return text if _probe_tip(
+            lambda: BitcoindClient(
+                base_url=text,
+                timeout_s=timeout,
+                max_retries=retries,
+                rpc_cookie_path=settings.rpc_cookie_path,
+                **_bitcoind_auth_kwargs(auth),
+            )
+        ) else None
+    if text.startswith("http://"):
+        # The ambiguous rung: Core shape first (this ticket's order), then
+        # the Esplora shape. The rewrite is safe to attempt because a
+        # malformed Core endpoint (path, junk) fails the CONSTRUCTION guard
+        # inside the probe and collapses to False — the Esplora branch then
+        # judges the ORIGINAL URL.
+        rest = text[len("http://") :]
+        if "@" not in rest.partition("/")[0]:
+            core_url = BITCOIND_SCHEME + rest
+            if _probe_tip(
+                lambda: BitcoindClient(
+                    base_url=core_url,
+                    timeout_s=timeout,
+                    max_retries=retries,
+                    rpc_cookie_path=settings.rpc_cookie_path,
+                    **_bitcoind_auth_kwargs(auth),
+                )
+            ):
+                return core_url
+        try:
+            return text if check_backend(text, timeout_s=timeout, max_retries=retries) else None
+        except Exception:  # noqa: BLE001 — belt-braces: check_backend already collapses
+            return None
+    if text.startswith("https://"):
+        try:
+            return text if check_backend(text, timeout_s=timeout, max_retries=retries) else None
+        except Exception:  # noqa: BLE001 — same collapse contract
+            return None
+    return None
 
 
 def _backend_kind(settings: Settings, *, resolved: bool) -> str:
@@ -6248,7 +6475,7 @@ class ChainBackendFlow:
     def __init__(
         self,
         wiring: _Wiring,
-        probe: Callable[[str], bool],
+        probe: Callable[[str], str | None],
     ) -> None:
         self._w = wiring
         self._probe = probe
@@ -6290,45 +6517,56 @@ class ChainBackendFlow:
         return scan is not None and scan.gate.state in ("pending", "running")
 
     def apply(self, url: str) -> tuple[str | None, dict[str, object]]:
-        """The settings-write path: PROBE before the save (deliverable 2),
+        """The settings-write path: PROBE-and-classify before the save
+        (deliverable 2 + TCK-ONB-004 M3 auto-detect — the probe returns the
+        CANONICAL URL: an ``http://`` endpoint answering in Core RPC shape
+        is stored as ``bitcoind://``, the detected kind therefore feeds
+        ``backend_kind``/dispatch through the ONE unchanged scheme seam),
         build before the save (a construction failure refuses the write —
-        never store a value this process could not serve), then the store's
-        typed writer (the ONLY sanctioned writer of the key) and the
+        never store a value this process could not serve) WITH the resolved
+        stored credentials riding the same overlay the probe used, then the
+        store's typed writer (the ONLY sanctioned writer of the key) and the
         install. Returns ``(value-free refusal line | None, reply fields
         swapped/resync)``. A failure at any pre-store step leaves the store
-        AND the live client untouched."""
+        AND the live client untouched (credential rows included — a plain
+        chain_base_url write never touches them)."""
         text = url.strip()
-        if text and not self._probe(text):
-            return BACKEND_PROBE_FAIL, {}
+        canonical = text
+        if text:
+            detected = self._probe(text)
+            if detected is None:
+                return BACKEND_PROBE_FAIL, {}
+            canonical = detected
+        auth = _backend_auth(self._w.store)
         if self.shadowed:
             # Env/config-file rung set: the write is STORED (probed) but the
             # live ladder already outranks it — no swap, next-launch honesty
             # (the response's requires_restart flag says so, unchanged).
-            error = self._store_write(text)
+            error = self._store_write(canonical)
             if error is not None:
                 return error, {}
             return None, {"swapped": False, "resync": "skipped"}
         try:
             new_client = _build_chain_client(
-                replace(self._w.settings, chain_base_url=text)
+                replace(self._w.settings, chain_base_url=canonical), auth
             )
         except ValueError:
             # Malformed despite the probe (a shape the probe tolerated that
             # ChainConfig refuses): refuse the WRITE value-free, old client
             # untouched — never store a value we cannot serve.
             return BACKEND_PROBE_FAIL, {}
-        error = self._store_write(text)
+        error = self._store_write(canonical)
         if error is not None:
             _close_quietly(new_client)
             return error, {}
         if self._worker_occupied():
             # A fetch owns the worker: DEFER the install (the validated
             # client idles — connected lazily, nothing is in flight on it).
-            self._deferred = (text, new_client)
+            self._deferred = (canonical, new_client)
             return None, {"swapped": False, "resync": "deferred"}
         return None, {
             "swapped": True,
-            "resync": self._install(text, new_client),
+            "resync": self._install(canonical, new_client),
         }
 
     def install_saved(self, url: str) -> str:
@@ -6344,8 +6582,13 @@ class ChainBackendFlow:
         if self.shadowed:
             return "skipped"
         try:
+            # The /setup conversation stored the probe's CANONICAL URL (and
+            # any credentials it collected) through the typed writers — the
+            # install resolves the same credential overlay a settings-apply
+            # would, so both entries build the identical client.
             new_client = _build_chain_client(
-                replace(self._w.settings, chain_base_url=text)
+                replace(self._w.settings, chain_base_url=text),
+                _backend_auth(self._w.store),
             )
         except ValueError:
             return "skipped"  # stored, honest next-launch line
@@ -6483,7 +6726,7 @@ def _wire(
     output_fn: Callable[[str], None],
     cli_interactive: bool = False,
     web_mode: bool = False,
-    backend_check_fn: Callable[[str], bool] | None = None,
+    backend_check_fn: Callable[[str], str | None] | None = None,
     replace: bool = False,
 ) -> _Wiring:
     """Build store → wallet profile → chain client → watch → startup-scan
@@ -6536,7 +6779,7 @@ def _wire(
     if effective_backend is not None:
         settings.chain_base_url = effective_backend
 
-    client = _build_chain_client(settings)
+    client = _build_chain_client(settings, _backend_auth(store))
     # The scheme-selecting construction helper (TCK-ONB-004 M1): it resolves
     # through the single selection point (ChainConfig.from_settings —
     # Settings.chain_base_url when set, else the legacy esplora_base_url)
@@ -6659,16 +6902,23 @@ def _wire(
     if not web_mode:
         output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
-    # TCK-BACKEND-002: the ONE scheme-aware probe every entry point shares
-    # (settings write-before-save, the onboarding step-5 validation). The
-    # test seam ``backend_check_fn`` overrides it for BOTH (the onboarding
-    # probe and the swap's before-save probe), so a scripted test drives the
-    # whole hot-swap path with one injected callable. Default is the bounded
-    # chain/ probe (G5: the only networked module).
-    probe_fn: Callable[[str], bool] = (
+    # TCK-BACKEND-002 + TCK-ONB-004 M3: the ONE scheme-aware probe-AND-
+    # classifier every entry point shares (settings write-before-save, the
+    # onboarding step-5 validation): it returns the CANONICAL backend URL to
+    # store (M3 auto-detect: an http:// Core-RPC endpoint is rewritten to
+    # bitcoind://) or None to refuse. The test seam ``backend_check_fn``
+    # overrides it for BOTH (the onboarding probe and the swap's before-save
+    # probe), so a scripted test drives the whole hot-swap path with one
+    # injected callable. Default is the bounded chain/ probe (G5: the only
+    # networked module); credentials are resolved FROM THE STORE at call
+    # time, so a credential saved moments before an Apply rides the same
+    # probe and the same client build.
+    probe_fn: Callable[[str], str | None] = (
         backend_check_fn
         if backend_check_fn is not None
-        else (lambda url: _probe_chain_backend(url, settings))
+        else (
+            lambda url: _probe_chain_backend(url, settings, _backend_auth(store))
+        )
     )
     # Late-bound: the onboarding flow's swap hook and the wiring's controller
     # resolve to the same object once _wire's tail builds it.
