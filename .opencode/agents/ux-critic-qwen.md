@@ -3,7 +3,7 @@ description: Independent UX critic (qwen voice). Reviews the localhost web UI fo
 mode: subagent
 model: cspark/qwen3.8-flash-next
 temperature: 0.7
-reasoningEffort: high
+reasoningEffort: xhigh
 permission:
   edit: deny
   read: allow
