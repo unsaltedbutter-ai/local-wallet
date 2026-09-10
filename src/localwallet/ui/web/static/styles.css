@@ -57,6 +57,10 @@
      the pane fits the viewport; internal scroll is the last resort. */
   --badge-dim: 0.45;
   --settings-max: 62vh;
+
+  /* TCK-UX-008: the turn-busy pulse — dot size and its dim floor. */
+  --busy-dot: 0.35rem;
+  --busy-dot-min: 0.25;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -443,6 +447,37 @@ body {
   margin: 0 auto;
   font-size: var(--fs-xs);
   color: var(--c-text-muted);
+}
+
+/* TCK-UX-008: turn-busy in-flight pulse — three static-markup dots beside
+   the "Working…" label, staggered by animation-delay only (no JS timers,
+   no inline styles; CSP-clean). Follows .meta's muted color via currentColor
+   and hides with #turn-busy's hidden attribute (setBusy toggles it). */
+.busy-dots {
+  display: inline-flex;
+  gap: var(--sp-2);
+  margin-inline-start: var(--sp-1);
+  vertical-align: middle;
+}
+
+.busy-dots > span {
+  inline-size: var(--busy-dot);
+  block-size: var(--busy-dot);
+  border-radius: 50%;
+  background: currentColor;
+  animation: busy-dot 1.2s ease-in-out infinite;
+}
+
+.busy-dots > span:nth-child(2) { animation-delay: 0.2s; }
+.busy-dots > span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes busy-dot {
+  0%, 80%, 100% { opacity: var(--busy-dot-min); }
+  40% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .busy-dots > span { animation: none; }
 }
 
 /* -------------------------------------------------------- actions (TCK-WEB-004) */

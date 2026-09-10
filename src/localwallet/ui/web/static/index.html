@@ -54,7 +54,10 @@
     <input id="turn-text" name="text" type="text" placeholder="Ask your wallet…" maxlength="4096" required>
     <button id="turn-send" class="btn btn-primary" type="submit">Send</button>
   </form>
-  <p id="turn-busy" class="meta" hidden>Working…</p>
+  <!-- TCK-UX-008: animated 3-dot in-flight pulse beside the label — pure CSS
+       keyframes (styles.css), no JS interval, aria-hidden static decoration
+       that show/hides with the parent via setBusy(). -->
+  <p id="turn-busy" class="meta" hidden>Working…<span class="busy-dots" aria-hidden="true"><span></span><span></span><span></span></span></p>
   <!-- TCK-WEB-004: action buttons (labels are designer-owned copy). Each click is the
        user's second key: its data-utterance (a canonical engine phrase) is POSTed to
        /action and runs the FULL turn pipeline, exactly like typing it. Visibility is
