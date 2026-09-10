@@ -131,6 +131,7 @@ from localwallet.agent.remote_runtime import (
 )
 from localwallet.agent.runtime import MODEL_PATH_ENV_VAR, GenerateFn, ModelRuntime
 from localwallet.chain import (
+    BitcoindClient,
     ChainClient,
     ChainConfig,
     ChainError,
@@ -148,7 +149,7 @@ from localwallet.chain import (
     estimate_eta,
     time_since_last_block,
 )
-from localwallet.chain.config import ELECTRUM_SCHEME
+from localwallet.chain.config import BITCOIND_SCHEME, ELECTRUM_SCHEME
 from localwallet.config import Settings, resolve_chain_base_url
 from localwallet.node import LocalNodeReport, NodeStatus, detect_local_nodes
 from localwallet.node.doctor import NodeDoctor
@@ -3311,6 +3312,15 @@ class StartupScan:
     def mark_skipped(self) -> None:
         self._state = "skipped"
 
+    def _rearm(self, state: str) -> None:
+        """Rebind the gate's state IN PLACE (TCK-BACKEND-002 stale-gate fix,
+        LOW): a backend release/re-arm mutates the SAME object instead of
+        replacing it, so the handler table's ``scan_gate`` (captured at
+        wiring time) keeps the one object the pump later flips to
+        ``done``/``skipped`` — a stale pre-release gate can never outlive a
+        release and strand every handler on ``awaiting_backend`` forever."""
+        self._state = state
+
 
 class _ScanTick:
     """A value-free progress marker the worker enqueues (one per probed
@@ -3487,7 +3497,7 @@ class ScanFlow:
         waits for the first scan; there is no unlocked window)."""
         self._startup_plan = plan
         self._rescan = rescan
-        self.gate = StartupScan(enabled=True)
+        self.gate._rearm("pending")
 
     def set_startup_deferred(self, *, rescan: bool = False) -> None:
         """TCK-ONB-006 (ADR-0022 amendment 1, the first-run exception): arm
@@ -3502,7 +3512,7 @@ class ScanFlow:
         planned — the hold exists to keep the lazy handlers and the watch
         drain stood down until the choice resolves."""
         self._rescan = rescan
-        self.gate = StartupScan(enabled=True, deferred=True)
+        self.gate._rearm("awaiting_backend")
 
     def release_backend(self) -> bool:
         """TCK-ONB-006: the backend choice resolved. Two callers, both
@@ -4535,6 +4545,9 @@ _CHAIN_BASE_URL_KEY: Final[str] = "chain_base_url"
 #: * ``none``      — no backend is being consulted (no client, or the
 #:                   first-run choice is still unresolved/held);
 #: * ``electrum``  — the live URL's scheme is ``ssl://`` (M1 adapter);
+#: * ``bitcoind``  — the live URL's scheme is ``bitcoind://`` (M2 adapter,
+#:                   TCK-ONB-004; checked before the http-shape heuristics
+#:                   below — userinfo-carrying RPC URLs badge by scheme);
 #: * ``public``    — http(s) whose HOST is the shipped public mempool.space
 #:                   default host (mempool.space's own instance, public API,
 #:                   ADR-0003) — the trust badge, regardless of path;
@@ -4543,9 +4556,9 @@ _CHAIN_BASE_URL_KEY: Final[str] = "chain_base_url"
 #:                   instances serve the Esplora API under ``/api``);
 #: * ``esplora``   — any other http(s) URL: an Esplora-shaped API served at
 #:                   the root (electrs/esplora-family servers);
-#: * ``bitcoind``  — RESERVED for the future Bitcoin Core RPC adapter
-#:                   (docs/onb-004 plan M2): a value of the enum, never
-#:                   emitted today (no client of that kind exists).
+#: * ``bitcoind``  — emitted since docs/onb-004 plan M2 (the Core RPC
+#:                   adapter shipped; the value shipped reserved under
+#:                   TCK-BACKEND-002).
 #:
 #: The mempool-vs-esplora split is a documented URL-SHAPE heuristic: the
 #: two serve indistinguishable APIs, so the badge says which install the
@@ -4587,7 +4600,8 @@ _PUBLIC_DEFAULT_HOST: Final[str] = (
 #: privacy by distinguishing "unreachable" from "wrong chain" over the wire).
 BACKEND_PROBE_FAIL: Final[str] = (
     "that backend did not check out: it is unreachable, or it does not "
-    "serve mainnet as an Esplora (http(s)) / Electrum (ssl://) server — "
+    "serve mainnet as an Esplora (http(s)) / Electrum (ssl://) / Bitcoin "
+    "Core RPC (bitcoind://) server — "
     "nothing was saved and the current backend stays in service"
 )
 
@@ -6068,20 +6082,33 @@ class _Wiring:
 
 
 def _build_chain_client(settings: Settings) -> ChainClient:
-    """Construct the config-selected chain backend (TCK-ONB-004 M1).
+    """Construct the config-selected chain backend (TCK-ONB-004 M1/M2).
 
     The URL SCHEME picks the adapter through the single selection point
     (:meth:`ChainConfig.from_settings`, ADR-0018 as amended): an
-    ``ssl://host[:port]`` base rides the Electrum-protocol client, http(s)
-    the Esplora client as ever. Construction is network-free in both kinds
-    (clients connect lazily; the Electrum handshake — including the
-    mainnet-only proof, ADR-0021 — runs on the first call), and
-    timeout/retry/TLS-trust values come from the SAME resolved settings,
-    so the privacy banner, the watch-mode line and the transport can never
-    disagree. A malformed selection fails closed here with the value-free
-    :class:`ValueError` ``ChainConfig`` has always raised at construction.
+    ``ssl://host[:port]`` base rides the Electrum-protocol client, a
+    ``bitcoind://host[:port]`` base the Bitcoin Core RPC client, http(s)
+    the Esplora client as ever. Construction is network-free in all three
+    kinds (clients connect lazily; the Electrum and Core handshakes —
+    including the mainnet-only proof, ADR-0021 — run on the first call),
+    and timeout/retry/TLS-trust values come from the SAME resolved
+    settings, so the privacy banner, the watch-mode line and the transport
+    can never disagree. A malformed selection fails closed here with the
+    value-free :class:`ValueError` ``ChainConfig`` has always raised at
+    construction.
     """
     config = ChainConfig.from_settings(settings)
+    if config.kind == "bitcoind":
+        # Auth rides the SAME resolved settings: URL userinfo (the
+        # env/config-file rung) for user/pass, ``settings.rpc_cookie_path``
+        # for the cookie file ("" → the documented ~/.bitcoin/.cookie
+        # default; M3 wires the stored rung's dedicated keys).
+        return BitcoindClient(
+            base_url=config.base_url,
+            timeout_s=config.timeout_s,
+            max_retries=config.max_retries,
+            rpc_cookie_path=settings.rpc_cookie_path,
+        )
     client_cls = ElectrumClient if config.kind == "electrum" else EsploraClient
     return client_cls(
         base_url=config.base_url,
@@ -6103,6 +6130,12 @@ def _probe_chain_backend(url: str, settings: Settings) -> bool:
       fail-closed HANDSHAKE (``server.version`` + ``server.features`` whose
       ``genesis_hash`` must equal the mainnet constant — the gate is REUSED
       verbatim, no second genesis check), then a bounded close.
+    * ``bitcoind://`` → one :class:`BitcoindClient` tip call (TCK-ONB-004
+      M2), which forces the adapter's handshake: ``getblockchaininfo``
+      whose ``chain`` must be ``"main"`` (ADR-0021) plus the
+      ``getnetworkinfo`` capability floor — the SAME gate the live client
+      runs, no second check; auth (user/pass URL or cookie file) is
+      exercised on the same call: a 401 collapses to ``False``.
 
     Snappy budget (same rule as the setup probe): ONE attempt past the
     initial, the shared per-request timeout; TLS trust rides the ladder
@@ -6112,14 +6145,22 @@ def _probe_chain_backend(url: str, settings: Settings) -> bool:
     nothing escapes to the engine-thread caller, and no URL/host/status
     ever rides the answer (the caller owns the one honest refusal line).
     """
-    if url.startswith(ELECTRUM_SCHEME):
+    if url.startswith((ELECTRUM_SCHEME, BITCOIND_SCHEME)):
         client: Any = None
         try:
-            client = ElectrumClient(
-                base_url=url,
-                timeout_s=settings.request_timeout_s,
-                max_retries=min(settings.max_retries, 1),
-            )
+            if url.startswith(BITCOIND_SCHEME):
+                client = BitcoindClient(
+                    base_url=url,
+                    timeout_s=settings.request_timeout_s,
+                    max_retries=min(settings.max_retries, 1),
+                    rpc_cookie_path=settings.rpc_cookie_path,
+                )
+            else:
+                client = ElectrumClient(
+                    base_url=url,
+                    timeout_s=settings.request_timeout_s,
+                    max_retries=min(settings.max_retries, 1),
+                )
             client.get_tip_height()  # connect + handshake + mainnet genesis gate
             return True
         except Exception:  # noqa: BLE001 — the collapse-everything contract
@@ -6155,6 +6196,12 @@ def _backend_kind(settings: Settings, *, resolved: bool) -> str:
     url = (settings.chain_base_url.strip() or settings.esplora_base_url.strip())
     if url.startswith(ELECTRUM_SCHEME):
         return BACKEND_KIND_ELECTRUM
+    if url.startswith(BITCOIND_SCHEME):
+        # The M2 Core-RPC adapter (TCK-ONB-004): the reserved enum value,
+        # emitted the day the scheme became selectable — checked BEFORE the
+        # public-host/path heuristics, which are http(s)-shape reads and
+        # would mis-badge a userinfo-carrying RPC URL.
+        return BACKEND_KIND_BITCOIND
     rest = url.partition("://")[2]
     netloc, slash, tail = rest.partition("/")
     # Plain-string host split (urllib is lint-banned here). Ceiling: an

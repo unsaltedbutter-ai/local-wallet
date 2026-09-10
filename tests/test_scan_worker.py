@@ -578,6 +578,56 @@ def test_release_backend_reports_a_failed_plan_closed(wallet_store) -> None:
         worker.stop()
 
 
+def test_create_tx_gate_is_identity_stable_across_backend_release(wallet_store) -> None:
+    """TCK-BACKEND-002 stale-gate fix (LOW, availability): the handler
+    table's ``scan_gate`` is the flow's ONE :class:`StartupScan` object — a
+    backend release re-arms it IN PLACE, so a handler consulted after
+    ``release_backend`` reflects the post-release state, never a stale
+    pre-release gate.
+
+    Interleaving pinned: construct handlers (held ``awaiting_backend``
+    gate) → release → complete the scan → consult ``create_tx``. The
+    refusal must CLEAR because the handler reads the same object the pump
+    flipped to ``done`` — under the old object-replacing release the table
+    kept the stale ``awaiting_backend`` gate (the pump only ever flipped
+    the flow's NEW object) and create_tx refused forever after."""
+    store, wallet, wd = wallet_store
+    worker = app.ChainWorker(None)
+    try:
+        flow = app.ScanFlow(store, wallet, worker, gap_limit=None)
+        flow.set_startup_deferred()  # held first-run gate (awaiting_backend)
+        table = app.build_dispatch_table(
+            store,
+            wallet,
+            wd.parsed,
+            None,
+            lambda: None,
+            flow=app.TxFlow(),
+            fee_estimator=SimpleNamespace(
+                estimate=lambda target: SimpleNamespace(sat_per_vb=2)
+            ),
+            price_oracle=SimpleNamespace(
+                fresh=lambda: (_ for _ in ()).throw(PriceUnavailableError("stub")),
+                sats_to_usd=lambda sats, rate: None,
+            ),
+            scan_gate=flow.gate,
+        )
+        envelope = validate_payload(_create_tx_envelope_json())
+        # Held: the pre-scan refusal applies while awaiting a backend.
+        assert table[IntentName.CREATE_TX](envelope) == {
+            "error": "wallet_loading",
+            "detail": app.WALLET_LOADING_REFUSAL,
+        }
+        assert flow.release_backend() is True  # consent: gate re-armed IN PLACE
+        flow.gate.mark_done()  # the scan completes — flips the SAME object
+        store.set_sync_state(wallet.id, wallet_scan.CURSOR_KEY, '{"0": 24, "1": 24}')
+        after = table[IntentName.CREATE_TX](envelope)
+        assert after.get("error") != "wallet_loading"  # gate cleared in place
+        assert after.get("error") == "insufficient_funds"
+    finally:
+        worker.stop()
+
+
 def test_freshness_fact_reaches_the_model_turn_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

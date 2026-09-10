@@ -1,7 +1,7 @@
 # ONB-004 — Backend adapters plan (Electrum + bitcoind RPC + auto-detect/creds)
 
-- **Status:** M1 IMPLEMENTED (TCK-ONB-004 M1, 2026-09-09 — status notes at §1);
-  M2/M3 plan (pre-implementation; splits into 3 tickets — M1, M2, M3)
+- **Status:** M1+M2 IMPLEMENTED (TCK-ONB-004 M1 2026-09-09, M2 2026-09-10 —
+  status notes at §1/§2); M3 plan (pre-implementation)
 - **Branch:** dev/plan-run-1
 - **Tracks:** TCK-ONB-004 (ADR-0023 decision 7 backlog)
 - **Scope:** `src/localwallet/chain/`, `src/localwallet/ui/onboarding.py`, `/setup`, web settings, `src/localwallet/config.py`, tests. ADR-0018/0023 amendment on acceptance.
@@ -198,6 +198,48 @@ descriptor range; never fabricate a "used" or history claim (fail closed).
 **Tests:** local fixture JSON-RPC stub (stdlib `http.server` on loopback) serving
 scripted RPC responses + cookie/user-pass auth variants; no network in CI. Live probe:
 documented manual procedure against a local regtest/mainnet Core.
+
+### M2 status notes (implemented 2026-09-10)
+
+- Shipped as designed: `chain/bitcoind.py` (`BitcoindClient`, JSON-RPC 1.0,
+  cookie AND user/pass auth, `scantxoutset` descriptor scan, verbose
+  `getrawtransaction` status/history assembly, `sendrawtransaction`
+  single-attempt + embit txid binding, `estimatesmartfee` CONSERVATIVE
+  mapping FAST=1/MEDIUM=2/SLOW=6, `getblockchaininfo` tip + mainnet gate,
+  `getnetworkinfo` capability floor), the `bitcoind://[user:pass@]host[:port]`
+  scheme at the single selection point, `supports_price=False` on the M1
+  capability seam, `tests/test_chain_bitcoind.py` (125 tests against the
+  loopback fixture — auth matrix, snapshot-cache semantics, and the
+  scan-equivalence run with the §2 unspent-only divergence asserted
+  EXACTLY: the confirmed surviving coin is field-by-field identical to the
+  Esplora mock's, spent/mempool history is pinned as honest absence).
+- Deviations, documented: (1) **transport is stdlib `http.client`, not
+  httpx** — the M2 ticket mandates stdlib within `chain/`'s rules (this
+  section's "use httpx" line traded against it; one-RPC-per-connection
+  framing keeps the electrum reconnect-discipline analogue trivial);
+  (2) **JSON-RPC 1.0**, not 2.0 as this section sketched — what Core
+  actually speaks (the ticket pins it; matches `node/detect.py`);
+  (3) mainnet + capability (Core ≥ 22) enforcement lives IN the adapter
+  handshake (like M1's deviation 3) and the app's `_probe_chain_backend`
+  gained the `bitcoind://` dispatch NOW (small: one tip call through the
+  same gate), while the STORED rung's shape validation stays http(s)/ssl://
+  — storing a `bitcoind://` choice (and the credentials UX) is M3's entry
+  work (ticket sanctioned scheme: env/config-file ladder only);
+  (4) M2 selection is the explicit `bitcoind://` scheme — the http(s)
+  Esplora-then-Core autodetect remains exactly as §3 scopes it;
+  (5) the UTXO-set walk is cached per client at the tip height (an
+  implementation necessity: per-address `scantxoutset` with no cache is one
+  whole-set walk per probe); same-height reorg staleness until the next
+  block is the accepted ceiling (ADR-0018 M2 amendment).
+- **Manual live probe (never in CI, never automated):** run a local
+  mainnet Core with `-rpcport=8332`, then
+  `LOCALWALLET_CHAIN_BASE_URL=bitcoind://127.0.0.1:8332 .venv/bin/python -c
+  "import sys; sys.path.insert(0,'src'); from localwallet.chain import
+  BitcoindClient; c = BitcoindClient(); print(c.get_tip_height());
+  print(c.get_address_utxos('<throwaway-mainnet-address>'))"` — cookie auth
+  resolves via `~/.bitcoin/.cookie` automatically; a testnet/signet node
+  must fail with `does not serve mainnet`, a pre-22 node with the
+  capability refusal. Expect unspent-only answers (the tradeoff above).
 
 ---
 

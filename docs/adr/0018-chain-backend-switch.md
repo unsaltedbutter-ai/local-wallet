@@ -263,3 +263,108 @@ changes is WHEN a stored change reaches the live client.
 `False` whenever a swap controller is wired and the write is not shadowed
 — the honest flag, per section 1. Decision 5's fail-closed construction
 discipline is unchanged; it just no longer waits for a launch.
+
+## Amendment (2026-09-10, TCK-ONB-004 M2): `bitcoind://` selects the Bitcoin Core RPC adapter
+
+Milestone 2 of docs/onb-004-backend-adapters-plan.md adds the third
+`ChainClient` implementation and completes the scheme-dispatch switch begun
+in M1: the scheme of the selected `chain_base_url` picks the adapter through
+the SAME single selection point (`ChainConfig.from_settings` →
+`app._build_chain_client`).
+
+Decision: `bitcoind://[user:pass@]host[:port]` selects the Bitcoin Core
+JSON-RPC client (`chain/bitcoind.py::BitcoindClient`); http(s) keeps
+`EsploraClient`, `ssl://` keeps `ElectrumClient`. Concretely:
+
+- **Scheme chosen over autodetect.** The ticket scoped M2 to an explicit
+  scheme so Core is selectable without M3's probe-based classification;
+  `bitcoind://` is added to `ChainConfig`'s shape rules (host required,
+  optional numeric in-range port, no path/query/fragment) and surfaces as
+  `ChainConfig.kind == "bitcoind"`. Malformed values still fail closed with
+  the value-free `ValueError` at construction (decision 5 unchanged). The
+  http(s) probe branch that might ALSO discover Core on a bare port stays
+  M3's job; until then Core is reachable ONLY via this scheme on the
+  env/config-file ladder — the stored DB rung still refuses it (its
+  `chain_base_url` write validation carries http(s)/ssl:// shapes only;
+  extending it to `bitcoind://` is M3's entry work, like M1's ssl://
+  split).
+
+- **Plain-http transport, stdlib.** Core RPC is a loopback administrative
+  interface: the adapter speaks JSON-RPC 1.0 over stdlib `http.client` on
+  plain http (the plan's httpx suggestion traded against the ticket's "use
+  stdlib within chain/" rule; `http.client` is that rule's stdlib form and
+  avoids a second transport). **https RPC is unexpressible on this scheme
+  and OUT of M2 scope** — Core needs `-rpcssl` or a TLS reverse proxy for
+  it, the target deployment is same-machine, and `tls_verify` is therefore
+  NOT consulted by this adapter (no TLS layer to trust or downgrade: an
+  honest named-unsupported state, never a silent downgrade). The default
+  port is mainnet RPC's 8332 (ADR-0021 has no other network).
+
+- **Auth, resolved per request, in the plan's order** (value-free, secrets
+  never logged/echoed): (1) user/pass from the URL userinfo (env/config-file
+  rung) or the `rpc_user`/`rpc_password` constructor pair; (2) the cookie
+  file at `Settings.rpc_cookie_path` (`LOCALWALLET_RPC_COOKIE_PATH` /
+  config-file key; empty → `~/.bitcoin/.cookie`, the same ladder the node
+  doctor documents), re-read every request (bounded size) so a Core restart
+  that rotates the cookie self-heals; (3) no credentials — the
+  `Authorization` header is OMITTED entirely for an open local RPC. The
+  cookie CONTENT and any password exist only inside the base64 header value;
+  a node that demands auth answers its absence with a 401, refused
+  value-free and never retried. The URL `user@host` half-pair is rejected at
+  construction (a typo, never a silent fallback).
+
+- **Mainnet gate lives IN the adapter handshake** (as in M1's
+  `server.features`): the first call runs `getblockchaininfo` whose `chain`
+  must be `"main"` (ADR-0021 — testnet/signet/regtest refused value-free,
+  deterministically, not retried), then `getnetworkinfo` whose `version`
+  must clear 220000 (capability floor: verbose `getrawtransaction` carries
+  the input `prevout` scriptPubKeys only from Core 22 on; an older node
+  would silently mis-attribute a spend as incoming, so it is refused rather
+  than trusted). A node still syncing (`blocks < headers`) is NOT an error —
+  the tip is honest chain-truth-so-far, and progress narration stays the
+  app's watch surface (ADR-0023 decision 5).
+
+- **Scan via `scantxoutset` (the plan's option (a), watch-only exact).**
+  `get_address_utxos`/`get_address_txs` are answered from a UTXO-set snapshot
+  walk (`scantxoutset("start", ["desc(raw(<script hex>))", ...])`) whose
+  descriptors are built ONLY from the wallet's own output scripts — no key
+  material is ever sent, `importprivkey`/`importdescriptors` are never
+  called, and the node's wallet is untouched (the watch-only invariant). The
+  whole-set walk is expensive, so its result is cached per client at the tip
+  height, re-walking only when the tip moves or a new own-script is queried
+  (a same-height reorg between probes is stale until the next block — the
+  accepted M2 ceiling). BTC amounts are parsed through `Decimal` and must be
+  a whole number of satoshis or the payload fails closed.
+
+- **The unspent-only-history tradeoff (plan §2, OQ-1 default, ACCEPTED
+  here).** Core without a wallet or an address index cannot enumerate a
+  per-address SPENT history, so `scantxoutset` surfaces only UNSPENT outputs:
+  fully-spent addresses yield NO history, and mempool outputs never enter the
+  UTXO set so unconfirmed coins are honest ABSENCE. `get_address_txs`
+  therefore assembles history only from the funding transactions of an
+  address's unspent outputs (verbose `getrawtransaction` per distinct txid);
+  the gap walk treats an invisible-history address as unused, exactly as a
+  genuinely fresh one. Nothing is fabricated; a rescan widens the descriptor
+  set. A user who needs full spent history points the backend at
+  Esplora/electrum instead — the badge (`backend_kind == "bitcoind"`, now
+  EMITTED for `bitcoind://`, superseding the previous amendment's
+  "RESERVED, never emitted") and this ADR say so honestly.
+
+- **Capability honesty (plan §0/OQ-2), same as M1.** Native fees through
+  `estimatesmartfee` (targets FAST=1/MEDIUM=2/SLOW=6, `CONSERVATIVE` mode;
+  a warmup answer with no `feerate` fails closed, never a fabricated bid —
+  the FeeEstimator's backend-native single-source path, floor-follower
+  skipped). `supports_price = False`: Core has no price feed, so the price
+  oracle refuses fail-closed to the sats-only rung and USD-denominated
+  `create_tx` answers `price_unavailable`. No `get_json` member (raw Esplora
+  JSON stays Esplora-only).
+
+- **Probe (deliverable 7) — small addition, NOT deferred.** The M1
+  amendment deferred the `ssl://` setup probe to M3 because M1 shipped no
+  entry UX; M2 reuses M1's `_probe_chain_backend` structure verbatim: a
+  `bitcoind://` candidate forces the SAME adapter handshake (the `chain ==
+  "main"` gate and the auth header ride the one `getblockchaininfo` tip
+  call), and every failure (unreachable, wrong chain, 401, too-old node)
+  collapses to `False` → the value-free `BACKEND_PROBE_FAIL` line, nothing
+  stored, the old client untouched. Core is therefore selectable AND
+  validated on the stored rung the moment its shape is accepted there.

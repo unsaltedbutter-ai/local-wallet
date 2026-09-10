@@ -51,7 +51,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Final, Protocol, Self, runtime_
 import httpx
 from embit.transaction import Transaction
 
-from localwallet.chain.config import ELECTRUM_SCHEME, ChainConfig
+from localwallet.chain.config import BITCOIND_SCHEME, ELECTRUM_SCHEME, ChainConfig
 from localwallet.config import Settings
 
 if TYPE_CHECKING:
@@ -450,6 +450,12 @@ class EsploraClient:
             # inherits the same value through this construction path.
             tls_verify=defaults.tls_verify,
         )
+        if self._config.base_url.startswith(BITCOIND_SCHEME):
+            # bitcoind:// is the Core-RPC adapter's scheme (TCK-ONB-004 M2;
+            # ADR-0018 amendment): fail closed at construction, never a
+            # nonsense httpx request (an UnsupportedProtocol crash class
+            # that escapes this module's ChainError contract).
+            raise ValueError("bitcoind:// URLs require the BitcoindClient adapter")
         if self._config.base_url.startswith(ELECTRUM_SCHEME):
             # ssl:// is the Electrum adapter's scheme (TCK-ONB-004 M1;
             # ADR-0018 amendment): construction fails closed here rather

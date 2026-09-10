@@ -12,12 +12,20 @@ from urllib.parse import urlsplit
 
 from localwallet.config import Settings
 
-__all__ = ["ELECTRUM_SCHEME", "ChainConfig"]
+__all__ = ["BITCOIND_SCHEME", "ELECTRUM_SCHEME", "ChainConfig"]
 
 
 #: URL scheme that selects the Electrum-protocol adapter (TCK-ONB-004 M1;
-#: ADR-0018 amendment). Everything else this class accepts is Esplora http(s).
+#: ADR-0018 amendment).
 ELECTRUM_SCHEME: str = "ssl://"
+
+#: URL scheme that selects the Bitcoin Core RPC adapter (TCK-ONB-004 M2;
+#: ADR-0018 amendment). ``bitcoind://host[:port]`` is an explicit-choice
+#: transport (the plain-http JSON-RPC surface; https RPC is out of M2
+#: scope and NOT expressible here) — scheme-based autodetection of Core
+#: on http(s) URLs stays M3's probe job. Everything else this class
+#: accepts is Esplora http(s) or Electrum ssl://.
+BITCOIND_SCHEME: str = "bitcoind://"
 
 
 @dataclass(frozen=True)
@@ -28,10 +36,16 @@ class ChainConfig:
         base_url: backend URL — an Esplora API root such as
             ``https://mempool.space/api`` (public default, ADR-0003) or a
             user's self-hosted instance selected via
-            ``Settings.chain_base_url`` (ADR-0018), OR an Electrum-protocol
+            ``Settings.chain_base_url`` (ADR-0018), an Electrum-protocol
             endpoint ``ssl://host[:port]`` which selects the Electrum
-            adapter (TCK-ONB-004 M1; ADR-0018 amendment — see :attr:`kind`).
-            The single selection lives in :meth:`from_settings`.
+            adapter, OR a Bitcoin Core RPC endpoint
+            ``bitcoind://[user:pass@]host[:port]`` which selects the
+            Core-RPC adapter (TCK-ONB-004 M2; ADR-0018 amendment — see
+            :attr:`kind`). The single selection lives in
+            :meth:`from_settings`. Core userinfo is permitted ONLY on the
+            env/config-file rungs (the store's ``set_chain_base_url`` write
+            validation refuses embedded credentials, and M3's settings pane
+            carries dedicated never-echoed keys); value-free everywhere.
         timeout_s: Per-request timeout in seconds (applied to connect/read).
         max_retries: Number of retries after the initial attempt (0 disables
             retries entirely).
@@ -41,6 +55,9 @@ class ChainConfig:
             https backends with a private-CA / self-signed cert — the app
             then prints one honest warning line at startup (transport auth
             is off: a network-path observer can see or alter requests).
+            The ``bitcoind://`` adapter is plain-http (Core RPC on
+            loopback) and does not consult this knob: https RPC is
+            unexpressible for the scheme (M2 scope, ADR-0018 amendment).
 
     Raises:
         ValueError: If any value is out of range or malformed (fail closed at
@@ -60,15 +77,22 @@ class ChainConfig:
     @property
     def kind(self) -> str:
         """Adapter selected by the URL scheme: ``"electrum"`` for ``ssl://``
-        (TCK-ONB-004 M1), ``"esplora"`` for http(s). The construction site
+        (TCK-ONB-004 M1), ``"bitcoind"`` for ``bitcoind://`` (TCK-ONB-004
+        M2), ``"esplora"`` for http(s). The construction site
         (``app._build_chain_client``) dispatches on exactly this value."""
-        return "electrum" if self.base_url.startswith(ELECTRUM_SCHEME) else "esplora"
+        if self.base_url.startswith(ELECTRUM_SCHEME):
+            return "electrum"
+        if self.base_url.startswith(BITCOIND_SCHEME):
+            return "bitcoind"
+        return "esplora"
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_url, str):
-            raise ValueError("base_url must be an http(s) or ssl:// URL")  # noqa: TRY004
+            raise ValueError("base_url must be an http(s), ssl:// or bitcoind:// URL")  # noqa: TRY004
         if self.base_url.startswith(ELECTRUM_SCHEME):
             self._validate_electrum_url()
+        elif self.base_url.startswith(BITCOIND_SCHEME):
+            self._validate_bitcoind_url()
         elif not (self.base_url.startswith("http://") or self.base_url.startswith("https://")):
             raise ValueError("base_url must be an http(s) URL")
         else:
@@ -100,6 +124,42 @@ class ChainConfig:
             # a mis-typed config knob is treated as a config error, not a
             # programmer type error, so the whole ladder surfaces one class.
             raise ValueError("tls_verify must be a boolean")  # noqa: TRY004
+
+    def _validate_bitcoind_url(self) -> None:
+        """Fail closed on a malformed ``bitcoind://[user:pass@]host[:port]``
+        endpoint (TCK-ONB-004 M2; ADR-0018 amendment).
+
+        Shape rules (the ``ssl://`` validator's discipline, with one
+        documented difference): a parseable host, an optional NUMERIC
+        in-range port, no path/query/fragment (the RPC surface is a single
+        POST root — a stray path is a typo, not a hint), and — because
+        Bitcoin Core RPC is Basic-auth by design — userinfo IS permitted
+        here. The credential rules that come with it are value-free and
+        strict: user and password must appear TOGETHER (``user@host`` with
+        no ``:pass`` is refused: Core's rpcuser/rpcpassword are a pair, a
+        half-pair is a typo, never a fallback), and neither may contain
+        whitespace or non-ASCII (percent-encode or use the constructor
+        arguments; a raw secret fragment must never need quoting rules to
+        survive). Nothing here echoes any part of the URL. The default
+        port (8332, mainnet RPC — ADR-0021 has no other network) is applied
+        by the adapter, not stored here.
+        """
+        parsed = urlsplit(self.base_url)
+        bad = ValueError("base_url must be a bitcoind://host[:port] Core RPC URL")
+        if not parsed.hostname:
+            raise bad
+        try:
+            _ = parsed.port  # raises ValueError on non-numeric/out-of-range
+        except ValueError:
+            raise bad from None
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            raise bad
+        if parsed.username is not None or parsed.password is not None:
+            if parsed.username is None or parsed.password is None:
+                raise bad  # half a credential pair is a typo, not a hint
+            for part in (parsed.username, parsed.password):
+                if not part or any(c.isspace() for c in part) or not part.isascii():
+                    raise bad
 
     def _validate_electrum_url(self) -> None:
         """Fail closed on a malformed ``ssl://host[:port]`` endpoint.

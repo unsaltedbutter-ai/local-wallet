@@ -1,11 +1,12 @@
-"""Chain subsystem: THE ONLY networked module (Esplora, Electrum, fees, price).
+"""Chain subsystem: THE ONLY networked module (Esplora, Electrum, bitcoind, fees, price).
 
 Network I/O lives exclusively here and is lint-enforced by
 ``tools/lint_network.py``: only ``src/localwallet/chain/**`` may import
 network modules.
 """
 
-from localwallet.chain.config import ChainConfig
+from localwallet.chain.bitcoind import BitcoindClient
+from localwallet.chain.config import BITCOIND_SCHEME, ELECTRUM_SCHEME, ChainConfig
 from localwallet.chain.electrum import ElectrumClient
 from localwallet.chain.esplora import (
     MAINNET_GENESIS_HASH,
@@ -34,8 +35,11 @@ from localwallet.chain.watch import (
 )
 
 __all__ = [
+    "BITCOIND_SCHEME",
+    "ELECTRUM_SCHEME",
     "MAINNET_GENESIS_HASH",
     "Balance",
+    "BitcoindClient",
     "ChainClient",
     "ChainConfig",
     "ChainError",
