@@ -110,3 +110,42 @@ before install.
 *Cross-references: PROJECT.md §7.1, §11 (LLM + Decoding constraint rows),
 §12 Phase 0, §13 R1/R12/R15, §14 OQ1/OQ20. Envelope contract: ADR-0002.
 Perf budget: ADR-0006.*
+
+## Amendment (2026-09-09, TCK-LAUNCH-002) — the default model is the pinned model, and a missing download is an offer, not a silent demo
+
+Per the user direction of 2026-09-09: **not specifying a model now means the
+DEFAULT pinned model, not the stub.** Selection order (in `app.run`):
+
+1. injected `generate_fn` (test seam),
+2. the ADR-0007 remote bridge (explicit env only),
+3. `LOCALWALLET_MODEL_PATH` (explicit path, unchanged),
+4. `--stub-llm` (explicit dev choice — no banner, no card, unchanged),
+5. **new:** `models/manifest.json`'s entry flagged `"default": true` resolved
+   to `models/bin/<name>.gguf` — **file present → the real GGUF runtime,
+   silently** (the normal launch); **file absent → the demo stub keeps the
+   session alive AND the engine arms a deterministic Yes/No download card**
+   (web buttons + CLI yes/no; the card replaces the old silent demo-mode
+   banner);
+6. no resolvable/UNPINNED default (manifest unreadable, no `default` entry,
+   or a null `sha256` — an unpinned model is never auto-downloaded) → the
+   old visible demo banner stands.
+
+On a YES the engine runs the tracked pinned downloader
+(`models/download_model.py --model <default> --json-progress`) as an
+**engine-owned subprocess** — argument list, never a shell; the child's own
+streaming SHA-256 verification against the manifest pin (and its resumable
+`.part`) is the install gate, untouched. Progress rides the event emitter as
+int-only payloads (percent + bytes; no path/name/user ever enters an event —
+the child's stdout is parsed for those ints and every other line, including
+its own messages, is discarded, stderr included). QUIT/process-exit
+terminates the child bounded (terminate → kill → bounded join; no orphans).
+Completion narrates once: **the model activates on the NEXT launch** (a
+hot-swap of the running session's runtime is deliberately not attempted —
+the stub owns this session until it exits).
+
+**Network-lint exception (scoped, ADR-blessed):** `tools/lint_network.py`
+gains `FILE_MODULE_EXCEPTIONS` — ONE file (`app.py`), ONE module
+(`subprocess`), for exactly this child-process orchestration. No network
+module is exempt there (a test pins that an injected `urllib` import in
+`app.py` still fails the lint); the child is a separate process running the
+repo's own build-time tool, which the lint has always excluded by design.

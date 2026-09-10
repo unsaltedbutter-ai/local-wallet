@@ -41,7 +41,7 @@ from localwallet.chain.esplora import ChainError
 from localwallet.config import Settings
 
 if TYPE_CHECKING:
-    from localwallet.chain.esplora import EsploraClient
+    from localwallet.chain.esplora import ChainClient
 
 __all__ = [
     "MAX_STALE_AGE_S",
@@ -122,7 +122,12 @@ class PriceOracle:
     """Cached, TTL-bounded USD/BTC price oracle.
 
     Args:
-        client: The shared :class:`EsploraClient` to GET through.
+        client: The shared :class:`ChainClient` to query through. Backends
+            that carry no ``supports_price`` capability (Electrum/bitcoind
+            adapters, TCK-ONB-004 plan OQ-2) are treated as a PERMANENT
+            price outage: :meth:`fresh` / :meth:`stale_ok` raise
+            :class:`PriceUnavailableError` without a fetch — USD-denominated
+            ``create_tx`` refuses cleanly, sats-only keeps working.
         ttl_s: Cache lifetime in seconds; defaults to
             ``Settings.price_ttl_s`` (60s).
         enabled: Whether the oracle may query the network; defaults to
@@ -139,7 +144,7 @@ class PriceOracle:
 
     def __init__(
         self,
-        client: EsploraClient,
+        client: ChainClient,
         ttl_s: float | None = None,
         enabled: bool | None = None,
     ) -> None:
@@ -169,6 +174,12 @@ class PriceOracle:
     def fresh(self) -> Rate:
         """Return a rate that is fresh (age < TTL) if at all possible.
 
+        A backend without a price feed (``supports_price`` falsy — the
+        capability seam of the TCK-ONB-004 plan) is the no-cache failure
+        branch of the ladder directly: :class:`PriceUnavailableError`,
+        nothing fetched, nothing fabricated.
+    
+
         Degrade ladder (R10, OQ4; see ADR-0011):
         - cached value younger than the TTL → returned with ``stale=False``;
         - otherwise fetch **and parse**: on any failure — transport error,
@@ -185,6 +196,7 @@ class PriceOracle:
         replaces the cached value.
         """
         self._check_enabled()
+        self._check_supports_price()
         cached = self._cache
         if cached is not None and _now() - cached.fetched_at < self._ttl_s:
             return cached
@@ -212,6 +224,7 @@ class PriceOracle:
         :class:`ConfigDisabled` when disabled.
         """
         self._check_enabled()
+        self._check_supports_price()
         if self._cache is not None:
             return self._cache
         try:
@@ -266,6 +279,13 @@ class PriceOracle:
     def _check_enabled(self) -> None:
         if not self._enabled:
             raise ConfigDisabled("price oracle is disabled by configuration")
+
+    def _check_supports_price(self) -> None:
+        # Capability gate (TCK-ONB-004 M1; plan OQ-2 default). Fail closed:
+        # absence of the flag is treated as "no price feed", so a backend
+        # can never be assumed to have one. Value-free message.
+        if not getattr(self._client, "supports_price", False):
+            raise PriceUnavailableError("price unavailable: backend has no price feed")
 
 
 def _with_stale(rate: Rate) -> Rate:

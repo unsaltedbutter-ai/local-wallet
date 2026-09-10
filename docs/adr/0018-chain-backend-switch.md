@@ -123,3 +123,53 @@ network path can observe the queried addresses and tamper with the
 responses. **The recommendation remains a properly-trusted certificate** —
 adding the private CA to the OS trust store keeps verification on and needs
 no app change; `verify=false` is the escape hatch, not the happy path.
+
+## Amendment (2026-09-09, TCK-ONB-004 M1): `ssl://` selects the Electrum adapter
+
+Milestone 1 of docs/onb-004-backend-adapters-plan.md extends this ADR's
+config-only switch from "Esplora base URL" to "chain backend URL": the
+scheme of the selected `chain_base_url` picks the adapter through the SAME
+single selection point.
+
+Decision: `ssl://host[:port]` selects the Electrum-protocol client
+(`chain/electrum.py::ElectrumClient`), http(s) keeps selecting
+`EsploraClient`. Concretely:
+
+- `ChainConfig` now validates BOTH shapes (an `ssl://` URL must have a host,
+  no userinfo, no path, and a numeric in-range port when present) and
+  exposes the selection as `ChainConfig.kind` (`"electrum"` / `"esplora"`);
+  malformed values keep failing closed with the value-free `ValueError` at
+  construction (decision 5 unchanged, now scheme-aware).
+- The one construction site gains a scheme dispatch
+  (`app._build_chain_client`): resolve `ChainConfig.from_settings(settings)`
+  (env > config file > stored — decision 1's ladder unchanged), build the
+  kind's client. Both adapters satisfy the same `ChainClient` protocol,
+  connect lazily, and share the timeout/retry/backoff and error-scrubbing
+  discipline, so every downstream surface (scan, watch, fees, broadcast,
+  privacy banner) is adapter-agnostic by construction.
+- `tls_verify` (previous amendment) rides the SAME path with identical
+  semantics on both kinds — electrs/Fulcrum servers commonly carry
+  self-signed certs exactly like Start9's https Esplora, so
+  `LOCALWALLET_TLS_VERIFY=0` is the same env/file-only escape hatch and the
+  same unskippable startup warning applies.
+- Mainnet-only (ADR-0021) is enforced INSIDE the Electrum adapter's
+  connection handshake (`server.features.genesis_hash` must equal the
+  mainnet constant): M1 deliberately ships no `ssl://` setup-time probe —
+  the `/setup` and first-run conversations still refuse `ssl://` entry
+  (their URL entry, validation and stored-rung support land with the plan's
+  M3), so until then the env/config-file ladder is the only `ssl://` path
+  and the handshake is the only gate. `check_backend` remains
+  Esplora-shaped and refuses `ssl://` (no silent cross-family fallback).
+- Capability honesty (plan §0): the Electrum backend has native fees
+  (`blockchain.estimatefee` → `estimate_fee`, the FeeEstimator's
+  backend-native single-source path — the floor-follower is skipped, never
+  faked) and NO price feed (`supports_price=False` → the price oracle
+  refuses fail-closed to the ADR-0011 ladder's sats-only rung;
+  USD-denominated `create_tx` answers `price_unavailable`).
+
+Credentials note: the Electrum protocol has no standard auth; ssl://
+endpoints essentially never take user/password. M1 therefore accepts no
+credential fields for `ssl://` at all; when M3 adds the credentials UX
+(user/pass + "no credentials needed") the accepted-but-rare case is
+handled there, per the plan. The stored (DB) rung still validates http(s)
+only in M1 — storing an `ssl://` choice is part of M3's settings work.

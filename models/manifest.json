@@ -3,7 +3,8 @@
     "name": "gemma-4-E2B-it-Q4_K_M",
     "url": "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf",
     "sha256": "740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8",
-    "size_bytes": "3106738272"
+    "size_bytes": "3106738272",
+    "default": true
   },
   {
     "name": "gemma-4-E4B-it-Q4_K_M",

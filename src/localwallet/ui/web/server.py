@@ -622,17 +622,36 @@ class _Handler(BaseHTTPRequestHandler):
         # the store. No transport-only fallback exists for settings (a settings
         # page that shows stale/absent values is worse than an honest 503): a
         # busy/dead engine answers 503 and the client retries. Value-free —
-        # only user-authored scalars (gap count, backend URL) appear, never
-        # wallet data; the token is never here.
+        # only user-authored scalars (gap count, backend URL) and the PUBLIC
+        # watch key appear (truncated in the list; the FULL key only on the
+        # explicit ``?key=watch_key`` single-key read — the settings panel's
+        # Show/Copy click, TCK-WEB-008 follow-up (a); never in any log, and
+        # this endpoint is token-gated). The token is never here.
+        key = self._query_key()
         settings = (
             None
             if self.engine.error is not None
-            else self.engine.request_settings(self.state_timeout_s)
+            # key=None → the general allowlisted list; key set → the
+            # ENGINE-decided single-key read (only watch_key reveals).
+            else self.engine.request_settings(self.state_timeout_s, key)
         )
         if settings is None:
             self._send_json(503, {"error": "engine busy"})
             return
         self._send_json(200, settings)
+
+    def _query_key(self) -> str | None:
+        """The single ``key`` query parameter of GET /settings (the explicit
+        single-key READ rung; TCK-WEB-008 follow-up (a)). Absent/blank/multi-
+        valued → ``None`` (the general list read). The value is untrusted and
+        never echoed — the ENGINE allowlist decides what a key read answers."""
+        try:
+            values = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query
+            ).get("key") or []
+        except ValueError:
+            return None
+        return values[0] if len(values) == 1 and values[0] else None
 
     def _settings_post(self, body: bytes) -> None:
         # ONE key per write (the engine applies + re-reads it, or refuses with
@@ -671,27 +690,38 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(code, result)
 
     def _watchkey_post(self, body: bytes) -> None:
-        # TCK-LAUNCH-001 first-run watch-key submit. The transport ONLY
-        # shape-checks the JSON (a string ``key``) and marshals it through
-        # the engine queue (``WatchKeyRequest``). ALL key validation —
-        # parse, mainnet-only gate, watch-only refusals, seed-phrase
-        # detection — is the EXISTING engine path (app.py), fail-closed, with
-        # value-free refusals; this module never imports a key parser. HTTP
-        # maps the closed engine status: accepted→200, rejected→400,
-        # already→409, store_error/unavailable/busy→503. The key never rides back.
+        # TCK-LAUNCH-001 first-run watch-key submit (and the TCK-LAUNCH-002
+        # in-place REPLACE rung, ADR-0024 amendment). The transport ONLY
+        # shape-checks the JSON (a string ``key``; STRICT boolean
+        # ``replace``+``confirm`` flags) and marshals it through the engine
+        # queue (``WatchKeyRequest``). ALL key validation — parse,
+        # mainnet-only gate, watch-only refusals, seed-phrase detection —
+        # is the EXISTING engine path (app.py), fail-closed, with
+        # value-free refusals; this module never imports a key parser.
+        # REPLACE requires BOTH flags (the double opt-in the settings
+        # panel's confirm step raises) and reruns the SAME gated path —
+        # the transport's verdict is structurally impossible here. HTTP
+        # maps the closed engine status: accepted/replaced→200,
+        # rejected→400, already→409, store_error/unavailable/busy→503.
+        # The key never rides back.
         try:
             payload = json.loads(body)
             key = payload["key"] if isinstance(payload, dict) else None
+            replace = payload.get("replace") if isinstance(payload, dict) else None
+            confirm = payload.get("confirm") if isinstance(payload, dict) else None
         except (ValueError, KeyError, TypeError):
             self._send_json(400, {"error": "expected JSON object with a 'key' string"})
             return
         if not isinstance(key, str):
             self._send_json(400, {"error": "'key' must be a string"})
             return
+        allow_replace = replace is True and confirm is True
         result = (
             None
             if self.engine.error is not None
-            else self.engine.request_watchkey(self.state_timeout_s, key)
+            else self.engine.request_watchkey(
+                self.state_timeout_s, key, allow_replace=allow_replace
+            )
         )
         if result is None:
             # Dead/timeout engine: the never-cancel POST contract stands —
@@ -700,7 +730,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(503, {"error": "engine busy"})
             return
         status = result.get("status")
-        code = {"accepted": 200, "rejected": 400, "already": 409}.get(status, 503)
+        code = {
+            "accepted": 200,
+            "replaced": 200,
+            "rejected": 400,
+            "already": 409,
+        }.get(status, 503)
         self._send_json(code, result)
 
     # -- static -------------------------------------------------------------

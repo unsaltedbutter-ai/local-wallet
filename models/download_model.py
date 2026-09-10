@@ -135,8 +135,32 @@ def _open_request(url: str, range_start: int | None, token: str | None = None):
     return urllib.request.urlopen(req, timeout=60)
 
 
-def download(url: str, part: Path, dest: Path, token: str | None = None) -> None:
-    """Download ``url`` into ``part`` (resumable), then move to ``dest``."""
+def _expected_total(resp, existing: int) -> int | None:
+    """The full-file byte count from the response headers, or ``None`` when
+    the server did not say (resume: ``206`` carries ``Content-Range``'s
+    total; a fresh ``200`` carries ``Content-Length``)."""
+    try:
+        if resp.getcode() == 206:
+            content_range = resp.headers.get("Content-Range")
+            if content_range and "/" in content_range:
+                return int(content_range.rsplit("/", 1)[1])
+        else:
+            length = resp.headers.get("Content-Length")
+            if length:
+                return existing + int(length)
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+def download(url: str, part: Path, dest: Path, token: str | None = None,
+             progress=None) -> None:
+    """Download ``url`` into ``part`` (resumable), then move to ``dest``.
+
+    ``progress(downloaded_bytes, total_bytes_or_None)`` (TCK-LAUNCH-002
+    seam) is called on every chunk when given — byte counts ONLY, no paths;
+    the download/verify/install ORDER and the hash contract are unchanged.
+    """
     existing = part.stat().st_size if part.exists() else 0
 
     if existing > 0:
@@ -149,6 +173,7 @@ def download(url: str, part: Path, dest: Path, token: str | None = None) -> None
             if exc.code == 416:
                 print(f"range rejected (416); restarting download for {part.name}")
                 part.unlink()
+                existing = 0  # clean restart: drop the stale resume size
                 resp = _open_request(url, None, token)
                 mode = "wb"
             else:
@@ -161,17 +186,23 @@ def download(url: str, part: Path, dest: Path, token: str | None = None) -> None
                 # Server ignored our Range header; restart from scratch.
                 print(f"server returned {code} (no resume support); restarting")
                 part.unlink()
+                existing = 0  # clean restart: drop the stale resume size
                 mode = "wb"
     else:
         resp = _open_request(url, None, token)
         mode = "wb"
 
+    total = _expected_total(resp, existing)
+    written = existing
     with part.open(mode) as fh:
         while True:
             chunk = resp.read(CHUNK)
             if not chunk:
                 break
             fh.write(chunk)
+            written += len(chunk)
+            if progress is not None:
+                progress(written, total)
     resp.close()
 
     part.replace(dest)
@@ -209,15 +240,23 @@ def cmd_check(entries: list[dict], name: str, out: Path) -> int:
 
 
 def cmd_install(entries: list[dict], name: str, out: Path,
-                write_hash: bool, token: str | None = None) -> int:
+                write_hash: bool, token: str | None = None,
+                json_progress: bool = False) -> int:
     entry = find_entry(entries, name)
     url = entry["url"]
     expected = entry.get("sha256")
     dest = out / f"{name}.gguf"
     part = out / f"{name}.gguf.part"
 
+    def progress(downloaded: int, total: int | None) -> None:
+        # TCK-LAUNCH-002: one int-only JSON line per chunk on stdout for the
+        # engine's inline progress bar. Byte counts ONLY — never a path,
+        # never a username. The app ignores every non-JSON stdout line.
+        print(json.dumps({"downloaded": downloaded, "total": total}), flush=True)
+
     out.mkdir(parents=True, exist_ok=True)
-    download(url, part, dest, token)
+    download(url, part, dest, token,
+             progress=progress if json_progress else None)
 
     actual = sha256_of(dest)
     size = dest.stat().st_size
@@ -266,6 +305,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "back into manifest.json (also bootstraps null hashes)")
     p.add_argument("--check", action="store_true",
                    help="verify existing file against the manifest; no download")
+    p.add_argument("--json-progress", action="store_true",
+                   help="emit one int-only JSON progress line per downloaded "
+                        "chunk ({downloaded,total}) on stdout — the seam the "
+                        "app's inline model-download progress bar consumes "
+                        "(TCK-LAUNCH-002); verification/install order unchanged")
     p.add_argument("--hf-token", default=None,
                    help="Hugging Face token for gated official repos "
                         "(falls back to HF_TOKEN env var). Never logged. "
@@ -294,7 +338,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_check(entries, args.model, args.out)
 
     token = resolve_token(args.hf_token)
-    return cmd_install(entries, args.model, args.out, args.write_hash, token)
+    return cmd_install(entries, args.model, args.out, args.write_hash, token,
+                       json_progress=args.json_progress)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ import http.client
 import json
 import re
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -1157,7 +1158,7 @@ def test_settings_get_lists_the_allowlist_shape_only(
         assert snapshot["schema"] == "settings/1"
         assert snapshot["status"] == "ok"
         entries = {entry["key"]: entry for entry in snapshot["settings"]}
-        assert set(entries) == {"gap_limit", "chain_base_url"}
+        assert set(entries) == {"gap_limit", "chain_base_url", "watch_key"}
         gap = entries["gap_limit"]
         assert gap["type"] == "int" and gap["value"] is None
         assert gap["default"] == str(app.wallet_scan.DEFAULT_GAP_LIMIT)
@@ -1169,6 +1170,11 @@ def test_settings_get_lists_the_allowlist_shape_only(
         chain = entries["chain_base_url"]
         assert chain["type"] == "url" and chain["value"] is None
         assert chain["requires_restart"] is True
+        # TCK-LAUNCH-002: the READ-ONLY watch key entry (no wallet in this
+        # bare store → configured False, null value; it is absent from the
+        # WRITE allowlist — pinned by the write-matrix tests).
+        watch = entries["watch_key"]
+        assert watch["type"] == "watch_key" and watch["configured"] is False
         assert server.token.encode() not in data
     finally:
         server.stop()
@@ -1467,12 +1473,18 @@ def _launch_first_run(
     monkeypatch: pytest.MonkeyPatch,
     *,
     args: list[str] | None = None,
+    arm_model_card: bool = False,
 ) -> tuple[threading.Thread, list[str], dict[str, Any]]:
     """Start a REAL web session with no key anywhere; returns
     ``(thread, outputs, capture)`` with ``capture["server"]`` live. The
     caller owns ``server.stop()`` + join. Chain I/O is impossible by
     construction here (unprovisioned) — the fresh tmp store also proves
-    nothing was configured by an earlier run."""
+    nothing was configured by an earlier run.
+
+    ``arm_model_card=True`` (TCK-LAUNCH-002) instead resolves the default
+    to a NOT-DOWNLOADED file, arming the download card; the fake model name
+    keeps every seam deterministic (no real manifest/models on either
+    branch, no subprocess ever spawned by these tests)."""
     import httpx  # local: the ONLY network-ish lib, mock transport only
 
     store_path = tmp_path / "first-run.db"
@@ -1489,6 +1501,20 @@ def _launch_first_run(
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
     monkeypatch.setenv(app.AUTO_SCAN_ENV_VAR, "1")
     monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
+    # TCK-LAUNCH-002 machine-independence: a real models/bin download would
+    # make the DEFAULT resolve to an existing file and select the GGUF
+    # runtime here; an absent file would ARM THE DOWNLOAD CARD (extra SSE
+    # frames). These first-run tests predate (and are orthogonal to) the
+    # card — pin the "no resolvable default" branch so the stream shape is
+    # identical on every machine. arm_model_card=True opts INTO the card
+    # (a fake not-downloaded default) for the dedicated card tests below.
+    if arm_model_card:
+        monkeypatch.setattr(
+            app, "_resolve_default_model",
+            lambda: ("fake-model", tmp_path / "no-such-model.gguf"),
+        )
+    else:
+        monkeypatch.setattr(app, "_resolve_default_model", lambda: None)
     calls: list[str] = []
     capture: dict[str, Any] = {"calls": calls, "store_path": store_path}
 
@@ -1726,3 +1752,312 @@ def test_watchkey_on_a_keyed_engine_is_refused(serve: Any) -> None:
     assert status == 503
     assert json.loads(data)["status"] == "unavailable"
     assert ZPUB.encode() not in data
+
+
+# =================== TCK-LAUNCH-002: model card + watch-key surfacing =======
+#
+# Transport-contract pins only — the download LIFECYCLE (subprocess, cancel,
+# concurrency) is pinned against a real pump at the app level in
+# tests/test_launch.py; here we assert only what crosses the HTTP/SSE
+# boundary. No test in this section POSTs /download (the web harness carries
+# a fake not-downloaded default but is never consented — no child spawns).
+
+from tests.test_wallet_descriptor import YPUB
+
+
+def _model_serve(tmp_path: Path, *, succeed: bool = True) -> Any:
+    """A web server whose engine carries an ARMED model-download flow (fake
+    command) + the RESPOND/CLARIFY table (no wallet), mirroring a real
+    default-file-absent launch. The caller owns server.stop()."""
+    table = {
+        IntentName.RESPOND: app._respond_handler,
+        IntentName.CLARIFY: app._clarify_handler,
+    }
+    command = [
+        "import json",
+        "for n in (1048576, 2097152, 3145728):",
+        "    print(json.dumps({'downloaded': n, 'total': 3145728}), flush=True)",
+    ] if succeed else ["import sys; sys.exit(1)"]
+
+    def bootstrap() -> EngineContext:
+        return EngineContext(
+            loop=AgentLoop(app.stub_generate, table),
+            flow=TxFlow(),
+            session=app.SendSession(),
+            table=table,
+            model=app.ModelDownloadFlow(
+                model_name="fake", command=[sys.executable, "-c", "\n".join(command)]
+            ),
+        )
+
+    return serve_web(bootstrap, static_dir=tmp_path / "static")
+
+
+def test_model_state_rides_the_typed_state_snapshot(tmp_path: Path) -> None:
+    """state/1 gains an ADDITIVE model_state NAME (enum only, never data)
+    while a download flow is armed — the sole source the client's Yes/No
+    buttons key off. No amount/address/token can appear in it."""
+    server = _model_serve(tmp_path)
+    try:
+        status, _h, data, _r = _request(server, "GET", "/state", token=server.token)
+        snap = json.loads(data)
+        assert status == 200 and snap["schema"] == "state/1"
+        assert snap["model_state"] == "absent"  # armed, card shown
+        assert server.token.encode() not in data
+    finally:
+        server.stop()
+
+
+def test_download_progress_is_int_only_value_free_sse(tmp_path: Path) -> None:
+    """A consented /download streams model_progress frames (int-only JSON:
+    percent + bytes, no path/user/wallet data) and the card flips to
+    `ready` — all across the wire, driven by the fake downloader."""
+    server = _model_serve(tmp_path)
+    stream = _Stream(server)
+    try:
+        stream.read_head()
+        # (a fresh subscription replays the ring — the startup card lines
+        # are already retained; no pre-turn to wait for.)
+        status, _h, _d, _r = _request(
+            server, "POST", "/action", {"utterance": "/download"},
+            token=server.token,
+        )
+        assert status == 202
+        stream.read_until(b"event: model_progress")
+        # isolate the model_progress frames' payloads:
+        import re as _re
+
+        ticks = _re.findall(
+            rb"event: model_progress\ndata: (\{[^}]*\})", stream.buf
+        )
+        assert ticks
+        for raw in ticks:
+            payload = json.loads(raw)
+            assert set(payload) == {"downloaded", "total", "pct"}
+            assert all(
+                v is None or isinstance(v, int) for v in payload.values()
+            )
+            assert b"/" not in raw  # no path-shaped string in any tick
+        stream.read_until(b"downloaded and verified")  # the ready line
+        snap = _session_state(server)
+        assert snap["model_state"] == "ready"
+    finally:
+        stream.close()
+        server.stop()
+
+
+def test_quick_action_bypasses_the_model_turn_pipeline(
+    serve: Any, echo_turns: list[str]
+) -> None:
+    """ADR-0024 §8 hold + LAUNCH-002: a canonical quick-action slash
+    (/balance) is intercepted by CODE ahead of _run_turn — the model is
+    never asked (echo_turns stays empty), so it answers with no model. A
+    NON-slash chat line still routes through the turn pipeline normally."""
+    server = serve(heartbeat_s=30.0)
+    stream = _Stream(server)
+    try:
+        stream.read_head()
+        _request(server, "POST", "/action", {"utterance": "/balance"},
+                 token=server.token)
+        frame = stream.read_until(b"event: turn_end")
+        assert echo_turns == []  # never reached _run_turn
+        assert b"not available" in frame  # (this harness table has no handler)
+        # A plain chat line still runs the full turn path:
+        _request(server, "POST", "/turn", {"text": "hello model"},
+                 token=server.token)
+        stream.read_until(b"echo:hello model")
+        assert echo_turns == ["hello model"]
+    finally:
+        stream.close()
+
+
+# ------------------------------------------- watch-key settings surfacing
+
+
+def _watch_store_server(tmp_path: Path, monkeypatch: Any) -> Any:
+    """A server over a REAL engine-owned store with an accepted wallet (the
+    canonical descriptor IS the persisted key) — the settings surface the
+    watch-key entry reads from."""
+    store_path = tmp_path / "watchkey.db"
+    seed = Store(str(store_path))
+    try:
+        wallet = seed.create_wallet(
+            "default", WalletDescriptor.from_key(ZPUB).descriptor
+        )
+        seed.set_active_wallet(wallet.id)
+    finally:
+        seed.close()
+    monkeypatch.delenv(app.GAP_LIMIT_ENV_VAR, raising=False)
+    monkeypatch.delenv(app.CHAIN_BASE_URL_ENV_VAR, raising=False)
+    monkeypatch.delenv(app.ZPUB_ENV_VAR, raising=False)
+
+    def bootstrap() -> EngineContext:
+        table = {
+            IntentName.RESPOND: app._respond_handler,
+            IntentName.CLARIFY: app._clarify_handler,
+        }
+        return EngineContext(
+            loop=AgentLoop(app.stub_generate, table),
+            flow=TxFlow(),
+            session=app.SendSession(),
+            table=table,
+            store=Store(str(store_path)),
+        )
+
+    server = serve_web(bootstrap, static_dir=tmp_path / "static")
+    server._watch_store_path = store_path  # type: ignore[attr-defined]
+    return server
+
+
+def test_settings_watch_key_truncated_in_list_full_only_on_explicit_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = _watch_store_server(tmp_path, monkeypatch)
+    descriptor = WalletDescriptor.from_key(ZPUB).descriptor
+    try:
+        status, _h, data, _r = _request(server, "GET", "/settings", token=server.token)
+        assert status == 200
+        entries = {e["key"]: e for e in json.loads(data)["settings"]}
+        watch = entries["watch_key"]
+        assert watch["configured"] is True and watch["type"] == "watch_key"
+        # DISPLAY-TRUNCATED in the general list — never the full descriptor:
+        assert watch["value"] == app._display_truncate(descriptor)
+        assert watch["value"] != descriptor
+        assert descriptor.encode() not in data
+        # The explicit single-key read (the Show/Copy click) carries FULL:
+        status, _h, rdata, _r = _request(
+            server, "GET", "/settings?key=watch_key", token=server.token
+        )
+        assert status == 200
+        revealed = json.loads(rdata)["settings"][0]
+        assert revealed["value"] == descriptor and revealed["revealed"] is True
+        # …and it is STILL token-gated: no token → 401, key never leaks.
+        status, _h, edata, _r = _request(server, "GET", "/settings?key=watch_key")
+        assert status == 401
+        assert descriptor.encode() not in edata
+    finally:
+        server.stop()
+
+
+def test_settings_watch_key_is_read_only_over_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The watch key is deliberately OFF the settings WRITE allowlist — a
+    POST /settings {key:watch_key} is refused (its name is not even echoed);
+    changing the key is the gated /watchkey path ONLY."""
+    server = _watch_store_server(tmp_path, monkeypatch)
+    try:
+        status, _h, data, _r = _request(
+            server, "POST", "/settings",
+            {"key": "watch_key", "value": YPUB}, token=server.token,
+        )
+        assert status == 400
+        assert json.loads(data)["status"] == "rejected"
+        assert YPUB.encode() not in data  # the submitted value is never echoed
+    finally:
+        server.stop()
+
+
+# --------------------------------------------- in-place REPLACE (002/ADR)
+
+
+def _keyed_web(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A REAL keyed web session (stub, tmp store) whose engine carries a
+    preset provision — the replace surface. Caller owns stop()+join()."""
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(tmp_path / "replace.db"))
+    monkeypatch.setenv(app.AUTO_SCAN_ENV_VAR, "0")
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
+    monkeypatch.delenv(app.UI_ENV_VAR, raising=False)
+    monkeypatch.delenv(app.ZPUB_ENV_VAR, raising=False)
+    capture: dict[str, Any] = {}
+    gate = threading.Event()
+    thread = threading.Thread(
+        target=lambda: capture.update(
+            code=app.run(
+                ["--stub-llm", "--zpub", ZPUB, "--web"],
+                output_fn=lambda _s: None,
+                on_web_server=lambda s: (capture.update(server=s), gate.set()),
+            )
+        ),
+        daemon=True,
+    )
+    thread.start()
+    assert gate.wait(30)
+    return thread, capture["server"]
+
+
+def test_watchkey_replace_requires_the_double_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    thread, server = _keyed_web(tmp_path, monkeypatch)
+    new_descriptor = WalletDescriptor.from_key(YPUB).descriptor
+    try:
+        # (a) bare submit against a configured wallet → 409 already (contract).
+        status, _h, data, _r = _request(
+            server, "POST", "/watchkey", {"key": YPUB}, token=server.token
+        )
+        assert status == 409 and json.loads(data)["status"] == "already"
+        assert YPUB.encode() not in data
+        # (b) replace WITHOUT confirm → still 409 (single flag is not consent).
+        status, _h, data, _r = _request(
+            server, "POST", "/watchkey", {"key": YPUB, "replace": True},
+            token=server.token,
+        )
+        assert status == 409
+        # (c) replace+confirm with the SAME key → 409, named as the current one.
+        status, _h, data, _r = _request(
+            server, "POST", "/watchkey",
+            {"key": ZPUB, "replace": True, "confirm": True}, token=server.token,
+        )
+        assert status == 409 and "already connected" in json.loads(data)["error"]
+        # (d) replace+confirm NEW key → 200 replaced; the new wallet is active.
+        status, _h, data, _r = _request(
+            server, "POST", "/watchkey",
+            {"key": YPUB, "replace": True, "confirm": True}, token=server.token,
+        )
+        assert status == 200 and json.loads(data)["status"] == "replaced"
+        assert YPUB.encode() not in data  # the key never rides back
+        store = Store(str(tmp_path / "replace.db"))
+        try:
+            active = store.get_active_wallet()
+            # ADR-0010 single-WALLET is per descriptor; the swap reactivated
+            # the store onto the NEW key while the session continues in place.
+            assert active is not None and active.descriptor == new_descriptor
+        finally:
+            store.close()
+        snap = _session_state(server)
+        assert "needs_watch_key" not in snap  # still provisioned
+    finally:
+        server.stop()
+        thread.join(15)
+
+
+def test_watchkey_replace_refusals_are_value_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replace submit runs the EXACT same gated parse path — a testnet /
+    private key is refused (400) value-free, and NOTHING was swapped."""
+    thread, server = _keyed_web(tmp_path, monkeypatch)
+    try:
+        for bad in (
+            (
+                "vpub5ZJ3cDEGGk61yWWUHFHgmG3M4je4yFD3ebC6jWHsqV8Cxh2K5zz8c6X5Hk7FkUAB"
+                "FTjRkQBz3g84MYeRhjAdnq1QmrmyTRTrzs8rFVCJUyh"
+            ),
+            (
+                "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKm"
+                "PGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi"
+            ),
+        ):
+            status, _h, data, _r = _request(
+                server, "POST", "/watchkey",
+                {"key": bad, "replace": True, "confirm": True},
+                token=server.token,
+            )
+            assert status == 400
+            assert bad.encode() not in data  # value-free refusal
+        snap = _session_state(server)
+        assert snap["scan_state"] in {"disabled", "awaiting_backend", "done"}
+    finally:
+        server.stop()
+        thread.join(15)

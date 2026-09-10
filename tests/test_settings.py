@@ -62,13 +62,16 @@ def _entries(store: Store) -> dict[str, dict[str, Any]]:
 
 
 def test_allowlist_is_exactly_the_live_db_keys(env_clean: None, tmp_path: Path) -> None:
-    """The fail-closed list: two keys today, each with name, current value,
-    type, bounds and honest flags. A key whose DB rung has no reader would be
-    a write into the void — refused (absent), never invented."""
+    """The fail-closed list: the two writable DB keys today, each with name,
+    current value, type, bounds and honest flags — plus the READ-ONLY
+    ``watch_key`` entry (TCK-WEB-008 follow-up (a), TCK-LAUNCH-002). A key
+    whose DB rung has no reader would be a write into the void — refused
+    (absent), never invented; the watch key is deliberately NOT writable
+    through this surface (it is absent from the write allowlist below)."""
     store = Store(tmp_path / "allow.db")
     try:
         entries = _entries(store)
-        assert set(entries) == {"gap_limit", "chain_base_url"}
+        assert set(entries) == {"gap_limit", "chain_base_url", "watch_key"}
         gap = entries["gap_limit"]
         assert gap == {
             "key": "gap_limit",
@@ -86,6 +89,12 @@ def test_allowlist_is_exactly_the_live_db_keys(env_clean: None, tmp_path: Path) 
         # ADR-0018 config-only switch: the client is built at bootstrap — the
         # honest flag is RESTART, never a silent hot-swap.
         assert chain["requires_restart"] is True
+        # No wallet provisioned → the watch key reads configured: False with a
+        # null value (fail quiet, never a guess).
+        watch = entries["watch_key"]
+        assert watch["type"] == "watch_key"
+        assert watch["configured"] is False
+        assert watch["value"] is None
     finally:
         store.close()
 

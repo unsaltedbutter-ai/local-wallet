@@ -101,6 +101,7 @@ import os
 import queue
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -126,8 +127,11 @@ from localwallet.agent.remote_runtime import (
 )
 from localwallet.agent.runtime import MODEL_PATH_ENV_VAR, GenerateFn, ModelRuntime
 from localwallet.chain import (
+    ChainClient,
+    ChainConfig,
     ChainError,
     ConfigDisabled,
+    ElectrumClient,
     EsploraClient,
     FeeEstimator,
     FeeTarget,
@@ -150,6 +154,7 @@ from localwallet.protocol import (
     CreateTxParams,
     DispatchTable,
     Envelope,
+    GetBalanceParams,
     GetHistoryParams,
     Handler,
     IntentName,
@@ -224,7 +229,12 @@ __all__ = [
     "AUTO_SCAN_ENV_VAR",
     "DEFAULT_HISTORY_LIMIT",
     "DEFAULT_SIGNER_DIR",
+    "EVENT_MODEL_PROGRESS",
     "GAP_LIMIT_ENV_VAR",
+    "MODEL_CARD_QUESTION",
+    "MODEL_DECLINED_LINES",
+    "MODEL_DOWNLOAD_COMMAND",
+    "MODEL_LATER_COMMAND",
     "NODE_STATUS_DETECTION_DISABLED",
     "NO_MODEL_DEMO_BANNER",
     "OUT_OF_WINDOW_NOTICE",
@@ -235,8 +245,10 @@ __all__ = [
     "SIGNER_ENV_VAR",
     "UI_ENV_VAR",
     "WATCHKEY_COMMAND",
+    "WATCH_KEY_SETTING",
     "WEB_PORT_ENV_VAR",
     "ZPUB_ENV_VAR",
+    "ModelDownloadFlow",
     "SendSession",
     "SignerSelection",
     "build_dispatch_table",
@@ -267,10 +279,149 @@ WEB_PORT_MAX: Final[int] = 65535
 #: runs the deterministic dev stub so the tool ALWAYS launches. The banner
 #: is VISIBLE (printed through the transport's own output channel) and says
 #: exactly what is canned and how to get the real model. Value-free.
+#: TCK-LAUNCH-002: this bare banner remains ONLY for the case where no
+#: default model can be resolved at all (no manifest / no pinned default —
+#: nothing the app could offer to download). The normal "not downloaded
+#: yet" case replaces it with the deterministic Yes/No card below.
 NO_MODEL_DEMO_BANNER: Final[str] = (
     "No model configured — running in demo mode (canned data); set "
     "LOCALWALLET_MODEL_PATH for the real model."
 )
+
+# ------------------------------------------------- default-model resolution
+# (TCK-LAUNCH-002, ADR-0001 amendment): no LOCALWALLET_MODEL_PATH means the
+# DEFAULT pinned model, not the stub. The manifest carries the pinned model
+# list; the entry flagged ``"default": true`` with a recorded sha256 is the
+# model every launch assumes. File exists → real runtime, no banner, no
+# card. File absent → the stub keeps the session alive BUT the launch is
+# never silently demo: the engine emits the card below and offers to run
+# the pinned downloader (models/download_model.py — hash verification
+# untouched) as an engine-owned subprocess with inline progress.
+
+#: Repo root when running from the source tree (``src/localwallet/app.py``
+#: → two parents up). The wheel/frozen packaging story is ADR-0024 §12
+#: (TCK-WEB-006); until then an install without this layout simply finds no
+#: manifest and degrades to the plain demo banner.
+_REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
+MODELS_DIR: Final[Path] = _REPO_ROOT / "models"
+_MODEL_MANIFEST_PATH: Final[Path] = MODELS_DIR / "manifest.json"
+_MODEL_BIN_DIR: Final[Path] = MODELS_DIR / "bin"
+_MODEL_DOWNLOAD_SCRIPT: Final[Path] = MODELS_DIR / "download_model.py"
+
+
+def _resolve_default_model() -> tuple[str, Path] | None:
+    """The manifest's pinned default model as ``(name, gguf_path)``.
+
+    Reads :data:`_MODEL_MANIFEST_PATH` (a repo-tracked build file, not user
+    data) and selects the entry flagged ``"default": true`` — the pinned
+    E2B build per ADR-0001. Fail-closed ``None`` (→ demo banner, no card):
+    unreadable/absent manifest, no defaulted entry, or an entry whose
+    ``sha256`` is still null (an UNPINNED model is never auto-downloaded —
+    the hash-pinned verification contract is what makes the download safe).
+    Never echoes any path or value; the returned path's existence is the
+    CALLER's question (this function only resolves what WOULD be used).
+    """
+    try:
+        entries = json.loads(_MODEL_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("default") is not True:
+            continue
+        name = entry.get("name")
+        sha256 = entry.get("sha256")
+        if not isinstance(name, str) or not name or not isinstance(sha256, str):
+            return None
+        return name, _MODEL_BIN_DIR / f"{name}.gguf"
+    return None
+
+
+#: The deterministic Yes/No card (TCK-LAUNCH-002, user direction
+#: 2026-09-09). Emitted by the ENGINE pump at session start when the pinned
+#: default model is simply not downloaded yet — code-owned text, identical
+#: on every transport (web: transcript lines + buttons driven by the
+#: additive ``model_state`` field of the typed ``/state`` snapshot; CLI:
+#: the same lines + the 'yes'/'no' prompt intercept below). Value-free.
+MODEL_CARD_QUESTION: Final[str] = (
+    "Model hasn't been downloaded. Want to download now?"
+)
+MODEL_CARD_HINT: Final[str] = (
+    "Answer 'yes' (or tap the button) to download it now, or 'no' to see "
+    "what I can do without the model — you can start the download anytime "
+    "with /download."
+)
+MODEL_DL_STARTED: Final[str] = (
+    "Downloading the model now — verified against its pinned hash before "
+    "install; progress appears here."
+)
+MODEL_DL_RUNNING: Final[str] = "The model download is already in progress."
+MODEL_DL_DONE: Final[str] = (
+    "Model downloaded and verified. It activates the NEXT time you start "
+    "local-wallet (this session keeps running without it)."
+)
+MODEL_DL_FAILED: Final[str] = (
+    "Model download failed — nothing was installed (an unfinished partial "
+    "file is kept for the next attempt to resume). Answer 'yes' or tap the "
+    "button to try again, or 'no' for the model-free actions."
+)
+MODEL_DECLINED_LINES: Final[tuple[str, ...]] = (
+    "No problem — these work right now without the model:",
+    "  /balance — show your balance",
+    "  /receive — show your next receive address",
+    "  /address — allocate a fresh address",
+    "  /settings — show the settings the app reads",
+    "  /download — start the model download later",
+)
+#: Bare-word CLI intercepts for the card (TCK-LAUNCH-002). Deliberately
+#: refused whenever a transaction pends (the confirm gate owns 'yes'/'no'
+#: then — the model-card intercept never runs ahead of ADR-0013) or once the
+#: card is no longer awaiting an answer. The slash forms (/download, /later)
+#: are unambiguous code-owned commands and always intercepted.
+_MODEL_YES_WORDS: Final[frozenset[str]] = frozenset({"yes", "y"})
+_MODEL_NO_WORDS: Final[frozenset[str]] = frozenset({"no", "n"})
+MODEL_DOWNLOAD_COMMAND: Final[str] = "/download"
+MODEL_LATER_COMMAND: Final[str] = "/later"
+#: Model states at which a BARE yes/no is read as a card answer (the card is
+#: on screen only in these). The slash forms (/download, /later) always
+#: classify while a flow object exists (an explicit re-arm after declining).
+_CARD_SHOWN_STATES: Final[frozenset[str]] = frozenset({"absent", "failed"})
+#: Model-free quick actions — canonical slash utterances the web buttons
+#: POST to /action (→ engine.submit → pump intercept). They dispatch
+#: EXISTING allowlist handlers directly with CODE-built envelopes (the same
+#: shape a model envelope takes), never the LLM (there may be no model).
+#: Each maps a command to an intent; params are the closed empty/default.
+_QUICK_ACTION_INTENTS: Final[dict[str, IntentName]] = {
+    "/balance": IntentName.GET_BALANCE,
+    "/address": IntentName.NEW_ADDRESS,
+}
+#: ``/receive`` (next receive address) and ``/settings`` (settings read) are
+#: pure store reads, not model intents — handled directly (None marker).
+_QUICK_STORE_COMMANDS: Final[frozenset[str]] = frozenset({"/receive", "/settings"})
+
+#: TCK-WEB-008 follow-up (a): the watch key surfaced in GET /settings — a
+#: display-TRUNCATED entry by default, the full value on an explicit
+#: single-key read (``GET /settings?key=watch_key``). It is a PUBLIC
+#: account key (watch-only app, ADR-0010/0021): not a secret, and yet it
+#: still never reaches logs (access logging is suppressed wholesale) or
+#: any unauthenticated surface (the endpoint is token-gated).
+WATCH_KEY_SETTING: Final[str] = "watch_key"
+
+#: The in-place REPLACE allowance decision (TCK-WEB-008 follow-up (b),
+#: ADR-0024 amendment): a POST /watchkey carrying BOTH ``replace: true``
+#: and ``confirm: true`` re-runs the EXISTING parse+gate path and rebinds
+#: the engine; a bare submit against a configured wallet stays 409.
+#: The one code-owned narration line after a successful replace — the
+#: explicit old-wallet-cache warning (the store keeps the previous wallet's
+#: rows; they simply stop being the active wallet's). Value-free.
+_WATCHKEY_REPLACED_NOTE: Final[str] = (
+    "Watch key replaced — the new wallet loads now with its own empty "
+    "cache and any pending transaction was discarded. The previous "
+    "wallet's cached data stays in the store; it no longer applies to "
+    "this wallet."
+)
+_WATCHKEY_SAME: Final[str] = "that key is the wallet already connected"
 
 #: Environment variable opting out of the startup scan (``"0"`` disables;
 #: any other value — including unset — keeps the default on).
@@ -891,7 +1042,7 @@ def build_dispatch_table(
     store: Store,
     wallet: WalletRecord,
     parsed: ParsedKey,
-    client: EsploraClient,
+    client: ChainClient,
     scan_fn: Callable[[], object],
     *,
     flow: TxFlow | None = None,
@@ -2706,6 +2857,13 @@ def _drain_watch(
 EVENT_TEXT: Final[str] = "text"
 EVENT_PROGRESS: Final[str] = "progress"
 EVENT_TURN_END: Final[str] = "turn_end"
+#: TCK-LAUNCH-002: one model-download progress tick. Payload is a JSON
+#: document of INTS ONLY ({"downloaded": int, "total": int|None, "pct":
+#: int|None}) — never a path, never a filename, never wallet data, so no
+#: scrubbing is needed (nothing string-shaped can enter it). The web client
+#: renders an inline progress bar; the CLI sink re-renders one percent line
+#: in place (carriage-return, like the scan dots).
+EVENT_MODEL_PROGRESS: Final[str] = "model_progress"
 
 #: Command token the web transport stamps on a typed ``/state`` snapshot
 #: request (TCK-WEB-003). Recognized ONLY as the ``command`` label of a
@@ -2764,10 +2922,36 @@ class EventEmitter:
         self.emit(EVENT_TEXT, payload)
 
 
+def _cli_model_progress_line(payload: str) -> str:
+    """Render one model-download tick as an in-place carriage-return line.
+
+    Input is the int-only JSON document built by :class:`ModelDownloadFlow`
+    (never parsed text from the child); a malformed payload renders a bare
+    "downloading" nudge, never raw bytes. Display formatting of tool
+    integers only — the UI computes nothing.
+    """
+    try:
+        data = json.loads(payload)
+        pct = data["pct"] if isinstance(data["pct"], int) else None
+        downloaded = data["downloaded"] if isinstance(data["downloaded"], int) else None
+        total = data["total"] if isinstance(data.get("total"), int) else None
+    except (ValueError, KeyError, TypeError):
+        pct, downloaded, total = None, None, None
+    if downloaded is None:
+        return "\r  downloading the model..."
+    shown = f"\r  downloading the model: {downloaded // (1 << 20)} MiB"
+    if total:
+        shown += f" of {total // (1 << 20)} MiB"
+    if pct is not None:
+        shown += f" ({pct}%)"
+    return shown + " "
+
+
 def cli_sink(output_fn: Callable[[str], None]) -> Callable[[EngineEvent], None]:
     """The CLI rendering of the event stream — byte-identical to the old
-    REPL: text lines go to ``output_fn``, progress chars (scan dots, the
-    closing newline) straight to ``sys.stdout`` flushed, markers invisible.
+    REPL for text/progress (output_fn line / raw stdout char; scan dots,
+    the closing newline), plus the TCK-LAUNCH-002 in-place model-download
+    percent line. Markers stay invisible.
     """
 
     def sink(event: EngineEvent) -> None:
@@ -2775,6 +2959,9 @@ def cli_sink(output_fn: Callable[[str], None]) -> Callable[[EngineEvent], None]:
             output_fn(event.payload)
         elif event.kind == EVENT_PROGRESS:
             sys.stdout.write(event.payload)
+            sys.stdout.flush()
+        elif event.kind == EVENT_MODEL_PROGRESS:
+            sys.stdout.write(_cli_model_progress_line(event.payload))
             sys.stdout.flush()
 
     return sink
@@ -2958,7 +3145,7 @@ class ChainWorker:
     synchronous scan did, but with no chain I/O on the engine thread).
     """
 
-    def __init__(self, client: EsploraClient) -> None:
+    def __init__(self, client: ChainClient) -> None:
         self._client = client
         self._jobs: queue.Queue[Any] = queue.Queue()
         self._thread = threading.Thread(target=self._run, name="chain-worker", daemon=True)
@@ -3291,6 +3478,232 @@ class ScanFlow:
             self.handle_command(command, output_fn, emitter)
 
 
+# ------------------------------------- model download (TCK-LAUNCH-002, ADR-0001)
+
+
+@dataclass(frozen=True)
+class _ModelProgress:
+    """One reader-thread delivery: bytes so far + the expected total (either
+    may be ``None`` when the server withheld Content-Length). Ints only,
+    never a path or name — the pump re-emits them as the int-only JSON
+    payload of :data:`EVENT_MODEL_PROGRESS`."""
+
+    downloaded: int
+    total: int | None
+
+
+@dataclass(frozen=True)
+class _ModelDone:
+    """The reader thread's terminal delivery: ``ok`` = the pinned downloader
+    exited 0 (its own contract: hash-verified before install, resumable
+    ``.part`` kept on failure)."""
+
+    ok: bool
+
+
+class ModelDownloadFlow:
+    """Engine-owned orchestrator for the pinned default-model download
+    (TCK-LAUNCH-002, ADR-0001 amendment).
+
+    The SAME lifecycle discipline as :class:`ScanFlow`: the state machine is
+    mutated ONLY on the ENGINE (pump) thread; the worker here (one reader
+    thread) does nothing but run the child and enqueue immutable int-only
+    markers on the pump's command queue. The child process is
+    ``models/download_model.py`` — the tracked, hash-pinned build-time
+    downloader — invoked as an argument LIST (no shell, ever); the script's
+    own verification contract (streaming SHA-256 against the manifest pin,
+    refuse-to-install on mismatch, resumable ``.part``) is untouched.
+
+    A closed state machine: ``absent`` (card armed) → ``running`` → ``ready``
+    | ``failed``; ``declined`` is the user's "no" (quick-action list shown;
+    ``/download`` re-arms the offer from any answered state). The
+    concurrency guard is single-threaded truth: :meth:`start` only proceeds
+    from ``absent``/``failed``, so ONE download at a time is structural.
+
+    ``command`` is the test seam: production always runs the pinned script
+    with ``--model <default> --json-progress``; tests inject a fast fake.
+    The child's stdout is parsed for INT-ONLY JSON progress lines and
+    otherwise IGNORED — no child text (paths, names, errors) ever reaches
+    an event, a log, or the terminal; failures surface only as the canned
+    value-free :data:`MODEL_DL_FAILED` line.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        command: Sequence[str] | None = None,
+        join_timeout_s: float = 5.0,
+    ) -> None:
+        self.model_name = model_name
+        self.state: str = "absent"
+        self._command = list(
+            command
+            if command is not None
+            else [
+                sys.executable,
+                str(_MODEL_DOWNLOAD_SCRIPT),
+                "--model",
+                model_name,
+                "--json-progress",
+            ]
+        )
+        self._join_timeout_s = join_timeout_s
+        self._commands: queue.Queue[Any] | None = None
+        self._proc: subprocess.Popen[str] | None = None
+        self._reader: threading.Thread | None = None
+        # Guards the spawn-vs-cancel race: QUIT may arrive BEFORE the reader
+        # thread has created the child (it would then orphan a live
+        # downloader). ``cancel`` flips the flag under the lock; the reader
+        # registers the proc under the same lock and terminates it itself if
+        # the session was already torn down.
+        self._lock = threading.Lock()
+        self._cancelled = False
+
+    def attach(self, commands: queue.Queue[Any]) -> None:
+        """Bind the pump's command queue (the reader delivers onto it)."""
+        self._commands = commands
+
+    def start(self) -> bool:
+        """Spawn the downloader (engine thread). ``False`` = the guard says
+        no (already running, already installed, or no pump queue yet) — ONE
+        download at a time is enforced HERE, at the single mutation point.
+        ``declined`` re-arms (the user changed their mind via /download)."""
+        if self.state not in ("absent", "failed", "declined") or (
+            self._commands is None
+        ):
+            return False
+        self.state = "running"
+        self._cancelled = False
+        self._reader = threading.Thread(target=self._run, name="model-download")
+        self._reader.start()
+        return True
+
+    def _run(self) -> None:  # reader thread — queue puts ONLY
+        commands = self._commands
+        assert commands is not None  # set by start() on the engine thread
+        try:
+            # Deliberate stderr=DEVNULL: the downloader's messages may name
+            # paths; the exit code is the whole story we surface. The human-
+            # readable --check/--write-hash workflow stays a terminal tool.
+            proc = subprocess.Popen(
+                self._command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            commands.put(_ModelDone(ok=False))
+            return
+        with self._lock:
+            self._proc = proc
+            doomed = self._cancelled
+        if doomed:  # QUIT landed between start() and the spawn
+            proc.terminate()
+        try:
+            assert proc.stdout is not None  # PIPE above
+            for raw in proc.stdout:
+                line = raw.strip()
+                if not line.startswith("{"):
+                    continue  # the downloader's human prints (never echoed)
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                downloaded = data.get("downloaded")
+                total = data.get("total")
+                if not isinstance(downloaded, int) or isinstance(downloaded, bool):
+                    continue
+                if total is not None and (
+                    not isinstance(total, int) or isinstance(total, bool)
+                ):
+                    total = None
+                commands.put(_ModelProgress(downloaded=downloaded, total=total))
+        except (OSError, ValueError):  # a broken pipe is a dead child
+            pass
+        finally:
+            try:
+                ok = proc.wait() == 0
+            except OSError:
+                ok = False
+            commands.put(_ModelDone(ok=ok))
+
+    def handle_command(
+        self,
+        command: object,
+        output_fn: Callable[[str], None],
+        emitter: EventEmitter | None,
+    ) -> bool:
+        """Consume one reader delivery ON THE ENGINE THREAD; ``True`` when
+        handled. Progress relays as the int-only JSON
+        :data:`EVENT_MODEL_PROGRESS`; the terminal marker flips the state,
+        closes the CLI's in-place line, and narrates the canned outcome."""
+        if isinstance(command, _ModelProgress):
+            if emitter is not None:
+                emitter.emit(
+                    EVENT_MODEL_PROGRESS,
+                    json.dumps(_model_progress_fields(command)),
+                )
+            return True
+        if isinstance(command, _ModelDone):
+            if emitter is not None:
+                emitter.emit(EVENT_PROGRESS, "\n")  # close the in-place line
+            self._proc = None
+            self._reader = None
+            self.state = "ready" if command.ok else "failed"
+            output_fn(MODEL_DL_DONE if command.ok else MODEL_DL_FAILED)
+            return True
+        return False
+
+    def decline(self) -> None:
+        """The user's 'no': the offer is answered with the model-free
+        actions. A running download is NOT cancelled by 'no' (it was
+        already consented); declining only applies to the card states."""
+        if self.state in ("absent", "failed"):
+            self.state = "declined"
+
+    def cancel(self) -> None:
+        """Session end (pump exit / QUIT): terminate the child BOUNDED and
+        join the reader — no orphaned downloader processes. The partial
+        file is deliberately left in place: the pinned script RESUMES it on
+        the next consented attempt (its documented contract). The
+        ``_cancelled`` flag (set under the lock) also dooms a child that
+        finishes spawning only AFTER this returns (the spawn-vs-QUIT race)."""
+        with self._lock:
+            self._cancelled = True
+            proc = self._proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=self._join_timeout_s)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=self._join_timeout_s)
+                except subprocess.TimeoutExpired:  # pragma: no cover
+                    pass
+        reader = self._reader
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(self._join_timeout_s)
+
+
+def _model_progress_fields(tick: _ModelProgress) -> dict[str, int | None]:
+    """The int-only event payload (percent computed from the tool's byte
+    counts — display arithmetic on tool output, the same class as txid
+    shortening; clamped, never fabricated: ``pct`` is ``None`` without a
+    known total)."""
+    total = tick.total
+    downloaded = max(tick.downloaded, 0)
+    pct: int | None = None
+    if total is not None and total > 0:
+        pct = min(100, downloaded * 100 // total)
+    return {"downloaded": downloaded, "total": total, "pct": pct}
+
+
 class _QuitSentinel:
     """Terminal command: stops the pump BETWEEN turns (never-cancel)."""
 
@@ -3357,17 +3770,25 @@ class WatchKeyRequest:
     runs the EXISTING parse+gate path (mainnet-only, testnet/private-key/
     seed refusals intact) and persists the wallet via the existing store
     path, then answers with a value-free closed status.
+
+    TCK-WEB-008 follow-up (b) / TCK-LAUNCH-002: ``allow_replace`` is set
+    ONLY when the transport saw BOTH ``replace: true`` AND ``confirm: true``
+    in the POST body (the ADR-0024 amendment's explicit double opt-in);
+    the engine's parse+gate path is IDENTICAL either way — replace changes
+    WHICH wiring the gate may produce, never HOW the key is gated.
     """
 
     command: str
     key: str
     reply: queue.Queue[dict[str, object]]
+    allow_replace: bool = False
 
 
 @dataclass
 class WatchKeyProvision:
-    """First-run watch-key provisioning for a web launch that started with
-    NO key (TCK-LAUNCH-001) — the engine thread's owner of that one step.
+    """Watch-key provisioning (and, per the ADR-0024 amendment, explicit
+    in-place REPLACEMENT) for a web launch — the engine thread's owner of
+    that one step (TCK-LAUNCH-001, TCK-LAUNCH-002).
 
     Holds every argument :func:`_wire` needs (all resolved and
     config-validated at startup, BEFORE the transport split). ``provision``
@@ -3378,11 +3799,17 @@ class WatchKeyProvision:
     ONB-006 ``awaiting_backend`` deferral, startup-scan planning) is
     exactly what a keyed launch gets, because it IS :func:`_wire`.
 
+    A keyed launch hands this object the EXISTING wiring (``wiring``
+    preset), which is what makes a later explicit replace possible; a
+    first-run launch starts it empty.
+
     The submitted key is a single-use argument: never stored on this
-    object, never logged, never echoed. ``wiring`` is set once on success;
-    later submits are refused value-free with :data:`_WATCHKEY_ALREADY`
-    (single-wallet tool, ADR-0010 — replacing a configured wallet is not
-    this endpoint's business).
+    object, never logged, never echoed. A submit against a configured
+    wallet WITHOUT the double opt-in is refused value-free with
+    :data:`_WATCHKEY_ALREADY` (the 409 contract stands — replace is
+    opt-in, never an accident); with it, the new key is gated, wired,
+    and the OLD engine pieces are torn down on this (engine) thread
+    before the swap.
     """
 
     settings: Settings
@@ -3395,17 +3822,19 @@ class WatchKeyProvision:
     output_fn: Callable[[str], None]
     wiring: _Wiring | None = None
 
-    def provision(self, key: str) -> dict[str, object]:
+    def provision(self, key: str, *, allow_replace: bool = False) -> dict[str, object]:
         """Parse+gate ``key`` and wire the engine ON THE ENGINE THREAD.
 
         Returns the value-free reply dict (``status`` is a closed enum:
-        ``accepted``/``rejected``/``already``/``store_error``; the pump adds
-        ``unavailable`` when no provision object exists). Every parse
-        or gate refusal (testnet key, private key, seed-shaped input,
-        malformed key) surfaces as ``rejected`` with the layer's own
-        value-free reason — the key NEVER rides back.
+        ``accepted``/``replaced``/``rejected``/``already``/``store_error``;
+        the pump adds ``unavailable`` when no provision object exists).
+        Every parse or gate refusal (testnet key, private key, seed-shaped
+        input, malformed key) surfaces as ``rejected`` with the layer's own
+        value-free reason — the key NEVER rides back. ``replaced`` fires
+        only on the explicit double opt-in against a configured wallet.
         """
-        if self.wiring is not None:
+        was_configured = self.wiring is not None
+        if was_configured and not allow_replace:
             return {
                 "schema": WATCHKEY_SCHEMA,
                 "status": "already",
@@ -3433,6 +3862,14 @@ class WatchKeyProvision:
                 "status": "rejected",
                 "error": str(exc),
             }
+        if was_configured and self._is_current_descriptor(descriptor):
+            # Replace with the SAME key is a no-op worth naming (still
+            # value-free — the descriptor is never echoed).
+            return {
+                "schema": WATCHKEY_SCHEMA,
+                "status": "already",
+                "error": _WATCHKEY_SAME,
+            }
         try:
             wiring = _wire(
                 parsed=descriptor.parsed,
@@ -3449,16 +3886,44 @@ class WatchKeyProvision:
                 node_detect_fn=self.node_detect_fn,
                 output_fn=self.output_fn,
                 web_mode=True,
+                replace=was_configured,
             )
         except _WiringError as exc:
             # Store-layer failure (the ONE line is the same value-free
             # string the keyed launch prints before its exit 2). The key
             # was valid but NOTHING was persisted — the form stays up,
-            # retriable, exactly like the settings path's refusals.
+            # retriable, exactly like the settings path's refusals. The
+            # existing wiring (if any) is untouched and still authoritative.
             return {"schema": WATCHKEY_SCHEMA, "status": "store_error",
                     "error": str(exc)}
+        if was_configured:
+            # The swap is atomic on the engine thread: the NEW wiring is
+            # fully built (wallet row persisted, active id set) before the
+            # OLD pieces are released. Everything on the old store was
+            # already durable (WAL autocommit); closing the chain client is
+            # thread-free, the worker join is bounded, and the pump rebinds
+            # onto the new pieces from the reply status.
+            old = self.wiring
+            assert old is not None
+            old.worker.stop()
+            old.client.close()
+            old.store.close()
         self.wiring = wiring
-        return {"schema": WATCHKEY_SCHEMA, "status": "accepted"}
+        return {
+            "schema": WATCHKEY_SCHEMA,
+            "status": "replaced" if was_configured else "accepted",
+        }
+
+    def _is_current_descriptor(self, descriptor: WalletDescriptor) -> bool:
+        """Whether the active wallet row already carries this descriptor
+        (fail-closed ``False`` on any read error — a broken store surfaces
+        through the real wiring path anyway)."""
+        try:
+            assert self.wiring is not None
+            wallet = self.wiring.store.get_active_wallet()
+        except (StoreError, sqlite3.Error):
+            return False
+        return wallet is not None and wallet.descriptor == descriptor.descriptor
 
 
 @dataclass
@@ -3483,6 +3948,12 @@ class EngineContext:
     #: user line and accepts only a :class:`WatchKeyRequest`, whose
     #: successful handling rebinds the pump onto the real wiring.
     provision: WatchKeyProvision | None = None
+    #: TCK-LAUNCH-002: the engine-owned model-download flow, present when
+    #: the launch fell back to the demo stub because the pinned default
+    #: model file is not downloaded yet. The pump arms it on the command
+    #: queue and surfaces its state/progress; ``None`` = nothing to offer
+    #: (a real model, remote bridge, or the explicit --stub-llm choice).
+    model: ModelDownloadFlow | None = None
 
 
 @dataclass(frozen=True)
@@ -3506,6 +3977,7 @@ def build_state_snapshot(
     session: SendSession,
     watcher: IncomingWatcher | None,
     scan: ScanFlow | None = None,
+    model: ModelDownloadFlow | None = None,
 ) -> dict[str, object]:
     """The value-free ``/state`` snapshot, built ON the engine thread.
 
@@ -3513,14 +3985,15 @@ def build_state_snapshot(
     dispatcher-owned flow position (a closed :class:`TxFlowStatus` enum name),
     whether a transaction pends (a boolean), the last turn's gate classification
     (a closed :class:`GateDecision` enum name), whether a watcher is
-    configured/enabled (booleans), and — TCK-WEB-005 — the startup-scan state
+    configured/enabled (booleans), — TCK-WEB-005 — the startup-scan state
     (a closed :class:`StartupScan` state name) plus the durable
-    first-scan-completed boolean. No address, amount, txid, ``tx_ref``, key
-    material OR scan progress CAN appear — every value is an enum NAME or a
-    boolean, never data. No progress percentage: a percent is a ratio against
-    the wallet's address count and leaks wallet size through the back door.
+    first-scan-completed boolean, and — TCK-LAUNCH-002 — the model-download
+    state (a closed :class:`ModelDownloadFlow` state name). No address, amount,
+    txid, ``tx_ref``, key material OR progress byte-count CAN appear — every
+    value is an enum NAME or a boolean, never data. No progress percentage
+    here (a wallet-size oracle); download progress rides its own event kind.
     """
-    return {
+    snapshot: dict[str, object] = {
         "schema": STATE_SCHEMA,
         "flow_state": flow.state.value,
         "pending_present": flow.pending is not None,
@@ -3532,6 +4005,11 @@ def build_state_snapshot(
         "scan_state": scan.gate.state if scan is not None else "disabled",
         "first_scan_complete": bool(scan is not None and scan.first_scan_recorded),
     }
+    if model is not None:
+        # Additive under state/1 (the shipped client reads named keys and
+        # ignores this whole field when absent): a closed state NAME only.
+        snapshot["model_state"] = model.state
+    return snapshot
 
 
 # ------------------------------------------------- settings surface (TCK-WEB-005)
@@ -3597,11 +4075,69 @@ def _env_overridden(env_var: str) -> bool:
     return bool(os.environ.get(env_var, "").strip())
 
 
+def _display_truncate(text: str) -> str:
+    """The display-only head…tail shortening of a public key (same visual
+    rule the client applies; TCK-WEB-008) — a display truncation of tool
+    output, never the revealed/copied value."""
+    if len(text) <= 24:
+        return text
+    return f"{text[:12]}…{text[-8:]}"
+
+
+def _watch_key_entry(store: Store, *, reveal: bool = False) -> dict[str, object]:
+    """The settings-surface watch-key entry (TCK-WEB-008 follow-up (a),
+    TCK-LAUNCH-002): the active wallet's canonical descriptor — a PUBLIC
+    account key (watch-only, ADR-0010/0021) — listed DISPLAY-TRUNCATED by
+    default and in full ONLY on an explicit single-key read. The entry
+    never appears in any log (web access logging is suppressed wholesale);
+    every route that can carry it is token-gated (ADR-0024 §6). A read
+    failure or no active wallet renders ``configured: False`` — fail quiet,
+    never a guess."""
+    descriptor: str | None = None
+    try:
+        wallet = store.get_active_wallet()
+        if wallet is not None:
+            descriptor = wallet.descriptor
+    except (StoreError, sqlite3.Error):
+        descriptor = None
+    if descriptor is None:
+        return {
+            "key": WATCH_KEY_SETTING,
+            "type": "watch_key",
+            "value": None,
+            "default": None,
+            "min": None,
+            "max": None,
+            "requires_restart": False,
+            "env_override": False,
+            "configured": False,
+            "revealed": False,
+        }
+    return {
+        "key": WATCH_KEY_SETTING,
+        "type": "watch_key",
+        "value": descriptor if reveal else _display_truncate(descriptor),
+        "default": None,
+        "min": None,
+        "max": None,
+        # The in-session REPLACE is engine-allowed now (ADR-0024 amendment:
+        # POST /watchkey with replace+confirm re-wires on the engine thread),
+        # so the honest restart flag is False.
+        "requires_restart": False,
+        # A key on the env/flag rung shadows the stored row after restart
+        # (LAUNCH-001 precedence) — the honest flag only, never the value.
+        "env_override": _env_overridden(ZPUB_ENV_VAR),
+        "configured": True,
+        "revealed": reveal,
+    }
+
+
 def _settings_entries(store: Store) -> list[dict[str, object]]:
     """The current stored value of every allowlisted key, with its type,
     allowed range, and honest effect flags. Values here are user-authored
-    scalars (a gap count, a backend URL) — never wallet data (no address,
-    amount or key material exists in the settings table)."""
+    scalars (a gap count, a backend URL) or the PUBLIC watch key in its
+    display-truncated form — never private material, never wallet history
+    data (no address, amount or balance exists in the settings table)."""
     return [
         {
             "key": wallet_scan.GAP_LIMIT_SETTING,
@@ -3630,6 +4166,13 @@ def _settings_entries(store: Store) -> list[dict[str, object]]:
             "requires_restart": True,
             "env_override": _env_overridden(CHAIN_BASE_URL_ENV_VAR),
         },
+        # TCK-WEB-008 follow-up (a), TCK-LAUNCH-002: the watch key rides the
+        # SAME read surface, display-TRUNCATED (a public account key, never a
+        # secret; never in logs). It is READ-ONLY here — the write allowlist
+        # (:data:`_SETTINGS_KEYS`) deliberately excludes it, so a POST can
+        # never invent a settings-shaped key write; changing the key goes
+        # through the gated :class:`WatchKeyRequest` path (replace opt-in).
+        _watch_key_entry(store),
     ]
 
 
@@ -3679,11 +4222,16 @@ def handle_settings_request(
     """Answer a :class:`SettingsRequest` ON THE ENGINE THREAD — the only
     thread that ever reads/writes the settings table for the web transport.
 
-    Read → the allowlisted entries. Write → validate fail-closed, persist via
-    the store's settings API, and reply with the freshly re-read entry (the
-    client confirms from tool truth, never from its own echo). Refusals carry
-    a value-free ``error``; an off-allowlist key is refused WITHOUT even
-    naming the request (the name itself is untrusted input)."""
+    Read (``key is None``) → the allowlisted entries (watch key DISPLAY-
+    TRUNCATED). Explicit single-key read (``key`` set, ``value is None``)
+    → that ONE entry, with the FULL public watch key — the deliberate
+    second step the settings UI takes only on the user's Show/Copy click
+    (TCK-WEB-008 follow-up (a); a public account key, still never logged).
+    Write → validate fail-closed, persist via the store's settings API, and
+    reply with the freshly re-read entry (the client confirms from tool
+    truth, never from its own echo). Refusals carry a value-free ``error``;
+    an off-allowlist key is refused WITHOUT even naming the request (the
+    name itself is untrusted input)."""
     unknown = {"schema": SETTINGS_SCHEMA, "status": "rejected", "error": "unknown setting"}
     if store is None:
         # Only reachable if the transport talks to an engine without the
@@ -3695,6 +4243,24 @@ def handle_settings_request(
         }
     if key is None:
         return {"schema": SETTINGS_SCHEMA, "status": "ok", "settings": _settings_entries(store)}
+    if value is None:
+        # Explicit single-key READ (never a write, never the general list).
+        # The watch key reads back FULL here — this shape (key set, value
+        # None) is the deliberate second step the settings UI takes ONLY on
+        # the user's Show/Copy click; the general list above stays
+        # truncated. An unknown read key is refused without naming it back.
+        if key == WATCH_KEY_SETTING:
+            return {
+                "schema": SETTINGS_SCHEMA,
+                "status": "ok",
+                "settings": [_watch_key_entry(store, reveal=True)],
+            }
+        entry = next(
+            (e for e in _settings_entries(store) if e["key"] == key), None
+        )
+        if entry is None:
+            return unknown
+        return {"schema": SETTINGS_SCHEMA, "status": "ok", "settings": [entry]}
     if key not in _SETTINGS_KEYS or not isinstance(value, str):
         return unknown
     if len(value) > MAX_SETTING_VALUE_CHARS:
@@ -3746,8 +4312,10 @@ class EngineHandle:
     def request_settings(
         self, timeout: float, key: str | None = None, value: str | None = None
     ) -> dict[str, object] | None:
-        """Read the allowlisted settings (``key is None``) or apply ONE
-        validated change THROUGH the pump (TCK-WEB-005).
+        """Read the allowlisted settings (``key is None``), read ONE key
+        explicitly (``key`` set, ``value is None`` — the full public watch
+        key), or apply ONE validated change THROUGH the pump (TCK-WEB-005,
+        TCK-WEB-008 follow-up (a)).
 
         Same discipline as :meth:`request_state`: the transport thread never
         touches the store; the ENGINE thread validates fail-closed, persists,
@@ -3762,18 +4330,25 @@ class EngineHandle:
         except queue.Empty:
             return None
 
-    def request_watchkey(self, timeout: float, key: str) -> dict[str, object] | None:
-        """Submit a first-run watch key THROUGH the pump (TCK-LAUNCH-001).
+    def request_watchkey(
+        self, timeout: float, key: str, *, allow_replace: bool = False
+    ) -> dict[str, object] | None:
+        """Submit a watch key THROUGH the pump (TCK-LAUNCH-001; in-place
+        REPLACE per the TCK-LAUNCH-002 / ADR-0024 amendment).
 
         Same discipline as :meth:`request_settings`: the transport thread
         never parses, gates, stores, or logs key material — it marshals the
-        raw string onto the command queue and the ENGINE thread runs the
+        raw string (plus the explicit ``allow_replace`` opt-in the transport
+        sets ONLY when the POST body carried BOTH ``replace`` and
+        ``confirm``) onto the command queue and the ENGINE thread runs the
         existing parse+gate path and answers between turns. ``None`` on
         timeout = never-cancel stands (the submit may still land; the client
         RE-READS /state rather than assuming failure).
         """
         reply: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
-        self.commands.put(WatchKeyRequest(WATCHKEY_COMMAND, key, reply))
+        self.commands.put(
+            WatchKeyRequest(WATCHKEY_COMMAND, key, reply, allow_replace)
+        )
         try:
             return reply.get(timeout=timeout)
         except queue.Empty:
@@ -3820,6 +4395,7 @@ def start_engine(
             scan=ctx.scan,
             store=ctx.store,
             provision=ctx.provision,
+            model=ctx.model,
         )
 
     handle.thread = threading.Thread(target=body, name="engine", daemon=True)
@@ -3862,6 +4438,159 @@ def _stdin_feeder(
         commands.put(line)
 
 
+def _model_card_verdict(
+    model: ModelDownloadFlow,
+    utterance: str,
+    tx_pending: bool,
+    onboarding_listening: bool = False,
+) -> str | None:
+    """Deterministically classify one model-card answer (TCK-LAUNCH-002).
+
+    ``"yes"`` / ``"no"`` / ``None`` (not a card answer — ordinary pipeline).
+    The slash forms are canonical button utterances and always classify
+    while a flow object exists. A BARE 'yes'/'no' classifies ONLY while the
+    card is genuinely showing, no transaction pends (the confirm gate owns
+    those words then — ADR-0013), AND no onboarding ask is listening (the
+    ADR-0023 backend ask answers by yes/no too — it is the higher-priority
+    deterministic channel).
+    """
+    if utterance == MODEL_DOWNLOAD_COMMAND:
+        return "yes"
+    if utterance == MODEL_LATER_COMMAND:
+        return "no"
+    if tx_pending or onboarding_listening or model.state not in _CARD_SHOWN_STATES:
+        return None
+    if utterance in _MODEL_YES_WORDS:
+        return "yes"
+    if utterance in _MODEL_NO_WORDS:
+        return "no"
+    return None
+
+
+def _answer_model_card(
+    model: ModelDownloadFlow, verdict: str, output_fn: Callable[[str], None]
+) -> None:
+    """Apply one card answer — code-owned narration, engine-thread-only
+    (the single mutation point for the flow's state machine)."""
+    if verdict == "yes":
+        if model.start():
+            output_fn(MODEL_DL_STARTED)
+        elif model.state == "running":
+            output_fn(MODEL_DL_RUNNING)
+        else:  # ready — the download already completed this session
+            output_fn(MODEL_DL_DONE)
+        return
+    model.decline()
+    for line in MODEL_DECLINED_LINES:
+        output_fn(line)
+
+
+def _run_quick_action(
+    line: str,
+    loop: AgentLoop,
+    table: DispatchTable,
+    session: SendSession,
+    store: Store | None,
+    output_fn: Callable[[str], None],
+) -> bool:
+    """Execute one model-free quick action ON THE ENGINE THREAD; ``True``
+    when handled (TCK-LAUNCH-002 deliverable 4).
+
+    DOCUMENTED LLM BYPASS: these are NOT model turns and emit NO model
+    output. The handler-bound commands dispatch the EXISTING allowlist
+    handlers directly with CODE-built empty-params envelopes (the same
+    handler + same ``_print_turn`` narration the retry interception rides,
+    TCK-HW-002) — the model is only ever the envelope SOURCE, so a session
+    running on the demo stub (or with no model at all) answers them
+    identically. ``/receive`` and ``/settings`` are pure store READS (same
+    deterministic channel as ``/label``, ADR-0020). Values print verbatim
+    from tool output; the UI computes nothing.
+    """
+    command = line.split(maxsplit=1)[0].lower()
+    intent = _QUICK_ACTION_INTENTS.get(command)
+    if intent is not None:
+        handler = table.get(intent)
+        if handler is None:  # pragma: no cover — bare test tables
+            output_fn("That action is not available right now.")
+            return True
+        params: NewAddressParams | GetBalanceParams
+        if intent is IntentName.NEW_ADDRESS:
+            params = NewAddressParams()
+        else:
+            params = GetBalanceParams()
+        envelope = Envelope(v=0, intent=intent, params=params)
+        result = handler(envelope)
+        loop.add_turn(command, envelope.model_dump_json())
+        _print_turn(
+            AgentTurnResult(
+                status=AgentTurnStatus.OK,
+                envelope=envelope,
+                result=result,
+                user_message=None,
+                turns_used=0,
+            ),
+            output_fn,
+            session=session,
+        )
+        return True
+    if command == "/receive":
+        _print_next_receive_address(store, output_fn)
+        return True
+    if command == "/settings":
+        _print_settings_readout(store, output_fn)
+        return True
+    return False
+
+
+def _print_next_receive_address(
+    store: Store | None, output_fn: Callable[[str], None]
+) -> None:
+    """``/receive``: the NEXT receive address — pure derivation at the
+    branch's live ``next_index``, NO allocation and NO network (an
+    allocation-free preview; ``/address`` is the allocating command).
+    Address display is verbatim tool output (terminal/transcript channel
+    only, never a log)."""
+    if store is None:
+        output_fn(_LABEL_STORE_UNAVAILABLE)
+        return
+    try:
+        wallet = store.get_active_wallet()
+        if wallet is None:
+            output_fn(_LABEL_NO_WALLET)
+            return
+        descriptor = WalletDescriptor.from_descriptor_string(wallet.descriptor)
+        index = store.get_derivation(wallet.id, 0).next_index
+        address = BranchDeriver(descriptor.parsed, 0).address(index)
+    except (StoreError, sqlite3.Error, WatchKeyError):
+        output_fn(_LABEL_ERROR_STORE)
+        return
+    output_fn(
+        sanitize_tool_output(
+            f"Next receive address (index {index}, not yet issued — "
+            f'"/address" reserves a fresh one): {address}'
+        )
+    )
+
+
+def _print_settings_readout(
+    store: Store | None, output_fn: Callable[[str], None]
+) -> None:
+    """``/settings`` CLI readout of the same allowlisted entries
+    GET /settings serves (the watch key arrives in its display-TRUNCATED
+    form by construction; user-authored scalars verbatim)."""
+    reply = handle_settings_request(store, None, None)
+    if reply.get("status") != "ok":
+        output_fn("Settings are not available right now.")
+        return
+    entries = reply.get("settings")
+    assert isinstance(entries, list)
+    for entry in entries:
+        assert isinstance(entry, dict)
+        value = entry.get("value")
+        shown = "(not set)" if value is None else str(value)
+        output_fn(sanitize_tool_output(f"{entry.get('key')}: {shown}"))
+
+
 def _pump(
     loop: AgentLoop,
     output_fn: Callable[[str], None],
@@ -3878,6 +4607,7 @@ def _pump(
     store: Store | None = None,
     onboarding: OnboardingFlow | None = None,
     provision: WatchKeyProvision | None = None,
+    model: ModelDownloadFlow | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
     ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
@@ -3909,11 +4639,34 @@ def _pump(
     given the engine started with NO wallet. A ``WatchKeyRequest`` runs the
     existing parse+gate path on this thread and — on success — the pump
     REBINDS onto the real wiring (the placeholder loop/table never runs a
-    turn); ordinary lines before that are refused value-free.
+    turn); ordinary lines before that are refused value-free. A submit
+    against an ALREADY-configured engine is refused 409 UNLESS it carries
+    the explicit replace+confirm opt-in (``allow_replace``, TCK-LAUNCH-002 /
+    ADR-0024 amendment) — then the pump rebinds onto the fresh wiring and
+    narrates the old-wallet-cache warning (never the key).
+
+    Model download (TCK-LAUNCH-002): when ``model`` is given the launch fell
+    back to the demo stub because the pinned default GGUF is not downloaded.
+    The pump attaches it to the command queue and arms the deterministic
+    Yes/No card once; ``_ModelProgress``/``_ModelDone`` reader deliveries
+    are consumed as first-class queue items (int-only progress events +
+    terminal narration), and ``/download``|``/later`` (plus bare yes/no when
+    nothing pends) answer the card on this thread. Model-free quick actions
+    (``/balance``, ``/address``) dispatch the allowlist handlers directly —
+    a code-owned bypass of the LLM, never model output. On exit any live
+    download child is terminated BOUNDED (no orphans).
     """
     if scan is not None:
         scan.attach(commands)
         scan.begin()
+    if model is not None:
+        model.attach(commands)
+        if model.state == "absent":
+            # The deterministic card (code-owned text; the web buttons and
+            # CLI yes/no are the two answer channels). Replaces the silent
+            # demo-mode banner — the user always learns the model is absent.
+            output_fn(MODEL_CARD_QUESTION)
+            output_fn(MODEL_CARD_HINT)
     while True:
         if not (scan is not None and scan.in_progress):
             watch_count = _drain_watch(watcher, output_fn, client=client)
@@ -3924,6 +4677,13 @@ def _pump(
         command = commands.get()
         if scan is not None and scan.handle_command(command, output_fn, emitter):
             continue
+        if model is not None and model.handle_command(command, output_fn, emitter):
+            # A terminal download marker closes an (implicit) turn so the
+            # web client re-reads /state: the model_state flips and the
+            # card/buttons resolve.
+            if isinstance(command, _ModelDone) and emitter is not None:
+                emitter.emit(EVENT_TURN_END)
+            continue
         if isinstance(command, _PumpError):
             raise command.exc
         if command is QUIT:
@@ -3932,17 +4692,25 @@ def _pump(
             # TCK-LAUNCH-001 first-run watch-key entry: the ENGINE thread
             # runs the EXISTING parse+gate path (:class:`WatchKeyProvision`
             # → _wire), never a model turn, and answers with a value-free
-            # status. On success the pump REBINDS onto the real wiring and
-            # starts the freshly armed startup scan — the normal post-xpub
-            # sequence continues from here exactly as a keyed launch.
-            command.reply.put(
+            # status. On success (accepted/replaced) the pump REBINDS onto
+            # the real wiring and starts the freshly armed startup scan —
+            # the normal post-xpub sequence continues from here exactly as
+            # a keyed launch. A bare submit against an already-configured
+            # engine is refused ``already`` (409) UNLESS the request carried
+            # the explicit replace+confirm opt-in (``allow_replace``,
+            # TCK-LAUNCH-002): then the SAME gated path rewires onto the
+            # new key and the pump emits the old-wallet-cache warning. The
+            # key NEVER rides back.
+            reply = (
                 {"schema": WATCHKEY_SCHEMA, "status": "unavailable",
                  "error": _WATCHKEY_UNAVAILABLE}
                 if provision is None
-                else provision.provision(command.key)
+                else provision.provision(command.key, allow_replace=command.allow_replace)
             )
-            if provision is not None and provision.wiring is not None:
+            command.reply.put(reply)
+            if reply.get("status") in ("accepted", "replaced"):
                 wiring = provision.wiring
+                assert wiring is not None
                 loop = wiring.loop
                 flow = wiring.flow
                 session = wiring.session
@@ -3954,6 +4722,8 @@ def _pump(
                 if scan is not None:
                     scan.attach(commands)
                     scan.begin()
+                if reply.get("status") == "replaced":
+                    output_fn(_WATCHKEY_REPLACED_NOTE)
             continue
         if isinstance(command, StateSnapshotRequest):
             # Typed value-free /state read (TCK-WEB-003), answered ON the engine
@@ -3964,7 +4734,9 @@ def _pump(
             # TCK-LAUNCH-001: an additive ``needs_watch_key`` flag (a boolean,
             # value-free) tells the first-run page to show its form; the
             # shipped client ignores unknown fields, so ``state/1`` is intact.
-            snapshot = build_state_snapshot(flow, session, watcher, scan)
+            # TCK-LAUNCH-002: an additive ``model_state`` NAME drives the
+            # Yes/No card + quick-action buttons (enum name, never data).
+            snapshot = build_state_snapshot(flow, session, watcher, scan, model)
             if provision is not None and provision.wiring is None:
                 snapshot["needs_watch_key"] = True
             command.reply.put(snapshot)
@@ -3978,6 +4750,36 @@ def _pump(
                 handle_settings_request(store, command.key, command.value)
             )
             continue
+        if isinstance(command, str):
+            utterance = command.strip().lower()
+            if model is not None:
+                verdict = _model_card_verdict(
+                    model,
+                    utterance,
+                    flow.state is TxFlowStatus.CREATED,
+                    onboarding_listening=(
+                        onboarding is not None and onboarding.is_listening
+                    ),
+                )
+                if verdict is not None:
+                    _answer_model_card(model, verdict, output_fn)
+                    if emitter is not None:
+                        emitter.emit(EVENT_TURN_END)
+                    continue
+            if (
+                utterance in _QUICK_ACTION_INTENTS
+                or utterance in _QUICK_STORE_COMMANDS
+            ) and (provision is None or provision.wiring is not None):
+                # Model-free quick action (TCK-LAUNCH-002): dispatch the
+                # EXISTING handler directly (or a store read) — a code-owned
+                # deterministic bypass of the LLM, never model output. Falls
+                # through to the provision guard while unprovisioned.
+                _run_quick_action(
+                    utterance, loop, table, session, store, output_fn
+                )
+                if emitter is not None:
+                    emitter.emit(EVENT_TURN_END)
+                continue
         if provision is not None and provision.wiring is None:
             # TCK-LAUNCH-001 first-run: NO wallet exists yet, so the
             # placeholder loop/table MUST never run a turn — every ordinary
@@ -4019,6 +4821,11 @@ def _pump(
             emitter.emit(EVENT_TURN_END)
     if scan is not None:
         scan.drain_until_complete(output_fn, emitter)
+    if model is not None:
+        # Session end (QUIT / process exit): terminate a live download
+        # child BOUNDED and join its reader — no orphaned downloader
+        # processes. The resumable partial file is deliberately kept.
+        model.cancel()
 
 
 def main(argv: Sequence[str] | None = None, **run_kwargs: Any) -> int:
@@ -4254,6 +5061,7 @@ def run(
         return 2
 
     generate: ModelRuntime | GenerateFn | RemoteOpenAIRuntime
+    model_flow: ModelDownloadFlow | None = None
     if generate_fn is not None:
         # Injected bare model callable (test seam) — used ahead of the
         # env/flag selection; flows through handle_raw like any runtime.
@@ -4266,17 +5074,32 @@ def run(
     elif os.environ.get(MODEL_PATH_ENV_VAR):
         generate = ModelRuntime()
     elif args.stub_llm:
+        # Explicit dev choice (unchanged from TCK-LAUNCH-001): the stub
+        # without a banner and without a download card — the operator
+        # already knows exactly what they are running.
         generate = stub_generate
     else:
-        # TCK-LAUNCH-001 "always stub-llm": the tool ALWAYS launches
-        # without model-setup friction. No model configured is no longer a
-        # startup refusal — it falls back to the deterministic dev stub with
-        # a VISIBLE banner line naming the demo mode and the env var that
-        # turns on the real model. (The stub is the SAME ``--stub-llm``
-        # path; ``--stub-llm`` itself prints no banner — it is a deliberate
-        # choice, not a fallback.)
-        generate = stub_generate
-        output_fn(NO_MODEL_DEMO_BANNER)
+        # TCK-LAUNCH-002 (ADR-0001 amendment): NO explicit model means the
+        # DEFAULT pinned model — not the stub. Resolution:
+        #   default file present  → the real GGUF runtime, silently (that
+        #                           is the normal, expected launch);
+        #   default file absent   → the demo stub KEEPS the session alive,
+        #                           but the engine arms the deterministic
+        #                           Yes/No download card (no more silent
+        #                           demo mode when the user simply has not
+        #                           downloaded yet);
+        #   no resolvable pinned  → the old plain banner (nothing the app
+        #                           default (manifest unreadable)   could
+        #                           offer to download).
+        default = _resolve_default_model()
+        if default is not None and default[1].is_file():
+            generate = ModelRuntime(model_path=str(default[1]))
+        elif default is not None:
+            generate = stub_generate
+            model_flow = ModelDownloadFlow(model_name=default[0])
+        else:
+            generate = stub_generate
+            output_fn(NO_MODEL_DEMO_BANNER)
 
     # TCK-CFG-001 preflight: resolve + validate LOCALWALLET_GAP_LIMIT
     # (fail-closed, value-free — the same spirit as the zpub config-error
@@ -4310,6 +5133,7 @@ def run(
             output_fn=output_fn,
             on_web_server=on_web_server,
             open_browser=open_browser,
+            model=model_flow,
         )
 
     assert descriptor is not None  # CLI reaches here only with a key
@@ -4345,6 +5169,7 @@ def run(
             scan=wiring.scan,
             store=wiring.store,
             onboarding=wiring.onboarding,
+            model=model_flow,
         )
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
@@ -4390,6 +5215,29 @@ class _Wiring:
     onboarding: OnboardingFlow | None = None
 
 
+def _build_chain_client(settings: Settings) -> ChainClient:
+    """Construct the config-selected chain backend (TCK-ONB-004 M1).
+
+    The URL SCHEME picks the adapter through the single selection point
+    (:meth:`ChainConfig.from_settings`, ADR-0018 as amended): an
+    ``ssl://host[:port]`` base rides the Electrum-protocol client, http(s)
+    the Esplora client as ever. Construction is network-free in both kinds
+    (clients connect lazily; the Electrum handshake — including the
+    mainnet-only proof, ADR-0021 — runs on the first call), and
+    timeout/retry/TLS-trust values come from the SAME resolved settings,
+    so the privacy banner, the watch-mode line and the transport can never
+    disagree. A malformed selection fails closed here with the value-free
+    :class:`ValueError` ``ChainConfig`` has always raised at construction.
+    """
+    config = ChainConfig.from_settings(settings)
+    client_cls = ElectrumClient if config.kind == "electrum" else EsploraClient
+    return client_cls(
+        base_url=config.base_url,
+        timeout_s=config.timeout_s,
+        max_retries=config.max_retries,
+    )
+
+
 def _wire(
     *,
     parsed: ParsedKey,
@@ -4405,6 +5253,7 @@ def _wire(
     cli_interactive: bool = False,
     web_mode: bool = False,
     backend_check_fn: Callable[[str], bool] | None = None,
+    replace: bool = False,
 ) -> _Wiring:
     """Build store → wallet profile → chain client → watch → startup-scan
     plan → dispatch table → agent loop (moved verbatim from the pre-web
@@ -4426,7 +5275,9 @@ def _wire(
     try:
         store = Store(settings.store_path)
         try:
-            wallet_row, created_here = _resolve_or_create_wallet(store, descriptor)
+            wallet_row, created_here = _resolve_or_create_wallet(
+                store, descriptor, replace=replace
+            )
             store.set_active_wallet(wallet_row.id)
         except (StoreError, sqlite3.Error) as exc:
             store.close()
@@ -4449,19 +5300,15 @@ def _wire(
     if effective_backend is not None:
         settings.chain_base_url = effective_backend
 
-    client = EsploraClient(
-        # ``None`` keeps today's client-side ``ChainConfig.from_settings``
-        # resolution; the only difference is that the stored rung has now
-        # been folded into ``settings.chain_base_url`` above, so the client
-        # and every banner/mode surface resolve the SAME value.
-        base_url=settings.chain_base_url or None,
-        timeout_s=settings.request_timeout_s,
-        max_retries=settings.max_retries,
-    )
-    # base_url is deliberately left as the client default: it resolves through
-    # the single selection point (ChainConfig.from_settings — Settings.chain_base_url
-    # when set, else the legacy esplora_base_url). This construction site must NOT
-    # hardcode a public default that would bypass the Phase 4 backend switch (ADR-0018).
+    client = _build_chain_client(settings)
+    # The scheme-selecting construction helper (TCK-ONB-004 M1): it resolves
+    # through the single selection point (ChainConfig.from_settings —
+    # Settings.chain_base_url when set, else the legacy esplora_base_url)
+    # and picks Esplora (http(s)) or Electrum (ssl://) from the URL scheme.
+    # The stored rung was folded into ``settings.chain_base_url`` above, so
+    # the client and every banner/mode surface resolve the SAME value. This
+    # site must NOT hardcode a public default that would bypass the Phase 4
+    # backend switch (ADR-0018).
     # Fee/price wrappers share the ONE chain client (no second transport);
     # construction is network-free — they fetch lazily, per their TTLs.
     fee_estimator = FeeEstimator(client)
@@ -4689,6 +5536,7 @@ def _run_web(
     output_fn: Callable[[str], None],
     on_web_server: Callable[[WebServer], None] | None = None,
     open_browser: bool = False,
+    model: ModelDownloadFlow | None = None,
 ) -> int:
     """The web launch (TCK-WEB-002, ADR-0024 §1/§3/§11; default UI and
     browser auto-open per the TCK-LAUNCH-001 amendment).
@@ -4711,7 +5559,14 @@ def _run_web(
     (:class:`WatchKeyProvision`), after which the pump rebinds and the
     normal post-xpub sequence (banner to this same terminal ``output_fn``,
     ONB-006 ``awaiting_backend`` deferral, startup scan) is exactly the
-    keyed launch's.
+    keyed launch's. A KEYED launch carries the same provision object with
+    its wiring preset (TCK-LAUNCH-002): bare re-submits still 409, the
+    explicit replace+confirm opt-in rewires in place (ADR-0024 amendment).
+
+    ``model`` (TCK-LAUNCH-002) is the armed download flow (``None`` when a
+    real model, the remote bridge, or the explicit --stub-llm path was
+    selected); it rides the engine context so the pump emits the Yes/No
+    card and owns the download lifecycle on the ENGINE thread.
 
     Exit codes mirror the CLI: ``0`` normal, ``2`` wiring/config failure
     (surfaced from the bootstrap; a busy fixed port names the fix).
@@ -4760,6 +5615,7 @@ def _run_web(
                 session=SendSession(),
                 table={},
                 provision=provision,
+                model=model,
             )
         try:
             wiring = _wire(
@@ -4780,6 +5636,23 @@ def _run_web(
             booted.set()
             raise
         wired["wiring"] = wiring
+        # TCK-LAUNCH-002 (ADR-0024 amendment): a keyed launch carries the
+        # SAME provisioning surface with its wiring preset — a bare
+        # POST /watchkey still 409s (the already-contracted answer), while
+        # the explicit replace+confirm opt-in reruns the gated path and the
+        # pump rebinds in place.
+        provision = WatchKeyProvision(
+            settings=settings,
+            signer_selection=signer_selection,
+            env_gap=env_gap,
+            rescan=rescan,
+            flow=flow,
+            generate=generate,
+            node_detect_fn=node_detect_fn,
+            output_fn=output_fn,
+            wiring=wiring,
+        )
+        held["provision"] = provision
         booted.set()
         return EngineContext(
             loop=wiring.loop,
@@ -4790,6 +5663,8 @@ def _run_web(
             client=wiring.client,
             scan=wiring.scan,
             store=wiring.store,
+            provision=provision,
+            model=model,
         )
 
     try:
@@ -4854,9 +5729,13 @@ def _run_web(
         # the freshly printed URL instead of staring at a stale "Reconnecting".
         output_fn("Web UI stopped — the URL printed above is no longer reachable.")
         wiring = wired.get("wiring")
-        if wiring is None:
-            provision = held.get("provision")
-            wiring = provision.wiring if provision is not None else None
+        provision = held.get("provision")
+        if provision is not None and provision.wiring is not None:
+            # Track the CURRENT wiring: a first-run provisioning lands
+            # here, and a TCK-LAUNCH-002 in-place REPLACE swapped
+            # provision.wiring (the old pieces were already torn down on
+            # the engine thread inside provision()).
+            wiring = provision.wiring
         if wiring is not None:
             # server.stop() pushed QUIT and joined the engine thread (whose
             # pump drained the startup scan to completion before returning);
@@ -4875,9 +5754,18 @@ def _run_web(
 
 
 def _resolve_or_create_wallet(
-    store: Store, descriptor: WalletDescriptor
+    store: Store,
+    descriptor: WalletDescriptor,
+    *,
+    replace: bool = False,
 ) -> tuple[WalletRecord, bool]:
     """Reuse the wallet row carrying this descriptor, else create one.
+
+    ``replace`` (TCK-LAUNCH-002 in-place wallet swap) changes the CREATE
+    path only: the previous wallet's row keeps its name and every cached
+    row it owns (it simply stops being the ACTIVE wallet), and the new
+    profile takes the next free deterministic name — the ADR-0010
+    name-collision guard for ordinary launches is untouched.
 
     Returns ``(row, created_this_run)`` — the fresh-wallet flag gates the
     ADR-0023 first-run conversation (returning users resume silently; the
@@ -4892,10 +5780,26 @@ def _resolve_or_create_wallet(
     *different* descriptor surfaces as a value-free store error to the
     caller (exit 2) rather than a silent second profile.
     """
-    for row in store.list_wallets():
+    rows = store.list_wallets()
+    for row in rows:
         if row.descriptor == descriptor.descriptor:
             return row, False
-    return store.create_wallet(name="default", descriptor=descriptor.descriptor), True
+    if not replace:
+        # Normal launch: the name collision with a DIFFERENT descriptor is
+        # the ADR-0010 guard (a conflicting --zpub exits 2 — never a silent
+        # second profile).
+        return store.create_wallet(name="default", descriptor=descriptor.descriptor), True
+    # IN-PLACE REPLACE (TCK-LAUNCH-002 / ADR-0024 amendment): the previous
+    # wallet's row KEEPS its name and its cached rows (they stop being the
+    # active wallet's); the new profile gets the next free deterministic
+    # name ("default-2", "default-3", … — bounded by the row count).
+    names = {row.name for row in rows}
+    name = "default"
+    suffix = 1
+    while name in names:
+        suffix += 1
+        name = f"default-{suffix}"
+    return store.create_wallet(name=name, descriptor=descriptor.descriptor), True
 
 
 def _scan_summary_line(summary: wallet_scan.ScanSummary) -> str:
@@ -5037,6 +5941,7 @@ def _repl(
     scan: ScanFlow | None = None,
     store: Store | None = None,
     onboarding: OnboardingFlow | None = None,
+    model: ModelDownloadFlow | None = None,
 ) -> None:
     """The CLI transport over the engine pump (TCK-WEB-001, ADR-0024 §3).
 
@@ -5089,20 +5994,27 @@ def _repl(
             scan=scan,
             store=store,
             onboarding=onboarding,
+            model=model,
         )
     finally:
         stop.set()
         ready.set()
 
 
-#: Fallback wording for an unparseable ``/`` command (value-free).
+#: Fallback wording for an unparseable ``/`` command (value-free). The
+#: TCK-LAUNCH-002 model-free quick actions (/balance, /receive, /address,
+#: /settings) and the card commands (/download, /later) join the list —
+#: all deterministic transcript/channel intercepts, never model intents.
 _TRANSCRIPT_HELP: Final[str] = (
     "Commands: /details — reprint the pending transaction's full card; "
     "/label — list or set your own coin tags and notes; "
     "/setup — choose which server answers the app about your addresses "
     "(public default or your own Esplora-compatible server); "
     "/export <path> — write a redacted session transcript; "
-    "/scrub — clear the in-memory transcript; /help — show this."
+    "/scrub — clear the in-memory transcript; "
+    "/balance, /receive, /address, /settings — model-free reads (work "
+    "without the local LLM); /download, /later — answer the model card; "
+    "/help — show this."
 )
 #: ``/details`` with no cached card (nothing has pended this session —
 #: value-free).

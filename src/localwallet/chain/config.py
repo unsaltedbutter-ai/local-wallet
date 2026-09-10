@@ -12,7 +12,12 @@ from urllib.parse import urlsplit
 
 from localwallet.config import Settings
 
-__all__ = ["ChainConfig"]
+__all__ = ["ELECTRUM_SCHEME", "ChainConfig"]
+
+
+#: URL scheme that selects the Electrum-protocol adapter (TCK-ONB-004 M1;
+#: ADR-0018 amendment). Everything else this class accepts is Esplora http(s).
+ELECTRUM_SCHEME: str = "ssl://"
 
 
 @dataclass(frozen=True)
@@ -20,10 +25,13 @@ class ChainConfig:
     """Connection parameters for the chain adapter.
 
     Attributes:
-        base_url: Esplora API root, e.g. ``https://mempool.space/api``
-            (public default, ADR-0003) or a user's self-hosted instance
-            selected via ``Settings.chain_base_url`` (ADR-0018). The single
-            selection lives in :meth:`from_settings`.
+        base_url: backend URL — an Esplora API root such as
+            ``https://mempool.space/api`` (public default, ADR-0003) or a
+            user's self-hosted instance selected via
+            ``Settings.chain_base_url`` (ADR-0018), OR an Electrum-protocol
+            endpoint ``ssl://host[:port]`` which selects the Electrum
+            adapter (TCK-ONB-004 M1; ADR-0018 amendment — see :attr:`kind`).
+            The single selection lives in :meth:`from_settings`.
         timeout_s: Per-request timeout in seconds (applied to connect/read).
         max_retries: Number of retries after the initial attempt (0 disables
             retries entirely).
@@ -49,16 +57,27 @@ class ChainConfig:
     # warning (see :attr:`Settings.tls_verify`).
     tls_verify: bool = True
 
+    @property
+    def kind(self) -> str:
+        """Adapter selected by the URL scheme: ``"electrum"`` for ``ssl://``
+        (TCK-ONB-004 M1), ``"esplora"`` for http(s). The construction site
+        (``app._build_chain_client``) dispatches on exactly this value."""
+        return "electrum" if self.base_url.startswith(ELECTRUM_SCHEME) else "esplora"
+
     def __post_init__(self) -> None:
-        if not isinstance(self.base_url, str) or not (
-            self.base_url.startswith("http://") or self.base_url.startswith("https://")
-        ):
+        if not isinstance(self.base_url, str):
+            raise ValueError("base_url must be an http(s) or ssl:// URL")  # noqa: TRY004
+        if self.base_url.startswith(ELECTRUM_SCHEME):
+            self._validate_electrum_url()
+        elif not (self.base_url.startswith("http://") or self.base_url.startswith("https://")):
             raise ValueError("base_url must be an http(s) URL")
-        # Reject embedded userinfo (https://user:pass@host): httpx would send
-        # those credentials on every request, contradicting the "no API keys
-        # are used or sent" guarantee. Value-free, fail closed.
-        if urlsplit(self.base_url).username is not None:
-            raise ValueError("base_url must be an http(s) URL without userinfo")
+        else:
+            # Reject embedded userinfo (https://user:pass@host): httpx would
+            # send those credentials on every request, contradicting the
+            # "no API keys are used or sent" guarantee. Value-free, fail
+            # closed.
+            if urlsplit(self.base_url).username is not None:
+                raise ValueError("base_url must be an http(s) URL without userinfo")
         if (
             isinstance(self.timeout_s, bool)
             or not isinstance(self.timeout_s, (int, float))
@@ -82,6 +101,30 @@ class ChainConfig:
             # programmer type error, so the whole ladder surfaces one class.
             raise ValueError("tls_verify must be a boolean")  # noqa: TRY004
 
+    def _validate_electrum_url(self) -> None:
+        """Fail closed on a malformed ``ssl://host[:port]`` endpoint.
+
+        Shape rules (mirroring the http(s) branch's discipline): a parseable
+        host, no embedded userinfo, no path/query/fragment (the Electrum
+        protocol has no URL namespace — a stray path is a typo, not a hint),
+        and a numeric port inside the TCP range when present. All errors are
+        value-free (the URL may embed nothing secret, but the invariant
+        covers every path). The default port (50002, the standard Electrum
+        SSL port) is applied by the adapter, not stored here.
+        """
+        parsed = urlsplit(self.base_url)
+        bad = ValueError("base_url must be an ssl://host[:port] Electrum URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("base_url must be an ssl:// URL without userinfo")
+        if not parsed.hostname:
+            raise bad
+        try:
+            _ = parsed.port  # raises ValueError on non-numeric/out-of-range
+        except ValueError:
+            raise bad from None
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            raise bad
+
     @classmethod
     def from_settings(cls, settings: Settings) -> ChainConfig:
         """Build a ChainConfig from the root Settings (no env reads here).
@@ -90,17 +133,22 @@ class ChainConfig:
         selection point (Phase 4, TCK-P4-002; ADR-0018):
 
         - if ``settings.chain_base_url`` is set (non-empty), it is the
-          authoritative Esplora base for the WHOLE wallet (every
-          EsploraClient-mediated call: address txs/utxos, tip, fees, price,
+          authoritative backend base for the WHOLE wallet (every
+          client-mediated call: address txs/utxos, tip, fees, price,
           broadcast) — flipping the backend to a user's own instance is a
           config-only operation;
         - otherwise ``settings.esplora_base_url`` is used, preserving the
           ADR-0003 public default and full backward compatibility with
           ``LOCALWALLET_ESPLORA_BASE_URL``.
 
-        A malformed (non-http(s)) selected URL fails closed here with a
-        value-free :class:`ValueError` at construction time — never a
-        mid-request crash.
+        The URL SCHEME selects the adapter kind (TCK-ONB-004 M1; ADR-0018
+        amendment): ``ssl://host[:port]`` → the Electrum-protocol client
+        (:attr:`kind` == ``"electrum"``, consumed at the single construction
+        site ``app._build_chain_client``); http(s) → Esplora as before.
+
+        A malformed selected URL (non-http(s), or an ``ssl://`` URL without
+        a well-formed host[:port]) fails closed here with a value-free
+        :class:`ValueError` at construction time — never a mid-request crash.
         """
         selected = settings.chain_base_url.strip() if settings.chain_base_url else ""
         # A non-empty chain_base_url that strips to nothing (whitespace-only)

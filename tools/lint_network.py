@@ -8,7 +8,10 @@ plus exactly ONE additional file: ``src/localwallet/agent/remote_runtime.py``
 package (the ADR-0016 localhost node doctor — see :data:`NODE_NETWORK_DIRS`),
 and the ``src/localwallet/ui/web/`` package (the ADR-0024 localhost web UI —
 see :data:`WEB_SERVER_DIRS`). Everything else outside ``chain/`` — including
-every other ``agent/`` file and ``evals/`` — stays banned. The node doctor is
+every other ``agent/`` file and ``evals/`` — stays banned; the only narrower
+form of grant is :data:`FILE_MODULE_EXCEPTIONS` (one file, named modules
+only — the ADR-0001 amendment's ``subprocess`` allowance in ``app.py`` for
+the pinned model download child process). The node doctor is
 a localhost-only Phase 4 privacy upgrade (no public-network calls); see
 docs/adr/0016-localhost-node-io.md. The web-server exception is for INBOUND
 loopback listening (the stdlib HTTP server); it authorizes no outbound calls
@@ -62,6 +65,19 @@ NODE_NETWORK_DIRS: Final[tuple[str, ...]] = ("node",)
 # to the lint root (SRC_ROOT). Amend only via a new ADR + test pins.
 WEB_SERVER_DIRS: Final[tuple[str, ...]] = ("ui/web",)
 
+# ADR-0001 amendment (TCK-LAUNCH-002): PER-FILE, PER-MODULE exception —
+# app.py may import EXACTLY ``subprocess``, for the engine-owned model
+# download that spawns ONLY the tracked pinned script
+# (models/download_model.py, argument list, hash verification inside the
+# child untouched). No outbound network module is exempt there: urllib/httpx
+# stay banned in app.py (the child is a separate process, the repo's own
+# build-time tool, exactly the pattern the file's own docstring describes).
+# tests/test_launch.py pins the one subprocess call site and its no-shell
+# argument-list shape. Relative to the lint root; amend only via ADR.
+FILE_MODULE_EXCEPTIONS: Final[dict[str, frozenset[str]]] = {
+    "app.py": frozenset({"subprocess"}),
+}
+
 # Top-level module names that imply network or shell access. Matched by their
 # *top-level* component, so dotted forms (``xmlrpc.client``,
 # ``multiprocessing.connection``, ``urllib.request``, ...) resolve to their ban.
@@ -113,11 +129,16 @@ class Violation:
 UNPARSEABLE: Final[str] = "<unparseable file>"
 
 
-def _check_file(path: Path, violations: list[Violation]) -> None:
+def _check_file(
+    path: Path, violations: list[Violation], allowed: frozenset[str] = frozenset()
+) -> None:
     """Scan one ``.py`` file, appending any :class:`Violation`.
 
-    Unparseable files are reported as a violation (fail loud) rather than
-    silently skipped, so a syntax error can no longer hide banned imports.
+    ``allowed`` names banned top-level modules EXEMPT for this one file
+    (:data:`FILE_MODULE_EXCEPTIONS`) — a scoped, ADR-documented grant; every
+    other banned module is still flagged here. Unparseable files are reported
+    as a violation (fail loud) rather than silently skipped, so a syntax
+    error can no longer hide banned imports.
     """
     try:
         source = path.read_text(encoding="utf-8")
@@ -134,10 +155,14 @@ def _check_file(path: Path, violations: list[Violation]) -> None:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
-                if top in BANNED_TOP_LEVELS:
+                if top in BANNED_TOP_LEVELS and top not in allowed:
                     violations.append(Violation(path, node.lineno, alias.name))
         elif isinstance(node, ast.ImportFrom):
-            if node.module and node.module.split(".")[0] in BANNED_TOP_LEVELS:
+            if (
+                node.module
+                and node.module.split(".")[0] in BANNED_TOP_LEVELS
+                and node.module.split(".")[0] not in allowed
+            ):
                 violations.append(Violation(path, node.lineno, node.module.split(".")[0]))
         elif isinstance(node, ast.Call):
             func = node.func
@@ -156,7 +181,7 @@ def _check_file(path: Path, violations: list[Violation]) -> None:
             ):
                 violations.append(Violation(path, node.lineno, f"asyncio.{func.attr}"))
             else:
-                _check_dynamic_import(path, node, violations)
+                _check_dynamic_import(path, node, violations, allowed)
 
 
 def _dynamic_import_name(func: ast.expr) -> str | None:
@@ -193,12 +218,18 @@ def _literal_module(arg: ast.expr | None) -> str | None:
     return None
 
 
-def _check_dynamic_import(path: Path, call: ast.Call, violations: list[Violation]) -> None:
+def _check_dynamic_import(
+    path: Path,
+    call: ast.Call,
+    violations: list[Violation],
+    allowed: frozenset[str] = frozenset(),
+) -> None:
     """Flag ``importlib.import_module``/``__import__`` that may reach a banned module.
 
     A string-literal argument naming a banned module is flagged by name; any
     non-literal (or missing) argument is flagged conservatively (file + line,
-    value-free) — we cannot prove it is safe, so we fail closed.
+    value-free) — we cannot prove it is safe, so we fail closed. Modules in
+    ``allowed`` (the file's scoped :data:`FILE_MODULE_EXCEPTIONS` grant) pass.
     """
     name = _dynamic_import_name(call.func)
     if name is None:
@@ -206,7 +237,10 @@ def _check_dynamic_import(path: Path, call: ast.Call, violations: list[Violation
     literal = _literal_module(_dynamic_import_module_arg(call))
     if literal is None:
         violations.append(Violation(path, call.lineno, f"{name}(<non-literal module>)"))
-    elif literal.split(".")[0] in DYNAMIC_IMPORT_BANNED:
+    elif (
+        literal.split(".")[0] in DYNAMIC_IMPORT_BANNED
+        and literal.split(".")[0] not in allowed
+    ):
         violations.append(Violation(path, call.lineno, literal))
 
 
@@ -227,7 +261,8 @@ def check_tree(root: Path) -> list[Violation]:
     relative to ``root``), the ADR-0016 node-doctor package
     (:data:`NODE_NETWORK_DIRS`, directories relative to ``root``), and the
     ADR-0024 web-server package (:data:`WEB_SERVER_DIRS` — inbound loopback
-    only).
+    only). A file listed in :data:`FILE_MODULE_EXCEPTIONS` is checked with
+    ONLY its granted modules exempted (everything else still banned).
     """
     violations: list[Violation] = []
     chain_dir = root / "chain"
@@ -243,7 +278,8 @@ def check_tree(root: Path) -> list[Violation]:
             continue  # ADR-0016 localhost node doctor — loopback-only
         if any(_is_under(path, wd) for wd in web_dirs):
             continue  # ADR-0024 localhost web server — INBOUND loopback only
-        _check_file(path, violations)
+        allowed = FILE_MODULE_EXCEPTIONS.get(str(path.relative_to(root)), frozenset())
+        _check_file(path, violations, allowed)
     return violations
 
 

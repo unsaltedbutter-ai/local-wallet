@@ -2268,15 +2268,21 @@ def test_repl_without_zpub_fails_cleanly(
     assert ZPUB_ENV_VAR in "\n".join(outputs)
 
 
-def test_no_model_falls_back_to_the_demo_stub(
+def test_no_resolvable_default_falls_back_to_the_demo_stub(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """TCK-LAUNCH-001 deliverable 3: no model configured is NO LONGER the
-    old exit-2 refusal — the launch falls back to the deterministic dev
-    stub with a VISIBLE banner naming the demo mode and the real-model env
-    var, and the session runs. (The deliberate ``--stub-llm`` flag prints
-    no banner — tested in tests/test_launch.py.)"""
+    """TCK-LAUNCH-001/002: a launch with no model configured AND no
+    resolvable pinned default (unreadable manifest / no ``default`` entry —
+    nothing the app could offer to download) still falls back to the
+    deterministic dev stub with a VISIBLE banner naming the demo mode and
+    the real-model env var; the session runs. (When the default IS
+    resolvable but simply not downloaded, the launch instead arms the
+    Yes/No download card — pinned in tests/test_launch.py. The deliberate
+    ``--stub-llm`` flag prints neither — tested in tests/test_launch.py.)"""
     monkeypatch.delenv("LOCALWALLET_MODEL_PATH", raising=False)
+    # Machine-independent: a real models/bin download would make the default
+    # RESOLVE and skip this branch (TCK-LAUNCH-002 resolution matrix).
+    monkeypatch.setattr(app_module, "_resolve_default_model", lambda: None)
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(tmp_path / "demo.db"))
     monkeypatch.setenv(app_module.AUTO_SCAN_ENV_VAR, "0")
     monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
@@ -2296,6 +2302,7 @@ def test_no_model_falls_back_to_the_demo_stub(
     assert "demo mode (canned data)" in joined
     assert "LOCALWALLET_MODEL_PATH" in joined
     assert "--stub-llm" not in joined  # the banner points at the model, not the flag
+    assert app_module.MODEL_CARD_QUESTION not in joined  # nothing to download
     assert recorded == []  # AUTO_SCAN/monitor untouched: the exit turn scans nothing
 
 

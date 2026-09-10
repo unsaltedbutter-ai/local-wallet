@@ -40,8 +40,10 @@ in the browser, only :data:`WEB_SETUP_HINT`):
   stored choice is shown first (mode framing, value-free) and an explicit
   ``y`` is required before it can be overwritten; ``n`` exits with no
   change. Non-http(s) schemes (``ssl://`` and the electrum kinds) are
-  refused plainly — v1 speaks Esplora over http(s) only (ADR-0023
-  decision 7, TCK-ONB-004 backlog) — and the entry re-prompts.
+  refused plainly IN THIS CONVERSATION — the setup entry neither probes
+  nor stores them (their validation + credential UX is TCK-ONB-004 M3);
+  an ``ssl://`` Electrum backend already works via the env/config-file
+  ladder (M1, ADR-0018 amendment) — and the entry re-prompts.
 - Validation is the ADR-0023 decision-5 gate: the ``chain/`` probe
   (Esplora shape + mainnet genesis, ADR-0021) plus — loopback URLs only,
   per the ADR-0016 contract — the node doctor's IBD facts; a syncing node
@@ -348,15 +350,20 @@ SETUP_REVERTED: Final[str] = (
     "has been removed."
 )
 
-#: A URL whose scheme v1 cannot speak (ssl:// and the other Electrum-
-#: protocol kinds, ADR-0023 decision 7 / TCK-ONB-004): plain statement, no
-#: probe, nothing saved — and the entry re-prompts (never a dead end).
+#: A URL whose scheme this CONVERSATION cannot set up (ssl:// and the other
+#: Electrum-protocol kinds — TCK-ONB-004 M1 ships the Electrum backend for
+#: the env/config-file ladder only; the setup entry's probe + stored rung
+#: land with M3): plain statement, no probe, nothing saved — and the entry
+#: re-prompts (never a dead end).
 NON_ESPLORA_URL: Final[str] = (
-    "That's not an address this app can use yet: right now it connects "
-    "only to Esplora-protocol servers over http(s) — the web address of a "
-    "mempool.space app. Electrum servers (ssl:// and the like) are planned "
-    "for a later version. Nothing was probed and nothing was saved. Type "
-    "an http(s) address, or 1 for the public server."
+    "I can't set that address up here yet: this setup conversation "
+    "connects only to Esplora-protocol servers over http(s) — the web "
+    "address of a mempool.space app. An Electrum server (ssl:// and the "
+    "like) already works as a launch setting (LOCALWALLET_CHAIN_BASE_URL "
+    "or your config file); setting it up here — with a check that it "
+    "really serves mainnet — comes in a later version. Nothing was "
+    "probed and nothing was saved. Type an http(s) address, or 1 for the "
+    "public server."
 )
 
 #: /setup refuses DORMANT when the stored rung cannot be read (no gate can
@@ -582,6 +589,14 @@ class OnboardingFlow:
     @property
     def done(self) -> bool:
         return self._state is _AskState.DONE
+
+    @property
+    def is_listening(self) -> bool:
+        """Whether ordinary lines may be consumed by this flow (armed and
+        not finished). TCK-LAUNCH-002 priority rule: while the backend ask
+        is open its yes/no gates (e.g. the /setup overwrite confirm) own
+        those bare words — the model-card intercept yields to it."""
+        return self._armed and self._state is not _AskState.DONE
 
     def opening_lines(self, *, load_started: bool, deferred: bool = False) -> list[str]:
         """Step 2 ask + step 3 narration, printed once at startup. With the

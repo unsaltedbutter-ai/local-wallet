@@ -79,6 +79,18 @@
     <button type="button" class="btn btn-secondary" data-action="retry" data-utterance="retry" title='Sends "retry"' hidden>Retry signing</button>
     <button type="button" class="btn btn-secondary" data-action="faster" data-utterance="faster" title='Sends "faster"' hidden>Faster fee</button>
     <button type="button" class="btn btn-secondary" data-action="slower" data-utterance="slower" title='Sends "slower"' hidden>Slower fee</button>
+    <!-- TCK-LAUNCH-002: the model-download card's Yes/No and the model-free
+         quick actions. Visibility comes ONLY from the typed /state
+         snapshot's additive model_state NAME (never prose). Their
+         data-utterance values are the pump's CANONICAL SLASH COMMANDS —
+         deterministic transcript commands dispatched by code, never
+         classified by the LLM (there may be no model). -->
+    <button type="button" class="btn btn-primary model-only" data-action="model-download" data-utterance="/download" hidden>Yes, download the model</button>
+    <button type="button" class="btn btn-secondary model-only" data-action="model-later" data-utterance="/later" hidden>No, show model-free actions</button>
+    <button type="button" class="btn btn-secondary quick-only" data-action="qa-balance" data-utterance="/balance" hidden>Show balance</button>
+    <button type="button" class="btn btn-secondary quick-only" data-action="qa-receive" data-utterance="/receive" hidden>Show receiving address</button>
+    <button type="button" class="btn btn-secondary quick-only" data-action="qa-address" data-utterance="/address" hidden>New address</button>
+    <button type="button" class="btn btn-secondary quick-only" data-action="qa-settings" hidden>Open settings</button>
   </section>
 </footer>
 

@@ -481,3 +481,22 @@ body {
 .watchkey-status { margin: 0; min-block-size: 1.2em; font-size: var(--fs-sm); }
 .watchkey-status[data-kind="ok"] { color: var(--c-ok); }
 .watchkey-status[data-kind="error"] { color: var(--c-danger); }
+
+/* TCK-LAUNCH-002: inline model-download progress in the transcript (native
+   <progress>; percent/bytes live in the label's textContent only). */
+.turn-model {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.turn-model progress {
+  inline-size: 12rem;
+  block-size: 0.6rem;
+  accent-color: var(--c-accent, currentColor);
+}
+.model-progress-label {
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text-muted);
+  font-size: var(--fs-sm);
+}

@@ -54,10 +54,20 @@ rather than silently estimating a fee the user might not expect (the fee
 *value* itself is not secret, but the shape contract is strict, mirroring
 the fail-closed style of :mod:`localwallet.chain.esplora`).
 
+**Backend-native path (TCK-ONB-004 M1).** A backend without the Esplora
+fee endpoints (no ``get_json`` — e.g. :class:`~localwallet.chain.electrum.
+ElectrumClient`) gets its bids from the client's own ``estimate_fee(target)``
+(a single ``estimatefee``/``estimatesmartfee``-style source, recorded with
+:attr:`FeeSource.RECOMMENDED` provenance): the floor-follower simply does
+not exist there and is NEVER faked. Its failure fails closed like a broken
+recommended payload — there is no lower layer. ``minimum_fee_sat_vb()``
+raises :class:`ChainError` on this path (the backend exposes no such field
+and we never invent one).
+
 Payloads are cheap but rate-limited (R11), so estimates are cached with a
 short, settings-driven TTL; one refresh (recommended + mempool-blocks + tip
 + recent blocks) populates the whole cache. All network I/O flows through
-the injected :class:`~localwallet.chain.esplora.EsploraClient` — this module
+the injected :class:`~localwallet.chain.esplora.ChainClient` — this module
 never creates its own ``httpx`` client.
 
 Only the estimator and its accessors live here. Fee *computation* for a
@@ -77,7 +87,7 @@ from localwallet.chain.esplora import ChainError
 from localwallet.config import Settings
 
 if TYPE_CHECKING:
-    from localwallet.chain.esplora import EsploraClient
+    from localwallet.chain.esplora import ChainClient
 
 __all__ = [
     "FeeEstimate",
@@ -173,6 +183,10 @@ class _Snapshot:
     estimates: dict[FeeTarget, FeeEstimate]
     minimum_fee_sat_vb: int
     fetched_at: float
+    #: True when the bids came from a backend-native ``estimate_fee`` (no
+    #: Esplora endpoints existed): ``minimum_fee_sat_vb`` has no value to
+    #: serve and refuses instead of fabricating one.
+    native: bool = False
 
 
 class FeeEstimator:
@@ -196,8 +210,10 @@ class FeeEstimator:
     (ADR-0012 §3, pinned in ADR-0011).
 
     Args:
-        client: The shared :class:`EsploraClient` to GET through (no second
-            ``httpx`` client is created). Network access stays in ``chain/``.
+        client: The shared :class:`ChainClient` to query through (no
+            second transport is created; Esplora backends additionally use
+            the floor-follower endpoints, non-Esplora backends their native
+            ``estimate_fee``). Network access stays in ``chain/``.
         ttl_s: Cache lifetime in seconds; defaults to
             ``Settings.fee_cache_ttl_s`` (30s).
 
@@ -208,7 +224,7 @@ class FeeEstimator:
             and an infinite TTL would never expire — hence fail closed.)
     """
 
-    def __init__(self, client: EsploraClient, ttl_s: float | None = None) -> None:
+    def __init__(self, client: ChainClient, ttl_s: float | None = None) -> None:
         if ttl_s is None:
             ttl_s = Settings.from_env().fee_cache_ttl_s
         if (
@@ -231,6 +247,13 @@ class FeeEstimator:
         now = _now()
         if self._cache is not None and now - self._cache.fetched_at < self._ttl_s:
             return self._cache
+        if not hasattr(self._client, "get_json"):
+            # Backend-native path (Electrum/bitcoind adapters expose no
+            # Esplora JSON): one estimate_fee per target, floor-follower
+            # skipped — never faked. Failures fail closed (ChainError).
+            snapshot = self._native_snapshot(now)
+            self._cache = snapshot
+            return snapshot
         payload = self._client.get_json(_FEES_PATH, _FEES_KIND)
         recommended = _parse_recommended(payload, _FEES_KIND, now)  # may raise (as before)
         snapshot = recommended
@@ -240,6 +263,34 @@ class FeeEstimator:
             snapshot = recommended  # fail-closed degrade; value-free, never logged
         self._cache = snapshot
         return snapshot
+
+    def _native_snapshot(self, now: float) -> _Snapshot:
+        """Backend-native estimates: one ``estimate_fee(target)`` per target.
+
+        The adapter's answer (sat/vB ``int``, already strictly validated by
+        the client — e.g. Electrum ``estimatefee``) is used verbatim with
+        :attr:`FeeSource.RECOMMENDED` provenance (single-source recommended
+        style, plan §0). A ChainError from any target aborts the refresh;
+        the previously cached snapshot keeps serving until its TTL, exactly
+        like a broken recommended payload.
+        """
+        estimates: dict[FeeTarget, FeeEstimate] = {}
+        for target in FeeTarget:
+            sat_per_vb = self._client.estimate_fee(target)
+            if isinstance(sat_per_vb, bool) or not isinstance(sat_per_vb, int) or sat_per_vb <= 0:
+                raise ChainError("fees-native estimate is missing or invalid")
+            estimates[target] = FeeEstimate(
+                target=target,
+                sat_per_vb=sat_per_vb,
+                source_timestamp=now,
+                source=FeeSource.RECOMMENDED,
+            )
+        return _Snapshot(
+            estimates=estimates,
+            minimum_fee_sat_vb=0,  # never served on the native path (see below)
+            fetched_at=now,
+            native=True,
+        )
 
     def _floor_follower(self, minimum_fee_sat_vb: int, now: float) -> _Snapshot:
         """Derive floor-follower bids, or raise :class:`ChainError` (caught by the caller).
@@ -288,8 +339,18 @@ class FeeEstimator:
         return self._get_snapshot().estimates[target]
 
     def minimum_fee_sat_vb(self) -> int:
-        """Return the ``minimumFee`` field (sats/vB), cached by TTL."""
-        return self._get_snapshot().minimum_fee_sat_vb
+        """Return the ``minimumFee`` field (sats/vB), cached by TTL.
+
+        Raises:
+            ChainError: On the backend-native path — a non-Esplora backend
+                exposes no separate minimum-fee figure and we never invent
+                one (fail closed; the tx engine's min-relay floor from
+                script size is the authority on that path anyway).
+        """
+        snapshot = self._get_snapshot()
+        if snapshot.native:
+            raise ChainError("fees-native backend exposes no minimum-fee endpoint")
+        return snapshot.minimum_fee_sat_vb
 
     def invalidate(self) -> None:
         """Drop the cached payload; the next call refetches."""

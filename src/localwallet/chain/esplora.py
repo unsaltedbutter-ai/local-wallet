@@ -46,17 +46,21 @@ import random
 import time
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Final, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Protocol, Self, runtime_checkable
 
 import httpx
 from embit.transaction import Transaction
 
-from localwallet.chain.config import ChainConfig
+from localwallet.chain.config import ELECTRUM_SCHEME, ChainConfig
 from localwallet.config import Settings
+
+if TYPE_CHECKING:
+    from localwallet.chain.fees import FeeTarget
 
 __all__ = [
     "MAINNET_GENESIS_HASH",
     "Balance",
+    "ChainClient",
     "ChainError",
     "EsploraClient",
     "TipBlock",
@@ -323,6 +327,56 @@ def _max_block_list_height(payload: list[Any], kind: str) -> int:
     return max_height
 
 
+@runtime_checkable
+class ChainClient(Protocol):
+    """The backend-agnostic contract every chain adapter satisfies.
+
+    Derived from the ACTUAL call sites (docs/onb-004-backend-adapters-plan.md
+    §0): ``wallet.scan``, ``chain.watch`` and the app's broadcast/recovery and
+    fee paths code against exactly these members. ``EsploraClient`` and
+    ``ElectrumClient`` both structurally satisfy it (pinned by
+    ``tests/test_chain_electrum.py``); the TCK-ONB-004 plan's M2 ``bitcoind``
+    adapter must too.
+
+    Deliberately NOT on the protocol: ``get_json`` — raw Esplora JSON is
+    Esplora-only, and every consumer that needs it (the fee floor-follower,
+    the price oracle) gates on the capability seam instead (``estimate_fee``
+    is the backend-native fee source; ``supports_price`` declares whether a
+    price feed exists at all). Presence of ``get_json`` identifies an Esplora
+    backend; absence means the honest non-Esplora degrade paths apply.
+    """
+
+    #: Whether this backend serves a USD price feed (ADR-0011 ladder input;
+    #: TCK-ONB-004 plan OQ-2). ``PriceOracle`` refuses fail-closed to the
+    #: sats-only rung when this is falsy.
+    supports_price: bool
+
+    def get_address_txs(self, address: str) -> list[dict[str, Any]]: ...
+
+    def get_address_utxos(self, address: str) -> list[dict[str, Any]]: ...
+
+    def get_tip_height(self) -> int: ...
+
+    def get_tip_block(self) -> TipBlock: ...
+
+    def broadcast_tx(self, tx_hex: str) -> str: ...
+
+    def get_tx_status(self, txid: str) -> TxStatus: ...
+
+    def estimate_fee(self, target: FeeTarget) -> int: ...
+
+    def close(self) -> None: ...
+
+    def __enter__(self) -> Self: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+
 class EsploraClient:
     """Synchronous client for a public or self-hosted Esplora API.
 
@@ -362,6 +416,20 @@ class EsploraClient:
             seam; production callers leave it as ``None``).
     """
 
+    #: This backend serves the mempool.space ``/v1/prices`` feed, so the
+    #: price oracle may query it (capability seam, TCK-ONB-004 plan §0).
+    supports_price: bool = True
+
+    #: Recommended-fee payload key per confirmation target (the single
+    #: native fee source for this backend; kept here as PLAIN STRINGS
+    #: because ``fees.FeeTarget`` would import-cycle — the lookup uses
+    #: ``target.value``).
+    _RECOMMENDED_FEE_KEYS: ClassVar[dict[str, str]] = {
+        "fast": "fastestFee",
+        "medium": "halfHourFee",
+        "slow": "hourFee",
+    }
+
     def __init__(
         self,
         base_url: str | None = None,
@@ -382,6 +450,11 @@ class EsploraClient:
             # inherits the same value through this construction path.
             tls_verify=defaults.tls_verify,
         )
+        if self._config.base_url.startswith(ELECTRUM_SCHEME):
+            # ssl:// is the Electrum adapter's scheme (TCK-ONB-004 M1;
+            # ADR-0018 amendment): construction fails closed here rather
+            # than sending a nonsense httpx request at it later.
+            raise ValueError("ssl:// URLs require the ElectrumClient adapter")
         # Trailing slash is normalized so the path joining below is exact.
         self._base_url = self._config.base_url.rstrip("/")
         self._client = httpx.Client(
@@ -630,6 +703,28 @@ class EsploraClient:
             block_height=parsed[0],
             block_time=parsed[1],
         )
+
+    def estimate_fee(self, target: FeeTarget) -> int:
+        """Backend-native single fee bid in sat/vB (``ChainClient`` contract).
+
+        Source: ``GET {base}/v1/fees/recommended`` (mempool.space shape), the
+        key matching ``target``. Strictly validated (positive ``int``, bools
+        rejected — a 0 sat/vB bid is a broken payload, never a free one;
+        same fail-closed rule as :func:`localwallet.chain.fees._parse_recommended`).
+        Note: the app's fee path for THIS backend goes through
+        :class:`~localwallet.chain.fees.FeeEstimator`, which prefers its
+        richer floor-follower over this single-source endpoint; this method
+        exists so the Esplora client satisfies the same protocol as every
+        other adapter.
+        """
+        key = self._RECOMMENDED_FEE_KEYS[target.value]
+        payload = self._request_json("fees-recommended", "/v1/fees/recommended")
+        if not isinstance(payload, dict):
+            raise ChainError("fees-recommended response was not an object")
+        value = payload.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ChainError(f"fees-recommended response has missing or invalid '{key}'")
+        return value
 
     def get_json(self, path: str, kind: str) -> Any:
         """Public GET + retry + parse for any path on this client.

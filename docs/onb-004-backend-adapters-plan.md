@@ -1,6 +1,7 @@
 # ONB-004 — Backend adapters plan (Electrum + bitcoind RPC + auto-detect/creds)
 
-- **Status:** Plan (pre-implementation; splits into 3 tickets — M1, M2, M3)
+- **Status:** M1 IMPLEMENTED (TCK-ONB-004 M1, 2026-09-09 — status notes at §1);
+  M2/M3 plan (pre-implementation; splits into 3 tickets — M1, M2, M3)
 - **Branch:** dev/plan-run-1
 - **Tracks:** TCK-ONB-004 (ADR-0023 decision 7 backlog)
 - **Scope:** `src/localwallet/chain/`, `src/localwallet/ui/onboarding.py`, `/setup`, web settings, `src/localwallet/config.py`, tests. ADR-0018/0023 amendment on acceptance.
@@ -111,6 +112,43 @@ network in CI** (binds 127.0.0.1). Mirror the `ScriptedServer` pattern
 **Live probe (documented, manual):** point at a real electrum server
 (e.g. `electrum.blockstream.info:50002` ssl) with a throwaway xpub and assert tip +
 one address's history shape; never automated.
+
+### M1 status notes (implemented 2026-09-09)
+
+- Shipped as designed: `chain/electrum.py` (`ElectrumClient`, stdlib `ssl` +
+  JSON-lines, sequential, no batching), `ChainConfig.kind` + `ssl://` scheme
+  validation, the scheme dispatch at the one construction site
+  (`app._build_chain_client`), the `ChainClient` protocol +
+  `estimate_fee`/`supports_price` capability seam (fees native path, price
+  refuses fail-closed to sats-only), `tests/test_chain_electrum.py` (76
+  tests against the loopback fixture — includes a `fetch_scan` run whose
+  `ScanRecords` are field-by-field EQUAL to the Esplora mock's on the same
+  scenario, so the scan seam is provably unedited).
+- Deviations, documented: (1) tip via `blockchain.headers.subscribe`
+  (universal; its result already carries the raw header — `blockchain.headers.tip`
+  + `blockchain.block.header` NOT used); (2) no
+  `blockchain.scripthash.get_balance`/`subscribe` methods — zero v1 callers
+  (balance comes from the UTXO snapshot; the watch poll rides the unchanged
+  ChainWorker re-scan); (3) mainnet enforcement lives IN the adapter
+  handshake (`server.features.genesis_hash`) because M1 exposes no ssl://
+  setup probe — M3's probe re-adds the check at entry time; (4) the
+  `/setup` + first-run entry still refuse `ssl://` (entry UX + stored rung +
+  credentials are M3); M1 selects via env (`LOCALWALLET_CHAIN_BASE_URL=ssl://…`)
+  or the config-file key only; (5) `estimatefee` answers arrive per-target
+  advisory as planned — accepted, tx engine min-relay floor unchanged.
+- Privacy banner behavior on `ssl://`: `_backend_mode`/`privacy_indicator`
+  are scheme-agnostic (loopback → "own node, this machine"; remote host →
+  "own node, another machine"), and `LOCALWALLET_TLS_VERIFY=0` prints the
+  SAME `TLS_UNVERIFIED_WARNING` on either adapter; price-dependent surfaces
+  degrade through the existing `price_unavailable` ladder.
+- **Manual live probe (never in CI, never automated):**
+  `LOCALWALLET_CHAIN_BASE_URL=ssl://electrum.blockstream.info:50002
+  .venv/bin/python -c "import sys; sys.path.insert(0,'src'); from
+  localwallet.chain import ElectrumClient; c = ElectrumClient();
+  print(c.get_tip_height()); print(c.get_address_txs('<throwaway-mainnet-address>'))"`
+  — expect a plausible tip and Esplora-shaped entries; a non-mainnet server
+  must fail the handshake with `does not serve mainnet`. Use a disposable
+  xpub-derived address only.
 
 ---
 

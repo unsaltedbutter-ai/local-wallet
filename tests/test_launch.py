@@ -19,9 +19,13 @@ Launch matrix (entry = ``main`` / ``python -m localwallet.ui.cli``):
 
 from __future__ import annotations
 
+import json
 import os
+import queue
 import socket
+import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -402,3 +406,380 @@ def test_events_reconnect_backoff_is_bounded() -> None:
     ).read_text(encoding="utf-8")
     assert "Math.min(state.backoffMs * 2, 15000)" in app_js  # 15s ceiling
     assert "state.backoffMs = 500; // a live stream resets the backoff ladder" in app_js
+
+
+# ===================== TCK-LAUNCH-002: default model + download card =========
+#
+# Resolution matrix (no --stub-llm / no generate_fn):
+#
+# | rung                                   | outcome                        |
+# |----------------------------------------|--------------------------------|
+# | LOCALWALLET_MODEL_PATH set             | ModelRuntime (env), no card    |
+# | manifest default, FILE PRESENT         | ModelRuntime(default), no card |
+# | manifest default, FILE ABSENT          | stub + Yes/No card + flow      |
+# | no resolvable default (manifest)       | stub + old demo banner         |
+# | --stub-llm                             | stub, NO banner, NO card       |
+#
+# Download lifecycle is driven with FAKE fast-downloader subprocesses (the
+# command seam) — the real models/download_model.py is never run here (its
+# own seam is pinned separately, and network stays untouched).
+
+# Fake downloader scripts (argument-list seam — no network, no paths):
+_FAKE_OK = (
+    "import json\n"
+    "for n in (1_048_576, 2_097_152, 3_145_728):\n"
+    "    print(json.dumps({'downloaded': n, 'total': 3_145_728}), flush=True)\n"
+)
+_FAKE_FAIL = (
+    "import sys\n"
+    "print('boom /Users/homer/.local-wallet/models/x', file=sys.stderr)\n"
+    "sys.exit(1)\n"
+)
+_FAKE_HANG = (
+    "import json, time\n"
+    "print(json.dumps({'downloaded': 1, 'total': 100}), flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+class _FakeRuntime:
+    """Stand-in for the lazily-loaded ModelRuntime (never generated on)."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self.ctor = (args, kwargs)
+
+    def generate(self, prompt: str, *, grammar_text: str | None = None) -> str:
+        raise AssertionError("no turn must run in these tests")
+
+
+# ------------------------------------------------------- resolution matrix
+
+
+def test_env_model_path_selects_runtime_without_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LOCALWALLET_MODEL_PATH", "/some/where/model.gguf")
+    built: list[_FakeRuntime] = []
+    monkeypatch.setattr(app, "ModelRuntime", lambda *a, **k: built.append(
+        _FakeRuntime(*a, **k)) or built[-1])
+    outputs: list[str] = []
+    code = app.run(
+        ["--zpub", ZPUB], input_fn=lambda _p: "exit", output_fn=outputs.append
+    )
+    assert code == 0
+    assert len(built) == 1  # the real runtime, not the stub
+    joined = "\n".join(outputs)
+    assert app.MODEL_CARD_QUESTION not in joined
+    assert app.NO_MODEL_DEMO_BANNER not in joined
+
+
+def test_default_file_present_selects_real_model_silently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gguf = tmp_path / "models" / "bin" / "m.gguf"
+    gguf.parent.mkdir(parents=True)
+    gguf.write_bytes(b"GGUF-fake")
+    monkeypatch.setattr(app, "_resolve_default_model", lambda: ("m", gguf))
+    built: list[_FakeRuntime] = []
+    monkeypatch.setattr(app, "ModelRuntime", lambda *a, **k: built.append(
+        _FakeRuntime(*a, **k)) or built[-1])
+    outputs: list[str] = []
+    code = app.run(
+        ["--zpub", ZPUB], input_fn=lambda _p: "exit", output_fn=outputs.append
+    )
+    assert code == 0
+    assert built and built[0].ctor[1].get("model_path") == str(gguf)
+    joined = "\n".join(outputs)
+    assert app.MODEL_CARD_QUESTION not in joined  # the NORMAL launch: no card
+    assert app.NO_MODEL_DEMO_BANNER not in joined  # no demo either
+
+
+def test_default_file_absent_arms_the_download_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    missing = tmp_path / "models" / "bin" / "m.gguf"
+    monkeypatch.setattr(app, "_resolve_default_model", lambda: ("m", missing))
+    outputs: list[str] = []
+    code = app.run(
+        ["--zpub", ZPUB], input_fn=lambda _p: "exit", output_fn=outputs.append
+    )
+    assert code == 0
+    joined = "\n".join(outputs)
+    assert app.MODEL_CARD_QUESTION in joined  # no silent demo mode
+    assert app.MODEL_CARD_HINT in joined
+    assert app.NO_MODEL_DEMO_BANNER not in joined  # the card REPLACES it
+
+
+def test_unresolvable_default_keeps_the_plain_demo_banner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app, "_resolve_default_model", lambda: None)
+    outputs: list[str] = []
+    code = app.run(
+        ["--zpub", ZPUB], input_fn=lambda _p: "exit", output_fn=outputs.append
+    )
+    assert code == 0
+    joined = "\n".join(outputs)
+    assert app.NO_MODEL_DEMO_BANNER in joined
+    assert app.MODEL_CARD_QUESTION not in joined  # nothing exists to download
+
+
+def test_stub_llm_flag_prints_no_banner_and_no_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """--stub-llm stays the explicit dev choice (LAUNCH-001 behavior):
+    neither the banner nor a download offer — no flow is ever built."""
+    monkeypatch.setattr(
+        app, "_resolve_default_model",
+        lambda: ("m", tmp_path / "nope.gguf"),
+    )
+    outputs: list[str] = []
+    code = app.run(
+        ["--stub-llm", "--zpub", ZPUB],
+        input_fn=lambda _p: "exit",
+        output_fn=outputs.append,
+    )
+    assert code == 0
+    joined = "\n".join(outputs)
+    assert app.NO_MODEL_DEMO_BANNER not in joined
+    assert app.MODEL_CARD_QUESTION not in joined
+
+
+def test_shipped_manifest_pins_exactly_one_default_model() -> None:
+    """The manifest's default marker IS the pinned E2B build with a real
+    sha256 (the card only ever offers what the child can hash-verify)."""
+    entries = json.loads((app.MODELS_DIR / "manifest.json").read_text())
+    defaults = [e for e in entries if e.get("default") is True]
+    assert len(defaults) == 1
+    assert defaults[0]["name"] == "gemma-4-E2B-it-Q4_K_M"
+    assert isinstance(defaults[0]["sha256"], str) and len(defaults[0]["sha256"]) == 64
+    resolved = app._resolve_default_model()
+    assert resolved is not None
+    name, path = resolved
+    assert name == "gemma-4-E2B-it-Q4_K_M"
+    assert path == app.MODELS_DIR / "bin" / f"{name}.gguf"
+
+
+# ----------------------------------------------------- verdict classifier
+
+
+def test_card_verdicts_never_outrun_the_confirm_gate() -> None:
+    """Bare yes/no classify only while the card is shown AND nothing
+    pends; slash forms are canonical and always classify while a flow
+    exists; once the model is ready, bare words return to chat."""
+    m = app.ModelDownloadFlow(model_name="x")
+    assert app._model_card_verdict(m, "yes", tx_pending=False) == "yes"
+    assert app._model_card_verdict(m, "n", tx_pending=False) == "no"
+    assert app._model_card_verdict(m, "yes", tx_pending=True) is None  # gate's
+    assert app._model_card_verdict(m, "no", tx_pending=True) is None
+    assert app._model_card_verdict(m, "/download", tx_pending=True) == "yes"
+    m.state = "declined"
+    assert app._model_card_verdict(m, "yes", tx_pending=False) is None
+    assert app._model_card_verdict(m, "/download", tx_pending=False) == "yes"
+    m.state = "ready"
+    assert app._model_card_verdict(m, "no", tx_pending=False) is None
+    # …and while the ADR-0023 onboarding ask listens (its yes/no gates):
+    assert app._model_card_verdict(
+        app.ModelDownloadFlow(model_name="x"), "yes", False, onboarding_listening=True
+    ) is None
+    assert app._model_card_verdict(
+        app.ModelDownloadFlow(model_name="x"), "/download", False,
+        onboarding_listening=True,
+    ) == "yes"  # slash forms never collide with any gate
+
+
+# --------------------------------------------------- download lifecycle
+
+
+def _download_session(
+    command: list[str], answers: list[str], *, until: str
+) -> tuple[app.ModelDownloadFlow, list[app.EngineEvent]]:
+    """Run ONE real pump on a thread with a fake-downloader flow; feed the
+    answers; wait for the flow to reach `until`; QUIT; join bounded."""
+    events: list[app.EngineEvent] = []
+    emitter = app.EventEmitter(events.append)
+    flow = app.ModelDownloadFlow(model_name="fake", command=command)
+    commands: queue.Queue[Any] = queue.Queue()
+    loop = app.AgentLoop(app.stub_generate, {app.IntentName.RESPOND: app._respond_handler})
+    thread = threading.Thread(
+        target=lambda: app._pump(
+            loop,
+            emitter.text,
+            commands,
+            flow=app.TxFlow(),
+            session=app.SendSession(),
+            table={},
+            emitter=emitter,
+            model=flow,
+        ),
+        daemon=True,
+    )
+    thread.start()
+    for answer in answers:
+        commands.put(answer)
+    deadline = time.monotonic() + 15
+    while flow.state != until and time.monotonic() < deadline:
+        time.sleep(0.02)
+    commands.put(app.QUIT)
+    thread.join(15)
+    assert not thread.is_alive()  # bounded exit, always
+    return flow, events
+
+
+def _texts(events: list[app.EngineEvent]) -> str:
+    return "\n".join(e.payload for e in events if e.kind == "text")
+
+
+def test_yes_downloads_with_inline_progress_then_ready() -> None:
+    flow, events = _download_session(
+        [sys.executable, "-c", _FAKE_OK], ["/download"], until="ready"
+    )
+    texts = _texts(events)
+    assert app.MODEL_DL_STARTED in texts
+    assert app.MODEL_DL_DONE in texts
+    ticks = [e for e in events if e.kind == app.EVENT_MODEL_PROGRESS]
+    assert len(ticks) == 3
+    percents = []
+    for tick in ticks:
+        payload = json.loads(tick.payload)  # INT-ONLY JSON by contract
+        assert set(payload) == {"downloaded", "total", "pct"}
+        assert all(v is None or isinstance(v, int) for v in payload.values())
+        percents.append(payload["pct"])
+    assert percents == [33, 66, 100]
+    assert flow.state == "ready"
+    # value-free progress: no path/name string can ride an int-only payload,
+    # and the child's stdout text never enters the stream either:
+    assert "/" not in "".join(t.payload for t in ticks)
+
+
+def test_download_failure_narrates_value_free_and_offers_retry() -> None:
+    flow, events = _download_session(
+        [sys.executable, "-c", _FAKE_FAIL], ["/download"], until="failed"
+    )
+    texts = _texts(events)
+    assert app.MODEL_DL_FAILED in texts
+    assert app.MODEL_DL_DONE not in texts
+    joined = texts + "".join(
+        e.payload for e in events if e.kind == app.EVENT_MODEL_PROGRESS
+    )
+    assert "homer" not in joined and ".local-wallet" not in joined  # stderr dead-dropped
+    # the card re-arms from failed (the No-path buttons offered again):
+    assert app._model_card_verdict(flow, "yes", tx_pending=False) == "yes"
+
+
+def test_one_download_at_a_time_concurrency_guard() -> None:
+    _flow, events = _download_session(
+        [sys.executable, "-c", _FAKE_HANG],
+        ["/download", "/download"],
+        until="running",
+    )
+    assert app.MODEL_DL_STARTED in _texts(events)
+    assert app.MODEL_DL_RUNNING in _texts(events)  # the second ask refused
+    assert sum(1 for e in events if e.kind == "text" and app.MODEL_DL_STARTED in e.payload) == 1
+
+
+def test_quit_terminates_the_child_bounded_no_orphans() -> None:
+    started = time.monotonic()
+    flow, _events = _download_session(
+        [sys.executable, "-c", _FAKE_HANG], ["/download"], until="running"
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 20  # _download_session joined the pump (5s term bounds)
+    proc = flow._proc
+    assert proc is not None and proc.poll() is not None  # child dead
+    assert not any(
+        t.name == "model-download" and t.is_alive() for t in threading.enumerate()
+    )
+
+
+def test_flow_start_guard_is_the_single_mutation_point() -> None:
+    """Unit-level: start() only proceeds from card states, never twice."""
+    flow = app.ModelDownloadFlow(model_name="x", command=[sys.executable, "-c", _FAKE_HANG])
+    assert flow.start() is False  # not attached yet (no pump queue)
+    commands: queue.Queue[Any] = queue.Queue()
+    flow.attach(commands)
+    assert flow.start() is True
+    assert flow.start() is False  # running: guard
+    assert flow.state == "running"
+    flow.cancel()
+    assert not any(t.name == "model-download" and t.is_alive() for t in threading.enumerate())
+
+
+def test_declined_shows_model_free_actions_and_quick_actions_run_without_llm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NO → the quick-action list renders; /receive, /address and /settings
+    perform through the pump's DETERMINISTIC intercepts (the stub is never
+    asked — no canned '(stub model, dev mode)' narration may appear)."""
+    monkeypatch.setattr(
+        app, "_resolve_default_model",
+        lambda: ("m", tmp_path / "nope.gguf"),
+    )
+    lines = iter(["no", "/receive", "/address", "/settings", "exit"])
+    outputs: list[str] = []
+    code = app.run(
+        ["--zpub", ZPUB], input_fn=lambda _p: next(lines), output_fn=outputs.append
+    )
+    assert code == 0
+    joined = "\n".join(outputs)
+    for offer in app.MODEL_DECLINED_LINES:
+        assert offer in joined
+    assert "Next receive address (index 0" in joined
+    assert "Fresh receive address (index 0)" in joined
+    assert "watch_key: " in joined  # the settings readout, truncated form
+    assert "…" in joined
+    assert ZPUB not in joined  # the settings surface never reveals in full
+    assert "(stub model, dev mode)" not in joined  # the LLM was bypassed
+
+
+# -------------------------------------------- watch-key settings entry
+
+
+def _keyed_store(tmp_path: Path) -> tuple[Path, str]:
+    """Seed a store the way an accepted launch would; return (path, desc)."""
+    from localwallet.wallet import WalletDescriptor
+
+    store_path = tmp_path / "watchkey.db"
+    store = Store(str(store_path))
+    try:
+        descriptor = WalletDescriptor.from_key(ZPUB).descriptor
+        wallet = store.create_wallet("default", descriptor)
+        store.set_active_wallet(wallet.id)
+    finally:
+        store.close()
+    return store_path, descriptor
+
+
+def test_settings_watch_key_entry_truncated_list_full_on_explicit_read(
+    tmp_path: Path,
+) -> None:
+    _, descriptor = _keyed_store(tmp_path)
+    store = Store(str(tmp_path / "watchkey.db"))
+    try:
+        listing = app.handle_settings_request(store, None, None)
+        entry = next(
+            e for e in listing["settings"] if e["key"] == app.WATCH_KEY_SETTING
+        )
+        assert entry["configured"] is True
+        assert entry["type"] == "watch_key"
+        assert entry["value"] == app._display_truncate(descriptor)
+        assert entry["value"] != descriptor  # the list NEVER carries the full key
+        # explicit single-key read → the full public value, flagged:
+        reveal = app.handle_settings_request(store, app.WATCH_KEY_SETTING, None)
+        assert reveal["status"] == "ok"
+        assert reveal["settings"][0]["value"] == descriptor
+        assert reveal["settings"][0]["revealed"] is True
+        # NOT on the write allowlist — a settings-shaped key write is refused
+        # and the submitted value is not echoed:
+        attempt = app.handle_settings_request(store, app.WATCH_KEY_SETTING, "x" * 30)
+        assert attempt["status"] == "rejected"
+        assert "x" * 30 not in str(attempt)
+    finally:
+        store.close()
+
+
+def test_display_truncation_is_head_dot_dot_tail() -> None:
+    assert app._display_truncate("short") == "short"
+    long = "z" * 100
+    cut = app._display_truncate(long)
+    assert cut.startswith(long[:12]) and cut.endswith(long[-8:]) and "…" in cut

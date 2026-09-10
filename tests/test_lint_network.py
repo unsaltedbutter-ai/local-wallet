@@ -333,3 +333,45 @@ def test_lint_main_exits_nonzero_on_unparseable(tmp_path, capsys):
     assert rc == 1
     assert "broken.py" in capsys.readouterr().out
 
+
+
+# --------------------- ADR-0001 amendment: per-file module exceptions (002)
+
+
+def test_file_module_exception_is_scoped_to_one_file_and_module(tmp_path):
+    """TCK-LAUNCH-002: app.py's grant is EXACTLY ``subprocess`` — another
+    file importing subprocess is still flagged, and app.py importing any
+    other banned module (network!) is still flagged."""
+    root = tmp_path / "localwallet"
+    root.mkdir()
+    (root / "app.py").write_text("import subprocess\n", encoding="utf-8")
+    assert LINT.check_tree(root) == []
+    (root / "other.py").write_text("import subprocess\n", encoding="utf-8")
+    violations = LINT.check_tree(root)
+    assert [v.module for v in violations] == ["subprocess"]
+    assert violations[0].path.name == "other.py"
+    (root / "other.py").unlink()
+    (root / "app.py").write_text(
+        "import subprocess\nimport httpx\n", encoding="utf-8"
+    )
+    violations = LINT.check_tree(root)
+    assert [v.module for v in violations] == ["httpx"]  # subprocess stays granted
+
+
+def test_real_tree_grant_list_is_exactly_app_py():
+    """The mutation gate on the exception itself: the ONLY per-file module
+    grant is app.py's subprocess (the model-download child), and the real
+    tree passes WITH it (test_lint_passes_on_current_scaffold)."""
+    assert LINT.FILE_MODULE_EXCEPTIONS == {
+        "app.py": frozenset({"subprocess"})
+    }
+
+
+def test_app_py_actually_needs_the_grant():
+    """If app.py ever drops its subprocess import, the grant should be
+    reconsidered — pin that the download orchestration is what uses it."""
+    app_py = SRC_ROOT / "app.py"
+    source = app_py.read_text(encoding="utf-8")
+    assert "subprocess.Popen(" in source
+    # no shell, ever: the one spawn is an argument list
+    assert "shell=True" not in source

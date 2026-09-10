@@ -456,3 +456,62 @@ threading model, transport, and render contract are unchanged.
   is CLI-only. The `/events` reconnect backoff (≤ 15 s cap, reset on a
   live stream) already bounds the dead-server console-error spam; no
   change (verified by a source pin, tests/test_launch.py).
+
+## Amendment (2026-09-09, TCK-LAUNCH-002): model card + inline download progress + model-free quick actions + watch-key settings surfacing + in-place REPLACE allowance
+
+Follows the TCK-LAUNCH-001 amendment; model-resolution rationale lives
+in the ADR-0001 amendment (same ticket).
+
+- **Yes/No download card (deterministic, never model-authored).** When the
+  pinned default is resolvable but not downloaded, the engine emits the
+  card text at pump start and the typed `state/1` snapshot gains the
+  additive `model_state` NAME (`absent`/`declined`/`running`/`ready`/
+  `failed`) — the buttons render ONLY from it (the §"never parse prose"
+  doctrine). The web buttons POST `/action` with **canonical SLASH
+  utterances** `/download` / `/later`; the pump intercepts those (plus bare
+  `yes`/`no` on the CLI) as a DETERMINISTIC channel BEFORE any model turn —
+  a decision, because there is no model to classify prose yet. Bare
+  `yes`/`no` are never intercepted while a transaction pends (the ADR-0013
+  confirm gate owns those words first).
+- **Inline progress.** A new event kind `model_progress` carries an
+  int-only JSON payload (`downloaded`/`total`/`pct`) — byte counts and a
+  computed percent of a PUBLIC file, never wallet data, never a path
+  (nothing string-shaped can enter it, so HOME-scrubbing is moot by
+  construction). The web renders a native `<progress>` + textContent
+  label in the transcript; the CLI re-renders one percent line in place.
+  The subprocess lifecycle (engine-owned, bounded terminate/join, hash
+  verification in the child) is pinned in the ADR-0001 amendment; the
+  model activates on NEXT launch (no in-session hot-swap attempted).
+- **Model-free quick actions (code-owned LLM bypass — documented).** After
+  "no", the buttons `/balance`, `/receive`, `/address` ride the SAME
+  `/action`→pump channel but are intercepted as deterministic commands:
+  `/balance`/`/address` dispatch EXISTING allowlist handlers directly with
+  CODE-built empty-params envelopes (the exact TCK-HW-002 "retry"
+  precedent — same handlers, same `_print_turn` verbatim narration, never
+  the LLM, which is only ever the envelope SOURCE), while `/receive` and
+  `/settings` are pure store reads on the deterministic transcript channel
+  (ADR-0020, like `/label`). "Open settings" is client-side only.
+- **Watch key in GET /settings (follow-up (a)).** The `settings/1` list
+  gains a READ-ONLY `watch_key` entry carrying the active wallet's
+  canonical descriptor DISPLAY-TRUNCATED (head…tail); the FULL value is
+  served ONLY by the explicit single-key read `GET /settings?key=watch_key`
+  (the Show/Copy click). This is a PUBLIC account key (watch-only app) —
+  not a secret — yet it still never enters a log (access logging is
+  suppressed wholesale) or any unauthenticated surface (the endpoint stays
+  token-gated). `watch_key` is deliberately ABSENT from the settings WRITE
+  allowlist: changing the key is only ever the gated `/watchkey` path.
+- **In-place REPLACE allowance (follow-up (b)) — DECIDED: allow, gated.**
+  A bare `POST /watchkey` against a configured wallet still answers 409
+  `already` (the TCK-LAUNCH-001 contract stands; no accidental swaps). The
+  explicit double opt-in — body `replace: true` AND `confirm: true`,
+  STRICT booleans, raised only by the settings panel's confirm → key-entry
+  two-step — reruns the EXACT same engine-thread parse+gate path
+  (mainnet-only, watch-only, seed refusals, value-free errors) and rebinds
+  the pump onto fresh wiring. The engine then narrates the explicit
+  old-wallet-cache warning (previous wallet's rows stay in the store, no
+  longer the active wallet's; any pending transaction is discarded). A
+  replace with the SAME key is refused; the key itself never rides back on
+  any status. The alternative (keep 409 + restart) was rejected for UX
+  honesty: the panel already promises the operation, the gate is the same
+  code, and the swap is atomic on the engine thread with bounded teardown
+  of the old pieces.
