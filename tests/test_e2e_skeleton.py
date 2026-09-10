@@ -345,6 +345,14 @@ def _mock_client(
     )
 
 
+def _scan_requests(recorded: list[httpx.Request]) -> list[httpx.Request]:
+    """Recorded requests minus the display-only ``/v1/prices`` best-effort
+    fetches (TCK-FIAT-001): every ``get_balance`` answer attempts one; the
+    ``_scan_handler`` mocks 404 it, so the USD keys stay absent and the
+    scan-count assertions below stay about SCAN traffic only."""
+    return [r for r in recorded if not r.url.path.endswith("/v1/prices")]
+
+
 def _build_table(
     make_handler: Callable[[list[httpx.Request]], Callable[[httpx.Request], httpx.Response]],
     *,
@@ -754,7 +762,9 @@ def test_second_balance_read_hits_store_only() -> None:
     second = loop.run("and now?", {})
     assert second.result is not None and "error" not in second.result
     assert second.result["total_sats"] == EXPECTED_TOTAL
-    assert len(recorded) == after_first  # no chain I/O on the cached read
+    # No new SCAN traffic on the cached read (TCK-FIAT-001: the best-effort
+    # price attempt is display sugar, not scan I/O).
+    assert _scan_requests(recorded[after_first:]) == []
     client.close()
     store.close()
 
@@ -1263,8 +1273,9 @@ def test_startup_scan_populates_store_then_balance_reads_it(
     assert wd.descriptor not in joined
     # 9 requests: 1 tip + 6 txs (gap-2 window extends past the two funded
     # branch-0 addresses) + 2 utxo (only the addresses with txs,
-    # TCK-SCAN-001).
-    assert len(recorded) == 9
+    # TCK-SCAN-001). The balance turn's best-effort /v1/prices fetch
+    # (TCK-FIAT-001, 404 here → sats-only answer) is excluded by design.
+    assert len(_scan_requests(recorded)) == 9
     # The store holds exactly the pre-seeded wallet row + scanned state.
     with Store(store_path) as store:
         rows = store.list_wallets()
@@ -1306,8 +1317,9 @@ def test_repl_end_to_end_with_stub_llm_prints_verbatim_balance(
     assert ZPUB not in joined
     assert all(addr not in joined for addr in (addr0, addr1))
     # Lazy scan only (auto-scan off): 1 tip + 6 txs + 2 utxo (funded
-    # addresses only — TCK-SCAN-001 skip for the empty-history rest).
-    assert len(recorded) == 9
+    # addresses only — TCK-SCAN-001 skip for the empty-history rest). The
+    # balance turn's display-only /v1/prices fetch is excluded (TCK-FIAT-001).
+    assert len(_scan_requests(recorded)) == 9
 
 
 def test_auto_scan_opt_out_balance_scans_lazily_on_first_ask(
@@ -5466,7 +5478,12 @@ def test_prompt_is_live_while_startup_scan_still_runs(
 
     def gating(request: httpx.Request) -> httpx.Response:
         # The scan cannot complete until the test releases it: any turn
-        # taken before then is DETERMINISTICALLY mid-first-scan.
+        # taken before then is DETERMINISTICALLY mid-first-scan. The
+        # balance turn's best-effort /v1/prices fetch (TCK-FIAT-001) is
+        # NOT gated: parking it would stall the mid-scan turn for the
+        # release timeout — it answers 404 (sats-only) immediately.
+        if request.url.path.endswith("/v1/prices"):
+            return inner(request)
         release.wait(10)
         return inner(request)
 
@@ -5528,8 +5545,9 @@ def test_prompt_is_live_while_startup_scan_still_runs(
     assert last_balance_idx > complete_idx
     assert app_module.FRESHNESS_NOTE not in outputs[last_balance_idx:]
     # One scan (9 requests: 1 tip + 6 txs + 2 utxo, TCK-SCAN-001) — the
-    # mid-scan turn did NOT trigger a second scan.
-    assert len(recorded) == 9
+    # mid-scan turn did NOT trigger a second scan. The two balance turns'
+    # display-only /v1/prices fetches are excluded (TCK-FIAT-001).
+    assert len(_scan_requests(recorded)) == 9
     joined = "\n".join(outputs)
     assert ZPUB not in joined and wd.descriptor not in joined
     assert all(addr not in joined for addr in (addr0, addr1))

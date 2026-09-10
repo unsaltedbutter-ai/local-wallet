@@ -54,7 +54,9 @@ never guess them. A send only moves funds through the full flow: \
 create_tx, then the user's explicit confirmation, then sign_tx (the user \
 confirms on their hardware wallet), then broadcast_tx.
 - get_balance: look up the wallet balance; params {} — when the user asks \
-what they have.
+what they have. Fiat asks ("balance in USD / dollars") are ALSO \
+get_balance: the result card carries the USD conversion — never compute \
+or invent a fiat number.
 - get_history: show recent wallet transactions; params {} or \
 {"limit": 1-100} — when the user asks what happened recently.
 - get_utxos: show the wallet's unspent outputs; params {} — when the user \

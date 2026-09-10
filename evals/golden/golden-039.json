@@ -1,0 +1,5 @@
+{
+  "id": "golden-039",
+  "prompt": "can you convert my balance to dollars?",
+  "expectation": {"intent": "get_balance", "params": {}}
+}

@@ -1188,8 +1188,9 @@ def build_dispatch_table(
             ADR-0013). Defaults to a fresh :class:`SendSession`.
         fee_estimator: Fee-rate source for ``create_tx``; defaults to a
             :class:`FeeEstimator` over ``client``.
-        price_oracle: USD/BTC rate source for ``create_tx``; defaults to
-            a :class:`PriceOracle` over ``client``.
+        price_oracle: USD/BTC rate source for ``create_tx`` and
+            ``get_balance`` (best-effort fiat display, TCK-FIAT-001);
+            defaults to a :class:`PriceOracle` over ``client``.
         signer_selection: Signing-backend configuration for
             ``sign_tx`` (TCK-P3-005). Defaults to the file signer over
             :data:`SIGNER_DIR_ENV_VAR` / :data:`DEFAULT_SIGNER_DIR` with
@@ -1231,11 +1232,15 @@ def build_dispatch_table(
             ),
             fingerprint_hex=parsed.hd_key.my_fingerprint.hex(),
         )
+    # ONE oracle shared by create_tx (USD amount resolution) and
+    # get_balance (best-effort fiat display, TCK-FIAT-001): the caches —
+    # fresh → stale → sats-only per the ADR-0011 ladder — ride together.
+    app_price_oracle = price_oracle if price_oracle is not None else PriceOracle(client)
     return {
         IntentName.RESPOND: _respond_handler,
         IntentName.CLARIFY: _clarify_handler,
         IntentName.GET_BALANCE: _make_get_balance_handler(
-            store, wallet_id, scan_fn, scan_gate
+            store, wallet_id, scan_fn, scan_gate, price_oracle=app_price_oracle,
         ),
         IntentName.GET_HISTORY: _make_get_history_handler(store, wallet_id, scan_gate),
         IntentName.GET_UTXOS: _make_get_utxos_handler(store, wallet_id, scan_gate),
@@ -1246,7 +1251,7 @@ def build_dispatch_table(
             parsed,
             tx_flow,
             fee_estimator if fee_estimator is not None else FeeEstimator(client),
-            price_oracle if price_oracle is not None else PriceOracle(client),
+            app_price_oracle,
             scan_fn,
             seconds_since_last_block_fn=seconds_since_last_block_fn,
             scan_gate=scan_gate,
@@ -1294,6 +1299,7 @@ def _make_get_balance_handler(
     wallet_id: int,
     scan_fn: Callable[[], object],
     scan_gate: StartupScan | None = None,
+    price_oracle: PriceOracle | None = None,
 ) -> Handler:
     """Create the ``get_balance`` handler closed over the store.
 
@@ -1315,6 +1321,14 @@ def _make_get_balance_handler(
     scan error strings are value-free by contract), store failures as
     ``{"error": "store_error", ...}``. A failed/absent tip height omits
     the ``tip_height`` key entirely — never a fabricated value.
+
+    Best-effort fiat (TCK-FIAT-001, no new intent): when ``price_oracle``
+    is wired, the answer gains ``usd_total_cents`` + ``btc_usd`` (and
+    the ``rate_stale``/``rate_age_s`` markers on the ADR-0011 degrade
+    ladder) computed from the sats total. ANY price outcome short of a
+    rate — unavailable feed, capability-absent backend, disabled oracle,
+    or an unexpected failure — leaves those keys ABSENT: a sats-only
+    answer, never an error, never a fabricated number.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -1354,6 +1368,31 @@ def _make_get_balance_handler(
                 tip = -1  # malformed cursor: omit rather than fabricate
             if tip >= 0:
                 result["tip_height"] = tip
+        # Fiat sugar (TCK-FIAT-001): best-effort USD total over the SAME
+        # ADR-0011 ladder as create_tx's sats path. The whole block is
+        # containment: price trouble must NEVER fail a balance answer —
+        # any miss leaves the usd keys absent (sats-only, no error, no
+        # value in any message; the oracle's own errors are value-free).
+        # ADR-0022 amendment 1: while the backend choice is unresolved
+        # (``awaiting_backend`` hold) the app makes ZERO chain calls —
+        # the best-effort price fetch stands down with the lazy scan.
+        held = scan_gate is not None and scan_gate.state == "awaiting_backend"
+        if price_oracle is not None and not held:
+            try:
+                rate = price_oracle.fresh()
+                usd_cents = price_oracle.sats_to_usd(result["total_sats"], rate)
+            except (PriceUnavailableError, ConfigDisabled):
+                pass  # outage / capability-absent / opt-out → sats-only
+            except Exception:  # noqa: BLE001, S110 — containment: never fail a balance answer over display sugar
+                pass
+            else:
+                result["usd_total_cents"] = usd_cents
+                result["btc_usd"] = rate.usd_per_btc
+                if rate.stale:
+                    # Stale-but-served (offline degrade): the narration
+                    # marks the age exactly like the send card does.
+                    result["rate_stale"] = True
+                    result["rate_age_s"] = int(rate.age_s())
         return result
 
     return handler
@@ -6901,7 +6940,7 @@ class ChainBackendFlow:
         return "started" if scan.resync_now() else "busy"
 
     def _rebind_handlers(self, client: ChainClient) -> None:
-        """Rebuild the three client-riding dispatch-table entries over the
+        """Rebuild the client-riding dispatch-table entries over the
         new client (fee/price wrappers re-attached) IN PLACE — the table is
         the same dict object the pump, the AgentLoop and every pending
         consult share, so no consumer can hold the dead closure set after
@@ -6909,6 +6948,13 @@ class ChainBackendFlow:
         are structurally unaffected."""
         w = self._w
         scan = w.scan
+        w.table[IntentName.GET_BALANCE] = _make_get_balance_handler(
+            w.store,
+            w.wallet.id,
+            scan.scan_now if scan is not None else (lambda: None),
+            scan.gate if scan is not None else None,
+            price_oracle=PriceOracle(client),
+        )
         w.table[IntentName.CREATE_TX] = _make_create_tx_handler(
             w.store,
             w.wallet.id,
@@ -8379,7 +8425,9 @@ def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None
 
     A ``stale`` freshness flag (TCK-SCAN-003, ADR-0022 decision 5) adds one
     value-free note line — honest display of the tool-owned flag; the
-    figures themselves print verbatim from the cache either way.
+    figures themselves print verbatim from the cache either way. A
+    ``usd_total_cents`` supplied by the handler (TCK-FIAT-001) adds one
+    fiat line, verbatim-formatted; absent keys render nothing.
     """
     if result.get("error") is not None:
         output_fn(sanitize_tool_output(_error_line(result, "Balance lookup failed")))
@@ -8399,6 +8447,24 @@ def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None
     output_fn(
         f"Total {total} sats · {scanned} addresses with UTXOs · {tip_label}"
     )
+    # Fiat line (TCK-FIAT-001): rendered iff the handler supplied the
+    # keys — figures verbatim from the result dict, formatted like the
+    # send card's USD segment (``_card_rate`` thousands separation, the
+    # same stale/age marker wording); absent keys print nothing (a sats-
+    # only answer never grows a dishonest fiat line).
+    usd_cents = result.get("usd_total_cents")
+    if isinstance(usd_cents, int) and not isinstance(usd_cents, bool):
+        usd_line = f"≈ ${usd_cents // 100:,}.{usd_cents % 100:02d}"
+        if result.get("rate_stale"):
+            rate_age = result.get("rate_age_s")
+            if rate_age is not None:
+                usd_line += f" · rate age {rate_age}s"
+            usd_line += " · stale"
+        else:
+            rate = _card_rate(result)
+            if rate is not None:
+                usd_line += f" · @ ${rate}/BTC"
+        output_fn(sanitize_tool_output(usd_line))
     _print_freshness_note(result, output_fn)
 
 

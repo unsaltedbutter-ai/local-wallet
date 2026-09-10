@@ -282,7 +282,11 @@ class TestSystemPrompt:
     def test_prompt_is_compact_for_8k_context_budget(self) -> None:
         # ADR-0006: v0 context budget is 8K tokens; the static system prompt
         # must stay a small fraction of it (~2 chars/token -> well under 6K).
-        assert len(build_system_prompt()) < 6000
+        # Ceiling raised 6000 → 6300 by TCK-FIAT-001: the pre-change prompt
+        # sat at 5988 chars (7 of headroom), so the mandatory fiat-phrasing
+        # guidance line could not fit without moving the guard. 6300 chars
+        # (~3.1K tokens) is still a small fraction of the 8K budget.
+        assert len(build_system_prompt()) < 6300
 
 
 # ------------------------------------------------------------------- grammar
