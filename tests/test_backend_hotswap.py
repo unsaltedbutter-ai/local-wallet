@@ -1,0 +1,770 @@
+"""TCK-BACKEND-002 — the chain-client HOT-SWAP, the resync trigger, ssl://
+acceptance at every entry point, and server-side backend-kind detection.
+
+The contract (USER DIRECTION 2026-09-09 items 5/6/8/9/10; ADR-0018 amendment
+— hot-swap supersedes the config-only-restart semantics for the STORED rung):
+
+* a ``chain_base_url`` write that APPLIES (web POST /settings or the /setup
+  conversation) swaps the live client ON THE ENGINE THREAD: the old client
+  is closed BOUNDED, the new one is built through ``_build_chain_client``
+  (scheme still picks the adapter), the worker + the fee/price-riding
+  dispatch handlers rebind, and a FULL rebuild resync fires (direction 5/6);
+* the probe runs BEFORE the save (deliverable 2): unreachable / foreign-chain
+  → refused VALUE-FREE, nothing stored, the old client untouched
+  (fail-closed — never left clientless);
+* concurrency rule PINNED: a swap never crosses an in-flight scan — while a
+  fetch owns the worker the (validated, stored) swap DEFERS and installs the
+  moment the scan's ``_ScanDone`` has been persisted;
+* ``ssl://`` is accepted everywhere (M3 acceptance, direction 9): the store's
+  typed writer, the settings path, the /setup entry (pinned in
+  test_setup_command.py); the Electrum probe reuses M1's handshake genesis
+  gate via ``_probe_chain_backend``;
+* ``resync_now`` (direction 6) re-runs the full SCAN-003 rebuild scan and
+  TAGS SURVIVE — ``coin_labels`` is a separate table, never in the scan
+  write-set (pinned below, pre- and post-hot-swap);
+* a ``gap_limit`` apply whose value ACTUALLY CHANGED fires the same resync
+  (direction 8); an unchanged apply says so (``resync: "unchanged"``) and
+  starts no scan;
+* ``backend_kind`` (direction 10): the CLOSED enum name of the live backend
+  (public/mempool/esplora/electrum/none; bitcoind reserved for M2, never
+  emitted today) rides /settings and /state additively — value-free.
+
+All hermetic: fake duck-typed chain clients, tmp stores, injected probes.
+"""
+
+from __future__ import annotations
+
+import queue
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from localwallet import app
+from localwallet.agent.loop import AgentLoop
+from localwallet.app import (
+    BACKEND_KINDS,
+    BACKEND_PROBE_FAIL,
+    ChainBackendFlow,
+    Settings,
+    StartupScan,
+    _backend_kind,
+    _Wiring,
+)
+from localwallet.chain import TxStatus
+from localwallet.config import resolve_chain_base_url
+from localwallet.protocol import Envelope, IntentName, TxStatusParams
+from localwallet.store import Store
+from localwallet.wallet import WalletDescriptor
+from localwallet.wallet import scan as wallet_scan
+from tests.test_e2e_skeleton import ZPUB
+
+GOOD_URL = "http://127.0.0.1:3006/api"
+NEW_URL = "https://mempool.mine.example:4000/api"
+SSL_URL = "ssl://evil-star.local:50001"
+
+
+def _probe_true(_url: str) -> bool:
+    return True
+
+
+class _FakeChain:
+    """Duck-typed ChainClient: answers a fresh-wallet scan with empties and
+    counts its own fetch/status/close traffic (which client SERVED is the
+    story these tests read)."""
+
+    supports_price = False
+
+    def __init__(self, base_url: str, hold: threading.Event | None = None) -> None:
+        self.base_url = base_url
+        self.closed = False
+        self.fetches = 0
+        self.status_calls = 0
+        #: Optional test brake: a fetch that must NOT finish on its own
+        #: timing (deterministic mid-scan swap/busy pins).
+        self.hold = hold
+
+    def close(self) -> None:
+        self.closed = True
+
+    def get_tip_height(self) -> int:
+        return 900_000
+
+    def get_address_txs(self, address: str) -> list[dict[str, Any]]:
+        if self.hold is not None:
+            self.hold.wait(5.0)
+        self.fetches += 1
+        return []
+
+    def get_address_utxos(self, address: str) -> list[dict[str, Any]]:
+        return []
+
+    def get_tx_status(self, txid: str) -> TxStatus:
+        self.status_calls += 1
+        return TxStatus(
+            txid=txid, confirmed=True, block_height=900_000, block_time=None
+        )
+
+
+def _mk_wiring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stored_url: str | None = None,
+    boot_backend: str = "",
+    gap: int = 2,
+) -> tuple[_Wiring, queue.Queue[Any]]:
+    """A REAL wiring (store/worker/scan/table) over fake chain clients.
+    ``_build_chain_client`` is patched at the app module — the swap's build
+    step still runs through it, so the test observes the production path.
+    The scan flow is attached to a bare command queue (the pump role the
+    tests play by hand via ``_drain``)."""
+    built: list[_FakeChain] = []
+    monkeypatch.setattr(
+        app, "_build_chain_client", lambda settings: _built(built, settings)
+    )
+
+    def _built(sink: list[_FakeChain], settings: Settings) -> _FakeChain:
+        client = _FakeChain(
+            resolve_chain_base_url(settings.chain_base_url, None)
+            or settings.esplora_base_url
+        )
+        sink.append(client)
+        return client
+
+    store = Store(tmp_path / "swap.db")
+    wd = WalletDescriptor.from_key(ZPUB)
+    wallet = store.create_wallet("default", wd.descriptor)
+    store.set_active_wallet(wallet.id)
+    store.set_setting(wallet_scan.GAP_LIMIT_SETTING, str(gap))
+    if stored_url is not None:
+        store.set_chain_base_url(stored_url)
+    settings = Settings(
+        store_path=str(tmp_path / "swap.db"), chain_base_url=boot_backend or ""
+    )
+    initial = _FakeChain(
+        resolve_chain_base_url(settings.chain_base_url, stored_url)
+        or settings.esplora_base_url
+    )
+    worker = app.ChainWorker(initial)  # type: ignore[arg-type]
+    scan = app.ScanFlow(store, wallet, worker, gap_limit=None)
+    commands: queue.Queue[Any] = queue.Queue()
+    scan.attach(commands)
+    flow = app.TxFlow()
+    session = app.SendSession()
+    table = app.build_dispatch_table(
+        store,
+        wallet,
+        wd.parsed,
+        initial,  # type: ignore[arg-type]
+        scan.scan_now,
+        flow=flow,
+        session=session,
+        settings=settings,
+        scan_gate=scan.gate,
+        signer_selection=app.SignerSelection(
+            kind="file", dir_path=tmp_path / "psbt", fingerprint_hex="00000000"
+        ),
+        node_detect_fn=lambda: None,  # never called on these paths
+    )
+    wiring = _Wiring(
+        store=store,
+        client=initial,  # type: ignore[arg-type]
+        loop=AgentLoop(app.stub_generate, table),
+        flow=flow,
+        session=session,
+        table=table,
+        watcher=None,
+        worker=worker,
+        scan=scan,
+        settings=settings,
+        parsed=wd.parsed,
+        wallet=wallet,
+        boot_backend=boot_backend,
+    )
+    return wiring, commands
+
+
+def _mk_flow(
+    wiring: _Wiring,
+    commands: queue.Queue[Any],
+    *,
+    probe_ok: bool = True,
+) -> tuple[ChainBackendFlow, list[str]]:
+    """The swap controller over a counting probe; returns it with the probe's
+    call log (URLs it saw — never echoed by the refusal, pinned separately)."""
+    seen: list[str] = []
+
+    def probe(url: str) -> bool:
+        seen.append(url)
+        return probe_ok
+
+    return ChainBackendFlow(wiring, probe), seen
+
+
+def _drain(
+    wiring: _Wiring,
+    commands: queue.Queue[Any],
+    *,
+    timeout: float = 5.0,
+) -> list[str]:
+    """Play the pump's scan-event handling until the running scan (if any)
+    completes; returns the narration lines."""
+    scan = wiring.scan
+    assert scan is not None
+    out: list[str] = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not scan.pending:
+            return out
+        try:
+            command = commands.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        scan.handle_command(command, out.append, None)
+
+
+@pytest.fixture
+def env_clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(app.CHAIN_BASE_URL_ENV_VAR, raising=False)
+    monkeypatch.delenv(app.GAP_LIMIT_ENV_VAR, raising=False)
+    monkeypatch.delenv(app.SIGNER_ENV_VAR, raising=False)
+
+
+# ------------------------------------------------------ the hot-swap matrix
+
+
+def test_apply_closes_old_serves_from_new_and_fires_rescan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """Directions 5+6: an applied chain_base_url write deallocated the old
+    client (bounded close), rebound the worker + the chain-riding handlers
+    onto the new one, and triggered the full rebuild rescan — which SERVES
+    from the new client."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    old = wiring.client
+    table = wiring.table
+    handlers_before = (
+        table[IntentName.CREATE_TX],
+        table[IntentName.BROADCAST_TX],
+        table[IntentName.TX_STATUS],
+    )
+    untouched_before = table[IntentName.NEW_ADDRESS]
+    error, fields = ChainBackendFlow(wiring, _probe_true).apply(NEW_URL)
+    assert fields == {"swapped": True, "resync": "started"} and error is None
+    new = wiring.worker._client
+    assert new is not old and wiring.client is new
+    assert old.closed is True  # BOUNDED close of the retired client
+    assert wiring.settings.chain_base_url == NEW_URL  # the ONE selection point
+    assert wiring.store.get_chain_base_url() == NEW_URL  # stored rung moved
+    assert wiring.scan is not None and wiring.scan.gate.state == "running"
+    narration = _drain(wiring, commands)
+    assert new.fetches > 0  # the resync rode the NEW client…
+    assert old.fetches == 0  # …and only ever the new one
+    assert any("Rescan complete" in line for line in narration)
+    # The SAME table dict, three entries rebuilt over the new client — the
+    # loop/pump references never move (identity pin), the store-only
+    # handlers are structurally untouched, and a subsequent handler call is
+    # served by the NEW client.
+    assert wiring.table is table
+    handlers_after = (
+        table[IntentName.CREATE_TX],
+        table[IntentName.BROADCAST_TX],
+        table[IntentName.TX_STATUS],
+    )
+    assert all(a is not b for a, b in zip(handlers_after, handlers_before))
+    assert table[IntentName.NEW_ADDRESS] is untouched_before
+    result = table[IntentName.TX_STATUS](
+        Envelope(
+            v=0,
+            intent=IntentName.TX_STATUS,
+            params=TxStatusParams(txid="ab" * 32),
+        )
+    )
+    assert result["confirmed"] is True
+    assert new.status_calls == 1 and old.status_calls == 0
+    wiring.store.close()
+
+
+def test_probe_failure_refuses_value_free_old_client_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """Deliverable 2, fail-closed: an unreachable/foreign-chain URL is
+    refused BEFORE the write lands — nothing stored, the old client keeps
+    serving, and the refusal carries no value (the URL never rides back)."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch, stored_url=GOOD_URL)
+    old = wiring.client
+    flow, seen = _mk_flow(wiring, commands, probe_ok=False)
+    error, fields = flow.apply(NEW_URL)
+    assert error == BACKEND_PROBE_FAIL
+    assert NEW_URL not in str(error) and "mempool.mine" not in str(error)
+    assert fields == {}
+    assert seen == [NEW_URL]  # the probe ran (that is what refused)
+    assert wiring.store.get_chain_base_url() == GOOD_URL  # NOTHING stored
+    assert wiring.client is old and old.closed is False  # still serving
+    assert wiring.settings.chain_base_url == ""  # boot rung unchanged here
+    assert wiring.scan is not None and wiring.scan.gate.state == "disabled"
+
+
+def test_mid_scan_swap_defers_until_scan_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """The PINNED concurrency rule (deliverable 1): a swap never crosses an
+    in-flight scan. The write validates + stores immediately, the INSTALL
+    defers; the old client keeps serving (its close is the install's, not
+    the write's), and the moment the scan's _ScanDone has been persisted the
+    deferred swap lands and its own resync runs."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    assert wiring.scan is not None
+    wiring.scan.set_startup(
+        wallet_scan.plan_scan(wiring.store, wiring.wallet, rebuild=False)
+    )
+    wiring.scan.begin()  # a startup fetch is now in flight on the OLD client
+    old = wiring.client
+    flow, _seen = _mk_flow(wiring, commands)
+    error, fields = flow.apply(NEW_URL)
+    assert error is None
+    assert fields == {"swapped": False, "resync": "deferred"}
+    assert wiring.store.get_chain_base_url() == NEW_URL  # stored NOW
+    assert wiring.client is old and old.closed is False  # still serving
+    # The in-flight scan completes → the pump's take_deferred lands the swap.
+    _drain(wiring, commands)
+    assert flow.take_deferred() is True
+    new = wiring.client
+    assert new is not old and old.closed is True
+    assert wiring.scan.gate.state == "running"  # the swap's resync is on
+    _drain(wiring, commands)
+    assert wiring.scan.gate.state == "done"
+    wiring.store.close()
+
+
+def test_clear_write_swaps_back_to_the_public_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """The typed writer's ``""``-clears convention rides the SAME hot-swap
+    path: clearing the stored rung swaps the live client back onto the
+    built-in public default and resyncs (no probe — the default is shipped,
+    not user-supplied)."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch, stored_url=GOOD_URL)
+    old = wiring.client
+    flow, seen = _mk_flow(wiring, commands)
+    error, fields = flow.apply("")
+    assert error is None and fields["swapped"] is True
+    assert seen == []  # clearing is never probed
+    assert wiring.store.get_chain_base_url() is None
+    assert wiring.client is not old and old.closed is True
+    assert wiring.client.base_url == Settings().esplora_base_url
+    _drain(wiring, commands)
+    wiring.store.close()
+
+
+def test_env_rung_shadows_the_stored_write_no_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """The ladder rule that SURVIVES the amendment: an env/config-file rung
+    outranks the stored write — the value is probed + stored (next-launch
+    truth) but the live client is NOT swapped (it serves the higher rung).
+    The response's honesty: swapped False, resync skipped, requires_restart
+    stays True."""
+    wiring, commands = _mk_wiring(
+        tmp_path, monkeypatch, boot_backend="https://operator.box:4000/api"
+    )
+    old = wiring.client
+    flow, seen = _mk_flow(wiring, commands)
+    error, fields = flow.apply(NEW_URL)
+    assert error is None
+    assert fields == {"swapped": False, "resync": "skipped"}
+    assert seen == [NEW_URL]  # the save gate still probes
+    assert wiring.store.get_chain_base_url() == NEW_URL  # stored, shadowed
+    assert wiring.client is old and old.closed is False  # not swapped
+    entry = next(
+        e
+        for e in app._settings_entries(wiring.store, flow)
+        if e["key"] == "chain_base_url"
+    )
+    assert entry["requires_restart"] is True  # the honest flag under shadowing
+    wiring.store.close()
+
+
+def test_settings_entry_requires_restart_flips_with_the_swap_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """The ADR-0018 AMENDMENT, pinned: with an engine swap controller wired
+    a stored chain_base_url write needs NO restart — the entry's honest flag
+    is False (and True only while an env/config-file rung shadows it)."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    flow, _seen = _mk_flow(wiring, commands)
+    entry = next(
+        e
+        for e in app._settings_entries(wiring.store, flow)
+        if e["key"] == "chain_base_url"
+    )
+    assert entry["requires_restart"] is False
+    bare = next(
+        e
+        for e in app._settings_entries(wiring.store, None)
+        if e["key"] == "chain_base_url"
+    )
+    assert bare["requires_restart"] is True  # no wiring → plain store write
+    wiring.store.close()
+
+
+# ---------------------------------------------------------------- resync now
+
+
+def test_resync_now_reruns_full_scan_and_tags_survive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """Deliverable 5 (direction 6): ``resync_now`` re-runs the FULL rebuild
+    scan (the --rescan semantics, "as though the zpub had been entered for
+    the first time") — and COIN TAGS SURVIVE: ``coin_labels`` is a separate
+    table, never in the scan write-set (store/db.py's contract, pinned here
+    for both a plain resync AND the hot-swap resync)."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    scan = wiring.scan
+    assert scan is not None
+    scan.gate = StartupScan(enabled=True)  # a startup scan completed already
+    scan.gate.mark_done()
+    label = wiring.store.set_coin_label(
+        wiring.wallet.id, "ab" * 32, 0, tags=("kyc",), note="mine"
+    )
+    assert label is not None
+    assert scan.resync_now() is True
+    assert scan.gate.state == "running"
+    narration = _drain(wiring, commands)
+    assert scan.gate.state == "done"
+    assert any("Rescan complete" in line for line in narration)
+    # Tags survived the rescan…
+    assert wiring.store.get_coin_label(wiring.wallet.id, "ab" * 32, 0) is not None
+    # …and survive the HOT-SWAP-TRIGGERED resync too:
+    flow, _seen = _mk_flow(wiring, commands)
+    error, fields = flow.apply(NEW_URL)
+    assert error is None and fields["resync"] == "started"
+    _drain(wiring, commands)
+    kept = wiring.store.get_coin_label(wiring.wallet.id, "ab" * 32, 0)
+    assert kept is not None and kept.tags == ("kyc",) and kept.note == "mine"
+    wiring.store.close()
+
+
+def test_resync_now_concurrency_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """One scan at a time is STRUCTURAL: while a fetch owns the worker the
+    resync refuses (``busy``), and a held first-run scan (awaiting a backend
+    choice) refuses too — the hold resolves via the backend choice, which
+    now swaps + releases (pinned above)."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    scan = wiring.scan
+    assert scan is not None
+    scan.set_startup(
+        wallet_scan.plan_scan(wiring.store, wiring.wallet, rebuild=False)
+    )
+    scan.begin()
+    assert scan.resync_now() is False  # in-flight: refused, single worker
+    _drain(wiring, commands)
+    assert scan.resync_now() is True  # free again: the full scan re-runs
+    _drain(wiring, commands)
+    scan.gate.mark_skipped()
+    scan.gate = StartupScan(enabled=True, deferred=True)
+    assert scan.resync_now() is False  # held for the choice: nothing to resync
+    wiring.store.close()
+
+
+def test_resync_request_is_answered_on_the_engine_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """The typed ``resync_now`` pump command + the transport seam: the reply
+    is the closed value-free status, the whole flow (store, worker fetch,
+    persist) runs on the ENGINE thread, and no chain I/O touches that
+    thread's turn (the fetch rides the worker; the engine only persists)."""
+    holder: dict[str, Any] = {}
+    booted = threading.Event()
+
+    def bootstrap() -> app.EngineContext:
+        # The store + wiring are CONSTRUCTED on the engine thread (the
+        # check_same_thread contract the real web bootstrap obeys).
+        wiring, _commands = _mk_wiring(tmp_path, monkeypatch)
+        flow = ChainBackendFlow(wiring, _probe_true)
+        holder["wiring"] = wiring
+        holder["flow"] = flow
+        holder["engine"] = threading.get_ident()
+        booted.set()
+        return app.EngineContext(
+            loop=wiring.loop,
+            flow=wiring.flow,
+            session=wiring.session,
+            table=wiring.table,
+            scan=wiring.scan,
+            store=wiring.store,
+            client=wiring.client,  # type: ignore[arg-type]
+            backend=flow,
+        )
+
+    events: list[app.EngineEvent] = []
+    handle = app.start_engine(bootstrap, events.append)
+    assert booted.wait(5.0)
+    # Brake the fake fetch so the resync CANNOT complete on its own timing:
+    # the busy answer below is deterministic, not a race.
+    hold = threading.Event()
+    holder["wiring"].client.hold = hold
+    try:
+        first = handle.request_resync(5.0)
+        assert first is not None
+        assert first["schema"] == "resync/1" and first["status"] == "started"
+        # The resync owns the worker NOW: a direct second trigger answers the
+        # closed ``busy`` (the deterministic guard).
+        assert holder["flow"].resync() == "busy"
+    finally:
+        hold.set()
+        handle.shutdown()
+        assert handle.thread is not None
+        handle.thread.join(10)
+    assert handle.error is None
+    assert holder["engine"] != threading.get_ident()
+    assert holder["wiring"].scan is not None
+    # The session-end drain completed (persisted) the running resync.
+    assert holder["wiring"].scan.gate.state == "done"
+
+
+# ------------------------------------------------- gap-limit → resync (dir 8)
+
+
+def test_gap_limit_changed_fires_resync_unchanged_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """Direction 8: applying a gap_limit that CHANGED syncs against the
+    chain base (the same full resync); an unchanged apply starts NO scan and
+    SAYS SO in the reply."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    flow = ChainBackendFlow(wiring, lambda _url: True)
+    store = wiring.store
+    reply = app.handle_settings_request(store, "gap_limit", "5", flow)
+    assert reply["status"] == "applied"
+    assert reply["resync"] == "started"
+    assert wiring.scan is not None and wiring.scan.gate.state == "running"
+    _drain(wiring, commands)
+    # Unchanged apply: the same canonical value → no rescan, stated plainly.
+    reply = app.handle_settings_request(store, "gap_limit", "5", flow)
+    assert reply["status"] == "applied"
+    assert reply["resync"] == "unchanged"
+    assert wiring.scan.gate.state == "done"  # NOT re-armed
+    # Whitespace canonicalizes to the same value → still unchanged.
+    reply = app.handle_settings_request(store, "gap_limit", " 5 ", flow)
+    assert reply["resync"] == "unchanged"
+    # A refused write never resyncs (fail-closed before the store too).
+    reply = app.handle_settings_request(store, "gap_limit", "99999", flow)
+    assert reply["status"] == "rejected" and "resync" not in reply
+    wiring.store.close()
+
+
+def test_settings_write_path_surfaces_swap_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """The web POST /settings response shape: applied chain writes carry
+    ``swapped``/``resync`` and the entry confirms from re-read tool truth;
+    a refused probe answers the closed ``rejected`` status value-free."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    ok_flow = ChainBackendFlow(wiring, lambda _url: True)
+    reply = app.handle_settings_request(
+        wiring.store, "chain_base_url", NEW_URL, ok_flow
+    )
+    assert reply["status"] == "applied"
+    assert reply["swapped"] is True and reply["resync"] == "started"
+    assert reply["settings"][0]["value"] == NEW_URL
+    assert reply["settings"][0]["requires_restart"] is False
+    _drain(wiring, commands)
+    bad_flow = ChainBackendFlow(wiring, lambda _url: False)
+    reply = app.handle_settings_request(
+        wiring.store, "chain_base_url", "https://sneaky.example/api", bad_flow
+    )
+    assert reply["status"] == "rejected"
+    assert "sneaky" not in str(reply)  # value-free refusal
+    assert wiring.store.get_chain_base_url() == NEW_URL  # unchanged
+    wiring.store.close()
+
+
+# ---------------------------------------------------- ssl:// acceptance (9)
+
+
+class _FakeElectrum:
+    """Constructor-side stand-in for the Electrum adapter (the handshake +
+    genesis gate are chain/'s, exercised in test_chain_electrum.py)."""
+
+    supports_price = False
+
+    def __init__(self, base_url: str = "", **_kw: Any) -> None:
+        self.base_url = base_url
+        self.closed = False
+        self.tip_calls = 0
+
+    def get_tip_height(self) -> int:
+        self.tip_calls += 1  # forces the M1 handshake (the genesis gate)
+        return 900_000
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_store_typed_writer_accepts_ssl_shape(tmp_path: Path) -> None:
+    """The stored rung now carries ``ssl://host[:port]`` (user example
+    verbatim); shape refusals stay fail-closed and value-free (mirroring
+    ChainConfig — the deep gate), so no stored value can crash the client
+    construction at startup."""
+    store = Store(tmp_path / "ssl.db")
+    try:
+        for good in (SSL_URL, "ssl://host", "ssl://127.0.0.1:50001"):
+            store.set_chain_base_url(good)
+            assert store.get_chain_base_url() == good
+        for bad in (
+            "ssl://",
+            "ssl://host:port",
+            "ssl://host:99999",
+            "ssl://host/p",
+            "ssl://user:pass@host",
+            "ssl://ho st",
+            "gopher://x",
+        ):
+            with pytest.raises(app.StoreError) as exc:
+                store.set_chain_base_url(bad)
+            # Value-free like every other store refusal: the submitted URL
+            # (host, credentials, port) never rides the message.
+            assert bad not in str(exc.value)
+        assert store.get_chain_base_url() == "ssl://127.0.0.1:50001"
+    finally:
+        store.close()
+
+
+def test_settings_path_accepts_ssl_and_installs_the_electrum_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """The web path end-to-end for ssl:// (probe mocked at the transport
+    seam, the adapter faked at the construction seam): stored, swapped onto
+    the ELECTUM-kind client, resync fired."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    old = wiring.client
+    flow, seen = _mk_flow(wiring, commands)
+    error, fields = flow.apply(SSL_URL)
+    assert error is None and fields["swapped"] is True
+    assert seen == [SSL_URL]
+    assert wiring.store.get_chain_base_url() == SSL_URL
+    assert old.closed is True and wiring.client is not old
+    assert wiring.client.base_url == SSL_URL  # the fake build carried the URL
+    _drain(wiring, commands)
+    wiring.store.close()
+
+
+def test_probe_dispatches_by_scheme_reusing_the_m1_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_probe_chain_backend`` (the M3 setup-probe slot from the M1
+    amendment): http(s) rides ``check_backend`` (Esplora shape + genesis);
+    ssl:// constructs the Electrum adapter and forces ONE tip call — the
+    M1 handshake's genesis gate IS the mainnet proof; everything collapses
+    to False value-free, and the probe client is always closed."""
+    settings = Settings(request_timeout_s=0.5, max_retries=3)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        app, "check_backend", lambda url, **kw: calls.append(f"esplora:{url}") or True
+    )
+    built: list[_FakeElectrum] = []
+
+    def fake_electrum(base_url: str = "", **kw: Any) -> _FakeElectrum:
+        calls.append(f"electrum:{base_url}:{kw.get('max_retries')}")
+        client = _FakeElectrum(base_url)
+        built.append(client)
+        return client
+
+    monkeypatch.setattr(app, "ElectrumClient", fake_electrum)
+    assert app._probe_chain_backend(GOOD_URL, settings) is True
+    assert calls == [f"esplora:{GOOD_URL}"]
+    assert app._probe_chain_backend(SSL_URL, settings) is True
+    assert calls[-1] == f"electrum:{SSL_URL}:1"  # the snappy budget, M1 gate
+    assert built[0].tip_calls == 1 and built[0].closed is True
+
+    def explode(_base_url: str = "", **_kw: Any) -> _FakeElectrum:
+        raise RuntimeError("ssl://boom")  # escaping surprise must collapse
+
+    monkeypatch.setattr(app, "ElectrumClient", explode)
+    assert app._probe_chain_backend(SSL_URL, settings) is False
+
+
+# ------------------------------------------------ kind detection (direction 10)
+
+
+@pytest.mark.parametrize(
+    ("url", "resolved", "expected"),
+    [
+        ("", False, "none"),  # first-run choice unmade: nothing is consulted
+        ("https://mempool.space/api", False, "none"),  # … even with a client
+        ("ssl://evil-star.local:50001", True, "electrum"),
+        ("ssl://host", True, "electrum"),
+        ("https://mempool.space/api", True, "public"),
+        ("https://mempool.space", True, "public"),  # host match, path irrelevant
+        ("http://mempool.space:80/api", True, "public"),
+        ("https://mempool.mine.example:4000/api", True, "mempool"),
+        ("http://127.0.0.1:3006/api", True, "mempool"),
+        ("http://127.0.0.1:3006", True, "esplora"),  # root-served API shape
+        ("https://electrs.box/esplora", True, "esplora"),
+    ],
+)
+def test_backend_kind_closed_mapping(url: str, resolved: bool, expected: str) -> None:
+    kind = _backend_kind(Settings(chain_base_url=url), resolved=resolved)
+    assert kind == expected
+    assert kind in BACKEND_KINDS
+
+
+def test_backend_kind_bitcoind_is_reserved_unreachable() -> None:
+    """Honest enum: the M2 Core adapter's name ships NOW (the client can
+    badge-color it the day one exists) but no configuration can produce it
+    today — the enum is closed and the mapping never lies."""
+    assert "bitcoind" in BACKEND_KINDS
+    for url in ("", "ssl://h", "https://x/api", "http://y", "bitcoin://z"):
+        assert _backend_kind(Settings(chain_base_url=url), resolved=True) != "bitcoind"
+
+
+def test_backend_kind_follows_the_live_client_after_a_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """The badge answers what is SERVING (the boot-resolved selection point,
+    folded + updated by the swap), not what is merely stored: public before
+    any choice resolves, electrum after an ssl:// swap — and ``none`` while a
+    first-run choice is still unmade."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    store = wiring.store
+    # Unresolved first-run: no marker, no rung → nothing is being consulted.
+    flow = ChainBackendFlow(wiring, _probe_true)
+    assert flow.kind == "none"
+    store.set_setting(app.BACKEND_CHOICE_SETTING, app.BACKEND_CHOICE_PUBLIC)
+    assert flow.kind == "public"  # the warned consent → the folded default
+    store.set_setting(app.BACKEND_CHOICE_SETTING, "")  # back to unresolved
+    error, fields = flow.apply(SSL_URL)
+    assert error is None and fields["swapped"] is True
+    assert flow.kind == "electrum"
+    _drain(wiring, commands)
+    wiring.store.close()
+
+
+def test_kind_and_flags_ride_the_settings_and_state_surfaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """Additive-field pin (settings/1 + state/1 unchanged): the settings READ
+    and the /state snapshot carry ``backend_kind`` (an enum NAME) whenever a
+    backend is wired, and carry NOTHING when one is not."""
+    wiring, _commands = _mk_wiring(tmp_path, monkeypatch, stored_url=GOOD_URL)
+    wiring.settings.chain_base_url = GOOD_URL  # the boot fold the real wiring does
+    flow = ChainBackendFlow(wiring, lambda _url: True)
+    reply = app.handle_settings_request(wiring.store, None, None, flow)
+    assert reply["backend_kind"] == "mempool"
+    snapshot = app.build_state_snapshot(
+        wiring.flow, wiring.session, None, wiring.scan, None, flow.kind
+    )
+    assert snapshot["backend_kind"] == "mempool"
+    bare = app.handle_settings_request(wiring.store, None, None)
+    assert "backend_kind" not in bare  # absent, never guessed
+    assert (
+        "backend_kind"
+        not in app.build_state_snapshot(wiring.flow, wiring.session, None)
+    )
+    wiring.store.close()

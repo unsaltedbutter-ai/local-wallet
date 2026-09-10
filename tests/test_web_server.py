@@ -1300,6 +1300,41 @@ def test_settings_endpoints_answer_503_when_the_engine_is_dead(
         server.stop()
 
 
+# ---------------------------------------------- POST /resync (TCK-BACKEND-002)
+
+
+def test_resync_endpoint_is_token_gated_and_status_mapped(tmp_path: Path) -> None:
+    """``POST /resync`` (user direction 6, the ``Resync now`` button): carries
+    NO data; the transport marshals a typed ResyncRequest through the pump
+    and maps the closed engine status (started→202, busy→409, other→503).
+    Token-gated like every mutating endpoint (401 without it). The bare
+    harness engine has no chain wiring → the honest ``unavailable``; the
+    started/busy shapes are pinned by patching the handle seam (the engine-
+    side semantics live in tests/test_backend_hotswap.py)."""
+    server = _settings_server(tmp_path)
+    try:
+        status, _h, _d, _r = _request(server, "POST", "/resync")
+        assert status == 401  # token gate before anything else
+        status, _h, data, _r = _request(
+            server, "POST", "/resync", token=server.token
+        )
+        assert status == 503  # no chain wiring: unavailable, never a lie
+        body = json.loads(data)
+        assert body["schema"] == "resync/1"
+        assert body["status"] == "unavailable"
+        for status_name, code in (("started", 202), ("busy", 409)):
+            server.handle.request_resync = (
+                lambda _t, _s=status_name: {"schema": "resync/1", "status": _s}
+            )
+            status, _h, data, _r = _request(
+                server, "POST", "/resync", token=server.token
+            )
+            assert status == code
+            assert json.loads(data)["status"] == status_name
+    finally:
+        server.stop()
+
+
 # --------------------------- pre-first-scan refusal over the web turn (WEB-005)
 
 

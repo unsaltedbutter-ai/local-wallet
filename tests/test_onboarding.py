@@ -115,11 +115,16 @@ def _fake_client() -> EsploraClient:
     )
 
 
-def _counting_client(calls: list[int]) -> EsploraClient:
+def _counting_client(calls: list[int], target: Any = 1) -> EsploraClient:
     """A fake backend that COUNTS every chain request — the TCK-ONB-006
-    leak pin: the count must stay 0 until a backend choice resolves."""
+    leak pin: the count must stay 0 until a backend choice resolves.
+    TCK-BACKEND-002: ``target`` tags WHICH client served (the harness
+    passes the base_url it was constructed with) so the pin can tell
+    "loaded from the server the user chose" apart from "leaked to the
+    public default they refused" — an int stays recorded for legacy
+    count-only uses."""
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(1)
+        calls.append(target)
         return _tip_or_empty_handler(request)
 
     return EsploraClient(
@@ -306,15 +311,18 @@ def _public_marker(tmp_path: Path) -> str | None:
 
 def test_fresh_user_full_flow_five_steps(tmp_path: Path, monkeypatch) -> None:
     """Steps 1→5 end to end ON A DEFERRED first run (TCK-ONB-006, ADR-0022
-    amendment 1): greeting+key ask → node ask + LOAD_WAIT (nothing is
-    loading — the scan is HELD for the choice) → guide (ask stays open) →
-    2 → URL → (d); the choice lands in the store; the held scan NEVER fires
-    through the (public-default) live client in-session — an own-server
-    choice takes effect next launch (ADR-0018/decision 4: no fetch through
-    a server the user just refused), so LOAD_COMPLETE waits for that
-    restart. Only the ONE chat turn after the flow closes touches the
+    amendment 1), now with the TCK-BACKEND-002 hot-swap (ADR-0018
+    amendment): greeting+key ask → node ask + LOAD_WAIT (nothing is loading
+    — the scan is HELD for the choice) → guide (ask stays open) → 2 → URL →
+    (d); the choice lands in the store AND the held scan releases IN-SESSION
+    ON THE CHOSEN SERVER (no more next-launch wait, no restart line): the
+    swap closes the public-default client and loads the wallet from the new
+    one, so LOAD_COMPLETE arrives this session. The leak invariant STANDS —
+    every chain request after the choice rides the user's OWN server; the
+    public default they refused is never fetched through (pinned per
+    base_url). Only the ONE chat turn after the flow closes touches the
     model."""
-    calls: list[int] = []
+    calls: list[Any] = []
     code, rec, stored, state = _drive(
         monkeypatch,
         tmp_path,
@@ -323,7 +331,7 @@ def test_fresh_user_full_flow_five_steps(tmp_path: Path, monkeypatch) -> None:
         interactive=True,
         auto_scan=True,
         backend_check=lambda _url: True,
-        client=lambda **_kw: _counting_client(calls),
+        client=lambda **kw: _counting_client(calls, kw.get("base_url")),
     )
     assert code == 0
     joined = rec.joined
@@ -334,13 +342,15 @@ def test_fresh_user_full_flow_five_steps(tmp_path: Path, monkeypatch) -> None:
     assert ob.GUIDE in joined  # (f) — then the ask stayed open
     assert ob.URL_PROMPT in joined  # (b)
     assert ob.CONFIRMED in joined  # (d)
-    assert ob.EFFECTS_NEXT_LAUNCH in joined
-    assert ob.DEFERRED_RESTART in joined  # the load waits for the restart
-    assert ob.LOAD_COMPLETE not in joined  # nothing loaded this session
-    assert "Startup scan complete" not in joined
-    assert calls == []  # THE leak pin: zero chain requests — before the
-    # choice AND after an own-server choice (it must never load through
-    # the public default it just refused)
+    assert ob.SWITCHING_NOW in joined  # TCK-BACKEND-002: swapped + resyncing
+    assert ob.EFFECTS_NEXT_LAUNCH not in joined  # the swap made it live now
+    assert ob.DEFERRED_RESTART not in joined  # no restart wait anymore
+    assert ob.LOAD_COMPLETE in joined  # the load finished THIS session
+    assert "Startup scan complete" in joined
+    # THE leak pin (amended): after the own-server choice the held scan
+    # releases and runs — but ONLY against the chosen server; the public
+    # default the user refused never serves a single request.
+    assert calls and set(calls) == {GOOD_URL}
     assert stored == GOOD_URL
     assert _public_marker(tmp_path) is None  # an own URL is not the marker
     assert state["probes"] == 1
@@ -716,14 +726,17 @@ def test_node_ask_answer_may_arrive_later(tmp_path: Path, monkeypatch) -> None:
 
 def test_url_accepted_stores_choice(tmp_path: Path, monkeypatch) -> None:
     """Remote URL passing the chain probe → (d); the doctor (loopback-only,
-    ADR-0016) is NOT consulted for a remote host."""
+    ADR-0016) is NOT consulted for a remote host. TCK-BACKEND-002 (ADR-0018
+    amendment): the saved choice then hot-swaps the live client and
+    releases/resyncs IN-SESSION — the next-launch honesty line is gone."""
     code, rec, stored, state = _drive(
         monkeypatch, tmp_path, lines=["2", GOOD_URL, "exit"],
         interactive=True, backend_check=lambda _u: True,
     )
     assert code == 0
     assert ob.CONFIRMED in rec.joined
-    assert ob.EFFECTS_NEXT_LAUNCH in rec.joined
+    assert ob.SWITCHING_NOW in rec.joined  # swapped + loading from it now
+    assert ob.EFFECTS_NEXT_LAUNCH not in rec.joined
     assert stored == GOOD_URL
     assert state["probes"] == 1
     assert state["detects"] == 0  # remote: chain probe only, doctor stands down

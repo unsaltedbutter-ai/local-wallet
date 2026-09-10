@@ -39,19 +39,22 @@ in the browser, only :data:`WEB_SETUP_HINT`):
   exists DORMANT on every interactive CLI launch and /setup arms it. A
   stored choice is shown first (mode framing, value-free) and an explicit
   ``y`` is required before it can be overwritten; ``n`` exits with no
-  change. Non-http(s) schemes (``ssl://`` and the electrum kinds) are
-  refused plainly IN THIS CONVERSATION — the setup entry neither probes
-  nor stores them (their validation + credential UX is TCK-ONB-004 M3);
-  an ``ssl://`` Electrum backend already works via the env/config-file
-  ladder (M1, ADR-0018 amendment) — and the entry re-prompts.
-- Validation is the ADR-0023 decision-5 gate: the ``chain/`` probe
-  (Esplora shape + mainnet genesis, ADR-0021) plus — loopback URLs only,
-  per the ADR-0016 contract — the node doctor's IBD facts; a syncing node
-  is refused with its progress quoted from tool output. A failed URL is
-  NEVER saved and never silently falls back; on success the store's typed
-  writer (:meth:`Store.set_chain_base_url`) is the only writer (ONB-002),
-  and the switch takes effect on the NEXT launch (ADR-0018 config-only
-  semantics — the live chain client is built once per session).
+  change. ``ssl://`` Electrum-protocol addresses are ACCEPTED since
+  TCK-BACKEND-002 (the M1 adapter is live; the entry probes the handshake
+  + mainnet genesis before saving — user direction 9); the other foreign
+  schemes are still refused plainly (never probed, never stored, the entry
+  re-prompts).
+- Validation is the ADR-0023 decision-5 gate: the ``chain/`` probe (Esplora
+  shape + mainnet genesis, or the Electrum handshake + genesis for
+  ``ssl://``; ADR-0021) plus — loopback URLs only, per the ADR-0016
+  contract — the node doctor's IBD facts; a syncing node is refused with
+  its progress quoted from tool output. A failed URL is NEVER saved and
+  never silently falls back; on success the store's typed writer
+  (:meth:`Store.set_chain_base_url`) is the only writer (ONB-002), and —
+  TCK-BACKEND-002, ADR-0018 amendment — the ``backend_saved`` hook
+  hot-swaps the live client and fires the full resync IN-SESSION (no
+  restart); only when an env/config-file rung shadows the stored one does
+  the honest next-launch line return.
 
 All copy is value-free: no address, amount, xpub, or echoed URL in any
 string, ever (AGENTS.md).
@@ -87,6 +90,8 @@ __all__ = [
     "SETUP_KEPT",
     "SETUP_OVERWRITE",
     "SETUP_REVERTED",
+    "SWITCHING_NOW",
+    "SWITCH_AFTER_SCAN",
     "URL_PROMPT",
     "WEB_SETUP_HINT",
     "OnboardingFlow",
@@ -132,9 +137,9 @@ NODE_ASK: Final[str] = (
     "transactions move.\n"
     "\n"
     "One honest limit for today: the app connects to an Esplora-style "
-    "http(s) address — the mempool.space app — which those boxes all "
-    "offer; a plain Bitcoin Core install doesn't serve one yet, and "
-    "ssl://-style Electrum addresses come in a later version.\n"
+    "http(s) address — the mempool.space app, which those boxes all "
+    "offer — or to an Electrum server's ssl:// address; a plain Bitcoin "
+    "Core install serves neither yet.\n"
     "\n"
     "1. Public mempool.space server — nothing to set up, with the leak "
     "above.\n"
@@ -198,10 +203,12 @@ PUBLIC_CHOSEN_ACK: Final[str] = (
 #: review F2: a failed plan stands the scan down and nothing loads).
 PUBLIC_LOADING_NOW: Final[str] = "Loading your wallet from it now."
 
-#: An own-server choice saved WHILE the startup scan was deferred
-#: (TCK-ONB-006): the live client is still the public default (ADR-0018
-#: config-only), and loading from it would leak exactly what the choice
-#: refuses — so the load waits for the restart the honesty line promises.
+#: An own-server choice saved WHILE the startup scan was deferred AND the
+#: hot-swap declined it (TCK-BACKEND-002: only the no-controller/shadowed
+#: rungs still land here — with a live swap the held scan releases on the
+#: NEW server in-session instead): the live client is still the public
+#: default, and loading from it would leak exactly what the choice refuses
+#: — so the load waits for the restart the honesty line promises.
 DEFERRED_RESTART: Final[str] = (
     "Your server is saved, and your wallet is still unloaded — I won't "
     "check its addresses against a server you didn't choose just to fill "
@@ -225,13 +232,16 @@ URL_PROMPT: Final[str] = (
 )
 
 #: Copy block (c) — validation failure: plain cause, next step, nothing
-#: saved, never a silent public fallback.
+#: saved, never a silent public fallback. The family wording widened to
+#: cover ``ssl://`` Electrum servers (TCK-BACKEND-002 — they are now
+#: first-class candidates at this entry, so the honest cause names both).
 VALIDATION_FAIL: Final[str] = (
     "That address didn't check out: it wasn't reachable, or it didn't "
-    "answer as a mainnet mempool.space API. Nothing was saved, and no "
-    "address of your wallet was ever sent to it. Ask \"node status\" to "
-    "see what the app can detect on this machine — then say \"retry\" "
-    "with the same or a new address, or pick the public server instead."
+    "answer as a mainnet Esplora (mempool.space) or Electrum server. "
+    "Nothing was saved, and no address of your wallet was ever sent to "
+    "it. Ask \"node status\" to see what the app can detect on this "
+    "machine — then say \"retry\" with the same or a new address, or pick "
+    "the public server instead."
 )
 
 #: Copy block (d) — confirmation after a successful own-node setup
@@ -265,14 +275,29 @@ GUIDE: Final[str] = (
     "try setting one up now, or continue without?"
 )
 
-#: ADR-0018 config-only semantics: the live client is built at bootstrap,
-#: so the persisted switch lands on the next launch. Appended verbatim
-#: after :data:`CONFIRMED` (implementation-time honesty line; the signed
-#: copy alone would over-claim an in-session switch).
+#: ADR-0018 (as amended by TCK-BACKEND-002): a stored own-server choice now
+#: hot-swaps the live client IN-SESSION — this honesty line returns ONLY
+#: when the swap declines (an env/config-file rung shadows the stored one,
+#: or no engine swap controller exists), never as a blanket promise.
 EFFECTS_NEXT_LAUNCH: Final[str] = (
     "The switch is saved for your next launch — quit and start the app "
     "again to run on your own node (until then this session keeps its "
     "current backend)."
+)
+
+#: TCK-BACKEND-002 (ADR-0018 amendment, user directions 5/6): the swap
+#: landed — the live client is the chosen server NOW and the full rebuild
+#: resync is running behind this line.
+SWITCHING_NOW: Final[str] = (
+    "Switched — the app asks your new server from here on, and I'm "
+    "reloading your wallet from it now (your coin tags stay put)."
+)
+
+#: The swap validated and stored but deferred behind the scan already in
+#: flight (the one concurrency rule: a swap never crosses a running fetch).
+SWITCH_AFTER_SCAN: Final[str] = (
+    "Saved — the app switches to your new server and reloads your wallet "
+    "the moment the scan in progress finishes (your coin tags stay put)."
 )
 
 #: Implementation-time copy (flagged in ADR-0023 §9 as awaiting a draft):
@@ -302,8 +327,9 @@ WEB_SETUP_HINT: Final[str] = (
     "mempool.space app, an Electrum server, or a private mempool.space "
     "install) or the public mempool.space server, whose operator can see "
     "the addresses you check and when your transactions move. Saving a "
-    "backend address in Settings works too; either choice takes effect "
-    "on the next launch."
+    "backend address in Settings works too — and since TCK-BACKEND-002 it "
+    "switches over right away, no restart needed: the wallet loads from "
+    "the server you save."
 )
 
 # --- /setup re-entry copy (TCK-ONB-005; implementation-time, value-free) ---
@@ -342,28 +368,26 @@ SETUP_KEEP_CURRENT: Final[str] = (
 )
 
 #: Picking the public server explicitly (/setup with a stored choice):
-#: clears the stored rung; honesty about the session riding the old backend
-#: (ADR-0018 config-only) lives in this line's own wording.
+#: clears the stored rung; the live switch (or its honest next-launch
+#: variant when the swap declines) is carried by the copy itself —
+#: TCK-BACKEND-002: the session follows the revert (hot-swap), no longer
+#: "keeps the backend it started with".
 SETUP_REVERTED: Final[str] = (
-    "Set — from your next launch the app uses the public server again; "
-    "this session keeps the backend it started with. Your saved address "
-    "has been removed."
+    "Set — the app uses the public server again. Your saved address has "
+    "been removed."
 )
 
-#: A URL whose scheme this CONVERSATION cannot set up (ssl:// and the other
-#: Electrum-protocol kinds — TCK-ONB-004 M1 ships the Electrum backend for
-#: the env/config-file ladder only; the setup entry's probe + stored rung
-#: land with M3): plain statement, no probe, nothing saved — and the entry
-#: re-prompts (never a dead end).
+#: A URL whose scheme NO entry point of this app can speak (neither the
+#: http(s) Esplora family nor the ``ssl://`` Electrum family —
+#: TCK-BACKEND-002 opened ssl://; ftp:// and friends stay foreign): plain
+#: statement, no probe, nothing saved — and the entry re-prompts (never a
+#: dead end).
 NON_ESPLORA_URL: Final[str] = (
-    "I can't set that address up here yet: this setup conversation "
-    "connects only to Esplora-protocol servers over http(s) — the web "
-    "address of a mempool.space app. An Electrum server (ssl:// and the "
-    "like) already works as a launch setting (LOCALWALLET_CHAIN_BASE_URL "
-    "or your config file); setting it up here — with a check that it "
-    "really serves mainnet — comes in a later version. Nothing was "
-    "probed and nothing was saved. Type an http(s) address, or 1 for the "
-    "public server."
+    "I can't use that address: this app speaks only Esplora servers over "
+    "http(s) — the web address of a mempool.space app — and Electrum "
+    "servers over ssl:// (a plain Bitcoin Core address is not one of "
+    "those). Nothing was probed and nothing was saved. Type an http(s) "
+    "or ssl:// address, or 1 for the public server."
 )
 
 #: /setup refuses DORMANT when the stored rung cannot be read (no gate can
@@ -477,17 +501,22 @@ def _looks_like_seed(line: str) -> bool:
 
 
 def _is_url_candidate(line: str) -> bool:
-    return line.strip().lower().startswith(("http://", "https://"))
+    # TCK-BACKEND-002 (user direction 9): ``ssl://`` is a FIRST-CLASS
+    # candidate now — the M1 Electrum adapter is live and the entry probes
+    # it (handshake + mainnet genesis) before saving, same discipline as
+    # http(s).
+    return line.strip().lower().startswith(("http://", "https://", "ssl://"))
 
 
 def _is_other_scheme_url(line: str) -> bool:
-    """A bare URL with a scheme v1 cannot speak — ``ssl://host:50001`` and
-    the other Electrum-protocol shapes (ADR-0023 decision 7: Esplora over
-    http(s) only; TCK-ONB-004 owns the future adapter). Scheme token
-    immediately before ``://`` (no spaces): free prose merely MENTIONING a
-    URL ("why is https://x slow?") stays ordinary chat."""
+    """A bare URL with a scheme we still cannot speak — anything but the
+    http(s) Esplora family and the ``ssl://`` Electrum family (TCK-BACKEND-002
+    closed the ssl:// gap; the M1 adapter + the handshake genesis gate make
+    it a first-class candidate). Scheme token immediately before ``://``
+    (no spaces): free prose merely MENTIONING a URL ("why is https://x
+    slow?") stays ordinary chat."""
     low = line.strip().lower()
-    if "://" not in low or low.startswith(("http://", "https://")):
+    if "://" not in low or low.startswith(("http://", "https://", "ssl://")):
         return False
     return " " not in low.split("://", 1)[0]
 
@@ -561,7 +590,13 @@ class OnboardingFlow:
     the ONLY sanctioned writer (ONB-002), and it is NEVER called with a
     URL that failed validation (decision 4: no silent public fallback —
     the default stays because the user chose it, never because a probe was
-    papered over).
+    papered over). ``backend_saved`` (TCK-BACKEND-002;
+    ADR-0018 amendment) is the app's hot-swap hook, invoked AFTER a stored
+    write: it swaps the live chain client onto the new URL and fires the
+    full rebuild resync IN-SESSION, returning the closed outcome
+    (``swapped``/``deferred``/``skipped``) that picks the conversation's
+    honesty line. ``None`` (a flow built without engine wiring — tests)
+    keeps the pre-amendment next-launch copy verbatim.
     """
 
     def __init__(
@@ -574,6 +609,7 @@ class OnboardingFlow:
         armed: bool = True,
         deferred: bool = False,
         public_chosen: Callable[[], bool] | None = None,
+        backend_saved: Callable[[str], str] | None = None,
     ) -> None:
         self._store = store
         self._check_backend = check_backend
@@ -585,6 +621,7 @@ class OnboardingFlow:
         self._had_choice = False
         self._deferred = deferred
         self._public_chosen = public_chosen
+        self._backend_saved = backend_saved
 
     @property
     def done(self) -> bool:
@@ -624,9 +661,10 @@ class OnboardingFlow:
         stored URL is never echoed) and an explicit ``y`` at the overwrite
         gate is required BEFORE the branch can reach a write; ``n``/back
         exits with no change. With nothing stored the ask leads directly
-        (a skip keeps the current public default). The live client is NOT
-        touched — the write rides the ADR-0018 config-only ladder and is
-        honest about taking effect next launch.
+        (a skip keeps the current public default). A saved URL then rides
+        the TCK-BACKEND-002 hot-swap (in-session switch + full resync); the
+        next-launch honesty line returns only when the swap declines
+        (env/config-file rung shadowing the stored one).
         """
         self._last_failed = None
         try:
@@ -679,11 +717,12 @@ class OnboardingFlow:
                 output_fn(SETUP_OVERWRITE)
             return True
         if _is_other_scheme_url(text):
-            # ssl://-style Electrum-protocol address: v1 cannot speak it
-            # (ADR-0023 decision 7; adapter = TCK-ONB-004 backlog) — said
-            # plainly, never probed, never saved, the entry re-prompts.
-            # Both the ask state and the URL-entry state take this line
-            # (a first-run paste gets the same honest treatment).
+            # A scheme NEITHER entry point speaks (ftp:// and friends —
+            # TCK-BACKEND-002 opened ssl:// to the full probe+store+swap
+            # path, same discipline as http(s)): said plainly, never probed,
+            # never saved, the entry re-prompts. Both the ask state and the
+            # URL-entry state take this line (a first-run paste gets the
+            # same honest treatment).
             output_fn(NON_ESPLORA_URL)
             return True
         if key in _SKIP_WORDS:
@@ -775,23 +814,41 @@ class OnboardingFlow:
         ``public``): clear the stored rung through the typed writer (the
         ``""``-clears convention, ONB-002) AND record the public marker —
         without it the cleared rung would read "never chose" next launch
-        and the ask would re-arm. A failed write keeps the stored choice
-        and says so — the ack is never a lie either way."""
+        and the ask would re-arm. TCK-BACKEND-002: the clear then rides the
+        SAME hot-swap hook (install of the public-default client + full
+        resync) — with no swap controller (or a shadowed rung) the session
+        honestly keeps its current backend until the next launch. A failed
+        write keeps the stored choice and says so — the ack is never a lie
+        either way."""
         try:
             self._store.set_chain_base_url("")
         except StoreError:
             output_fn(SETUP_KEEP_CURRENT)
-        else:
-            try:
-                self._store.set_setting(BACKEND_CHOICE_SETTING, BACKEND_CHOICE_PUBLIC)
-            except StoreError:
-                pass
-            output_fn(SETUP_REVERTED)
+            return
+        try:
+            self._store.set_setting(BACKEND_CHOICE_SETTING, BACKEND_CHOICE_PUBLIC)
+        except StoreError:
+            pass
+        output_fn(SETUP_REVERTED)
+        outcome = (
+            self._backend_saved("") if self._backend_saved is not None else "skipped"
+        )
+        if outcome == "skipped":
+            output_fn(EFFECTS_NEXT_LAUNCH)
+        elif outcome == "deferred":
+            output_fn(SWITCH_AFTER_SCAN)
+        # "swapped": SETUP_REVERTED already says the app uses the public
+        # server again — true NOW; the resync narrates its own completion.
+        self._deferred = False
 
     def _validate(self, url: str, output_fn: Callable[[str], None]) -> bool:
-        """Decision-5 validation: chain probe + (loopback only) doctor's
-        IBD facts; success is the typed store write, failure is copy (c)
-        or the syncing branch. NEVER saves on failure."""
+        """Decision-5 validation: chain probe (http(s) Esplora shape, or the
+        ssl:// Electrum handshake + mainnet genesis since TCK-BACKEND-002 —
+        the injected probe dispatches by scheme) + (loopback only) doctor's
+        IBD facts; success is the typed store write, failure is copy (c) or
+        the syncing branch. NEVER saves on failure. A save that lands then
+        rides the engine's hot-swap hook (in-session switch + resync), or
+        the honest next-launch line when the swap declines."""
         if not self._check_backend(url):
             output_fn(VALIDATION_FAIL)
             self._last_failed = url
@@ -810,13 +867,23 @@ class OnboardingFlow:
             self._last_failed = url
             return True
         output_fn(CONFIRMED)
-        output_fn(EFFECTS_NEXT_LAUNCH)
-        if self._deferred:
-            # TCK-ONB-006: the held scan does NOT start on this choice —
-            # the live client is the old (public-default) one, and loading
-            # through it would leak what the user just refused. The scan
-            # runs from the server they chose at the next launch.
-            output_fn(DEFERRED_RESTART)
+        # TCK-BACKEND-002 (ADR-0018 amendment): the engine hot-swaps the
+        # live client onto the saved URL and resyncs in-session; the copy
+        # follows the hook's ACTUAL outcome (never claims a switch the
+        # shadowed ladder declined, and never promises a restart the swap
+        # already performed).
+        outcome = self._backend_saved(url) if self._backend_saved is not None else "skipped"
+        if outcome in ("swapped", "deferred"):
+            self._deferred = False
+            output_fn(SWITCHING_NOW if outcome == "swapped" else SWITCH_AFTER_SCAN)
+        else:
+            output_fn(EFFECTS_NEXT_LAUNCH)
+            if self._deferred:
+                # TCK-ONB-006 (pre-amendment shape, kept honest for the
+                # declined-swap rungs): the held scan does NOT start on a
+                # save the live client cannot serve — the load waits for
+                # the restart the honesty line promises.
+                output_fn(DEFERRED_RESTART)
         self._state = _AskState.DONE
         return True
 

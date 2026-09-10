@@ -959,13 +959,17 @@ class Store(AbstractContextManager["Store"]):
         """Persist the user's chain backend choice; ``""`` clears it (back to default).
 
         Validation is fail-closed at write, before anything lands on disk
-        (ADR-0023 decision 5): a non-empty value must be an http(s) URL with a
-        host and no embedded credentials — mirroring the ``ChainConfig``
-        construction check that stays as the last line of defense. A
-        whitespace-only write is refused (deliberate-but-blank is malformed,
-        never a silent clear); only the exact empty string clears the choice.
-        Errors are value-free: the URL (which may embed credentials) never
-        appears in the message.
+        (ADR-0023 decision 5): a non-empty value must be an http(s) Esplora
+        base URL or an ``ssl://host[:port]`` Electrum endpoint (TCK-BACKEND-002;
+        ADR-0018 M3 acceptance — the M1 adapter ships, the stored rung now
+        carries it), each with a host and no embedded credentials — mirroring
+        the ``ChainConfig`` construction check that stays as the last line of
+        defense. A whitespace-only write is refused (deliberate-but-blank is
+        malformed, never a silent clear); only the exact empty string clears
+        the choice. Errors are value-free: the URL (which may embed
+        credentials) never appears in the message. NOTE: this writer checks
+        the URL SHAPE only — reachability/mainnet proof is the app's probe
+        (chain/), deliberately not the store's job.
         """
         candidate = url.strip()
         if not candidate:
@@ -979,8 +983,12 @@ class Store(AbstractContextManager["Store"]):
         # Plain-string checks (no urllib: network-ish imports are lint-banned
         # outside chain/). As strict as the ChainConfig construction check it
         # mirrors, plus an internal-whitespace guard.
+        if candidate.startswith("ssl://"):
+            self._check_electrum_base_url(candidate)
+            self.set_setting(_CHAIN_BASE_URL_SETTING, candidate)
+            return
         if not candidate.startswith(("http://", "https://")):
-            raise StoreError("chain base url must be an http(s) URL")
+            raise StoreError("chain base url must be an http(s) or ssl:// URL")
         if any(c.isspace() for c in candidate):
             raise StoreError("chain base url must not contain whitespace")
         netloc = candidate.partition("://")[2].split("/", 1)[0]
@@ -989,6 +997,26 @@ class Store(AbstractContextManager["Store"]):
         if "@" in netloc:  # embedded userinfo would ride on every request
             raise StoreError("chain base url must not embed credentials")
         self.set_setting(_CHAIN_BASE_URL_SETTING, candidate)
+
+    @staticmethod
+    def _check_electrum_base_url(candidate: str) -> None:
+        """Shape rules for a stored ``ssl://host[:port]`` Electrum endpoint
+        (mirrors :meth:`ChainConfig._validate_electrum_url` value-free): a
+        host, an optional NUMERIC in-range port, no userinfo, and no
+        path/query/fragment (the protocol has no URL namespace)."""
+        rest = candidate[len("ssl://") :]
+        if any(c.isspace() for c in rest):
+            raise StoreError("chain base url must not contain whitespace")
+        if any(c in rest for c in "/?#"):
+            raise StoreError("electrum chain base url must not carry a path")
+        host, sep, port = rest.rpartition(":")
+        if "@" in rest:  # embedded credentials — never storable
+            raise StoreError("chain base url must not embed credentials")
+        if sep:
+            if not host or not port.isdigit() or not 0 < int(port) < 65536:
+                raise StoreError("electrum chain base url has an invalid port")
+        elif not rest:
+            raise StoreError("chain base url must have a host")
 
     # ------------------------------------ coin-selection policy settings (UTXO-002)
     #

@@ -144,6 +144,7 @@ from localwallet.chain import (
     estimate_eta,
     time_since_last_block,
 )
+from localwallet.chain.config import ELECTRUM_SCHEME
 from localwallet.config import Settings, resolve_chain_base_url
 from localwallet.node import LocalNodeReport, NodeStatus, detect_local_nodes
 from localwallet.node.doctor import NodeDoctor
@@ -3324,6 +3325,17 @@ class ChainWorker:
             raise job.value  # type: ignore[misc]
         return job.value  # type: ignore[return-value]
 
+    def set_client(self, client: ChainClient) -> None:
+        """Rebind the fetch client IN PLACE (TCK-BACKEND-002 hot-swap;
+        ADR-0018 amendment). ENGINE-THREAD ONLY, and only while NO job is in
+        flight — the same precondition the blocking :meth:`scan` documents
+        (the swap controller checks the scan gate before installing): the
+        worker thread reads ``self._client`` once at the START of each job
+        and never touches it mid-fetch, so a swap between jobs is atomic by
+        construction. No worker/thread rebuild: the queue, the thread, and
+        every :class:`ScanFlow` bound method ride through unchanged."""
+        self._client = client
+
     def _run(self) -> None:
         while True:
             item = self._jobs.get()
@@ -3419,12 +3431,14 @@ class ScanFlow:
         self.gate = StartupScan(enabled=True, deferred=True)
 
     def release_backend(self) -> bool:
-        """TCK-ONB-006: the backend choice resolved (an explicit public
-        consent was recorded — the ONLY in-session release; an own-server
-        choice takes effect next launch per ADR-0018, so it never fires a
-        fetch through the old public client). Plan NOW on the engine thread
-        (fresh store reads) and start the held startup scan. No-op unless
-        the gate is ``awaiting_backend``.
+        """TCK-ONB-006: the backend choice resolved. Two callers, both
+        loading from the user's CHOSEN server, never a refused one:
+        an explicit PUBLIC consent (the flow's own ``public_chosen`` hook,
+        releasing the still-public-default client the user just accepted),
+        or a TCK-BACKEND-002 own-server HOT-SWAP (the swap has already moved
+        the worker onto the chosen client before calling this). Plan NOW on
+        the engine thread (fresh store reads) and start the held startup
+        scan. No-op unless the gate is ``awaiting_backend``.
 
         Returns whether the load actually started (security review F2): the
         consent ack may only claim "loading now" when this says ``True`` —
@@ -3475,6 +3489,48 @@ class ScanFlow:
             on_progress=lambda: commands.put(_ScanTick()),
             on_result=lambda ok, value: commands.put(_ScanDone(ok, value)),
         )
+
+    def resync_now(self) -> bool:
+        """The full REPAIR rescan as a triggerable action (TCK-BACKEND-002
+        deliverable 5 — the ``Resync now`` button, the chain-swap resync, and
+        the gap-limit-change resync all ride here): the SCAN-003 ``--rescan``
+        rebuild semantics (re-derive the whole gap window from chain truth,
+        "as though the zpub had been entered for the first time") re-run on
+        the SAME flow, gate object, worker and command queue — the pump's
+        existing ``_ScanTick``/``_ScanDone`` handling persists + narrates it
+        exactly like the startup scan (the rescan summary line, since the
+        rescan flag flips here).
+
+        Tags survive by construction: ``persist_scan``'s write-set is the
+        utxo/address/tx/sync-state tables only — ``coin_labels`` is a
+        separate table the scan never touches (pinned in
+        tests/test_backend_hotswap.py; store/db.py's own contract note).
+
+        Concurrency guard (single-threaded truth, engine thread): ``False``
+        when a scan already owns the worker (pending/running) or the startup
+        scan is still HELD awaiting a backend choice (nothing to resync yet),
+        or when the pump queue is not attached. While it runs, the gate is
+        ``running`` again — stale-flagged reads, the ``create_tx`` block, and
+        the watch stand-down behave exactly as during a startup rescan.
+        """
+        if self.gate.in_progress or self._commands is None:
+            return False
+        try:
+            self._startup_plan = wallet_scan.plan_scan(
+                self._store, self._wallet, gap_limit=self._gap_limit, rebuild=True
+            )
+        except (
+            ChainError,
+            wallet_scan.ScanError,
+            WatchKeyError,
+            StoreError,
+            sqlite3.Error,
+        ):
+            return False
+        self._rescan = True
+        self._started = False  # let begin() submit the fresh plan once
+        self.begin()
+        return self.gate.state in ("pending", "running")
 
     def handle_command(
         self,
@@ -4103,6 +4159,12 @@ class EngineContext:
     #: after bootstrap so startup narration reaches the SSE stream (and
     #: provisioning narration routes there directly).
     output: _Output | None = None
+    #: TCK-BACKEND-002: the engine's chain-backend hot-swap controller
+    #: (built by :func:`_wire`, engine-thread-owned). The pump answers
+    #: chain_base_url settings writes through it (probe-before-save + swap),
+    #: serves ``backend_kind`` to /state, and runs the resync-now command.
+    #: ``None`` on the first-run placeholder (no wiring to swap).
+    backend: ChainBackendFlow | None = None
 
 
 @dataclass(frozen=True)
@@ -4127,6 +4189,7 @@ def build_state_snapshot(
     watcher: IncomingWatcher | None,
     scan: ScanFlow | None = None,
     model: ModelDownloadFlow | None = None,
+    backend_kind: str | None = None,
 ) -> dict[str, object]:
     """The value-free ``/state`` snapshot, built ON the engine thread.
 
@@ -4136,8 +4199,10 @@ def build_state_snapshot(
     (a closed :class:`GateDecision` enum name), whether a watcher is
     configured/enabled (booleans), — TCK-WEB-005 — the startup-scan state
     (a closed :class:`StartupScan` state name) plus the durable
-    first-scan-completed boolean, and — TCK-LAUNCH-002 — the model-download
-    state (a closed :class:`ModelDownloadFlow` state name). No address, amount,
+    first-scan-completed boolean, — TCK-LAUNCH-002 — the model-download
+    state (a closed :class:`ModelDownloadFlow` state name), and —
+    TCK-BACKEND-002 — the live backend kind (a closed :data:`BACKEND_KINDS`
+    enum NAME, badge material: never a URL/host). No address, amount,
     txid, ``tx_ref``, key material OR progress byte-count CAN appear — every
     value is an enum NAME or a boolean, never data. No progress percentage
     here (a wallet-size oracle); download progress rides its own event kind.
@@ -4158,6 +4223,10 @@ def build_state_snapshot(
         # Additive under state/1 (the shipped client reads named keys and
         # ignores this whole field when absent): a closed state NAME only.
         snapshot["model_state"] = model.state
+    if backend_kind is not None:
+        # Additive under state/1 (same rule): the CLOSED enum name of the
+        # live chain backend kind — a badge label, value-free by construction.
+        snapshot["backend_kind"] = backend_kind
     return snapshot
 
 
@@ -4189,6 +4258,84 @@ MAX_SETTING_VALUE_CHARS: Final[int] = 2048
 #: ``set_chain_base_url``), which owns the write validation (TCK-ONB-002).
 _CHAIN_BASE_URL_KEY: Final[str] = "chain_base_url"
 
+# --------------------------------- backend kind + hot-swap surfaces (TCK-BACKEND-002)
+
+#: The CLOSED enum of ``backend_kind`` values the settings/``/state``
+#: surfaces expose for the client's badges (TCK-BACKEND-002 user direction
+#: 10; ADR-0018 amendment). Value-free by construction — an enum NAME, never
+#: a URL/host. Mapping (scheme + config-derived; no probe rides the read):
+#:
+#: * ``none``      — no backend is being consulted (no client, or the
+#:                   first-run choice is still unresolved/held);
+#: * ``electrum``  — the live URL's scheme is ``ssl://`` (M1 adapter);
+#: * ``public``    — http(s) whose HOST is the shipped public mempool.space
+#:                   default host (mempool.space's own instance, public API,
+#:                   ADR-0003) — the trust badge, regardless of path;
+#: * ``mempool``   — any other http(s) URL whose API path starts with
+#:                   ``/api``: the mempool.space-app convention (self-hosted
+#:                   instances serve the Esplora API under ``/api``);
+#: * ``esplora``   — any other http(s) URL: an Esplora-shaped API served at
+#:                   the root (electrs/esplora-family servers);
+#: * ``bitcoind``  — RESERVED for the future Bitcoin Core RPC adapter
+#:                   (docs/onb-004 plan M2): a value of the enum, never
+#:                   emitted today (no client of that kind exists).
+#:
+#: The mempool-vs-esplora split is a documented URL-SHAPE heuristic: the
+#: two serve indistinguishable APIs, so the badge says which install the
+#: URL LOOKS like, never a probed software claim (ponytail: a real
+#: distinction would need a probe per page-load — not worth the traffic).
+BACKEND_KIND_NONE: Final[str] = "none"
+BACKEND_KIND_ELECTRUM: Final[str] = "electrum"
+BACKEND_KIND_PUBLIC: Final[str] = "public"
+BACKEND_KIND_MEMPOOL: Final[str] = "mempool"
+BACKEND_KIND_ESPLORA: Final[str] = "esplora"
+BACKEND_KIND_BITCOIND: Final[str] = "bitcoind"
+BACKEND_KINDS: Final[frozenset[str]] = frozenset(
+    {
+        BACKEND_KIND_NONE,
+        BACKEND_KIND_ELECTRUM,
+        BACKEND_KIND_PUBLIC,
+        BACKEND_KIND_MEMPOOL,
+        BACKEND_KIND_ESPLORA,
+        BACKEND_KIND_BITCOIND,
+    }
+)
+
+#: The shipped public default's HOST (``https://mempool.space/api`` →
+#: ``mempool.space``) — derived from the :class:`Settings` field default,
+#: never a second hardcoded literal, so the badge and the ADR-0003 default
+#: can never disagree. Plain-string split (urllib is lint-banned here).
+_PUBLIC_DEFAULT_HOST: Final[str] = (
+    Settings.__dataclass_fields__["esplora_base_url"]
+    .default.partition("://")[2]
+    .partition("/")[0]
+    .partition(":")[0]
+    .lower()
+)
+
+#: The ONE honest refusal line for a failed validation probe (TCK-BACKEND-002
+#: deliverable 2): the write is refused value-free — neither URL nor host nor
+#: server text ever rides it. It names the CLOSED probe categories the probe
+#: collapses to (both collapse identically, so the refusal cannot probe-worsen
+#: privacy by distinguishing "unreachable" from "wrong chain" over the wire).
+BACKEND_PROBE_FAIL: Final[str] = (
+    "that backend did not check out: it is unreachable, or it does not "
+    "serve mainnet as an Esplora (http(s)) / Electrum (ssl://) server — "
+    "nothing was saved and the current backend stays in service"
+)
+
+#: The closed ``resync`` reply values on the settings/resync surfaces
+#: (TCK-BACKEND-002): ``started`` (the full rebuild scan is running),
+#: ``busy`` (another scan owns the chain worker right now — the regular
+#: scan will use the new value anyway), ``deferred`` (only via a
+#: chain_base_url swap queued behind an in-flight scan), ``skipped``
+#: (nothing to resync / the write is shadowed by an env/config-file rung),
+#: ``unchanged`` (a gap_limit apply whose value did not change),
+#: ``unavailable`` (no engine chain wiring).
+RESYNC_STATUSES: Final[frozenset[str]] = frozenset(
+    {"started", "busy", "deferred", "skipped", "unchanged", "unavailable"}
+)
+
 #: THE allowlist (fail-closed, TCK-WEB-005): only settings keys that EXIST in
 #: the store's key/value table and are READ by live code today. Anything
 #: else — invented ``fee_cache_ttl_s``/``utxo_*``/env-only scalars — would be
@@ -4214,6 +4361,31 @@ class SettingsRequest:
     command: str
     key: str | None
     value: str | None
+    reply: queue.Queue[dict[str, object]]
+
+
+#: Command token the web transport stamps on the ``Resync now`` action
+#: (TCK-BACKEND-002 user direction 6; the sibling of :data:`SETTINGS_COMMAND`):
+#: recognized ONLY as the ``command`` label of a :class:`ResyncRequest`.
+RESYNC_COMMAND: Final[str] = "/resync"
+
+#: ``/resync`` reply schema tag (additive-tag rule as for ``settings/1``).
+RESYNC_SCHEMA: Final[str] = "resync/1"
+
+
+@dataclass(frozen=True)
+class ResyncRequest:
+    """A typed ``resync_now`` trigger queued THROUGH the engine pump
+    (TCK-BACKEND-002 deliverable 5). The browser's button carries NO data;
+    the ENGINE thread runs the existing SCAN-003 rebuild path (the ``--rescan``
+    semantics: full rescan as-if the key was entered for the first time) —
+    tags survive by construction (``coin_labels`` is a separate table, never
+    in the scan write-set; pinned by tests/test_backend_hotswap.py). The
+    concurrency guard is single-threaded truth: one answer, one scan at a
+    time (:meth:`ScanFlow.resync_now` refuses while a scan owns the worker).
+    """
+
+    command: str
     reply: queue.Queue[dict[str, object]]
 
 
@@ -4281,12 +4453,24 @@ def _watch_key_entry(store: Store, *, reveal: bool = False) -> dict[str, object]
     }
 
 
-def _settings_entries(store: Store) -> list[dict[str, object]]:
+def _settings_entries(
+    store: Store, backend: ChainBackendFlow | None = None
+) -> list[dict[str, object]]:
     """The current stored value of every allowlisted key, with its type,
     allowed range, and honest effect flags. Values here are user-authored
     scalars (a gap count, a backend URL) or the PUBLIC watch key in its
     display-truncated form — never private material, never wallet history
-    data (no address, amount or balance exists in the settings table)."""
+    data (no address, amount or balance exists in the settings table).
+
+    ``backend`` (TCK-BACKEND-002): the engine's hot-swap controller. With
+    one wired (every production pump), a stored ``chain_base_url`` write
+    takes effect IN-SESSION — the honest ``requires_restart`` flag is then
+    ``False``, UNLESS an env/config-file rung shadows the stored one (that
+    ladder rule is unchanged: ADR-0023). With ``None`` (a bare harness pump
+    with no chain wiring) the flag stays ``True`` — the write would be a
+    plain store row, effective next launch, and the flag must say so.
+    """
+    shadowed = backend is not None and backend.shadowed
     return [
         {
             "key": wallet_scan.GAP_LIMIT_SETTING,
@@ -4296,7 +4480,8 @@ def _settings_entries(store: Store) -> list[dict[str, object]]:
             "min": wallet_scan._MIN_GAP,
             "max": wallet_scan._MAX_GAP,
             # Every scan plan re-reads the setting (wallet.scan._resolve_gap_limit):
-            # takes effect on the NEXT scan, no restart.
+            # takes effect on the NEXT scan, no restart. TCK-BACKEND-002: an
+            # APPLIED change now also fires a resync itself (user direction 8).
             "requires_restart": False,
             "env_override": _env_overridden(GAP_LIMIT_ENV_VAR),
         },
@@ -4309,10 +4494,11 @@ def _settings_entries(store: Store) -> list[dict[str, object]]:
             "default": None,
             "min": None,
             "max": None,
-            # ADR-0018: the switch is CONFIG-only — the chain client (and the
-            # fee/price wrappers riding it) are constructed once at bootstrap;
-            # a stored change takes effect on the next launch, never hot.
-            "requires_restart": True,
+            # TCK-BACKEND-002 (ADR-0018 amendment): the engine hot-swaps the
+            # chain client when the write lands — NO restart — unless the
+            # stored rung is shadowed by an env/config-file rung (then the
+            # next-launch honesty stands).
+            "requires_restart": backend is None or shadowed,
             "env_override": _env_overridden(CHAIN_BASE_URL_ENV_VAR),
         },
         # TCK-WEB-008 follow-up (a), TCK-LAUNCH-002: the watch key rides the
@@ -4366,7 +4552,10 @@ def _apply_setting_change(store: Store, key: str, value: str) -> str | None:
 
 
 def handle_settings_request(
-    store: Store | None, key: str | None, value: str | None
+    store: Store | None,
+    key: str | None,
+    value: str | None,
+    backend: ChainBackendFlow | None = None,
 ) -> dict[str, object]:
     """Answer a :class:`SettingsRequest` ON THE ENGINE THREAD — the only
     thread that ever reads/writes the settings table for the web transport.
@@ -4380,7 +4569,22 @@ def handle_settings_request(
     reply with the freshly re-read entry (the client confirms from tool
     truth, never from its own echo). Refusals carry a value-free ``error``;
     an off-allowlist key is refused WITHOUT even naming the request (the
-    name itself is untrusted input)."""
+    name itself is untrusted input).
+
+    ``backend`` (TCK-BACKEND-002, the ADR-0018 hot-swap amendment): with the
+    engine's chain-backend controller wired, a ``chain_base_url`` write runs
+    the probe-before-save path (deliverable 2 — an unreachable/foreign-chain
+    URL is refused value-free, NOTHING stored, the old client untouched) and,
+    once stored, hot-swaps the live client + fires a full resync (or defers
+    both behind the in-flight scan); the applied reply carries the honest
+    ``swapped``/``resync`` fields. A ``gap_limit`` write whose value ACTUALLY
+    CHANGED fires the same resync (user direction 8); an unchanged apply says
+    so (``resync: "unchanged"``, no scan). With ``backend=None`` (a bare
+    harness pump — no chain wiring to swap) both keys keep the plain store
+    write and the entry flags carry the next-launch honesty. Every wired
+    reply (reads included) carries the additive ``backend_kind`` NAME for the
+    client's badges (deliverable 10 — an enum name, value-free).
+    """
     unknown = {"schema": SETTINGS_SCHEMA, "status": "rejected", "error": "unknown setting"}
     if store is None:
         # Only reachable if the transport talks to an engine without the
@@ -4390,8 +4594,9 @@ def handle_settings_request(
             "status": "unavailable",
             "error": "settings not available",
         }
+    kind = backend.kind if backend is not None else None
     if key is None:
-        return {"schema": SETTINGS_SCHEMA, "status": "ok", "settings": _settings_entries(store)}
+        return _settings_reply({"status": "ok", "settings": _settings_entries(store, backend)}, kind)
     if value is None:
         # Explicit single-key READ (never a write, never the general list).
         # The watch key reads back FULL here — this shape (key set, value
@@ -4399,30 +4604,75 @@ def handle_settings_request(
         # the user's Show/Copy click; the general list above stays
         # truncated. An unknown read key is refused without naming it back.
         if key == WATCH_KEY_SETTING:
-            return {
-                "schema": SETTINGS_SCHEMA,
-                "status": "ok",
-                "settings": [_watch_key_entry(store, reveal=True)],
-            }
+            return _settings_reply(
+                {"status": "ok", "settings": [_watch_key_entry(store, reveal=True)]}, kind
+            )
         entry = next(
-            (e for e in _settings_entries(store) if e["key"] == key), None
+            (e for e in _settings_entries(store, backend) if e["key"] == key), None
         )
         if entry is None:
             return unknown
-        return {"schema": SETTINGS_SCHEMA, "status": "ok", "settings": [entry]}
+        return _settings_reply({"status": "ok", "settings": [entry]}, kind)
     if key not in _SETTINGS_KEYS or not isinstance(value, str):
         return unknown
     if len(value) > MAX_SETTING_VALUE_CHARS:
-        return {
-            "schema": SETTINGS_SCHEMA,
-            "status": "rejected",
-            "key": key,
-            "error": "value too long",
-        }
-    if (error := _apply_setting_change(store, key, value)) is not None:
-        return {"schema": SETTINGS_SCHEMA, "status": "rejected", "key": key, "error": error}
-    entry = next(e for e in _settings_entries(store) if e["key"] == key)
-    return {"schema": SETTINGS_SCHEMA, "status": "applied", "settings": [entry]}
+        return _settings_reply(
+            {
+                "status": "rejected",
+                "key": key,
+                "error": "value too long",
+            },
+            kind,
+        )
+    extra: dict[str, object] = {}
+    if key == _CHAIN_BASE_URL_KEY and backend is not None:
+        # The hot-swap path OWNS this write (probe → build → typed store
+        # write → install) — the store's typed writer stays the only writer.
+        error, extra = backend.apply(value)
+        if error is not None:
+            return _settings_reply(
+                {"status": "rejected", "key": key, "error": error}, kind
+            )
+    else:
+        before = (
+            store.get_setting(key) if key == wallet_scan.GAP_LIMIT_SETTING else None
+        )
+        if (error := _apply_setting_change(store, key, value)) is not None:
+            return _settings_reply(
+                {"status": "rejected", "key": key, "error": error}, kind
+            )
+        if key == wallet_scan.GAP_LIMIT_SETTING:
+            after = next(
+                (
+                    e["value"]
+                    for e in _settings_entries(store, backend)
+                    if e["key"] == key
+                ),
+                None,
+            )
+            if str(after) == str(before):
+                extra["resync"] = "unchanged"  # direction 8: say so, no scan
+            elif backend is not None:
+                extra["resync"] = backend.resync()
+            else:
+                extra["resync"] = "unavailable"
+    entry = next(e for e in _settings_entries(store, backend) if e["key"] == key)
+    return _settings_reply(
+        {"status": "applied", "settings": [entry], **extra}, kind
+    )
+
+
+def _settings_reply(
+    fields: dict[str, object], kind: str | None
+) -> dict[str, object]:
+    """Seal one ``/settings`` reply with its schema tag — and, when an
+    engine chain wiring exists, the additive ``backend_kind`` NAME
+    (TCK-BACKEND-002 deliverable 10: a closed enum member, value-free;
+    absent when no backend is wired — the additive-``settings/1`` rule)."""
+    reply: dict[str, object] = {"schema": SETTINGS_SCHEMA, **fields}
+    if kind is not None:
+        reply["backend_kind"] = kind
+    return reply
 
 
 @dataclass
@@ -4503,6 +4753,21 @@ class EngineHandle:
         except queue.Empty:
             return None
 
+    def request_resync(self, timeout: float) -> dict[str, object] | None:
+        """Trigger a full wallet resync THROUGH the pump (TCK-BACKEND-002
+        deliverable 5 — the browser's ``Resync now`` button). Same discipline
+        as :meth:`request_settings`: the transport carries no data, the
+        ENGINE thread runs the existing SCAN-003 rebuild path and answers
+        with the closed value-free status. ``None`` on timeout = never-cancel
+        stands (the queued resync may still land; the client re-reads
+        /state — scan_state is the truth)."""
+        reply: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+        self.commands.put(ResyncRequest(RESYNC_COMMAND, reply))
+        try:
+            return reply.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
     def shutdown(self) -> None:
         """End the session AFTER the current turn completes (never-cancel)."""
         self.commands.put(QUIT)
@@ -4550,6 +4815,7 @@ def start_engine(
             store=ctx.store,
             provision=ctx.provision,
             model=ctx.model,
+            backend=ctx.backend,
         )
 
     handle.thread = threading.Thread(target=body, name="engine", daemon=True)
@@ -4646,6 +4912,7 @@ def _run_quick_action(
     session: SendSession,
     store: Store | None,
     output_fn: Callable[[str], None],
+    backend: ChainBackendFlow | None = None,
 ) -> bool:
     """Execute one model-free quick action ON THE ENGINE THREAD; ``True``
     when handled (TCK-LAUNCH-002 deliverable 4).
@@ -4691,7 +4958,7 @@ def _run_quick_action(
         _print_next_receive_address(store, output_fn)
         return True
     if command == "/settings":
-        _print_settings_readout(store, output_fn)
+        _print_settings_readout(store, output_fn, backend)
         return True
     return False
 
@@ -4727,12 +4994,14 @@ def _print_next_receive_address(
 
 
 def _print_settings_readout(
-    store: Store | None, output_fn: Callable[[str], None]
+    store: Store | None,
+    output_fn: Callable[[str], None],
+    backend: ChainBackendFlow | None = None,
 ) -> None:
     """``/settings`` CLI readout of the same allowlisted entries
     GET /settings serves (the watch key arrives in its display-TRUNCATED
     form by construction; user-authored scalars verbatim)."""
-    reply = handle_settings_request(store, None, None)
+    reply = handle_settings_request(store, None, None, backend)
     if reply.get("status") != "ok":
         output_fn("Settings are not available right now.")
         return
@@ -4762,6 +5031,7 @@ def _pump(
     onboarding: OnboardingFlow | None = None,
     provision: WatchKeyProvision | None = None,
     model: ModelDownloadFlow | None = None,
+    backend: ChainBackendFlow | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
     ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
@@ -4809,6 +5079,20 @@ def _pump(
     (``/balance``, ``/address``) dispatch the allowlist handlers directly —
     a code-owned bypass of the LLM, never model output. On exit any live
     download child is terminated BOUNDED (no orphans).
+
+    Chain-backend hot-swap (TCK-BACKEND-002, ADR-0018 amendment): when
+    ``backend`` is given, ``chain_base_url`` settings writes run the probe→
+    store→SWAP path on this thread (the engine thread owns the client's
+    whole lifecycle), and ``ResyncRequest`` triggers the full rebuild scan.
+    The ONE concurrency rule (pinned): a swap never crosses an in-flight
+    scan — while the scan gate is in progress the (already-validated,
+    already-stored) swap is DEFERRED and installed the moment the worker's
+    ``_ScanDone`` has been persisted; the OLD client keeps serving untouched
+    until then (fail-closed, never clientless). ``client`` (this pump's
+    local: watch-drain + turn facts) rebinds on every swap, immediate or
+    deferred. A deferred swap whose session ends first is dropped — the
+    stored value simply takes effect at next launch, exactly the
+    pre-amendment behavior.
     """
     if scan is not None:
         scan.attach(commands)
@@ -4830,6 +5114,12 @@ def _pump(
             ready.set()
         command = commands.get()
         if scan is not None and scan.handle_command(command, output_fn, emitter):
+            # A swap DEFERRED behind this scan installs now that the worker
+            # has delivered (and the engine has persisted) its result — then
+            # the swap's own resync occupies the worker again (the pump's
+            # watch drain stands down on its own in-progress check).
+            if backend is not None and backend.take_deferred():
+                client = backend.client
             continue
         if model is not None and model.handle_command(command, output_fn, emitter):
             # A terminal download marker closes an (implicit) turn so the
@@ -4873,6 +5163,9 @@ def _pump(
                 client = wiring.client
                 store = wiring.store
                 scan = wiring.scan
+                # TCK-BACKEND-002: the fresh wiring owns its own swap
+                # controller (built by _wire) — the pump follows.
+                backend = wiring.swap
                 if scan is not None:
                     scan.attach(commands)
                     scan.begin()
@@ -4890,7 +5183,16 @@ def _pump(
             # shipped client ignores unknown fields, so ``state/1`` is intact.
             # TCK-LAUNCH-002: an additive ``model_state`` NAME drives the
             # Yes/No card + quick-action buttons (enum name, never data).
-            snapshot = build_state_snapshot(flow, session, watcher, scan, model)
+            # TCK-BACKEND-002: an additive ``backend_kind`` NAME is the
+            # client's badge material (closed enum, never a URL/host).
+            snapshot = build_state_snapshot(
+                flow,
+                session,
+                watcher,
+                scan,
+                model,
+                backend.kind if backend is not None else None,
+            )
             if provision is not None and provision.wiring is None:
                 snapshot["needs_watch_key"] = True
             command.reply.put(snapshot)
@@ -4900,9 +5202,30 @@ def _pump(
             # the engine thread — the ONLY thread that reads/writes the
             # settings table for the transport. Fail-closed validation,
             # value-free refusals, unrelated keys structurally untouched.
-            command.reply.put(
-                handle_settings_request(store, command.key, command.value)
+            # TCK-BACKEND-002: with the engine's ``backend`` controller wired,
+            # a chain_base_url write additionally probes BEFORE the save and
+            # hot-swaps the live client after it (or defers the install
+            # behind the in-flight scan) — the pump's ``client`` local (watch
+            # drain + turn facts) rebinds on an immediate swap.
+            reply = handle_settings_request(
+                store, command.key, command.value, backend
             )
+            command.reply.put(reply)
+            if backend is not None and reply.get("swapped") is True:
+                client = backend.client
+            continue
+        if isinstance(command, ResyncRequest):
+            # Typed resync_now trigger (TCK-BACKEND-002 deliverable 5): the
+            # ENGINE thread runs the existing SCAN-003 rebuild path (tags
+            # survive — coin_labels is outside the scan write-set by
+            # construction); the closed value-free status answers the button
+            # and the scan's own progress/completion narration rides the
+            # regular scan events. Emit turn_end so the web client re-reads
+            # /state (scan_state flipped).
+            status = backend.resync() if backend is not None else "unavailable"
+            command.reply.put({"schema": RESYNC_SCHEMA, "status": status})
+            if emitter is not None:
+                emitter.emit(EVENT_TURN_END)
             continue
         if isinstance(command, str):
             utterance = command.strip().lower()
@@ -4929,7 +5252,7 @@ def _pump(
                 # deterministic bypass of the LLM, never model output. Falls
                 # through to the provision guard while unprovisioned.
                 _run_quick_action(
-                    utterance, loop, table, session, store, output_fn
+                    utterance, loop, table, session, store, output_fn, backend
                 )
                 if emitter is not None:
                     emitter.emit(EVENT_TURN_END)
@@ -5344,6 +5667,7 @@ def run(
             store=wiring.store,
             onboarding=wiring.onboarding,
             model=model_flow,
+            backend=wiring.swap,
         )
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
@@ -5382,12 +5706,35 @@ class _Wiring:
     watcher: IncomingWatcher | None
     worker: ChainWorker
     scan: ScanFlow
+    #: The runtime settings whose ``chain_base_url`` field carries the
+    #: boot-resolved effective backend (env > config file > stored, folded
+    #: by :func:`_wire`). The hot-swap mutates this ONE field and rebuilds
+    #: from it (TCK-BACKEND-002), so the client, the banner classification
+    #: and the node_status narration keep resolving the SAME value.
+    settings: Settings = dataclass_field(repr=False)
+    #: The parsed account key + active wallet row the swap needs to REBUILD
+    #: the three chain-riding dispatch-table handlers (create_tx /
+    #: broadcast_tx / tx_status) over a fresh client — everything else in
+    #: the table is store/flow-only and survives a swap untouched.
+    parsed: ParsedKey = dataclass_field(repr=False)
+    wallet: WalletRecord
     #: TCK-ONB-003/005 (ADR-0023): the backend conversation for THIS session
     #: — armed at startup on a first-run CLI launch, DORMANT on every other
     #: interactive CLI launch (the /setup command arms it), and always
     #: ``None`` for web (the browser never gets an onboarding surface, only
     #: :data:`WEB_SETUP_HINT`).
     onboarding: OnboardingFlow | None = None
+    #: The env/config-file rung of the backend ladder AS PRESENTED to
+    #: :func:`_wire` (before the stored fold): non-empty means the STORED
+    #: rung is shadowed (ADR-0023 precedence) — a stored write then takes
+    #: effect at NEXT launch only, and the hot-swap honestly declines
+    #: (TCK-BACKEND-002: the swap follows the same precedence the client
+    #: construction does; the ladder itself stays single-sourced in config).
+    boot_backend: str = ""
+    #: The engine-thread hot-swap controller (TCK-BACKEND-002; built by
+    #: :func:`_wire` right after the wiring itself — late-bound because it
+    #: owns a reference to the wiring it can mutate).
+    swap: ChainBackendFlow | None = None
 
 
 def _build_chain_client(settings: Settings) -> ChainClient:
@@ -5411,6 +5758,338 @@ def _build_chain_client(settings: Settings) -> ChainClient:
         timeout_s=config.timeout_s,
         max_retries=config.max_retries,
     )
+
+
+def _probe_chain_backend(url: str, settings: Settings) -> bool:
+    """The ONE bounded, value-free readiness probe for a CANDIDATE backend
+    URL (TCK-BACKEND-002 deliverable 2; the M3 setup-probe slot left open by
+    the ADR-0018 M1 amendment): the scheme picks the family, mirroring
+    :func:`_build_chain_client`.
+
+    * http(s) → :func:`localwallet.chain.check_backend` — Esplora shape plus
+      the height-0 mainnet GENESIS proof (ADR-0021), its own documented
+      all-failures-collapse-to-False contract;
+    * ``ssl://`` → one :class:`ElectrumClient` tip call, which forces M1's
+      fail-closed HANDSHAKE (``server.version`` + ``server.features`` whose
+      ``genesis_hash`` must equal the mainnet constant — the gate is REUSED
+      verbatim, no second genesis check), then a bounded close.
+
+    Snappy budget (same rule as the setup probe): ONE attempt past the
+    initial, the shared per-request timeout; TLS trust rides the ladder
+    inside the clients, so a probe can never disagree with the transport
+    policy the real client would get. EVERY failure (construction,
+    transport, shape, wrong chain — anything) collapses to ``False``:
+    nothing escapes to the engine-thread caller, and no URL/host/status
+    ever rides the answer (the caller owns the one honest refusal line).
+    """
+    if url.startswith(ELECTRUM_SCHEME):
+        client: Any = None
+        try:
+            client = ElectrumClient(
+                base_url=url,
+                timeout_s=settings.request_timeout_s,
+                max_retries=min(settings.max_retries, 1),
+            )
+            client.get_tip_height()  # connect + handshake + mainnet genesis gate
+            return True
+        except Exception:  # noqa: BLE001 — the collapse-everything contract
+            return False
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001, S110 — a dead probe cannot fail
+                    pass
+    try:
+        return check_backend(
+            url,
+            timeout_s=settings.request_timeout_s,
+            max_retries=min(settings.max_retries, 1),
+        )
+    except Exception:  # noqa: BLE001 — belt-braces: check_backend already collapses
+        return False
+
+
+def _backend_kind(settings: Settings, *, resolved: bool) -> str:
+    """The CLOSED ``backend_kind`` enum NAME for the live backend (badge
+    material for the web client, TCK-BACKEND-002 deliverable 10; the full
+    mapping table lives at :data:`BACKEND_KINDS`). Derived from the SAME
+    single selection point the client construction uses
+    (``Settings.chain_base_url`` over the legacy default) — scheme +
+    config-shape only, NEVER a network probe, and VALUE-FREE: a name, not a
+    URL. ``resolved=False`` (the first-run choice still unmade) answers
+    ``none``: nothing is being consulted and the badge must not claim a
+    server the user never picked."""
+    if not resolved:
+        return BACKEND_KIND_NONE
+    url = (settings.chain_base_url.strip() or settings.esplora_base_url.strip())
+    if url.startswith(ELECTRUM_SCHEME):
+        return BACKEND_KIND_ELECTRUM
+    rest = url.partition("://")[2]
+    netloc, slash, tail = rest.partition("/")
+    # Plain-string host split (urllib is lint-banned here). Ceiling: an
+    # IPv6-literal self-host counts its bracket as part of the host and
+    # never matches the public comparison — still classifies mempool/
+    # esplora by path, which is all the badge promises.
+    if netloc.partition(":")[0].lower() == _PUBLIC_DEFAULT_HOST:
+        return BACKEND_KIND_PUBLIC
+    if ("api" == tail.partition("/")[0]) if slash else False:
+        return BACKEND_KIND_MEMPOOL
+    return BACKEND_KIND_ESPLORA
+
+
+class ChainBackendFlow:
+    """The engine-thread chain-backend hot-swap controller (TCK-BACKEND-002;
+    ADR-0018 amendment: a stored ``chain_base_url`` write takes effect
+    IN-SESSION — the requires-restart semantics this ADR carried are
+    superseded for the stored rung).
+
+    ONE owner of the swap lifecycle, mutated exclusively on the ENGINE
+    (pump) thread between turns; the chain client's entire lifecycle is
+    engine-thread-owned by construction. State:
+
+        idle ─apply(url)→ [probe → build → store-write] →
+            install-now → swapped + full resync → idle
+                      ↘ (scan in flight) DEFERRED(url, client) ──┐
+        idle ─install_saved(url)→ (probe+store already done by    │ the
+                                           /setup conversation) ──┤ pump:
+        idle ─resync()→ full rebuild scan ────────────────────────┘
+        take_deferred() after the in-flight scan's _ScanDone → install → resync
+
+    Fail-closed at every seam: a probe/build/store failure REFUSES the write
+    (value-free) and the OLD client stays installed and serving — the engine
+    is never left clientless. The install (worker rebind + handler rebuild +
+    BOUNDED close of the old client) runs only while NO scan fetch is in
+    flight: the worker reads its client once per job, so between-jobs is the
+    only moment an in-flight fetch cannot be holding the old reference —
+    hence the defer-instead-of-stand-down rule (pinned; the alternative —
+    blocking the engine on a job drain — would stall the pump for the whole
+    scan). Tags survive the resync by construction (``coin_labels`` is not
+    in the scan write-set).
+    """
+
+    def __init__(
+        self,
+        wiring: _Wiring,
+        probe: Callable[[str], bool],
+    ) -> None:
+        self._w = wiring
+        self._probe = probe
+        #: A validated, stored-but-not-yet-installed swap: (url, client).
+        self._deferred: tuple[str, ChainClient] | None = None
+
+    # ------------------------------------------------------------- surfaces
+
+    @property
+    def client(self) -> ChainClient:
+        """The CURRENTLY SERVING chain client (the pump rebinds its local
+        after any swap via this property)."""
+        return self._w.client
+
+    @property
+    def shadowed(self) -> bool:
+        """Whether the env/config-file rung shadows the stored one — the
+        honest ``requires_restart`` answer (a stored write waits for the
+        next launch, exactly the resolution precedence, unchanged)."""
+        return bool(self._w.boot_backend.strip())
+
+    @property
+    def kind(self) -> str:
+        """The live backend's CLOSED enum NAME (:data:`BACKEND_KINDS`) for
+        the settings/``/state`` badge fields — computed from the same
+        selection point the serving client was built from, value-free."""
+        effective = self._w.settings.chain_base_url.strip()
+        return _backend_kind(
+            self._w.settings,
+            resolved=_backend_resolved(effective or None, self._w.store),
+        )
+
+    def _worker_occupied(self) -> bool:
+        """Whether a scan FETCH owns the worker right now (pending/running).
+        ``awaiting_backend`` deliberately does NOT count: a HELD first-run
+        scan has submitted nothing — the worker is idle, and installing over
+        it (then releasing on the new client) is exactly the point."""
+        scan = self._w.scan
+        return scan is not None and scan.gate.state in ("pending", "running")
+
+    def apply(self, url: str) -> tuple[str | None, dict[str, object]]:
+        """The settings-write path: PROBE before the save (deliverable 2),
+        build before the save (a construction failure refuses the write —
+        never store a value this process could not serve), then the store's
+        typed writer (the ONLY sanctioned writer of the key) and the
+        install. Returns ``(value-free refusal line | None, reply fields
+        swapped/resync)``. A failure at any pre-store step leaves the store
+        AND the live client untouched."""
+        text = url.strip()
+        if text and not self._probe(text):
+            return BACKEND_PROBE_FAIL, {}
+        if self.shadowed:
+            # Env/config-file rung set: the write is STORED (probed) but the
+            # live ladder already outranks it — no swap, next-launch honesty
+            # (the response's requires_restart flag says so, unchanged).
+            error = self._store_write(text)
+            if error is not None:
+                return error, {}
+            return None, {"swapped": False, "resync": "skipped"}
+        try:
+            new_client = _build_chain_client(
+                replace(self._w.settings, chain_base_url=text)
+            )
+        except ValueError:
+            # Malformed despite the probe (a shape the probe tolerated that
+            # ChainConfig refuses): refuse the WRITE value-free, old client
+            # untouched — never store a value we cannot serve.
+            return BACKEND_PROBE_FAIL, {}
+        error = self._store_write(text)
+        if error is not None:
+            _close_quietly(new_client)
+            return error, {}
+        if self._worker_occupied():
+            # A fetch owns the worker: DEFER the install (the validated
+            # client idles — connected lazily, nothing is in flight on it).
+            self._deferred = (text, new_client)
+            return None, {"swapped": False, "resync": "deferred"}
+        return None, {
+            "swapped": True,
+            "resync": self._install(text, new_client),
+        }
+
+    def install_saved(self, url: str) -> str:
+        """The ``/setup`` hook (deliverable 1, CLI path): the conversation
+        already ran its warned probe + doctor gate + typed store write —
+        this only performs the SAME install ``apply`` would. Returns the
+        closed ONBOARDING outcome (not the resync status): ``swapped`` (the
+        live client moved to the saved URL and the resync was started),
+        ``deferred`` (validated + stored, install queued behind the
+        in-flight scan), ``skipped`` (an env/config-file rung shadows the
+        stored one — the honest next-launch copy)."""
+        text = url.strip()
+        if self.shadowed:
+            return "skipped"
+        try:
+            new_client = _build_chain_client(
+                replace(self._w.settings, chain_base_url=text)
+            )
+        except ValueError:
+            return "skipped"  # stored, honest next-launch line
+        if self._worker_occupied():
+            self._deferred = (text, new_client)
+            return "deferred"
+        self._install(text, new_client)
+        return "swapped"
+
+    def resync(self) -> str:
+        """The ``Resync now`` action (deliverable 5, user direction 6): the
+        full SCAN-003 rebuild scan on the CURRENT client (tags survive).
+        ``busy`` while a scan owns the worker or the first-run backend is
+        still unchosen (the held scan will run the full load anyway)."""
+        scan = self._w.scan
+        if scan is None:
+            return "unavailable"
+        return "started" if scan.resync_now() else "busy"
+
+    def take_deferred(self) -> bool:
+        """Called by the pump after every handled scan event: install the
+        deferred swap once no scan is in flight (the scan that was in
+        flight has just been persisted — or failed and stood down). Returns
+        whether a swap landed (the pump rebinds its ``client`` local). A
+        swap deferred across a session END is dropped: the stored value
+        simply applies at next launch (the pre-amendment behavior)."""
+        if self._deferred is None:
+            return False
+        if self._worker_occupied():
+            return False  # a newer job grabbed the worker again; wait it out
+        url, new_client = self._deferred
+        self._deferred = None
+        self._install(url, new_client)
+        return True
+
+    # -------------------------------------------------------------- internals
+
+    def _store_write(self, text: str) -> str | None:
+        """The sanctioned typed write (``""`` clears, per the store's
+        convention); the value-free StoreError line is the refusal."""
+        try:
+            self._w.store.set_chain_base_url(text)
+        except (StoreError, sqlite3.Error) as exc:
+            return str(exc)
+        return None
+
+    def _install(self, url: str, new_client: ChainClient) -> str:
+        """Swap in the validated client, rebind every chain-riding surface,
+        BOUNDED-close the old one, then fire the full resync (user
+        directions 5/6: a new URL is always followed by a fresh sync).
+
+        Precondition (checked by every caller): NO scan fetch is in flight
+        (gate not pending/running) — the worker reads its client once per
+        job, and the engine-thread blocking scans cannot interleave with
+        this (single-threaded between turns)."""
+        w = self._w
+        # The single selection point moves as ONE value: everything that
+        # resolves the backend (banner, watch mode, node_status, the next
+        # plan/fetch) rides this same settings object.
+        w.settings.chain_base_url = url
+        old = w.client
+        w.worker.set_client(new_client)
+        w.client = new_client  # type: ignore[assignment]
+        self._rebind_handlers(new_client)
+        _close_quietly(old)
+        scan = w.scan
+        if scan is None:
+            return "unavailable"
+        if scan.gate.state == "awaiting_backend":
+            # The first-run HELD scan: releasing now plans + starts it ON
+            # THE NEW CLIENT — the server the user just chose, never the
+            # public default they refused (the ONB-006 promise, now kept
+            # in-session instead of at next launch).
+            return "started" if scan.release_backend() else "busy"
+        return "started" if scan.resync_now() else "busy"
+
+    def _rebind_handlers(self, client: ChainClient) -> None:
+        """Rebuild the three client-riding dispatch-table entries over the
+        new client (fee/price wrappers re-attached) IN PLACE — the table is
+        the same dict object the pump, the AgentLoop and every pending
+        consult share, so no consumer can hold the dead closure set after
+        the swap returns. The other handlers read only the store/flow and
+        are structurally unaffected."""
+        w = self._w
+        scan = w.scan
+        w.table[IntentName.CREATE_TX] = _make_create_tx_handler(
+            w.store,
+            w.wallet.id,
+            w.parsed,
+            w.flow,
+            FeeEstimator(client),
+            PriceOracle(client),
+            scan.scan_now if scan is not None else (lambda: None),
+            seconds_since_last_block_fn=lambda: _safe_time_since_last_block(client),
+            scan_gate=scan.gate if scan is not None else None,
+        )
+        w.table[IntentName.BROADCAST_TX] = _make_broadcast_tx_handler(
+            w.flow, client, w.store, w.wallet.id
+        )
+        w.table[IntentName.TX_STATUS] = _make_tx_status_handler(client, w.flow)
+
+
+def _close_quietly(client: ChainClient) -> None:
+    """Bounded, best-effort close of a retired client: BOTH adapters'
+    close() are synchronous and local (httpx pool discard / socket close),
+    and a close failure can never be allowed to unwind an APPLIED settings
+    write — the value is stored and serving regardless."""
+    try:
+        client.close()
+    except Exception:  # noqa: BLE001, S110 — containment: retirement never raises
+        pass
+
+
+def _safe_time_since_last_block(client: ChainClient) -> int | None:
+    """The rebuilt ETA hint's fail-closed wrapper (chain.watch is already
+    fail-quiet; this keeps a handler-internal surprise from escaping — the
+    narration-only fact degrades to ``None``, never a crash mid-turn)."""
+    try:
+        return time_since_last_block(client)
+    except Exception:  # noqa: BLE001 — narration-only; degrade to no hint
+        return None
 
 
 def _wire(
@@ -5469,6 +6148,11 @@ def _wire(
     # the node_status narration all read that one field and can therefore
     # never disagree (decision 6). With nothing on any rung, the value stays
     # empty and behavior is bit-identical to the public default.
+    # TCK-BACKEND-002: the PRE-fold value is the env/config-file rung, kept
+    # on the wiring as ``boot_backend`` — the hot-swap's honest
+    # shadowed/requires_restart answer follows the SAME precedence without
+    # re-reading the world (a rung set at launch cannot be unset in-session).
+    boot_backend = (settings.chain_base_url or "").strip()
     effective_backend = resolve_chain_base_url(
         settings.chain_base_url, store.get_chain_base_url()
     )
@@ -5598,6 +6282,21 @@ def _wire(
     if not web_mode:
         output_fn("Type a message — 'exit' or Ctrl-D quits.")
 
+    # TCK-BACKEND-002: the ONE scheme-aware probe every entry point shares
+    # (settings write-before-save, the onboarding step-5 validation). The
+    # test seam ``backend_check_fn`` overrides it for BOTH (the onboarding
+    # probe and the swap's before-save probe), so a scripted test drives the
+    # whole hot-swap path with one injected callable. Default is the bounded
+    # chain/ probe (G5: the only networked module).
+    probe_fn: Callable[[str], bool] = (
+        backend_check_fn
+        if backend_check_fn is not None
+        else (lambda url: _probe_chain_backend(url, settings))
+    )
+    # Late-bound: the onboarding flow's swap hook and the wiring's controller
+    # resolve to the same object once _wire's tail builds it.
+    swap: ChainBackendFlow | None = None
+
     # TCK-ONB-003 (ADR-0023) + TCK-ONB-005 + TCK-ONB-006: the backend
     # conversation — CLI transport ONLY, built for EVERY interactive CLI
     # launch. It arms at startup whenever the backend is UNRESOLVED and the
@@ -5624,17 +6323,7 @@ def _wire(
         )
         onboarding = OnboardingFlow(
             store=store,
-            check_backend=backend_check_fn
-            or (
-                # Snappy setup probe: one attempt (min'ing the retry budget
-                # down, never up), the shared per-request timeout. The probe
-                # itself is chain/ code — the ONLY networked module (G5).
-                lambda url: check_backend(
-                    url,
-                    timeout_s=settings.request_timeout_s,
-                    max_retries=min(settings.max_retries, 1),
-                )
-            ),
+            check_backend=probe_fn,
             node_report=(
                 None
                 if not settings.node_detection_enabled
@@ -5643,14 +6332,20 @@ def _wire(
             loopback_host=_loopback_host_of,
             armed=ask_at_startup,
             deferred=defer_startup,
-            # Explicit public consent (recorded by the flow itself) is the
-            # ONLY in-session release of the held scan — an own-server save
-            # waits for the next launch (ADR-0018 config-only; the live
-            # client is the old one and must never fetch on a refused
-            # backend). No-op unless the gate is actually awaiting, and it
-            # REPORTS whether the load started (the flow gates its
-            # "loading now" line on that answer, security review F2).
+            # Explicit public consent (recorded by the flow itself) releases
+            # the held scan ON THE CURRENT (public-default) client — the only
+            # in-session release that needs no swap. No-op unless the gate is
+            # actually awaiting, and it REPORTS whether the load started (the
+            # flow gates its "loading now" line on that answer, F2).
             public_chosen=scan.release_backend,
+            # TCK-BACKEND-002: an OWN-server save now hot-swaps the live
+            # client and resyncs in-session (the ADR-0018 amendment) — the
+            # conversation reports swapped/deferred/skipped and adjusts its
+            # honesty line accordingly. ``None`` until the tail builds the
+            # controller (never called before then: only the pump runs it).
+            backend_saved=(
+                lambda url: swap.install_saved(url) if swap is not None else "skipped"
+            ),
         )
         if ask_at_startup:
             for line in onboarding.opening_lines(
@@ -5684,7 +6379,7 @@ def _wire(
         scan_gate=scan.gate,
     )
     loop = AgentLoop(generate, table)
-    return _Wiring(
+    wiring = _Wiring(
         store=store,
         client=client,
         loop=loop,
@@ -5695,7 +6390,16 @@ def _wire(
         worker=worker,
         scan=scan,
         onboarding=onboarding,
+        settings=settings,
+        parsed=parsed,
+        wallet=wallet_row,
+        boot_backend=boot_backend,
     )
+    # Build last so the controller sees the finished wiring it mutates (the
+    # late-bound ``swap`` name above now points here for the onboarding hook).
+    swap = ChainBackendFlow(wiring, probe_fn)
+    wiring.swap = swap
+    return wiring
 
 
 def _run_web(
@@ -5843,6 +6547,7 @@ def _run_web(
             provision=provision,
             model=model,
             output=output,
+            backend=wiring.swap,
         )
 
     try:
@@ -6121,6 +6826,7 @@ def _repl(
     store: Store | None = None,
     onboarding: OnboardingFlow | None = None,
     model: ModelDownloadFlow | None = None,
+    backend: ChainBackendFlow | None = None,
 ) -> None:
     """The CLI transport over the engine pump (TCK-WEB-001, ADR-0024 §3).
 
@@ -6174,6 +6880,7 @@ def _repl(
             store=store,
             onboarding=onboarding,
             model=model,
+            backend=backend,
         )
     finally:
         stop.set()

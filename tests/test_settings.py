@@ -16,9 +16,15 @@ The contract (docs/ux-utxo-notes-design.md §3 data-model rule + ADR-0024 §3):
   value-free, and an unrelated key is structurally untouched (one key per
   write);
 * every entry carries the honest effect flags: ``requires_restart``
-  (chain_base_url is config-only per ADR-0018 — never hot-swapped) and
-  ``env_override`` (the env rung shadows the stored one; the VALUE is never
-  read or shown).
+  (TCK-BACKEND-002 / ADR-0018 amendment: with an engine swap controller
+  wired, a stored chain_base_url write hot-swaps IN-SESSION — the flag
+  answers honestly per rung: False when the swap can take the write, True
+  while an env/config-file rung shadows it. These tests drive the BARE
+  surface — ``handle_settings_request`` with no backend controller — so
+  the plain-write honesty (requires_restart True) is what stands here;
+  the swap matrix itself lives in tests/test_backend_hotswap.py) and
+  ``env_override`` (the env rung shadows the stored one; the VALUE is
+  never read or shown).
 
 All hermetic: in-memory/tmp stores, no chain, no model.
 """

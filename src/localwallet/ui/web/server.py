@@ -25,7 +25,8 @@ Thin stdlib HTTP/SSE transport over the engine pump (:func:`localwallet.app`
 * **Security (§6):** binds 127.0.0.1 only, ephemeral port (fixed-port
   opt-in via ``LOCALWALLET_WEB_PORT``, ADR-0024 §6 amendment); a random
   per-launch token gates every DATA-BEARING endpoint (``/events``,
-  ``/state``, ``/turn``, ``/action``, ``/settings``, ``/watchkey``) via the ``X-Auth-Token`` header (the
+  ``/state``, ``/turn``, ``/action``, ``/settings``, ``/watchkey``,
+  ``/resync``) via the ``X-Auth-Token`` header (the
   401 path deliberately does NOT send ``WWW-Authenticate`` — a browser would
   pop a native credential prompt). The shell (``GET /``, ``/index.html``) and
   ``GET /static/*`` are the deliberate token EXEMPTION (TCK-WEB-007): the
@@ -478,6 +479,25 @@ class _Handler(BaseHTTPRequestHandler):
             self._drain_body()
             return
         path = self._path()
+        if path == "/resync":
+            # TCK-BACKEND-002 (user direction 6): the ``Resync now`` action.
+            # No body, no data: the transport marshals an empty typed
+            # ResyncRequest THROUGH the pump (never touches the store or the
+            # chain client) and echoes only the closed value-free status
+            # (started/busy/unavailable). The rescan itself narrates through
+            # the existing scan events; /state's scan_state is the truth.
+            self._drain_body()
+            result = (
+                None
+                if self.engine.error is not None
+                else self.engine.request_resync(self.state_timeout_s)
+            )
+            if result is None:
+                self._send_json(503, {"error": "engine busy"})
+                return
+            code = {"started": 202, "busy": 409}.get(result.get("status"), 503)
+            self._send_json(code, result)
+            return
         if path not in ("/turn", "/action", "/settings", "/watchkey"):
             self._drain_body()
             self._send_json(404, {"error": "not found"})

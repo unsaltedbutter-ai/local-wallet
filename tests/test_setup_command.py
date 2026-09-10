@@ -6,22 +6,24 @@ through to the LLM (which can only narrate), and the ADR-0023 backend
 branch fired ONLY on a first launch with a fresh wallet. ``/setup`` now
 runs the SAME code-owned state machine (:class:`OnboardingFlow`) against
 an EXISTING wallet — privacy ask → URL entry → ``check_backend``
-validation → typed store write → honest "takes effect next launch" line
-(ADR-0018: no client hot-swap) — gated by an explicit y/n when a choice
-is already stored.
+validation → typed store write → hot-swap + full resync IN-SESSION
+(TCK-BACKEND-002, ADR-0018 amendment; the next-launch copy returns only
+when the swap declines) — gated by an explicit y/n when a choice is
+already stored.
 
 Pinned here (ticket requirement 6):
 
-* happy path (URL accepted → stored → next-launch line), skip path (no
+* happy path (URL accepted → stored → live swap), skip path (no
   change), reject path (bad URL → value-free failure → retry → explicit
   public pick — never saved, never echoed);
 * the already-stored overwrite gate: decline → unchanged; accept →
   replace; non-y/n holds at the gate; skip inside a gated run keeps the
   stored choice ("keep current", not the first-run "public for now");
   an explicit public pick reverts (clears the stored rung);
-* ``ssl://``/electrum-protocol URLs: plainly named as unsupported for
-  v1 (Esplora over http(s) only, TCK-ONB-004 backlog), never probed,
-  re-prompted — in both the ask state and the URL-entry state;
+* ``ssl://``/electrum-protocol URLs: FIRST-CLASS candidates since
+  TCK-BACKEND-002 (probe → store → swap, M3 acceptance); genuinely
+  foreign schemes (ftp://…) stay plainly refused — never probed, never
+  saved, re-prompted — in both the ask state and the URL-entry state;
 * ``/help`` lists ``/setup``; ``/setup`` without a CLI flow (web/headless
   pumps) prints the pointer instead — CLI-only by construction;
 * the doctor's ``NONE_FOUND`` guidance names the real options (no more
@@ -52,7 +54,7 @@ from localwallet.ui import onboarding as ob
 # Canonical fixture key material + the established onboarding harness (public
 # fixture only; the /setup conversation is the same state machine as
 # first-run step 5, so its seams are reused verbatim).
-from tests.test_onboarding import GOOD_URL, _drive, _preset_wallet
+from tests.test_onboarding import GOOD_URL, _drive, _fake_client, _preset_wallet
 
 SSL_URL = "ssl://evil-star.local:50001"
 BAD_URL = "https://typo.example/api"
@@ -195,7 +197,9 @@ def test_setup_gate_accept_overwrites_stored_choice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """y at the gate opens the ask; a new validated URL REPLACES the stored
-    rung (the write the gate authorized), with the next-launch honesty."""
+    rung (the write the gate authorized) — and since TCK-BACKEND-002 (the
+    ADR-0018 amendment) the live client follows IN-SESSION: swap + full
+    resync, no next-launch promise."""
     _preset_wallet(tmp_path, base_url=GOOD_URL)
     NEW_URL = "https://node2.mine.example:4000/api"
     code, rec, stored, state = _drive(
@@ -206,7 +210,8 @@ def test_setup_gate_accept_overwrites_stored_choice(
     )
     assert code == 0
     assert ob.CONFIRMED in rec.joined
-    assert ob.EFFECTS_NEXT_LAUNCH in rec.joined
+    assert ob.SWITCHING_NOW in rec.joined  # hot-swapped, resyncing now
+    assert ob.EFFECTS_NEXT_LAUNCH not in rec.joined
     assert stored == NEW_URL
     assert state["probes"] == 1
     assert state["model"] == 0
@@ -261,39 +266,67 @@ def test_setup_explicit_public_reverts_stored_choice(
 # -------------------------------------------------- ssl:// / electrum URLs
 
 
-def test_setup_ssl_url_named_plainly_never_probed_reprompted(
+def test_setup_ssl_url_is_probed_stored_and_swapped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Requirement 2: an ssl:// (Electrum-protocol) address at URL entry
-    gets the plain Esplora-only statement — zero probes, zero echoes — and
-    the entry stays open for a real http(s) URL."""
+    """TCK-BACKEND-002 (user direction 9): an ``ssl://`` (Electrum-protocol)
+    address at URL entry is a FIRST-CLASS candidate now — probed through the
+    same setup check, stored through the typed writer, and hot-swapped with
+    the full resync; never echoed. The M1 adapter's handshake (injected
+    fake here) replaces the old never-probed refusal."""
+    _preset_wallet(tmp_path)
+    monkeypatch.setattr(app_module, "ElectrumClient", lambda **_kw: _fake_client())
+    code, rec, stored, state = _drive(
+        monkeypatch, tmp_path,
+        lines=["/setup", "2", SSL_URL, "exit"],
+        interactive=True,
+        backend_check=lambda _u: True,
+    )
+    assert code == 0
+    joined = rec.joined
+    assert ob.NON_ESPLORA_URL not in joined  # the refusal era is over
+    assert ob.VALIDATION_FAIL not in joined
+    assert ob.CONFIRMED in joined
+    assert ob.SWITCHING_NOW in joined  # stored AND swapped live now
+    assert stored == SSL_URL  # the stored rung carries it (M3 acceptance)
+    assert "evil-star" not in joined  # value-free: the URL is never echoed
+    assert state["probes"] == 1  # probed as a candidate, once
+    assert state["model"] == 0
+
+
+def test_setup_foreign_scheme_named_never_probed_reprompted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scheme statement (narrowed by TCK-BACKEND-002 to genuinely
+    foreign schemes — ssl:// is spoken for now): an ftp:// address gets the
+    plain never-probed, never-saved answer at URL entry and the entry
+    re-prompts — the real URL that follows lands normally."""
     _preset_wallet(tmp_path)
     code, rec, stored, state = _drive(
         monkeypatch, tmp_path,
-        lines=["/setup", "2", SSL_URL, GOOD_URL, "exit"],
+        lines=["/setup", "2", "ftp://x/api", GOOD_URL, "exit"],
         interactive=True,
         backend_check=lambda _u: True,
     )
     assert code == 0
     joined = rec.joined
     assert ob.NON_ESPLORA_URL in joined
-    assert "evil-star" not in joined  # value-free: the URL is never echoed
-    assert "ssl" in joined  # the copy NAMES the unsupported scheme
+    assert "ftp" not in joined  # the copy names families, never the URL
     assert ob.VALIDATION_FAIL not in joined  # not probed → no "didn't check out"
     assert stored == GOOD_URL  # re-prompted entry accepted the real URL
-    assert state["probes"] == 1  # ONLY the http(s) candidate was ever probed
+    assert state["probes"] == 1  # ONLY the accepted candidate was ever probed
     assert state["model"] == 0
 
 
 def test_setup_ssl_url_at_the_ask_is_consumed_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The scheme refusal is channel-wide: pasting ssl:// while the ask is
-    open (where first run used to hand it to the model) gets the same
-    statement — nothing probed, nothing saved, ask stays open. The skip
-    that follows lands on the HELD launch's honest answer (ASK_WAITS_ACK,
-    security review F1 — an unresolved launch waits, scan-less or not),
-    still not the plain (e) ack."""
+    """An ssl:// paste while the ask is open rides the URL-candidate channel
+    (TCK-BACKEND-002 — no longer the foreign-scheme statement): probed as a
+    candidate (refused here, nothing saved, ask stays open), never echoed.
+    The skip that follows lands on the HELD launch's honest answer
+    (ASK_WAITS_ACK, security review F1 — an unresolved launch waits,
+    scan-less or not), still not the plain (e) ack."""
     _preset_wallet(tmp_path)
     code, rec, stored, state = _drive(
         monkeypatch, tmp_path,
@@ -301,12 +334,13 @@ def test_setup_ssl_url_at_the_ask_is_consumed_too(
         interactive=True,
     )
     assert code == 0
-    assert ob.NON_ESPLORA_URL in rec.joined
+    assert ob.NON_ESPLORA_URL not in rec.joined  # candidate, not foreign
+    assert ob.VALIDATION_FAIL in rec.joined  # probed, refused (seam says no)
     assert "evil-star" not in rec.joined
     assert ob.ASK_WAITS_ACK in rec.joined  # held: skipping is not consent
     assert ob.SKIP_ACK not in rec.joined
     assert stored is None
-    assert state["probes"] == 0
+    assert state["probes"] == 1  # the ssl:// candidate WAS probed (as a candidate)
     assert state["model"] == 0
 
 
