@@ -19,6 +19,7 @@ Launch matrix (entry = ``main`` / ``python -m localwallet.ui.cli``):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -26,12 +27,14 @@ import socket
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from localwallet import app
+from localwallet.agent.runtime import ModelRuntime
 from localwallet.config import Settings
 from localwallet.store import Store
 from localwallet.wallet import WalletDescriptor
@@ -448,10 +451,20 @@ _FAKE_HANG = (
 
 
 class _FakeRuntime:
-    """Stand-in for the lazily-loaded ModelRuntime (never generated on)."""
+    """Stand-in for the lazily-loaded ModelRuntime (never generated on).
+
+    TCK-LAUNCH-003: records preload ``load()`` calls (the background
+    preload thread fires at engine start) without touching llama.cpp.
+    """
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         self.ctor = (args, kwargs)
+        self.load_calls = 0
+        self.loaded = threading.Event()
+
+    def load(self) -> None:
+        self.load_calls += 1
+        self.loaded.set()
 
     def generate(self, prompt: str, *, grammar_text: str | None = None) -> str:
         raise AssertionError("no turn must run in these tests")
@@ -497,6 +510,10 @@ def test_default_file_present_selects_real_model_silently(
     joined = "\n".join(outputs)
     assert app.MODEL_CARD_QUESTION not in joined  # the NORMAL launch: no card
     assert app.NO_MODEL_DEMO_BANNER not in joined  # no demo either
+    # TCK-LAUNCH-003: and the real rung PRELOADS at engine start — the
+    # background loader called runtime.load() (seam counter, never llama).
+    assert built[0].loaded.wait(10)
+    assert app.MODEL_PRELOAD_NOTICE in joined
 
 
 def test_default_file_absent_arms_the_download_card(
@@ -513,6 +530,9 @@ def test_default_file_absent_arms_the_download_card(
     assert app.MODEL_CARD_QUESTION in joined  # no silent demo mode
     assert app.MODEL_CARD_HINT in joined
     assert app.NO_MODEL_DEMO_BANNER not in joined  # the card REPLACES it
+    # TCK-LAUNCH-003: the card path is the PRELOAD path's exclusive
+    # opposite — nothing to load, so no preload arms (no regression).
+    assert app.MODEL_PRELOAD_NOTICE not in joined
 
 
 def test_unresolvable_default_keeps_the_plain_demo_banner(
@@ -788,3 +808,306 @@ def test_display_truncation_is_head_dot_dot_tail() -> None:
     long = "z" * 100
     cut = app._display_truncate(long)
     assert cut.startswith(long[:12]) and cut.endswith(long[-8:]) and "…" in cut
+
+
+# ============ TCK-LAUNCH-003: background model preload + launch checksum ====
+#
+# The repo machine HAS the real 3GB GGUF: nothing here may load it. Every
+# build is a fake — a duck-typed runtime with a gated ``load()`` for the
+# flow/pump level, and a fake ``llama_cpp`` module injected into
+# ``sys.modules`` for the ModelRuntime lock pin. Checksums run over tiny
+# tmp files with a supplied fake pin.
+
+_PRELOAD_THREAD_NAMES = ("model-preload", "model-integrity")
+
+
+class _LoadBoom(Exception):
+    """Error type raised by a fake load() that fails (the flow catches
+    Exception broadly; the name only documents intent)."""
+
+
+class _GateRuntime:
+    """Duck-typed ModelRuntime: ``load()`` waits on a gate Event (the
+    stand-in for the multi-GB build) and records calls."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.fail = fail
+
+    def load(self) -> None:
+        self.calls += 1
+        self.entered.set()
+        assert self.release.wait(15), "test gate never opened"
+        if self.fail:
+            raise _LoadBoom("fake load failure")
+
+
+class _DoneRuntime:
+    """Duck-typed ModelRuntime whose ``load()`` returns at once."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.loaded = threading.Event()
+
+    def load(self) -> None:
+        self.calls += 1
+        self.loaded.set()
+
+
+def _preload_pump(
+    flow: app.ModelPreloadFlow,
+) -> tuple[list[app.EngineEvent], queue.Queue[Any], threading.Thread]:
+    """One REAL pump on a thread with the flow attached; returns the event
+    list, the command queue and the pump thread (caller QUITs/joins)."""
+    events: list[app.EngineEvent] = []
+    emitter = app.EventEmitter(events.append)
+    commands: queue.Queue[Any] = queue.Queue()
+    thread = threading.Thread(
+        target=lambda: app._pump(
+            app.AgentLoop(app.stub_generate, {app.IntentName.RESPOND: app._respond_handler}),
+            emitter.text,
+            commands,
+            flow=app.TxFlow(),
+            session=app.SendSession(),
+            table={},
+            emitter=emitter,
+            preload=flow,
+        ),
+        daemon=True,
+    )
+    thread.start()
+    return events, commands, thread
+
+
+def _request_snapshot(commands: queue.Queue[Any]) -> dict[str, object]:
+    """One typed ``/state`` read through the SAME queue. Queue FIFO is the
+    drain proof: every marker enqueued BEFORE this request has been
+    engine-handled by the time the reply lands."""
+    reply: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+    commands.put(app.StateSnapshotRequest(app.STATE_SNAPSHOT_COMMAND, reply))
+    return reply.get(15)
+
+
+def _await_settled(flow: app.ModelPreloadFlow, deadline_s: float = 15.0) -> None:
+    """Block until the load marker has been CONSUMED (state flipped off
+    ``loading``) AND every spawned worker thread is done — so a checksum
+    marker is provably ENQUEUED by the time the caller does a FIFO
+    ``/state`` drain. Sound after the flip: both workers spawn inside the
+    one PRELOAD_START handling that strictly precedes any marker, so a
+    worker seen not-alive then is a finished one (not a not-yet-started
+    one)."""
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline and flow.state == "loading":
+        time.sleep(0.02)
+    assert flow.state != "loading", "load marker never consumed"
+    while time.monotonic() < deadline:
+        if not any(
+            t.name in _PRELOAD_THREAD_NAMES and t.is_alive()
+            for t in threading.enumerate()
+        ):
+            return
+        time.sleep(0.02)
+    raise AssertionError("preload workers never settled")
+
+
+def _quit_and_join(commands: queue.Queue[Any], thread: threading.Thread) -> None:
+    commands.put(app.QUIT)
+    thread.join(15)
+    assert not thread.is_alive()  # bounded exit, always
+
+
+def test_model_state_flips_loading_to_ready_over_the_pump(tmp_path: Path) -> None:
+    """The deliverable-1 pin: with the load GATED, the pump keeps answering
+    ``/state`` — additive ``model_state='loading'`` — and the terminal
+    marker flips it to ``ready`` (turn_end rides so the browser re-reads)."""
+    runtime = _GateRuntime()
+    flow = app.ModelPreloadFlow(runtime, model_path=str(tmp_path / "m.gguf"))
+    events, commands, thread = _preload_pump(flow)
+    try:
+        commands.put(app.PRELOAD_START)
+        assert runtime.entered.wait(10)  # the loader called runtime.load()
+        snap = _request_snapshot(commands)
+        assert snap["model_state"] == "loading"  # pump responsive DURING load
+        assert app.MODEL_PRELOAD_NOTICE in _texts(events)
+        before = len(events)
+        runtime.release.set()
+        _await_settled(flow)
+        snap = _request_snapshot(commands)  # FIFO: the marker was consumed
+        assert snap["model_state"] == "ready"
+        assert runtime.calls == 1  # exactly ONE build
+        assert any(
+            e.kind == app.EVENT_TURN_END and e.id > before for e in events
+        )  # the flip closes a turn for the re-read
+    finally:
+        runtime.release.set()
+        _quit_and_join(commands, thread)
+
+
+def test_preload_failure_flips_failed_and_logs_value_free(tmp_path: Path) -> None:
+    """A raising load = state ``failed`` + one log line; the session keeps
+    running (the next generate re-raises through the existing per-turn
+    path — runtime-side, pinned separately)."""
+    logs: list[str] = []
+    runtime = _GateRuntime(fail=True)
+    flow = app.ModelPreloadFlow(
+        runtime, model_path=str(tmp_path / "m.gguf"), log_fn=logs.append
+    )
+    events, commands, thread = _preload_pump(flow)
+    try:
+        commands.put(app.PRELOAD_START)
+        assert runtime.entered.wait(10)
+        runtime.release.set()
+        _await_settled(flow)
+        snap = _request_snapshot(commands)
+        assert snap["model_state"] == "failed"
+        assert logs == [app._MODEL_PRELOAD_FAILED_LOG]  # log-only, value-free
+        assert not any(  # no extra user-facing panic line
+            app.MODEL_INTEGRITY_WARNING in e.payload for e in events
+        )
+    finally:
+        _quit_and_join(commands, thread)
+
+
+def test_checksum_mismatch_warns_and_keeps_serving(tmp_path: Path) -> None:
+    """The deliverable-2 decision pin: mismatch = the value-free warning
+    LINE (transcript) + LOG entry, state stays honest about the LOAD
+    (``ready``) — serving continues."""
+    gguf = tmp_path / "m.gguf"
+    payload = b"GGUF-ish bytes"
+    gguf.write_bytes(payload)
+    logs: list[str] = []
+    flow = app.ModelPreloadFlow(
+        _DoneRuntime(),
+        model_path=str(gguf),
+        sha256="0" * 64,  # fake pin that can never match
+        log_fn=logs.append,
+    )
+    events, commands, thread = _preload_pump(flow)
+    try:
+        commands.put(app.PRELOAD_START)
+        _await_settled(flow)
+        snap = _request_snapshot(commands)  # FIFO drain proof
+        assert snap["model_state"] == "ready"  # KEEPS SERVING
+        texts = _texts(events)
+        assert texts.count(app.MODEL_INTEGRITY_WARNING) == 1  # one line
+        assert logs == [app.MODEL_INTEGRITY_WARNING]  # + the log entry
+        # value-free: no path, no digests, no filename anywhere
+        joined = texts + "".join(logs)
+        assert str(gguf) not in joined and "m.gguf" not in joined
+        assert hashlib.sha256(payload).hexdigest() not in joined
+    finally:
+        _quit_and_join(commands, thread)
+
+
+def test_checksum_pass_is_silent(tmp_path: Path) -> None:
+    """The matching pin = the NORMAL case: the check RUNS (thread, FIFO
+    drain) and says NOTHING."""
+    payload = b"GGUF-fake-pinned-bytes"
+    gguf = tmp_path / "m.gguf"
+    gguf.write_bytes(payload)
+    logs: list[str] = []
+    flow = app.ModelPreloadFlow(
+        _DoneRuntime(),
+        model_path=str(gguf),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        log_fn=logs.append,
+    )
+    events, commands, thread = _preload_pump(flow)
+    try:
+        commands.put(app.PRELOAD_START)
+        _await_settled(flow)
+        snap = _request_snapshot(commands)
+        assert snap["model_state"] == "ready"
+        assert app.MODEL_INTEGRITY_WARNING not in _texts(events)
+        assert logs == []
+    finally:
+        _quit_and_join(commands, thread)
+
+
+def test_env_rung_preloads_at_engine_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point (user direction 11): a resolved REAL model rung
+    starts the load at ENGINE START — not at the first question. Driven
+    end-to-end through run() on the CLI pump with a fake runtime."""
+    gguf = tmp_path / "m.gguf"
+    gguf.write_bytes(b"GGUF")
+    built: list[_FakeRuntime] = []
+    monkeypatch.setattr(
+        app, "ModelRuntime",
+        lambda *a, **k: built.append(_FakeRuntime(*a, **k)) or built[-1],
+    )
+    monkeypatch.setenv("LOCALWALLET_MODEL_PATH", str(gguf))
+    outputs: list[str] = []
+    code = app.run(
+        ["--zpub", ZPUB], input_fn=lambda _p: "exit", output_fn=outputs.append
+    )
+    assert code == 0
+    assert built and built[0].loaded.wait(10)  # load called at start
+    assert app.MODEL_PRELOAD_NOTICE in "\n".join(outputs)
+
+
+def test_first_query_waits_for_the_in_flight_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The runtime-side serialization pin (deliverable 1's "waits cleanly"):
+    a generate() landing mid-build BLOCKS on the construction lock, then
+    rides the finished runtime — never a double build, never an error,
+    never a silent drop. Fake llama_cpp module (slow ctor), real lock code."""
+    gguf = tmp_path / "m.gguf"
+    gguf.write_bytes(b"GGUF")
+    entered = threading.Event()
+    release = threading.Event()
+    built: list[str] = []
+
+    class FakeLlama:
+        def __init__(self, *, model_path: str, **_kw: object) -> None:
+            built.append(model_path)
+            entered.set()
+            assert release.wait(15), "test gate never opened"
+
+        def __call__(self, **_kw: object) -> dict[str, Any]:
+            return {"choices": [{"text": '{"v": 0}'}]}
+
+    class FakeGrammar:
+        @classmethod
+        def from_string(cls, _text: str) -> FakeGrammar:
+            return cls()
+
+    fake_mod = types.ModuleType("llama_cpp")
+    fake_mod.Llama = FakeLlama  # type: ignore[attr-defined]
+    fake_mod.LlamaGrammar = FakeGrammar  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "llama_cpp", fake_mod)
+
+    rt = ModelRuntime(model_path=str(gguf))
+    loader = threading.Thread(target=rt.load, daemon=True)
+    loader.start()
+    assert entered.wait(10)  # the build is IN FLIGHT, lock held
+
+    outcomes: list[str] = []
+    query = threading.Thread(
+        target=lambda: outcomes.append(rt.generate("prompt")), daemon=True
+    )
+    query.start()
+    query.join(0.3)
+    assert query.is_alive()  # the first query WAITS (clean block, no drop)
+    assert built == [str(gguf)]  # …and did NOT start a second build
+    release.set()
+    loader.join(15)
+    query.join(15)
+    assert built == [str(gguf)]  # exactly one construction, ever
+    assert outcomes == ['{"v": 0}']  # the waited-on turn ANSWERS
+
+
+def test_manifest_pin_lookup_is_exact_and_fail_closed(tmp_path: Path) -> None:
+    """The launch checksum verifies ONLY manifest-pinned files; an arbitrary
+    env-rung path gets no verdict against no pin (``None`` = skip)."""
+    entries = json.loads((app.MODELS_DIR / "manifest.json").read_text())
+    pinned = next(e for e in entries if e.get("default") is True)
+    assert app._manifest_pin_for(app.MODELS_DIR / "bin" / f"{pinned['name']}.gguf") == (
+        pinned["sha256"]
+    )
+    assert app._manifest_pin_for(tmp_path / "whatever.gguf") is None
+    assert app._manifest_pin_for(app.MODELS_DIR / "bin" / "unpinned.gguf") is None

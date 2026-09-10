@@ -321,9 +321,10 @@ def test_state_snapshot_request_is_answered_on_the_engine_thread(
     build_threads: list[int] = []
     real_build = app.build_state_snapshot
 
-    def spy_build(flow, session, watcher, scan=None, model=None, backend_kind=None):
+    def spy_build(flow, session, watcher, scan=None, model=None, backend_kind=None,
+                  preload=None):
         build_threads.append(threading.get_ident())
-        return real_build(flow, session, watcher, scan, model, backend_kind)
+        return real_build(flow, session, watcher, scan, model, backend_kind, preload)
 
     monkeypatch.setattr(app, "build_state_snapshot", spy_build)
     events: list[EngineEvent] = []

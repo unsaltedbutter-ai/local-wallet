@@ -48,8 +48,11 @@ implements no protocol, wallet, chain, or tx-engine logic itself:
   ``env > config file > stored > public default``, resolved through
   :func:`localwallet.config.resolve_chain_base_url` — the ONE place the
   stored choice enters), reuse or create the single wallet profile
-  (descriptor-match guard, ADR-0010), pick the model runtime (remote
-  debug bridge → local GGUF → ``--stub-llm``), start the NON-BLOCKING
+   (descriptor-match guard, ADR-0010), pick the model runtime (remote
+   debug bridge → local GGUF → ``--stub-llm``; a resolved local GGUF is
+   PRELOADED on a background thread at engine start, with a launch checksum
+   against the manifest's pinned sha256, so the first user query never pays
+   the multi-GB build — TCK-LAUNCH-003), start the NON-BLOCKING
   startup scan (or ``--rescan``; env opt-out via ``LOCALWALLET_AUTO_SCAN=0``)
   on the dedicated chain worker (:class:`ScanFlow`, TCK-SCAN-003 /
   ADR-0022 — the REPL prompt is live while the scan runs, dots flow
@@ -96,6 +99,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import queue
@@ -235,10 +239,13 @@ __all__ = [
     "MODEL_CARD_QUESTION",
     "MODEL_DECLINED_LINES",
     "MODEL_DOWNLOAD_COMMAND",
+    "MODEL_INTEGRITY_WARNING",
     "MODEL_LATER_COMMAND",
+    "MODEL_PRELOAD_NOTICE",
     "NODE_STATUS_DETECTION_DISABLED",
     "NO_MODEL_DEMO_BANNER",
     "OUT_OF_WINDOW_NOTICE",
+    "PRELOAD_START",
     "PRIVACY_INDICATOR",
     "PRIVACY_INDICATOR_OWN_NODE_LOCAL",
     "PRIVACY_INDICATOR_OWN_NODE_REMOTE",
@@ -250,6 +257,7 @@ __all__ = [
     "WEB_PORT_ENV_VAR",
     "ZPUB_ENV_VAR",
     "ModelDownloadFlow",
+    "ModelPreloadFlow",
     "SendSession",
     "SignerSelection",
     "build_dispatch_table",
@@ -339,6 +347,36 @@ def _resolve_default_model() -> tuple[str, Path] | None:
     return None
 
 
+def _manifest_pin_for(path: Path) -> str | None:
+    """The manifest's pinned ``sha256`` for ``path`` when that path IS a
+    pinned model entry's file (``models/bin/<name>.gguf``); ``None`` when
+    nothing pins it (TCK-LAUNCH-003 launch checksum). An arbitrary
+    ``LOCALWALLET_MODEL_PATH`` file has no recorded hash — the app NEVER
+    invents a verdict against no pin; it simply skips the checksum.
+    Fail-closed ``None`` on an unreadable manifest; value-free (the hash
+    is build metadata, but it still goes nowhere near a line or a log).
+    """
+    try:
+        entries = json.loads(_MODEL_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        sha256 = entry.get("sha256")
+        if (
+            isinstance(name, str)
+            and name
+            and isinstance(sha256, str)
+            and _MODEL_BIN_DIR / f"{name}.gguf" == path
+        ):
+            return sha256
+    return None
+
+
 #: The deterministic Yes/No card (TCK-LAUNCH-002, user direction
 #: 2026-09-09). Emitted by the ENGINE pump at session start when the pinned
 #: default model is simply not downloaded yet — code-owned text, identical
@@ -400,6 +438,42 @@ _QUICK_ACTION_INTENTS: Final[dict[str, IntentName]] = {
 #: ``/receive`` (next receive address) and ``/settings`` (settings read) are
 #: pure store reads, not model intents — handled directly (None marker).
 _QUICK_STORE_COMMANDS: Final[frozenset[str]] = frozenset({"/receive", "/settings"})
+
+# ------------------------------------------- model preload (TCK-LAUNCH-003)
+#
+# User direction 2026-09-09 (11): the first query paid the whole
+# multi-GB llama.cpp build because ModelRuntime loaded lazily — the model
+# is now PRELOADED on a bounded background thread at ENGINE start, so a
+# session's first question only waits for whatever load remains (never
+# an error, never a drop: the runtime's build lock serializes the wait).
+# (4 part 2): a model file already present is checksummed against the
+# manifest's pinned sha256 at launch — CONCURRENTLY with the load (both
+# are read-only and the checksum gates nothing, so sequencing it before
+# the load would only delay readiness). A mismatch is the value-free
+# warning below + a line in the per-launch log, and the session KEEPS
+# SERVING (documented decision: model_state stays honest about the LOAD
+# — ``loading`` → ``ready`` | ``failed`` — the checksum is advisory; a
+# genuinely corrupt GGUF fails inside llama.cpp's own build anyway, and
+# a verdict that bricks a working wallet is the worse failure).
+
+#: Narrated by the pump when the background preload begins (web: the
+#: transcript, CLI: the terminal). Value-free.
+MODEL_PRELOAD_NOTICE: Final[str] = (
+    "Loading the model in the background — your first question may wait "
+    "for it."
+)
+#: Browser/transcript status line when the launch checksum fails.
+#: Value-free: no path, no hash, no filename (the manifest is public but
+#: the line stays scrubbed like every other warning).
+MODEL_INTEGRITY_WARNING: Final[str] = (
+    "model file failed its integrity check — re-download recommended"
+)
+#: Per-launch-log line when the background LOAD itself failed (the state
+#: flips to ``failed`` and the next generate re-raises through the
+#: existing per-turn error path — this only records the startup fact).
+_MODEL_PRELOAD_FAILED_LOG: Final[str] = (
+    "model failed to preload at startup; the next request will retry the load"
+)
 
 #: TCK-WEB-008 follow-up (a): the watch key surfaced in GET /settings — a
 #: display-TRUNCATED entry by default, the full value on an explicit
@@ -3904,6 +3978,183 @@ def _model_progress_fields(tick: _ModelProgress) -> dict[str, int | None]:
     return {"downloaded": downloaded, "total": total, "pct": pct}
 
 
+# ------------------------------- model preload + launch checksum (TCK-LAUNCH-003)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreloadStart:
+    """Pump command: arm the background model preload + launch checksum.
+    The CLI transport queues it at pump entry; the WEB launcher queues it
+    only AFTER the URL/token launch lines have printed — the pinned
+    wheel's model-build noise silencer dup2's /dev/null onto process fds
+    1/2 for the build's duration (process-wide), and the printed token is
+    the ONE line that must never fall into that window."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "PRELOAD_START"
+
+
+#: Push this on the command queue to arm the preload (see
+#: :class:`_PreloadStart`).
+PRELOAD_START: Final = _PreloadStart()
+
+
+@dataclass(frozen=True)
+class _PreloadDone:
+    """The loader thread's terminal delivery: ``ok`` = the llama runtime
+    finished building. VALUE-FREE by construction (a flag only — the
+    failure's message may name the model path; the error resurfaces on
+    the next generate through the existing per-turn path, which is the
+    whole reason the marker carries nothing else)."""
+
+    ok: bool
+
+
+@dataclass(frozen=True)
+class _IntegrityDone:
+    """The checksum thread's delivery: ``ok`` = the file hashed to the
+    manifest's pinned sha256 (never the digests themselves)."""
+
+    ok: bool
+
+
+class ModelPreloadFlow:
+    """Background preload + launch checksum for a resolved REAL local
+    model (TCK-LAUNCH-003; the absent-file sibling is
+    :class:`ModelDownloadFlow` — the two are mutually exclusive by
+    construction: no file → card, file → preload).
+
+    The SAME lifecycle discipline as every other engine flow
+    (:class:`ScanFlow`, :class:`ModelDownloadFlow`): the closed state
+    machine (``loading`` → ``ready`` | ``failed``) is mutated ONLY on the
+    ENGINE (pump) thread in :meth:`handle_command`; the two daemon worker
+    threads do nothing but read-only work and queue immutable markers.
+
+    Why a BACKGROUND load thread rather than the ticket's engine-thread
+    arm alternative: while the pump itself builds the model it cannot
+    service the command queue — the required ``model_state='loading'``
+    badge could never be SERVED, ``/state`` would time out for the whole
+    build, and QUIT would stall. Off-thread the pump stays live: snapshots
+    answer ``loading`` throughout, the terminal marker flips the state and
+    emits ``turn_end`` so the browser re-reads /state, and only a model
+    turn waits — INSIDE the runtime's build lock
+    (:meth:`localwallet.agent.runtime.ModelRuntime.load`/``generate``),
+    the ticket's "first query waits cleanly" serialization point: a
+    mid-build ``generate`` blocks on the same lock the loader holds and
+    then finds the finished runtime (never a double build of a multi-GB
+    model, never an error, never a drop). The wait is bounded
+    (:data:`~localwallet.agent.runtime.LOAD_WAIT_TIMEOUT_S`) and honest:
+    it only expires on a genuinely wedged read, where the pre-change
+    inline load would have hung the session exactly the same.
+
+    Thread-safety evidence for OFF-THREAD construction (pinned wheel,
+    llama-cpp-python 0.3.35): ``Llama.__init__`` is pure construction —
+    ``internals.LlamaModel``/``LlamaContext`` are ctypes handles with no
+    thread-local state, no signal handlers and no Python-level caches;
+    ctypes foreign calls RELEASE THE GIL, so the engine loop keeps
+    ticking while the native load runs, and the finished object is handed
+    over under the build lock and thereafter used by exactly one thread
+    (the engine). The one process-wide side effect is the wheel's
+    ``suppress_stdout_stderr`` around the model read (fd dup2 + sys.stdout
+    swap for the build's few seconds): launch lines are printed BEFORE the
+    arm (the web launcher queues :data:`PRELOAD_START` after the token
+    line), and CLI scan dots that land inside the window are the accepted,
+    self-healing, DOCUMENTED loss (next turn's prompt returns; the log
+    file and SSE stream have their own fds and never see it).
+
+    The checksum thread runs CONCURRENTLY with the load (documented
+    ordering decision: both are pure reads, the checksum gates nothing,
+    and hashing first would only postpone readiness). Mismatch → value-free
+    warning line + log entry, session KEEPS SERVING: ``model_state``
+    reflects the LOAD's honest verdict only (closed enum: card states
+    ``absent``/``running``/``ready``/``failed``/``declined`` + preload
+    member ``loading``; ``ready``/``failed`` are shared names with the
+    card's meanings).
+    """
+
+    def __init__(
+        self,
+        runtime: ModelRuntime,
+        *,
+        model_path: str,
+        sha256: str | None = None,
+        log_fn: Callable[[str], None] | None = None,
+        hash_chunk_bytes: int = 1 << 23,
+    ) -> None:
+        self.state: str = "loading"
+        self._runtime = runtime
+        self._model_path = model_path
+        self._sha256 = sha256 if isinstance(sha256, str) and sha256 else None
+        self._log_fn = log_fn
+        self._chunk = hash_chunk_bytes
+        self._commands: queue.Queue[Any] | None = None
+        self._started = False
+
+    def attach(self, commands: queue.Queue[Any]) -> None:
+        """Bind the pump's command queue (the workers deliver onto it)."""
+        self._commands = commands
+
+    def handle_command(
+        self, command: object, output_fn: Callable[[str], None]
+    ) -> bool:
+        """Consume one queue item ON THE ENGINE THREAD; ``True`` when
+        handled. The start marker spawns the workers (never before the
+        launch lines have printed — see :class:`_PreloadStart`); the
+        preload marker flips the state machine; the checksum marker only
+        narrates (see the class docstring's ordering decision)."""
+        if isinstance(command, _PreloadStart):
+            output_fn(MODEL_PRELOAD_NOTICE)  # prints BEFORE the fd window opens
+            commands = self._commands
+            if commands is not None and not self._started:
+                self._started = True
+                threading.Thread(
+                    target=self._load,
+                    args=(commands,),
+                    name="model-preload",
+                    daemon=True,
+                ).start()
+                if self._sha256 is not None:
+                    threading.Thread(
+                        target=self._integrity,
+                        args=(commands,),
+                        name="model-integrity",
+                        daemon=True,
+                    ).start()
+            return True
+        if isinstance(command, _PreloadDone):
+            self.state = "ready" if command.ok else "failed"
+            if not command.ok and self._log_fn is not None:
+                self._log_fn(_MODEL_PRELOAD_FAILED_LOG)
+            return True
+        if isinstance(command, _IntegrityDone):
+            if not command.ok:
+                if self._log_fn is not None:
+                    self._log_fn(MODEL_INTEGRITY_WARNING)
+                output_fn(MODEL_INTEGRITY_WARNING)
+            return True
+        return False
+
+    def _load(self, commands: queue.Queue[Any]) -> None:  # loader thread
+        try:
+            self._runtime.load()
+            ok = True
+        except Exception:  # noqa: BLE001 — the flag is the whole story;
+            # the error itself re-raises on the next generate (the runtime
+            # caches SUCCESS only), never from a worker thread.
+            ok = False
+        commands.put(_PreloadDone(ok=ok))
+
+    def _integrity(self, commands: queue.Queue[Any]) -> None:  # checksum thread
+        digest = hashlib.sha256()
+        try:
+            with open(self._model_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(self._chunk), b""):
+                    digest.update(chunk)
+        except OSError:
+            return  # cannot hash → claims NOTHING (the loader surfaces it)
+        commands.put(_IntegrityDone(ok=digest.hexdigest() == self._sha256.lower()))
+
+
 class _QuitSentinel:
     """Terminal command: stops the pump BETWEEN turns (never-cancel)."""
 
@@ -4150,10 +4401,16 @@ class EngineContext:
     provision: WatchKeyProvision | None = None
     #: TCK-LAUNCH-002: the engine-owned model-download flow, present when
     #: the launch fell back to the demo stub because the pinned default
-    #: model file is not downloaded yet. The pump arms it on the command
+    #: model file is not downloaded yet. The pump attaches it to the command
     #: queue and surfaces its state/progress; ``None`` = nothing to offer
     #: (a real model, remote bridge, or the explicit --stub-llm choice).
     model: ModelDownloadFlow | None = None
+    #: TCK-LAUNCH-003: the engine-owned background PRELOAD + launch checksum
+    #: of the resolved REAL local model (mutually exclusive with ``model``:
+    #: file present → preload, absent → card). The pump attaches it; the
+    #: transport arms it with :data:`PRELOAD_START` (CLI at pump entry, web
+    #: after the URL/token launch lines — see :class:`_PreloadStart`).
+    preload: ModelPreloadFlow | None = None
     #: TCK-APP-LOG-001: the mode-aware output router (web mode only). When
     #: present, :func:`start_engine` binds the engine emitter to it right
     #: after bootstrap so startup narration reaches the SSE stream (and
@@ -4190,6 +4447,7 @@ def build_state_snapshot(
     scan: ScanFlow | None = None,
     model: ModelDownloadFlow | None = None,
     backend_kind: str | None = None,
+    preload: ModelPreloadFlow | None = None,
 ) -> dict[str, object]:
     """The value-free ``/state`` snapshot, built ON the engine thread.
 
@@ -4200,12 +4458,15 @@ def build_state_snapshot(
     configured/enabled (booleans), — TCK-WEB-005 — the startup-scan state
     (a closed :class:`StartupScan` state name) plus the durable
     first-scan-completed boolean, — TCK-LAUNCH-002 — the model-download
-    state (a closed :class:`ModelDownloadFlow` state name), and —
-    TCK-BACKEND-002 — the live backend kind (a closed :data:`BACKEND_KINDS`
-    enum NAME, badge material: never a URL/host). No address, amount,
-    txid, ``tx_ref``, key material OR progress byte-count CAN appear — every
-    value is an enum NAME or a boolean, never data. No progress percentage
-    here (a wallet-size oracle); download progress rides its own event kind.
+    state (a closed :class:`ModelDownloadFlow` state name), —
+    TCK-LAUNCH-003 — the model PRELOAD state (a closed
+    :class:`ModelPreloadFlow` state name; the two are mutually exclusive:
+    file present → preload, absent → card), and — TCK-BACKEND-002 — the
+    live backend kind (a closed :data:`BACKEND_KINDS` enum NAME, badge
+    material: never a URL/host). No address, amount, txid, ``tx_ref``, key
+    material OR progress byte-count CAN appear — every value is an enum NAME
+    or a boolean, never data. No progress percentage here (a wallet-size
+    oracle); download progress rides its own event kind.
     """
     snapshot: dict[str, object] = {
         "schema": STATE_SCHEMA,
@@ -4223,6 +4484,12 @@ def build_state_snapshot(
         # Additive under state/1 (the shipped client reads named keys and
         # ignores this whole field when absent): a closed state NAME only.
         snapshot["model_state"] = model.state
+    elif preload is not None:
+        # TCK-LAUNCH-003: the SAME additive ``model_state`` field now also
+        # carries the preload machine (``loading`` while the background load
+        # runs, then ``ready``/``failed``). A checksum mismatch does NOT ride
+        # here (advisory; the session keeps serving) — see the class docs.
+        snapshot["model_state"] = preload.state
     if backend_kind is not None:
         # Additive under state/1 (same rule): the CLOSED enum name of the
         # live chain backend kind — a badge label, value-free by construction.
@@ -4780,9 +5047,12 @@ def start_engine(
     """Start the dedicated engine thread (ADR-0024 §3, threaded mode).
 
     ``bootstrap`` runs ON the engine thread — the Store (sqlite3 default
-    ``check_same_thread=True``) and the lazy Llama runtime MUST be created
-    inside it — and the pump then serves ``handle.commands`` there. The
-    CLI path (:func:`_repl`) runs the same pump with the main thread as the
+    ``check_same_thread=True``) MUST be created inside it — and the pump
+    then serves ``handle.commands`` there. (The lazy Llama runtime USED to
+    share this pinning; TCK-LAUNCH-003 made its construction explicitly
+    thread-safe, so a resolved local model now preloads on its own
+    background thread and the engine only ever uses it.)
+    The CLI path (:func:`_repl`) runs the same pump with the main thread as the
     engine; WEB-002's server supplies ``bootstrap`` over the real wiring.
     """
     handle = EngineHandle(commands=queue.Queue(), emitter=EventEmitter(sink))
@@ -4815,6 +5085,7 @@ def start_engine(
             store=ctx.store,
             provision=ctx.provision,
             model=ctx.model,
+            preload=ctx.preload,
             backend=ctx.backend,
         )
 
@@ -5031,6 +5302,7 @@ def _pump(
     onboarding: OnboardingFlow | None = None,
     provision: WatchKeyProvision | None = None,
     model: ModelDownloadFlow | None = None,
+    preload: ModelPreloadFlow | None = None,
     backend: ChainBackendFlow | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
@@ -5080,6 +5352,19 @@ def _pump(
     a code-owned bypass of the LLM, never model output. On exit any live
     download child is terminated BOUNDED (no orphans).
 
+    Model preload (TCK-LAUNCH-003): when ``preload`` is given the launch
+    resolved a REAL local model; the pump attaches it to the command queue
+    but does NOT arm it — the transport queues :data:`PRELOAD_START` when
+    safe for its channel (CLI: at pump entry; web: after the URL/token
+    launch lines printed, because the wheel's build-time stdout silencer is
+    process-wide). The pump then consumes the ``_PreloadDone``/
+    ``_IntegrityDone`` worker deliveries as first-class queue items: the
+    state machine (``loading`` → ``ready``/``failed``) flips HERE (the
+    terminal marker also emits ``turn_end`` so the browser re-reads
+    ``/state``), a checksum mismatch narrates one value-free warning and
+    serving CONTINUES, and a model turn that arrives mid-load waits inside
+    the runtime's build lock — clean serialization, never an error.
+
     Chain-backend hot-swap (TCK-BACKEND-002, ADR-0018 amendment): when
     ``backend`` is given, ``chain_base_url`` settings writes run the probe→
     store→SWAP path on this thread (the engine thread owns the client's
@@ -5105,6 +5390,11 @@ def _pump(
             # demo-mode banner — the user always learns the model is absent.
             output_fn(MODEL_CARD_QUESTION)
             output_fn(MODEL_CARD_HINT)
+    if preload is not None:
+        # TCK-LAUNCH-003: bind the queue only — the TRANSPORT arms the
+        # load with PRELOAD_START when its channel is print-safe (the
+        # wheel's build-time /dev/null dup2 window is process-wide).
+        preload.attach(commands)
     while True:
         if not (scan is not None and scan.in_progress):
             watch_count = _drain_watch(watcher, output_fn, client=client)
@@ -5126,6 +5416,15 @@ def _pump(
             # web client re-reads /state: the model_state flips and the
             # card/buttons resolve.
             if isinstance(command, _ModelDone) and emitter is not None:
+                emitter.emit(EVENT_TURN_END)
+            continue
+        if preload is not None and preload.handle_command(command, output_fn):
+            # TCK-LAUNCH-003: PRELOAD_START spawns the workers; _PreloadDone
+            # flips the closed state machine and closes an implicit turn so
+            # the client re-reads /state (model_state loading → ready/failed);
+            # _IntegrityDone narrates the value-free warning inline (no state
+            # change — the session keeps serving a mismatched file).
+            if isinstance(command, (_PreloadStart, _PreloadDone)) and emitter is not None:
                 emitter.emit(EVENT_TURN_END)
             continue
         if isinstance(command, _PumpError):
@@ -5192,6 +5491,7 @@ def _pump(
                 scan,
                 model,
                 backend.kind if backend is not None else None,
+                preload,
             )
             if provision is not None and provision.wiring is None:
                 snapshot["needs_watch_key"] = True
@@ -5558,6 +5858,7 @@ def run(
 
     generate: ModelRuntime | GenerateFn | RemoteOpenAIRuntime
     model_flow: ModelDownloadFlow | None = None
+    preload_flow: ModelPreloadFlow | None = None
     if generate_fn is not None:
         # Injected bare model callable (test seam) — used ahead of the
         # env/flag selection; flows through handle_raw like any runtime.
@@ -5569,6 +5870,21 @@ def run(
         output_fn(debug_notice(remote_base_url, remote_model))
     elif os.environ.get(MODEL_PATH_ENV_VAR):
         generate = ModelRuntime()
+        # TCK-LAUNCH-003 (user direction 11): a REAL local model at the env
+        # rung preloads on a background thread at engine start so the FIRST
+        # query stops paying the multi-GB build. Only when the file is
+        # actually there (else the pre-existing per-turn error stands);
+        # no launch checksum for an arbitrary path — nothing pins it, and
+        # the app never invents a verdict against no pin. The hasattr guard
+        # is the test seam that swaps in a faked runtime with no load hook.
+        env_model = os.environ.get(MODEL_PATH_ENV_VAR, "")
+        if env_model and Path(env_model).is_file() and hasattr(generate, "load"):
+            preload_flow = ModelPreloadFlow(
+                generate,  # type: ignore[arg-type]  # env rung: always ModelRuntime
+                model_path=env_model,
+                sha256=_manifest_pin_for(Path(env_model)),
+                log_fn=log.warning,
+            )
     elif args.stub_llm:
         # Explicit dev choice (unchanged from TCK-LAUNCH-001): the stub
         # without a banner and without a download card — the operator
@@ -5590,6 +5906,18 @@ def run(
         default = _resolve_default_model()
         if default is not None and default[1].is_file():
             generate = ModelRuntime(model_path=str(default[1]))
+            # TCK-LAUNCH-003: the normal, expected launch. The GGUF loads
+            # on a background thread NOW (user direction 11) and its bytes
+            # are checksummed CONCURRENTLY against the manifest pin (user
+            # direction 4 part 2) — mismatch warns value-free, serving
+            # continues (documented in ModelPreloadFlow).
+            if hasattr(generate, "load"):
+                preload_flow = ModelPreloadFlow(
+                    generate,
+                    model_path=str(default[1]),
+                    sha256=_manifest_pin_for(default[1]),
+                    log_fn=log.warning,
+                )
         elif default is not None:
             generate = stub_generate
             model_flow = ModelDownloadFlow(model_name=default[0])
@@ -5631,6 +5959,7 @@ def run(
             on_web_server=on_web_server,
             open_browser=open_browser,
             model=model_flow,
+            preload=preload_flow,
         )
 
     assert descriptor is not None  # CLI reaches here only with a key
@@ -5667,6 +5996,7 @@ def run(
             store=wiring.store,
             onboarding=wiring.onboarding,
             model=model_flow,
+            preload=preload_flow,
             backend=wiring.swap,
         )
     except KeyboardInterrupt:
@@ -6417,6 +6747,7 @@ def _run_web(
     on_web_server: Callable[[WebServer], None] | None = None,
     open_browser: bool = False,
     model: ModelDownloadFlow | None = None,
+    preload: ModelPreloadFlow | None = None,
 ) -> int:
     """The web launch (TCK-WEB-002, ADR-0024 §1/§3/§11; default UI and
     browser auto-open per the TCK-LAUNCH-001 amendment).
@@ -6447,6 +6778,11 @@ def _run_web(
     real model, the remote bridge, or the explicit --stub-llm path was
     selected); it rides the engine context so the pump emits the Yes/No
     card and owns the download lifecycle on the ENGINE thread.
+    ``preload`` (TCK-LAUNCH-003) is the mutually-exclusive sibling: the
+    background preload + launch checksum of the resolved REAL local model,
+    armed only AFTER the URL/token launch lines above have printed (the
+    wheel's build-time stdout silencer is process-wide — see
+    :class:`ModelPreloadFlow`).
 
     Exit codes mirror the CLI: ``0`` normal, ``2`` wiring/config failure
     (surfaced from the bootstrap; a busy fixed port names the fix).
@@ -6496,6 +6832,7 @@ def _run_web(
                 table={},
                 provision=provision,
                 model=model,
+                preload=preload,
                 output=output,
             )
         try:
@@ -6546,6 +6883,7 @@ def _run_web(
             store=wiring.store,
             provision=provision,
             model=model,
+            preload=preload,
             output=output,
             backend=wiring.swap,
         )
@@ -6599,6 +6937,15 @@ def _run_web(
                 output_fn(
                     f"Could not open a browser — open {server.url} manually."
                 )
+        if preload is not None:
+            # TCK-LAUNCH-003: arm the background preload + launch checksum
+            # ONLY now — every launch-critical line above (URL, TOKEN) has
+            # printed. The pinned wheel's model-build noise silencer dup2's
+            # /dev/null onto the process's stdout/stderr for the build's
+            # duration; a swallowed token would lock the user out, so the
+            # web transport arms AFTER its prints (the CLI arms at pump
+            # entry, where nothing unrecoverable is pending).
+            server.handle.commands.put(PRELOAD_START)
         if on_web_server is not None:
             on_web_server(server)
         server.wait()
@@ -6826,6 +7173,7 @@ def _repl(
     store: Store | None = None,
     onboarding: OnboardingFlow | None = None,
     model: ModelDownloadFlow | None = None,
+    preload: ModelPreloadFlow | None = None,
     backend: ChainBackendFlow | None = None,
 ) -> None:
     """The CLI transport over the engine pump (TCK-WEB-001, ADR-0024 §3).
@@ -6856,6 +7204,12 @@ def _repl(
     commands: queue.Queue[Any] = queue.Queue()
     ready = threading.Event()
     stop = threading.Event()
+    if preload is not None:
+        # TCK-LAUNCH-003: the CLI arms the preload at pump entry — every
+        # launch-critical line (banner, privacy notice) already printed
+        # through _wire; the first prompt/dots racing the wheel's
+        # build-time stdout window are the documented self-healing loss.
+        commands.put(PRELOAD_START)
     if emitter is None:
         emitter = cli_emitter(output_fn)
     threading.Thread(
@@ -6880,6 +7234,7 @@ def _repl(
             store=store,
             onboarding=onboarding,
             model=model,
+            preload=preload,
             backend=backend,
         )
     finally:

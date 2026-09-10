@@ -6,7 +6,10 @@ agent never touches llama.cpp directly. Design points:
 - **Lazy wheel import.** ``llama_cpp`` is imported only when a real
   generation is first attempted, so this module (and the whole ``agent``
   package) imports cleanly on machines without the wheel installed. Tests
-  inject a ``generate_fn`` stub instead.
+  inject a ``generate_fn`` stub instead. The lazy *build* gained a
+  thread-safe eager entry point (:meth:`ModelRuntime.load`, TCK-LAUNCH-003)
+  so the engine can preload the model at launch instead of making the
+  first user query pay for it.
 - **Grammar-constrained decoding.** The real path loads the envelope GBNF
   grammar (``agent/grammar/envelope.gbnf`` via :data:`GRAMMAR_PATH`) and
   passes it to every completion, so malformed envelope JSON is
@@ -29,6 +32,7 @@ flakiness (live evidence: escalation on a prompt that passes 5/5 isolated).
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Final
@@ -41,6 +45,7 @@ __all__ = [
     "DEFAULT_TEMPERATURE",
     "DEFAULT_TOP_K",
     "DEFAULT_TOP_P",
+    "LOAD_WAIT_TIMEOUT_S",
     "MODEL_PATH_ENV_VAR",
     "GenerateFn",
     "ModelRuntime",
@@ -75,6 +80,13 @@ DEFAULT_TOP_K: Final[int] = 64
 #: emit more than one envelope — the ceiling only bounds a pathological trailing
 #: whitespace loop (the recursive ``ws`` rule is unbounded).
 DEFAULT_MAX_TOKENS: Final[int] = 512
+
+#: TCK-LAUNCH-003: how long a mid-flight background preload may keep a
+#: first ``generate`` waiting on the construction lock before the wait is
+#: reported as a busy error (the next turn retries — never a silent drop).
+#: 600s is deliberately far beyond the worst real load of the pinned 3GB
+#: GGUF; hitting the bound means the load thread is genuinely wedged.
+LOAD_WAIT_TIMEOUT_S: Final[float] = 600.0
 
 #: Test injection seam: given the prompt and the grammar text, return the
 #: raw model completion. ``grammar_text`` is ``None`` only when a caller
@@ -149,6 +161,10 @@ class ModelRuntime:
         self.max_tokens = max_tokens
         self._generate_fn = generate_fn
         self._llama: object | None = None
+        # TCK-LAUNCH-003: guards model construction so a background preload
+        # (:meth:`load`) and the engine thread's first :meth:`generate`
+        # cannot build the (multi-GB) runtime twice.
+        self._llama_lock = threading.Lock()
         self._grammar_cls: type | None = None
         self._grammar: object | None = None
         self._grammar_text: str | None = None
@@ -192,6 +208,30 @@ class ModelRuntime:
             return self._generate_fn(prompt, text)
         return self._generate_with_llama(prompt, text)
 
+    def load(self) -> None:
+        """Build the llama runtime NOW instead of lazily (TCK-LAUNCH-003
+        preload hook; also what the lazy first ``generate`` funnels into).
+
+        Idempotent and thread-safe by construction: the (multi-GB) build
+        happens exactly once under ``_llama_lock``. A background preload
+        thread and the engine thread's first :meth:`generate` may race
+        here by design — whoever loses waits on the lock and then finds
+        the finished runtime, so the first query WAITS for an in-flight
+        load (never a double build, never a silent drop). Only a load
+        that still holds the lock past :data:`LOAD_WAIT_TIMEOUT_S` (a
+        wedged read — no timeout could rescue that either) is surfaced
+        as a busy :class:`ModelRuntimeError` the next turn retries. With
+        an injected ``generate_fn`` there is nothing to build.
+
+        Raises:
+            ModelRuntimeError: same conditions as the lazy path (wheel
+                absent, path unset/missing, llama failure), or the
+                bounded wait on a concurrent load expiring.
+        """
+        if self._generate_fn is not None:
+            return
+        self._ensure_llama()
+
     def _generate_with_llama(self, prompt: str, grammar_text: str) -> str:
         """Real llama.cpp path: cached model + cached grammar, one call.
 
@@ -225,31 +265,48 @@ class ModelRuntime:
 
         The import lives here — not at module top level — so this module
         imports cleanly without the wheel installed (TCK-P0-005).
+
+        TCK-LAUNCH-003: the build is lock-guarded so a background preload
+        (:meth:`load`) and an engine-thread ``generate`` cannot both
+        construct the model. The bounded acquire is the WAIT primitive
+        the first query rides: a concurrent in-flight load releases the
+        lock when it finishes (successfully or not), so the waiter then
+        either uses the loaded model or constructs it itself.
         """
-        if self._llama is not None:
-            return self._llama
-        try:
-            from llama_cpp import (  # deliberate lazy import (ADR-0001)
-                Llama,
-                LlamaGrammar,
-            )
-        except ImportError as exc:
-            msg = (
-                "llama-cpp-python is not installed; install it to run the local "
-                "model, or inject a generate_fn for testing"
-            )
-            raise ModelRuntimeError(msg) from exc
-
-        model_path = self.resolve_model_path()
-        if not model_path:
-            msg = f"no model path configured: pass model_path= or set {MODEL_PATH_ENV_VAR}"
+        llama = self._llama
+        if llama is not None:
+            return llama
+        if not self._llama_lock.acquire(timeout=LOAD_WAIT_TIMEOUT_S):
+            msg = "the model is still loading — try again"
             raise ModelRuntimeError(msg)
-        if not Path(model_path).is_file():
-            raise ModelRuntimeError(f"model file not found: {model_path}")
+        try:
+            llama = self._llama
+            if llama is not None:
+                return llama
+            try:
+                from llama_cpp import (  # deliberate lazy import (ADR-0001)
+                    Llama,
+                    LlamaGrammar,
+                )
+            except ImportError as exc:
+                msg = (
+                    "llama-cpp-python is not installed; install it to run the local "
+                    "model, or inject a generate_fn for testing"
+                )
+                raise ModelRuntimeError(msg) from exc
 
-        self._llama = Llama(model_path=model_path, n_ctx=self.n_ctx, verbose=False)
-        self._grammar_cls = LlamaGrammar
-        return self._llama
+            model_path = self.resolve_model_path()
+            if not model_path:
+                msg = f"no model path configured: pass model_path= or set {MODEL_PATH_ENV_VAR}"
+                raise ModelRuntimeError(msg)
+            if not Path(model_path).is_file():
+                raise ModelRuntimeError(f"model file not found: {model_path}")
+
+            self._llama = Llama(model_path=model_path, n_ctx=self.n_ctx, verbose=False)
+            self._grammar_cls = LlamaGrammar
+            return self._llama
+        finally:
+            self._llama_lock.release()
 
     def _ensure_grammar(self, grammar_text: str) -> object:
         """Compile (and cache) the GBNF grammar for constrained decoding."""
