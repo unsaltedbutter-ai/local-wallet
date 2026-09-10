@@ -19,43 +19,30 @@
   <button id="settings-toggle" class="btn btn-ghost" type="button" aria-expanded="false" aria-controls="settings-panel">Settings</button>
 </header>
 
-<!-- TCK-WEB-005: settings panel — rows are built by app.js from GET /settings
-     (textContent-only). Fetched on demand each time the panel opens; values
-     live only in this DOM: never logged, never persisted client-side. -->
+<!-- TCK-WEB-009 (h): header quick actions BELOW the top bar. Model-free
+     bypass actions riding the pump's canonical slash utterance through
+     POST /action (the same full-pipeline path every button takes). Both
+     ride "/balance": the engine offers no separate USD utterance and the
+     balance card carries the USD line, so the USD button is the same
+     deterministic turn (never an invented endpoint). Hidden pre-provision;
+     shown ONLY from the typed /state snapshot (never inferred). -->
+<nav id="quickbar" class="quickbar" aria-label="Quick balance actions" hidden>
+  <button type="button" class="btn btn-secondary btn-small" data-action="quick-btc" data-utterance="/balance" title='Sends "/balance"'>BTC Balance</button>
+  <button type="button" class="btn btn-secondary btn-small" data-action="quick-usd" data-utterance="/balance" title='Sends "/balance"'>USD Balance</button>
+</nav>
+
+<!-- TCK-WEB-009 (a): the settings pane is the ONLY first-run surface — the
+     separate "Connect your wallet" card is gone; its entry logic (POST
+     /watchkey incl. the replace/confirm rung) lives in the pane's zpub
+     section. Rows are built by app.js from GET /settings (textContent-only)
+     in the fixed order: wallet zpub, chain base url, gap limit. Values live
+     only in this DOM: never logged, never persisted client-side. -->
 <section id="settings-panel" class="settings" aria-label="Settings" hidden>
   <p id="settings-status" class="settings-status" role="status" aria-live="polite"></p>
-  <ul id="settings-list" class="settings-list"></ul>
+  <div id="settings-list" class="settings-cols"></div>
 </section>
 
 <main id="scroller" class="transcript-region">
-  <!-- TCK-LAUNCH-001 first-run watch-key form: shown only when the typed
-       /state snapshot carries needs_watch_key (a fresh single-user wallet
-       with no key on env/flag/stored). The copy mirrors the seed-policy
-       sweep (hardware-wallet-only, never seed words); submission is a
-       fetch to POST /watchkey (CSP form-action 'none' forbids native
-       submit). No key material is ever echoed back. -->
-  <section id="watchkey-panel" class="watchkey" aria-labelledby="watchkey-title" hidden>
-    <h2 id="watchkey-title">Connect your wallet</h2>
-    <p class="watchkey-lede">
-      Enter the wallet's <strong>public account key</strong> — an
-      <code>xpub</code>, <code>ypub</code>, or <code>zpub</code> — to begin.
-      You'll find it in your hardware wallet's settings under “export public
-      key” or “account descriptor” (for example a Jade or Coldcard).
-    </p>
-    <p class="watchkey-warning">
-      This is <strong>not</strong> your seed words. This app is
-      hardware-wallet-only: it never accepts a seed phrase or a private key,
-      and it could not use one. Mainnet keys only — testnet keys are refused.
-      Please never share your seed words with anyone.
-    </p>
-    <div class="watchkey-line">
-      <label class="visually-hidden" for="watchkey-input">Public account key</label>
-      <input id="watchkey-input" type="text" spellcheck="false" autocomplete="off"
-             placeholder="zpub…" maxlength="200" required>
-      <button id="watchkey-submit" class="btn btn-primary" type="button">Connect</button>
-    </div>
-    <p id="watchkey-status" class="watchkey-status" role="status" aria-live="polite"></p>
-  </section>
   <ol id="transcript" class="transcript" aria-label="Wallet conversation">
     <li id="hint" class="turn turn-system">Messages you send and replies from your wallet appear here.</li>
   </ol>

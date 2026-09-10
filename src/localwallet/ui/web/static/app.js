@@ -1,9 +1,16 @@
-// Local Wallet web client (TCK-WEB-002 + TCK-WEB-004). Vanilla ES module —
-// no framework, no build step. XSS contract: every dynamic value (all model
-// output) is rendered via textContent ONLY. HTML-string sinks are banned
-// here (ADR-0024 §7). Buttons inject canonical utterances through POST
-// /action into the FULL engine turn pipeline (ADR-0024 §8) — the client can
-// never skip a gate because it never touches a handler or the flow.
+// Local Wallet web client (TCK-WEB-002 + 004 + 005 + 008, LAUNCH-001/002,
+// WEB-009). Vanilla ES module — no framework, no build step. XSS contract:
+// every dynamic value (all model output) is rendered via textContent ONLY.
+// HTML-string sinks are banned here (ADR-0024 §7). Buttons inject canonical
+// utterances through POST /action into the FULL engine turn pipeline
+// (ADR-0024 §8) — the client can never skip a gate because it never touches
+// a handler or the flow. Settings mutations ride POST /settings and
+// POST /watchkey (engine-validated); the resync button rides POST /resync
+// (TCK-BACKEND-002). TCK-WEB-009: the settings pane is the ONLY first-run
+// surface (zpub entry moved into it; the separate card is gone), the set
+// watch key collapses to a read-only truncated display, the chain-base row
+// is an Edit→Apply read-only cycle with backend badges + a Resync-now
+// action, and the header carries the model-free balance quick actions.
 
 const island = window.__LOCALWALLET__;
 const token = island && typeof island.token === "string" ? island.token : "";
@@ -17,15 +24,12 @@ const sendBtn = document.getElementById("turn-send");
 const busyEl = document.getElementById("turn-busy");
 const scrollerEl = document.getElementById("scroller");
 const actionsEl = document.getElementById("actions");
+const quickbarEl = document.getElementById("quickbar");
 const scanChipEl = document.getElementById("scan-chip");
 const settingsToggleEl = document.getElementById("settings-toggle");
 const settingsPanelEl = document.getElementById("settings-panel");
 const settingsStatusEl = document.getElementById("settings-status");
 const settingsListEl = document.getElementById("settings-list");
-const watchkeyPanelEl = document.getElementById("watchkey-panel");
-const watchkeyInputEl = document.getElementById("watchkey-input");
-const watchkeySubmitEl = document.getElementById("watchkey-submit");
-const watchkeyStatusEl = document.getElementById("watchkey-status");
 
 // One map for every user-facing string this file injects (designer pass —
 // button labels live in index.html markup, likewise for rewording).
@@ -42,6 +46,7 @@ const LABELS = {
   settingsLoading: "Loading…",
   settingsUnavailable: "Could not load settings — the wallet is busy or unreachable.",
   settingsApply: "Apply",
+  settingsEdit: "Edit",
   settingsSaving: "Saving…",
   settingsApplied: "Applied.",
   settingsRejected: "Rejected — no reason given.",
@@ -56,46 +61,62 @@ const LABELS = {
     "Empty = public default — its operator can link your queries to your IP.",
   settingsEnvOverride: "Set via environment variable — edit there or remove it.",
   settingsRange: (min, max) => `Enter a whole number between ${min} and ${max}.`,
+  settingsSectionWatchKey: "Wallet",
+  settingsSectionNetwork: "Network & scanning",
   // TCK-LAUNCH-002 model-download card + inline progress.
   modelDownloading: "Downloading the model",
-  // watch key in settings (TCK-WEB-008 follow-up (a) / TCK-LAUNCH-002): the
-  // FULL public key arrives ONLY on the explicit single-key read (Show/Copy).
-  watchKeyEnvOverride:
-    "The key was set via environment variable — a replacement takes " +
-    "effect once that override is removed.",
-  watchKeyReplaced: "Watch key replaced.",
-  watchKeyReplacedNote:
-    "The new wallet loads with its own empty cache; the previous wallet's " +
-    "data stays in the store and no longer applies.",
-  // first-run watch-key form (TCK-LAUNCH-001) — the engine owns all key
-  // validation; we only relay its value-free status lines verbatim.
+  // zpub section of the settings pane (TCK-WEB-009 a/b): first-run ENTRY
+  // state (the moved card, compacted) and the collapsed SET state. The full
+  // key is never needed in this pane anymore — the display is the engine's
+  // own truncated value (Show/Copy/Replace affordances removed by user
+  // direction; the replace/confirm POST rung stays wired for an
+  // already-provisioned engine answering a fresh submit).
+  watchkeyLede:
+    "Enter the wallet's public account key — an xpub, ypub, or zpub — to " +
+    "begin. You'll find it in your hardware wallet's settings under “export " +
+    "public key” or “account descriptor” (for example a Jade or Coldcard).",
+  watchkeyWarning:
+    "This is not your seed words. This app is hardware-wallet-only. It " +
+    "never accepts a seed phrase or a private key, and it could not use " +
+    "one. Mainnet keys only — testnet keys are refused.",
+  watchKeyInputLabel: "Public account key",
+  watchKeyConnect: "Connect",
   watchkeySaving: "Connecting…",
   watchkeyConnected: "Connected.",
   watchkeyRejectedPrefix: "Not accepted:",
-  watchkeyRejected: "The key was not accepted — check it and try again.",
   watchkeyBusy: "The wallet is busy — try again.",
   watchkeyFailed: "Could not connect — try again.",
-  // settings watch-key row (TCK-WEB-008) — placeholder copy for the
-  // designer pass (docs/ux-first-run-web.md); strings live ONLY here.
-  settingsSectionWatchKey: "Wallet",
-  settingsSectionNetwork: "Network & scanning",
   watchKeyRowUnknown: "Status unknown — reconnecting…",
-  watchKeyRowAbsent: "No watch key connected yet — enter it in the form above.",
   watchKeyRowConnected: "Connected.",
-  watchKeyReveal: "Show",
-  watchKeyHide: "Hide",
-  watchKeyCopy: "Copy full key",
-  watchKeyCopied: "Full key copied.",
-  watchKeyCopyFailed: "Copy failed — the full key is shown; select and copy it.",
-  watchKeyReplace: "Replace watch key",
-  watchKeyReplaceCancel: "Cancel",
-  watchKeyReplaceYes: "Replace",
+  watchKeyEnvOverride:
+    "The key was set via environment variable — a replacement takes " +
+    "effect once that override is removed.",
   watchKeyReplaceConfirm:
     "The cached data belongs to the current wallet; replacing discards " +
     "any pending transaction and re-scans for the new wallet (the previous " +
     "wallet's cache stays in the store, unused). Replace the watch key?",
-  watchKeyReplaceLabel: "New public account key",
-  watchKeyReplaceApply: "Apply new key",
+  watchKeyReplaceYes: "Replace",
+  watchKeyReplaceCancel: "Cancel",
+  // backend badges (TCK-WEB-009 e) — the words are the closed enum family
+  // names the engine's backend_kind maps onto (bitcoind is reserved).
+  badgeMempool: "mempool",
+  badgeElectrum: "electrum",
+  badgeBitcoind: "bitcoind",
+  // Resync now (TCK-WEB-009 f) — POST /resync's closed statuses, value-free.
+  resyncNow: "Resync now",
+  resyncSaving: "Starting…",
+  resyncStarted: "Re-scan started — the scan chip above shows progress.",
+  resyncBusy: "Already scanning — try again once the current scan finishes.",
+  resyncUnavailable: "Re-scan is not available right now.",
+  // applied-write notes from the response's resync field (TCK-WEB-009 g):
+  // gap-limit and chain-base writes report whether a resync followed.
+  resyncNoteStarted: "Saved — re-scanning with the new value; the scan chip above follows.",
+  resyncNoteBusy: "Saved — a scan is already running; it will use the new value.",
+  resyncNoteDeferred: "Saved — the re-scan is queued behind the current scan.",
+  resyncNoteSkipped:
+    "Saved — your environment configuration outranks this one; it applies at next restart.",
+  resyncNoteUnchanged: "Already up to date — no re-scan needed.",
+  resyncNoteUnavailable: "Saved — no re-scan could start right now.",
 };
 
 // Which buttons the typed /state snapshot shows, per flow position. The
@@ -114,6 +135,36 @@ const FLOW_STATES = new Set([
   "idle", "created", "confirmed", "signed", "broadcast", "cancelled", "expired",
 ]);
 
+// TCK-WEB-009 (e): the three dimmed badges next to the chain-base field and
+// the closed backend_kind → badge mapping (the engine's enum, app.py
+// BACKEND_KINDS). mempool/electrum/bitcoind are the badge families: every
+// http(s) Esplora-shaped backend (the public mempool.space default, a
+// self-hosted mempool /api install, a root-served electrs/esplora) is the
+// "mempool" family; ssl:// is electrum; bitcoind is reserved (never emitted
+// today — its badge stays dimmed by construction). "none"/unknown: all dim.
+// ponytail: one badge per family, not per enum name — a fourth "esplora"
+// badge only earns its pixels when the two ever behave differently here.
+const BADGE_FAMILIES = {
+  mempool: new Set(["mempool", "public", "esplora"]),
+  electrum: new Set(["electrum"]),
+  bitcoind: new Set(["bitcoind"]),
+};
+const BACKEND_KINDS = new Set([
+  "none", "electrum", "public", "mempool", "esplora", "bitcoind",
+]);
+
+// The closed resync statuses the settings/resync replies carry (app.py
+// RESYNC_STATUSES) → honest inline note. An unknown value renders the plain
+// "Applied." line — never a guess.
+const RESYNC_NOTES = new Map([
+  ["started", LABELS.resyncNoteStarted],
+  ["busy", LABELS.resyncNoteBusy],
+  ["deferred", LABELS.resyncNoteDeferred],
+  ["skipped", LABELS.resyncNoteSkipped],
+  ["unchanged", LABELS.resyncNoteUnchanged],
+  ["unavailable", LABELS.resyncNoteUnavailable],
+]);
+
 const state = {
   lastEventId: 0,       // SSE cursor; sent as Last-Event-ID on reconnect
   openTurn: null,       // <li> currently receiving engine output
@@ -124,21 +175,29 @@ const state = {
   stopped: false,       // true on 401/no-token: stop reconnecting
   backoffMs: 500,
   // TCK-WEB-008: /state freshness (a slow first snapshot must never re-show
-  // a form the engine has already outgrown), the terminal dismiss on accept,
-  // the derived presence for the settings row, and the key the USER supplied
-  // in THIS page session (memory only — never persisted, never logged; a
-  // key supplied at launch never reaches the client at all, so it cannot be
-  // shown: the row then says so).
+  // an entry state the engine has already outgrown), the terminal dismiss on
+  // accept, and the key the USER supplied in THIS page session (memory only
+  // — never persisted, never logged; a key supplied at launch never reaches
+  // the client at all, so the collapsed display then falls back to the
+  // engine's own truncated settings entry).
   stateSeq: 0,
   watchKeyDismissed: false,
   watchKeyPresent: null, // null = unknown | true | false (typed state/1 only)
+  watchKeyNeeded: false, // the pane renders the zpub ENTRY form iff true
   sessionWatchKey: "",
   settingsAutoShown: false, // first-run auto-open episode armed/active
   // TCK-LAUNCH-002: the model card + inline download progress. The card /
   // quick-action buttons are shown ONLY from the typed snapshot's additive
   // model_state NAME (never prose); the progress line is an inline element
   // fed by the int-only model_progress events (percent + bytes, value-free).
-  downloadLine: null, // <p> currently receiving the inline progress bar
+  downloadLine: null, // <p> currently receiving the inline download bar
+  // TCK-WEB-009: the pane's data. The last successfully read settings
+  // entries (in memory only — never persisted, never logged) plus the live
+  // backend_kind NAME, so the zpub row can flip form↔display on a /state
+  // transition without a refetch storm (the engine is routinely busy —
+  // refetching right after a provisioning accept would 503).
+  settings: null, // null | Map<key, entry>
+  backendKind: "",
 };
 
 // model_state (a closed enum name from /state) → which of the two model
@@ -335,6 +394,7 @@ function applyState(snap) {
   applyScanChip(snap);
   applyWatchKeyGate(snap);
   applyModelPrompt(snap);
+  applyBackendKind(snap);
 }
 
 // TCK-LAUNCH-002: the Yes/No card buttons and the model-free quick-action
@@ -342,12 +402,13 @@ function applyState(snap) {
 // (state/1; the shipped doctrine: never infer structure from prose, never
 // guess on an unknown value). absent/failed = the card; declined/running =
 // quick actions; ready / a real model (no model_state field) / an unknown
-// name = neither. While the watch-key form still gates the page the model
-// card stands down (the form is the single first-run ask).
+// name = neither. While the wallet still needs its key (the pane's zpub
+// entry state) the model card stands down (provisioning is the single
+// first-run ask).
 function applyModelPrompt(snap) {
   const typed = snap && snap.schema === "state/1";
   const modelState = typed && typeof snap.model_state === "string" ? snap.model_state : "";
-  const gated = !watchkeyPanelEl.hidden; // no wallet yet — form owns the page
+  const gated = state.watchKeyNeeded; // no wallet yet — the entry state owns the page
   const showCard = !gated && MODEL_CARD_STATES.has(modelState);
   const showQuick = !gated && MODEL_QUICK_STATES.has(modelState);
   for (const btn of actionsEl.querySelectorAll(".model-only")) {
@@ -358,32 +419,34 @@ function applyModelPrompt(snap) {
   }
 }
 
-// TCK-LAUNCH-001 first-run: the watch-key form is shown ONLY on the typed
-// snapshot's additive ``needs_watch_key`` boolean (state/1 stays valid;
-// the shipped client keys off known fields and ignores the rest). While it
-// is up, chat is disabled — there is no wallet to talk to yet. The panel's
-// own submit (POST /watchkey) clears it; we NEVER infer provisioning from
-// local state, only from the engine's next snapshot — with one TCK-WEB-008
-// exception: a 200 ``accepted`` is the ENGINE'S OWN confirmation that the
-// key parsed, gated and persisted, so the form DISMISSES on the spot (the
-// user fix: no lingering card while the pump is busy with the post-provision
-// banner). A terminal dismiss is never re-shown by a stale snapshot, and the
-// ongoing refreshes below still re-sync everything else.
+// TCK-LAUNCH-001 first-run (TCK-WEB-009 (a): now a SETTINGS-PANE state, the
+// standalone card is gone): the zpub entry form shows iff the typed
+// snapshot's additive ``needs_watch_key`` is true. While it is up, chat is
+// disabled — there is no wallet to talk to yet — and the header balance
+// buttons stay hidden. The pane's own submit (POST /watchkey) clears the
+// state; we NEVER infer provisioning from local state, only from the
+// engine's next snapshot — with the TCK-WEB-008 exception kept: a 200
+// ``accepted`` is the ENGINE'S OWN confirmation that the key parsed, gated
+// and persisted, so the entry state DISMISSES on the spot (no lingering
+// form while the pump is busy with the post-provision banner). A terminal
+// dismiss is never re-shown by a stale snapshot.
 function applyWatchKeyGate(snap) {
   const typed = !!snap && snap.schema === "state/1";
   let needs = typed && snap.needs_watch_key === true;
   if (state.watchKeyDismissed) needs = false;
   if (typed) state.watchKeyPresent = !needs;
-  const wasNeeded = !watchkeyPanelEl.hidden;
-  watchkeyPanelEl.hidden = !needs;
-  const mute = needs;
-  inputEl.disabled = mute;
-  sendBtn.disabled = mute;
-  if (needs && !wasNeeded) watchkeyInputEl.focus(); // once, on reveal — not every refresh
+  const wasNeeded = state.watchKeyNeeded;
+  state.watchKeyNeeded = needs;
+  inputEl.disabled = needs;
+  sendBtn.disabled = needs;
+  // TCK-WEB-009 (h): the header quick buttons appear once a wallet is
+  // provisioned and never before (typed truth only — unknown = hidden).
+  quickbarEl.hidden = state.watchKeyPresent !== true;
+  if (needs !== wasNeeded) renderSettings(); // flip the pane's zpub row
+  if (needs && !wasNeeded && settingsPanelEl.hidden === false) focusWatchInput();
   // TCK-WEB-008 fix 3: an unset wallet opens the settings panel on its own
-  // (the row inside explains what is missing) and the panel closes itself
-  // once the key lands. A configured launch never opens; a state/0 (unknown)
-  // never fires either direction.
+  // and the panel closes itself once the key lands. A configured launch
+  // never opens; a state/0 (unknown) never fires either direction.
   if (needs && !state.settingsAutoShown) {
     state.settingsAutoShown = true;
     openSettings();
@@ -393,16 +456,18 @@ function applyWatchKeyGate(snap) {
   }
 }
 
-// The terminal success path of a watch-key submit (TCK-WEB-008 fix 1): hide
-// the whole form card, hand focus back to chat, keep the transcript + status.
+// The terminal success path of a watch-key submit (TCK-WEB-008 fix 1,
+// TCK-WEB-009 (b)): collapse the pane's zpub row to the read-only truncated
+// display, hand focus back to chat, keep the transcript + status.
 function dismissWatchKeyForm(key) {
-  state.sessionWatchKey = key; // memory only: powers the settings-row reveal/copy
+  state.sessionWatchKey = key; // memory only: the display fallback pre-/settings-read
   state.watchKeyDismissed = true;
   state.watchKeyPresent = true;
-  watchkeyInputEl.value = ""; // the key lives nowhere else after this line
-  watchkeyPanelEl.hidden = true;
+  state.watchKeyNeeded = false;
   inputEl.disabled = false;
   sendBtn.disabled = false;
+  quickbarEl.hidden = false;
+  renderSettings();
   if (state.settingsAutoShown) {
     state.settingsAutoShown = false; // the auto-open episode is over
     closeSettings();
@@ -421,6 +486,21 @@ function applyScanChip(snap) {
   } else if (snap.scan_state === "skipped") {
     scanChipEl.textContent = LABELS.scanSkipped;
     scanChipEl.hidden = false;
+  }
+}
+
+// TCK-WEB-009 (e): the badge strip follows the additive backend_kind NAME
+// from /state (and from every /settings reply — both carry it). An absent
+// or unknown value keeps the last known kind (additive-field rule: the
+// engine may legitimately answer state/0 while busy; that is not "no
+// backend").
+function applyBackendKind(snap) {
+  if (!snap || snap.schema !== "state/1") return;
+  if (typeof snap.backend_kind === "string" && BACKEND_KINDS.has(snap.backend_kind)) {
+    if (snap.backend_kind !== state.backendKind) {
+      state.backendKind = snap.backend_kind;
+      paintBackendBadges();
+    }
   }
 }
 
@@ -576,7 +656,9 @@ formEl.addEventListener("submit", (event) => {
 // channel with the pump's canonical SLASH COMMANDS (/download, /later,
 // /balance, /receive, /address) — deterministic engine-side intercepts,
 // never model-classified. "Open settings" (no utterance) is client-only:
-// the panel is already local.
+// the panel is already local. TCK-WEB-009 (h): the header balance buttons
+// ride the same /action channel with /balance (the card it renders carries
+// the USD line — there is no separate USD utterance and none is invented).
 actionsEl.addEventListener("click", (event) => {
   const btn = event.target.closest("button");
   if (!btn || state.stopped) return;
@@ -589,12 +671,25 @@ actionsEl.addEventListener("click", (event) => {
   }
 });
 
-// ------------------------------------------------------------------ settings
-// TCK-WEB-005. GET /settings renders an allowlisted snapshot the SERVER owns;
-// unknown keys/fields render generically (a text input) and never crash the
-// panel. POSTs reuse the same auth header path as every other request. Values
-// live only in panel DOM state — never logged, never stored client-side.
+quickbarEl.addEventListener("click", (event) => {
+  const btn = event.target.closest("button");
+  if (!btn || state.stopped || !btn.dataset.utterance) return;
+  submit("/action", "utterance", btn.dataset.utterance);
+});
 
+// ------------------------------------------------------------------ settings
+// TCK-WEB-005 + TCK-WEB-009. GET /settings renders an allowlisted snapshot
+// the SERVER owns; unknown keys/fields render generically (a text input) and
+// never crash the panel. The pane's section order is fixed by the user
+// direction: 1) wallet zpub, 2) chain base url (+ badges + Resync now),
+// 3) gap limit. POSTs reuse the same auth header path as every other
+// request. Values live only in panel DOM + in-memory render state — never
+// logged, never stored client-side.
+
+let inputSeq = 0; // unique label/id pairing inside the rebuilt panel
+
+// A generic editable row (gap_limit and any future allowlisted key the
+// client has no special row for): text/number input + Apply → POST /settings.
 function settingRow(entry, index) {
   const li = el("li", "setting");
   const keyId = "setting-input-" + index;
@@ -616,15 +711,12 @@ function settingRow(entry, index) {
     input.max = String(entry.max);
   }
   if (entry.type === "url") input.placeholder = LABELS.settingsEmptyPlaceholder;
-  const btn = el("button", "btn btn-secondary setting-apply", LABELS.settingsApply);
+  const btn = el("button", "btn btn-secondary btn-small setting-apply", LABELS.settingsApply);
   btn.type = "button";
   btn.dataset.settingKey = entry.key;
   line.append(input, btn);
   li.appendChild(line);
 
-  if (entry.type === "url") {
-    li.appendChild(el("p", "setting-hint", LABELS.settingsEmptyIsDefault));
-  }
   if (entry.requires_restart === true) {
     li.appendChild(el("p", "setting-flag", LABELS.settingsRestart));
   }
@@ -637,236 +729,258 @@ function settingRow(entry, index) {
   return li;
 }
 
-function headingRow(text) {
-  return el("li", "setting-heading", text);
-}
-
-// Display-only shortening (TCK-WEB-008 fix 2): the COPY and the reveal show
-// the FULL key — a display truncation is head…tail, never mid-hash-where-it-
-// matters, and never the copied value.
+// Display-only shortening (TCK-WEB-008): head…tail, never mid-hash. The
+// engine's settings entry is already truncated by the SAME rule server-side;
+// this fallback only covers the pre-read window of a key typed in THIS page.
 function truncateKey(key) {
   return key.length <= 24 ? key : key.slice(0, 12) + "…" + key.slice(-8);
 }
 
-async function copyText(text) {
-  // Loopback http://127.0.0.1 IS a secure context (browser rule), so the
-  // clipboard API is normally there; any failure falls back to on-screen
-  // full reveal — the user fix demands a copyable value, however it lands.
-  await navigator.clipboard.writeText(text);
+// Live refs of the zpub ENTRY form (rebuilt whenever the row flips state).
+let watchForm = null; // { input, submit }
+
+function focusWatchInput() {
+  if (watchForm && watchForm.input.isConnected) watchForm.input.focus();
 }
 
-// The settings watch-key row (TCK-WEB-008 + TCK-LAUNCH-002 follow-up (a)).
-// PRESENCE comes from the typed /state truth (same source as the form
-// gate); the DISPLAY value comes from the server's settings list entry
-// (display-TRUNCATED — the engine owns the shortening) and falls back to a
-// this-session key ONLY when the server entry is not yet loaded. The FULL
-// value is fetched on demand via the explicit single-key read
-// GET /settings?key=watch_key (a public account key — never a secret, yet
-// still never logged; the endpoint is token-gated). The server never sends
-// the key on any UNauthenticated surface (ADR-0024, pinned by server tests).
+// The settings pane's zpub section (TCK-WEB-009 a/b). Two states, both
+// rendered from typed /state truth plus the server's entry:
+//  * ENTRY (wallet needs a key): the moved card, compacted — lede, warning,
+//    one input + Connect. Submit is the ONE POST /watchkey channel (the same
+//    path the replaced card used, replace/confirm rung kept); ALL key
+//    validation is the engine's parse+gate, refusals relayed value-free.
+//  * SET: a collapsed read-only display — the engine's truncated descriptor
+//    ("wpkh([e7f511…" style). No Show/Copy/Replace affordances (user
+//    direction): the full value is never needed in this pane anymore.
 function watchKeyRow(serverEntry) {
   const li = el("li", "setting setting-watchkey");
   li.appendChild(el("p", "setting-key", "watch_key"));
-  const value = el("p", "watchkey-value");
-  li.appendChild(value);
-  const actions = el("div", "watchkey-actions");
-  li.appendChild(actions);
   const status = el("p", "setting-status");
   status.setAttribute("role", "status");
-  li.appendChild(status);
-  const box = el("div", "watchkey-replace"); // replace-confirm / replace-apply stages
-  box.hidden = true;
-  li.appendChild(box);
+  watchForm = null;
 
   if (state.watchKeyPresent === null && !serverEntry) {
-    value.textContent = LABELS.watchKeyRowUnknown;
+    li.appendChild(el("p", "watchkey-value", LABELS.watchKeyRowUnknown));
+    li.appendChild(status);
     return li;
   }
-  const configured = serverEntry
-    ? serverEntry.configured === true
-    : state.watchKeyPresent === true;
-  if (!configured) {
-    value.textContent = LABELS.watchKeyRowAbsent;
+  const needsEntry =
+    state.watchKeyNeeded ||
+    (serverEntry ? serverEntry.configured !== true : state.watchKeyPresent !== true);
+  if (needsEntry) {
+    li.appendChild(el("p", "setting-hint", LABELS.watchkeyLede));
+    li.appendChild(el("p", "setting-flag", LABELS.watchkeyWarning));
+    const box = el("div", "watchkey-replace"); // confirm / apply rungs of a replace
+    const line = el("div", "watchkey-line");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.spellcheck = false;
+    input.autocomplete = "off";
+    input.maxLength = 200;
+    input.placeholder = "zpub…";
+    input.setAttribute("aria-label", LABELS.watchKeyInputLabel);
+    const btn = el("button", "btn btn-primary btn-small", LABELS.watchKeyConnect);
+    btn.type = "button";
+    line.append(input, btn);
+    li.append(line, box, status);
+    btn.addEventListener("click", () => submitWatchKey(input, btn, status, box));
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        submitWatchKey(input, btn, status, box);
+      }
+    });
+    watchForm = { input, submit: btn };
+    if (state.settingsAutoShown) focusWatchInput(); // first-run episode: once, on reveal
     return li;
   }
 
-  // Display value: the server's truncated entry verbatim, or the value this
-  // page supplied (memory only) before the settings list arrived.
-  let display =
+  // SET — collapsed display only.
+  const display =
     serverEntry && typeof serverEntry.value === "string"
       ? serverEntry.value
       : state.sessionWatchKey
         ? truncateKey(state.sessionWatchKey)
         : LABELS.watchKeyRowConnected;
-  let revealed = false;
-  let full = ""; // the revealed value (memory only; never logged/persisted)
-  value.textContent = display;
-
-  const renderValue = () => {
-    value.textContent = revealed && full ? full : display;
-  };
-
-  async function ensureFull() {
-    if (full) return full;
-    if (state.sessionWatchKey) {
-      full = state.sessionWatchKey; // this page's own submit — reuse it
-      return full;
-    }
-    // Explicit single-key read (the ONLY channel that carries the full key).
-    try {
-      const response = await fetch("/settings?key=watch_key", {
-        headers: authHeaders(),
-        cache: "no-store",
-      });
-      const data = response.ok ? await response.json().catch(() => null) : null;
-      const entry = data && Array.isArray(data.settings) ? data.settings[0] : null;
-      if (entry && typeof entry.value === "string") full = entry.value;
-    } catch {
-      /* full stays empty: reveal shows the truncated value, never a guess */
-    }
-    return full;
-  }
-
-  const reveal = el("button", "btn btn-secondary btn-small", LABELS.watchKeyReveal);
-  reveal.type = "button";
-  reveal.addEventListener("click", async () => {
-    if (revealed) {
-      revealed = false;
-    } else {
-      full = await ensureFull();
-      revealed = !!full;
-    }
-    renderValue();
-    reveal.textContent = revealed ? LABELS.watchKeyHide : LABELS.watchKeyReveal;
-  });
-  const copy = el("button", "btn btn-secondary btn-small", LABELS.watchKeyCopy);
-  copy.type = "button";
-  copy.addEventListener("click", async () => {
-    full = await ensureFull();
-    if (!full) {
-      status.dataset.kind = "error";
-      status.textContent = LABELS.watchKeyCopyFailed;
-      return;
-    }
-    try {
-      await copyText(full);
-      status.dataset.kind = "ok";
-      status.textContent = LABELS.watchKeyCopied;
-    } catch {
-      status.dataset.kind = "error";
-      status.textContent = LABELS.watchKeyCopyFailed;
-    }
-    if (!revealed) {
-      revealed = true; // the full value is on screen either way
-      renderValue();
-      reveal.textContent = LABELS.watchKeyHide;
-    }
-  });
-  actions.append(reveal, copy);
-
-  // EDIT flow (TCK-WEB-008 fix 2 + TCK-LAUNCH-002 replace decision): button
-  // → inline confirm (the cached data belongs to the CURRENT wallet; the
-  // engine warns it stays behind) → new-key input → POST /watchkey with the
-  // explicit replace+confirm opt-in. The engine re-runs the SAME parse+gate
-  // path on the ENGINE thread; its closed status is the whole verdict,
-  // relayed value-free. A running session can now replace in place.
-  const replace = el("button", "btn btn-secondary btn-small", LABELS.watchKeyReplace);
-  replace.type = "button";
-  replace.addEventListener("click", () => replaceStage("confirm"));
-  actions.appendChild(replace);
+  li.appendChild(el("p", "watchkey-value", display));
   if (serverEntry && serverEntry.env_override === true) {
     li.appendChild(el("p", "setting-flag", LABELS.watchKeyEnvOverride));
   }
-
-  function replaceStage(stage) {
-    status.textContent = "";
-    status.dataset.kind = "";
-    box.replaceChildren();
-    box.hidden = false;
-    if (stage === "confirm") {
-      box.appendChild(el("p", "watchkey-warning", LABELS.watchKeyReplaceConfirm));
-      const yes = el("button", "btn btn-danger btn-small", LABELS.watchKeyReplaceYes);
-      yes.type = "button";
-      yes.addEventListener("click", () => replaceStage("apply"));
-      const no = el("button", "btn btn-secondary btn-small", LABELS.watchKeyReplaceCancel);
-      no.type = "button";
-      no.addEventListener("click", () => {
-        box.hidden = true;
-        box.replaceChildren();
-      });
-      box.append(yes, no);
-      return;
-    }
-    const line = el("div", "setting-line");
-    const input = document.createElement("input");
-    input.type = "text";
-    input.className = "setting-input";
-    input.spellcheck = false;
-    input.autocomplete = "off";
-    input.maxLength = 200;
-    input.setAttribute("aria-label", LABELS.watchKeyReplaceLabel);
-    const apply = el("button", "btn btn-primary btn-small", LABELS.watchKeyReplaceApply);
-    apply.type = "button";
-    apply.addEventListener("click", async () => {
-      const key = input.value.trim();
-      if (!key || apply.disabled) return;
-      apply.disabled = true;
-      status.dataset.kind = "";
-      status.textContent = LABELS.watchkeySaving;
-      const { code, data } = await postWatchKey(key, true);
-      apply.disabled = false;
-      if (code === 200 && data && (data.status === "replaced" || data.status === "accepted")) {
-        // The engine re-wired onto the new key: re-read the panel rows from
-        // tool truth (fresh /settings list + /state), never from this echo.
-        state.sessionWatchKey = key;
-        state.watchKeyPresent = true;
-        full = ""; // force a fresh server reveal of the NEW key
-        revealed = false;
-        status.dataset.kind = "ok";
-        status.textContent = LABELS.watchKeyReplaced;
-        box.hidden = true;
-        box.replaceChildren();
-        loadSettings();
-        refreshState();
-      } else {
-        // Rejection reasons are value-free by the engine's contract.
-        const reason =
-          code === 0
-            ? LABELS.unreachable
-            : data && typeof data.error === "string"
-              ? LABELS.watchkeyRejectedPrefix + " " + data.error
-              : LABELS.watchkeyFailed;
-        status.dataset.kind = "error";
-        status.textContent = reason;
-      }
-    });
-    line.append(input, apply);
-    box.appendChild(line);
-  }
+  li.appendChild(status);
   return li;
 }
 
-async function loadSettings() {
-  // The watch-key section renders from the typed /state truth alone at
-  // first — honest even when GET /settings is unavailable (a first-run
-  // engine has no settings store yet). Once the server list lands, the row
-  // re-renders with its display-TRUNCATED entry (TCK-LAUNCH-002); the
-  // watch_key entry is NEVER rendered as a generic editable row (it is
-  // read-only through this surface — changing the key is the gated
-  // POST /watchkey replace path). The server-owned rows follow under their
-  // own heading (TCK-WEB-008 fix 4: coherent grouping/labels).
-  const render = (watchEntry, serverRows) => {
-    const rows = [];
-    for (const entry of serverRows) {
-      rows.push(settingRow(entry, rows.length));
+// The chain-base row (TCK-WEB-009 d/e/f): a read-only field + Edit; Edit
+// makes it editable and the button becomes Apply; Apply is the existing
+// POST /settings write (the engine probes before saving and hot-swaps
+// server-side — ADR-0018 amendment), and success returns the row to
+// read-only. A refused probe shows the engine's honest value-free line and
+// keeps the field editable for a correction. While a write (or the engine's
+// probe inside it) is in flight the button is disabled: no double-submit.
+// Under the field: the three dimmed backend badges and the Resync-now
+// action.
+function chainBaseRow(entry) {
+  inputSeq += 1;
+  const li = el("li", "setting setting-chain");
+  const keyId = "setting-input-" + inputSeq;
+  const label = el("label", "setting-key", entry.key);
+  label.htmlFor = keyId;
+  li.appendChild(label);
+
+  const line = el("div", "setting-line");
+  const input = document.createElement("input");
+  input.className = "setting-input";
+  input.id = keyId;
+  input.type = "text";
+  input.spellcheck = false;
+  input.autocomplete = "off";
+  input.readOnly = true; // (d): starts read-only
+  input.value = typeof entry.value === "string" ? entry.value : "";
+  input.placeholder = LABELS.settingsEmptyPlaceholder;
+  const btn = el("button", "btn btn-secondary btn-small setting-apply", LABELS.settingsEdit);
+  btn.type = "button";
+  btn.dataset.settingKey = entry.key;
+  line.append(input, btn);
+  li.appendChild(line);
+
+  const badges = el("div", "backend-badges");
+  badges.setAttribute("role", "img");
+  badges.setAttribute("aria-label", LABELS.badgeMempool + " " + LABELS.badgeElectrum + " " + LABELS.badgeBitcoind);
+  for (const [family, labelText] of [
+    ["mempool", LABELS.badgeMempool],
+    ["electrum", LABELS.badgeElectrum],
+    ["bitcoind", LABELS.badgeBitcoind],
+  ]) {
+    const badge = el("span", "backend-badge", labelText);
+    badge.dataset.badge = family;
+    badges.appendChild(badge);
+  }
+  li.appendChild(badges);
+
+  const resyncLine = el("div", "setting-line setting-resync-line");
+  const resyncBtn = el("button", "btn btn-ghost btn-small", LABELS.resyncNow);
+  resyncBtn.type = "button";
+  resyncBtn.addEventListener("click", () => requestResync(resyncBtn, status));
+  resyncLine.appendChild(resyncBtn);
+  li.appendChild(resyncLine);
+
+  li.appendChild(el("p", "setting-hint", LABELS.settingsEmptyIsDefault));
+  if (entry.requires_restart === true) {
+    li.appendChild(el("p", "setting-flag", LABELS.settingsRestart));
+  }
+  if (entry.env_override === true) {
+    li.appendChild(el("p", "setting-flag", LABELS.settingsEnvOverride));
+  }
+  const status = el("p", "setting-status");
+  status.setAttribute("role", "status");
+  li.appendChild(status);
+  return li;
+}
+
+// (e): dimmed by default (low-opacity token styling), highlighted only for
+// the family the current backend_kind belongs to. bitcoind stays dimmed —
+// reserved, the engine never emits that kind today.
+function paintBackendBadges() {
+  for (const badge of settingsListEl.querySelectorAll(".backend-badge")) {
+    const family = BADGE_FAMILIES[badge.dataset.badge];
+    if (family && state.backendKind && family.has(state.backendKind)) {
+      badge.dataset.active = "true";
+    } else {
+      badge.removeAttribute("data-active");
     }
-    const list = [headingRow(LABELS.settingsSectionWatchKey), watchKeyRow(watchEntry)];
-    if (rows.length > 0) list.push(headingRow(LABELS.settingsSectionNetwork), ...rows);
-    settingsListEl.replaceChildren(...list);
-    return rows.length;
-  };
+  }
+}
+
+// (f): POST /resync carries no data; the transport maps the closed engine
+// status (started→202, busy→409, anything else→503). 202: the scan chip
+// reappears from the next /state truth (the engine also emits turn_end).
+// Disabled while in flight — no double-submit.
+async function requestResync(btn, status) {
+  if (btn.disabled || state.stopped) return;
+  btn.disabled = true;
+  status.dataset.kind = "";
+  status.textContent = LABELS.resyncSaving;
+  let note = LABELS.resyncUnavailable;
+  let kind = "error";
+  try {
+    const response = await fetch("/resync", { method: "POST", headers: authHeaders() });
+    const data = await response.json().catch(() => null);
+    const closed =
+      data && data.schema === "resync/1" && typeof data.status === "string"
+        ? data.status
+        : null;
+    if ((response.status === 202 && closed === "started") || (response.status === 202 && closed === null)) {
+      note = LABELS.resyncStarted;
+      kind = "ok";
+    } else if (response.status === 409 || closed === "busy") {
+      note = LABELS.resyncBusy;
+      kind = "";
+    }
+  } catch {
+    note = LABELS.unreachable;
+    kind = "error";
+  } finally {
+    status.dataset.kind = kind;
+    status.textContent = note;
+    btn.disabled = false;
+    refreshState(); // the scan chip is the truth, never this echo
+  }
+}
+
+// Rebuild the pane from in-memory render state (last settings read + typed
+// /state). Section order is fixed (user direction a): Wallet (zpub), then
+// Network & scanning (chain base row, gap row, then any future generic
+// keys). Rows are rebuilt only on open/fetch or a watch-state flip — an
+// in-flight edit is never clobbered by a background /state refresh.
+function renderSettings() {
+  const entries = state.settings;
+  const watch = watchKeyRow(entries ? entries.get("watch_key") : null);
+  const walletCol = settingsCol(LABELS.settingsSectionWatchKey, [watch]);
+  const networkRows = [];
+  if (entries) {
+    const chain = entries.get("chain_base_url");
+    if (chain) networkRows.push(chainBaseRow(chain));
+    const gap = entries.get("gap_limit");
+    if (gap) {
+      inputSeq += 1;
+      networkRows.push(settingRow(gap, inputSeq));
+    }
+    for (const entry of entries.values()) {
+      if (entry.key !== "watch_key" && entry.key !== "chain_base_url" && entry.key !== "gap_limit") {
+        inputSeq += 1;
+        networkRows.push(settingRow(entry, inputSeq));
+      }
+    }
+  }
+  if (networkRows.length > 0) {
+    settingsListEl.replaceChildren(
+      walletCol,
+      settingsCol(LABELS.settingsSectionNetwork, networkRows),
+    );
+  } else {
+    settingsListEl.replaceChildren(walletCol);
+  }
+  paintBackendBadges();
+}
+
+function settingsCol(title, rows) {
+  const col = el("section", "settings-col");
+  col.appendChild(el("h3", "setting-heading", title));
+  const ul = el("ul", "settings-col-list");
+  ul.append(...rows);
+  col.appendChild(ul);
+  return col;
+}
+
+async function loadSettings() {
+  // The zpub section renders from the typed /state truth alone at first —
+  // honest even when GET /settings is unavailable (a first-run engine has no
+  // settings store yet, or is mid-provision). Once the server list lands,
+  // the rows render from its entries: the watch_key entry is NEVER an
+  // editable row (read-only surface; changing the key is the engine-gated
+  // POST /watchkey path) and chain_base_url gets its Edit/Apply row.
   settingsStatusEl.textContent = LABELS.settingsLoading;
-  render(null, []);
+  renderSettings();
   try {
     const response = await fetch("/settings", { headers: authHeaders(), cache: "no-store" });
     const data = response.ok ? await response.json().catch(() => null) : null;
@@ -875,18 +989,17 @@ async function loadSettings() {
       return;
     }
     settingsStatusEl.textContent = "";
-    let watchEntry = null;
-    const serverRows = [];
+    const entries = new Map();
     for (const entry of data.settings) {
       // an entry without a string key is unrenderable: skip it, keep the rest
       if (!entry || typeof entry.key !== "string") continue;
-      if (entry.key === "watch_key") watchEntry = entry;
-      else serverRows.push(entry);
+      entries.set(entry.key, entry);
     }
-    const rendered = render(watchEntry, serverRows);
-    if (rendered === 0 && !watchEntry) {
-      settingsStatusEl.textContent = LABELS.settingsUnavailable;
+    state.settings = entries;
+    if (typeof data.backend_kind === "string" && BACKEND_KINDS.has(data.backend_kind)) {
+      state.backendKind = data.backend_kind;
     }
+    renderSettings();
   } catch {
     settingsStatusEl.textContent = LABELS.settingsUnavailable;
   }
@@ -906,22 +1019,37 @@ function localSettingProblem(input) {
   return LABELS.settingsRange(min, max);
 }
 
-// Delegated (same pattern as /action): apply clicks POST one {key, value} to
-// /settings and render the server's honest status. Rejection bodies are
-// value-free; we show the server's own reason line, inventing no detail.
+// Delegated (same pattern as /action): the chain-base button runs the
+// Edit↔Apply state machine ((d): read-only → Edit click → editable + Apply
+// → write → read-only); every [data-setting-key] Apply click POSTs one
+// {key, value} to /settings and renders the server's honest status.
+// Rejection bodies are value-free; we show the server's own reason line,
+// inventing no detail. The reply's additive resync/swapped fields (TCK-BACK-
+// END-002) pick the applied note ((g): gap-limit "resyncing…" vs "already up
+// to date", straight from the response — never inferred).
 settingsListEl.addEventListener("click", async (event) => {
   const btn = event.target.closest("button[data-setting-key]");
   if (!btn || state.stopped) return;
   const row = btn.closest(".setting");
   const input = row.querySelector("input");
   const status = row.querySelector(".setting-status");
+  const isChain = btn.dataset.settingKey === "chain_base_url";
+  if (isChain && input.readOnly) {
+    // Edit rung: no request, no state change — just open the field.
+    input.readOnly = false;
+    input.focus();
+    btn.textContent = LABELS.settingsApply;
+    status.dataset.kind = "";
+    status.textContent = "";
+    return;
+  }
   const problem = localSettingProblem(input);
   status.dataset.kind = "error";
   if (problem) {
     status.textContent = problem;
     return;
   }
-  btn.disabled = true;
+  btn.disabled = true; // in-flight (engine probe included): no double-submit
   status.textContent = LABELS.settingsSaving;
   try {
     const response = await fetch("/settings", {
@@ -932,11 +1060,29 @@ settingsListEl.addEventListener("click", async (event) => {
     const data = await response.json().catch(() => null);
     if (response.status === 200 && data && data.status === "applied") {
       status.dataset.kind = "ok";
-      status.textContent = LABELS.settingsApplied;
+      const note =
+        typeof data.resync === "string" && RESYNC_NOTES.has(data.resync)
+          ? RESYNC_NOTES.get(data.resync)
+          : LABELS.settingsApplied;
+      status.textContent = note;
       // confirm from the server's freshly re-read entry, never our own echo
       const fresh = Array.isArray(data.settings) ? data.settings[0] : null;
       if (fresh && Object.prototype.hasOwnProperty.call(fresh, "value")) {
         input.value = typeof fresh.value === "string" ? fresh.value : "";
+      }
+      if (isChain) {
+        input.readOnly = true; // (d): applied → back to the read-only state
+        btn.textContent = LABELS.settingsEdit;
+      }
+      if (state.settings && fresh && typeof fresh.key === "string") {
+        state.settings.set(fresh.key, fresh);
+      }
+      if (typeof data.backend_kind === "string" && BACKEND_KINDS.has(data.backend_kind)) {
+        state.backendKind = data.backend_kind; // a swap may have moved the kind
+        paintBackendBadges();
+      }
+      if (data.resync === "started" || data.resync === "deferred") {
+        refreshState(); // the scan chip follows, from engine truth
       }
     } else if (response.status === 400 && data && data.status === "rejected") {
       status.dataset.kind = "error";
@@ -944,6 +1090,7 @@ settingsListEl.addEventListener("click", async (event) => {
         typeof data.error === "string"
           ? LABELS.settingsRejectedPrefix + " " + data.error
           : LABELS.settingsRejected;
+      // a refused swap/probe: the field stays editable for a correction
     } else {
       // 503 (engine busy) and anything unexpected: one honest retry line
       status.dataset.kind = "error";
@@ -962,6 +1109,7 @@ function openSettings() {
     settingsPanelEl.hidden = false;
     settingsToggleEl.setAttribute("aria-expanded", "true");
     loadSettings(); // fetch on demand, fresh every time the panel opens
+    if (state.watchKeyNeeded) focusWatchInput();
   }
 }
 
@@ -977,15 +1125,16 @@ settingsToggleEl.addEventListener("click", () => {
   else closeSettings();
 });
 
-// ------------------------------------------------- first-run watch key (001)
+// ------------------------------------------------- watch key entry (001/009)
 // The key string rides ONLY to POST /watchkey (token/Host/Origin-gated, like
 // every mutation); ALL validation is the engine's existing parse+gate path.
 // We relay the server's value-free status line verbatim — the submitted key
-// is never re-rendered, cleared into the transcript, or logged. ONE fetch
-// path (TCK-WEB-008): the first-run form and the settings replace flow are
-// the same POST /watchkey — no second endpoint, no client-side verdict.
-// The replace rung (TCK-LAUNCH-002 / ADR-0024 amendment) adds the explicit
-// DOUBLE opt-in the engine demands: replace:true AND confirm:true.
+// is never re-rendered, echoed into the transcript, or logged. ONE fetch path
+// (TCK-WEB-008): the pane's entry form and the replace rung are the same
+// POST /watchkey — no second endpoint, no client-side verdict. The replace
+// rung (TCK-LAUNCH-002) adds the explicit DOUBLE opt-in the engine demands:
+// replace:true AND confirm:true, raised only when the engine itself answers
+// ``already`` (409) to a fresh submit.
 async function postWatchKey(key, replace = false) {
   try {
     const response = await fetch("/watchkey", {
@@ -1000,21 +1149,25 @@ async function postWatchKey(key, replace = false) {
   }
 }
 
-async function submitWatchKey() {
-  const key = watchkeyInputEl.value.trim();
-  if (!key || watchkeySubmitEl.disabled) return;
-  watchkeySubmitEl.disabled = true;
-  watchkeyStatusEl.dataset.kind = "";
-  watchkeyStatusEl.textContent = LABELS.watchkeySaving;
+async function submitWatchKey(input, btn, status, box) {
+  const key = input.value.trim();
+  if (!key || btn.disabled) return;
+  btn.disabled = true;
+  status.dataset.kind = "";
+  status.textContent = LABELS.watchkeySaving;
   const { code, data } = await postWatchKey(key);
-  if (code === 200 && data && data.status === "accepted") {
-    // TCK-WEB-008 fix 1: the engine just confirmed the key — dismiss the
-    // form card NOW (no waiting on the next /state round-trip, which can
-    // stall behind the post-provision banner), and keep "Connected." where
-    // it survives: the transcript + the connection status.
-    watchkeyStatusEl.textContent = "";
+  if (code === 200 && data && (data.status === "accepted" || data.status === "replaced")) {
+    // TCK-WEB-008 fix 1: the engine just confirmed the key — collapse the
+    // row NOW (no waiting on the next /state round-trip, which can stall
+    // behind the post-provision banner), and keep "Connected." where it
+    // survives: the transcript + the connection status.
+    status.textContent = "";
     dismissWatchKeyForm(key);
     appendSystem(LABELS.watchkeyConnected);
+  } else if (code === 409 && data && data.status === "already") {
+    // The engine holds a key already: the replace/confirm rung (never a
+    // silent overwrite — the double opt-in rides on confirm).
+    replaceStage("confirm", input, btn, status, box, key);
   } else if (
     (code === 400 || code === 409) &&
     data &&
@@ -1022,31 +1175,74 @@ async function submitWatchKey() {
   ) {
     // Rejection reasons are value-free by the engine's contract — safe to
     // quote; we add nothing, and nothing here can echo the submitted key.
-    watchkeyStatusEl.dataset.kind = "error";
-    watchkeyStatusEl.textContent = LABELS.watchkeyRejectedPrefix + " " + data.error;
+    status.dataset.kind = "error";
+    status.textContent = LABELS.watchkeyRejectedPrefix + " " + data.error;
   } else if (code === 0) {
-    watchkeyStatusEl.dataset.kind = "error";
-    watchkeyStatusEl.textContent = LABELS.unreachable;
+    status.dataset.kind = "error";
+    status.textContent = LABELS.unreachable;
   } else if (code === 503) {
-    watchkeyStatusEl.dataset.kind = "error";
-    watchkeyStatusEl.textContent = LABELS.watchkeyBusy;
+    status.dataset.kind = "error";
+    status.textContent = LABELS.watchkeyBusy;
   } else {
-    watchkeyStatusEl.dataset.kind = "error";
-    watchkeyStatusEl.textContent = LABELS.watchkeyFailed;
+    status.dataset.kind = "error";
+    status.textContent = LABELS.watchkeyFailed;
   }
-  watchkeySubmitEl.disabled = false;
+  btn.disabled = false;
   // Re-read the engine's truth either way: the snapshot re-syncs button/scan
   // state, and (post-dismiss, TCK-WEB-008) can no longer resurrect the form.
   refreshState();
 }
 
-watchkeySubmitEl.addEventListener("click", submitWatchKey);
-watchkeyInputEl.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
-    event.preventDefault();
-    submitWatchKey();
+// The replace confirm/apply stages, inline in the pane's zpub section
+// ((a): the entry logic — including the engine's replace+confirm semantics
+// — moved here with the form). The engine re-runs the SAME parse+gate path
+// on the ENGINE thread; its closed status is the whole verdict, relayed
+// value-free.
+function replaceStage(stage, input, btn, status, box, key) {
+  status.textContent = "";
+  status.dataset.kind = "";
+  box.replaceChildren();
+  box.hidden = false;
+  if (stage === "confirm") {
+    box.appendChild(el("p", "setting-flag", LABELS.watchKeyReplaceConfirm));
+    const yes = el("button", "btn btn-danger btn-small", LABELS.watchKeyReplaceYes);
+    yes.type = "button";
+    yes.addEventListener("click", () => replaceStage("apply", input, btn, status, box, key));
+    const no = el("button", "btn btn-secondary btn-small", LABELS.watchKeyReplaceCancel);
+    no.type = "button";
+    no.addEventListener("click", () => {
+      box.hidden = true;
+      box.replaceChildren();
+    });
+    box.append(yes, no);
+    return;
   }
-});
+  btn.disabled = true;
+  status.dataset.kind = "";
+  status.textContent = LABELS.watchkeySaving;
+  postWatchKey(key, true).then(({ code, data }) => {
+    btn.disabled = false;
+    if (code === 200 && data && (data.status === "replaced" || data.status === "accepted")) {
+      // The engine re-wired onto the new key: collapse the row and re-read
+      // tool truth (fresh /settings + /state), never from this echo.
+      box.hidden = true;
+      box.replaceChildren();
+      dismissWatchKeyForm(key);
+      loadSettings();
+      refreshState();
+    } else {
+      // Rejection reasons are value-free by the engine's contract.
+      const reason =
+        code === 0
+          ? LABELS.unreachable
+          : data && typeof data.error === "string"
+            ? LABELS.watchkeyRejectedPrefix + " " + data.error
+            : LABELS.watchkeyFailed;
+      status.dataset.kind = "error";
+      status.textContent = reason;
+    }
+  });
+}
 
 // -------------------------------------------------------------------- start
 

@@ -52,6 +52,11 @@
 
   /* focus ring (single source of truth) */
   --focus-ring: 0 0 0 2px var(--c-bg), 0 0 0 4px var(--c-accent);
+
+  /* TCK-WEB-009 (e/c): dim-badge opacity and the settings-pane ceiling —
+     the pane fits the viewport; internal scroll is the last resort. */
+  --badge-dim: 0.45;
+  --settings-max: 62vh;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -169,35 +174,48 @@ body {
 
 .btn-ghost:hover { color: var(--c-text); border-color: var(--c-border-strong); }
 
+/* TCK-WEB-009 (c): compact — tighter rows, two columns when there is room,
+   the pane fits the viewport (internal scroll only as a last resort). */
 .settings {
   background: var(--c-surface);
   border-bottom: 1px solid var(--c-border);
   box-shadow: var(--shadow-1);
-  padding: var(--sp-4);
-  max-block-size: 45vh;
+  padding: var(--sp-3) var(--sp-4);
+  max-block-size: var(--settings-max);
   overflow-y: auto;
 }
 
 .settings-status {
-  margin: 0 0 var(--sp-3);
+  margin: 0 0 var(--sp-2);
   font-size: var(--fs-sm);
   color: var(--c-text-muted);
 }
 
-.settings-list {
+.settings-cols {
   margin: 0 auto;
+  max-inline-size: 60rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--sp-2) var(--sp-5);
+}
+
+@media (min-width: 760px) {
+  .settings-cols { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+}
+
+.settings-col-list {
+  margin: 0;
   padding: 0;
-  max-inline-size: 46rem;
   list-style: none;
   display: flex;
   flex-direction: column;
-  gap: var(--sp-4);
+  gap: var(--sp-3);
 }
 
 .setting {
   display: flex;
   flex-direction: column;
-  gap: var(--sp-2);
+  gap: var(--sp-1);
 }
 
 .setting-key {
@@ -224,15 +242,22 @@ body {
 
 .setting-apply { padding: var(--sp-2) var(--sp-4); }
 
-/* TCK-WEB-008: settings consolidation — section headings, the watch-key row
-   and its controls. Tokens only, like every other rule in this file. */
+/* (d): the read-only field is visibly inert until Edit opens it. */
+.setting-input[readonly] {
+  background: var(--c-surface-2);
+  border-color: var(--c-border);
+  color: var(--c-text-muted);
+}
+
+/* TCK-WEB-008/009: settings sections, the watch-key row and its controls.
+   Tokens only, like every other rule in this file. */
 .setting-heading {
+  margin: var(--sp-1) 0 0;
   font-size: var(--fs-xs);
   font-weight: 650;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--c-text-muted);
-  margin-block-start: var(--sp-2);
 }
 
 .btn-small {
@@ -248,12 +273,6 @@ body {
   font-family: var(--font-mono);
   font-size: var(--fs-sm);
   overflow-wrap: anywhere;
-}
-
-.watchkey-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--sp-2);
 }
 
 .watchkey-replace {
@@ -450,37 +469,58 @@ body {
   .btn { padding: var(--sp-3) var(--sp-4); }
 }
 
-/* ------------------------------------------------ first-run watch key (001) */
+/* --------------------------- watch key, now INSIDE the settings pane (009 a/b) */
 
-.watchkey {
-  margin: 0 auto var(--sp-4);
-  padding: var(--sp-4);
-  max-inline-size: 46rem;
-  background: var(--c-surface);
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-md);
-  box-shadow: var(--shadow-1);
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-}
-.watchkey h2 { margin: 0; font-size: var(--fs-lg); }
-.watchkey-lede, .watchkey-warning { margin: 0; color: var(--c-text-muted); }
-.watchkey-warning { font-size: var(--fs-sm); }
-.watchkey code { font-family: var(--font-mono); }
 .watchkey-line { display: flex; gap: var(--sp-2); }
 .watchkey-line input {
   flex: 1;
   min-inline-size: 0;
   padding: var(--sp-2) var(--sp-3);
+  color: var(--c-text);
+  background: var(--c-surface);
   border: 1px solid var(--c-border-strong);
   border-radius: var(--r-md);
   font-family: var(--font-mono);
-  font-size: var(--fs-md);
+  font-size: var(--fs-sm);
 }
-.watchkey-status { margin: 0; min-block-size: 1.2em; font-size: var(--fs-sm); }
-.watchkey-status[data-kind="ok"] { color: var(--c-ok); }
-.watchkey-status[data-kind="error"] { color: var(--c-danger); }
+
+/* (e): backend badges — dimmed family chips; the active kind's chip takes
+   the accent. bitcoind stays dimmed (reserved; the engine never emits it). */
+.backend-badges {
+  display: flex;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.backend-badge {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-text-muted);
+  border: 1px solid var(--c-border-strong);
+  border-radius: 999px;
+  padding: 0 var(--sp-2);
+  opacity: var(--badge-dim);
+}
+
+.backend-badge[data-active="true"] {
+  color: var(--c-accent);
+  border-color: var(--c-accent);
+  background: var(--c-accent-soft);
+  opacity: 1;
+}
+
+/* (f): the Resync-now action sits on its own quiet line under the badges. */
+.setting-resync-line { align-items: center; }
+
+/* (h): header quick balance buttons, one row below the top bar. */
+.quickbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  background: var(--c-bg);
+  border-bottom: 1px solid var(--c-border);
+}
 
 /* TCK-LAUNCH-002: inline model-download progress in the transcript (native
    <progress>; percent/bytes live in the label's textContent only). */
