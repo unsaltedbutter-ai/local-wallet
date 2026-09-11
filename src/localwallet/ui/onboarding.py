@@ -77,6 +77,7 @@ string, ever (AGENTS.md).
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
 from enum import Enum
 from typing import Final
@@ -173,10 +174,14 @@ NODE_ASK: Final[str] = (
 #: no URL on any ladder rung, an explicit public pick is ONLY "a backend
 #: choice exists" once it is recorded — an unset stored rung means "never
 #: chose", not "chose public". Written through the store's generic settings
-#: table by this module (the only writer), read by ``app._backend_resolved``
-#: (the single source of truth for scan gating + ask arming). Deliberately
-#: NOT in the web ``/settings`` allowlist: consenting to the public server
-#: happens in the warned conversation, never by silent API write.
+#: table by the warned conversation (this module) or by the engine-side
+#: explicit-consent seam ``app.set_public_backend_consent`` (TCK-PRIVACY-001
+#: — the seam the web consent button, TCK-PRIVACY-001B, rides); read by
+#: ``app._backend_resolved`` (the single source of truth for scan gating +
+#: ask arming). Deliberately NOT in the web ``/settings`` allowlist:
+#: consenting to the public server happens through an EXPLICIT consent
+#: action, never by silent API write, and never implied by closing a pane,
+#: asking a balance, or any other ordinary action.
 BACKEND_CHOICE_SETTING: Final[str] = "chain_backend_choice"
 BACKEND_CHOICE_PUBLIC: Final[str] = "public"
 
@@ -905,7 +910,11 @@ class OnboardingFlow:
         was_deferred = self._deferred
         try:
             self._store.set_setting(BACKEND_CHOICE_SETTING, BACKEND_CHOICE_PUBLIC)
-        except StoreError:
+        except (StoreError, sqlite3.Error):
+            # The SAME catch as the engine-side seam
+            # (app.set_public_backend_consent) — one marker, two writers,
+            # structurally identical failure handling (code-review
+            # TCK-PRIVACY-001 MINOR).
             pass
         started = self._public_chosen() if self._public_chosen is not None else False
         output_fn(PUBLIC_CHOSEN_ACK)

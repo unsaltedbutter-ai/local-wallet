@@ -1071,6 +1071,19 @@ WALLET_LOADING_REFUSAL: Final[str] = (
     "marked as still loading)."
 )
 
+#: TCK-PRIVACY-001 (user direction 2026-09-11): the value-free ``tx_status``
+#: refusal while the first-run backend choice is UNRESOLVED (the
+#: ``awaiting_backend`` hold). The ONB-006 promise is that NO query reaches a
+#: server the user never picked — the honest answer is "nothing was looked
+#: up", never a silent wrong answer and never a leak. The model narrates it
+#: verbatim (dispatcher-owned copy, same discipline as
+#: :data:`WALLET_LOADING_REFUSAL`).
+NO_BACKEND_REFUSAL: Final[str] = (
+    "No server has been chosen yet, so there is nothing for me to ask — "
+    "that check did not run, and no query left this machine. Pick a server "
+    "first (your own, or explicitly the public one), then ask me again."
+)
+
 
 #: Fallback UI strings (mirror the agent loop's generic containment
 #: messages; the loop normally supplies these).
@@ -1574,7 +1587,7 @@ def build_dispatch_table(
         IntentName.BROADCAST_TX: _make_broadcast_tx_handler(
             tx_flow, client, store, wallet_id
         ),
-        IntentName.TX_STATUS: _make_tx_status_handler(client, tx_flow),
+        IntentName.TX_STATUS: _make_tx_status_handler(client, tx_flow, scan_gate),
         IntentName.NODE_STATUS: _make_node_status_handler(
             app_settings,
             node_detect_fn=node_detect_fn,
@@ -3645,13 +3658,22 @@ def _make_broadcast_tx_handler(
     return handler
 
 
-def _make_tx_status_handler(client: EsploraClient, flow: TxFlow) -> Handler:
+def _make_tx_status_handler(
+    client: EsploraClient, flow: TxFlow, scan_gate: StartupScan | None = None
+) -> Handler:
     """Create the ``tx_status`` handler: quoted txid → Esplora status.
 
     The ``txid`` param (layer 3 enforced it to EXACTLY 64 lowercase hex —
     the injection guard for the URL path) is looked up via
     ``client.get_tx_status``; the result quotes the response verbatim:
     ``{"txid", "confirmed", "block_height", "block_time"}``.
+
+    TCK-PRIVACY-001 (the audit's one un-gated pre-consent chain call): while
+    the first-run backend is UNRESOLVED (``awaiting_backend``), the handler
+    refuses with :data:`NO_BACKEND_REFUSAL` BEFORE the lookup — a status
+    check must never be the query that reaches a server the user never
+    picked. The hold state is the ONLY stand-down: once a backend is chosen
+    (or during the consented first scan) the lookup behaves unchanged.
 
     Eventual consistency (documented): a JUST-broadcast transaction is
     often not indexed by the explorer yet — Esplora answers 404 until it
@@ -3673,6 +3695,8 @@ def _make_tx_status_handler(client: EsploraClient, flow: TxFlow) -> Handler:
         params = envelope.params
         if not isinstance(params, TxStatusParams):
             return {"error": "internal", "detail": "tx_status params shape mismatch"}
+        if scan_gate is not None and scan_gate.state == "awaiting_backend":
+            return {"error": "backend_unchosen", "detail": NO_BACKEND_REFUSAL}
         try:
             status = client.get_tx_status(params.txid)
         except ChainError as exc:
@@ -4333,8 +4357,9 @@ def _backend_resolved(effective_backend: str | None, store: Store) -> bool:
     (TCK-ONB-006; ADR-0022 amendment 1 + ADR-0023 amendment 2). Resolved =
     a URL on any rung of the resolution ladder (env > config file > stored
     — exactly what :func:`resolve_chain_base_url` returns), OR an explicit
-    public opt-in record (:data:`BACKEND_CHOICE_SETTING`, written only by
-    the warned onboarding conversation). An UNSET stored rung means "never
+    public opt-in record (:data:`BACKEND_CHOICE_SETTING`, written ONLY by an
+    explicit public consent — the warned onboarding conversation or
+    :func:`set_public_backend_consent`). An UNSET stored rung means "never
     chose", NOT "chose public" — that's why the marker exists. Fail closed:
     an unreadable record counts as unresolved (defer + ask, never
     leak-by-accident). While unresolved, a first-run startup scan holds at
@@ -4345,6 +4370,34 @@ def _backend_resolved(effective_backend: str | None, store: Store) -> bool:
         return store.get_setting(BACKEND_CHOICE_SETTING) == BACKEND_CHOICE_PUBLIC
     except (StoreError, sqlite3.Error):
         return False
+
+
+def set_public_backend_consent(store: Store, scan: ScanFlow | None = None) -> bool:
+    """TCK-PRIVACY-001: the ENGINE-SIDE way to record an EXPLICIT
+    public-backend consent — the seam the web consent button
+    (TCK-PRIVACY-001B) rides. Two effects, identical to the warned CLI
+    conversation's public branch (:meth:`OnboardingFlow._accept_public`):
+    write the ONB-006 marker (:data:`BACKEND_CHOICE_SETTING` =
+    ``"public"``, so every FUTURE launch resolves as chosen-what-it-is),
+    then release a HELD first-run startup scan on the current client.
+
+    Callers must be consent itself, never a proxy for it: closing the
+    onboarding pane, asking a balance, skipping the ask, or any other user
+    action implies NOTHING here (an unset rung means "never chose").
+    ENGINE-THREAD ONLY (the pump's thread owns the store, the gate and the
+    scan — like every typed request). The record write is best-effort with
+    the same fail-closed direction as the CLI path: a failed write means
+    the ask re-appears next launch (toward asking, never toward leaking);
+    THIS session's consent and release stand either way.
+
+    Returns whether a held scan actually started loading (security review
+    F2 contract: report "loading now" only on ``True``; ``False`` when no
+    scan is held, none exists, or planning failed and it stood down)."""
+    try:
+        store.set_setting(BACKEND_CHOICE_SETTING, BACKEND_CHOICE_PUBLIC)
+    except (StoreError, sqlite3.Error):
+        pass
+    return scan is not None and scan.release_backend()
 
 
 def _freshness(store: Store, wallet_id: int, gate: StartupScan | None) -> str:
@@ -8220,7 +8273,9 @@ class ChainBackendFlow:
         w.table[IntentName.BROADCAST_TX] = _make_broadcast_tx_handler(
             w.flow, client, w.store, w.wallet.id
         )
-        w.table[IntentName.TX_STATUS] = _make_tx_status_handler(client, w.flow)
+        w.table[IntentName.TX_STATUS] = _make_tx_status_handler(
+            client, w.flow, scan.gate if scan is not None else None
+        )
         # TCK-TX-SELF-001: self_transfer rides the fee estimator (the one
         # chain call it makes), so it is rebuilt over the new client too —
         # same scan_fn/gate threading as create_tx.
@@ -10525,8 +10580,9 @@ def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], No
 
     Confirmed → "Confirmed at height N." (N verbatim from the chain
     response); unconfirmed → "In mempool (unconfirmed).";
-    ``unknown_tx`` → the eventual-consistency note; other errors surface
-    value-free via :func:`_error_line`.
+    ``unknown_tx`` → the eventual-consistency note; ``backend_unchosen`` →
+    :data:`NO_BACKEND_REFUSAL` verbatim (TCK-PRIVACY-001); other errors
+    surface value-free via :func:`_error_line`.
     """
     error = result.get("error")
     if error == "unknown_tx":
@@ -10535,6 +10591,14 @@ def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], No
                 "Transaction not found on the chain yet — it may not be indexed; "
                 "try again in a moment."
             )
+        )
+        return
+    if error == "backend_unchosen":
+        # TCK-PRIVACY-001: the dispatcher-owned refusal prints verbatim
+        # (the same style as the create_tx wallet_loading line) — never
+        # the raw error code, never a chain-failure wording.
+        output_fn(
+            sanitize_tool_output(str(result.get("detail", "")) or NO_BACKEND_REFUSAL)
         )
         return
     if error is not None:
