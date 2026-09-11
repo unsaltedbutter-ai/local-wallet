@@ -121,6 +121,10 @@ const LABELS = {
   badgeMempool: "mempool",
   badgeElectrum: "electrum",
   badgeBitcoind: "bitcoind",
+  // TCK-WEB-010: bubble copy control (aria-label + transient title states).
+  copyMessage: "Copy message",
+  copyDone: "Copied",
+  copyFailed: "Copy failed",
   // copy pass 2 #44: dim/lit is a state-carrying indicator, so it gets
   // words — a legend line plus a dynamic title/aria-label per badge
   // (recomposed by paintBackendBadges, the sole badge painter).
@@ -314,6 +318,74 @@ function authHeaders(extra) {
 
 // ---------------------------------------------------------------- rendering
 
+// TCK-WEB-010: per-bubble copy control. The copyable text of a turn is its
+// message lines only (progress dots and the model-download bar are transient
+// telemetry, not message text); a system bubble holds its text on the li
+// itself. textContent read, textContent copy — the XSS contract never
+// serializes markup here.
+function bubbleText(turn) {
+  const lines = turn.querySelectorAll(".turn-text:not(.turn-progress):not(.turn-model)");
+  if (lines.length > 0) return Array.from(lines, (line) => line.textContent).join("\n").trim();
+  return (turn.textContent || "").trim();
+}
+
+// The overlapping-squares icon, built with createElementNS (CSP-safe: no
+// markup strings, no external assets; the shapes carry no text nodes, so an
+// appended button never changes bubbleText).
+function copyIcon() {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  const front = document.createElementNS(ns, "rect");
+  front.setAttribute("x", "9");
+  front.setAttribute("y", "9");
+  front.setAttribute("width", "13");
+  front.setAttribute("height", "13");
+  front.setAttribute("rx", "2");
+  const back = document.createElementNS(ns, "path");
+  back.setAttribute("d", "M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1");
+  svg.append(back, front);
+  return svg;
+}
+
+// One button per bubble, added when the bubble first carries copyable text
+// (empty / progress-only bubbles get none). localhost is a secure context so
+// navigator.clipboard normally exists; a missing API or a rejected write
+// lands in the visible fail state (class + title only — never an alert,
+// never an inline style).
+function addCopyButton(turn) {
+  if (turn.querySelector(".copy-btn") || !bubbleText(turn)) return;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "copy-btn";
+  btn.setAttribute("aria-label", LABELS.copyMessage);
+  btn.title = LABELS.copyMessage;
+  btn.appendChild(copyIcon());
+  let resetTimer = 0;
+  btn.addEventListener("click", async () => {
+    const text = bubbleText(turn);
+    if (!text) return;
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch {
+      ok = false;
+    }
+    btn.classList.remove("copy-ok", "copy-fail");
+    btn.classList.add(ok ? "copy-ok" : "copy-fail");
+    btn.title = ok ? LABELS.copyDone : LABELS.copyFailed;
+    clearTimeout(resetTimer);
+    resetTimer = setTimeout(() => {
+      btn.classList.remove("copy-ok", "copy-fail");
+      btn.title = LABELS.copyMessage;
+    }, 1600);
+  });
+  turn.appendChild(btn);
+}
+
 function ensureTurn() {
   if (!state.openTurn) {
     state.openTurn = el("li", "turn turn-engine");
@@ -330,6 +402,7 @@ function appendText(text) {
   const line = el("p", "turn-text");
   line.appendChild(document.createTextNode(text));
   turn.appendChild(line);
+  addCopyButton(turn); // first copyable line of this engine turn
   state.progressLine = null;
   state.downloadLine = null; // the next tick starts a fresh inline bar
   scrollToEnd();
@@ -403,7 +476,9 @@ function humanBytes(bytes) {
 }
 
 function appendSystem(text) {
-  transcriptEl.appendChild(el("li", "turn turn-system", text));
+  const turn = el("li", "turn turn-system", text);
+  addCopyButton(turn);
+  transcriptEl.appendChild(turn);
   hintEl.hidden = true;
   scrollToEnd();
 }
@@ -415,6 +490,7 @@ function appendUser(text, queued) {
   const line = el("p", "turn-text");
   line.appendChild(document.createTextNode(text));
   turn.appendChild(line);
+  addCopyButton(turn);
   transcriptEl.appendChild(turn);
   hintEl.hidden = true;
   scrollToEnd();

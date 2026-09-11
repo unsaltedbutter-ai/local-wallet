@@ -63,6 +63,10 @@
   --busy-dot: 0.35rem;
   --busy-dot-min: 0.25;
 
+  /* TCK-WEB-010: the bubble copy control — corner button size (its reserved
+     gutter keeps bubble text from ever reflowing when it appears). */
+  --copy-size: 1.5rem;
+
   /* TCK-UX-010: privacy-label chip — one ink/surface pair per state family
      (public = danger-red, local = green, trust-dependent = warn-yellow).
      Mapped to the palette tokens so both schemes retint automatically;
@@ -386,6 +390,10 @@ body {
   border-radius: var(--r-md);
   box-shadow: var(--shadow-1);
   padding: var(--sp-3) var(--sp-4);
+  /* TCK-WEB-010: the copy button is an absolute corner overlay; the gutter
+     is permanently reserved so revealing it never reflows the text. */
+  position: relative;
+  padding-inline-end: calc(var(--sp-4) + var(--copy-size) + var(--sp-2));
 }
 
 .turn-user {
@@ -423,6 +431,52 @@ body {
   color: var(--c-text-muted);
   letter-spacing: 0.2em;
 }
+
+/* TCK-WEB-010: bubble copy control. Hidden until the bubble is hovered or
+   keyboard-focused (focus-within keeps it operable by tab alone); on
+   hover-impossible devices it is always present. The ok/fail feedback of a
+   copy attempt is class-driven color + title (never an alert, never an
+   inline style). */
+.copy-btn {
+  position: absolute;
+  inset-block-start: var(--sp-1);
+  inset-inline-end: var(--sp-1);
+  inline-size: var(--copy-size);
+  block-size: var(--copy-size);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--c-text-muted);
+  cursor: pointer;
+  opacity: 0;
+}
+
+.copy-btn svg {
+  inline-size: var(--fs-md);
+  block-size: var(--fs-md);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.turn:hover .copy-btn,
+.turn:focus-within .copy-btn,
+.copy-btn.copy-ok,
+.copy-btn.copy-fail { opacity: 1; }
+
+@media (hover: none) {
+  .copy-btn { opacity: 1; }
+}
+
+.copy-btn:hover { color: var(--c-text); background: var(--c-surface-2); }
+.copy-btn.copy-ok { color: var(--c-ok); }
+.copy-btn.copy-fail { color: var(--c-danger); }
 
 /* --------------------------------------------------------------- compose */
 
