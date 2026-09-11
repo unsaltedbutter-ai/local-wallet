@@ -152,6 +152,10 @@ concern; gate enforcement is structural.
 - Phase 3 will extend the state machine with `SIGNED`/`BROADCAST` behind
   the same discipline: dispatcher-owned transitions, verbatim `tx_ref`
   matching, and — for broadcast — a fresh same-turn gate decision.
+  (The "fresh same-turn gate decision" for broadcast is SUPERSEDED by the
+  2026-09-11 RECON amendment below: the implemented broadcast gate is
+  SIGNED-state + frozen record + signed-PSBT re-validation, not an
+  utterance gate.)
 - `confirm_tx` business rules validate `tx_ref` shape only (non-empty,
   printable); content matching against flow state is the flow's job, so
   there is exactly one authority for "does this reference name the pending
@@ -255,6 +259,9 @@ that succeeds, the dispatcher runs the sign handoff **in the same turn**
 - **Broadcast is still separately gated** — the chain stops at the handoff;
   `sign`→`broadcast` is not chained (a signed transaction reaching the chain
   still needs its own fresh same-turn gate decision, Phase-3 amendment).
+  (The "own fresh same-turn gate decision" is SUPERSEDED by the 2026-09-11
+  RECON amendment below: the broadcast gate is structural — SIGNED-state +
+  frozen record + signed-PSBT re-validation.)
   `cancel` stays CREATED-only; the merged turn can still reject on the
   device, and nothing broadcasts without the gated "broadcast".
 - **The speed words never confirm.** "faster"/"slower"/"important"/"save"
@@ -273,3 +280,44 @@ tx pends ⇒ `confirm_tx`; `golden-032`/`033` the importance→`fee_target`
 mapping; `golden-034` "sign" with nothing pending ⇒ never a fabricated
 `confirm_tx`; `confirm-bypass-007` "faster" ⇒ not a confirm) ship with this
 change per the AGENTS.md eval-ship obligation.
+
+## Amendment (2026-09-11, security review — ticket TCK-ADR-013-RECON): the broadcast gate is SIGNED + re-validation, not a fresh same-turn utterance
+
+Earlier wording in this ADR (the Phase-3 note in Consequences and the
+TCK-UX-002 amendment) described broadcast as needing "its own fresh
+same-turn gate decision." The security review of the Phase 3 flow
+(TCK-TX-SELF-001) found the implemented `TxFlow.broadcast` enforces **no
+`GateDecision` at all**: its preconditions are only SIGNED state, a verbatim
+`tx_ref`, and completed signed-PSBT re-validation. This amendment records
+that the implemented discipline IS the decision and **supersedes** that
+earlier wording.
+
+The broadcast gate is, precisely:
+
+1. **SIGNED state** — broadcast is refused from every other state
+   (broadcast from CONFIRMED is refused; there is no skip path past
+   signing), and
+2. **the byte-frozen signed record** — `SignedTx` is immutable and carries
+   exactly the PSBT the signer gateway returned, so what was re-validated
+   is byte-for-byte what is broadcast, and
+3. **full signed-PSBT re-validation** — the handler-level deterministic
+   check (`tx/revalidate.py`, TCK-P3-005) re-derives the intended
+   transaction from the dispatcher-owned confirmed record and re-proves the
+   signed PSBT against it (outputs, fee, signatures); a mismatch is a hard
+   stop that never reaches `broadcast`.
+
+Fail-closed: the re-validation is the binding money check. A fresh
+same-turn utterance gate adds **no security property** at broadcast:
+
+- broadcast is not user-interactive in the same way confirm and sign are —
+  it is post-sign. The user already made their decision on the device
+  (the trust anchor, PROJECT.md §9) at sign time; and
+- the PSBT bytes were frozen at sign time and re-validated against the
+  intended transaction, so the transaction that reaches the chain is
+  byte-for-byte the one the user approved.
+
+The interactive same-turn gates live on **confirm** (the dual-key rule, §2)
+and **sign** (the device interaction). Broadcast's gate is structural —
+state + frozen record + re-validation — not an utterance classification, and
+this discipline supersedes the earlier "broadcast needs its own gate
+decision" wording.

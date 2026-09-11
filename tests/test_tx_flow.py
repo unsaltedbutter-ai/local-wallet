@@ -454,6 +454,32 @@ def test_broadcast_from_confirmed_is_refused_no_skip_path():
     assert flow.txid is None
 
 
+def test_adr0013_recon_broadcast_gate_is_signed_and_revalidation_not_an_utterance():
+    """ADR-0013 RECON amendment (2026-09-11) pin: broadcast is gated
+    STRUCTURALLY, not by an utterance.
+
+    The amendment supersedes the earlier "broadcast needs its own fresh
+    same-turn gate decision" wording. As implemented, broadcast's binding
+    gate is SIGNED state + the byte-frozen signed record + completed
+    signed-PSBT re-validation at the handler (``tx/revalidate.py``). The
+    flow enforces the SIGNED-state leg here (broadcast from CONFIRMED —
+    before re-validation could have completed — is refused), and the API
+    carries no ``gate_decision`` at all: broadcast is not a user-utterance
+    gate. The re-validation leg is handler-level (a precondition of
+    reaching ``broadcast``, never modeled by the flow).
+    """
+    flow, _ = make_flow()
+    pending = drive_to_confirmed(flow)  # CONFIRMED: signed & re-validated? no
+    with pytest.raises(FlowError, match="no signed transaction"):
+        flow.broadcast(pending.tx_ref, "a" * 64)
+    assert flow.state is TxFlowStatus.CONFIRMED
+    assert flow.txid is None
+    # broadcast's signature carries no gate decision — no utterance can gate it
+    import inspect
+
+    assert "gate_decision" not in inspect.signature(TxFlow.broadcast).parameters
+
+
 def test_broadcast_wrong_tx_ref_and_value_hygiene_refused():
     flow, _ = make_flow()
     drive_to_signed(flow)

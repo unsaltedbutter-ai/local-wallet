@@ -85,8 +85,10 @@ This merges the *user prompts* from two to one; it changes nothing here:
 ``CONFIRMED`` and ``SIGNED`` stay distinct auditable states, the dual key
 still guards confirm, the device screen is still the trust anchor for
 signing (the chained handoff is the ordinary ``sign_tx`` handler path —
-code-invoked with the dispatcher-owned ``tx_ref``), and broadcast keeps
-its own fresh same-turn gate decision.
+code-invoked with the dispatcher-owned ``tx_ref``), and broadcast is gated
+structurally — SIGNED state + the byte-frozen signed record + completed
+signed-PSBT re-validation at the handler (ADR-0013 RECON amendment), not a
+fresh same-turn utterance gate (see :meth:`TxFlow.broadcast`).
 
 :func:`ConfirmGate.classify` is a conservative, whitelist-exact classifier:
 
