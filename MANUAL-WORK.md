@@ -53,14 +53,28 @@ Steps:
 7. `rm -rf /tmp/mw7.db*` when done.
 
 ## MW-16: Backend live verification on your Start9 machine (NEW 2026-09-09 — the newest code)
-PROGRESS 2026-09-11: electrum `ssl://evil-star.local:50001` VERIFIED WORKING. The two previously-rejected URLs are FIXED (TCK-BACKEND-003, 71048f1): https mempool URLs now auto-try the /api segment; https bitcoind RPC now classifies (canonical bitcoind+tls://) with the LOCALWALLET_TLS_VERIFY rung honored. RE-TEST both in Settings (no restart needed — hot-swap) and run the diagnostic below if anything still fails.
+PROGRESS 2026-09-11 (round 1): electrum `ssl://evil-star.local:50001` VERIFIED WORKING (again). bitcoind `https://192.168.0.25:65154` now CLASSIFIES (creds required — pane shows the fields; that's expected). Model download card + progress: WORKING.
+
+MW-16 round-2 failures (your report 2026-09-11, tickets below):
+1. **Private mempool still rejected** (`https://192.168.0.25:56191`, `https://evil-start:56191`) — same generic refusal + the new hints. NOTE: browser loads `https://192.168.0.25:56191/api/v1/fees/mempool-blocks` fine. → TCK-DIAG-001 (console error surfacing) + TCK-BACKEND-004 (root-cause). Hypotheses to check: (a) was LOCALWALLET_TLS_VERIFY=0 actually set this run? (b) hostname spelling — earlier working host was `evil-star.local`; `evil-start` (no .local) may be a typo in the URL field, (c) probe shape check vs your mempool version.
+2. **Private bitcoind classifies but startup scan fails**: "warning: startup scan failed: utxo-scan request rejected by the server — continuing with cached state." → likely the scantxoutset RPC refused (Core version < 22, or your Start9 RPC role lacks scantxoutset permission). → TCK-BACKEND-004.
+3. Electrum: working. Gap-limit apply→rescan: working (smaller-value semantics question → TCK-GAP-001). Cred matrix confirmed: bitcoind requires creds, mempool + electrum do not (all as designed).
 Launch is now just: `cd ~/local-wallet && .venv/bin/python -m localwallet.ui.cli` — the web UI opens in your browser automatically (add `LOCALWALLET_ZPUB="<zpub>"` or enter it in the page; no model path needed — it preloads the pinned model in the background and offers a Yes/No download if absent).
 Verify, reporting any failure verbatim:
 - [ ] **Private mempool (Esplora)**: in Settings → chain base, enter `https://evil-star.local:56191`. Start9's self-signed cert needs `LOCALWALLET_TLS_VERIFY=false` (env or `~/.localwallet/config.json`) — expect one honest warning line about unverified transport. Apply → NO restart needed: the client hot-swaps and a resync fires against your node.
 - [ ] **Electrum server**: `ssl://evil-star.local:50001` — accepted everywhere now (settings, /setup, stored). Probe = mainnet-genesis handshake.
 - [ ] **bitcoind**: `bitcoind://<host>:8332` with user/pass (or the "no credentials needed" checkbox / cookie). Core ≥ 22 required (older refuses, value-free). Note: scantxoutset scan shows unspent coins + their txs; fully-spent addresses' history is honestly absent (documented tradeoff).
 - [ ] **Autodetect**: a plain `http://<core-host>:8332` URL should classify itself as bitcoind (probe), `http://<mempool-host>` as mempool — you never specify the kind. Badges (mempool/electrum/bitcoind) light up accordingly.
-- [ ] **NEW — re-test after TCK-BACKEND-003**: Settings → chain base: `https://evil-star.local:56191` should now validate (probe auto-tries /api) and `https://192.168.0.25:65154` should classify as bitcoind (enter creds in the pane when shown; needs LOCALWALLET_TLS_VERIFY=false env/config for Start9 self-signed certs). If either still fails, run the diagnostic and paste the output (this pins the mempool/bitcoind rejection exactly; value-free, safe to paste):
+- [x] **Re-tested after TCK-BACKEND-003 (round 1, 2026-09-11)**: bitcoind classifies ✓ (startup scan then fails — see round-2 notes above); mempool still rejected ✗.
+- [ ] **Round 2 — run these on the VPN machine and paste ALL output (value-free, safe):**
+  1. Confirm the flag was set this run: `echo $LOCALWALLET_TLS_VERIFY` (must print 0/false for Start9 self-signed certs; if unset, set it in `~/.localwallet/config.json` as `"tls_verify": false` and restart).
+  2. Mempool probe (both hostnames, with and without --insecure):
+     `python3 tools/probe_backend_diag.py https://192.168.0.25:56191 --insecure --json`
+     `python3 tools/probe_backend_diag.py https://evil-star.local:56191 --insecure --json`
+     `python3 tools/probe_backend_diag.py https://192.168.0.25:56191 --json`   (TLS-on class, expect verify-failure)
+  3. Check the mempool shape the probe needs: `curl -k https://192.168.0.25:56191/api/blocks/tip` and `curl -k https://192.168.0.25:56191/api/blocks/0 | head -c 200` (tip must be a bare integer; /blocks/0 must return the mainnet genesis object).
+  4. bitcoind scantxoutset support check (cheap, no scan started):
+     `curl -k --user "bit:<your-rpc-pass>" --data-binary '{"jsonrpc":"1.0","id":"d","method":"scantxoutset","params":["status",[]]}' -H 'content-type: application/json;' https://192.168.0.25:65154` — paste the result (error here = version/permission root cause). (this pins the mempool/bitcoind rejection exactly; value-free, safe to paste):
   `python3 tools/probe_backend_diag.py https://evil-star.local:56191 --insecure --json`
   `python3 tools/probe_backend_diag.py https://192.168.0.25:65154 --user bit --password '<your-rpc-pass>' --insecure --json`
   (also run both WITHOUT `--insecure` once — distinguishes the TLS-verify failure class from the path/shape failure class; password is never printed)
