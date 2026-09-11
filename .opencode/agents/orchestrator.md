@@ -5,7 +5,7 @@ model: aspark/glm-5.3-flash
 reasoningEffort: high
 temperature: 0.3
 permission:
-  edit: deny
+  edit: allow
   bash:
     "*": allow
     "git status": allow
