@@ -11,6 +11,12 @@
 // watch key collapses to a read-only truncated display, the chain-base row
 // is an Edit→Apply read-only cycle with backend badges + a Resync-now
 // action, and the header carries the model-free balance quick actions.
+// TCK-WEB-013: the chain row always shows the effective backend URL with a
+// privacy_mode-driven trust badge, the empty field is directly typeable
+// (Edit/Cancel only once a value exists), the env rung gets one honest
+// note instead of the write path, first run stays in the pane under a
+// one-time public-default leak beat, and a 401 on any pane POST says
+// "reload" rather than "try again".
 
 const island = window.__LOCALWALLET__;
 const token = island && typeof island.token === "string" ? island.token : "";
@@ -35,6 +41,13 @@ const settingsCloseEl = document.getElementById("settings-close");
 const settingsRetryEl = document.getElementById("settings-retry");
 const settingsStatusEl = document.getElementById("settings-status");
 const settingsListEl = document.getElementById("settings-list");
+
+// The leak sentence, shared verbatim by the empty-apply note and the
+// first-run beat (TCK-WEB-013 item 4 reuses the copy pass 2 #52 wording —
+// one string, so the two disclosures can never drift).
+const PUBLIC_LEAK_SENTENCE =
+  "whoever runs it sees every address you check, can link those to your IP, " +
+  "and watches when your transactions move.";
 
 // One map for every user-facing string this file injects (designer pass —
 // button labels live in index.html markup, likewise for rewording).
@@ -178,9 +191,36 @@ const LABELS = {
   // LANDS — the placeholder hint above the field is not the consent beat.
   // Tested for emptiness only; the value itself is never echoed (value-free).
   settingsEmptyApplied:
-    "Switched to the public mempool.space server — whoever runs it sees " +
-    "every address you check, can link those to your IP, and watches when " +
-    "your transactions move. Enter your own server's address to switch back.",
+    "Switched to the public mempool.space server — " +
+    PUBLIC_LEAK_SENTENCE +
+    " Enter your own server's address to switch back.",
+  // TCK-WEB-013: (1) the effective-backend line (the ADDITIVE
+  // effective_chain_base_url from the /settings replies — the public
+  // default becomes VISIBLE when the stored rung is empty; absent = the
+  // line is omitted, never fabricated). (4) the one-time first-run beat,
+  // the same leak named up front instead of only after an empty Apply.
+  settingsNowUsing: "Now using:",
+  firstRunBeat:
+    "You are on the public mempool.space server — " +
+    PUBLIC_LEAK_SENTENCE +
+    " Add your own server's address below — or close Settings to continue " +
+    "for now.",
+  // (5) the env rung's honest note (value-free: names the mechanism and
+  // the file, never the env VALUE beyond the URL already shown).
+  chainEnvOverride:
+    "Set by environment variable — change it there or in " +
+    "~/.localwallet/config.json.",
+  settingsCancel: "Cancel",
+  // (2) the chain row's trust badge — rides the /state privacy_mode
+  // closed enum ONLY (never derived from the URL string client-side).
+  trustLocal: "on this computer",
+  trustRemote: "your own machine (remote)",
+  trustPublic: "public server — see privacy notice",
+  trustAwaiting: "not set up yet",
+  // (6) the stale-token sentence: shared with the stream path — a pane
+  // POST that 401s can never be fixed by retrying.
+  sessionStale:
+    "This page\u2019s session no longer matches the wallet — reload this page.",
   resyncNoteBusy: "Saved — a scan is already running; it will use the new value.",
   resyncNoteDeferred: "Saved — the re-scan is queued behind the current scan.",
   resyncNoteSkipped:
@@ -271,6 +311,15 @@ const state = {
   watchKeyNeeded: false, // the pane renders the zpub ENTRY form iff true
   sessionWatchKey: "",
   settingsAutoShown: false, // first-run auto-open episode armed/active
+  // TCK-WEB-013 (4): the one-time first-run backend beat. Set on a
+  // successful Connect DURING the auto-open episode (the pane then stays
+  // open under it); cleared when the user closes the pane themselves —
+  // that close is the explicit "not now" (no re-open loop, no re-show).
+  firstRunBeat: false,
+  // TCK-WEB-013 (1): the effective chain base URL from the last settings
+  // read (creds-stripped server-side; null = field absent = omit the
+  // "Now using" line, never fabricate). Memory only, like every value.
+  effectiveChainUrl: null,
   // TCK-LAUNCH-002: the model card + inline download progress. The card /
   // quick-action buttons are shown ONLY from the typed snapshot's additive
   // model_state NAME (never prose); the progress line is an inline element
@@ -643,7 +692,10 @@ function applyWatchKeyGate(snap) {
 
 // The terminal success path of a watch-key submit (TCK-WEB-008 fix 1,
 // TCK-WEB-009 (b)): collapse the pane's zpub row to the read-only truncated
-// display, hand focus back to chat, keep the transcript + status.
+// display. TCK-WEB-013 (4): during a first-run auto-open episode the pane
+// now STAYS OPEN under the backend beat instead of auto-closing — the
+// WEB-012 dismiss→chat-focus handoff moved to closeSettings (it fires when
+// the user actually closes the pane, which is the explicit "not now").
 function dismissWatchKeyForm(key) {
   state.sessionWatchKey = key; // memory only: the display fallback pre-/settings-read
   state.watchKeyDismissed = true;
@@ -653,11 +705,28 @@ function dismissWatchKeyForm(key) {
   inputEl.disabled = false;
   sendBtn.disabled = false;
   quickbarEl.hidden = false;
-  renderSettings();
   if (state.settingsAutoShown) {
-    state.settingsAutoShown = false; // the auto-open episode is over
-    closeSettings(inputEl); // (d): hand focus to chat compose, not <body>
+    state.settingsAutoShown = false; // the auto-open episode hands off to the beat
+    state.firstRunBeat = true;
+    renderSettings();
+    // The chain row (the beat's host) is engine truth: read it fresh, then
+    // scroll/focus. A failed read shows the pane's honest retry line.
+    loadSettings().then(revealFirstRunBeat);
+    return;
   }
+  renderSettings();
+}
+
+// (4): reveal the beat — put the cursor where the user acts (the empty,
+// directly-typeable chain field; focus() scrolls it into view), or on the
+// pane heading when the settings read could not land a chain row yet.
+function revealFirstRunBeat() {
+  if (!state.firstRunBeat || settingsPanelEl.hidden) return;
+  const field = settingsListEl.querySelector(
+    ".setting-chain .setting-line > input.setting-input",
+  );
+  const target = field || settingsHeadingEl;
+  if (target.isConnected) target.focus();
 }
 
 // The scan chip reflects ONLY the typed snapshot's scan_state (additive under
@@ -686,6 +755,40 @@ const PRIVACY_SUBLINE = {
   awaiting_backend: LABELS.privacyAwaiting,
 };
 
+// TCK-WEB-013 (2): the chain row's trust badge — the SAME closed enum the
+// header chip rides (privacy_mode from /state; never derived from the URL
+// string client-side). Unknown/absent enum → no badge (existing discipline).
+const TRUST_BADGE_WORDS = {
+  own_node_local: LABELS.trustLocal,
+  own_node_remote: LABELS.trustRemote,
+  public: LABELS.trustPublic,
+  awaiting_backend: LABELS.trustAwaiting,
+};
+
+// The badge element for the "Now using" line, or null (unknown mode).
+// Color rides data-privacy — the same attribute selector + token pair as
+// the header chip (styles.css), so pane and header can never disagree.
+function trustBadge() {
+  const words = TRUST_BADGE_WORDS[state.privacyMode];
+  if (!words) return null;
+  const badge = el("span", "trust-badge", words);
+  badge.dataset.privacy = state.privacyMode;
+  return badge;
+}
+
+// Re-paint the pane's existing badges in place when /state moves the mode
+// (the pane is not rebuilt by snapshots — renderSettings owns that).
+function paintTrustBadges() {
+  const words = TRUST_BADGE_WORDS[state.privacyMode] || "";
+  for (const badge of settingsListEl.querySelectorAll(".trust-badge")) {
+    badge.hidden = !words;
+    if (words) {
+      badge.dataset.privacy = state.privacyMode;
+      badge.textContent = words;
+    }
+  }
+}
+
 // TCK-UX-010 + TCK-WEB-012 (f): two upgrades over the original chip. (1) The chip PERSISTS the last known mode
 // across state/0 (engine-busy) snapshots — it must not blink out mid-turn;
 // only a contradicting TYPED snapshot (a different valid name, or an
@@ -703,6 +806,7 @@ function applyPrivacyChip(snap) {
         : "";
   }
   const mode = state.privacyMode;
+  paintTrustBadges(); // TCK-WEB-013 (2): the pane badge rides the same truth
   if (!mode) {
     privacyChipEl.hidden = true;
     privacyChipEl.removeAttribute("data-privacy");
@@ -820,10 +924,7 @@ async function listen() {
       const response = await fetch("/events", { headers, cache: "no-store" });
       if (response.status === 401) {
         state.stopped = true;
-        setStatus(
-          "unauthorized",
-          "This page's session no longer matches the wallet — reload this page.",
-        );
+        setStatus("unauthorized", LABELS.sessionStale);
         return;
       }
       if (!response.ok || !response.body) throw new Error(String(response.status));
@@ -1098,15 +1199,18 @@ function watchKeyRow(serverEntry) {
   return li;
 }
 
-// The chain-base row (TCK-WEB-009 d/e/f): a read-only field + Edit; Edit
-// makes it editable and the button becomes Apply; Apply is the existing
-// POST /settings write (the engine probes before saving and hot-swaps
-// server-side — ADR-0018 amendment), and success returns the row to
-// read-only. A refused probe shows the engine's honest value-free line and
-// keeps the field editable for a correction. While a write (or the engine's
-// probe inside it) is in flight the button is disabled: no double-submit.
-// Under the field: the three dimmed backend badges and the Resync-now
-// action.
+// The chain-base row (TCK-WEB-009 d/e/f, reworked by TCK-WEB-013): the
+// effective backend is ALWAYS shown ("Now using: <url>" from the additive
+// /settings field, omitted when absent — never fabricated) with a trust
+// badge riding the /state privacy_mode enum ONLY. A stored value renders
+// read-only + Edit→Apply (the existing POST /settings write; the engine
+// probes before saving and hot-swaps server-side — ADR-0018 amendment); an
+// EMPTY field is directly typeable (Apply straight away), and the env rung
+// suppresses the field's whole write path for one honest note. Edit/typing
+// gain Cancel + Escape, which rebuild the row from engine truth with no
+// request. While a write (or the engine's probe inside it) is in flight the
+// button is disabled: no double-submit. Under the field: the three dimmed
+// backend badges and the Resync-now action.
 function chainBaseRow(entry) {
   inputSeq += 1;
   const li = el("li", "setting setting-chain");
@@ -1115,6 +1219,29 @@ function chainBaseRow(entry) {
   label.htmlFor = keyId;
   li.appendChild(label);
 
+  // (5): an env-rung entry is not this field's to write — no Edit rung.
+  const envRung = entry.env_override === true;
+
+  // TCK-WEB-013 (1/2): the effective backend is ALWAYS shown when the
+  // server carries it (this is how the public default becomes visible
+  // under an empty stored field), with the trust badge riding the
+  // privacy_mode enum beside it. Field absent (bare pump) → line omitted.
+  if (state.effectiveChainUrl) {
+    const nowLine = el("div", "chain-now-line");
+    nowLine.appendChild(
+      el("p", "chain-now", LABELS.settingsNowUsing + " " + state.effectiveChainUrl)
+    );
+    const badge = trustBadge();
+    if (badge) nowLine.appendChild(badge);
+    li.appendChild(nowLine);
+  }
+
+  // (4): the one-time first-run beat, above the field the "add your own
+  // node below" sentence points at.
+  if (state.firstRunBeat) {
+    li.appendChild(el("p", "setting-flag chain-beat", LABELS.firstRunBeat));
+  }
+
   const line = el("div", "setting-line");
   const input = document.createElement("input");
   input.className = "setting-input";
@@ -1122,13 +1249,36 @@ function chainBaseRow(entry) {
   input.type = "text";
   input.spellcheck = false;
   input.autocomplete = "off";
-  input.readOnly = true; // (d): starts read-only
   input.value = typeof entry.value === "string" ? entry.value : "";
-  input.placeholder = LABELS.settingsEmptyPlaceholder;
-  const btn = el("button", "btn btn-secondary btn-small setting-apply", LABELS.settingsEdit);
+  // (3): an EMPTY stored field is directly typeable — Edit earns its keep
+  // only when a value exists (and never on the env rung, where a stored
+  // write is shadowed anyway).
+  const directlyTypeable = !envRung && input.value.trim() === "";
+  input.readOnly = !directlyTypeable;
+  if (!envRung) input.placeholder = LABELS.settingsEmptyPlaceholder;
+  // Escape-cancel must tell a touched directly-typeable field from an
+  // untouched one (the field never was "opened" by an Edit click).
+  input.dataset.dirty = "0";
+  input.addEventListener("input", () => {
+    input.dataset.dirty = "1";
+    updateCredsVisibility(li, input);
+  });
+  const btn = el(
+    "button",
+    "btn btn-secondary btn-small setting-apply",
+    directlyTypeable ? LABELS.settingsApply : LABELS.settingsEdit,
+  );
   btn.type = "button";
   btn.dataset.settingKey = entry.key;
-  line.append(input, btn);
+  // (3): Cancel for the edit mode — restores read-only from ENGINE truth
+  // (renderSettings rebuilds from the entry, the replace-cancel shape),
+  // no request. Visible exactly while the field is editable.
+  const cancel = el("button", "btn btn-secondary btn-small setting-cancel", LABELS.settingsCancel);
+  cancel.type = "button";
+  cancel.hidden = !directlyTypeable;
+  cancel.addEventListener("click", () => renderSettings());
+  if (!envRung) line.append(input, btn, cancel);
+  else line.appendChild(input);
   li.appendChild(line);
 
   // copy pass 2 #44: the legend is the visible text alternative to dim/lit,
@@ -1156,12 +1306,16 @@ function chainBaseRow(entry) {
   resyncLine.appendChild(resyncBtn);
   li.appendChild(resyncLine);
 
-  li.appendChild(el("p", "setting-hint", LABELS.settingsEmptyIsDefault));
+  // (5): the "Empty = public default" hint lies under an env rung (the
+  // effective URL line above carries the truth instead) — suppressed there.
+  if (!envRung) {
+    li.appendChild(el("p", "setting-hint", LABELS.settingsEmptyIsDefault));
+  }
   if (entry.requires_restart === true) {
     li.appendChild(el("p", "setting-flag", LABELS.settingsRestart));
   }
-  if (entry.env_override === true) {
-    li.appendChild(el("p", "setting-flag", LABELS.settingsEnvOverride));
+  if (envRung) {
+    li.appendChild(el("p", "setting-flag", LABELS.chainEnvOverride));
   }
 
   // TCK-ONB-004 M3: the credentials block. The engine's secret entries
@@ -1215,7 +1369,6 @@ function chainBaseRow(entry) {
   creds.append(noneLine, credsLine, el("p", "setting-hint", LABELS.credsHint));
   li.appendChild(creds);
   li.dataset.credsNoneInitial = credFlags.none ? "1" : "0";
-  input.addEventListener("input", () => updateCredsVisibility(li, input));
 
   const status = el("p", "setting-status");
   status.setAttribute("role", "status");
@@ -1248,15 +1401,17 @@ function updateCredsVisibility(row, input) {
   );
 }
 
-// One POST /settings write, parsed or null. Returns the engine's reply
-// object (its closed ``status`` is the truth the caller judges).
+// One POST /settings write: {code, data} — the engine's closed ``status``
+// is the truth the caller judges, and the HTTP code rides along because a
+// 401 has its own honest sentence (TCK-WEB-013 item 6) that a parse-only
+// return would lose.
 async function postSetting(key, value) {
   const response = await fetch("/settings", {
     method: "POST",
     headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ key, value }),
   });
-  return response.json().catch(() => null);
+  return { code: response.status, data: await response.json().catch(() => null) };
 }
 
 // The credential overlay the chain-base Apply submits AS PART OF the URL
@@ -1309,7 +1464,13 @@ async function clearBackendCreds(btn, status, row) {
   status.textContent = LABELS.settingsSaving;
   try {
     for (const key of ["backend_auth_user", "backend_auth_pass", "backend_auth_none"]) {
-      const data = await postSetting(key, "");
+      const { code, data } = await postSetting(key, "");
+      if (code === 401) {
+        // TCK-WEB-013 (6): a retry can never succeed on a stale token.
+        status.dataset.kind = "error";
+        status.textContent = LABELS.sessionStale;
+        return;
+      }
       if (!data || data.status !== "applied") {
         status.dataset.kind = "error";
         status.textContent =
@@ -1374,6 +1535,10 @@ async function requestResync(btn, status) {
     } else if (response.status === 409 || closed === "busy") {
       note = LABELS.resyncBusy;
       kind = "";
+    } else if (response.status === 401) {
+      // TCK-WEB-013 (6): a stale per-launch token — retrying can never
+      // succeed; say what actually fixes it (same sentence as the stream).
+      note = LABELS.sessionStale;
     }
   } catch {
     note = LABELS.unreachable;
@@ -1460,6 +1625,13 @@ async function loadSettings() {
       entries.set(entry.key, entry);
     }
     state.settings = entries;
+    // TCK-WEB-013 (1): the additive effective-URL field — stamped when the
+    // engine has chain wiring, omitted (null) on bare pumps. Reset first:
+    // a reply without the field must not keep a stale line up.
+    state.effectiveChainUrl =
+      typeof data.effective_chain_base_url === "string"
+        ? data.effective_chain_base_url
+        : null;
     if (typeof data.backend_kind === "string" && BACKEND_KINDS.has(data.backend_kind)) {
       state.backendKind = data.backend_kind;
     }
@@ -1517,6 +1689,8 @@ settingsListEl.addEventListener("click", async (event) => {
     input.readOnly = false;
     input.focus();
     btn.textContent = LABELS.settingsApply;
+    const cancel = row.querySelector(".setting-cancel");
+    if (cancel) cancel.hidden = false; // WEB-013 (3): Cancel earns its keep now
     status.dataset.kind = "";
     status.textContent = "";
     updateCredsVisibility(row, input);
@@ -1576,8 +1750,35 @@ settingsListEl.addEventListener("click", async (event) => {
         input.value = typeof fresh.value === "string" ? fresh.value : "";
       }
       if (isChain) {
-        input.readOnly = true; // (d): applied → back to the read-only state
-        btn.textContent = LABELS.settingsEdit;
+        // (d) + TCK-WEB-013 (3): applied → read-only with Edit again — but
+        // an applied EMPTY value lands directly-typeable (with the leak
+        // note above already naming what just happened).
+        input.readOnly = input.value.trim() !== "";
+        btn.textContent = input.readOnly ? LABELS.settingsEdit : LABELS.settingsApply;
+        const cancel = row.querySelector(".setting-cancel");
+        if (cancel) cancel.hidden = input.readOnly;
+        input.dataset.dirty = "0";
+        // (4): an Apply answers the first-run beat's ask — it retires here
+        // too (the pane-close path clears it in closeSettings).
+        state.firstRunBeat = false;
+        const beat = row.querySelector(".chain-beat");
+        if (beat) beat.remove();
+        // (1): this reply is a sealed one too — follow the effective URL,
+        // with the GET's reset-if-absent rule (TCK-WEB-013 (1)): an applied
+        // reply without the field means bare pump now — null it and drop the
+        // line, never leave the previous URL painted.
+        state.effectiveChainUrl =
+          typeof data.effective_chain_base_url === "string"
+            ? data.effective_chain_base_url
+            : null;
+        const now = row.querySelector(".chain-now");
+        if (state.effectiveChainUrl) {
+          if (now) {
+            now.textContent = LABELS.settingsNowUsing + " " + state.effectiveChainUrl;
+          }
+        } else if (now) {
+          now.remove();
+        }
         // (M3): the login fields close with the row — the pair lives only
         // in the engine's store now; refresh the local set/unset facts from
         // what this Apply actually wrote (the next full read confirms
@@ -1621,6 +1822,11 @@ settingsListEl.addEventListener("click", async (event) => {
           ? LABELS.settingsRejectedPrefix + " " + data.error
           : LABELS.settingsRejected;
       // a refused swap/probe: the field stays editable for a correction
+    } else if (response.status === 401) {
+      // TCK-WEB-013 (6): a stale per-launch token — retrying can never
+      // succeed; say what actually fixes it (the stream's own sentence).
+      status.dataset.kind = "error";
+      status.textContent = LABELS.sessionStale;
     } else {
       // 503 (engine busy) and anything unexpected: one honest retry line
       status.dataset.kind = "error";
@@ -1675,6 +1881,14 @@ function closeSettings(returnFocusTo) {
   if (!settingsPanelEl.hidden) {
     settingsPanelEl.hidden = true;
     settingsToggleEl.setAttribute("aria-expanded", "false");
+    if (state.firstRunBeat) {
+      // TCK-WEB-013 (4): this close (X / Escape / header toggle) IS the
+      // explicit "not now" — the beat retires one-time (never re-shown,
+      // no re-open loop; the engine's awaiting_backend gate defers the
+      // first-run scan on its own) and the WEB-012 chat handoff fires here.
+      state.firstRunBeat = false;
+      if (!returnFocusTo) returnFocusTo = inputEl;
+    }
     const target = returnFocusTo || settingsToggleEl;
     if (!target.disabled) target.focus();
   }
@@ -1702,11 +1916,13 @@ document.addEventListener("keydown", (event) => {
   }
   // The URL field only — the login block's fields are never readonly and
   // live hidden when not editing, so a class-scoped match is required.
-  if (
-    settingsPanelEl.querySelector(
-      ".setting-chain .setting-line > input.setting-input:not(.creds-user):not(.creds-pass):not([readonly])",
-    )
-  ) {
+  // TCK-WEB-013 (3): cancel the row only when an edit is actually OPEN —
+  // a value present (Edit rung) or a touched directly-typeable field; an
+  // untouched empty field is not an open edit, so Escape closes the pane.
+  const editing = settingsPanelEl.querySelector(
+    ".setting-chain .setting-line > input.setting-input:not(.creds-user):not(.creds-pass):not([readonly])",
+  );
+  if (editing && (editing.value.trim() !== "" || editing.dataset.dirty === "1")) {
     event.preventDefault();
     renderSettings(); // row back to read-only + Edit; nothing was sent
     return;
@@ -1770,6 +1986,10 @@ async function submitWatchKey(input, btn, status, box) {
   } else if (code === 0) {
     status.dataset.kind = "error";
     status.textContent = LABELS.unreachable;
+  } else if (code === 401) {
+    // TCK-WEB-013 (6): stale token — the reload sentence, never "try again".
+    status.dataset.kind = "error";
+    status.textContent = LABELS.sessionStale;
   } else if (code === 503) {
     status.dataset.kind = "error";
     status.textContent = LABELS.watchkeyBusy;
@@ -1825,9 +2045,11 @@ function replaceStage(stage, input, btn, status, box, key) {
       const reason =
         code === 0
           ? LABELS.unreachable
-          : data && typeof data.error === "string"
-            ? LABELS.watchkeyRejectedPrefix + " " + data.error
-            : LABELS.watchkeyFailed;
+          : code === 401
+            ? LABELS.sessionStale // TCK-WEB-013 (6)
+            : data && typeof data.error === "string"
+              ? LABELS.watchkeyRejectedPrefix + " " + data.error
+              : LABELS.watchkeyFailed;
       status.dataset.kind = "error";
       status.textContent = reason;
     }

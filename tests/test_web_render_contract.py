@@ -118,6 +118,56 @@ def test_privacy_chip_is_enum_gated_and_never_paints_raw_enum() -> None:
         assert f'data-privacy="{name}"' in styles
 
 
+# TCK-WEB-010 static pins: per-bubble copy control. The copyable text of a
+# turn excludes transient telemetry (progress dots + model-download bar); an
+# empty / progress-only bubble gets no button (addCopyButton early-returns on
+# the .copy-btn idempotence check OR an empty bubbleText); exactly ONE button
+# class assignment exists, shared by every call site.
+def test_copy_button_selector_guard_and_single_class_assignment() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    # copy-text selector excludes progress + model-download telemetry verbatim.
+    assert ".turn-text:not(.turn-progress):not(.turn-model)" in code
+    # empty-bubble guard sits alongside the wiring, and the .copy-btn early
+    # return makes addCopyButton idempotent (no double buttons on re-render).
+    assert "!bubbleText(turn)" in code
+    assert 'turn.querySelector(".copy-btn")' in code
+    # exactly ONE button class assignment, shared by every call site.
+    assert code.count('btn.className = "copy-btn"') == 1
+    # real call sites today: appendText, appendSystem, appendUser (3).
+    assert code.count("addCopyButton(turn);") == 3
+
+
+# TCK-WEB-011 static pin: the engine's user_text echo is deduped against this
+# tab's locally-echoed pending submits (renderUserText), and that branch rides
+# the SAME handleEvent AFTER the event-id replay-duplicate guard — so a
+# replayed echo of an already-consumed pending is dropped before renderUserText
+# ever runs (ordering pinned by source index).
+def test_render_user_text_dedupes_after_event_id_guard() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    assert "renderUserText" in code
+    assert "state.pendingEchos" in code
+    guard = code.index("id <= state.lastEventId")  # replay duplicate guard
+    user_text = code.index('kind === "user_text"')  # the dedupe branch
+    assert guard < user_text
+
+
+# TCK-WEB-012/013 static pins: the privacy subline is VISIBLE text painted onto
+# privacySublineEl (per privacy_mode NAME) while the raw enum name is never the
+# chip's visible text; the chain-row trust badge derives ONLY from the
+# state.privacyMode closed enum — never from the effective chain URL content.
+def test_privacy_subline_visible_and_trust_badge_keys_off_privacy_mode() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    # visible subline: the closed enum NAME maps to prose on privacySublineEl.
+    assert "privacySublineEl.textContent" in code
+    # the raw privacy enum is never painted as the chip's visible text.
+    assert "privacyChipEl.textContent" not in code
+    # the chain-row trust badge derives ONLY from the privacyMode state.
+    assert "TRUST_BADGE_WORDS[state.privacyMode]" in code
+    # ...and no trust decision reads the effective chain URL content.
+    trust_block = code[code.index("const TRUST_BADGE_WORDS"):code.index("function paintTrustBadges")]
+    assert "effectiveChainUrl" not in trust_block
+
+
 @pytest.mark.parametrize(
     "path", sorted(_RENDER_DIR.glob("*.json")), ids=lambda p: p.stem
 )

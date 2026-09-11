@@ -203,21 +203,56 @@ body {
   font-size: var(--fs-xs);
   white-space: normal;
 }
-.privacy[data-privacy="public"] {
+.privacy[data-privacy="public"],
+/* TCK-WEB-013 (2): the settings pane's trust badge is the chip's twin —
+   the SAME data-privacy attribute selectors and the SAME --c-priv-* token
+   pairs, so pane and header recolor together and can never disagree. */
+.trust-badge[data-privacy="public"] {
   color: var(--c-priv-public);
   background: var(--c-priv-public-bg);
   border-color: var(--c-priv-public);
 }
-.privacy[data-privacy="own_node_local"] {
+.privacy[data-privacy="own_node_local"],
+.trust-badge[data-privacy="own_node_local"] {
   color: var(--c-priv-local);
   background: var(--c-priv-local-bg);
   border-color: var(--c-priv-local);
 }
 .privacy[data-privacy="own_node_remote"],
-.privacy[data-privacy="awaiting_backend"] {
+.privacy[data-privacy="awaiting_backend"],
+.trust-badge[data-privacy="own_node_remote"],
+.trust-badge[data-privacy="awaiting_backend"] {
   color: var(--c-priv-trust);
   background: var(--c-priv-trust-bg);
   border-color: var(--c-priv-trust);
+}
+
+/* TCK-WEB-013 (1): the chain row's effective-backend line — "Now using:
+   <url>" plus the trust badge beside it. The URL is the user's own config
+   (creds stripped server-side): muted mono, copyable, wrapped never cut
+   mid-value. */
+.chain-now-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+
+.chain-now {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.trust-badge {
+  flex: none;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border: 1px solid var(--c-border-strong);
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
 }
 
 /* ---------------------------------------------------------------- settings */
