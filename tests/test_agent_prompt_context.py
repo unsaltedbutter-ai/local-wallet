@@ -51,9 +51,18 @@ def _llama_cpp_available() -> bool:
     return importlib.util.find_spec("llama_cpp") is not None
 
 
+_DEFAULT_GGUF = _SRC.parent / "models" / "bin" / "gemma-4-E2B-it-Q4_K_M.gguf"
+
+
+def _model_file_path() -> Path | None:
+    env = os.environ.get(MODEL_PATH_ENV_VAR)
+    if env and Path(env).is_file():
+        return Path(env)
+    return _DEFAULT_GGUF if _DEFAULT_GGUF.is_file() else None
+
+
 def _model_file_available() -> bool:
-    path = os.environ.get(MODEL_PATH_ENV_VAR)
-    return bool(path) and Path(path).is_file()
+    return _model_file_path() is not None
 
 
 LLAMA_CPP_AVAILABLE = _llama_cpp_available()
@@ -371,7 +380,7 @@ class TestGrammar:
         from llama_cpp import llama_cpp as _lib
 
         llm = Llama(
-            model_path=os.environ[MODEL_PATH_ENV_VAR],
+            model_path=str(_model_file_path()),
             vocab_only=True,
             verbose=False,
         )
@@ -500,7 +509,7 @@ class TestRuntimeRealPath:
         reason=f"no model file; set {MODEL_PATH_ENV_VAR} to a local GGUF",
     )
     def test_real_generation_returns_string(self) -> None:
-        runtime = ModelRuntime()
+        runtime = ModelRuntime(model_path=str(_model_file_path()))
         out = runtime.generate("user: how much do I have?\n\nenvelope:")
         assert isinstance(out, str)
         assert len(out) > 0
