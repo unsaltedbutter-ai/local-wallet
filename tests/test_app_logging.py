@@ -227,3 +227,57 @@ def test_web_narration_is_in_the_emitter_not_the_terminal(
     # block: URL + token + shutdown):
     assert not any("hello there" in line or "(stub model" in line for line in outputs)
     assert any(line.startswith("Web UI:") for line in outputs)
+
+
+# ---------------------------------------- TCK-UX-012(a): web startup lines = separate bubbles
+
+
+def test_web_output_closes_each_startup_line_as_its_own_turn(
+    tmp_path: Path,
+) -> None:
+    """In WEB mode every narration line (the whole buffered banner, then any
+    post-bind startup line) is followed by a ``turn_end`` marker: the browser
+    renders one bubble per turn, so WITHOUT the closer the banner lines — and
+    the first reply after them — all glom into a single merged bubble. The
+    engine already emitted one event per line (verified); this pins the
+    web-side delimiter that actually separates them."""
+    events: list[Any] = []
+    emitter = app.EventEmitter(events.append)
+    log = app._Log(str(tmp_path / "store.db"), "web")
+    terminal_lines: list[str] = []
+    out = app._Output(web=True, terminal=terminal_lines.append, log=log)
+    try:
+        # Pre-bind lines buffer, then flush at bind_emitter.
+        out("Privacy notice: x")
+        out("Background watch: off. Change it in settings.")
+        out.bind_emitter(emitter)
+        # Post-bind line routes directly.
+        out("Type a message — 'exit' or Ctrl-D quits.")
+    finally:
+        log.close()
+    assert [(e.kind, e.payload) for e in events] == [
+        (app.EVENT_TEXT, "Privacy notice: x"),
+        (app.EVENT_TURN_END, ""),
+        (app.EVENT_TEXT, "Background watch: off. Change it in settings."),
+        (app.EVENT_TURN_END, ""),
+        (app.EVENT_TEXT, "Type a message — 'exit' or Ctrl-D quits."),
+        (app.EVENT_TURN_END, ""),
+    ]
+    assert terminal_lines == []  # web narration never reaches the terminal
+
+
+def test_cli_output_prints_lines_with_no_markers(tmp_path: Path) -> None:
+    """CLI mode is byte-identical: each line goes to the terminal, no emitter
+    / turn_end machinery is involved at all."""
+    log = app._Log(str(tmp_path / "store.db"), "cli")
+    lines: list[str] = []
+    out = app._Output(web=False, terminal=lines.append, log=log)
+    try:
+        out("Privacy notice: x")
+        out("Background watch: off. Change it in settings.")
+    finally:
+        log.close()
+    assert lines == [
+        "Privacy notice: x",
+        "Background watch: off. Change it in settings.",
+    ]

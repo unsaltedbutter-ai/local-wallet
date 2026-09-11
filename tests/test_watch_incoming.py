@@ -600,6 +600,12 @@ def test_drain_watch_suffix_computed_once_per_drain_not_per_event():
 # ---------------------------------------------------------------- NOTE-1: persistent-failure visibility
 
 
+def _fail_line(interval_s: float = 60.0) -> str:
+    """The TCK-UX-012(c) failure line: names the watcher's RESOLVED interval
+    (the deterministic retry delay), value-free otherwise."""
+    return f"watch: check failed — retrying in ~{interval_s:g}s"
+
+
 def test_drain_watch_failure_line_printed_once_per_streak():
     def boom() -> list[WatchedTx]:
         raise ChainError("address-txs request failed: status 500")
@@ -607,14 +613,77 @@ def test_drain_watch_failure_line_printed_once_per_streak():
     clock_watcher = _TickWatcher(boom)
     outputs: list[str] = []
     _drain_watch(clock_watcher.watcher, outputs.append)
-    assert outputs == ["watch: check failed, will retry next cycle"]
+    assert outputs == [_fail_line()]
     # A second consecutive failure does NOT repeat the line (throttled per streak).
     clock_watcher.advance(60.0)
     _drain_watch(clock_watcher.watcher, outputs.append)
-    assert outputs == ["watch: check failed, will retry next cycle"]
+    assert outputs == [_fail_line()]
     clock_watcher.advance(60.0)
     _drain_watch(clock_watcher.watcher, outputs.append)
-    assert outputs == ["watch: check failed, will retry next cycle"]
+    assert outputs == [_fail_line()]
+
+
+def test_drain_watch_failure_line_names_the_resolved_interval():
+    """TCK-UX-012(c): the retry-delay claim is the watcher's OWN resolved
+    interval (``IncomingWatcher.interval_s``), not a hardcoded number."""
+
+    def boom() -> list[WatchedTx]:
+        raise ChainError("address-txs request failed: status 500")
+
+    clock_watcher = _TickWatcher(boom, interval_s=90.0)
+    outputs: list[str] = []
+    _drain_watch(clock_watcher.watcher, outputs.append)
+    assert outputs == ["watch: check failed — retrying in ~90s"]
+
+
+def test_drain_watch_recovered_line_once_per_streak():
+    """TCK-UX-012(c): when a failure streak ENDS, exactly ONE
+    ``watch: recovered.`` line prints (symmetric throttle); plain successes
+    print nothing."""
+    state = {"fail": True}
+
+    def probe() -> list[WatchedTx]:
+        if state["fail"]:
+            raise ChainError("address-txs request failed: status 500")
+        return []
+
+    clock_watcher = _TickWatcher(probe)
+    outputs: list[str] = []
+    _drain_watch(clock_watcher.watcher, outputs.append)
+    assert outputs == [_fail_line()]
+    # The streak ends: one recovery line.
+    state["fail"] = False
+    clock_watcher.advance(60.0)
+    _drain_watch(clock_watcher.watcher, outputs.append)
+    assert outputs == [_fail_line(), "watch: recovered."]
+    # Further successes stay silent (no streak had ended).
+    clock_watcher.advance(60.0)
+    _drain_watch(clock_watcher.watcher, outputs.append)
+    assert outputs == [_fail_line(), "watch: recovered."]
+
+
+def test_drain_watch_success_without_prior_failure_prints_nothing():
+    """A healthy watcher never prints the recovery line (it answers False on
+    every success with no prior failure)."""
+    clock_watcher = _TickWatcher(list)
+    outputs: list[str] = []
+    _drain_watch(clock_watcher.watcher, outputs.append)
+    clock_watcher.advance(60.0)
+    _drain_watch(clock_watcher.watcher, outputs.append)
+    assert outputs == []
+
+
+def test_watcher_streak_readers():
+    """Unit pins for the two TCK-UX-012(c) seams on the watcher itself:
+    the resolved-interval reader and the streak-end answer of
+    ``mark_poll_succeeded`` (the throttle basis for both narrated lines)."""
+    watcher = IncomingWatcher(probe=list, interval_s=45.0)
+    assert watcher.interval_s == 45.0
+    assert watcher.mark_poll_succeeded() is False  # no streak to end
+    assert watcher.mark_poll_failed() is True  # streak STARTS
+    assert watcher.mark_poll_failed() is False  # within the streak
+    assert watcher.mark_poll_succeeded() is True  # the streak ENDS (once)
+    assert watcher.mark_poll_succeeded() is False  # stays ended
 
 
 def test_drain_watch_failure_line_absent_after_successful_poll_resets_streak():
@@ -628,19 +697,20 @@ def test_drain_watch_failure_line_absent_after_successful_poll_resets_streak():
     clock_watcher = _TickWatcher(probe)
     outputs: list[str] = []
     _drain_watch(clock_watcher.watcher, outputs.append)
-    assert outputs == ["watch: check failed, will retry next cycle"]
-    # A successful poll ends the streak: no failure line, and it stays quiet
-    # on the immediate next (not-yet-due) call.
+    assert outputs == [_fail_line()]
+    # A successful poll ends the streak (one recovery line), and it stays
+    # quiet on the immediate next (not-yet-due) call.
     state["fail"] = False
     clock_watcher.advance(60.0)
     _drain_watch(clock_watcher.watcher, outputs.append)
-    assert outputs == ["watch: check failed, will retry next cycle"]
+    assert outputs == [_fail_line(), "watch: recovered."]
     # A NEW failure after the success starts a fresh streak -> line again.
     state["fail"] = True
     clock_watcher.advance(60.0)
     _drain_watch(clock_watcher.watcher, outputs.append)
     assert outputs == [
-        "watch: check failed, will retry next cycle",
-        "watch: check failed, will retry next cycle",
+        _fail_line(),
+        "watch: recovered.",
+        _fail_line(),
     ]
 

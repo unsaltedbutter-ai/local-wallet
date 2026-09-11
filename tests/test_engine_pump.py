@@ -127,6 +127,36 @@ def test_pump_is_queue_driven_with_monotonic_ids_and_markers(
     assert ids == [1, 2, 3, 4]  # strictly monotonic, no gaps, no reuse
 
 
+def test_pump_card_lines_close_their_own_turns() -> None:
+    """TCK-UX-012(a): the startup model-card lines are separate banner lines
+    — each is emitted as its own text event and closed with a ``turn_end``,
+    so the web transcript renders separate incoming bubbles (the browser
+    groups text events per turn). The CLI sink ignores the marker, so the
+    terminal stays byte-identical."""
+    events: list[EngineEvent] = []
+    emitter = EventEmitter(events.append)
+    commands: queue.Queue[Any] = queue.Queue()
+    commands.put(app.QUIT)
+    model = app.ModelDownloadFlow(model_name="x")
+    assert model.state == "absent"  # the card arms on this state
+    app._pump(
+        _make_loop(),
+        emitter.text,
+        commands,
+        flow=TxFlow(),
+        session=app.SendSession(),
+        table={},
+        emitter=emitter,
+        model=model,
+    )
+    assert [(e.kind, e.payload) for e in events] == [
+        (EVENT_TEXT, app.MODEL_CARD_QUESTION),
+        (EVENT_TURN_END, ""),
+        (EVENT_TEXT, app.MODEL_CARD_HINT),
+        (EVENT_TURN_END, ""),
+    ]
+
+
 def test_pump_never_cancels_an_inflight_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1733,9 +1733,17 @@ def test_first_run_state_shows_the_form_and_chat_is_refused(
             token=server.token,
         )
         assert status == 202  # queued like every turn — the refusal rides the stream
-        frame = stream.read_until(b"event: turn_end")
+        # TCK-UX-012(a): the demo banner now closes its OWN turn (a ``turn_end``
+        # BEFORE the refusal), so ``read_until(turn_end)`` could legitimately
+        # return just the banner bubble. Read for the refusal itself (blocks
+        # until it reaches the stream); the bubble SPLIT is pinned where it is
+        # cleanly observable (test_engine_pump card test + test_app_logging
+        # _Output test), here we pin the refusal still rides a real turn.
+        frame = stream.read_until(app.WATCHKEY_REQUIRED_NOTICE.encode())
         assert app.WATCHKEY_REQUIRED_NOTICE.encode() in frame
         assert ZPUB.encode() not in frame  # and NOTHING key-shaped
+        # The refusal's own completion marker follows it in the stream.
+        assert b"event: turn_end" in stream.read_until(b"event: turn_end")
         stream.close()
         assert capture["calls"] == []  # refusal meant zero chain access
     finally:

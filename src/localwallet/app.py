@@ -1296,7 +1296,7 @@ def build_dispatch_table(
     node_detect_fn: Callable[[], LocalNodeReport] | None = None,
     seconds_since_last_block_fn: Callable[[], int | None] | None = None,
     scan_gate: StartupScan | None = None,
-    kick_scan_fn: Callable[[], None] | None = None,
+    kick_scan_fn: Callable[[], bool] | None = None,
     defer_scans: bool = False,
 ) -> DispatchTable:
     """Build the allowlist dispatch table for the running app.
@@ -1330,6 +1330,8 @@ def build_dispatch_table(
             flight, so the stale answer actually kicks off the load it
             promises. Idempotent by construction (a no-op while any scan
             is in flight) — the double-``/balance`` never double-kicks.
+            Its BOOL result drives the answer's ``scan_pending`` key
+            (TCK-UX-012(d): kick reality, not kick intent).
         defer_scans: Keyed on TRANSPORT, not gate-None (TCK-UX-011):
             ``True`` in the web/engine world, where a lazy first scan is
             NEVER run inline (a minutes-class chain walk must not block
@@ -1458,7 +1460,7 @@ def _make_get_balance_handler(
     scan_fn: Callable[[], object],
     scan_gate: StartupScan | None = None,
     price_oracle: PriceOracle | None = None,
-    kick_scan_fn: Callable[[], None] | None = None,
+    kick_scan_fn: Callable[[], bool] | None = None,
     defer_scans: bool = False,
 ) -> Handler:
     """Create the ``get_balance`` handler closed over the store.
@@ -1510,16 +1512,19 @@ def _make_get_balance_handler(
                     # TCK-UX-011 (ADR-0022 amendment 2): the web/engine
                     # world never blocks a turn on a minutes-class inline
                     # scan. Stand down like the SCAN-003 in-flight path —
-                    # cache answers verbatim, stale-flagged, with the
-                    # additive tool-owned ``scan_pending`` key — and KICK
-                    # the background flow so the stale answer actually
-                    # starts the load it promises (engine thread, no new
-                    # threads, no store access off it). A later turn while
-                    # the kicked scan runs sees ``in_flight`` and takes
-                    # the unchanged SCAN-003 path: no second kick.
-                    scan_pending = True
-                    if kick_scan_fn is not None:
-                        kick_scan_fn()
+                    # cache answers verbatim, stale-flagged — and KICK the
+                    # background flow so the honest "first scan running in
+                    # the background" is literally true (engine thread, no
+                    # new threads, no store access off it). A later turn
+                    # while the kicked scan runs sees ``in_flight`` and
+                    # takes the unchanged SCAN-003 path: no second kick.
+                    # TCK-UX-012(d) review MINOR: ``scan_pending`` reflects
+                    # the KICK REALITY (kick_scan's bool), not mere intent —
+                    # no kick fired (no seam, or the kick's plan failed)
+                    # means no key, and the answer falls back to the plain
+                    # stale note rather than claiming a load that never
+                    # started.
+                    scan_pending = bool(kick_scan_fn()) if kick_scan_fn is not None else False
                 else:
                     try:
                         scan_fn()
@@ -3198,11 +3203,14 @@ def _drain_watch(
     failure fails open — no events, no crash, no logged value — and the next
     turn retries.
 
-    Persistent-failure visibility (NOTE-1): when a due poll raises, a short
-    value-free line (``watch: check failed, will retry next cycle``) is
-    surfaced THROTTLED — once per failure streak, tracked on the watcher and
-    reset on the next successful poll — so a persistently broken poll stays
-    visible without spamming every turn. It is never logged.
+    Persistent-failure visibility (NOTE-1, TCK-UX-012(c) copy): when a due
+    poll raises, a short value-free line naming the deterministic retry delay
+    (``watch: check failed — retrying in ~60s`` — the interval comes from the
+    watcher's own resolved value, never a re-read of the ladder) is surfaced
+    THROTTLED — once per failure streak, tracked on the watcher — so a
+    persistently broken poll stays visible without spamming every turn. When
+    a streak ENDS (the first success after at least one failure), ONE
+    symmetric ``watch: recovered.`` line prints. Both are never logged.
 
     Time-since-block narration (NOTE-2): when ``client`` is provided and the
     drain produced events, the "last block ~N min ago" suffix is computed
@@ -3220,7 +3228,13 @@ def _drain_watch(
         if not watcher.poll_due():
             return 0
         events = watcher.tick()
-        watcher.mark_poll_succeeded()
+        recovered = watcher.mark_poll_succeeded()
+        if recovered:
+            # TCK-UX-012(c): the failure streak ENDED (mark_poll_succeeded
+            # answers True only after at least one prior failure) — ONE
+            # value-free recovery line, symmetric to the once-per-streak
+            # failure line below. A healthy poll prints nothing.
+            output_fn("watch: recovered.")
         suffix = (
             _last_block_suffix(client)
             if (client is not None and events)
@@ -3231,10 +3245,11 @@ def _drain_watch(
         return len(events)
     except (ChainError, wallet_scan.ScanError, StoreError, sqlite3.Error, WatchKeyError):
         # Fail open: a background-poll failure must never interrupt the chat.
-        # NOTE-1: surface a throttled, value-free line ONCE per failure streak
-        # (reset on the next successful poll). Never logged.
+        # NOTE-1 (TCK-UX-012(c)): surface a throttled, value-free line ONCE
+        # per failure streak (the retry delay is the watcher's own resolved
+        # interval — never a hardcoded number). Never logged.
         if watcher.mark_poll_failed():
-            output_fn("watch: check failed, will retry next cycle")
+            output_fn(f"watch: check failed — retrying in ~{watcher.interval_s:g}s")
         return 0
 
 
@@ -3444,7 +3459,20 @@ class _Output:
     terminal output (URL/token/shutdown) in web mode. In web mode narration
     is buffered until the engine emitter is bound (:meth:`bind_emitter`) so
     the startup banner reaches the browser, then routes directly — all on the
-    engine thread (one emitter writer)."""
+    engine thread (one emitter writer).
+
+    TCK-UX-012(a): in WEB mode every narration line also closes its turn with
+    a ``turn_end`` marker. The browser renders one bubble per turn (it groups
+    ``text`` events until the marker), and everything this channel carries in
+    web mode is a standalone startup line (the bootstrap banner, buffered or
+    post-bind, and the provisioning path's re-run of it) — without the
+    delimiter the whole banner, and the first reply after it, arrived as ONE
+    merged bubble. The emission was already one ``output_fn`` call per line
+    (verified); this closes the web-side merge at its actual source. The CLI
+    terminal never sees a marker (its sink ignores the kind — byte-identical
+    output); mid-turn narration in web flows through the pump's own emitter
+    text channel, untouched here.
+    """
 
     def __init__(
         self,
@@ -3461,10 +3489,12 @@ class _Output:
 
     def bind_emitter(self, emitter: EventEmitter) -> None:
         """Attach the engine emitter (once available) and flush any buffered
-        startup narration to it. Engine-thread only."""
+        startup narration to it — each line as its own closed turn (see the
+        class docstring, TCK-UX-012(a)). Engine-thread only."""
         self._emitter = emitter
         for line in self._buffered:
             emitter.text(line)
+            emitter.emit(EVENT_TURN_END)
         self._buffered.clear()
 
     def __call__(self, line: str) -> None:  # narration
@@ -3472,6 +3502,9 @@ class _Output:
             self._terminal(line)
         elif self._emitter is not None:
             self._emitter.text(line)
+            # Buffered lines get the same closer at flush time (above): every
+            # web narration line is one closed bubble (TCK-UX-012(a)).
+            self._emitter.emit(EVENT_TURN_END)
         else:
             self._buffered.append(line)
 
@@ -3842,29 +3875,18 @@ class ScanFlow:
         a no-op or a failed plan (scan stood down) says ``False``."""
         if self.gate.state != "awaiting_backend":
             return False
-        try:
-            plan = wallet_scan.plan_scan(
-                self._store,
-                self._wallet,
-                gap_limit=self._gap_limit,
-                rebuild=self._rescan,
-            )
-        except (
-            ChainError,
-            wallet_scan.ScanError,
-            WatchKeyError,
-            StoreError,
-            sqlite3.Error,
-        ):
-            # Planning is store-reads-only and network-free; a failure here
-            # can only be a broken store — stand the startup scan down
-            # exactly like the wiring-time planning failure did, and let the
-            # handlers' lazy path (now unlocked) retry per turn.
+        # The shared plan→arm→begin tail (TCK-UX-012(d) dedup): a plan
+        # failure here can only be a broken store (planning is
+        # store-reads-only and network-free) — stand the startup scan down
+        # exactly like the wiring-time planning failure did, and let the
+        # handlers' lazy path (now unlocked) retry per turn. The tail can
+        # only answer False on that failure (a successful plan always arms
+        # the gate ``pending`` before the submit), so ``not started`` IS
+        # the planning failure.
+        if not self._plan_arm_begin(rebuild=self._rescan):
             self.gate.mark_skipped()
             return False
-        self.set_startup(plan, rescan=self._rescan)
-        self.begin()
-        return self.gate.state in ("pending", "running")
+        return True
 
     # ------------------------------------------------------ non-blocking startup
 
@@ -3886,6 +3908,39 @@ class ScanFlow:
             on_progress=lambda: commands.put(_ScanTick()),
             on_result=lambda ok, value: commands.put(_ScanDone(ok, value)),
         )
+
+    def _plan_arm_begin(self, *, rebuild: bool) -> bool:
+        """The ONE plan→arm→begin tail shared by :meth:`release_backend`,
+        :meth:`resync_now` and :meth:`kick_scan` (TCK-UX-012(d) review
+        MINOR dedup; behavior identical): plan on engine-thread store reads
+        (network-free), arm the gate via :meth:`set_startup`, and let
+        :meth:`begin` submit the fetch exactly once (``_started`` reset first
+        so a finished earlier scan cannot block the fresh plan). ``rebuild``
+        is the ONLY per-caller difference — ``resync_now`` forces ``True``
+        (the ``--rescan`` repair semantics); the release/kick paths carry the
+        launch's own ``self._rescan``. ``False`` when planning failed (a
+        broken store — the callers decide their stand-down); after a
+        successful plan the gate is always armed ``pending``/``running``, so
+        the answer says whether the load is on."""
+        try:
+            plan = wallet_scan.plan_scan(
+                self._store,
+                self._wallet,
+                gap_limit=self._gap_limit,
+                rebuild=rebuild,
+            )
+        except (
+            ChainError,
+            wallet_scan.ScanError,
+            WatchKeyError,
+            StoreError,
+            sqlite3.Error,
+        ):
+            return False
+        self.set_startup(plan, rescan=rebuild)
+        self._started = False  # let begin() submit the fresh plan once
+        self.begin()
+        return self.gate.state in ("pending", "running")
 
     def resync_now(self) -> bool:
         """The full REPAIR rescan as a triggerable action (TCK-BACKEND-002
@@ -3912,22 +3967,7 @@ class ScanFlow:
         """
         if self.gate.in_progress or self._commands is None:
             return False
-        try:
-            self._startup_plan = wallet_scan.plan_scan(
-                self._store, self._wallet, gap_limit=self._gap_limit, rebuild=True
-            )
-        except (
-            ChainError,
-            wallet_scan.ScanError,
-            WatchKeyError,
-            StoreError,
-            sqlite3.Error,
-        ):
-            return False
-        self._rescan = True
-        self._started = False  # let begin() submit the fresh plan once
-        self.begin()
-        return self.gate.state in ("pending", "running")
+        return self._plan_arm_begin(rebuild=True)
 
     def kick_scan(self) -> bool:
         """TCK-UX-011 (ADR-0022 amendment 2): start the background scan for
@@ -3948,25 +3988,7 @@ class ScanFlow:
         distinction). Returns whether the load started."""
         if self.gate.in_progress or self._commands is None:
             return False
-        try:
-            plan = wallet_scan.plan_scan(
-                self._store,
-                self._wallet,
-                gap_limit=self._gap_limit,
-                rebuild=self._rescan,
-            )
-        except (
-            ChainError,
-            wallet_scan.ScanError,
-            WatchKeyError,
-            StoreError,
-            sqlite3.Error,
-        ):
-            return False
-        self.set_startup(plan, rescan=self._rescan)
-        self._started = False  # let begin() submit the fresh plan once
-        self.begin()
-        return self.gate.state in ("pending", "running")
+        return self._plan_arm_begin(rebuild=self._rescan)
 
     def handle_command(
         self,
@@ -6071,8 +6093,14 @@ def _pump(
             # The deterministic card (code-owned text; the web buttons and
             # CLI yes/no are the two answer channels). Replaces the silent
             # demo-mode banner — the user always learns the model is absent.
+            # TCK-UX-012(a): each card line is a startup line — closed as its
+            # own web turn (the CLI sink ignores the marker; byte-identical).
             output_fn(MODEL_CARD_QUESTION)
+            if emitter is not None:
+                emitter.emit(EVENT_TURN_END)
             output_fn(MODEL_CARD_HINT)
+            if emitter is not None:
+                emitter.emit(EVENT_TURN_END)
     if preload is not None:
         # TCK-LAUNCH-003: bind the queue only — the TRANSPORT arms the
         # load with PRELOAD_START when its channel is print-safe (the
@@ -7430,7 +7458,9 @@ def _wire(
     # interval resolves on its ladder (env > stored setting > default 60)
     # HERE — the stored rung's reader, which is what makes the plain
     # "Change it in settings" claim true (the watcher is built at launch →
-    # the settings entry carries requires_restart).
+    # the settings entry carries requires_restart). TCK-UX-012(b): "on" is
+    # the NORMAL state — an on launch prints NOTHING (UX-009's on-line is
+    # retired); the off line keeps the settings pointer.
     scan = ScanFlow(store, wallet_row, worker, gap_limit=env_gap)
     watch_interval, watch_interval_warning = _resolve_watch_interval(settings, store)
     if watch_interval_warning is not None:
@@ -7441,9 +7471,8 @@ def _wire(
             _make_watch_probe(store, wallet_row.id, scan.scan_now),
             interval_s=watch_interval,
         )
-        output_fn("Background watch: on. Change it in settings.")
     else:
-        output_fn("Background watch: off.")
+        output_fn("Background watch: off. Change it in settings.")
 
     # Startup scan plan (non-blocking, ADR-0022 decision 1) — or the
     # opted-out / failed-to-plan fallback. Planning is store-reads-only and

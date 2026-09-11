@@ -163,8 +163,9 @@ class IncomingWatcher:
         #: Persistent-failure visibility (NOTE-1): True while the most recent
         #: poll cycle failed. The app surfaces a throttled, value-free
         #: "check failed" line ONCE per failure streak (reset on the next
-        #: successful poll) so a persistently broken poll stays visible
-        #: without spamming every turn. Never logged.
+        #: successful poll, which also answers once via
+        #: :meth:`mark_poll_succeeded`, so the streak's end gets a single
+        #: symmetric "recovered" line). Never logged.
         self._poll_failed: bool = False
         #: When the last poll ran (or, before any poll, when this watcher was
         #: built). Seeded at construction so the FIRST poll is not forced on
@@ -177,6 +178,18 @@ class IncomingWatcher:
     def enabled(self) -> bool:
         """True when watching is on (interval > 0)."""
         return self._interval_s > 0
+
+    @property
+    def interval_s(self) -> float:
+        """The RESOLVED poll interval in seconds (``<= 0`` = off).
+
+        TCK-UX-012(c): the resolution (env > stored setting > default) lives
+        at the watcher build site; this reader exposes the single resolved
+        value the watcher itself gates on, so the app's failure narration can
+        name the deterministic retry delay honestly. Value-free: a configured
+        timing number only — never a wallet value.
+        """
+        return self._interval_s
 
     def poll_due(self, *, now: float | None = None) -> bool:
         """True when an interval has elapsed since the last poll (or startup).
@@ -200,9 +213,17 @@ class IncomingWatcher:
         self._poll_failed = True
         return True
 
-    def mark_poll_succeeded(self) -> None:
-        """Record that a poll cycle succeeded, ending any failure streak."""
+    def mark_poll_succeeded(self) -> bool:
+        """Record that a poll cycle succeeded; True when it ENDED a failure streak.
+
+        TCK-UX-012(c): the streak-end edge answer lets the caller surface one
+        throttled, value-free "recovered" line per streak (symmetric to the
+        once-per-streak failure line of :meth:`mark_poll_failed`); subsequent
+        successes report False, so a healthy poll never prints it.
+        """
+        ended = self._poll_failed
         self._poll_failed = False
+        return ended
 
     def tick(self) -> list[IncomingEvent]:
         """Run exactly one poll cycle and return the events to surface.

@@ -53,12 +53,17 @@ Steps:
 7. `rm -rf /tmp/mw7.db*` when done.
 
 ## MW-16: Backend live verification on your Start9 machine (NEW 2026-09-09 — the newest code)
+PROGRESS 2026-09-10: electrum `ssl://evil-star.local:50001` VERIFIED WORKING (scanned, 312500 sats found). Private mempool `https://evil-star.local:56191` and bitcoind RPC `https://192.168.0.25:65154` both REJECTED — root causes found (https Core RPC can't classify; probe lacks /api-segment tolerance) — fix = TCK-BACKEND-003, in flight.
 Launch is now just: `cd ~/local-wallet && .venv/bin/python -m localwallet.ui.cli` — the web UI opens in your browser automatically (add `LOCALWALLET_ZPUB="<zpub>"` or enter it in the page; no model path needed — it preloads the pinned model in the background and offers a Yes/No download if absent).
 Verify, reporting any failure verbatim:
 - [ ] **Private mempool (Esplora)**: in Settings → chain base, enter `https://evil-star.local:56191`. Start9's self-signed cert needs `LOCALWALLET_TLS_VERIFY=false` (env or `~/.localwallet/config.json`) — expect one honest warning line about unverified transport. Apply → NO restart needed: the client hot-swaps and a resync fires against your node.
 - [ ] **Electrum server**: `ssl://evil-star.local:50001` — accepted everywhere now (settings, /setup, stored). Probe = mainnet-genesis handshake.
 - [ ] **bitcoind**: `bitcoind://<host>:8332` with user/pass (or the "no credentials needed" checkbox / cookie). Core ≥ 22 required (older refuses, value-free). Note: scantxoutset scan shows unspent coins + their txs; fully-spent addresses' history is honestly absent (documented tradeoff).
 - [ ] **Autodetect**: a plain `http://<core-host>:8332` URL should classify itself as bitcoind (probe), `http://<mempool-host>` as mempool — you never specify the kind. Badges (mempool/electrum/bitcoind) light up accordingly.
+- [ ] **NEW — run the diagnostic and paste the output** (this pins the mempool/bitcoind rejection exactly; value-free, safe to paste):
+  `python3 tools/probe_backend_diag.py https://evil-star.local:56191 --insecure --json`
+  `python3 tools/probe_backend_diag.py https://192.168.0.25:65154 --user bit --password '<your-rpc-pass>' --insecure --json`
+  (also run both WITHOUT `--insecure` once — distinguishes the TLS-verify failure class from the path/shape failure class; password is never printed)
 - [ ] **Credentials**: the "no credentials needed" checkbox + user/pass fields appear only for http/bitcoind URLs; GET /settings shows "configured", never the values.
 - [ ] **Resync now** button near chain base: full re-scan; coin tags/notes you set via /label SURVIVE it (pinned, but verify live).
 - [ ] **gap_limit apply** with a changed value triggers a resync; unchanged says so.
@@ -109,6 +114,14 @@ Feeds TCK-WEB-003/004 follow-ups; MW-10 is the thorough version. NEW 2026-09-09,
 
 ## MW-14: install.sh smoke on a clean machine (optional, after MW-12)
 - [ ] On any spare mac/Linux: `curl -fsSL https://unsaltedbutter.ai/install | bash` (or run ./install.sh from a fresh clone) with INSTALL_ROOT=<tmp>; confirm OS/arch detection, uv + Python 3.12 (<3.14) install, venv boot, model-download prompt defaults to NO, next-steps output. Report failures verbatim.
+
+## MW-17: Relaunch verification list (NEW 2026-09-10 — the UX/fiat wave + today's fixes)
+Launch `cd ~/local-wallet && .venv/bin/python -m localwallet.ui.cli` and check, reporting anything off:
+- [ ] Balance quick action answers INSTANTLY even before the first scan finishes ("first scan running in the background…" + dots) — no more minutes-long stall (TCK-UX-011).
+- [ ] Balance answer includes the USD line when you ask for dollars (TCK-FIAT-001); animated dots while a turn runs (UX-008); privacy chip colored red/green/yellow per backend (UX-010); "Local llm fully loaded." appears once after launch (UX-009).
+- [ ] Startup message arrives as SEPARATE bubbles; "Background watch" line only appears when watch is OFF (UX-012).
+- [ ] Every bubble has a copy icon (overlapping squares) that copies its text (WEB-010).
+- [ ] Watch failure line says "retrying in ~Ns" and a "watch: recovered." line appears when it heals (UX-012).
 
 ## MW-15: Live run — new fee + UX behavior (refreshed 2026-09-09)
 - [ ] Start a send and check the new fee line: FAST should now bid near the mempool floor (your 0.3–0.5 sat/vB morning → expect 1 sat/vB, not 2) and the Pay line shows `@ $/BTC` instead of `rate age`. Say "faster" twice — the second time it should ASK for a sat/vB rate; answer with a number (e.g. "3") and the rebuild should go through the normal confirm flow. Also try an explicit rate from the start ("send 100000 sats to <addr> at 5 sat/vB"). Startup should NOT block: the prompt appears immediately with dots finishing in the background.

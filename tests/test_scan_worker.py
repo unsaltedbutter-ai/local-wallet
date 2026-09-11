@@ -839,6 +839,34 @@ def test_defer_scans_kick_is_a_no_op_when_a_scan_is_in_flight(
         store.close()
 
 
+def test_defer_scans_stand_down_falls_back_when_the_kick_does_not_fire(
+    wallet_store,
+) -> None:
+    """TCK-UX-012(d) review MINOR: ``scan_pending`` reflects KICK REALITY
+    (``kick_scan``'s bool), not kick intent. When no kick fires — the seam
+    reports False (e.g. its planning failed) or there is no seam at all —
+    the answer is the plain cache-stale read: NO ``scan_pending`` key, so
+    the narration prints the ordinary freshness note and never claims a
+    background load that was never started."""
+    store, wallet, wd = wallet_store
+
+    def no_inline() -> object:
+        raise AssertionError("defer_scans must NOT run the inline scan")
+
+    kicked_false = _table(
+        store, wallet, wd, None, no_inline,
+        defer_scans=True, kick_scan_fn=lambda: False,
+    )
+    result = kicked_false[IntentName.GET_BALANCE](validate_payload(_BALANCE))
+    assert result["freshness"] == "stale"  # never-scanned cache, verbatim
+    assert "scan_pending" not in result
+
+    no_seam = _table(store, wallet, wd, None, no_inline, defer_scans=True)
+    result2 = no_seam[IntentName.GET_BALANCE](validate_payload(_BALANCE))
+    assert "scan_pending" not in result2
+    assert result2["freshness"] == "stale"
+
+
 def test_cli_world_keeps_the_inline_lazy_scan_and_never_kicks(wallet_store) -> None:
     """TCK-UX-011 AC(c): ``defer_scans=False`` (the CLI world, incl.
     ``AUTO_SCAN=0``) keeps the pre-split INLINE scan and never touches the

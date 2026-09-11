@@ -1535,9 +1535,10 @@ def test_node_status_own_node_narration_and_banner_flip(
         "lookups stay here." in joined
     )
     assert "You are querying the public API" not in joined
-    # Watch line: TCK-UX-009 copy — the settings claim is TRUE (stored
-    # rung has a live reader; the entry ships with the settings surface).
-    assert "Background watch: on. Change it in settings." in joined
+    # Watch line: TCK-UX-012(b) copy — "on" is the NORMAL state, so an
+    # on-launch prints NOTHING (UX-009's on-line retired; the stored rung
+    # still reaches the watcher, pinned below).
+    assert "Background watch" not in joined
 
 
 def test_node_status_remote_own_node_narration_and_banner(
@@ -1573,21 +1574,44 @@ def test_node_status_remote_own_node_narration_and_banner(
     )
     assert "You are querying the public API" not in joined
     assert "lookups stay on this machine" not in joined
-    # Watch line: the TCK-UX-009 copy (no mode fragment any more).
-    assert "Background watch: on. Change it in settings." in joined
+    # Watch line: TCK-UX-012(b) — watch on prints nothing.
+    assert "Background watch" not in joined
 
 
 def test_watch_line_off_copy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """TCK-UX-009 copy: interval 0 (env rung) ⇒ exactly
-    ``Background watch: off.`` — no settings claim on the off path."""
+    """TCK-UX-012(b) copy: interval 0 (env rung) ⇒ exactly
+    ``Background watch: off. Change it in settings.`` — the off path keeps
+    the settings pointer (UX-009's claim, now only where it's actionable);
+    the on path prints nothing at all (pinned by the on-state tests)."""
     monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
     code, outputs, _ = _run_node_repl(
         monkeypatch, tmp_path, detect_report=_core_ready_report()
     )
     assert code == 0
     joined = "\n".join(outputs)
-    assert "Background watch: off." in joined
-    assert "Change it in settings" not in joined
+    assert "Background watch: off. Change it in settings." in joined
+    assert "Background watch: on" not in joined
+
+
+def test_startup_banner_lines_are_separate_events(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-UX-012(a) emission pin: every startup banner line arrives as its
+    OWN output_fn call — the privacy notice, the watch line and the prompt
+    hint are each a WHOLE event (a merged emission would fail membership,
+    not just the web-side bubble split the engine's turn delimiters drive).
+    Watch off here so the banner grows the off line (the on path adds
+    nothing — pinned by the copy tests)."""
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
+    code, outputs, _ = _run_node_repl(
+        monkeypatch, tmp_path, detect_report=_core_ready_report()
+    )
+    assert code == 0
+    assert f"Privacy notice: {PRIVACY_INDICATOR}" in outputs
+    assert "Background watch: off. Change it in settings." in outputs
+    assert "Type a message — 'exit' or Ctrl-D quits." in outputs
+    # Each appears exactly once as its own event (no duplicates/merges).
+    assert outputs.count("Background watch: off. Change it in settings.") == 1
 
 
 def _watch_spy(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
@@ -1620,7 +1644,8 @@ def test_watch_stored_setting_reaches_the_watcher(
     )
     assert code == 0
     assert captured["interval_s"] == 45.0
-    assert "Background watch: on. Change it in settings." in "\n".join(outputs)
+    # TCK-UX-012(b): on is silent (the reader proof is ``captured`` above).
+    assert "Background watch" not in "\n".join(outputs)
 
 
 def test_watch_stored_setting_malformed_warns_once_and_defaults(
@@ -1644,7 +1669,9 @@ def test_watch_stored_setting_malformed_warns_once_and_defaults(
     joined = "\n".join(outputs)
     assert joined.count(app_module.WATCH_INTERVAL_STALE_WARNING) == 1
     assert "banana" not in joined  # value-free, as ever
-    assert "Background watch: on. Change it in settings." in joined
+    # TCK-UX-012(b): the default 60 still builds the watcher (captured
+    # above) and on-state prints no watch line at all.
+    assert "Background watch" not in joined
 
 
 def test_backend_mode_three_state_classification() -> None:
