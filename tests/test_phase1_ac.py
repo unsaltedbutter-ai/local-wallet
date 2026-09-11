@@ -501,6 +501,66 @@ def test_ac3_gap20_misses_deep_usage_rescan_gap30_finds_it(store: Store) -> None
 
 
 # --------------------------------------------------------------------------
+# TCK-GAP-001: a smaller-gap rescan preserves allocation state
+# --------------------------------------------------------------------------
+
+
+def test_rescan_smaller_gap_preserves_allocation_state(store: Store) -> None:
+    """TCK-GAP-001 pin: a RESCAN with a SMALLER gap narrows the walked
+    window but never destroys the persisted derivation/allocation state or
+    the sync cursor (store layer). Setup mirrors the real decrease path
+    (ADR-0009 amendment): the wallet saw deep usage at index 25 under a wide
+    gap, and the user was handed an address at index 40 (beyond any smaller
+    window). A gap-5 rescan must narrow the window, keep index 40 allocated
+    (never re-issued), keep the derivation cursor floored above it, and write
+    a valid (narrow) sync cursor."""
+    wid = _wallet_row(store).id
+    row = _wallet_row(store)
+
+    # Wide rescan records the deep usage (branch 0 max_used=25, next=26).
+    rescan_wallet(store, _truth_chain().client(), row, gap_limit=GAP_WIDE)
+    _assert_derivation_truth(store, wid, next_b0=26)
+
+    # Hand out an address at index 40 (allocated), pinning next_index at 41.
+    store.update_derivation(wid, 0, max_used_index=25, next_index=41)
+    store.upsert_batch(
+        [
+            AddressRecord(
+                wid, 0, 40, ADDRS[0][40], WD.parsed.script_type, ADDRESS_ALLOCATED
+            )
+        ]
+    )
+    assert store.get_derivation(wid, 0).next_index == 41
+
+    # Narrow rescan (gap 5): deep usage at 25 AND the allocation at 40 fall
+    # outside the smaller window.
+    rescan_wallet(store, _truth_chain().client(), row, gap_limit=5)
+
+    # (a) The scanned window NARROWED: branch 0 now ends at 8 (usage at 3 +
+    #      gap 5), not the wide 55.
+    rows = store.get_addresses(wid, 0)
+    by_index = {r.index: r for r in rows}
+    assert set(range(9)) <= set(by_index)  # 0..8 in the narrow window
+    # The deep-used row (index 25) is beyond the window but left as cached
+    # history — never destroyed.
+    assert by_index[25].address == ADDRS[0][25]
+    assert by_index[25].status == ADDRESS_USED
+    # (b) The beyond-window allocation SURVIVES: still allocated, not wiped.
+    assert by_index[40].status == ADDRESS_ALLOCATED
+    # (c) The derivation cursor is NOT rolled back below the issued address
+    #     (never re-issue): floored at max-allocated + 1 = 41. max_used_index
+    #     is recomputed HONESTLY to the narrow window (3) per ADR decision 3.
+    d0 = store.get_derivation(wid, 0)
+    assert d0.next_index == 41
+    assert d0.max_used_index == 3
+    # (d) The sync cursor is a VALID fresh narrow payload, not destroyed.
+    assert json.loads(store.get_sync_state(wid, CURSOR_KEY) or "null") == {
+        "0": 9,
+        "1": 10,
+    }
+
+
+# --------------------------------------------------------------------------
 # AC-4: the three store-view narration inputs (explorer→scan→store→handler)
 # --------------------------------------------------------------------------
 

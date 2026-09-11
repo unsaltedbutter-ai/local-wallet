@@ -23,8 +23,10 @@ The contract (USER DIRECTION 2026-09-09 items 5/6/8/9/10; ADR-0018 amendment
   TAGS SURVIVE — ``coin_labels`` is a separate table, never in the scan
   write-set (pinned below, pre- and post-hot-swap);
 * a ``gap_limit`` apply whose value ACTUALLY CHANGED fires the same resync
-  (direction 8); an unchanged apply says so (``resync: "unchanged"``) and
-  starts no scan;
+  (direction 8) — UNLESS it NARROWED the window (TCK-GAP-001), which is
+  applied WITHOUT an auto-rescan (``resync: "no_rescan"``) plus the
+  value-free tradeoff line (a smaller window can only hide addresses); an
+  unchanged apply says so (``resync: "unchanged"``) and starts no scan;
 * ``backend_kind`` (direction 10): the CLOSED enum name of the live backend
   (public/mempool/esplora/electrum/none; bitcoind reserved for M2, never
   emitted today) rides /settings and /state additively — value-free.
@@ -575,12 +577,16 @@ def test_resync_request_is_answered_on_the_engine_thread(
 def test_gap_limit_changed_fires_resync_unchanged_does_not(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
 ) -> None:
-    """Direction 8: applying a gap_limit that CHANGED syncs against the
-    chain base (the same full resync); an unchanged apply starts NO scan and
-    SAYS SO in the reply."""
+    """Direction 8: applying a gap_limit that RAISED the value syncs against
+    the chain base (the same full resync); an unchanged apply starts NO scan
+    and SAYS SO in the reply. TCK-GAP-001: a NARROWING apply stores the value
+    WITHOUT any auto-rescan (``resync: "no_rescan"``) and narrates the
+    value-free tradeoff note."""
     wiring, commands = _mk_wiring(tmp_path, monkeypatch)
     flow = ChainBackendFlow(wiring, _probe_true)
     store = wiring.store
+    # Raise: stored gap is 2 (the _mk_wiring default), applying 5 widens the
+    # window → the normal full resync fires.
     reply = app.handle_settings_request(store, "gap_limit", "5", flow)
     assert reply["status"] == "applied"
     assert reply["resync"] == "started"
@@ -594,6 +600,20 @@ def test_gap_limit_changed_fires_resync_unchanged_does_not(
     # Whitespace canonicalizes to the same value → still unchanged.
     reply = app.handle_settings_request(store, "gap_limit", " 5 ", flow)
     assert reply["resync"] == "unchanged"
+    # TCK-GAP-001: NARROW the window (5 → 3). The value is stored but NO
+    # auto-rescan is started (a smaller window can only hide addresses),
+    # and the reply carries the value-free tradeoff narration.
+    reply = app.handle_settings_request(store, "gap_limit", "3", flow)
+    assert reply["status"] == "applied"
+    assert store.get_setting(wallet_scan.GAP_LIMIT_SETTING) == "3"  # stored
+    assert reply["resync"] == "no_rescan"
+    assert wiring.scan.gate.state == "done"  # still NOT re-armed
+    assert reply["note"] == app.GAP_NARROW_NOTE
+    assert app.GAP_NARROW_NOTE == (
+        "A smaller window may hide addresses beyond it; your existing "
+        "derivation state is kept, and raising the value again (then "
+        "re-syncing) will show them again."
+    )
     # A refused write never resyncs (fail-closed before the store too).
     reply = app.handle_settings_request(store, "gap_limit", "99999", flow)
     assert reply["status"] == "rejected" and "resync" not in reply

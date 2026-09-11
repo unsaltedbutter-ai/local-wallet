@@ -561,6 +561,19 @@ GAP_LIMIT_ENV_VAR: Final[str] = "LOCALWALLET_GAP_LIMIT"
 GAP_LIMIT_MIN: Final[int] = 1
 GAP_LIMIT_MAX: Final[int] = 1000
 
+#: TCK-GAP-001: the ONE value-free line narrated when a ``gap_limit`` apply
+#: NARROWS the window (new value < old). A smaller window can only HIDE
+#: addresses beyond it, so no auto-rescan follows (ADR-0009 amendment); the
+#: line names the tradeoff — addresses beyond the window may drop out of
+#: visibility, existing derivation state is preserved, and raising the value
+#: again (then re-syncing) brings them back. No addresses, amounts, or
+#: digits: value-free by construction.
+GAP_NARROW_NOTE: Final[str] = (
+    "A smaller window may hide addresses beyond it; your existing derivation "
+    "state is kept, and raising the value again (then re-syncing) will show "
+    "them again."
+)
+
 #: Environment rung of the background-watch interval (TCK-UX-009 ladder:
 #: env > stored ``watch_interval_s`` setting > default 60; ``0`` = off —
 #: the ADR-0019 escape hatch, now also settable via the settings surface).
@@ -5905,9 +5918,21 @@ BACKEND_PROBE_FAIL: Final[str] = (
 #: chain_base_url swap queued behind an in-flight scan), ``skipped``
 #: (nothing to resync / the write is shadowed by an env/config-file rung),
 #: ``unchanged`` (a gap_limit apply whose value did not change),
-#: ``unavailable`` (no engine chain wiring).
+#: ``no_rescan`` (TCK-GAP-001: a gap_limit apply that NARROWED the window —
+#: deliberately applied WITHOUT an auto-rescan, since a smaller window can
+#: only hide addresses; the reply carries the value-free
+#: :data:`GAP_NARROW_NOTE` tradeoff line instead), ``unavailable`` (no
+#: engine chain wiring).
 RESYNC_STATUSES: Final[frozenset[str]] = frozenset(
-    {"started", "busy", "deferred", "skipped", "unchanged", "unavailable"}
+    {
+        "started",
+        "busy",
+        "deferred",
+        "skipped",
+        "unchanged",
+        "no_rescan",
+        "unavailable",
+    }
 )
 
 #: THE allowlist (fail-closed, TCK-WEB-005): only settings keys that EXIST in
@@ -6117,7 +6142,10 @@ def _settings_entries(
             "max": wallet_scan._MAX_GAP,
             # Every scan plan re-reads the setting (wallet.scan._resolve_gap_limit):
             # takes effect on the NEXT scan, no restart. TCK-BACKEND-002: an
-            # APPLIED change now also fires a resync itself (user direction 8).
+            # APPLIED change fires a resync itself (user direction 8) — except
+            # a NARROWING change (TCK-GAP-001), which is applied without one
+            # (a smaller window can only hide addresses) and narrates the
+            # tradeoff instead.
             "requires_restart": False,
             "env_override": _env_overridden(GAP_LIMIT_ENV_VAR),
         },
@@ -6438,10 +6466,15 @@ def handle_settings_request(
     once stored, hot-swaps the live client + fires a full resync (or defers
     both behind the in-flight scan); the applied reply carries the honest
     ``swapped``/``resync`` fields. A ``gap_limit`` write whose value ACTUALLY
-    CHANGED fires the same resync (user direction 8); an unchanged apply says
-    so (``resync: "unchanged"``, no scan). With ``backend=None`` (a bare
-    harness pump — no chain wiring to swap) both keys keep the plain store
-    write and the entry flags carry the next-launch honesty. Every wired
+    CHANGED fires the same resync (user direction 8) — UNLESS it NARROWED the
+    window (TCK-GAP-001): a SMALLER value is applied WITHOUT an auto-rescan
+    (``resync: "no_rescan"``) plus the value-free :data:`GAP_NARROW_NOTE`
+    tradeoff line, because a smaller window can only hide addresses beyond
+    it — the user can still re-sync manually (Resync now). An unchanged
+    apply says so (``resync: "unchanged"``, no scan). With ``backend=None``
+    (a bare harness pump — no chain wiring to swap) both keys keep the
+    plain store write and the entry flags carry the next-launch honesty.
+    Every wired
     reply (reads included) carries the additive ``backend_kind`` NAME for the
     client's badges (deliverable 10 — an enum name, value-free).
 
@@ -6556,6 +6589,15 @@ def handle_settings_request(
             )
             if str(after) == str(before):
                 extra["resync"] = "unchanged"  # direction 8: say so, no scan
+            elif int(after) < (
+                int(before) if before is not None else wallet_scan.DEFAULT_GAP_LIMIT
+            ):
+                # TCK-GAP-001: a NARROWER window never auto-rescans — it can
+                # only hide addresses beyond it (ADR-0009 amendment). Apply
+                # the stored value WITHOUT a resync and narrate the tradeoff
+                # (value-free); the user can re-sync manually via Resync now.
+                extra["resync"] = "no_rescan"
+                extra["note"] = GAP_NARROW_NOTE
             elif backend is not None:
                 extra["resync"] = backend.resync()
             else:

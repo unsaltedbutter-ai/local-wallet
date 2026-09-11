@@ -386,6 +386,15 @@ def rescan_wallet(
     failure semantics). The optional ``progress_fn`` behaves exactly as in
     :meth:`scan_wallet` (one bare tick per probed address; ``None`` = no
     callback, unchanged behavior).
+
+    A rescan with a NARROWER ``gap_limit`` than the previous scan narrows
+    the walked window (ADR-0009 amendment, TCK-GAP-001): usage beyond the
+    smaller window drops OUT of the recomputed ``max_used_index`` — that is
+    the honest narrow-window truth — while the persisted ALLOCATION state
+    survives: ``allocated`` address rows are preserved by address string,
+    and ``next_index`` is floored at the highest allocated/used index + 1,
+    so no issued address is ever re-issued and the sync cursor is written
+    fresh for the narrow window (never corrupted).
     """
     plan = plan_scan(store, wallet, gap_limit=gap_limit, rebuild=True)
     return persist_scan(store, fetch_scan(plan, client, progress_fn=progress_fn))

@@ -89,6 +89,35 @@ provide a repair path that never silently guesses.
   the prior state stays exactly intact and the scan can be retried
   cleanly.
 
+## Amendment (TCK-GAP-001, 2026-09-11): narrowing the gap never auto-rescans
+
+Decision 3's "widen the gap and rescan" repair path is only ever a
+*non-harmful* widening; a SMALLER `gap_limit` narrows the scan window and
+can therefore only **hide** addresses — usage beyond `index + gap` drops
+out of visibility (honest out-of-window detection), so an auto-rescan on
+a narrowing change is meaningless at best and surprising at worst.
+Semantics:
+
+1. **Auto-rescan only on increase.** A `gap_limit` apply that RAISES the
+   value keeps the existing behavior: it fires the full resync (user
+   direction 8). A apply that LOWERS it stores the value WITHOUT any
+   auto-rescan and narrates the tradeoff with the value-free line *"A
+   smaller window may hide addresses beyond it; your existing derivation
+   state is kept, and raising the value again (then re-syncing) will show
+   them again."* The user can still re-sync manually via the existing
+   `Resync now` affordance (TCK-BACKEND-002). An unchanged apply says so
+   (`resync: "unchanged"`, no scan) exactly as before.
+2. **Narrow-window rescan preserves allocation state.** Should the user
+   re-sync manually at the smaller gap, the store layer keeps every
+   issued address: `allocated` rows survive by address string and
+   `next_index` is floored at the highest allocated/used index + 1 (never
+   re-issued), while `max_used_index` is recomputed honestly from the
+   narrower window and the sync cursor is written fresh — narrowing the
+   window never destroys derivation/allocation state or the sync cursor.
+3. **Narration carries no values.** The tradeoff line states the
+   tradeoff and the recovery path; it never quotes an address, amount, or
+   index.
+
 ## Amendment (TCK-SEC-002, 2026-09-06): absolute per-branch window ceiling
 
 The termination rule above ("bounded by used + gap") assumes honest
