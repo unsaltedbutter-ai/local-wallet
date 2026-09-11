@@ -29,7 +29,13 @@ Usage: python tools/probe_backend_diag.py URL [--user U --password P]
 """
 from __future__ import annotations
 
-import argparse, json, socket, ssl, sys, urllib.parse
+import argparse
+import json
+import socket
+import ssl
+import sys
+import urllib.parse
+
 import httpx
 
 MAINNET_GENESIS_HASH = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
@@ -131,7 +137,7 @@ def probe_electrum(url, insecure):
         r["tls_error"] = r["error_class"] = classify(e)
     except ssl.SSLError as e:
         r["tls_error"] = r["error_class"] = classify(e)
-    except (socket.timeout, OSError) as e:
+    except (TimeoutError, OSError) as e:
         r["tls_error"] = r["error_class"] = classify(e)
     except Exception as e:  # noqa: BLE001
         r["error_class"] = classify(e)
