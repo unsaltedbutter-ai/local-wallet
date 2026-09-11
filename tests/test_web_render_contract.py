@@ -99,6 +99,25 @@ def test_client_dismisses_the_form_on_accept_and_reuses_watchkey_endpoint() -> N
     assert "replaceStage" in code and "watchKeyRow" in code
 
 
+# TCK-UX-010 static pin: the persistent privacy chip renders ONLY the closed
+# privacy_mode enum NAMES (unknown/absent → hidden), styles it via the
+# data-privacy attribute (CSP-clean: classes/attrs, never inline styles), and
+# never writes the raw enum as visible text (the word shown is the static
+# "Privacy notice" node in index.html).
+def test_privacy_chip_is_enum_gated_and_never_paints_raw_enum() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    assert "applyPrivacyChip" in code and "privacy_mode" in code
+    assert "PRIVACY_SUBLINE" in code
+    assert 'dataset.privacy = mode' in code  # color rides the attribute, not inline style
+    assert "privacyChipEl.textContent" not in code  # visible text stays static markup
+    index_html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    assert 'id="privacy-chip"' in index_html
+    assert "Privacy notice" in index_html
+    styles = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    for name in ("public", "own_node_local", "own_node_remote", "awaiting_backend"):
+        assert f'data-privacy="{name}"' in styles
+
+
 @pytest.mark.parametrize(
     "path", sorted(_RENDER_DIR.glob("*.json")), ids=lambda p: p.stem
 )

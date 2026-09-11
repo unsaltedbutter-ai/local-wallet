@@ -163,7 +163,14 @@ def test_setup_gate_decline_exits_unchanged(
     assert code == 0
     joined = rec.joined
     assert ob.SETUP_CURRENT in joined  # the current choice, named by mode
-    assert GOOD_URL not in joined and "mempool.mine" not in joined  # value-free
+    # Value-free: the /setup flow never echoes the URL. The launch banner
+    # line is excluded on purpose — TCK-UX-009 user copy makes it NAME the
+    # configured host (stripped credentials/port, the user's own config
+    # displayed back to them); the setup surface itself stays anonymous.
+    flow_text = "\n".join(
+        line for line in rec.lines if not line.startswith("Privacy notice:")
+    )
+    assert GOOD_URL not in flow_text and "mempool.mine" not in flow_text
     assert ob.SETUP_KEPT in joined
     assert ob.NODE_ASK not in joined  # declined: never entered the branch
     assert stored == GOOD_URL  # unchanged

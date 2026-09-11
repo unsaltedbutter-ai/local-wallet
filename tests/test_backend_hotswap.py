@@ -290,6 +290,42 @@ def test_apply_closes_old_serves_from_new_and_fires_rescan(
     wiring.store.close()
 
 
+def _closure_value(fn: object, name: str) -> object:
+    """One freevar cell of a handler closure (the oracle the rebuilt handler
+    actually carries — narration-free introspection of the shipped path)."""
+    cells = dict(zip(fn.__code__.co_freevars, fn.__closure__))  # type: ignore[attr-defined]
+    return cells[name].cell_contents  # type: ignore[attr-defined]
+
+
+def test_hot_swap_rebinds_one_shared_price_oracle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """TCK-FIAT-001 security-review LOW (folded into TCK-UX-009): the
+    post-swap GET_BALANCE and CREATE_TX rebuilds must share ONE fresh
+    PriceOracle over the new client — the single-cache invariant the
+    initial wiring (build_dispatch_table) establishes — not two private
+    caches."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    built: list[object] = []
+
+    def _counting_oracle(client: object) -> object:
+        built.append(client)
+        return client  # never fetched on this path
+
+    monkeypatch.setattr(app, "PriceOracle", _counting_oracle)
+    error, fields = ChainBackendFlow(wiring, _probe_true).apply(NEW_URL)
+    assert error is None and fields["swapped"] is True
+    _drain(wiring, commands)
+    assert len(built) == 1  # ONE oracle for the whole rebind
+    assert _closure_value(
+        wiring.table[IntentName.GET_BALANCE], "price_oracle"
+    ) is built[0]
+    assert _closure_value(
+        wiring.table[IntentName.CREATE_TX], "price_oracle"
+    ) is built[0]
+    wiring.store.close()
+
+
 def test_probe_failure_refuses_value_free_old_client_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
 ) -> None:
@@ -761,9 +797,19 @@ def test_kind_and_flags_ride_the_settings_and_state_surfaces(
     reply = app.handle_settings_request(wiring.store, None, None, flow)
     assert reply["backend_kind"] == "mempool"
     snapshot = app.build_state_snapshot(
-        wiring.flow, wiring.session, None, wiring.scan, None, flow.kind
+        wiring.flow,
+        wiring.session,
+        None,
+        wiring.scan,
+        None,
+        flow.kind,
+        privacy_mode=app._backend_mode(wiring.settings),  # the pump's source
     )
     assert snapshot["backend_kind"] == "mempool"
+    # TCK-UX-010: the additive privacy_mode rides the SAME live settings
+    # object the swap mutates — a closed enum NAME, never the URL/host.
+    assert snapshot["privacy_mode"] == "own_node_local"
+    assert "127.0.0.1" not in repr(snapshot) and "://" not in repr(snapshot)
     bare = app.handle_settings_request(wiring.store, None, None)
     assert "backend_kind" not in bare  # absent, never guessed
     assert (

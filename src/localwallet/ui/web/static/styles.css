@@ -16,6 +16,7 @@
   --c-danger: #a12626;          /* destructive affordance (actions ticket) */
   --c-danger-soft: #f7e4e4;
   --c-warn: #9a6700;
+  --c-warn-soft: #f4e9cf;
   --c-ok: #1f6f43;
   --c-offline: #8a8f99;
 
@@ -61,6 +62,17 @@
   /* TCK-UX-008: the turn-busy pulse — dot size and its dim floor. */
   --busy-dot: 0.35rem;
   --busy-dot-min: 0.25;
+
+  /* TCK-UX-010: privacy-label chip — one ink/surface pair per state family
+     (public = danger-red, local = green, trust-dependent = warn-yellow).
+     Mapped to the palette tokens so both schemes retint automatically;
+     --c-warn-soft is declared per palette below. */
+  --c-priv-public: var(--c-danger);
+  --c-priv-public-bg: var(--c-danger-soft);
+  --c-priv-local: var(--c-accent);
+  --c-priv-local-bg: var(--c-accent-soft);
+  --c-priv-trust: var(--c-warn);
+  --c-priv-trust-bg: var(--c-warn-soft);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -78,6 +90,7 @@
     --c-danger: #e07a7a;
     --c-danger-soft: #402325;
     --c-warn: #d9a441;
+    --c-warn-soft: #3d351f;
     --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-2: 0 2px 10px rgba(0, 0, 0, 0.5);
   }
@@ -164,6 +177,28 @@ body {
   border: 1px solid var(--c-border-strong);
   border-radius: 999px;
   padding: var(--sp-1) var(--sp-3);
+}
+
+/* TCK-UX-010: the privacy chip recolors by the typed privacy_mode NAME via
+   data-privacy (the same attribute-selector pattern as the conn dot above);
+   awaiting_backend shares the trust-yellow family. Unknown/absent → the
+   element stays hidden, so no fallback color is needed. */
+.privacy { font-weight: 600; }
+.privacy[data-privacy="public"] {
+  color: var(--c-priv-public);
+  background: var(--c-priv-public-bg);
+  border-color: var(--c-priv-public);
+}
+.privacy[data-privacy="own_node_local"] {
+  color: var(--c-priv-local);
+  background: var(--c-priv-local-bg);
+  border-color: var(--c-priv-local);
+}
+.privacy[data-privacy="own_node_remote"],
+.privacy[data-privacy="awaiting_backend"] {
+  color: var(--c-priv-trust);
+  background: var(--c-priv-trust-bg);
+  border-color: var(--c-priv-trust);
 }
 
 /* ---------------------------------------------------------------- settings */

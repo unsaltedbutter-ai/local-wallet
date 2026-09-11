@@ -533,6 +533,8 @@ def test_default_file_absent_arms_the_download_card(
     # TCK-LAUNCH-003: the card path is the PRELOAD path's exclusive
     # opposite — nothing to load, so no preload arms (no regression).
     assert app.MODEL_PRELOAD_NOTICE not in joined
+    # TCK-UX-009: with no preload flow AT ALL, the ready line never prints.
+    assert app.MODEL_PRELOADED_NOTICE not in joined
 
 
 def test_unresolvable_default_keeps_the_plain_demo_banner(
@@ -937,6 +939,8 @@ def test_model_state_flips_loading_to_ready_over_the_pump(tmp_path: Path) -> Non
         snap = _request_snapshot(commands)  # FIFO: the marker was consumed
         assert snap["model_state"] == "ready"
         assert runtime.calls == 1  # exactly ONE build
+        # TCK-UX-009: the ready transition narrates EXACTLY ONE line.
+        assert _texts(events).count(app.MODEL_PRELOADED_NOTICE) == 1
         assert any(
             e.kind == app.EVENT_TURN_END and e.id > before for e in events
         )  # the flip closes a turn for the re-read
@@ -963,6 +967,8 @@ def test_preload_failure_flips_failed_and_logs_value_free(tmp_path: Path) -> Non
         snap = _request_snapshot(commands)
         assert snap["model_state"] == "failed"
         assert logs == [app._MODEL_PRELOAD_FAILED_LOG]  # log-only, value-free
+        # TCK-UX-009: the failed path NEVER narrates the ready line.
+        assert app.MODEL_PRELOADED_NOTICE not in _texts(events)
         assert not any(  # no extra user-facing panic line
             app.MODEL_INTEGRITY_WARNING in e.payload for e in events
         )

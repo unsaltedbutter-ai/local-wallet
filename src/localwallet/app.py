@@ -255,6 +255,7 @@ __all__ = [
     "MODEL_DOWNLOAD_COMMAND",
     "MODEL_INTEGRITY_WARNING",
     "MODEL_LATER_COMMAND",
+    "MODEL_PRELOADED_NOTICE",
     "MODEL_PRELOAD_NOTICE",
     "NODE_STATUS_DETECTION_DISABLED",
     "NO_MODEL_DEMO_BANNER",
@@ -267,6 +268,8 @@ __all__ = [
     "SIGNER_ENV_VAR",
     "UI_ENV_VAR",
     "WATCHKEY_COMMAND",
+    "WATCH_INTERVAL_ENV_VAR",
+    "WATCH_INTERVAL_SETTING",
     "WATCH_KEY_SETTING",
     "WEB_PORT_ENV_VAR",
     "ZPUB_ENV_VAR",
@@ -471,11 +474,13 @@ _QUICK_STORE_COMMANDS: Final[frozenset[str]] = frozenset({"/receive", "/settings
 # a verdict that bricks a working wallet is the worse failure).
 
 #: Narrated by the pump when the background preload begins (web: the
-#: transcript, CLI: the terminal). Value-free.
-MODEL_PRELOAD_NOTICE: Final[str] = (
-    "Loading the model in the background — your first question may wait "
-    "for it."
-)
+#: transcript, CLI: the terminal). Value-free. (TCK-UX-009 user copy.)
+MODEL_PRELOAD_NOTICE: Final[str] = "Loading local llm."
+#: Narrated ONCE when the preload reaches ``ready`` (TCK-UX-009). The
+#: failed/declined paths never print it, and a launch with no preload
+#: flow at all (stub / download card / remote bridge) never prints it —
+#: it rides the :class:`ModelPreloadFlow` ready transition only.
+MODEL_PRELOADED_NOTICE: Final[str] = "Local llm fully loaded."
 #: Browser/transcript status line when the launch checksum fails.
 #: Value-free: no path, no hash, no filename (the manifest is public but
 #: the line stays scrubbed like every other warning).
@@ -539,6 +544,35 @@ GAP_LIMIT_ENV_VAR: Final[str] = "LOCALWALLET_GAP_LIMIT"
 GAP_LIMIT_MIN: Final[int] = 1
 GAP_LIMIT_MAX: Final[int] = 1000
 
+#: Environment rung of the background-watch interval (TCK-UX-009 ladder:
+#: env > stored ``watch_interval_s`` setting > default 60; ``0`` = off —
+#: the ADR-0019 escape hatch, now also settable via the settings surface).
+WATCH_INTERVAL_ENV_VAR: Final[str] = "LOCALWALLET_WATCH_INTERVAL_S"
+
+#: The store key of the persisted watch interval — allowlisted for the
+#: settings surface ONLY because :func:`_resolve_watch_interval` (the
+#: watcher build site in :func:`_wire`) reads it on every launch.
+WATCH_INTERVAL_SETTING: Final[str] = "watch_interval_s"
+
+#: Bounds of the whole watch-interval ladder: 0 (off) .. one day (seconds).
+WATCH_INTERVAL_MIN: Final[int] = 0
+WATCH_INTERVAL_MAX: Final[int] = 86400
+
+#: The shipped default — derived from the :class:`Settings` field default,
+#: never a second hardcoded literal (same single-source rule as
+#: ``_PUBLIC_DEFAULT_HOST``).
+WATCH_INTERVAL_DEFAULT_S: Final[float] = float(
+    Settings.__dataclass_fields__["watch_interval_s"].default
+)
+
+#: ONE value-free startup line when the STORED watch interval fails its
+#: read-time validation (non-numeric or out of bounds): the default applies
+#: and the watcher still builds — a corrupt setting never silently kills
+#: the watch (the WRITE path is what refuses, fail-closed).
+WATCH_INTERVAL_STALE_WARNING: Final[str] = (
+    "The stored background-watch interval is invalid — using the default."
+)
+
 #: Environment variable selecting the signing backend (``--signer``
 #: overrides it): ``"file"`` (airgap transfer folder, ADR-0014 — the
 #: default) or ``"hwi"`` (USB hardware wallet via HWI-as-a-library,
@@ -587,9 +621,24 @@ PRIVACY_INDICATOR_OWN_NODE_LOCAL: Final[str] = (
 )
 
 #: The §9 privacy indicator for a self-hosted backend on ANOTHER machine
-#: (LAN/VPS instance): still the user's own node — but the R7 no-over-claim
-#: rule forbids saying lookups "stay on this machine".
+#: (LAN/VPS instance). TCK-UX-009 user copy: the configured HOST is
+#: interpolated (scheme/port/credentials stripped by
+#: :func:`_configured_url_host`) — a display of the user's own config,
+#: not a new leak surface — and the sentence itself carries the trust
+#: hedge ("only private if you trust this machine"), which also carries
+#: the follow-up-register L5 over-claim (the banner keys on
+#: ``chain_base_url`` PRESENCE, not ownership). This is a format
+#: template: render it with the host, or fall back to the generic
+#: :data:`PRIVACY_INDICATOR_OWN_NODE_REMOTE_GENERIC` when no host is
+#: parseable (malformed URL — better vague than broken).
 PRIVACY_INDICATOR_OWN_NODE_REMOTE: Final[str] = (
+    "Querying {} for transaction information. This is only private if you "
+    "trust this machine."
+)
+
+#: The host-less fallback of the REMOTE banner (no host extractable from
+#: the configured URL): the pre-TCK-UX-009 generic wording.
+PRIVACY_INDICATOR_OWN_NODE_REMOTE_GENERIC: Final[str] = (
     "Querying your own node on another machine — nothing goes to a public API."
 )
 
@@ -599,6 +648,25 @@ BACKEND_MODE_PUBLIC: Final[str] = "public"
 BACKEND_MODE_OWN_NODE_LOCAL: Final[str] = "own_node_local"
 BACKEND_MODE_OWN_NODE_REMOTE: Final[str] = "own_node_remote"
 
+#: TCK-UX-010: the FOURTH ``/state`` ``privacy_mode`` name — the ONB-006
+#: first-run hold (``scan.gate.state == "awaiting_backend"``, the same
+#: literal as the ``scan_state`` gate name). It OVERRIDES the 3-way mode
+#: while held: the backend is not chosen yet, so no mode claim is honest.
+PRIVACY_MODE_AWAITING_BACKEND: Final[str] = "awaiting_backend"
+
+#: The CLOSED enum of ``/state`` ``privacy_mode`` values (TCK-UX-010): the
+#: three :func:`_backend_mode` names plus the :data:`PRIVACY_MODE_AWAITING_BACKEND`
+#: hold. Names only — never a URL/host, never a bool (the same badge rule as
+#: :data:`BACKEND_KINDS`).
+PRIVACY_MODES: Final[frozenset[str]] = frozenset(
+    {
+        BACKEND_MODE_PUBLIC,
+        BACKEND_MODE_OWN_NODE_LOCAL,
+        BACKEND_MODE_OWN_NODE_REMOTE,
+        PRIVACY_MODE_AWAITING_BACKEND,
+    }
+)
+
 #: Hosts that count as "the user's own node on this machine" — mirrors the
 #: intent of ``node/detect.py`` ``_LOOPBACK_HOSTS`` (that helper cannot be
 #: imported with its httpx dependency into this network-import-free module,
@@ -607,7 +675,10 @@ _LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "localhost", ":
 
 #: The ``node_status`` narration predicates (TCK-SEC-004 change 5, approved
 #: copy) — "You are " + one of these, mirroring the banner's 3-way split.
-#: The public wording is unchanged from the pre-change narration.
+#: The public wording is unchanged from the pre-change narration. The
+#: REMOTE predicate carries the SAME host insertion as the banner
+#: (TCK-UX-009 lockstep), falling back to the generic line when no host
+#: is parseable.
 _NODE_STATUS_PUBLIC: Final[str] = (
     "You are querying the public API — the operator can associate queried "
     "addresses with your IP."
@@ -617,6 +688,10 @@ _NODE_STATUS_OWN_NODE_LOCAL: Final[str] = (
     "stay here."
 )
 _NODE_STATUS_OWN_NODE_REMOTE: Final[str] = (
+    "You are querying {} for transaction information. This is only private "
+    "if you trust this machine."
+)
+_NODE_STATUS_OWN_NODE_REMOTE_GENERIC: Final[str] = (
     "You are querying your own node on another machine — nothing goes to a "
     "public API."
 )
@@ -683,6 +758,53 @@ def _env_gap_limit(settings: Settings) -> int | None:
             f"{GAP_LIMIT_MIN} and {GAP_LIMIT_MAX}"
         )
     return value
+
+
+def _resolve_watch_interval(settings: Settings, store: Store) -> tuple[float, str | None]:
+    """The background-watch interval ladder, read at the watcher build site
+    (TCK-UX-009): env ``LOCALWALLET_WATCH_INTERVAL_S`` (or the config-file
+    rung — both already merged into ``settings.watch_interval_s`` by
+    ``from_env``) > the stored ``watch_interval_s`` settings key > the
+    shipped default 60. Bounded 0..86400 (0 = off), fail-closed:
+
+    * an env/config-file rung outside the bounds is a startup refusal with
+      a VALUE-FREE :class:`_WiringError` (the value is never echoed) — the
+      same config-error spirit as :func:`_env_gap_limit`;
+    * a stored rung that fails read-time validation (not a whole number in
+      bounds) degrades to the default with ONE value-free warning —
+      returned as the second tuple element; the caller narrates it. A
+      broken setting never takes the watcher (or the launch) down.
+
+    Known simplification (ponytail: the from_env merge erased the
+    distinction): an env/config rung EXACTLY equal to the default is
+    indistinguishable from "no rung" when only the config file set it (the
+    env var's presence is checked directly) — the ladder then falls to
+    stored/default. The file rung is the dev surface; the settings UI
+    claim this ladder backs is env > stored > default.
+    """
+    if _env_overridden(WATCH_INTERVAL_ENV_VAR) or (
+        settings.watch_interval_s != WATCH_INTERVAL_DEFAULT_S
+    ):
+        rung = settings.watch_interval_s
+        if not WATCH_INTERVAL_MIN <= rung <= WATCH_INTERVAL_MAX:
+            raise _WiringError(
+                f"Configuration error: {WATCH_INTERVAL_ENV_VAR} must be "
+                f"between {WATCH_INTERVAL_MIN} and {WATCH_INTERVAL_MAX}"
+            )
+        return rung, None
+    try:
+        raw = store.get_setting(WATCH_INTERVAL_SETTING)
+    except (StoreError, sqlite3.Error):
+        raw = None  # unreadable store → the shipped default; never a stall
+    if raw is None:
+        return WATCH_INTERVAL_DEFAULT_S, None
+    try:
+        stored = int(raw.strip())
+    except ValueError:
+        stored = -1
+    if not WATCH_INTERVAL_MIN <= stored <= WATCH_INTERVAL_MAX:
+        return WATCH_INTERVAL_DEFAULT_S, WATCH_INTERVAL_STALE_WARNING
+    return float(stored), None
 
 
 def _open_browser(url: str) -> bool:
@@ -753,7 +875,14 @@ def privacy_indicator(settings: Settings) -> str:
     if mode == BACKEND_MODE_OWN_NODE_LOCAL:
         return PRIVACY_INDICATOR_OWN_NODE_LOCAL
     if mode == BACKEND_MODE_OWN_NODE_REMOTE:
-        return PRIVACY_INDICATOR_OWN_NODE_REMOTE
+        # TCK-UX-009 user copy: name the host (scheme/port/creds stripped —
+        # user-owned config display, not a leak surface); a URL with no
+        # parseable host keeps the generic wording rather than printing
+        # something broken.
+        host = _configured_url_host(settings.chain_base_url.strip())
+        if host is not None:
+            return PRIVACY_INDICATOR_OWN_NODE_REMOTE.format(host)
+        return PRIVACY_INDICATOR_OWN_NODE_REMOTE_GENERIC
     return PRIVACY_INDICATOR
 
 #: TCK-BACKEND-001 (ADR-0018 amendment): the honest, value-free warning
@@ -2755,9 +2884,12 @@ def _backend_mode(settings: Settings) -> str:
       (LAN/VPS instance): still the user's own node, but NOT on this
       machine, so copy must not claim lookups "stay on this machine".
 
-    The node_status narration and the watch-mode line mirror this function,
-    so neither can disagree with the privacy banner about which backend is
-    actually in use.
+    The node_status narration mirrors this function (and the privacy banner
+    renders its REMOTE host through it), so neither can disagree with the
+    banner about which backend is actually in use. The ``/state``
+    ``privacy_mode`` field rides this classification too (TCK-UX-010),
+    overridden by the ONB-006 ``awaiting_backend`` hold when a first-run
+    backend choice is still outstanding.
     """
     configured = settings.chain_base_url.strip()
     if not configured:
@@ -2795,7 +2927,11 @@ def _make_node_status_handler(
     from the chain-backend selection, :func:`_backend_mode`:
     ``public``/``own_node_local``/``own_node_remote``) so the narration can
     state "querying the public API" vs "your own node on this machine" vs
-    "your own node on another machine" in lockstep with the privacy banner.
+    the REMOTE host-named line in lockstep with the privacy banner — in
+    REMOTE mode the result also carries ``backend_host`` (the configured
+    URL's host, scheme/port/credentials stripped, TCK-UX-009: the user's
+    OWN config echoed back to them, same as the banner), and the narration
+    falls back to the generic wording when there is no host to name.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -2803,10 +2939,15 @@ def _make_node_status_handler(
         if not isinstance(params, NodeStatusParams):
             # Unreachable via validated envelopes; fail closed anyway.
             return {"error": "internal", "detail": "node_status params shape mismatch"}
+        mode = _backend_mode(settings)
         facts: dict[str, object] = {
-            "backend_mode": _backend_mode(settings),
+            "backend_mode": mode,
             "node_detection_enabled": bool(settings.node_detection_enabled),
         }
+        if mode == BACKEND_MODE_OWN_NODE_REMOTE:
+            host = _configured_url_host(settings.chain_base_url.strip())
+            if host is not None:
+                facts["backend_host"] = host
         if not settings.node_detection_enabled:
             facts["detection_state"] = NODE_STATUS_DETECTION_DISABLED
             return facts
@@ -2909,21 +3050,6 @@ def _narrate_incoming_event(
     if suffix:
         line = f"{line} · {suffix}"
     return line
-
-
-def _watch_mode_fragment(mode: str) -> str:
-    """The watch-startup line's backend fragment, mirroring the banner.
-
-    Approved copy (TCK-SEC-004 change 5): ``the public API`` /
-    ``your own node on this machine`` / ``your own node on another
-    machine`` — the same three-way honesty split as
-    :func:`privacy_indicator` and the node_status narration.
-    """
-    return {
-        BACKEND_MODE_PUBLIC: "the public API",
-        BACKEND_MODE_OWN_NODE_LOCAL: "your own node on this machine",
-        BACKEND_MODE_OWN_NODE_REMOTE: "your own node on another machine",
-    }[mode]
 
 
 def _make_watch_probe(
@@ -4254,7 +4380,12 @@ class ModelPreloadFlow:
             return True
         if isinstance(command, _PreloadDone):
             self.state = "ready" if command.ok else "failed"
-            if not command.ok and self._log_fn is not None:
+            if command.ok:
+                # TCK-UX-009: exactly once — this marker is delivered by
+                # the single loader thread (the _started guard spawns it
+                # once), and the failed path never prints it.
+                output_fn(MODEL_PRELOADED_NOTICE)
+            elif self._log_fn is not None:
                 self._log_fn(_MODEL_PRELOAD_FAILED_LOG)
             return True
         if isinstance(command, _IntegrityDone):
@@ -4553,6 +4684,13 @@ class EngineContext:
     #: serves ``backend_kind`` to /state, and runs the resync-now command.
     #: ``None`` on the first-run placeholder (no wiring to swap).
     backend: ChainBackendFlow | None = None
+    #: TCK-UX-010: the boot-resolved runtime settings — the ONE
+    #: object the hot-swap mutates (:attr:`_Wiring.settings`). The pump
+    #: derives the ``/state`` ``privacy_mode`` NAME from it (via
+    #: :func:`_backend_mode`) at the snapshot call site; ``None`` on the
+    #: degenerate first-run placeholder (no backend chosen yet → the field
+    #: is OMITTED, never fabricated — same rule as ``backend_kind``).
+    settings: Settings | None = None
 
 
 @dataclass(frozen=True)
@@ -4579,6 +4717,7 @@ def build_state_snapshot(
     model: ModelDownloadFlow | None = None,
     backend_kind: str | None = None,
     preload: ModelPreloadFlow | None = None,
+    privacy_mode: str | None = None,
 ) -> dict[str, object]:
     """The value-free ``/state`` snapshot, built ON the engine thread.
 
@@ -4592,9 +4731,12 @@ def build_state_snapshot(
     state (a closed :class:`ModelDownloadFlow` state name), —
     TCK-LAUNCH-003 — the model PRELOAD state (a closed
     :class:`ModelPreloadFlow` state name; the two are mutually exclusive:
-    file present → preload, absent → card), and — TCK-BACKEND-002 — the
+    file present → preload, absent → card), — TCK-BACKEND-002 — the
     live backend kind (a closed :data:`BACKEND_KINDS` enum NAME, badge
-    material: never a URL/host). No address, amount, txid, ``tx_ref``, key
+    material: never a URL/host), and — TCK-UX-010 — the privacy mode (a
+    precomputed closed :data:`PRIVACY_MODES` enum NAME, computed by the
+    pump at the call site; the builder sees no settings). No address,
+    amount, txid, ``tx_ref``, key
     material OR progress byte-count CAN appear — every value is an enum NAME
     or a boolean, never data. No progress percentage here (a wallet-size
     oracle); download progress rides its own event kind.
@@ -4625,6 +4767,12 @@ def build_state_snapshot(
         # Additive under state/1 (same rule): the CLOSED enum name of the
         # live chain backend kind — a badge label, value-free by construction.
         snapshot["backend_kind"] = backend_kind
+    if privacy_mode is not None:
+        # TCK-UX-010: additive under state/1 (same rule): the CLOSED
+        # privacy-mode NAME (:data:`PRIVACY_MODES`) the pump precomputed —
+        # an enum name, never a URL/host. Absent (None) = no settings
+        # context; omitted, never guessed (the ``backend_kind`` pattern).
+        snapshot["privacy_mode"] = privacy_mode
     return snapshot
 
 
@@ -4766,6 +4914,11 @@ _SETTINGS_KEYS: Final[frozenset[str]] = frozenset(
     {
         wallet_scan.GAP_LIMIT_SETTING,
         _CHAIN_BASE_URL_KEY,
+        # TCK-UX-009: the background-watch interval. Allowlisted ONLY
+        # because the watcher build site in _wire reads it back through
+        # _resolve_watch_interval (env > stored > default) — the setting
+        # the "Change it in settings" line claims.
+        WATCH_INTERVAL_SETTING,
         # TCK-ONB-004 M3: the backend credential keys (SECRET entries —
         # readable as SET/UNSET only, never value). They have live readers
         # (the engine's credential resolver feeding probe + client build).
@@ -4945,6 +5098,20 @@ def _settings_entries(
             "requires_restart": backend is None or shadowed,
             "env_override": _env_overridden(CHAIN_BASE_URL_ENV_VAR),
         },
+        # TCK-UX-009: the background-watch interval, same gap-limit shape.
+        # The ladder at the watcher build site (env > stored > default 60)
+        # is its live reader; the watcher is built ONCE at launch, so the
+        # honest effect flag is RESTART.
+        {
+            "key": WATCH_INTERVAL_SETTING,
+            "type": "int",
+            "value": store.get_setting(WATCH_INTERVAL_SETTING),
+            "default": f"{WATCH_INTERVAL_DEFAULT_S:g}",
+            "min": WATCH_INTERVAL_MIN,
+            "max": WATCH_INTERVAL_MAX,
+            "requires_restart": True,
+            "env_override": _env_overridden(WATCH_INTERVAL_ENV_VAR),
+        },
         # TCK-WEB-008 follow-up (a), TCK-LAUNCH-002: the watch key rides the
         # SAME read surface, display-TRUNCATED (a public account key, never a
         # secret; never in logs). It is READ-ONLY here — the write allowlist
@@ -5098,6 +5265,29 @@ def _apply_setting_change(store: Store, key: str, value: str) -> str | None:
             )
         try:
             store.set_setting(key, str(gap))  # canonical decimal string
+        except (StoreError, sqlite3.Error):
+            return f"could not save {key}"
+        return None
+    if key == WATCH_INTERVAL_SETTING:
+        # TCK-UX-009: the same gap-limit shape (no typed writer yet) —
+        # canonical-form + bounds 0..86400 here, fail-closed, VALUE-FREE
+        # (the submitted value is never echoed); the ladder at the watcher
+        # build site is the reader.
+        text = value.strip()
+        try:
+            interval = int(text)
+        except ValueError:
+            interval = -1
+        if (
+            str(interval) != text
+            or not WATCH_INTERVAL_MIN <= interval <= WATCH_INTERVAL_MAX
+        ):
+            return (
+                f"{key} must be a whole number between "
+                f"{WATCH_INTERVAL_MIN} and {WATCH_INTERVAL_MAX}"
+            )
+        try:
+            store.set_setting(key, str(interval))  # canonical decimal string
         except (StoreError, sqlite3.Error):
             return f"could not save {key}"
         return None
@@ -5473,6 +5663,7 @@ def start_engine(
             model=ctx.model,
             preload=ctx.preload,
             backend=ctx.backend,
+            settings=ctx.settings,
         )
 
     handle.thread = threading.Thread(target=body, name="engine", daemon=True)
@@ -5690,6 +5881,7 @@ def _pump(
     model: ModelDownloadFlow | None = None,
     preload: ModelPreloadFlow | None = None,
     backend: ChainBackendFlow | None = None,
+    settings: Settings | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
     ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
@@ -5851,6 +6043,11 @@ def _pump(
                 # TCK-BACKEND-002: the fresh wiring owns its own swap
                 # controller (built by _wire) — the pump follows.
                 backend = wiring.swap
+                # TCK-UX-010: the privacy_mode source moves with the wiring —
+                # the SAME settings object the swap mutates in place (and the
+                # provisioned first-run path's boot-resolved settings before
+                # any wiring existed: the rebind simply follows the live one).
+                settings = wiring.settings
                 if scan is not None:
                     scan.attach(commands)
                     scan.begin()
@@ -5870,6 +6067,16 @@ def _pump(
             # Yes/No card + quick-action buttons (enum name, never data).
             # TCK-BACKEND-002: an additive ``backend_kind`` NAME is the
             # client's badge material (closed enum, never a URL/host).
+            # TCK-UX-010: an additive ``privacy_mode`` NAME (closed
+            # :data:`PRIVACY_MODES`, never a URL/host), computed HERE —
+            # the ONB-006 hold overrides the mode while a first-run backend
+            # choice is outstanding; no settings context = field omitted,
+            # never fabricated (the builder stays settings-free and value-free).
+            privacy_mode = (
+                PRIVACY_MODE_AWAITING_BACKEND
+                if scan is not None and scan.gate.state == PRIVACY_MODE_AWAITING_BACKEND
+                else (_backend_mode(settings) if settings is not None else None)
+            )
             snapshot = build_state_snapshot(
                 flow,
                 session,
@@ -5878,6 +6085,7 @@ def _pump(
                 model,
                 backend.kind if backend is not None else None,
                 preload,
+                privacy_mode,
             )
             if provision is not None and provision.wiring is None:
                 snapshot["needs_watch_key"] = True
@@ -6948,12 +7156,18 @@ class ChainBackendFlow:
         are structurally unaffected."""
         w = self._w
         scan = w.scan
+        # TCK-FIAT-001 security-review LOW (folded into TCK-UX-009): ONE
+        # oracle rebuilt per swap, shared by get_balance (fiat display) and
+        # create_tx (USD resolution) — the single-cache invariant the
+        # initial wiring establishes (build_dispatch_table), restored here
+        # instead of two private caches over the same client.
+        price_oracle = PriceOracle(client)
         w.table[IntentName.GET_BALANCE] = _make_get_balance_handler(
             w.store,
             w.wallet.id,
             scan.scan_now if scan is not None else (lambda: None),
             scan.gate if scan is not None else None,
-            price_oracle=PriceOracle(client),
+            price_oracle=price_oracle,
         )
         w.table[IntentName.CREATE_TX] = _make_create_tx_handler(
             w.store,
@@ -6961,7 +7175,7 @@ class ChainBackendFlow:
             w.parsed,
             w.flow,
             FeeEstimator(client),
-            PriceOracle(client),
+            price_oracle,
             scan.scan_now if scan is not None else (lambda: None),
             seconds_since_last_block_fn=lambda: _safe_time_since_last_block(client),
             scan_gate=scan.gate if scan is not None else None,
@@ -7097,22 +7311,22 @@ def _wire(
     # sqlite object across threads; the REPL runs a due poll cycle between
     # turns, and the poll's chain fetch rides the SAME worker (the P5-001
     # "full scan per poll on the engine thread" cost note is retired — the
-    # engine only persists what the worker fetched). The startup line
-    # states — in lockstep with the privacy banner — whether background
-    # watching runs against the user's own node or the public API.
+    # engine only persists what the worker fetched). TCK-UX-009: the
+    # interval resolves on its ladder (env > stored setting > default 60)
+    # HERE — the stored rung's reader, which is what makes the plain
+    # "Change it in settings" claim true (the watcher is built at launch →
+    # the settings entry carries requires_restart).
     scan = ScanFlow(store, wallet_row, worker, gap_limit=env_gap)
+    watch_interval, watch_interval_warning = _resolve_watch_interval(settings, store)
+    if watch_interval_warning is not None:
+        output_fn(watch_interval_warning)
     watcher: IncomingWatcher | None = None
-    if settings.watch_interval_s > 0:
+    if watch_interval > 0:
         watcher = IncomingWatcher(
             _make_watch_probe(store, wallet_row.id, scan.scan_now),
-            interval_s=settings.watch_interval_s,
+            interval_s=watch_interval,
         )
-        watch_mode = _watch_mode_fragment(_backend_mode(settings))
-        output_fn(
-            f"Background watch: on — checks up to every "
-            f"{settings.watch_interval_s:g}s against {watch_mode} "
-            f"(LOCALWALLET_WATCH_INTERVAL_S=0 turns it off)."
-        )
+        output_fn("Background watch: on. Change it in settings.")
     else:
         output_fn("Background watch: off.")
 
@@ -7465,6 +7679,7 @@ def _run_web(
             preload=preload,
             output=output,
             backend=wiring.swap,
+            settings=wiring.settings,
         )
 
     try:
@@ -9004,7 +9219,13 @@ def _print_node_status(result: Mapping[str, object], output_fn: Callable[[str], 
     if backend == BACKEND_MODE_OWN_NODE_LOCAL:
         output_fn(sanitize_tool_output(_NODE_STATUS_OWN_NODE_LOCAL))
     elif backend == BACKEND_MODE_OWN_NODE_REMOTE:
-        output_fn(sanitize_tool_output(_NODE_STATUS_OWN_NODE_REMOTE))
+        # Same host insertion as the banner (TCK-UX-009 lockstep); generic
+        # wording when the handler found no host to name.
+        host = result.get("backend_host")
+        if isinstance(host, str) and host:
+            output_fn(sanitize_tool_output(_NODE_STATUS_OWN_NODE_REMOTE.format(host)))
+        else:
+            output_fn(sanitize_tool_output(_NODE_STATUS_OWN_NODE_REMOTE_GENERIC))
     else:
         output_fn(sanitize_tool_output(_NODE_STATUS_PUBLIC))
 

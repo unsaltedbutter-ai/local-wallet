@@ -322,9 +322,10 @@ def test_state_snapshot_request_is_answered_on_the_engine_thread(
     real_build = app.build_state_snapshot
 
     def spy_build(flow, session, watcher, scan=None, model=None, backend_kind=None,
-                  preload=None):
+                  preload=None, privacy_mode=None):
         build_threads.append(threading.get_ident())
-        return real_build(flow, session, watcher, scan, model, backend_kind, preload)
+        return real_build(flow, session, watcher, scan, model, backend_kind, preload,
+                          privacy_mode)
 
     monkeypatch.setattr(app, "build_state_snapshot", spy_build)
     events: list[EngineEvent] = []
@@ -391,9 +392,135 @@ def test_build_state_snapshot_is_value_free() -> None:
     # count/percent (a progress value would leak wallet size indirectly).
     assert snap["scan_state"] == "disabled"
     assert snap["first_scan_complete"] is False
-    dumped = repr(snap)
+    # TCK-UX-010: the additive privacy_mode rides as a closed PRIVACY_MODES
+    # NAME, verbatim — the builder has no settings and no formatting, so it
+    # CANNOT turn it into a URL/host.
+    named = app.build_state_snapshot(
+        flow, app.SendSession(), None, privacy_mode="own_node_remote"
+    )
+    assert named["privacy_mode"] in app.PRIVACY_MODES
+    dumped = repr(named)
+    for leak in ("://", "127.0.0.1", "localhost", ".onion", ".invalid"):
+        assert leak not in dumped
     for leak in ("REFSECRET", "654321", "bc1qLEAK", "cHNidP8"):
         assert leak not in dumped
+
+
+def _privacy_snapshot(bootstrap: Any) -> dict[str, object]:
+    """One typed ``/state`` read through a REAL engine pump — the snapshot's
+    ``privacy_mode`` is computed at the pump call site (TCK-UX-010 source
+    rule), so the tests drive the pump, never the builder directly.
+    ``bootstrap`` builds the :class:`EngineContext` ON the engine thread
+    (thread-pinned Store included)."""
+    events: list[EngineEvent] = []
+    handle = app.start_engine(bootstrap, events.append)
+    try:
+        snap = handle.request_state(5.0)
+    finally:
+        handle.shutdown()
+        assert handle.thread is not None
+        handle.thread.join(10)
+    assert snap is not None
+    return snap
+
+
+def _bare_context(**kwargs: Any) -> Any:
+    """Bootstrap returning an EngineContext with the (main-thread-free)
+    pieces every /state test needs, plus the given scan/settings context."""
+
+    def bootstrap() -> app.EngineContext:
+        return app.EngineContext(
+            loop=_make_loop(),
+            flow=TxFlow(),
+            session=app.SendSession(),
+            table={IntentName.RESPOND: app._respond_handler},
+            **kwargs,
+        )
+
+    return bootstrap
+
+
+def test_state_snapshot_carries_each_privacy_mode_name() -> None:
+    """Done-when: the additive ``privacy_mode`` carries every closed enum
+    NAME sourced from ``_backend_mode(settings)`` — and NEVER the URL or
+    host behind it (the pinned contract: names over the wire)."""
+    from localwallet.config import Settings
+
+    for url, expected in (
+        ("", "public"),
+        ("ssl://127.0.0.1:50002", "own_node_local"),
+        ("http://node.example.invalid:3006", "own_node_remote"),
+    ):
+        snap = _privacy_snapshot(
+            _bare_context(settings=Settings(chain_base_url=url))
+        )
+        assert snap["privacy_mode"] == expected
+        assert snap["privacy_mode"] in app.PRIVACY_MODES
+        text = repr(snap)
+        for leak in (url, "://", "127.0.0.1", "example.invalid", "3006", "50002"):
+            assert not leak or leak not in text
+
+
+def test_state_snapshot_awaiting_backend_hold_overrides_the_mode(
+    tmp_path: Path,
+) -> None:
+    """Dual source (critic finding 2): the ONB-006 hold WINS over the
+    settings-derived mode. Synthetic held gate — in real runs this state
+    exists only on a first launch before the backend choice (critic
+    finding 4), which is exactly what :meth:`ScanFlow.set_startup_deferred`
+    models. The configured URL would otherwise badge ``own_node_local``."""
+    from localwallet.config import Settings
+
+    workers: list[Any] = []
+    db_files = iter(("privacy.db", "privacy2.db"))
+
+    def bootstrap(settings: Any) -> Any:
+        def build() -> app.EngineContext:
+            # a FRESH store/scan per pump: a held gate's begin() consumes the
+            # first pump's queue — a second pump must re-defer its own.
+            store = Store(str(tmp_path / next(db_files)))
+            wallet = store.create_wallet(
+                "default", app.WalletDescriptor.from_key(ZPUB).descriptor
+            )
+            worker = app.ChainWorker(None)  # held scan fetches nothing
+            workers.append(worker)
+            scan = app.ScanFlow(store, wallet, worker, gap_limit=None)
+            scan.set_startup_deferred()
+            return app.EngineContext(
+                loop=_make_loop(),
+                flow=TxFlow(),
+                session=app.SendSession(),
+                table={IntentName.RESPOND: app._respond_handler},
+                scan=scan,
+                store=store,
+                settings=settings,
+            )
+
+        return build
+
+    snap = _privacy_snapshot(
+        bootstrap(Settings(chain_base_url="http://127.0.0.1:3006"))
+    )
+    assert snap["scan_state"] == "awaiting_backend"  # the same gate, both faces
+    assert snap["privacy_mode"] == "awaiting_backend"  # OVERRIDES the mode
+    # No settings at all (placeholder degenerate) + held gate: still the
+    # honest hold — the gate check needs no settings.
+    held_only = _privacy_snapshot(bootstrap(None))
+    assert held_only["privacy_mode"] == "awaiting_backend"
+    for worker in workers:
+        worker.stop()
+
+
+def test_state_snapshot_omits_privacy_mode_without_settings() -> None:
+    """Degenerate stub paths (no settings/context): the field is ABSENT,
+    never fabricated — the exact ``backend_kind`` rule. The existing
+    whole-snapshot equality pins in this file double as the absent-pin."""
+    snap = _privacy_snapshot(_bare_context())
+    assert "privacy_mode" not in snap
+    # A live (non-held) scan alone must not fabricate it either:
+    assert "privacy_mode" not in app.build_state_snapshot(
+        TxFlow(), app.SendSession(), None
+    )
 
 
 def test_store_built_off_the_engine_thread_is_refused(tmp_path: Path) -> None:

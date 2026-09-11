@@ -307,6 +307,126 @@ def test_watch_interval_malformed_env_fails_closed(monkeypatch: pytest.MonkeyPat
         Settings.from_env()
 
 
+# ------- TCK-UX-009: the ladder at the watcher build site (env > stored > 60)
+
+
+def _ladder(settings: Settings, store: Store) -> tuple[float, str | None]:
+    from localwallet.app import _resolve_watch_interval
+
+    return _resolve_watch_interval(settings, store)
+
+
+def test_watch_interval_ladder_default_when_no_rung(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("LOCALWALLET_WATCH_INTERVAL_S", raising=False)
+    store = Store(tmp_path / "lad.db")
+    try:
+        assert _ladder(Settings(), store) == (60.0, None)
+    finally:
+        store.close()
+
+
+def test_watch_interval_ladder_stored_wins_without_env(tmp_path: Path, monkeypatch):
+    """THE settings-surface reader: a stored ``watch_interval_s`` reaches
+    the watcher (the "Change it in settings" claim, made true)."""
+    monkeypatch.delenv("LOCALWALLET_WATCH_INTERVAL_S", raising=False)
+    store = Store(tmp_path / "lad.db")
+    try:
+        store.set_setting("watch_interval_s", "300")
+        assert _ladder(Settings(), store) == (300.0, None)
+        store.set_setting("watch_interval_s", "0")  # off via settings
+        assert _ladder(Settings(), store) == (0.0, None)
+        store.set_setting("watch_interval_s", "86400")  # upper bound stands
+        assert _ladder(Settings(), store) == (86400.0, None)
+    finally:
+        store.close()
+
+
+def test_watch_interval_ladder_env_beats_stored(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "30")
+    store = Store(tmp_path / "lad.db")
+    try:
+        store.set_setting("watch_interval_s", "300")
+        # from_env merged the env rung into the settings field; the ladder
+        # must take the env rung, not the stored one.
+        settings = Settings.from_env()
+        assert _ladder(settings, store) == (30.0, None)
+        monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")  # off beats stored
+        assert _ladder(Settings.from_env(), store) == (0.0, None)
+    finally:
+        store.close()
+
+
+def test_watch_interval_ladder_env_60_beats_stored(tmp_path: Path, monkeypatch):
+    """The equal-to-default edge: env explicitly 60 still WINS over a
+    stored rung (presence is checked, not just the merged value)."""
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "60")
+    store = Store(tmp_path / "lad.db")
+    try:
+        store.set_setting("watch_interval_s", "300")
+        assert _ladder(Settings.from_env(), store) == (60.0, None)
+    finally:
+        store.close()
+
+
+def test_watch_interval_ladder_malformed_stored_degrades_with_one_warning(
+    tmp_path: Path, monkeypatch
+):
+    """Malformed / out-of-bounds STORED rungs never stall the launch:
+    default + ONE value-free warning line (the refusal is the WRITE
+    path's; a corrupt row read at startup degrades honestly)."""
+    monkeypatch.delenv("LOCALWALLET_WATCH_INTERVAL_S", raising=False)
+    store = Store(tmp_path / "lad.db")
+    try:
+        from localwallet.app import WATCH_INTERVAL_STALE_WARNING
+
+        for bad in ("abc", "0.5", "86401", "-1", ""):
+            store.set_setting("watch_interval_s", bad)
+            value, warning = _ladder(Settings(), store)
+            assert value == 60.0, bad
+            assert warning == WATCH_INTERVAL_STALE_WARNING, bad
+        # a valid stored rung after a bad one clears the warning back to None
+        store.set_setting("watch_interval_s", "45")
+        assert _ladder(Settings(), store) == (45.0, None)
+    finally:
+        store.close()
+
+
+def test_watch_interval_ladder_out_of_bounds_env_refuses_value_free(
+    tmp_path: Path, monkeypatch
+):
+    """The env rung outside 0..86400 is a config error, raised as a
+    :class:`_WiringError` with a VALUE-FREE message (the same spirit as
+    the gap-limit preflight)."""
+    from localwallet.app import _WiringError
+
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "86401")
+    store = Store(tmp_path / "lad.db")
+    try:
+        with pytest.raises(_WiringError) as raised:
+            _ladder(Settings(watch_interval_s=86401.0), store)
+        assert "86401" not in str(raised.value)
+        monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "-5")
+        with pytest.raises(_WiringError):
+            _ladder(Settings(watch_interval_s=-5.0), store)
+    finally:
+        store.close()
+
+
+def test_watch_interval_ladder_honours_settings_field_seam(
+    tmp_path: Path, monkeypatch
+):
+    """No env, no stored rung: a Settings whose field was set off-default
+    (config file or the test seam) wins — e.g. the sub-second intervals
+    the onboarding probes use."""
+    monkeypatch.delenv("LOCALWALLET_WATCH_INTERVAL_S", raising=False)
+    store = Store(tmp_path / "lad.db")
+    try:
+        store.set_setting("watch_interval_s", "300")
+        assert _ladder(Settings(watch_interval_s=0.05), store) == (0.05, None)
+    finally:
+        store.close()
+
+
 # ---------------------------------------------------------------- app wiring / narration
 
 

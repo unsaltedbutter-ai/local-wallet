@@ -54,6 +54,7 @@ from localwallet import app
 from localwallet.agent.loop import AgentLoop
 from localwallet.app import EngineContext, EngineEvent
 from localwallet.chain import PriceUnavailableError
+from localwallet.config import Settings
 from localwallet.protocol import IntentName
 from localwallet.store import Store
 from localwallet.tx.flow import TxFlow, TxFlowStatus
@@ -1038,6 +1039,11 @@ def test_state_reports_awaiting_backend_for_a_held_scan(tmp_path: Path) -> None:
         assert snapshot["schema"] == "state/1"
         assert snapshot["scan_state"] == "awaiting_backend"
         assert snapshot["first_scan_complete"] is False
+        # TCK-UX-010 (critic finding 4): the held first-run gate rides the
+        # additive ``privacy_mode`` too — the ONB-006 hold overrides the
+        # settings-derived mode (this harness carries no settings at all,
+        # which the hold still outranks: an enum NAME, never a URL).
+        assert snapshot["privacy_mode"] == "awaiting_backend"
         assert ZPUB not in data.decode()  # value-free like every other state
     finally:
         server.stop()
@@ -1098,16 +1104,30 @@ def test_state_snapshot_never_carries_values(
         state = TxFlowStatus.CREATED
         pending = _Pending()
 
-    snapshot = app.build_state_snapshot(_BusyFlow(), app.SendSession(), None)
+    snapshot = app.build_state_snapshot(
+        _BusyFlow(),
+        app.SendSession(),
+        None,
+        # TCK-UX-010: the new field rides the SAME value-free door — its
+        # value is a closed PRIVACY_MODES NAME, so no host/scheme/port/
+        # userinfo CAN appear anywhere in the body.
+        privacy_mode=app._backend_mode(
+            Settings(chain_base_url="ssl://us3r:secret@node.invalid:50002")
+        ),
+    )
     monkeypatch.setattr(server.handle, "request_state", lambda _t: snapshot)
 
     status, _h, data, _r = _request(server, "GET", "/state", token=server.token)
     assert status == 200
     assert snapshot["flow_state"] == "created"
     assert snapshot["pending_present"] is True  # a BOOL, never the pending data
+    assert snapshot["privacy_mode"] == "own_node_remote"  # a NAME, never the URL
+    assert snapshot["privacy_mode"] in app.PRIVACY_MODES
     text = data.decode("latin-1")
     for secret in ("bc1qattrrust", "100000", "SECRETREF", "cHNidP8"):
         assert secret not in text
+    for leak in ("node.invalid", "50002", "us3r", "secret", "://", "ssl:"):
+        assert leak not in text
     assert str(server.token) not in text
 
 
@@ -1165,6 +1185,10 @@ def test_settings_get_lists_the_allowlist_shape_only(
         assert set(entries) == {
             "gap_limit",
             "chain_base_url",
+            # TCK-UX-009: the background-watch interval (the watcher-build
+            # ladder is its live reader; the watcher builds at launch →
+            # requires_restart True).
+            "watch_interval_s",
             "watch_key",
             # TCK-ONB-004 M3: the credential keys join the read surface as
             # SECRET entries — set/unset facts only, never the value.

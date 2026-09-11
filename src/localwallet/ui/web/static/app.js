@@ -26,6 +26,7 @@ const scrollerEl = document.getElementById("scroller");
 const actionsEl = document.getElementById("actions");
 const quickbarEl = document.getElementById("quickbar");
 const scanChipEl = document.getElementById("scan-chip");
+const privacyChipEl = document.getElementById("privacy-chip");
 const settingsToggleEl = document.getElementById("settings-toggle");
 const settingsPanelEl = document.getElementById("settings-panel");
 const settingsStatusEl = document.getElementById("settings-status");
@@ -42,6 +43,15 @@ const LABELS = {
   scanLoading:
     "Wallet loading — balances may be incomplete until the first scan finishes.",
   scanSkipped: "First scan failed — balances may be incomplete.",
+  // TCK-UX-010: privacy chip subline (title/aria-label) per privacy_mode
+  // NAME — the closed enum the server adds to /state. Unknown names hide
+  // the chip; these strings are the only per-mode prose.
+  privacyPublic:
+    "Public explorer — the operator can associate queried addresses with your IP.",
+  privacyOwnLocal: "Your node on this machine — lookups stay here.",
+  privacyOwnRemote:
+    "Your node on another machine — private only if you trust it.",
+  privacyAwaiting: "No backend chosen yet.",
   // settings panel (TCK-WEB-005)
   settingsLoading: "Loading…",
   settingsUnavailable: "Could not load settings — the wallet is busy or unreachable.",
@@ -455,6 +465,7 @@ function applyState(snap) {
     btn.hidden = !visible.has(btn.dataset.action);
   }
   applyScanChip(snap);
+  applyPrivacyChip(snap);
   applyWatchKeyGate(snap);
   applyModelPrompt(snap);
   applyBackendKind(snap);
@@ -551,6 +562,36 @@ function applyScanChip(snap) {
     scanChipEl.textContent = LABELS.scanSkipped;
     scanChipEl.hidden = false;
   }
+}
+
+// TCK-UX-010: the persistent privacy label. The closed privacy_mode enum
+// NAMES (the additive /state field) map to the subline copy; the chip's
+// color rides the data-privacy attribute → .privacy[data-privacy=…] rules
+// in styles.css (no inline styles, CSP-clean). Absent or unknown value →
+// hidden: the chip is never fabricated and the raw enum never reaches the
+// user as visible text (the word shown is the static "Privacy notice").
+const PRIVACY_SUBLINE = {
+  public: LABELS.privacyPublic,
+  own_node_local: LABELS.privacyOwnLocal,
+  own_node_remote: LABELS.privacyOwnRemote,
+  awaiting_backend: LABELS.privacyAwaiting,
+};
+
+function applyPrivacyChip(snap) {
+  privacyChipEl.hidden = true;
+  privacyChipEl.removeAttribute("data-privacy");
+  privacyChipEl.removeAttribute("title");
+  privacyChipEl.removeAttribute("aria-label");
+  if (!snap || snap.schema !== "state/1") return;
+  const mode = snap.privacy_mode;
+  if (typeof mode !== "string" || !Object.prototype.hasOwnProperty.call(PRIVACY_SUBLINE, mode)) return;
+  const subline = PRIVACY_SUBLINE[mode];
+  privacyChipEl.dataset.privacy = mode;
+  // subline as tooltip + accessible name; the enum NAME itself never reaches
+  // the user as text — it only rides the data-privacy attribute (CSS hook).
+  privacyChipEl.title = subline;
+  privacyChipEl.setAttribute("aria-label", `Privacy notice: ${subline}`);
+  privacyChipEl.hidden = false;
 }
 
 // TCK-WEB-009 (e): the badge strip follows the additive backend_kind NAME

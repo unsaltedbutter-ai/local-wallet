@@ -61,6 +61,7 @@ def env_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     """No env rungs: the stored rung is the whole story in these tests."""
     monkeypatch.delenv(app.GAP_LIMIT_ENV_VAR, raising=False)
     monkeypatch.delenv(app.CHAIN_BASE_URL_ENV_VAR, raising=False)
+    monkeypatch.delenv(app.WATCH_INTERVAL_ENV_VAR, raising=False)
     for coin_key in COIN_SETTING_KEYS:
         monkeypatch.delenv(f"LOCALWALLET_{coin_key.upper()}", raising=False)
 
@@ -89,6 +90,10 @@ def test_allowlist_is_exactly_the_live_db_keys(env_clean: None, tmp_path: Path) 
         assert set(entries) == {
             "gap_limit",
             "chain_base_url",
+            # TCK-UX-009: the background-watch interval — allowlisted only
+            # because the watcher build site reads it back (ladder: env >
+            # stored > default 60), which makes "Change it in settings" true.
+            "watch_interval_s",
             "watch_key",
             # TCK-ONB-004 M3: the credential keys — writable AND readable,
             # but the read answers SET/UNSET only (``type: "secret"``).
@@ -127,6 +132,18 @@ def test_allowlist_is_exactly_the_live_db_keys(env_clean: None, tmp_path: Path) 
         # ADR-0018 config-only switch: the client is built at bootstrap — the
         # honest flag is RESTART, never a silent hot-swap.
         assert chain["requires_restart"] is True
+        # TCK-UX-009: the watch-interval entry — bounded int, shipped
+        # default 60, honest RESTART flag (the watcher is built at launch).
+        assert entries["watch_interval_s"] == {
+            "key": "watch_interval_s",
+            "type": "int",
+            "value": None,
+            "default": "60",
+            "min": 0,
+            "max": 86400,
+            "requires_restart": True,
+            "env_override": False,
+        }
         # No wallet provisioned → the watch key reads configured: False with a
         # null value (fail quiet, never a guess).
         watch = entries["watch_key"]
@@ -280,6 +297,56 @@ def test_gap_limit_write_matrix_validates_fail_closed_and_value_free(
         # Value-free: the submitted value is never echoed in the refusal.
         for bad in ("abc", "1e3", "1001", "٢٠"):
             assert bad not in str(app.handle_settings_request(store, "gap_limit", bad))
+    finally:
+        store.close()
+
+
+def test_watch_interval_write_matrix_validates_fail_closed_and_value_free(
+    env_clean: None, tmp_path: Path
+) -> None:
+    """TCK-UX-009: bounded whole-number seconds 0..86400 (0 = off — the
+    settings-rung answer to the old env-var hatch), canonical decimal
+    writes, VALUE-FREE refusals (the ladder at the watcher build site
+    shares the same bounds)."""
+    store = Store(tmp_path / "watchi.db")
+    try:
+        for good in ("0", "1", "60", "86400", "  120 "):
+            result = app.handle_settings_request(store, "watch_interval_s", good)
+            assert result["status"] == "applied", good
+            assert result["settings"][0]["value"] == good.strip()
+            assert store.get_setting("watch_interval_s") == good.strip()
+            assert result["settings"][0]["requires_restart"] is True
+
+        for bad in ("-1", "86401", "abc", "0.5", "60.0", "0060", "1e2", "", "  "):
+            result = app.handle_settings_request(store, "watch_interval_s", bad)
+            assert result["status"] == "rejected", bad
+            assert store.get_setting("watch_interval_s") == "120"  # last GOOD
+        for bad in ("abc", "86401", "0.5"):
+            assert bad not in str(
+                app.handle_settings_request(store, "watch_interval_s", bad)
+            )
+    finally:
+        store.close()
+
+
+def test_watch_interval_env_override_flag_is_honest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TCK-UX-009: the env rung flips the watch entry's ``env_override``
+    (existence only — the value never rides the entry), while the stored
+    rung stays readable/writable."""
+    monkeypatch.delenv(app.GAP_LIMIT_ENV_VAR, raising=False)
+    monkeypatch.delenv(app.CHAIN_BASE_URL_ENV_VAR, raising=False)
+    monkeypatch.delenv(app.WATCH_INTERVAL_ENV_VAR, raising=False)
+    for coin_key in COIN_SETTING_KEYS:
+        monkeypatch.delenv(f"LOCALWALLET_{coin_key.upper()}", raising=False)
+    store = Store(tmp_path / "watchienv.db")
+    try:
+        assert _entries(store)["watch_interval_s"]["env_override"] is False
+        monkeypatch.setenv(app.WATCH_INTERVAL_ENV_VAR, "5")
+        entry = _entries(store)["watch_interval_s"]
+        assert entry["env_override"] is True
+        assert entry["value"] is None  # the env VALUE never rides
     finally:
         store.close()
 

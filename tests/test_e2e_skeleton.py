@@ -61,6 +61,7 @@ from localwallet.app import (
     PRIVACY_INDICATOR,
     PRIVACY_INDICATOR_OWN_NODE_LOCAL,
     PRIVACY_INDICATOR_OWN_NODE_REMOTE,
+    PRIVACY_INDICATOR_OWN_NODE_REMOTE_GENERIC,
     ZPUB_ENV_VAR,
     SendSession,
     _env_gap_limit,
@@ -1522,19 +1523,21 @@ def test_node_status_own_node_narration_and_banner_flip(
     assert code == 0
     assert len(detect_calls) == 1
     joined = "\n".join(outputs)
-    # Banner: approved LOCAL wording, verbatim.
+    # Banner: approved LOCAL wording, verbatim (TCK-UX-009: LOCAL is NOT
+    # host-named — only the REMOTE wording grew the <host> insertion).
     assert PRIVACY_INDICATOR_OWN_NODE_LOCAL in joined
     assert PRIVACY_INDICATOR not in joined  # public wording flipped away
-    assert PRIVACY_INDICATOR_OWN_NODE_REMOTE not in joined
+    assert "for transaction information" not in joined  # no REMOTE wording
+    assert PRIVACY_INDICATOR_OWN_NODE_REMOTE_GENERIC not in joined
     # node_status narration: approved LOCAL predicate, verbatim.
     assert (
         "You are querying your own node on this machine — addresses and "
         "lookups stay here." in joined
     )
     assert "You are querying the public API" not in joined
-    # Watch line mirrors the same state.
-    assert "against your own node on this machine" in joined
-    assert "against the public API" not in joined
+    # Watch line: TCK-UX-009 copy — the settings claim is TRUE (stored
+    # rung has a live reader; the entry ships with the settings surface).
+    assert "Background watch: on. Change it in settings." in joined
 
 
 def test_node_status_remote_own_node_narration_and_banner(
@@ -1542,38 +1545,113 @@ def test_node_status_remote_own_node_narration_and_banner(
 ) -> None:
     """LOCALWALLET_CHAIN_BASE_URL pointing at a NON-loopback host (LAN/VPS)
     ⇒ own-node-REMOTE wording everywhere (TCK-SEC-004 change 5, R7
-    no-over-claim): the banner must NOT claim lookups "stay on this
-    machine", and nothing may claim the public API either."""
+    no-over-claim), and since TCK-UX-009 the REMOTE wording NAMES THE HOST
+    (scheme/port/credentials stripped) in banner and narration alike:
+    "Querying <host> for transaction information. This is only private if
+    you trust this machine." Nothing may claim lookups "stay on this
+    machine" or the public API."""
     code, outputs, _detect_calls = _run_node_repl(
         monkeypatch,
         tmp_path,
         detect_report=_core_ready_report(),
-        chain_base_url="http://192.168.1.50:3006",
+        chain_base_url="http://192.168.1.50:3006/api",
     )
 
     assert code == 0
     joined = "\n".join(outputs)
-    # Banner: approved REMOTE wording, verbatim.
-    assert PRIVACY_INDICATOR_OWN_NODE_REMOTE in joined
+    # Banner: approved REMOTE wording with the host inserted; the path and
+    # the port never ride the display (the credential-strip pin lives in
+    # the pure-function tests — client build refuses userinfo on http(s)).
+    assert PRIVACY_INDICATOR_OWN_NODE_REMOTE.format("192.168.1.50") in joined
+    assert "192.168.1.50:3006" not in joined and "/api" not in joined
     assert PRIVACY_INDICATOR not in joined
     assert PRIVACY_INDICATOR_OWN_NODE_LOCAL not in joined
-    # node_status narration: approved REMOTE predicate, verbatim.
+    # node_status narration: the SAME host insertion (lockstep).
     assert (
-        "You are querying your own node on another machine — nothing goes "
-        "to a public API." in joined
+        "You are querying 192.168.1.50 for transaction information. This "
+        "is only private if you trust this machine." in joined
     )
     assert "You are querying the public API" not in joined
     assert "lookups stay on this machine" not in joined
-    # Watch line mirrors the same state.
-    assert "against your own node on another machine" in joined
-    assert "against the public API" not in joined
+    # Watch line: the TCK-UX-009 copy (no mode fragment any more).
+    assert "Background watch: on. Change it in settings." in joined
 
 
-def test_backend_mode_three_state_classification_and_watch_fragments() -> None:
+def test_watch_line_off_copy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """TCK-UX-009 copy: interval 0 (env rung) ⇒ exactly
+    ``Background watch: off.`` — no settings claim on the off path."""
+    monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
+    code, outputs, _ = _run_node_repl(
+        monkeypatch, tmp_path, detect_report=_core_ready_report()
+    )
+    assert code == 0
+    joined = "\n".join(outputs)
+    assert "Background watch: off." in joined
+    assert "Change it in settings" not in joined
+
+
+def _watch_spy(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
+    """Wrap the app's IncomingWatcher construction to record the interval
+    the watcher build site actually resolved (the ladder's live reader)."""
+    real = app_module.IncomingWatcher
+
+    def spy(probe: Any, *, interval_s: float) -> Any:
+        captured["interval_s"] = interval_s
+        return real(probe, interval_s=interval_s)
+
+    monkeypatch.setattr(app_module, "IncomingWatcher", spy)
+
+
+def test_watch_stored_setting_reaches_the_watcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-UX-009 reader proof (settings-allowlist invariant): a stored
+    ``watch_interval_s`` row is RESOLVED AT THE WATCHER BUILD SITE and
+    reaches the watcher — the "Change it in settings" claim is TRUE."""
+    monkeypatch.delenv("LOCALWALLET_WATCH_INTERVAL_S", raising=False)
+    store_path = _store_path(tmp_path)  # _run_node_repl presets the wallet row
+    with Store(store_path) as store:
+        store.set_setting("watch_interval_s", "45")
+    captured: dict[str, Any] = {}
+    _watch_spy(monkeypatch, captured)
+
+    code, outputs, _ = _run_node_repl(
+        monkeypatch, tmp_path, detect_report=_core_ready_report()
+    )
+    assert code == 0
+    assert captured["interval_s"] == 45.0
+    assert "Background watch: on. Change it in settings." in "\n".join(outputs)
+
+
+def test_watch_stored_setting_malformed_warns_once_and_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-UX-009 fail-soft read: a corrupt stored watch interval never
+    stalls the launch — ONE value-free warning, the default 60 still
+    builds the watcher."""
+    monkeypatch.delenv("LOCALWALLET_WATCH_INTERVAL_S", raising=False)
+    store_path = _store_path(tmp_path)  # _run_node_repl presets the wallet row
+    with Store(store_path) as store:
+        store.set_setting("watch_interval_s", "banana")
+    captured: dict[str, Any] = {}
+    _watch_spy(monkeypatch, captured)
+
+    code, outputs, _ = _run_node_repl(
+        monkeypatch, tmp_path, detect_report=_core_ready_report()
+    )
+    assert code == 0
+    assert captured["interval_s"] == 60.0
+    joined = "\n".join(outputs)
+    assert joined.count(app_module.WATCH_INTERVAL_STALE_WARNING) == 1
+    assert "banana" not in joined  # value-free, as ever
+    assert "Background watch: on. Change it in settings." in joined
+
+
+def test_backend_mode_three_state_classification() -> None:
     """The 3-way classification (TCK-SEC-004 change 5): no configured URL ⇒
     public; loopback host ⇒ own_node_local; anything else ⇒
-    own_node_remote. The watch fragments mirror the same three states."""
-    from localwallet.app import _backend_mode, _watch_mode_fragment
+    own_node_remote."""
+    from localwallet.app import _backend_mode
     from localwallet.config import Settings
 
     assert _backend_mode(Settings()) == BACKEND_MODE_PUBLIC
@@ -1604,26 +1682,60 @@ def test_backend_mode_three_state_classification_and_watch_fragments() -> None:
         == BACKEND_MODE_OWN_NODE_REMOTE
     )
 
-    assert _watch_mode_fragment(BACKEND_MODE_PUBLIC) == "the public API"
+
+def test_configured_url_host_extraction() -> None:
+    """TCK-UX-009 unit pins for the host parser the REMOTE banner mirrors:
+    scheme, port, path/query/fragment and USERINFO are stripped; IPv6
+    literals de-bracket; unparseable hosts return ``None`` (the caller's
+    fallback trigger). Never raises."""
+    from localwallet.app import _configured_url_host
+
+    assert _configured_url_host("https://node.lan:3006/api") == "node.lan"
+    assert _configured_url_host("http://127.0.0.1:3006") == "127.0.0.1"
+    assert _configured_url_host("ssl://electrum.lan:50001") == "electrum.lan"
+    # Credentials stripped — the userinfo never survives the split.
     assert (
-        _watch_mode_fragment(BACKEND_MODE_OWN_NODE_LOCAL)
-        == "your own node on this machine"
+        _configured_url_host("https://user:hunter2@node.lan:3006/x?a=b#f")
+        == "node.lan"
     )
-    assert (
-        _watch_mode_fragment(BACKEND_MODE_OWN_NODE_REMOTE)
-        == "your own node on another machine"
-    )
+    assert _configured_url_host("http://[fd00::5]:443/api") == "fd00::5"
+    assert _configured_url_host("http://[::1]") == "::1"
+    assert _configured_url_host("barehost.example") == "barehost.example"
+    assert _configured_url_host("barehost.example:8080") == "barehost.example"
+    # Malformed / host-less shapes → None (never a guess, never a raise).
+    assert _configured_url_host("") is None
+    assert _configured_url_host("http://") is None
+    assert _configured_url_host(":://::") is None
+    assert _configured_url_host("https://:3006/api") is None
 
 
 def test_privacy_indicator_function_selects_wording_from_settings() -> None:
-    """The banner helper is a pure function of the backend selection."""
+    """The banner helper is a pure function of the backend selection; the
+    REMOTE branch names the host, and a URL with no extractable host falls
+    back to the generic wording (TCK-UX-009) rather than printing a broken
+    line."""
     from localwallet.config import Settings
 
     assert privacy_indicator(Settings()) == PRIVACY_INDICATOR
     own = Settings(chain_base_url="http://127.0.0.1:3006")
     assert privacy_indicator(own) == PRIVACY_INDICATOR_OWN_NODE_LOCAL
     remote = Settings(chain_base_url="http://192.168.1.50:3006")
-    assert privacy_indicator(remote) == PRIVACY_INDICATOR_OWN_NODE_REMOTE
+    assert privacy_indicator(remote) == PRIVACY_INDICATOR_OWN_NODE_REMOTE.format(
+        "192.168.1.50"
+    )
+    # Credentials are stripped from the display (the userinfo-carrying
+    # shape the chain layer really allows: bitcoind:// RPC URLs).
+    authed = Settings(chain_base_url="bitcoind://rpcuser:s3cr3t@10.0.0.7:8332/w")
+    assert privacy_indicator(authed) == PRIVACY_INDICATOR_OWN_NODE_REMOTE.format(
+        "10.0.0.7"
+    )
+    assert "s3cr3t" not in privacy_indicator(authed)
+    assert "rpcuser" not in privacy_indicator(authed)
+    # Malformed URL: REMOTE mode (a configured non-loopback string) with
+    # no parseable host → the generic fallback, never a half-rendered line.
+    malformed = Settings(chain_base_url=":://::")
+    assert privacy_indicator(malformed) == PRIVACY_INDICATOR_OWN_NODE_REMOTE_GENERIC
+    assert "{}" not in privacy_indicator(malformed)
 
 
 def test_node_status_detection_disabled_does_not_probe(

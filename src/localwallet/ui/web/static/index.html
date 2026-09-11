@@ -15,6 +15,12 @@
   <!-- TCK-WEB-005: honest scan status, driven ONLY by the typed /state snapshot's
        scan_state field (never inferred from dots). Hidden until a snapshot says so. -->
   <p id="scan-chip" class="chip" role="status" aria-live="polite" hidden></p>
+  <!-- TCK-UX-010: persistent colored privacy label, driven ONLY by the typed
+       /state snapshot's privacy_mode NAME (absent/unknown → hidden, never
+       fabricated). The visible word is static; the per-mode banner sentence
+       rides title/aria-label (recomposed in app.js). Color comes from
+       data-privacy + styles.css selectors — no inline styles. -->
+  <p id="privacy-chip" class="chip privacy" role="status" aria-live="polite" hidden>Privacy notice</p>
   <p id="conn-status" class="status" role="status" aria-live="polite" data-state="connecting">Connecting…</p>
   <button id="settings-toggle" class="btn btn-ghost" type="button" aria-expanded="false" aria-controls="settings-panel">Settings</button>
 </header>

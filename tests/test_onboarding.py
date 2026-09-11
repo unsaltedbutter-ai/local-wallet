@@ -481,7 +481,9 @@ def test_env_preset_skips_onboarding(tmp_path: Path, monkeypatch) -> None:
     assert ob.WEB_SETUP_HINT not in rec.joined
     assert stored is None  # env wins; nothing written to the stored rung
     assert state["probes"] == 0
-    assert "your own node on another machine" in rec.joined
+    # TCK-UX-009: the REMOTE banner names the configured host (GOOD_URL's
+    # host, scheme/port/path stripped).
+    assert "Querying mempool.mine.example for transaction information" in rec.joined
 
 
 # ------------------------------------------------ the deferred first scan
