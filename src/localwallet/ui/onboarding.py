@@ -40,17 +40,22 @@ in the browser, only :data:`WEB_SETUP_HINT`):
   stored choice is shown first (mode framing, value-free) and an explicit
   ``y`` is required before it can be overwritten; ``n`` exits with no
   change. Accepted since then, in order: ``ssl://`` Electrum-protocol
-  addresses (TCK-BACKEND-002) and — TCK-ONB-004 M3 — plain ``bitcoind://``
-  Core RPC addresses and the AUTO-DETECT of an ambiguous ``http://`` one
-  (the user never classifies; the entry probe answers in Core RPC shape
-  first, then Esplora shape, and a Core win STORES the ``bitcoind://``
-  rewrite so kind/badge/dispatch all ride the one scheme seam). Foreign
+   addresses (TCK-BACKEND-002) and — TCK-ONB-004 M3 — plain ``bitcoind://``
+   Core RPC addresses and the AUTO-DETECT of an ambiguous ``http://`` one
+   (TCK-BACKEND-003 extended the Core-shape-first AUTO-DETECT to
+   ``https://``, added the ``bitcoind+tls://`` explicit scheme, and made
+   the Esplora probe tolerate a bare host whose API lives under /api; the
+   user never classifies; the entry probe answers in Core RPC shape
+   first, then Esplora shape, and a Core win STORES the
+   ``bitcoind://``/``bitcoind+tls://`` rewrite so kind/badge/dispatch all
+   ride the one scheme seam). Foreign
   schemes are still refused plainly (never probed, never stored, the entry
   re-prompts).
 - Validation is the ADR-0023 decision-5 gate: the ``chain/`` probe (Esplora
   shape + mainnet genesis, the Electrum handshake + genesis for ``ssl://``,
   or the Core handshake — ``chain == "main"`` + capability floor — for a
-  ``bitcoind://``/answering-http address; ADR-0021) plus — loopback URLs
+  ``bitcoind://``/answering-http(s) address (TCK-BACKEND-003 extended the
+  Core-first probe to https and the TLS sibling scheme; ADR-0021) plus — loopback URLs
   only, per the ADR-0016 contract — the node doctor's IBD facts; a syncing
   node is refused with its progress quoted from tool output. EVERY entry
   enforces mainnet AT ENTRY through the real adapter's own handshake — the
@@ -150,7 +155,7 @@ NODE_ASK: Final[str] = (
     "\n"
     "One thing you do NOT have to know: which kind of server it is. Give "
     "me an address — the mempool.space app's http(s) one, an Electrum "
-    "server's ssl:// one, or a plain Bitcoin Core RPC one (a plain http "
+    "server's ssl:// one, or a plain Bitcoin Core RPC one (an http(s) "
     "address on the RPC port, or written with a bitcoind:// prefix) — and "
     "the app checks what answers and sets itself up to match; a Core "
     "login, if it wants one, is asked for separately. Mainnet only, as "
@@ -426,16 +431,18 @@ SETUP_REVERTED: Final[str] = (
 )
 
 #: A URL whose scheme NO entry point of this app can speak — foreign
-#: schemes like ftp:// stay refused (http(s), ssl:// and bitcoind:// are
-#: the families the app speaks since TCK-ONB-004 M3, which also opened
-#: plain Core RPC addresses): plain statement, no probe, nothing saved —
+#: schemes like ftp:// stay refused (http(s), ssl:// and the bitcoind://
+#: family are the schemes the app speaks since TCK-ONB-004 M3, with
+#: TCK-BACKEND-003 adding the https Core-RPC rung and its
+#: ``bitcoind+tls://`` scheme): plain statement, no probe, nothing saved —
 #: and the entry re-prompts (never a dead end).
 NON_ESPLORA_URL: Final[str] = (
     "I can't use that address: this app speaks Esplora servers over "
     "http(s) — the web address of a mempool.space app — Electrum servers "
-    "over ssl://, and Bitcoin Core over a plain http RPC address (or one "
-    "written with a bitcoind:// prefix). Nothing was probed and nothing "
-    "was saved. Type such an address, or 1 for the public server."
+    "over ssl://, and Bitcoin Core over an http(s) RPC address (or one "
+    "written with a bitcoind:// / bitcoind+tls:// prefix). Nothing was "
+    "probed and nothing was saved. Type such an address, or 1 for the "
+    "public server."
 )
 
 #: /setup refuses DORMANT when the stored rung cannot be read (no gate can
@@ -563,8 +570,16 @@ def _looks_like_seed(line: str) -> bool:
 #: The schemes this app's entries accept (TCK-ONB-004 M3 closed the last
 #: gap: plain ``bitcoind://`` Core RPC, auto-detected ``http://`` Core
 #: endpoints). Stored URLs are canonical: an http:// candidate that answers
-#: in Core shape is saved as ``bitcoind://`` by the entry probe.
-_URL_SCHEMES: Final[tuple[str, ...]] = ("http://", "https://", "ssl://", "bitcoind://")
+#: in Core shape is saved as ``bitcoind://`` by the entry probe; TCK-BACKEND-003
+#: added the https sibling (Core behind TLS) and moved Core-shape-first
+#: autodetect onto the ``https://`` rung too.
+_URL_SCHEMES: Final[tuple[str, ...]] = (
+    "http://",
+    "https://",
+    "ssl://",
+    "bitcoind://",
+    "bitcoind+tls://",
+)
 
 
 def _is_url_candidate(line: str) -> bool:
@@ -578,12 +593,18 @@ def _is_url_candidate(line: str) -> bool:
 def _scheme_can_auth(line: str) -> bool:
     """Whether an address names a server family this app can hand a login
     to (TCK-ONB-004 M3): the ambiguous ``http://`` rung (the Core RPC probe
-    runs against it) and the explicit ``bitcoind://`` scheme. ``https://``
-    is Esplora-primary (Core RPC is plain-http — M2 scope), and ``ssl://``
-    Electrum has no standard auth (plan OQ-5); for both, credentials are
-    inert, so the conversation never asks for them there."""
+    runs against it) and the explicit Core schemes — ``bitcoind://`` and
+    its https sibling ``bitcoind+tls://`` (TCK-BACKEND-003; the login rides
+    the same never-echoed keys and the same auth overlay). ``https://``
+    keeps the M3 answer: the CLI conversation's Esplora-primary rungs get
+    no login offer (an https Core node that needs one is named EXPLICITLY
+    with the bitcoind+tls:// prefix, or enters through the web pane, whose
+    credential fields are scheme-free). ``ssl://`` Electrum has no standard
+    auth (plan OQ-5); credentials are inert there too."""
     low = line.strip().lower()
-    return low.startswith(("http://", "bitcoind://"))
+    return low.startswith(
+        ("http://", "bitcoind://", "bitcoind+tls://")
+    )
 
 
 def _is_other_scheme_url(line: str) -> bool:

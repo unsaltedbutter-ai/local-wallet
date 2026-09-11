@@ -467,3 +467,64 @@ Decisions:
 
 Side note: the M2 review LOW closed here too — the cookie file read is now
 bounded AT READ TIME (`read(cap+1)`), not read-then-check.
+
+## Amendment (2026-09-11, TCK-BACKEND-003): https Core-RPC is now expressible, and a bare mempool host is tolerated
+
+Two Start9 live repros (USER REPORT MW-16) showed the M2/M3 scope notes
+were too narrow for real self-hosted deployments.
+
+Decision 1 — https Core RPC (`bitcoind+tls://`). M2 declared https RPC
+"inexpressible"; M3's auto-detect therefore tried the Core shape on
+`http://` only. A Start9 node exposing Core JSON-RPC behind a TLS reverse
+proxy (`https://host:port`, basic auth) was thus unreachable by every
+entry. The Core adapter now speaks stdlib `HTTPSConnection` on a new scheme
+`bitcoind+tls://host[:port]`, selected exactly like `bitcoind://` and
+`ssl://`:
+
+- `ChainConfig.kind == "bitcoind"` for BOTH `bitcoind://` and
+  `bitcoind+tls://`; `_build_chain_client` and `_backend_kind` dispatch on
+  that one value. The scheme is the ONLY new seam — the transport bit is
+  carried in the scheme so a stored URL rebuilds the identical https client
+  at every later launch (a plain `bitcoind://` rewrite would rebuild a
+  plain-http client that cannot reach the node; that is the one deviation
+  from the ticket's "rewrite to `bitcoind://`" phrasing, and the reason it
+  is stored as `bitcoind+tls://`).
+- `app._probe_chain_backend` runs the Core-shape probe FIRST on the
+  `https://` rung too (against the `bitcoind+tls://` rewrite of the input),
+  then the Esplora shape; a Core win stores `bitcoind+tls://h:p` (the
+  `https://` URL is an INPUT alias, the TLS scheme is canonical). The
+  Esplora win stores the input unchanged. Auto-detect order on `http://`
+  (Core-first, then Esplora) is unchanged.
+- `tls_verify` is threaded into the Core adapter for the TLS sibling only
+  (the plain-http scheme has no TLS layer): it rides the same env > config
+  file > fail-closed `True` ladder as Esplora/Electrum, reusing the
+  `ChainConfig` built from `Settings.from_env()`. A self-signed RPC node is
+  reached only via an explicit `LOCALWALLET_TLS_VERIFY=0`, which ALSO drives
+  the live client — probe and wallet can never disagree on transport policy.
+
+Decision 2 — bare mempool host (`/api` tolerance). `check_backend` hit
+`{base}/blocks/tip` with no `/api` normalization, so a user who pointed the
+app at `https://host:port` (the mempool.space FRONTEND root; the API lives
+under `/api`) was refused though `/api/...` worked in a browser. The
+Esplora request join now tries `{base}{path}`, and — ONLY when the base did
+not already answer in API shape at that URL (a non-retryable HTTP status or
+a non-JSON body, the frontend's answer) AND the base does not already end in
+`/api` — retries `{base}/api{path}` once, latching whichever root served
+Esplora shape for the client's life. The single change is in
+`EsploraClient._request_json`, so BOTH the onboarding probe and the live
+client (including a URL saved bare) get the tolerance; a correct
+`.../api` base never double-requests. Transport failures and exhausted
+429/5xx are NOT the mismatch class (a path change fixes neither) and
+propagate immediately, preserving the snappy probe budget.
+
+Decision 3 — refusal copy. `BACKEND_PROBE_FAIL` gains three static,
+value-free HINTS (self-signed cert → `LOCALWALLET_TLS_VERIFY=0` with the
+unverified-transport caveat; mempool API under `/api`, now auto-tried;
+server answering but demanding a login → set the backend credentials). A
+per-failure "reached-but-401" line was considered and SKIPPED: the probe's
+`str | None` collapse-everything contract (TCK-ONB-003 finding 1) has no
+value-free channel for a failure CLASS, and widening it is not worth one
+hint a static line already carries.
+
+`tools/probe_backend_diag.py` is updated to mirror all of this (the /api
+auto-try on the Esplora probe, https Core RPC on the `bitcoind+tls` scheme).

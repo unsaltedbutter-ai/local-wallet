@@ -1,12 +1,16 @@
 """Bitcoin Core RPC chain client (TCK-ONB-004 M2; ADR-0018 amendment).
 
 The third :class:`~localwallet.chain.esplora.ChainClient` implementation: a
-synchronous Bitcoin Core JSON-RPC client over stdlib ``http.client`` (plain
-http — Core RPC is a loopback administrative interface; https RPC needs
-``-rpcssl`` or a TLS reverse proxy and is deliberately OUT OF M2 SCOPE: the
-``bitcoind://`` scheme carries no tls component and an https RPC URL cannot
-be expressed at all — an honest named-unsupported state, not a silent
-downgrade). Selected by the ``bitcoind://host[:port]`` URL scheme at the
+synchronous Bitcoin Core JSON-RPC client over stdlib ``http.client`` —
+plain http on the ``bitcoind://`` scheme (Core RPC's loopback form), and
+since TCK-BACKEND-003 (ADR-0018 amendment), https on the ``bitcoind+tls://``
+sibling (Core's ``-rpcssl`` or, the common shape, a TLS reverse proxy —
+Start9 etc.). The transport bit is part of the scheme so a stored URL
+rebuilds the identical client at every later launch; TLS trust on the TLS
+sibling rides the SAME ``tls_verify`` ladder as the httpx adapters (fail-
+closed default True; ``LOCALWALLET_TLS_VERIFY=0`` reaches a private-CA /
+self-signed node, and the app's honest value-free startup warning fires
+there exactly as it does for Esplora). Selected by the URL scheme at the
 single construction point (``ChainConfig.from_settings`` →
 ``app._build_chain_client``); http(s) keeps Esplora, ``ssl://`` keeps
 Electrum (docs/onb-004-backend-adapters-plan.md §2, M2).
@@ -21,7 +25,8 @@ reduces to "the next attempt opens a fresh socket".
 
 Auth (HTTP Basic, resolved per request, in the plan's order):
 
-1. user/pass — the ``bitcoind://user:pass@host:port`` URL userinfo (the
+1. user/pass — the ``bitcoind://user:pass@host:port`` (or
+   ``bitcoind+tls://user:pass@host:port``) URL userinfo (the
    env/config-file rungs only: the store's write validation refuses
    embedded credentials, and M3 adds the dedicated settings keys), or the
    explicit ``rpc_user``/``rpc_password`` constructor pair (library seam);
@@ -110,6 +115,7 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import ssl
 import threading
 from decimal import Decimal
 from pathlib import Path
@@ -295,19 +301,21 @@ class _TransportRetry(Exception):
 
 
 class BitcoindClient:
-    """Synchronous Bitcoin Core JSON-RPC client (HTTP Basic, plain http).
+    """Synchronous Bitcoin Core JSON-RPC client (HTTP Basic; plain http on
+    ``bitcoind://``, https on the ``bitcoind+tls://`` sibling — TCK-BACKEND-003).
 
     Satisfies :class:`~localwallet.chain.esplora.ChainClient`. Construction
     is network-free (the fail-closed handshake runs on the first call); the
     URL, timeout, retry budget and cookie path resolve through the SAME
     single selection point as every other backend —
     :meth:`ChainConfig.from_settings` (``Settings.chain_base_url`` /
-    ``LOCALWALLET_CHAIN_BASE_URL`` with a ``bitcoind://`` scheme) and
+    ``LOCALWALLET_CHAIN_BASE_URL`` with a ``bitcoind://``-family scheme) and
     ``Settings.rpc_cookie_path`` (env > config-file > data-dir default,
-    ladder unchanged, ADR-0018 amendment). ``tls_verify`` is NOT consulted:
-    the transport is plain http — there is no TLS layer to trust or
-    downgrade, and no https RPC is expressible on this scheme (module
-    docstring).
+    ladder unchanged, ADR-0018 amendment). ``tls_verify`` rides the
+    construction ONLY for the TLS sibling: the plain-http transport has no
+    TLS layer to trust or downgrade, the https transport verifies by
+    default and is downgraded only by the explicit env/file rung (the app
+    prints its honest startup warning there, backend-agnostic as ever).
 
     Retry policy (consistent with Esplora/Electrum): transport failures and
     bare 429/5xx retry up to ``max_retries`` with the shared exponential
@@ -319,7 +327,8 @@ class BitcoindClient:
 
     Raises:
         ValueError: at construction if the resolved URL is not a well-formed
-            ``bitcoind://host[:port]`` endpoint (fail closed, value-free).
+            ``bitcoind://`` or ``bitcoind+tls://`` endpoint (fail closed,
+            value-free).
     """
 
     #: No price feed on a Bitcoin Core node (plan OQ-2): the price oracle
@@ -343,12 +352,30 @@ class BitcoindClient:
             base_url=defaults.base_url if base_url is None else base_url,
             timeout_s=defaults.timeout_s if timeout_s is None else timeout_s,
             max_retries=defaults.max_retries if max_retries is None else max_retries,
-            # tls_verify deliberately NOT threaded (plain-http transport).
-            tls_verify=True,
+            # TCK-BACKEND-003: the ladder rides through, exactly as the
+            # Esplora/Electrum constructions do it. inert on the plain-http
+            # scheme (no TLS layer); decides certificate trust on the
+            # bitcoind+tls:// sibling. There is no per-call override seam:
+            # probe and live client can never disagree on transport policy.
+            tls_verify=defaults.tls_verify,
         )
         parsed = urlsplit(self._config.base_url)
-        if parsed.scheme != "bitcoind":
-            raise ValueError("BitcoindClient requires a bitcoind:// URL")
+        if parsed.scheme not in ("bitcoind", "bitcoind+tls"):
+            raise ValueError("BitcoindClient requires a bitcoind:// (or bitcoind+tls://) URL")
+        self._tls = parsed.scheme == "bitcoind+tls"
+        # One server TLS context per client (immutable after construction —
+        # the ladder cannot change mid-session). Verified by default; the
+        # explicit LOCALWALLET_TLS_VERIFY=0 / config-file rung disables
+        # verification for private-CA / self-signed nodes, mirroring the
+        # httpx adapters' behaviour (and the app's honest startup warning
+        # fires alongside it, value-free).
+        self._ssl_context: ssl.SSLContext | None = None
+        if self._tls:
+            context = ssl.create_default_context()
+            if not self._config.tls_verify:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            self._ssl_context = context
         if not isinstance(no_credentials, bool):
             raise ValueError("no_credentials must be a boolean")  # noqa: TRY004
         if no_credentials and (
@@ -864,9 +891,24 @@ class BitcoindClient:
         basic = self._credential_header()
         if basic is not None:
             headers["Authorization"] = basic
-        conn = http.client.HTTPConnection(
-            self._host, self._port, timeout=self._config.timeout_s
-        )
+        conn: http.client.HTTPConnection
+        if self._tls:
+            # The https transport (TCK-BACKEND-003): the per-client context
+            # above decides certificate trust. A failed verification is the
+            # ssl.SSLCertVerificationError (an OSError) the retry handler
+            # below already classifies value-free as a network error — the
+            # same collapse httpx's ConnectError gets on the Esplora side,
+            # and the refusal copy names the TLS escape hatch.
+            conn = http.client.HTTPSConnection(
+                self._host,
+                self._port,
+                timeout=self._config.timeout_s,
+                context=self._ssl_context,
+            )
+        else:
+            conn = http.client.HTTPConnection(
+                self._host, self._port, timeout=self._config.timeout_s
+            )
         try:
             try:
                 conn.request("POST", "/", body=body, headers=headers)

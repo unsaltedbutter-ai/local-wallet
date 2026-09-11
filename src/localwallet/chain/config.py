@@ -12,20 +12,39 @@ from urllib.parse import urlsplit
 
 from localwallet.config import Settings
 
-__all__ = ["BITCOIND_SCHEME", "ELECTRUM_SCHEME", "ChainConfig"]
+__all__ = [
+    "BITCOIND_SCHEME",
+    "BITCOIND_TLS_SCHEME",
+    "ELECTRUM_SCHEME",
+    "ChainConfig",
+]
 
 
 #: URL scheme that selects the Electrum-protocol adapter (TCK-ONB-004 M1;
 #: ADR-0018 amendment).
 ELECTRUM_SCHEME: str = "ssl://"
 
-#: URL scheme that selects the Bitcoin Core RPC adapter (TCK-ONB-004 M2;
-#: ADR-0018 amendment). ``bitcoind://host[:port]`` is an explicit-choice
-#: transport (the plain-http JSON-RPC surface; https RPC is out of M2
-#: scope and NOT expressible here) — scheme-based autodetection of Core
-#: on http(s) URLs stays M3's probe job. Everything else this class
-#: accepts is Esplora http(s) or Electrum ssl://.
+#: URL scheme that selects the Bitcoin Core RPC adapter over the PLAIN-HTTP
+#: JSON-RPC surface (TCK-ONB-004 M2; ADR-0018 amendment). Scheme-based
+#: autodetection of Core on http(s) URLs is M3's probe job; a plain-http
+#: endpoint answering in Core shape is stored under THIS scheme (the
+#: canonical rewrite).
 BITCOIND_SCHEME: str = "bitcoind://"
+
+#: The TLS sibling of :data:`BITCOIND_SCHEME` (TCK-BACKEND-003; ADR-0018
+#: amendment): ``bitcoind+tls://host[:port]`` selects the SAME Core RPC
+#: adapter over an HTTPS transport (a node behind ``-rpcssl`` or a TLS
+#: reverse proxy — the Start9 shape). The transport bit must survive the
+#: save (a stored URL rebuilds the live client verbatim at every later
+#: launch), so the https-RPC INPUT alias gets its CANONICAL form here —
+#: one added scheme in the same family, NOT a second dispatch seam:
+#: :attr:`ChainConfig.kind` answers ``"bitcoind"`` for both, and every
+#: badge/kind/build site rides that unchanged. TLS trust rides the same
+#: ``tls_verify`` ladder as the httpx adapters (fail-closed default True;
+#: ``False`` only via LOCALWALLET_TLS_VERIFY / config-file key, with the
+#: app's honest startup warning). Same shape rules as the plain scheme
+#: (userinfo permitted on the env/config-file rungs only).
+BITCOIND_TLS_SCHEME: str = "bitcoind+tls://"
 
 
 @dataclass(frozen=True)
@@ -37,15 +56,17 @@ class ChainConfig:
             ``https://mempool.space/api`` (public default, ADR-0003) or a
             user's self-hosted instance selected via
             ``Settings.chain_base_url`` (ADR-0018), an Electrum-protocol
-            endpoint ``ssl://host[:port]`` which selects the Electrum
+            endpoint             ``ssl://host[:port]`` which selects the Electrum
             adapter, OR a Bitcoin Core RPC endpoint
-            ``bitcoind://[user:pass@]host[:port]`` which selects the
-            Core-RPC adapter (TCK-ONB-004 M2; ADR-0018 amendment — see
-            :attr:`kind`). The single selection lives in
-            :meth:`from_settings`. Core userinfo is permitted ONLY on the
-            env/config-file rungs (the store's ``set_chain_base_url`` write
-            validation refuses embedded credentials, and M3's settings pane
-            carries dedicated never-echoed keys); value-free everywhere.
+            ``bitcoind://[user:pass@]host[:port]`` (plain-http JSON-RPC) /
+            ``bitcoind+tls://[user:pass@]host[:port]`` (https JSON-RPC,
+            TCK-BACKEND-003) which selects the Core-RPC adapter
+            (TCK-ONB-004 M2; ADR-0018 amendment — see :attr:`kind`). The
+            single selection lives in :meth:`from_settings`. Core userinfo
+            is permitted ONLY on the env/config-file rungs (the store's
+            ``set_chain_base_url`` write validation refuses embedded
+            credentials, and M3's settings pane carries dedicated
+            never-echoed keys); value-free everywhere.
         timeout_s: Per-request timeout in seconds (applied to connect/read).
         max_retries: Number of retries after the initial attempt (0 disables
             retries entirely).
@@ -55,9 +76,10 @@ class ChainConfig:
             https backends with a private-CA / self-signed cert — the app
             then prints one honest warning line at startup (transport auth
             is off: a network-path observer can see or alter requests).
-            The ``bitcoind://`` adapter is plain-http (Core RPC on
-            loopback) and does not consult this knob: https RPC is
-            unexpressible for the scheme (M2 scope, ADR-0018 amendment).
+            The plain-http ``bitcoind://`` transport has no TLS layer and
+            does not consult it; the ``bitcoind+tls://`` sibling (https
+            Core RPC, TCK-BACKEND-003) rides this knob exactly like the
+            httpx adapters do.
 
     Raises:
         ValueError: If any value is out of range or malformed (fail closed at
@@ -77,12 +99,17 @@ class ChainConfig:
     @property
     def kind(self) -> str:
         """Adapter selected by the URL scheme: ``"electrum"`` for ``ssl://``
-        (TCK-ONB-004 M1), ``"bitcoind"`` for ``bitcoind://`` (TCK-ONB-004
-        M2), ``"esplora"`` for http(s). The construction site
-        (``app._build_chain_client``) dispatches on exactly this value."""
+        (TCK-ONB-004 M1), ``"bitcoind"`` for the Core RPC family —
+        ``bitcoind://`` and its https sibling ``bitcoind+tls://``
+        (TCK-ONB-004 M2; TCK-BACKEND-003) — ``"esplora"`` for http(s).
+        The construction site (``app._build_chain_client``) dispatches on
+        exactly this value; the transport difference between the two Core
+        schemes lives INSIDE the adapter, not in a second seam."""
         if self.base_url.startswith(ELECTRUM_SCHEME):
             return "electrum"
-        if self.base_url.startswith(BITCOIND_SCHEME):
+        if self.base_url.startswith(
+            (BITCOIND_SCHEME, BITCOIND_TLS_SCHEME)
+        ):
             return "bitcoind"
         return "esplora"
 
@@ -91,7 +118,7 @@ class ChainConfig:
             raise ValueError("base_url must be an http(s), ssl:// or bitcoind:// URL")  # noqa: TRY004
         if self.base_url.startswith(ELECTRUM_SCHEME):
             self._validate_electrum_url()
-        elif self.base_url.startswith(BITCOIND_SCHEME):
+        elif self.base_url.startswith((BITCOIND_SCHEME, BITCOIND_TLS_SCHEME)):
             self._validate_bitcoind_url()
         elif not (self.base_url.startswith("http://") or self.base_url.startswith("https://")):
             raise ValueError("base_url must be an http(s) URL")
@@ -127,7 +154,10 @@ class ChainConfig:
 
     def _validate_bitcoind_url(self) -> None:
         """Fail closed on a malformed ``bitcoind://[user:pass@]host[:port]``
-        endpoint (TCK-ONB-004 M2; ADR-0018 amendment).
+        or ``bitcoind+tls://[user:pass@]host[:port]`` Core RPC endpoint
+        (TCK-ONB-004 M2; ADR-0018 amendment; the TLS sibling added by
+        TCK-BACKEND-003 — identical shape rules, transport differs inside
+        the adapter).
 
         Shape rules (the ``ssl://`` validator's discipline, with one
         documented difference): a parseable host, an optional NUMERIC

@@ -151,7 +151,11 @@ from localwallet.chain import (
     minor_per_unit,
     time_since_last_block,
 )
-from localwallet.chain.config import BITCOIND_SCHEME, ELECTRUM_SCHEME
+from localwallet.chain.config import (
+    BITCOIND_SCHEME,
+    BITCOIND_TLS_SCHEME,
+    ELECTRUM_SCHEME,
+)
 from localwallet.config import (
     COIN_SETTING_BOUNDS,
     COIN_SETTING_DEFAULTS,
@@ -5172,11 +5176,28 @@ _PUBLIC_DEFAULT_HOST: Final[str] = (
 #: server text ever rides it. It names the CLOSED probe categories the probe
 #: collapses to (both collapse identically, so the refusal cannot probe-worsen
 #: privacy by distinguishing "unreachable" from "wrong chain" over the wire).
+#: TCK-BACKEND-003 (fix C) appends three value-free HINTS after the line —
+#: the TLS escape hatch (honest: the unverified-transport warning applies),
+#: the /api API-root segment (now auto-tried, so the bare host works), and
+#: the demanded-login case. The hints are static (not per-failure) because
+#: the probe's contract is the collapse-everything ``str | None`` answer
+#: (TCK-ONB-003 review finding 1: NOTHING escapes to the caller — plumbing
+#: a "reached-but-401" distinction through it would either widen that
+#: escape surface or rewrite the return type every conversation and test
+#: pins, for a message one hint already carries; fix D's conditional line
+#: SKIPPED by design, documented).
 BACKEND_PROBE_FAIL: Final[str] = (
     "that backend did not check out: it is unreachable, or it does not "
     "serve mainnet as an Esplora (mempool.space-style) http(s), Electrum "
     "(ssl://) or Bitcoin Core RPC (bitcoind://) server — "
-    "nothing was saved and the current backend stays in service"
+    "nothing was saved and the current backend stays in service. hints: a "
+    "self-signed server certificate is refused unless TLS verification is "
+    "turned off (LOCALWALLET_TLS_VERIFY=0 / tls_verify=false — transport "
+    "authentication is then OFF, see the startup warning); a "
+    "mempool.space-style server serves its API under /api (auto-tried, so "
+    "the bare host works too); if the server answers but demands a login, "
+    "set the backend credentials and retry (a bare URL without them "
+    "cannot pass)"
 )
 
 #: The closed ``resync`` reply values on the settings/resync surfaces
@@ -7164,29 +7185,41 @@ def _probe_chain_backend(
       (``server.version`` + ``server.features`` whose ``genesis_hash`` must
       equal the mainnet constant — the entry-time GENESIS gate is the
       adapter's own, reused verbatim), then a bounded close. Stored as-is.
-    * ``bitcoind://`` → explicit Core RPC choice (M2 scheme, still
-      accepted): one :class:`BitcoindClient` tip call through the SAME
-      handshake the live client runs (``getblockchaininfo.chain == "main"``
-      + the Core-22 capability floor + the auth matrix — a 401 collapses to
-      refusal). The stored rung carries it WITHOUT userinfo (the store's
-      writer); credentials ride the dedicated ``backend_auth_*`` keys via
-      ``auth``. Stored as-is.
-    * ``https://`` → Esplora/mempool (existing ``check_backend`` shape
-      probe + height-0 GENESIS proof, ADR-0021). An https Core RPC is not
-      expressible on the plain-http ``bitcoind://`` transport (M2 scope),
-      so no Core branch runs against https. Stored as-is.
-    * ``http://`` → AMBIGUOUS — the only real detection case. Probe order
-      per this ticket: Core JSON-RPC SHAPE FIRST (a :class:`BitcoindClient`
-      against the ``bitcoind://`` rewrite of the URL, POST
-      ``getblockchaininfo`` with the resolved credentials — stored pair,
-      else the documented cookie ladder — over ``auth``), then the Esplora
-      shape (``check_backend``). First shape wins; a Core win STORES THE
-      REWRITE (``http://h:8332`` → ``bitcoind://h:8332``), so the detected
-      kind feeds ``backend_kind``, the client builder and every badge
-      through the ONE unchanged scheme-dispatch seam. Neither shape →
-      ``None`` (the caller's refusal names what was tried). URLs carrying
-      userinfo skip the Core branch (embedded credentials are refused on
-      the stored rung — logins ride the dedicated keys).
+    * ``bitcoind://`` / ``bitcoind+tls://`` → explicit Core RPC choice (the
+      M2 scheme and its https TLS sibling, TCK-BACKEND-003): one
+      :class:`BitcoindClient` tip call through the SAME handshake the live
+      client runs (``getblockchaininfo.chain == "main"`` + the Core-22
+      capability floor + the auth matrix — a 401 collapses to refusal). The
+      stored rung carries it WITHOUT userinfo (the store's writer);
+      credentials ride the dedicated ``backend_auth_*`` keys via ``auth``.
+      Stored as-is (the transport bit is the scheme, so it survives the
+      save and rebuilds the identical live client every later launch).
+    * ``http://`` → AMBIGUOUS — a real detection case. Probe order per this
+      ticket: Core JSON-RPC SHAPE FIRST (a :class:`BitcoindClient` against
+      the ``bitcoind://`` rewrite of the URL, POST ``getblockchaininfo``
+      with the resolved credentials — stored pair, else the documented
+      cookie ladder — over ``auth``), then the Esplora shape
+      (``check_backend``). First shape wins; a Core win STORES THE REWRITE
+      (``http://h:8332`` → ``bitcoind://h:8332``), so the detected kind
+      feeds ``backend_kind``, the client builder and every badge through the
+      ONE unchanged scheme-dispatch seam. Neither shape → ``None`` (the
+      caller's refusal names what was tried). URLs carrying userinfo skip
+      the Core branch (embedded credentials are refused on the stored rung
+      — logins ride the dedicated keys).
+    * ``https://`` → ALSO ambiguous since TCK-BACKEND-003 (D1): the SAME
+      Core-first probe runs against the ``bitcoind+tls://`` rewrite (an
+      https-capable transport; TLS trust rides the ladder inside the
+      client, so a self-signed RPC node is reachable only via the explicit
+      LOCALWALLET_TLS_VERIFY rung that also drives the live client), then
+      the Esplora shape (``check_backend`` — which itself auto-tries the
+      ``/api`` API-root segment, D2). A Core win STORES THE
+      ``bitcoind+tls://`` REWRITE; an Esplora win stores the input as-is.
+      This supersedes the M2 "https Core RPC is inexpressible" scope note
+      (ADR-0018 amendment): the https RPC URL is an INPUT alias, the
+      canonical STORED form is the ``bitcoind+tls://`` scheme (NOT plain
+      ``bitcoind://`` — a plain scheme would rebuild a plain-http client
+      that cannot reach the https node; storing the TLS sibling keeps the
+      ONE scheme-dispatch seam while carrying the transport).
     * anything else → ``None`` WITHOUT probing (a foreign scheme is said
       plainly by the caller, never probed).
 
@@ -7207,49 +7240,44 @@ def _probe_chain_backend(
         return None
     timeout = settings.request_timeout_s
     retries = min(settings.max_retries, 1)
+
+    def _core_shape(core_url: str) -> bool:
+        """One bounded Core-RPC handshake against the canonical rewrite; a
+        malformed rewrite (e.g. a path riding through) fails the CONSTRUCTION
+        guard inside the probe and collapses to False — the Esplora branch
+        then judges the ORIGINAL URL."""
+        return _probe_tip(
+            lambda: BitcoindClient(
+                base_url=core_url,
+                timeout_s=timeout,
+                max_retries=retries,
+                rpc_cookie_path=settings.rpc_cookie_path,
+                **_bitcoind_auth_kwargs(auth),
+            )
+        )
+
     if text.startswith(ELECTRUM_SCHEME):
         return text if _probe_tip(
             lambda: ElectrumClient(
                 base_url=text, timeout_s=timeout, max_retries=retries
             )
         ) else None
-    if text.startswith(BITCOIND_SCHEME):
-        return text if _probe_tip(
-            lambda: BitcoindClient(
-                base_url=text,
-                timeout_s=timeout,
-                max_retries=retries,
-                rpc_cookie_path=settings.rpc_cookie_path,
-                **_bitcoind_auth_kwargs(auth),
-            )
-        ) else None
-    if text.startswith("http://"):
-        # The ambiguous rung: Core shape first (this ticket's order), then
-        # the Esplora shape. The rewrite is safe to attempt because a
-        # malformed Core endpoint (path, junk) fails the CONSTRUCTION guard
-        # inside the probe and collapses to False — the Esplora branch then
-        # judges the ORIGINAL URL.
-        rest = text[len("http://") :]
-        if "@" not in rest.partition("/")[0]:
-            core_url = BITCOIND_SCHEME + rest
-            if _probe_tip(
-                lambda: BitcoindClient(
-                    base_url=core_url,
-                    timeout_s=timeout,
-                    max_retries=retries,
-                    rpc_cookie_path=settings.rpc_cookie_path,
-                    **_bitcoind_auth_kwargs(auth),
-                )
-            ):
-                return core_url
+    if text.startswith((BITCOIND_SCHEME, BITCOIND_TLS_SCHEME)):
+        return text if _core_shape(text) else None
+    for scheme, core_scheme in (("http://", BITCOIND_SCHEME), ("https://", BITCOIND_TLS_SCHEME)):
+        if not text.startswith(scheme):
+            continue
+        # The ambiguous rungs (http:// M3, https:// TCK-BACKEND-003): Core
+        # shape FIRST, then the Esplora shape. The rewrite feeds the one
+        # scheme-dispatch seam; an Esplora win (check_backend) stores the
+        # input UNCHANGED. A userinfo-carrying candidate skips the Core
+        # branch (embedded credentials are refused on the stored rung).
+        rest = text[len(scheme) :]
+        if "@" not in rest.partition("/")[0] and _core_shape(core_scheme + rest):
+            return core_scheme + rest
         try:
             return text if check_backend(text, timeout_s=timeout, max_retries=retries) else None
         except Exception:  # noqa: BLE001 — belt-braces: check_backend already collapses
-            return None
-    if text.startswith("https://"):
-        try:
-            return text if check_backend(text, timeout_s=timeout, max_retries=retries) else None
-        except Exception:  # noqa: BLE001 — same collapse contract
             return None
     return None
 
@@ -7269,8 +7297,9 @@ def _backend_kind(settings: Settings, *, resolved: bool) -> str:
     url = _effective_chain_url(settings)
     if url.startswith(ELECTRUM_SCHEME):
         return BACKEND_KIND_ELECTRUM
-    if url.startswith(BITCOIND_SCHEME):
-        # The M2 Core-RPC adapter (TCK-ONB-004): the reserved enum value,
+    if url.startswith((BITCOIND_SCHEME, BITCOIND_TLS_SCHEME)):
+        # The M2 Core-RPC adapter (TCK-ONB-004), including the https TLS
+        # sibling scheme (TCK-BACKEND-003): the reserved enum value,
         # emitted the day the scheme became selectable — checked BEFORE the
         # public-host/path heuristics, which are http(s)-shape reads and
         # would mis-badge a userinfo-carrying RPC URL.

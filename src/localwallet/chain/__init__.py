@@ -6,7 +6,12 @@ network modules.
 """
 
 from localwallet.chain.bitcoind import BitcoindClient
-from localwallet.chain.config import BITCOIND_SCHEME, ELECTRUM_SCHEME, ChainConfig
+from localwallet.chain.config import (
+    BITCOIND_SCHEME,
+    BITCOIND_TLS_SCHEME,
+    ELECTRUM_SCHEME,
+    ChainConfig,
+)
 from localwallet.chain.electrum import ElectrumClient
 from localwallet.chain.esplora import (
     MAINNET_GENESIS_HASH,
@@ -37,6 +42,7 @@ from localwallet.chain.watch import (
 
 __all__ = [
     "BITCOIND_SCHEME",
+    "BITCOIND_TLS_SCHEME",
     "ELECTRUM_SCHEME",
     "MAINNET_GENESIS_HASH",
     "Balance",

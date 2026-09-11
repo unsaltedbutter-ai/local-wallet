@@ -1018,7 +1018,9 @@ class Store(AbstractContextManager["Store"]):
             self._check_electrum_base_url(candidate)
             self.set_setting(_CHAIN_BASE_URL_SETTING, candidate)
             return
-        if candidate.startswith("bitcoind://"):
+        if candidate.startswith(("bitcoind://", "bitcoind+tls://")):
+            # The Core-RPC family (plain http + the https TLS sibling,
+            # TCK-BACKEND-003): same stored-rung rules for both.
             self._check_bitcoind_base_url(candidate)
             self.set_setting(_CHAIN_BASE_URL_SETTING, candidate)
             return
@@ -1064,7 +1066,7 @@ class Store(AbstractContextManager["Store"]):
         fragment (the RPC surface is a single POST root), and NO embedded
         credentials (``@`` refused; the dedicated never-echoed
         ``backend_auth_*`` keys carry logins instead)."""
-        rest = candidate[len("bitcoind://") :]
+        rest = candidate.partition("://")[2]  # both bitcoind:// and bitcoind+tls://
         if any(c.isspace() for c in rest):
             raise StoreError("chain base url must not contain whitespace")
         if any(c in rest for c in "/?#"):

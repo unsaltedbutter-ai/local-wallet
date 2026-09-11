@@ -51,7 +51,12 @@ from typing import TYPE_CHECKING, Any, ClassVar, Final, Protocol, Self, runtime_
 import httpx
 from embit.transaction import Transaction
 
-from localwallet.chain.config import BITCOIND_SCHEME, ELECTRUM_SCHEME, ChainConfig
+from localwallet.chain.config import (
+    BITCOIND_SCHEME,
+    BITCOIND_TLS_SCHEME,
+    ELECTRUM_SCHEME,
+    ChainConfig,
+)
 from localwallet.config import Settings
 
 if TYPE_CHECKING:
@@ -119,6 +124,19 @@ class ChainError(Exception):
     Message contract: safe for logs and chat narration — never contains full
     addresses, txids, or amounts (log-scrubbing invariant, PROJECT.md §7.8).
     """
+
+
+class _ApiRootMismatch(ChainError):
+    """Internal marker (TCK-BACKEND-003): the server ANSWERED this request,
+    but the answer was not usable at this URL — a non-retryable HTTP status
+    or a body that is not JSON. On an unresolved bare-host base this is the
+    one failure class where the Esplora API may actually live under the
+    ``/api`` segment (mempool.space-style: the frontend answers at ``/``,
+    the API under ``/api``), so the outer join gets its one /api retry.
+    Transport losses and exhausted 429/5xx are the OTHER class (plain
+    ChainError): the server never spoke or is busy, and a path change fixes
+    neither. Subclasses ChainError, so every caller-visible surface (types,
+    messages, value-freeness) is unchanged."""
 
 
 @dataclass(frozen=True)
@@ -450,11 +468,13 @@ class EsploraClient:
             # inherits the same value through this construction path.
             tls_verify=defaults.tls_verify,
         )
-        if self._config.base_url.startswith(BITCOIND_SCHEME):
-            # bitcoind:// is the Core-RPC adapter's scheme (TCK-ONB-004 M2;
-            # ADR-0018 amendment): fail closed at construction, never a
-            # nonsense httpx request (an UnsupportedProtocol crash class
-            # that escapes this module's ChainError contract).
+        if self._config.base_url.startswith((BITCOIND_SCHEME, BITCOIND_TLS_SCHEME)):
+            # The bitcoind:// family (plain + tls sibling) is the Core-RPC
+            # adapter's scheme (TCK-ONB-004 M2; the TLS sibling added by
+            # TCK-BACKEND-003; ADR-0018 amendment): fail closed at
+            # construction, never a nonsense httpx request (an
+            # UnsupportedProtocol crash class that escapes this module's
+            # ChainError contract).
             raise ValueError("bitcoind:// URLs require the BitcoindClient adapter")
         if self._config.base_url.startswith(ELECTRUM_SCHEME):
             # ssl:// is the Electrum adapter's scheme (TCK-ONB-004 M1;
@@ -463,6 +483,13 @@ class EsploraClient:
             raise ValueError("ssl:// URLs require the ElectrumClient adapter")
         # Trailing slash is normalized so the path joining below is exact.
         self._base_url = self._config.base_url.rstrip("/")
+        # API-root segment cache (TCK-BACKEND-003): None = not yet
+        # resolved; "" or "/api" = the prefix that first answered in API
+        # shape (see :meth:`_request_json`). A base already ending in
+        # ``/api`` is pre-resolved to "" so it never double-requests.
+        self._api_prefix: str | None = (
+            "" if self._base_url.endswith("/api") else None
+        )
         self._client = httpx.Client(
             timeout=self._config.timeout_s,
             headers={"User-Agent": _USER_AGENT},
@@ -642,7 +669,12 @@ class EsploraClient:
             raise ChainError(
                 f"{_KIND_BROADCAST} invalid transaction hex: not a parseable transaction"
             ) from exc
-        url = f"{self._base_url}/tx"
+        # The latched API root if one is known (TCK-BACKEND-003: a saved
+        # bare-host mempool base is resolved by the reads every flow runs
+        # before a broadcast; an unresolved client keeps the historical
+        # bare join — a POST is NEVER speculatively sent twice, the
+        # single-attempt discipline below is the whole point).
+        url = f"{self._base_url}{self._api_prefix or ''}/tx"
         try:
             response = self._client.post(
                 url, content=tx_hex.encode("ascii"), headers={"Content-Type": "text/plain"}
@@ -761,8 +793,47 @@ class EsploraClient:
         non-2xx statuses raise immediately. All failure surfaces end as
         :class:`ChainError` carrying only the endpoint kind, status code,
         or exception class name (no addresses/txids).
+
+        /api tolerance (TCK-BACKEND-003, D2): a mempool.space-style server
+        serves its API under the ``/api`` segment while a user may point
+        the app at the bare frontend host. While the API root is still
+        unresolved, a candidate whose answer proves unusable at this URL
+        (a non-retryable status or a body that is not JSON — the
+        frontend's 404/index answers) gets ONE retry with ``/api``
+        inserted; whichever candidate answers in API shape is latched for
+        the client's life, so the cost is at most one wasted round trip
+        per client, ever. Transport failures and retry exhaustion are NOT
+        the mismatch class (a path change fixes neither) and propagate
+        immediately, preserving the snappy probe budget; a base already
+        ending in ``/api`` (the public default, well-known self-hosted
+        roots) only ever tries itself, so no request is ever doubled on a
+        correct configuration. The same join serves check_backend's probe
+        and the live client — a saved bare-host URL works after save, not
+        just at probe time. (Benign race: concurrent first requests may
+        each negotiate; they latch the same value.)
         """
-        url = f"{self._base_url}{path}"
+        if self._api_prefix is not None:
+            return self._request_json_at(self._api_prefix, kind, path)
+        candidates = ("", "/api") if not self._base_url.endswith("/api") else ("",)
+        first_mismatch: _ApiRootMismatch | None = None
+        for prefix in candidates:
+            try:
+                result = self._request_json_at(prefix, kind, path)
+            except _ApiRootMismatch as mismatch:
+                if first_mismatch is None:
+                    first_mismatch = mismatch
+                continue
+            except ChainError:
+                raise  # transport/exhaustion/invalid-URL: /api cannot help
+            else:
+                self._api_prefix = prefix
+                return result
+        assert first_mismatch is not None  # candidates is never empty
+        raise first_mismatch
+
+    def _request_json_at(self, prefix: str, kind: str, path: str) -> Any:
+        """One request against ``{base}{prefix}{path}``, old retry policy."""
+        url = f"{self._base_url}{prefix}{path}"
         last_failure = "no attempt completed"
         for attempt in range(self._config.max_retries + 1):
             try:
@@ -782,12 +853,21 @@ class EsploraClient:
             else:
                 status = response.status_code
                 if 200 <= status < 300:
-                    return _parse_json(response, kind)
+                    try:
+                        return _parse_json(response, kind)
+                    except ChainError as exc:
+                        # 2xx but the body is not JSON: the frontend (or
+                        # some other server) answered, not the API — the
+                        # mismatch class, if a prefix is still unresolved.
+                        raise _ApiRootMismatch(str(exc)) from None
                 if status == 429 or status >= 500:
                     last_failure = f"status {status}"
                 else:
-                    # 4xx (rate limiting aside) and anything else: fail now.
-                    raise ChainError(f"{kind} request failed: status {status}")
+                    # 4xx (rate limiting aside) and anything else: fail
+                    # now — answered-but-not-here is the mismatch class.
+                    raise _ApiRootMismatch(
+                        f"{kind} request failed: status {status}"
+                    )
             if attempt < self._config.max_retries:
                 _sleep_for(_backoff_delay(attempt))
         raise ChainError(
@@ -807,7 +887,11 @@ def check_backend(
     ``True`` only when the URL (a) constructs through the fail-closed
     :class:`ChainConfig` shape check (well-formed http(s), no userinfo),
     (b) answers in Esplora shape (the strict tip-height parse proves
-    reachability *and* the API family), and (c) serves **mainnet** — its
+    reachability *and* the API family) — at ``{base}`` OR, when the base
+    is a bare frontend host whose root does not answer in API shape, at
+    ``{base}/api`` (the mempool.space-style API-root segment, auto-tried
+    and latched by :meth:`EsploraClient._request_json`, TCK-BACKEND-003),
+    and (c) serves **mainnet** — its
     block-height-0 list must contain a block whose hash is
     :data:`MAINNET_GENESIS_HASH` (canonical Esplora entries are block
     objects carrying ``"id"``; a bare hash string is tolerated). A

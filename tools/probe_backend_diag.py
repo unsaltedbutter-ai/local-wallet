@@ -13,9 +13,16 @@ It writes nothing and echoes NO secrets: the password is never printed, URL
 userinfo is stripped, no addresses/xpubs are touched — safe to paste in chat.
 
 Probes mirror src/localwallet/chain/{esplora,electrum,bitcoind}.py:
-  esplora : GET {base}/blocks/tip then /blocks/0 (mainnet genesis hash)
+  esplora : GET {base}/blocks/tip then {base}/api/blocks/tip (the app
+            auto-tries the /api API-root segment, TCK-BACKEND-003, latching
+            whichever answers in shape) then /blocks/0 (mainnet genesis)
   electrum: TLS socket + server.features genesis_hash == mainnet
-  bitcoind: POST getblockchaininfo (chain == "main")
+  bitcoind: POST getblockchaininfo (chain == "main") — over http for
+            http:// and bitcoind:// inputs, over https for https:// and
+            bitcoind+tls:// inputs (the app's Core-first classification on
+            the https rung, and its stored canonical form, is
+            bitcoind+tls://<host>:<port>; --insecure mirrors the
+            LOCALWALLET_TLS_VERIFY=0 rung on every TLS probe)
 
 Usage: python tools/probe_backend_diag.py URL [--user U --password P]
        [--insecure] [--json]
@@ -34,6 +41,7 @@ _VERIFY_NONE.check_hostname, _VERIFY_NONE.verify_mode = False, ssl.CERT_NONE
 def classify(exc):
     """Coarse TLS/transport class, walking the cause chain (httpx nests ssl
     errors several levels deep)."""
+    original = exc
     for _ in range(8):
         if exc is None:
             break
@@ -48,7 +56,7 @@ def classify(exc):
         if isinstance(exc, socket.gaierror):
             return "dns"
         exc = exc.__cause__ or exc.__context__
-    return type(exc).__name__
+    return type(original).__name__
 
 
 def strip_userinfo(url):
@@ -58,26 +66,48 @@ def strip_userinfo(url):
 
 def probe_esplora(base_url, insecure):
     r = {"kind": "esplora", "reachable": False, "tls_error": None,
-         "http_status": None, "mainnet": None, "error_class": None}
+         "http_status": None, "mainnet": None, "error_class": None,
+         "api_root": None}
     try:
-        with httpx.Client(base_url=base_url, timeout=TIMEOUT, verify=not insecure) as c:
-            resp = c.get("/blocks/tip")
-            r["http_status"] = resp.status_code
-            if resp.status_code != 200 or not resp.text.strip().isdigit():
-                r["error_class"] = "http-status" if resp.status_code != 200 else "not-esplora-shape"
+        with httpx.Client(timeout=TIMEOUT, verify=not insecure) as c:
+            # Mirror the app's /api auto-try (TCK-BACKEND-003): bare {base}
+            # first; only when it ANSWERS in a non-Esplora shape (non-2xx
+            # or a non-JSON tip) move to {base}/api — a transport failure
+            # is not retried under another path.
+            for prefix in ("", "/api"):
+                try:
+                    resp = c.get(f"{base_url.rstrip('/')}{prefix}/blocks/tip")
+                except httpx.TimeoutException:
+                    r["tls_error"] = r["error_class"] = "timeout"
+                    r["http_status"] = None
+                    return r
+                except httpx.ConnectError as e:
+                    r["tls_error"] = r["error_class"] = classify(e)
+                    return r
+                r["http_status"] = resp.status_code
+                usable = resp.status_code == 200 and resp.text.strip().isdigit()
+                if not usable and resp.status_code == 200:
+                    try:
+                        resp.json()
+                    except ValueError:
+                        r["error_class"] = "not-esplora-shape"  # 200 non-JSON
+                        continue
+                if not usable:
+                    r["error_class"] = (
+                        "http-status" if resp.status_code != 200
+                        else "not-esplora-shape")
+                    continue
+                r["reachable"] = True
+                r["api_root"] = prefix or "/"
+                blocks = c.get(f"{base_url.rstrip('/')}{prefix}/blocks/0").json()
+                ids = [b.get("id") if isinstance(b, dict) else b for b in blocks]
+                r["mainnet"] = MAINNET_GENESIS_HASH in ids
                 return r
-            r["reachable"] = True
-            blocks = c.get("/blocks/0").json()
-            ids = [b.get("id") if isinstance(b, dict) else b for b in blocks]
-            r["mainnet"] = MAINNET_GENESIS_HASH in ids
-    except httpx.TimeoutException:
-        r["tls_error"] = r["error_class"] = "timeout"
-    except httpx.ConnectError as e:
-        r["tls_error"] = r["error_class"] = classify(e)
+            return r
     except httpx.InvalidURL:
         r["error_class"] = "invalid-url"
     except Exception as e:  # noqa: BLE001
-        r["error_class"] = classify(e)
+        r["tls_error"] = r["error_class"] = classify(e)
     return r
 
 
@@ -117,7 +147,8 @@ def probe_bitcoind(url, user, password, insecure):
     r = {"kind": "bitcoind", "reachable": False, "tls_error": None,
          "http_status": None, "mainnet": None, "error_class": None}
     p = urllib.parse.urlsplit(url)
-    scheme = {"bitcoind": "http", "https": "https", "http": "http"}.get(p.scheme, "http")
+    scheme = {"bitcoind": "http", "bitcoind+tls": "https",
+              "https": "https", "http": "http"}.get(p.scheme, "http")
     auth = (user, password) if (user and password) else None
     body = json.dumps({"jsonrpc": "1.0", "id": 1, "method": "getblockchaininfo", "params": []})
     try:
@@ -160,9 +191,12 @@ def main():
     print(f"URL: {strip_userinfo(a.url)}  (--insecure: {a.insecure})")
     print("Password: [redacted]")
     for r in results:
-        print(f"\n[{r['kind']}]\n  reachable: {r['reachable']}\n  tls_error: "
-              f"{r['tls_error']}\n  http     : {r['http_status']}\n  mainnet  : "
-              f"{r['mainnet']}\n  error    : {r['error_class']}")
+        line = (f"\n[{r['kind']}]\n  reachable: {r['reachable']}\n  tls_error: "
+                f"{r['tls_error']}\n  http     : {r['http_status']}\n  mainnet  : "
+                f"{r['mainnet']}\n  error    : {r['error_class']}")
+        if r.get("api_root"):
+            line += f"\n  api_root : {r['api_root']}"
+        print(line)
     return 0
 
 
