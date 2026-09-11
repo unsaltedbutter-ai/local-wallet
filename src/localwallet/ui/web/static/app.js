@@ -27,8 +27,12 @@ const actionsEl = document.getElementById("actions");
 const quickbarEl = document.getElementById("quickbar");
 const scanChipEl = document.getElementById("scan-chip");
 const privacyChipEl = document.getElementById("privacy-chip");
+const privacySublineEl = document.getElementById("privacy-subline");
 const settingsToggleEl = document.getElementById("settings-toggle");
 const settingsPanelEl = document.getElementById("settings-panel");
+const settingsHeadingEl = document.getElementById("settings-heading");
+const settingsCloseEl = document.getElementById("settings-close");
+const settingsRetryEl = document.getElementById("settings-retry");
 const settingsStatusEl = document.getElementById("settings-status");
 const settingsListEl = document.getElementById("settings-list");
 
@@ -43,8 +47,8 @@ const LABELS = {
   scanLoading:
     "Wallet loading — balances may be incomplete until the first scan finishes.",
   scanSkipped: "First scan failed — balances may be incomplete.",
-  // TCK-UX-010: privacy chip subline (title/aria-label) per privacy_mode
-  // NAME — the closed enum the server adds to /state. Unknown names hide
+  // TCK-UX-010 + WEB-012 (f): privacy chip subline (VISIBLE text under the
+  // chip word) per privacy_mode NAME — the closed enum the server adds to /state. Unknown names hide
   // the chip; these strings are the only per-mode prose.
   privacyPublic:
     "Public explorer — the operator can associate queried addresses with your IP.",
@@ -254,6 +258,13 @@ const state = {
   // — never persisted, never logged; a key supplied at launch never reaches
   // the client at all, so the collapsed display then falls back to the
   // engine's own truncated settings entry).
+  // TCK-WEB-011: this tab's locally-echoed submits awaiting their engine
+  // ``user_text`` echo (see renderUserText). Memory only; order = submit
+  // order; the engine's bus order matches it.
+  pendingEchos: [],
+  // TCK-WEB-012 (f): the last KNOWN privacy_mode NAME from a typed
+  // snapshot — state/0 (engine busy) must not blank the chip mid-turn.
+  privacyMode: "",
   stateSeq: 0,
   watchKeyDismissed: false,
   watchKeyPresent: null, // null = unknown | true | false (typed state/1 only)
@@ -497,6 +508,30 @@ function appendUser(text, queued) {
   return turn;
 }
 
+// TCK-WEB-011: the engine echoes EVERY accepted line (typed text, button
+// utterance, slash command, CLI) on the shared bus as ``user_text`` before
+// running it, so every tab renders the user's message. Dedupe: this tab's
+// own submits are already echoed locally — the event suppresses the ONE
+// oldest still-unconfirmed pending echo with the exact same text (the bus
+// delivers in engine-pickup order, which matches local submit order), and
+// anything unmatched (another tab's line, or the CLI) renders as a normal
+// user bubble. Replay composes with this: the event-id duplicate guard in
+// handleEvent drops a replayed echo of an already-consumed pending, and a
+// tab that connects LATE has no pending echoes at all, so replay renders
+// every echo exactly once.
+// ponytail ceiling: EXACT text match, not turn ids — a pending entry whose
+// event is lost (only possible across a too_far_behind gap, which clears
+// the list) could later suppress another tab's identical-text echo; the
+// bubble count and content stay correct either way.
+function renderUserText(text) {
+  const at = state.pendingEchos.indexOf(text);
+  if (at !== -1) {
+    state.pendingEchos.splice(at, 1);
+    return;
+  }
+  appendUser(text, false);
+}
+
 // One turn_end closed the engine's current turn. Promote the oldest locally
 // queued submit (it is the next line the FIFO pump will pick up) and re-sync
 // button visibility — flow state only changes during turns. No turn_start
@@ -602,7 +637,7 @@ function applyWatchKeyGate(snap) {
     openSettings();
   } else if (typed && !needs && state.settingsAutoShown) {
     state.settingsAutoShown = false;
-    closeSettings();
+    closeSettings(inputEl); // same episode end via snapshot: focus chat
   }
 }
 
@@ -621,7 +656,7 @@ function dismissWatchKeyForm(key) {
   renderSettings();
   if (state.settingsAutoShown) {
     state.settingsAutoShown = false; // the auto-open episode is over
-    closeSettings();
+    closeSettings(inputEl); // (d): hand focus to chat compose, not <body>
   }
 }
 
@@ -640,12 +675,10 @@ function applyScanChip(snap) {
   }
 }
 
-// TCK-UX-010: the persistent privacy label. The closed privacy_mode enum
-// NAMES (the additive /state field) map to the subline copy; the chip's
-// color rides the data-privacy attribute → .privacy[data-privacy=…] rules
-// in styles.css (no inline styles, CSP-clean). Absent or unknown value →
-// hidden: the chip is never fabricated and the raw enum never reaches the
-// user as visible text (the word shown is the static "Privacy notice").
+// TCK-UX-010: the persistent privacy label — the closed privacy_mode enum
+// NAMES (the additive /state field) map to the subline copy; the raw enum
+// never reaches the user as text (the word shown is the static "Privacy
+// notice" node in index.html).
 const PRIVACY_SUBLINE = {
   public: LABELS.privacyPublic,
   own_node_local: LABELS.privacyOwnLocal,
@@ -653,20 +686,31 @@ const PRIVACY_SUBLINE = {
   awaiting_backend: LABELS.privacyAwaiting,
 };
 
+// TCK-UX-010 + TCK-WEB-012 (f): two upgrades over the original chip. (1) The chip PERSISTS the last known mode
+// across state/0 (engine-busy) snapshots — it must not blink out mid-turn;
+// only a contradicting TYPED snapshot (a different valid name, or an
+// unknown/absent one, which is never fabricated) replaces or clears it.
+// (2) The trust subline is VISIBLE text (a small line under the chip word),
+// not a hover-only title — readable without a mouse; the raw enum name
+// still never reaches the user as text.
 function applyPrivacyChip(snap) {
-  privacyChipEl.hidden = true;
-  privacyChipEl.removeAttribute("data-privacy");
-  privacyChipEl.removeAttribute("title");
-  privacyChipEl.removeAttribute("aria-label");
-  if (!snap || snap.schema !== "state/1") return;
-  const mode = snap.privacy_mode;
-  if (typeof mode !== "string" || !Object.prototype.hasOwnProperty.call(PRIVACY_SUBLINE, mode)) return;
-  const subline = PRIVACY_SUBLINE[mode];
+  if (snap && snap.schema === "state/1") {
+    const mode = snap.privacy_mode;
+    state.privacyMode =
+      typeof mode === "string" &&
+      Object.prototype.hasOwnProperty.call(PRIVACY_SUBLINE, mode)
+        ? mode
+        : "";
+  }
+  const mode = state.privacyMode;
+  if (!mode) {
+    privacyChipEl.hidden = true;
+    privacyChipEl.removeAttribute("data-privacy");
+    privacySublineEl.textContent = "";
+    return;
+  }
   privacyChipEl.dataset.privacy = mode;
-  // subline as tooltip + accessible name; the enum NAME itself never reaches
-  // the user as text — it only rides the data-privacy attribute (CSS hook).
-  privacyChipEl.title = subline;
-  privacyChipEl.setAttribute("aria-label", `Privacy notice: ${subline}`);
+  privacySublineEl.textContent = PRIVACY_SUBLINE[mode];
   privacyChipEl.hidden = false;
 }
 
@@ -712,12 +756,16 @@ function handleEvent(id, kind, data) {
   if (kind === "text") appendText(data);
   else if (kind === "progress") appendProgress(data);
   else if (kind === "model_progress") renderModelProgress(data);
+  else if (kind === "user_text") renderUserText(data);
   else if (kind === "turn_end") noteTurnEnd();
   else if (kind === "resync") {
     // too_far_behind: the cursor predates the server ring, so part of the
     // transcript is unrecoverable — say so (never silently gap-fill), then
     // re-sync state. The retained backlog follows this frame on the same
     // stream; the duplicate guard above drops any of it we already saw.
+    // TCK-WEB-011: echoes lost in the gap can never arrive, so drop the
+    // pending list rather than let a stale entry swallow a future message.
+    state.pendingEchos = [];
     appendSystem(LABELS.resyncGap);
     refreshState();
   }
@@ -805,6 +853,10 @@ async function submit(path, field, value) {
   const queued = state.busy;
   const echo = appendUser(value, queued);
   if (queued) state.queue.push(echo);
+  // TCK-WEB-011: the engine re-echoes every accepted line on the bus as a
+  // ``user_text`` event (all tabs see it); this tab registers the pending
+  // local echo so renderUserText can suppress its own copy.
+  state.pendingEchos.push(value);
   setBusy(true);
   try {
     const response = await fetch(path, {
@@ -817,6 +869,8 @@ async function submit(path, field, value) {
     echo.remove();
     const at = state.queue.indexOf(echo);
     if (at !== -1) state.queue.splice(at, 1);
+    const pe = state.pendingEchos.indexOf(value);
+    if (pe !== -1) state.pendingEchos.splice(pe, 1); // the engine never saw the line
     setBusy(state.queue.length > 0);
     appendSystem(LABELS.unreachable);
   }
@@ -1388,13 +1442,14 @@ async function loadSettings() {
   // the rows render from its entries: the watch_key entry is NEVER an
   // editable row (read-only surface; changing the key is the engine-gated
   // POST /watchkey path) and chain_base_url gets its Edit/Apply row.
+  settingsRetryEl.hidden = true; // a new attempt speaks for itself
   settingsStatusEl.textContent = LABELS.settingsLoading;
   renderSettings();
   try {
     const response = await fetch("/settings", { headers: authHeaders(), cache: "no-store" });
     const data = response.ok ? await response.json().catch(() => null) : null;
     if (!data || !Array.isArray(data.settings)) {
-      settingsStatusEl.textContent = LABELS.settingsUnavailable;
+      showSettingsUnavailable();
       return;
     }
     settingsStatusEl.textContent = "";
@@ -1410,9 +1465,22 @@ async function loadSettings() {
     }
     renderSettings();
   } catch {
-    settingsStatusEl.textContent = LABELS.settingsUnavailable;
+    showSettingsUnavailable();
   }
 }
+
+// TCK-WEB-012 (g): the load-failure line gets a visible Retry beside it —
+// the pane's ONLY unavailability path — rerunning the same GET /settings.
+function showSettingsUnavailable() {
+  settingsStatusEl.textContent = LABELS.settingsUnavailable;
+  settingsRetryEl.hidden = false;
+  settingsRetryEl.disabled = false;
+}
+
+settingsRetryEl.addEventListener("click", () => {
+  settingsRetryEl.disabled = true; // one attempt in flight; loadSettings re-arms
+  loadSettings();
+});
 
 // Inline pre-POST check for bounded int keys; the engine re-validates
 // fail-closed anyway. Returns "" when the value may be sent.
@@ -1566,25 +1634,85 @@ settingsListEl.addEventListener("click", async (event) => {
   }
 });
 
+// TCK-WEB-012 (g): Enter inside a setting row's main field (the chain-base
+// input, the gap row, any future generic row) triggers that row's primary
+// action — the same Edit→Apply verb as a click, matching the watch-key
+// forms' Enter handlers. The login block's fields are deliberately out:
+// their verb is the row's Apply fired from the URL field, never a partial
+// credential submit.
+settingsListEl.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  const input = event.target;
+  if (!(input instanceof HTMLInputElement) || input.type === "checkbox") return;
+  if (input.closest(".setting-creds")) return;
+  const btn = input
+    .closest(".setting")
+    .querySelector("button[data-setting-key]");
+  if (!btn || btn.disabled) return;
+  event.preventDefault();
+  btn.click();
+});
+
 function openSettings() {
   if (settingsPanelEl.hidden) {
     settingsPanelEl.hidden = false;
     settingsToggleEl.setAttribute("aria-expanded", "true");
     loadSettings(); // fetch on demand, fresh every time the panel opens
+    // TCK-WEB-012 (d): opening moves focus INTO the pane — the zpub entry
+    // input when the first-run form owns the pane, else the pane heading
+    // (a tabindex="-1" programmatic landmark, announced but not tab-stopped).
     if (state.watchKeyNeeded) focusWatchInput();
+    else settingsHeadingEl.focus();
   }
 }
 
-function closeSettings() {
+// TCK-WEB-012 (c/d): closing returns focus to a chosen element — by default
+// the header Settings toggle (so the keyboard never drops to <body>), or
+// the chat compose input for the first-run auto-close after Connect (the
+// promise dismissWatchKeyForm's comment makes: the user is done with the
+// pane and ready to type).
+function closeSettings(returnFocusTo) {
   if (!settingsPanelEl.hidden) {
     settingsPanelEl.hidden = true;
     settingsToggleEl.setAttribute("aria-expanded", "false");
+    const target = returnFocusTo || settingsToggleEl;
+    if (!target.disabled) target.focus();
   }
 }
 
 settingsToggleEl.addEventListener("click", () => {
   if (settingsPanelEl.hidden) openSettings();
   else closeSettings();
+});
+
+settingsCloseEl.addEventListener("click", () => closeSettings());
+
+// TCK-WEB-012 (c): Escape while the pane is open. An OPEN EDIT ROW cancels
+// FIRST (watch-key replace form → collapsed display; editing chain-base /
+// generic row → renderSettings() rebuilds from engine truth, discarding
+// the unsaved input); the NEXT Escape closes the pane. With nothing open,
+// one Escape closes.
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || settingsPanelEl.hidden) return;
+  if (state.watchKeyReplaceOpen) {
+    event.preventDefault();
+    state.watchKeyReplaceOpen = false;
+    renderSettings();
+    return;
+  }
+  // The URL field only — the login block's fields are never readonly and
+  // live hidden when not editing, so a class-scoped match is required.
+  if (
+    settingsPanelEl.querySelector(
+      ".setting-chain .setting-line > input.setting-input:not(.creds-user):not(.creds-pass):not([readonly])",
+    )
+  ) {
+    event.preventDefault();
+    renderSettings(); // row back to read-only + Edit; nothing was sent
+    return;
+  }
+  event.preventDefault();
+  closeSettings();
 });
 
 // ------------------------------------------------- watch key entry (001/009)

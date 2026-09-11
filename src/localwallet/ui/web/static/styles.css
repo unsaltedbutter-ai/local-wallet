@@ -54,10 +54,13 @@
   /* focus ring (single source of truth) */
   --focus-ring: 0 0 0 2px var(--c-bg), 0 0 0 4px var(--c-accent);
 
-  /* TCK-WEB-009 (e/c): dim-badge opacity and the settings-pane ceiling —
-     the pane fits the viewport; internal scroll is the last resort. */
-  --badge-dim: 0.45;
-  --settings-max: 62vh;
+  /* TCK-WEB-012 (a/b): the settings pane is its OWN task surface — an
+     offset elevation tone (retints per palette via --c-surface-2, which is
+     brighter than the chat surface in dark and grayer in light), a strong
+     edge and the deeper shadow, and a full-height ceiling (the pane fills
+     the viewport below the header/compose chrome; internal scroll stays). */
+  --c-settings-surface: var(--c-surface-2);
+  --settings-max: calc(100dvh - 10rem);
 
   /* TCK-UX-008: the turn-busy pulse — dot size and its dim floor. */
   --busy-dot: 0.35rem;
@@ -187,7 +190,19 @@ body {
    data-privacy (the same attribute-selector pattern as the conn dot above);
    awaiting_backend shares the trust-yellow family. Unknown/absent → the
    element stays hidden, so no fallback color is needed. */
-.privacy { font-weight: 600; }
+/* The two-line chip is a rounded block, not a single-row pill. */
+.privacy { font-weight: 600; border-radius: var(--r-lg); }
+
+/* TCK-WEB-012 (f): the trust subline is a small VISIBLE line under the
+   chip word (readable without hover), not a title-only tooltip. It rides
+   the chip's recolored pill in normal (non-bold) muted-weight text. */
+.privacy-subline {
+  display: block;
+  margin-block-start: var(--sp-1);
+  font-weight: 400;
+  font-size: var(--fs-xs);
+  white-space: normal;
+}
 .privacy[data-privacy="public"] {
   color: var(--c-priv-public);
   background: var(--c-priv-public-bg);
@@ -217,16 +232,45 @@ body {
 
 .btn-ghost:hover { color: var(--c-text); border-color: var(--c-border-strong); }
 
-/* TCK-WEB-009 (c): compact — tighter rows, two columns when there is room,
-   the pane fits the viewport (internal scroll only as a last resort). */
+/* TCK-WEB-009 (c) + TCK-WEB-012 (a/b): compact rows, two columns when there
+   is room — and a surface of its OWN: the pane reads as a different task
+   at a glance (offset tone, strong edges top AND bottom, deeper shadow),
+   and it fills the viewport below the header instead of a 62vh cap. */
 .settings {
-  background: var(--c-surface);
-  border-bottom: 1px solid var(--c-border);
-  box-shadow: var(--shadow-1);
-  padding: var(--sp-3) var(--sp-4);
+  background: var(--c-settings-surface);
+  border-bottom: 2px solid var(--c-border-strong);
+  box-shadow: var(--shadow-2);
+  padding: var(--sp-4);
+  block-size: var(--settings-max);
   max-block-size: var(--settings-max);
   overflow-y: auto;
 }
+
+/* (c/d): the pane's own top row — heading (the script-focus target) and
+   the in-pane Close button on the same line. */
+.settings-top {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-block-end: var(--sp-2);
+}
+
+.settings-heading {
+  margin: 0;
+  font-size: var(--fs-lg);
+  font-weight: 650;
+}
+
+.settings-close { margin-inline-start: auto; }
+
+/* (g): the Retry rides the failure line, inline right after it. */
+.settings-retry { margin-block-end: var(--sp-2); }
+
+/* (a): on the offset pane tone, the secondary buttons and the read-only
+   fields re-layer against it — Edit/Apply stay raised (the surface token
+   the chat bubbles use) and a read-only field reads as the inset, inert
+   variant instead of blending into the pane. */
+.settings .btn-secondary { background: var(--c-surface); }
 
 .settings-status {
   margin: 0 0 var(--sp-2);
@@ -285,9 +329,10 @@ body {
 
 .setting-apply { padding: var(--sp-2) var(--sp-4); }
 
-/* (d): the read-only field is visibly inert until Edit opens it. */
+/* (d): the read-only field is visibly inert until Edit opens it — the
+   inset page-tone (--c-bg) against the pane's offset surface, not a blend. */
 .setting-input[readonly] {
-  background: var(--c-surface-2);
+  background: var(--c-bg);
   border-color: var(--c-border);
   color: var(--c-text-muted);
 }
@@ -631,8 +676,11 @@ body {
 .watchkey-display-line { align-items: baseline; }
 .watchkey-display-line .watchkey-value { flex: 1; min-inline-size: 0; }
 
-/* (e): backend badges — dimmed family chips; the active kind's chip takes
-   the accent. bitcoind stays dimmed (reserved; the engine never emits it). */
+/* (e) + TCK-WEB-012: backend badges — quiet family chips; the active kind's
+   chip takes the accent. All three families (mempool, electrum, bitcoind)
+   are LIVE (TCK-ONB-004 M3): dim now means "not the current backend", and
+   a dim badge is a legible muted pill (surface tone + border + normal
+   --c-text-muted ink), NOT 0.45-opacity text hiding near 2:1 contrast. */
 .backend-badges {
   display: flex;
   gap: var(--sp-2);
@@ -643,17 +691,16 @@ body {
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
   color: var(--c-text-muted);
+  background: var(--c-surface);
   border: 1px solid var(--c-border-strong);
   border-radius: 999px;
   padding: 0 var(--sp-2);
-  opacity: var(--badge-dim);
 }
 
 .backend-badge[data-active="true"] {
   color: var(--c-accent);
   border-color: var(--c-accent);
   background: var(--c-accent-soft);
-  opacity: 1;
 }
 
 /* (f): the Resync-now action sits on its own quiet line under the badges. */
