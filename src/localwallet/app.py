@@ -1046,6 +1046,19 @@ SCAN_PENDING_NOTE: Final[str] = (
     "note: first scan running in the background — these figures may update when it completes"
 )
 
+#: TCK-PENDING-001: the tool-owned confirm-likelihood line on a pending
+#: summary, when NO fee/ETA data backs an estimate. Static copy — value-free
+#: by construction (no digits, no probability, no minutes). The documented
+#: bound: the store records no fee TARGET and no first-seen timestamp for
+#: cached transactions, so the eta.py ladder has nothing honest to compute
+#: from here (the ladder still runs where its inputs exist — the confirmation
+#: card / CREATED pending FACTS, TCK-P5-002, unchanged). A future ticket that
+#: records broadcast fee-targets may replace this note's VALUE with the
+#: ladder's wording; the key shape stays.
+PENDING_NO_ETA_NOTE: Final[str] = (
+    "No confirmation estimate right now — pending transactions have no recorded fee target to estimate from"
+)
+
 #: TCK-SCAN-003 (ADR-0022 decision 6): the friendly, value-free
 #: ``create_tx`` refusal while the FIRST scan has not completed —
 #: dispatcher-owned code gates it (never model judgment), mirroring the
@@ -1296,7 +1309,10 @@ def stub_generate(prompt: str, grammar_text: str | None) -> str:
     Behavior: matches the current user turn (the last ``user: `` segment
     of the assembled prompt, see ``AgentLoop._build_prompt``) against a
     fixed phrase table — "balance" → ``get_balance``; "history" or
-    "transaction" → ``get_history``; "utxo" → ``get_utxos``; "new
+    "transaction" → ``get_history`` (except a no-txid confirm-ask like
+    "when will my transaction confirm?" → ``get_utxos``, TCK-PENDING-001);
+    "utxo", "pending" or "incoming" → ``get_utxos`` (TCK-PENDING-001: the
+    answer's pending block narrates from the store either way); "new
     address" / "address" → ``new_address``; "node" or "privacy" →
     ``node_status``; "status" → ``tx_status`` (the
     first 64-hex token in the utterance is extracted verbatim, with the
@@ -1335,9 +1351,24 @@ def stub_generate(prompt: str, grammar_text: str | None) -> str:
     utterance = user_turn.split("\n")[0].strip()
     if "balance" in user_turn:
         return _STUB_BALANCE_ENVELOPE
+    # TCK-PENDING-001 fix (scoped): only a no-txid CONFIRM-ASK ("when
+    # will my transaction confirm?") routes to get_utxos per the
+    # docstring / prompt map, NOT get_history (which "transaction" would
+    # otherwise match first). The confirm-ask shape asks about
+    # confirmation timing: it contains "confirm"/"confirmation" AND a
+    # transaction/tx/it token AND has no 64-hex txid. Plain "transaction"
+    # phrasings (history/recent/show) keep routing to get_history below;
+    # a phrase WITH an explicit 64-hex txid/hash falls through as before.
+    _confirm_ask = (
+        "confirm" in user_turn
+        and re.search(r"\b(transaction|tx|it)\b", user_turn)
+        and not re.search(r"\b[0-9a-f]{64}\b", user_turn)
+    )
+    if _confirm_ask:
+        return _STUB_UTXOS_ENVELOPE
     if "history" in user_turn or "transaction" in user_turn:
         return _STUB_HISTORY_ENVELOPE
-    if "utxo" in user_turn:
+    if "utxo" in user_turn or "pending" in user_turn or "incoming" in user_turn:
         return _STUB_UTXOS_ENVELOPE
     if "address" in user_turn:
         return _STUB_NEW_ADDRESS_ENVELOPE
@@ -1805,6 +1836,59 @@ def _make_get_history_handler(
     return handler
 
 
+def _pending_summary(
+    utxo_records: Sequence[UtxoRecord],
+    tx_records: Sequence[TxRecord],
+) -> dict[str, object]:
+    """The compact pending block for a ``get_utxos`` answer (TCK-PENDING-001).
+
+    Pure and store-only — no network, no clock, no new tracking:
+
+    - **Incoming pending** = unconfirmed UTXO rows (the same
+      ``confirmed != 1`` data the balance answer already carries). A
+      coin CREATED by one of the wallet's own still-unconfirmed
+      transactions is our own change, not an incoming payment — excluded
+      by exact txid join (both rows already in the cache; no heuristics).
+    - **Outgoing pending** = transaction rows with ``height is None`` and
+      our spend directions (``out``/``self``) — broadcast-but-unconfirmed
+      (the history row the broadcast handler writes, plus whatever a
+      scan has since confirmed about direction).
+
+    Documented bounds (the store's fidelity, narrated honestly rather
+    than invented): it records **no amount** for an outgoing transaction
+    (only ``fee_sats``, nullable — not the sent value), **no first-seen
+    timestamp** for any row (so no age line), and **no fee target**, so
+    the eta.py ladder has no honest input here — the confirm-likelihood
+    line is the static :data:`PENDING_NO_ETA_NOTE` degrade, never a
+    fabricated probability or minute figure. Empty dict when nothing is
+    pending (a clean wallet's answer is byte-identical to before).
+    """
+    outgoing = [
+        t
+        for t in tx_records
+        if t.height is None and t.direction in (DIR_OUT, DIR_SELF)
+    ]
+    if not outgoing:
+        incoming = [u for u in utxo_records if u.confirmed != 1]
+    else:
+        own_pending_txids = {t.txid for t in outgoing}
+        incoming = [
+            u
+            for u in utxo_records
+            if u.confirmed != 1 and u.txid not in own_pending_txids
+        ]
+    if not incoming and not outgoing:
+        return {}
+    return {
+        "pending_incoming_count": len(incoming),
+        "pending_incoming_sats": sum(u.value_sats for u in incoming),
+        "pending_outgoing_count": len(outgoing),
+        # Tool-owned wording; the narration prints it verbatim (the model
+        # never authors the estimate — there is none to author).
+        "pending_eta_note": PENDING_NO_ETA_NOTE,
+    }
+
+
 def _make_get_utxos_handler(
     store: Store,
     wallet_id: int,
@@ -1818,13 +1902,21 @@ def _make_get_utxos_handler(
     quote-verbatim rule is satisfied end to end. The result carries the
     tool-owned ``freshness`` key (ADR-0022 decision 6: cache-served
     answers before the first scan completes are stale-flagged, never
-    withheld). No network I/O.
+    withheld). When anything is pending (unconfirmed receives or
+    broadcast-unconfirmed spends), the answer gains the additive
+    ``pending_*`` block from :func:`_pending_summary` — counts and
+    verbatim store sums plus the static no-ETA honesty line; on a clean
+    wallet these keys are ABSENT and the result shape is unchanged. The
+    pending figures ride the cache, so during the first scan they are
+    partial-but-verbatim — the stale flag already says so. No network
+    I/O.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
         del envelope  # get_utxos params are empty by schema
         try:
             records = store.get_utxos_for_wallet(wallet_id)
+            txs = store.get_txs_for_wallet(wallet_id)
             freshness = _freshness(store, wallet_id, scan_gate)
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
@@ -1838,7 +1930,13 @@ def _make_get_utxos_handler(
             }
             for r in records
         ]
-        return {"utxos": utxos, "count": len(utxos), "freshness": freshness}
+        result: dict[str, object] = {
+            "utxos": utxos,
+            "count": len(utxos),
+            "freshness": freshness,
+        }
+        result.update(_pending_summary(records, txs))
+        return result
 
     return handler
 
@@ -9710,12 +9808,19 @@ def _print_utxos(result: Mapping[str, object], output_fn: Callable[[str], None])
 
     A stale-flagged answer (ADR-0022) leads with the value-free loading
     note — an empty/partial cache during the first scan must never read
-    as a final "No unspent outputs."
+    as a final "No unspent outputs." When the handler flagged pending
+    items (TCK-PENDING-001), one compact summary line follows — counts
+    and the incoming sat sum verbatim from the tool-owned ``pending_*``
+    keys (the UI computes nothing), the unrecorded-outgoing-amount bound
+    stated in copy, never an address — plus the tool's static
+    confirm-likelihood note line (verbatim; on the cache-served pending
+    path it is the honest no-estimate degrade, never a minute figure).
     """
     if result.get("error") is not None:
         output_fn(sanitize_tool_output(_error_line(result, "UTXO lookup failed")))
         return
     _print_freshness_note(result, output_fn)
+    _print_pending_block(result, output_fn)
     utxos = result.get("utxos")
     if not isinstance(utxos, list) or not utxos:
         output_fn(sanitize_tool_output("No unspent outputs."))
@@ -9734,6 +9839,35 @@ def _print_utxos(result: Mapping[str, object], output_fn: Callable[[str], None])
                 f"{confirmed_label} · tx {short} vout {utxo.get('vout', 0)}"
             )
         )
+
+
+def _print_pending_block(
+    result: Mapping[str, object], output_fn: Callable[[str], None]
+) -> None:
+    """The one-line pending summary + the tool's confirm-likelihood line.
+
+    Absent keys (nothing pending) print nothing — a clean wallet's
+    answer is byte-identical to before TCK-PENDING-001. Figures are
+    verbatim from the handler result; the wording around them is static
+    copy. The outgoing segment states the recorded-data bound
+    ("amount not recorded") instead of hiding the missing figure.
+    """
+    incoming = result.get("pending_incoming_count", 0)
+    outgoing = result.get("pending_outgoing_count", 0)
+    if not isinstance(incoming, int) or not isinstance(outgoing, int):
+        return  # malformed shape: print nothing rather than guess (fail quiet)
+    if incoming <= 0 and outgoing <= 0:
+        return
+    segments: list[str] = []
+    if incoming > 0:
+        sats = result.get("pending_incoming_sats", 0)
+        segments.append(f"{incoming} incoming for {sats} sats")
+    if outgoing > 0:
+        segments.append(f"{outgoing} outgoing (amount not recorded)")
+    output_fn(sanitize_tool_output("Pending: " + " · ".join(segments)))
+    note = result.get("pending_eta_note")
+    if isinstance(note, str) and note:
+        output_fn(sanitize_tool_output(note))
 
 
 def _print_new_address(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:

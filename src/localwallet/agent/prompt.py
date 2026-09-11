@@ -63,7 +63,11 @@ a fiat number, code or amount.
 - get_history: show recent wallet transactions; params {} or \
 {"limit": 1-100} — when the user asks what happened recently.
 - get_utxos: show the wallet's unspent outputs; params {} — when the user \
-asks what is spendable.
+asks what is spendable, how many UTXOs/coins they have, or what is \
+pending/incoming/unconfirmed. "How many utxos do I have?", "what's \
+pending?" and "when will my transaction confirm?" (no txid given) are \
+ALL get_utxos — its answer carries the pending summary; tx_status is \
+only for a known 64-hex txid.
 - new_address: allocate a fresh receive address; params {} — when the user \
 asks for a new receiving address. Never invent an address: emit the intent \
 and quote the address from the tool result afterwards.

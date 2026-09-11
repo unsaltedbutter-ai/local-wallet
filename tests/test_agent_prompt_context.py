@@ -304,9 +304,28 @@ class TestSystemPrompt:
         # sat at 5988 chars (7 of headroom), so the mandatory fiat-phrasing
         # guidance line could not fit without moving the guard. Raised
         # 6300 → 7300 by TCK-TX-SELF-001: the self_transfer intent line +
-        # two few-shots (~1000 chars) ship the closed protocol; ~7300 chars
-        # is still ~3.6K tokens, a small fraction of the 8K budget.
-        assert len(build_system_prompt()) < 7300
+        # two few-shots (~1000 chars) ship the closed protocol. Raised
+        # 7300 → 7600 by TCK-PENDING-001: the get_utxos line now names the
+        # utxo-count / "what's pending" / "when will my transaction
+        # confirm?" phrasings explicitly (MW-11 #3 fix). ~7600 chars is
+        # still ~3.8K tokens, a small fraction of the 8K budget.
+        assert len(build_system_prompt()) < 7600
+
+    def test_get_utxos_line_maps_count_and_pending_phrasings(self) -> None:
+        # TCK-PENDING-001 (user report MW-11 #3: "how many utxo do I have?"
+        # once produced an EMPTY turn): the get_utxos intent line must name
+        # the utxo-COUNT and PENDING phrasings explicitly, not just
+        # "what is spendable", and keep the tx_status split (pending asks
+        # without a txid route to get_utxos).
+        prompt = build_system_prompt()
+        line = next(
+            ln
+            for ln in prompt.splitlines()
+            if ln.startswith("- get_utxos:")
+        )
+        assert "how many UTXOs" in line
+        assert "pending" in line.lower()
+        assert "tx_status" in line
 
 
 # ------------------------------------------------------------------- grammar

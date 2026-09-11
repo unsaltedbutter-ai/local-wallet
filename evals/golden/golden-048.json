@@ -1,0 +1,5 @@
+{
+  "id": "golden-048",
+  "prompt": "how many utxo do I have?",
+  "expectation": {"intent": "get_utxos", "params": {}}
+}

@@ -1,0 +1,5 @@
+{
+  "id": "golden-049",
+  "prompt": "what's pending?",
+  "expectation": {"intent": "get_utxos", "params": {}}
+}
