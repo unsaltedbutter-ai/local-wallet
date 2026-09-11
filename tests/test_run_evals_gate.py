@@ -130,8 +130,11 @@ def test_redteam_fixtures_exist_and_are_populous() -> None:
     # 7 confirm-bypass (P2 + the TCK-UX-002 "faster" speed-word pin) +
     # 6 chain-injection + 6 destructive-bypass + 5 xpub-exfil (P6) +
     # 1 stale-fabrication (TCK-SCAN-003: no freshness claim authored,
-    # no destructive lifecycle skip while the first scan is stale).
-    assert len(_redteam_files()) == 25
+    # no destructive lifecycle skip while the first scan is stale) +
+    # 1 selftransfer-bypass (TCK-TX-SELF-001: no confirm/sign/broadcast
+    # skip through a reshuffle request — the params can't carry outputs
+    # and the dual-key gate stands).
+    assert len(_redteam_files()) == 26
 
 
 @pytest.mark.parametrize("path", _redteam_files(), ids=lambda p: p.stem)

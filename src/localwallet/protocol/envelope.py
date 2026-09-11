@@ -5,8 +5,8 @@ Canonical envelope contract v0 — the model-emitted wire format::
     {"v": 0, "intent": <closed enum>, "params": {...}}
 
 - ``v``: integer, exactly ``0`` (booleans are not integers for this purpose).
-- ``intent``: closed enum — see :class:`IntentName` (twelve members as of
-  the Phase 4 v0 extension; see ``docs/adr/0002-envelope-spec.md``,
+- ``intent``: closed enum — see :class:`IntentName` (thirteen members as of
+  the TCK-TX-SELF-001 v0 extension; see ``docs/adr/0002-envelope-spec.md``,
   ``docs/adr/0013-confirm-gate.md``).
 - ``params``: REQUIRED object, shape fixed per intent:
   ``respond`` → ``{"text": str, 1..4000 chars}``;
@@ -45,6 +45,20 @@ Canonical envelope contract v0 — the model-emitted wire format::
   ``node_status`` → ``{}`` exactly — no user-quoted values needed; the
   handler runs the advise-only node doctor (detect + guidance) and returns
   the dispatcher-owned FACTS for narration (Phase 4, TCK-P4-003).
+  ``self_transfer`` (TCK-TX-SELF-001) → ``{"mode": "split"|"consolidate"}``
+  plus the mode's ONE required key and nothing else: ``split`` requires
+  ``{"parts": int, 2..20}`` (the closed-world validator forbids
+  ``below_size_sats``); ``consolidate`` requires
+  ``{"below_size_sats": int, 546..21e15}`` (forbids ``parts``). The
+  optional ``{"fee_target": "fast"|"medium"|"slow"}`` tail matches
+  ``create_tx`` (no ``fee_rate_sat_vb`` — an internal reshuffle never gets
+  a literal-rate override; the estimator ladder alone bids it). CRITICAL:
+  params carry NO address, NO outpoint, NO recipient — the model cannot
+  author (or "correct") any money value of a self-transfer; every address,
+  amount, and input is derived deterministically by the engine handler
+  (own fresh receive addresses, tag-pure selection pools). The params
+  shape IS the guarantee that ``self_transfer`` cannot smuggle invented
+  outputs past the confirm gate.
 
 Adding enum members and optional params keys is a backward-compatible v0
 extension: previously-valid envelopes remain valid, so ``v`` stays ``0``
@@ -108,11 +122,13 @@ __all__ = [
     "MAX_FEE_RATE_SAT_VB",
     "MAX_QUESTION_CHARS",
     "MAX_RECIPIENT_CHARS",
+    "MAX_SELF_TRANSFER_PARTS",
     "MAX_TEXT_CHARS",
     "MAX_TX_REF_CHARS",
     "MIN_AMOUNT_SATS",
     "MIN_AMOUNT_USD",
     "MIN_RECIPIENT_CHARS",
+    "MIN_SELF_TRANSFER_PARTS",
     "BaseParams",
     "BroadcastTxParams",
     "ClarifyParams",
@@ -126,6 +142,7 @@ __all__ = [
     "NewAddressParams",
     "NodeStatusParams",
     "RespondParams",
+    "SelfTransferParams",
     "SignTxParams",
     "TxStatusParams",
     "validate_payload",
@@ -175,6 +192,17 @@ MAX_AMOUNT_USD: Final[float] = 1_000_000.0
 #: absurdity — 10_000 sat/vB is a 100_000-vB transaction costing 1 BTC.
 MAX_FEE_RATE_SAT_VB: Final[int] = 10_000
 
+#: Accepted bounds of ``self_transfer`` params ``parts`` (schema layer,
+#: TCK-TX-SELF-001). The floor 2 is the smallest meaningful split (1 "part"
+#: is a plain move — the modes' vocabulary keeps the intent honest); the
+#: ceiling 20 bounds the plan to a legible confirmation card and a small
+#: vsize cost (every extra P2WPKH output adds 31 vB; 20 outputs ride inside
+#: Core standardness by a wide margin). The real per-output floor is the
+#: dust threshold computed from the script size in :mod:`localwallet.tx.dust`
+#: at handler time — this is a coarse transport bound, never the dust rule.
+MIN_SELF_TRANSFER_PARTS: Final[int] = 2
+MAX_SELF_TRANSFER_PARTS: Final[int] = 20
+
 #: Maximum accepted length of ``confirm_tx`` / ``sign_tx`` / ``broadcast_tx``
 #: params ``tx_ref`` (characters).
 MAX_TX_REF_CHARS: Final[int] = 64
@@ -204,6 +232,9 @@ _KNOWN_LOC_FIELDS: Final[frozenset[str]] = frozenset(
         "amount_usd",
         "fee_target",
         "fee_rate_sat_vb",
+        "mode",
+        "parts",
+        "below_size_sats",
         "tx_ref",
         "signer",
         "txid",
@@ -253,6 +284,17 @@ class IntentName(StrEnum):
     (detect + guidance, ``localwallet.node``) and returns dispatcher-owned
     facts for narration. It carries no user-quoted params — the model emits
     nothing; the dispatcher owns all data.
+
+    TCK-TX-SELF-001 v0 extension (backward-compatible — see
+    ``docs/adr/0002-envelope-spec.md``): ``self_transfer`` joins as the
+    explicit on-demand reshuffle entry point (split one coin into N parts /
+    consolidate small coins below a size). It is the FIRST destructive
+    intent whose params carry no money value at all — no recipient, no
+    amount, no outpoint: the engine derives every address, amount, and
+    input deterministically. Like ``create_tx`` it is only the first step
+    of the dispatcher-owned flow (``create → confirm_tx → sign_tx →
+    broadcast_tx``, dual-key confirm gate unchanged — the handler stages
+    the plan through :meth:`localwallet.tx.flow.TxFlow.create`).
     """
 
     RESPOND = "respond"
@@ -267,6 +309,7 @@ class IntentName(StrEnum):
     BROADCAST_TX = "broadcast_tx"
     TX_STATUS = "tx_status"
     NODE_STATUS = "node_status"
+    SELF_TRANSFER = "self_transfer"
 
 
 class BaseParams(BaseModel):
@@ -583,6 +626,111 @@ class NodeStatusParams(BaseParams):
     """
 
 
+class SelfTransferParams(_OmitNoneDump):
+    """Params for ``self_transfer``: mode + its ONE required key + fee rung.
+
+    Contract (TCK-TX-SELF-001 v0 extension, ADR-0002 bump policy; ADR-0013
+    confirm discipline unchanged). The closed-world rule that makes the
+    flow SAFE: **no address, no outpoint, no recipient amount is
+    expressible here** — the money plan is derived entirely by the engine
+    handler from dispatcher-owned state (the wallet's own fresh receive
+    addresses and its tag-pure UTXO pools). The model can only relay the
+    two numbers the USER stated:
+
+    - ``mode``: REQUIRED enum literal ``"split"`` (one coin into N parts)
+      or ``"consolidate"`` (many small coins into one).
+    - ``parts``: for ``split``, a REQUIRED TRUE JSON integer
+      (strict-int pattern from ``amount_sats``; strings/bools/floats/null
+      rejected), bounded ``MIN_SELF_TRANSFER_PARTS..MAX_SELF_TRANSFER_PARTS``
+      (2..20). The GBNF grammar's syntactic bound is looser (1..99) — the
+      schema is the authority, the same loose-grammar/tight-schema split as
+      ``limit``. Forbidden for ``consolidate``.
+    - ``below_size_sats``: for ``consolidate``, a REQUIRED TRUE JSON
+      integer, bounded ``MIN_AMOUNT_SATS..MAX_AMOUNT_SATS`` — coarse
+      transport bounds mirroring ``create_tx.amount_sats`` (floor = the
+      canonical legacy-output dust figure; the real "is a coin below
+      this" decision compares stored values against it, and every
+      per-output dust check is computed from script size in
+      :mod:`localwallet.tx.dust`, never here). Forbidden for ``split``.
+    - ``fee_target``: optional enum literal ``"fast"|"medium"|"slow"``
+      (omitted ⇒ the handler's MEDIUM default, exactly like ``create_tx``).
+      Explicit ``null`` rejected — omission means leaving the key out.
+      Deliberately NO ``fee_rate_sat_vb`` sibling: an internal reshuffle
+      never rides the explicit-rate override (TCK-FEE-002 stays send-only).
+
+    The mode↔key pairing (split requires parts / consolidate requires
+    below_size_sats, "nothing else") is enforced HERE (model validator) and
+    re-checked at layer 3; the GBNF grammar makes every mismatched
+    combination syntactically impossible at decode time.
+    """
+
+    mode: Literal["split", "consolidate"]
+    parts: int | None = Field(
+        default=None, ge=MIN_SELF_TRANSFER_PARTS, le=MAX_SELF_TRANSFER_PARTS
+    )
+    below_size_sats: int | None = Field(
+        default=None, ge=MIN_AMOUNT_SATS, le=MAX_AMOUNT_SATS
+    )
+    fee_target: Literal["fast", "medium", "slow"] | None = None
+
+    @field_validator("parts", mode="before")
+    @classmethod
+    def _parts_must_be_true_int(cls, value: object) -> object:
+        """Close pydantic's lax coercions for ``parts`` (see ``limit``).
+
+        Also rejects explicit ``null``: omission is expressed by leaving
+        the key out; a half-hearted ``"parts": null`` is a malformed plan,
+        not an omission.
+        """
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        raise ValueError("parts must be an integer when present")
+
+    @field_validator("below_size_sats", mode="before")
+    @classmethod
+    def _below_size_sats_must_be_true_int(cls, value: object) -> object:
+        """Close pydantic's lax coercions for ``below_size_sats`` (see above)."""
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        raise ValueError("below_size_sats must be an integer when present")
+
+    @field_validator("fee_target", mode="before")
+    @classmethod
+    def _fee_target_must_be_present_when_not_omitted(cls, value: object) -> object:
+        """Reject explicit ``null`` for ``fee_target`` (see ``limit``).
+
+        Omission is expressed by leaving the key out entirely; ``null`` is
+        neither omitted nor an enum literal.
+        """
+        if value is None:
+            raise ValueError("fee_target must be 'fast', 'medium', or 'slow' when present")
+        return value
+
+    @model_validator(mode="after")
+    def _mode_owns_exactly_one_key(self) -> SelfTransferParams:
+        """``split`` ↔ ``parts`` XOR ``consolidate`` ↔ ``below_size_sats``.
+
+        Each mode REQUIRES its own key and FORBIDS the other's — a
+        split-with-threshold or a consolidate-with-parts is ambiguous
+        reshuffle intent, rejected here so the loop re-prompts once and
+        falls back to ``clarify`` rather than guessing (never a silent
+        money plan; fail closed per PROJECT.md §5.5). The GBNF branch
+        alternation already makes both shapes syntactically impossible for
+        a grammar-constrained decode; this covers every other producer.
+        """
+        if self.mode == "split":
+            if self.parts is None:
+                raise ValueError("mode 'split' requires params.parts")
+            if self.below_size_sats is not None:
+                raise ValueError("params.below_size_sats is not valid for mode 'split'")
+        else:
+            if self.below_size_sats is None:
+                raise ValueError("mode 'consolidate' requires params.below_size_sats")
+            if self.parts is not None:
+                raise ValueError("params.parts is not valid for mode 'consolidate'")
+        return self
+
+
 #: Frozen mapping intent name → params model — THE closed world. Intents
 #: outside this registry do not exist: the schema layer rejects them and
 #: the dispatcher refuses them (defense in depth).
@@ -607,6 +755,7 @@ INTENT_REGISTRY: Mapping[IntentName, type[BaseParams]] = MappingProxyType(
         IntentName.BROADCAST_TX: BroadcastTxParams,
         IntentName.TX_STATUS: TxStatusParams,
         IntentName.NODE_STATUS: NodeStatusParams,
+        IntentName.SELF_TRANSFER: SelfTransferParams,
     }
 )
 
@@ -635,6 +784,7 @@ class Envelope(BaseModel):
         | BroadcastTxParams
         | TxStatusParams
         | NodeStatusParams
+        | SelfTransferParams
     )
 
     @model_validator(mode="before")

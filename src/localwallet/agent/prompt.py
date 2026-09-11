@@ -13,8 +13,10 @@ the model's side of the closed intent protocol (PROJECT.md §7.1, §8):
 4. **No-secrets rule** — seed phrases / xprvs are refused with the
    hardware-wallet-only explanation and never repeated (PROJECT.md §9).
 5. **Few-shot examples** — user text → envelope JSON for ``respond``,
-   ``clarify`` (ambiguous amount), ``get_balance``, ``new_address``, and
-   ``create_tx`` (Phase 2 v0 extension; ADR-0002/0013 lockstep).
+   ``clarify`` (ambiguous amount), ``get_balance``, ``new_address``,
+   ``create_tx`` (Phase 2 v0 extension; ADR-0002/0013 lockstep), and
+   ``self_transfer`` (split + consolidate; TCK-TX-SELF-001 — the money
+   plan is engine-derived, so the examples carry no address/outpoint).
 
 The prompt is kept compact on purpose: v0 runs with a ≤8K context budget
 (ADR-0006), and this text is paid for on every turn.
@@ -111,6 +113,16 @@ asks about their own node, privacy/data source, or how to set one up. The \
 app detects your local Bitcoin Core / mempool / electrs instances and \
 provides guidance; you narrate ONLY the structured facts you are given — \
 never invent detection results or guidance.
+- self_transfer: reorganize your OWN coins (mainnet); params {"mode": \
+"split", "parts": <2-20 integer>} to split one coin into N equal parts, or \
+{"mode": "consolidate", "below_size_sats": <sats integer>} to merge the \
+coins smaller than that size into one; optional "fee_target" exactly like \
+create_tx — when the user asks to split a big coin/UTXO into N pieces, or \
+to consolidate / merge / sweep small or dust coins. The app derives ALL \
+addresses, amounts and inputs itself: NEVER supply a recipient or address, \
+NEVER name a coin — if the part count (split) or size threshold \
+(consolidate) is missing, clarify; the flow still runs create → confirm_tx \
+→ sign_tx → broadcast_tx.
 
 FACTS AND VERBATIM RULE
 - Addresses, amounts, and balances are provided in the FACTS block. Copy \
@@ -142,6 +154,14 @@ envelope: {"v": 0, "intent": "new_address", "params": {}}
 user: send 250000 sats to bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
 envelope: {"v": 0, "intent": "create_tx", "params": {"recipient": \
 "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "amount_sats": 250000}}
+
+user: split my big coin into 3 pieces
+envelope: {"v": 0, "intent": "self_transfer", "params": {"mode": "split", \
+"parts": 3}}
+
+user: consolidate all my coins under 100000 sats, no hurry
+envelope: {"v": 0, "intent": "self_transfer", "params": {"mode": \
+"consolidate", "below_size_sats": 100000, "fee_target": "slow"}}
 """
 
 
@@ -149,10 +169,13 @@ def build_system_prompt() -> str:
     """Return the system prompt encoding the output contract.
 
     The prompt fixes: exactly one envelope per turn with key order
-    ``v, intent, params``; the closed intent list (twelve intents as of the
-    Phase 4 v0 extension) with usage guidance; the quote-verbatim rule for
-    FACTS values; the no-secrets (watch-only) rule; and five few-shot
-    exchanges (respond / clarify / get_balance / new_address / create_tx).
+    ``v, intent, params``; the closed intent list (thirteen intents as of
+    the TCK-TX-SELF-001 v0 extension) with usage guidance; the
+    quote-verbatim rule for FACTS values; the no-secrets (watch-only) rule;
+    and seven few-shot exchanges (respond / clarify / get_balance /
+    new_address / create_tx / self_transfer-split / self_transfer-
+    consolidate). The self_transfer examples carry NO address or outpoint —
+    the money plan is engine-derived, never model-authored.
 
     Intentionally parameter-free: intent membership and the wire format
     are owned by the protocol subsystem and the GBNF grammar — this text

@@ -114,8 +114,14 @@ class TestSummarization:
         prompt = loop.context_prompt("what's next?", {})
         # Pinned budget: system + FACTS + summary(≤400) + recent(≤20) + user
         # turn stays comfortably inside the ADR-0006 ≤8K-token budget. 300
-        # turns never push it past this character bound.
-        assert len(prompt) < 9000
+        # turns never push it past this character bound. Ceiling moved
+        # 9000 → 10500 by TCK-TX-SELF-001: the fixed system prompt grew ~1K
+        # chars (the self_transfer intent line + two few-shots), lifting the
+        # whole assembled prompt; ~10.5K chars ≈ ~5.2K tokens, still well
+        # inside the 8K budget and the bound's POINT (it is independent of
+        # session length — the summary + recent window cap it, not the 300
+        # turns).
+        assert len(prompt) < 10500
         assert "SESSION SUMMARY" in prompt
         assert "CONVERSATION SO FAR" in prompt
         # The recent window holds the last 20 turns verbatim.

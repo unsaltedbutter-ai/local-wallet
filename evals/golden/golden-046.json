@@ -1,0 +1,8 @@
+{
+  "id": "golden-046",
+  "prompt": "merge my utxos",
+  "expectation": {
+    "intent": "clarify",
+    "question_nonempty": true
+  }
+}

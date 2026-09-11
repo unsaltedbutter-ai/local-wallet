@@ -180,13 +180,14 @@ class TestSystemPrompt:
         for intent in IntentName:
             assert intent.value in prompt
 
-    def test_contains_all_twelve_intent_names(self) -> None:
+    def test_contains_all_thirteen_intent_names(self) -> None:
         # Explicit pin (not just enum iteration): the Phase 1 v0 extension
         # added get_history / get_utxos / new_address, the Phase 2 v0
         # extension added create_tx / confirm_tx, the Phase 3 v0
-        # extension added sign_tx / broadcast_tx / tx_status, and the
-        # Phase 4 v0 extension added node_status — grammar, schema and
-        # prompt must move together (ADR-0002/0013 lockstep).
+        # extension added sign_tx / broadcast_tx / tx_status, the Phase 4
+        # v0 extension added node_status, and the TCK-TX-SELF-001 v0
+        # extension added self_transfer — grammar, schema and prompt must
+        # move together (ADR-0002/0013 lockstep).
         prompt = build_system_prompt()
         for name in (
             "respond",
@@ -201,6 +202,7 @@ class TestSystemPrompt:
             "broadcast_tx",
             "tx_status",
             "node_status",
+            "self_transfer",
         ):
             assert name in prompt
 
@@ -262,6 +264,22 @@ class TestSystemPrompt:
             envelope = validate_payload(raw)  # verbatim prompt text
             seen_intents.add(envelope.intent.value)
         assert {"respond", "clarify", "get_balance", "new_address"} <= seen_intents
+        # TCK-TX-SELF-001: both self_transfer few-shots must validate AND
+        # carry no address/outpoint material (the engine derives the plan).
+        assert "self_transfer" in seen_intents
+        self_examples = [
+            raw
+            for raw in examples
+            if validate_payload(raw).intent.value == "self_transfer"
+        ]
+        assert len(self_examples) >= 2
+        for raw in self_examples:
+            params = validate_payload(raw).params
+            assert params.model_dump() in (
+                {"mode": "split", "parts": 3},
+                {"mode": "consolidate", "below_size_sats": 100000, "fee_target": "slow"},
+            )
+            assert "bc1" not in raw and "txid" not in raw
 
     def test_new_address_few_shot_matches_grammar_key_order(self) -> None:
         prompt = build_system_prompt()
@@ -284,9 +302,11 @@ class TestSystemPrompt:
         # must stay a small fraction of it (~2 chars/token -> well under 6K).
         # Ceiling raised 6000 → 6300 by TCK-FIAT-001: the pre-change prompt
         # sat at 5988 chars (7 of headroom), so the mandatory fiat-phrasing
-        # guidance line could not fit without moving the guard. 6300 chars
-        # (~3.1K tokens) is still a small fraction of the 8K budget.
-        assert len(build_system_prompt()) < 6300
+        # guidance line could not fit without moving the guard. Raised
+        # 6300 → 7300 by TCK-TX-SELF-001: the self_transfer intent line +
+        # two few-shots (~1000 chars) ship the closed protocol; ~7300 chars
+        # is still ~3.6K tokens, a small fraction of the 8K budget.
+        assert len(build_system_prompt()) < 7300
 
 
 # ------------------------------------------------------------------- grammar

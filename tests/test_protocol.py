@@ -46,6 +46,7 @@ from localwallet.protocol import (
     NodeStatusParams,
     OutcomeStatus,
     RespondParams,
+    SelfTransferParams,
     SignTxParams,
     TxStatusParams,
     dispatch,
@@ -97,6 +98,17 @@ ACCEPT_CASES = {
     "tx_status": {"v": 0, "intent": "tx_status", "params": {"txid": "a" * 64}},
     # Phase 4 v0 extension (ADR-0002): the advise-only node-doctor intent.
     "node_status": {"v": 0, "intent": "node_status", "params": {}},
+    # TCK-TX-SELF-001 v0 extension: explicit self-transfer (split/consolidate).
+    "self_transfer_split": {
+        "v": 0,
+        "intent": "self_transfer",
+        "params": {"mode": "split", "parts": 4},
+    },
+    "self_transfer_consolidate": {
+        "v": 0,
+        "intent": "self_transfer",
+        "params": {"mode": "consolidate", "below_size_sats": 100000, "fee_target": "slow"},
+    },
 }
 
 PARAMS_TYPES = {
@@ -112,6 +124,7 @@ PARAMS_TYPES = {
     IntentName.BROADCAST_TX: BroadcastTxParams,
     IntentName.TX_STATUS: TxStatusParams,
     IntentName.NODE_STATUS: NodeStatusParams,
+    IntentName.SELF_TRANSFER: SelfTransferParams,
 }
 
 HANDLER_RESULTS = {
@@ -127,6 +140,7 @@ HANDLER_RESULTS = {
     IntentName.BROADCAST_TX: {"broadcast": True},
     IntentName.TX_STATUS: {"status": True},
     IntentName.NODE_STATUS: {"detected": True},
+    IntentName.SELF_TRANSFER: {"staged": True},
 }
 
 
@@ -192,15 +206,16 @@ def test_intent_enum_is_the_closed_world():
         "broadcast_tx",
         "tx_status",
         "node_status",
+        "self_transfer",
     }
-    assert len(IntentName) == 12
+    assert len(IntentName) == 13
 
 
 def test_intent_registry_is_frozen_and_complete():
     assert set(INTENT_REGISTRY.keys()) == set(IntentName)
     # explicit count: registry completeness is pinned, not incidental
-    # (Phase 4 v0 extension: 11 → 12)
-    assert len(INTENT_REGISTRY) == 12
+    # (TCK-TX-SELF-001 v0 extension: 12 → 13)
+    assert len(INTENT_REGISTRY) == 13
     for intent, model in INTENT_REGISTRY.items():
         assert model is PARAMS_TYPES[intent]
     # frozen mapping: mutation is refused
@@ -213,7 +228,7 @@ def test_intent_registry_is_frozen_and_complete():
 def test_business_rules_cover_every_intent():
     assert set(BUSINESS_RULES.keys()) == set(IntentName)
     # explicit count: registry completeness is pinned, not incidental
-    assert len(BUSINESS_RULES) == 12
+    assert len(BUSINESS_RULES) == 13
     for intent in IntentName:
         assert callable(BUSINESS_RULES[intent])
     # frozen mapping: mutation is refused (symmetry with INTENT_REGISTRY)

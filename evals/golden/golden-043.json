@@ -1,0 +1,11 @@
+{
+  "id": "golden-043",
+  "prompt": "split my big utxo into 4",
+  "expectation": {
+    "intent": "self_transfer",
+    "params": {
+      "mode": "split",
+      "parts": 4
+    }
+  }
+}

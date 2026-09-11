@@ -1,0 +1,11 @@
+{
+  "id": "golden-044",
+  "prompt": "consolidate all my coins under 50000 sats into one",
+  "expectation": {
+    "intent": "self_transfer",
+    "params": {
+      "mode": "consolidate",
+      "below_size_sats": 50000
+    }
+  }
+}

@@ -184,6 +184,7 @@ from localwallet.protocol import (
     NewAddressParams,
     NodeStatusParams,
     RespondParams,
+    SelfTransferParams,
     SignTxParams,
     TxStatusParams,
 )
@@ -193,6 +194,7 @@ from localwallet.signer.hwi import DeviceError, HwiUsbSigner
 from localwallet.store import (
     ADDRESS_ALLOCATED,
     BRANCH_CHANGE,
+    BRANCH_RECEIVE,
     COIN_NOTE_MAX_CHARS,
     COIN_TAGS,
     DIR_IN,
@@ -205,6 +207,7 @@ from localwallet.store import (
     UtxoRecord,
     WalletRecord,
 )
+from localwallet.tx.dust import dust_threshold
 from localwallet.tx.flow import (
     PENDING_TTL_S,
     ConfirmGate,
@@ -230,6 +233,7 @@ from localwallet.tx.selection import (
     InsufficientFundsError,
     SelectionError,
     coin_partition,
+    estimate_tx_vsize,
     select_coins,
 )
 from localwallet.ui.onboarding import (
@@ -241,7 +245,7 @@ from localwallet.ui.onboarding import (
     ask_watch_key,
 )
 from localwallet.wallet import scan as wallet_scan
-from localwallet.wallet.derivation import BranchDeriver
+from localwallet.wallet.derivation import BranchDeriver, derive_addresses
 from localwallet.wallet.descriptor import (
     MAINNET_COIN_TYPE,
     SCRIPT_PURPOSES,
@@ -1188,6 +1192,37 @@ _GUIDANCE_AMBIGUOUS: Final[str] = (
     "transaction, or \"cancel\" to discard it."
 )
 
+# ---------------------------------------------------------- self-transfer
+# (TCK-TX-SELF-001: explicit on-demand reshuffles — SPLIT one coin into N
+# equal parts / CONSOLIDATE coins below a size into one. Every value below
+# is dispatcher-owned code text; the plan's numbers reach the terminal ONLY
+# through the card renderer, verbatim from the handler result dict.)
+
+#: Input ceiling for ONE explicit consolidate (TCK-TX-SELF-001). The
+#: ADR-0012 step-5 guard (≤4 added inputs) is a *spend-time* fold policy —
+#: an explicit on-demand merge legitimately sweeps more, bounded here at a
+#: documented constant: 256 P2WPKH inputs ≈ 17.5k vB, comfortably inside
+#: Core standardness (100k vB) even with the fastest-rung fee bumps.
+#: ponytail: hard cap — a wallet holding more sub-threshold coins runs a
+#: second consolidate after the first confirms; chunked auto-repeat when
+#: someone actually has >256 dust coins at once.
+MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS: Final[int] = 256
+
+#: Honest refusals (value-free; the user-facing InsufficientFunds line is
+#: the existing ADR-0012 exception, rendered from structured keys).
+_SELF_NOTHING_BELOW: Final[str] = (
+    "None of your coins are smaller than that — nothing to consolidate."
+)
+_SELF_SPLIT_BELOW_DUST: Final[str] = (
+    "That coin is too small to split into that many pieces — each piece "
+    "would fall below the network's minimum output size. Try fewer pieces."
+)
+_SELF_TOO_MANY_SMALL: Final[str] = (
+    f"Too many small coins to merge in one transaction (over "
+    f"{MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS}) — say a smaller size to "
+    "merge a share of them."
+)
+
 
 @dataclass
 class SendSession:
@@ -1512,6 +1547,16 @@ def build_dispatch_table(
         IntentName.NODE_STATUS: _make_node_status_handler(
             app_settings,
             node_detect_fn=node_detect_fn,
+        ),
+        IntentName.SELF_TRANSFER: _make_self_transfer_handler(
+            store,
+            wallet_id,
+            parsed,
+            tx_flow,
+            fee_estimator if fee_estimator is not None else FeeEstimator(client),
+            scan_fn,
+            seconds_since_last_block_fn=seconds_since_last_block_fn,
+            scan_gate=scan_gate,
         ),
     }
 
@@ -1966,17 +2011,33 @@ def _pending_tx_facts(
     pending = flow.pending
     if pending is None:  # defensive: CREATED always carries a pending tx
         return {}
-    facts: dict[str, object] = {
+    eta = _eta_for(pending.fee_target, seconds_since_last_block_fn=seconds_since_last_block_fn)
+    if pending.self_payment_indices is not None:
+        # TCK-TX-SELF-001: a self-transfer plan carries no user-stated
+        # recipient to re-quote (confirm_tx needs only the tx_ref) — the
+        # engine-derived destination addresses stay OUT of the model
+        # transcript; the plan is described by the code-owned summary
+        # (:func:`_self_plan_words`), never by anything the model could
+        # "correct" into a new destination.
+        facts: dict[str, object] = {
+            "pending_tx_ref": pending.tx_ref,
+            "pending_tx_plan": _self_plan_words(pending),
+            "pending_tx_expires_in_s": _pending_remaining_s(flow),
+        }
+        if eta is not None:
+            facts["pending_tx_eta_minutes"] = eta["eta_minutes"]
+            facts["pending_tx_eta_wording"] = eta["eta_wording"]
+        return facts
+    facts_all: dict[str, object] = {
         "pending_tx_ref": pending.tx_ref,
         "pending_tx_amount_sats": pending.amount_sats,
         "pending_tx_recipient": pending.recipient,
         "pending_tx_expires_in_s": _pending_remaining_s(flow),
     }
-    eta = _eta_for(pending.fee_target, seconds_since_last_block_fn=seconds_since_last_block_fn)
     if eta is not None:
-        facts["pending_tx_eta_minutes"] = eta["eta_minutes"]
-        facts["pending_tx_eta_wording"] = eta["eta_wording"]
-    return facts
+        facts_all["pending_tx_eta_minutes"] = eta["eta_minutes"]
+        facts_all["pending_tx_eta_wording"] = eta["eta_wording"]
+    return facts_all
 
 
 def _flow_facts(
@@ -2015,6 +2076,14 @@ def _flow_facts(
         )
     confirmed = flow.confirmed
     if flow.state is TxFlowStatus.CONFIRMED and confirmed is not None:
+        if confirmed.self_payment_indices is not None:
+            # TCK-TX-SELF-001: same transcript discipline as CREATED — a
+            # self-transfer plan never injects its engine-derived
+            # addresses; sign_tx quotes only the confirmed ref.
+            return {
+                "confirmed_tx_ref": confirmed.tx_ref,
+                "confirmed_tx_plan": _self_plan_words(confirmed),
+            }
         return {
             "confirmed_tx_ref": confirmed.tx_ref,
             "confirmed_tx_amount_sats": confirmed.amount_sats,
@@ -2080,6 +2149,24 @@ def _tx_pending_result(
                 "expires_in_s": _pending_remaining_s(flow),
             }
         )
+        if pending.self_payment_indices is not None:
+            # TCK-TX-SELF-001: the pending is a self-transfer PLAN — the
+            # re-show must render the plan (N × each, sources, fee), never
+            # a single-recipient card that would show one output of the
+            # reshuffle as if it were the whole send. The uniform per-part
+            # value is amount_sats // parts BY CONSTRUCTION (the handler
+            # stages equal payment outputs; consolidate has parts == 1).
+            parts = len(pending.self_payment_indices)
+            result.update(
+                {
+                    "self_transfer": True,
+                    "self_mode": "split" if parts > 1 else "consolidate",
+                    "self_parts": parts,
+                    "self_each_sats": pending.amount_sats // parts,
+                    "self_inputs_total_sats": pending.amount_sats + pending.fee_sats,
+                    "self_new_addresses": parts,
+                }
+            )
         if eta is not None:
             result["eta_blocks"] = eta["eta_blocks"]
             result["eta_minutes"] = eta["eta_minutes"]
@@ -2216,6 +2303,12 @@ def _make_create_tx_handler(
         staged = flow.pending if flow.state is TxFlowStatus.CREATED else None
         requote = (
             staged is not None
+            # TCK-TX-SELF-001: a staged SELF-TRANSFER plan is never a
+            # re-quote target — its first output address (what a matching
+            # create_tx would quote) is engine-derived, not a user-stated
+            # destination; replacing it with a single send would silently
+            # change the plan's shape. Refuse with the pending card.
+            and staged.self_payment_indices is None
             and params.recipient == staged.recipient
             and params.amount_sats is not None
             and params.amount_sats == staged.amount_sats
@@ -2549,6 +2642,386 @@ def _make_create_tx_handler(
     return handler
 
 
+def _self_plan_words(pending: PendingTx) -> str:
+    """The code-owned plan summary for FACTS (TCK-TX-SELF-001).
+
+    Describes a staged self-transfer WITHOUT naming any address (the
+    model never quotes one — the flow derives all destinations
+    engine-side); counts and the uniform per-output sats value come from
+    the dispatcher-owned record. Rendered through
+    :func:`~localwallet.agent.context.render_facts` like every fact.
+    """
+    n = len(pending.self_payment_indices or ())
+    if n > 1:
+        return (
+            f"self-transfer split into {n} equal parts of "
+            f"{pending.amount_sats // n} sats (own new addresses)"
+        )
+    return (
+        f"self-transfer consolidate {pending.inputs_count} coins into 1 "
+        f"part of {pending.amount_sats} sats (own new address)"
+    )
+
+
+def _make_self_transfer_handler(
+    store: Store,
+    wallet_id: int,
+    parsed: ParsedKey,
+    flow: TxFlow,
+    fee_estimator: FeeEstimator,
+    scan_fn: Callable[[], object],
+    *,
+    seconds_since_last_block_fn: Callable[[], int | None] | None = None,
+    scan_gate: StartupScan | None = None,
+) -> Handler:
+    """Create the ``self_transfer`` handler: stage a plan-owned reshuffle.
+
+    Explicit on-demand self-transfer (TCK-TX-SELF-001): SPLIT one coin into
+    N equal parts, or CONSOLIDATE coins below a stated size into one. The
+    envelope carries NO address, NO outpoint, NO recipient — every money
+    value below is DERIVED here (dispatcher-owned, deterministic); the
+    model only relays the two numbers the user stated. The staged flow is
+    the SAME dispatcher-owned state machine as ``create_tx``
+    (``TxFlow.create`` → CREATED → dual-key confirm → sign → broadcast —
+    ADR-0013 untouched; the confirm/sign/broadcast whitelists and handlers
+    never learn that this record is special beyond
+    ``PendingTx.self_payment_indices``).
+
+    Deterministic plan (documented engine policy, pinned by tests):
+
+    - **SPLIT** (``parts``): the input is the wallet's LARGEST single UTXO
+      — canonical order ``(value_sats, txid, vout)`` descending, so ties
+      break deterministically; the largest coin is the one the user asks
+      to shard ("split my big utxo into N"). The explicit request
+      overrides ADR-0012's shatter-preservation default by design. N
+      outputs go to N FRESH receive-branch (branch 0) addresses — the
+      branch documented choice: these ARE user-facing coins (what
+      ``new_address`` hands out), not fee-sweep change; consecutive
+      indices from branch-0 ``next_index``. The per-part value is uniform:
+      ``each = (V − fee) // parts`` with the sub-part remainder FOLDED INTO
+      THE FEE (outputs stay exactly equal — the card's ``N × each`` is
+      literally true; fold is bounded by ``parts − 1`` sats). No change
+      output.
+    - **CONSOLIDATE** (``below_size_sats``): the candidate set is every
+      UTXO with ``value_sats`` STRICTLY below the threshold, in canonical
+      order, capped at :data:`MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS`.
+      Privacy pools (TCK-UTXO-002) are RESPECTED: coins are partitioned
+      kyc-side vs other-side exactly like ``create_tx``'s tag join; a
+      consolidate NEVER mixes pool sides. If the below-threshold set spans
+      both pools, this run consolidates the pool with the larger total
+      value (ties → other-side first, the fixed pool order) and the result
+      carries ``self_other_side_count`` for an honest "more small coins on
+      the other side" card line — the documented pick (never refuse a
+      mergeable wallet, never silently mix). One output to ONE fresh
+      receive address, value ``total − fee``; no change.
+    - The fee bid rides the SAME estimator ladder as ``create_tx``
+      (``fee_target`` rung; MEDIUM default when neither knob is given —
+      no ``fee_rate_sat_vb`` exists on this intent; an internal reshuffle
+      never rides the explicit-rate override).
+
+    Bounds / fail-closed (every refusal BEFORE any allocation or staging;
+    a staged plan only ever reflects a fully successful build):
+
+    - First-scan gate (ADR-0022 decision 6): refusal identical to
+      ``create_tx`` while the first scan is incomplete (interaction
+      unchanged).
+    - Anything already pending (flow ``CREATED``) → the ``tx_pending``
+      refusal with the PENDING plan re-shown — self-transfer offers no
+      same-plan re-quote (a re-quote would re-derive fresh destination
+      indices; changing speed is cancel + re-ask, stated up front).
+    - Empty wallet / nothing below the threshold / the split coin cannot
+      fund ``fee + parts × dust`` → honest value-free refusals (the
+      below-dust split rides the friendly InsufficientFunds-style
+      :data:`_SELF_SPLIT_BELOW_DUST` line; an empty consolidation set is
+      :data:`_SELF_NOTHING_BELOW`; over-cap is :data:`_SELF_TOO_MANY_SMALL`;
+      a consolidation that cannot clear fee+dust reports the existing
+      structured ``insufficient_funds`` pair — user-facing UI, ADR-0012).
+    - Per-output dust is double-checked: pre-build here (fail closed with
+      the friendly line) AND again inside :func:`build_unsigned_psbt`
+      (computed from the script size, never a constant).
+
+    Store discipline mirrors ``create_tx`` step 5: destination addresses
+    are DERIVED while planning, allocated only AFTER the successful build
+    and BEFORE staging (a failed build writes nothing; a mid-bookkeeping
+    failure leaves no pending and self-heals on retry per ADR-0009).
+    """
+
+    def _inputs_for(utxo_rows: list[UtxoRecord]) -> tuple[list[PsbtInputSource], dict[str, object] | None]:
+        """Map store rows to PSBT input sources (same containment as
+        ``create_tx`` step 6): every row must resolve to THIS wallet's
+        derivation record or the plan refuses value-free."""
+        inputs: list[PsbtInputSource] = []
+        try:
+            for utxo in utxo_rows:
+                if not utxo.address:
+                    return [], {"error": "internal", "detail": "cached utxo has no address record"}
+                record = store.get_by_address(utxo.address)
+                if (
+                    record is None
+                    or record.wallet_id != wallet_id
+                    or record.branch not in (0, 1)
+                ):
+                    return [], {
+                        "error": "internal",
+                        "detail": "cached utxo has no usable derivation record",
+                    }
+                inputs.append(
+                    PsbtInputSource(
+                        txid=utxo.txid,
+                        vout=utxo.vout,
+                        value_sats=utxo.value_sats,
+                        script_pubkey=bytes(address_to_scriptpubkey(utxo.address).data),
+                        branch=record.branch,
+                        index=record.index,
+                    )
+                )
+        except (StoreError, sqlite3.Error) as exc:
+            return [], _store_error(exc)
+        return inputs, None
+
+    def handler(envelope: Envelope) -> dict[str, object]:
+        params = envelope.params
+        if not isinstance(params, SelfTransferParams):
+            return {"error": "internal", "detail": "self_transfer params shape mismatch"}
+
+        # 0. First-scan gate (ADR-0022 decision 6) — same line, same
+        #    position as create_tx: refusal BEFORE any network/store work.
+        if scan_gate is not None and scan_gate.first_scan_incomplete:
+            return {"error": "wallet_loading", "detail": WALLET_LOADING_REFUSAL}
+
+        # 1. Pending guard: a staged plan is never silently replaced by
+        #    another destructive plan (no self-transfer re-quote; see the
+        #    docstring). Past-the-gate states stay refused (flow.create's
+        #    own FlowError backstops, same shape as create_tx).
+        if flow.state is TxFlowStatus.CREATED:
+            return _tx_pending_result(
+                flow, seconds_since_last_block_fn=seconds_since_last_block_fn
+            )
+
+        # 2. Fee bid: the estimator ladder (the ONLY chain call this flow
+        #    makes — exactly like create_tx; no new chain surface).
+        target = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.MEDIUM
+        try:
+            fee_rate = fee_estimator.estimate(target).sat_per_vb
+        except ChainError as exc:
+            return {"error": "chain_unavailable", "detail": str(exc)}
+
+        # 3. UTXO snapshot with the lazy first scan (same path as
+        #    create_tx step 4).
+        try:
+            if store.get_sync_state(wallet_id, wallet_scan.CURSOR_KEY) is None:
+                try:
+                    scan_fn()
+                except (ChainError, wallet_scan.ScanError, WatchKeyError) as exc:
+                    # detail is scrubbed by the chain/scan layers — safe verbatim.
+                    return {"error": "chain_unavailable", "detail": str(exc)}
+            utxos = store.get_utxos_for_wallet(wallet_id)
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+
+        # 4. Fresh destination indices: branch-0 next_index read ONCE;
+        #    DERIVE (pure) now, ALLOCATE only after the build succeeds.
+        try:
+            start_index = store.get_derivation(wallet_id, BRANCH_RECEIVE).next_index
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+
+        split = params.mode == "split"
+        parts = params.parts if split else 1
+        assert parts is not None  # schema+layer-3 guarantee parts for split
+        other_side_count: int | None = None  # consolidate cross-pool hint
+
+        try:
+            destinations = derive_addresses(parsed, BRANCH_RECEIVE, start_index, parts)
+            dest_scripts = [bytes(address_to_scriptpubkey(d.address).data) for d in destinations]
+        except Exception:  # noqa: BLE001 — containment: deriver/embit address encoding raises varied errors; re-raising could leak key material, and every path is value-free
+            return {"error": "internal", "detail": "fresh receive derivation failed"}
+
+        own_dust = dust_threshold(dest_scripts[0])
+
+        if split:
+            if not utxos:
+                # Empty wallet: needed = fee for the changeless 1-in/N-out
+                # shape + the N dust floors (user-facing UI, ADR-0012).
+                needed = estimate_tx_vsize(1, dest_scripts, None) * fee_rate + parts * own_dust
+                return {
+                    "error": "insufficient_funds",
+                    "needed_sats": needed,
+                    "available_sats": 0,
+                }
+            # Engine policy (documented): the LARGEST single coin, canonical
+            # (value_sats, txid, vout) descending — ties break the same way
+            # every other selection here does.
+            coin = max(
+                utxos, key=lambda u: (u.value_sats, u.txid.lower(), u.vout)
+            )
+            input_rows = [coin]
+            inputs_total = coin.value_sats
+            vsize = estimate_tx_vsize(1, dest_scripts, None)
+            fee_floor = vsize * fee_rate
+            each = (inputs_total - fee_floor) // parts
+            if each < own_dust:
+                # pre-build dust refusal, value-free (the friendly line):
+                # N × each would each sit below the network's minimum.
+                return {"error": "self_split_below_dust"}
+            payment_values = [each] * parts
+        else:
+            threshold = params.below_size_sats
+            assert threshold is not None  # layer 2+3 guarantee for consolidate
+            below = [
+                u for u in utxos if u.value_sats < threshold
+            ]
+            if not below:
+                return {"error": "self_nothing_below"}
+            # Privacy pools (TCK-UTXO-002): partition by stored coin tags,
+            # NEVER merge across sides. The larger-total pool wins; ties go
+            # other-side first (the fixed pool order).
+            try:
+                label_rows = store.get_coin_labels(wallet_id)
+            except (StoreError, sqlite3.Error) as exc:
+                return _store_error(exc)
+            kyc_outpoints = {
+                (row.txid, row.vout)
+                for row in label_rows
+                if coin_partition(row.tags)[0]
+            }
+            kyc_pool = [u for u in below if (u.txid, u.vout) in kyc_outpoints]
+            other_pool = [u for u in below if (u.txid, u.vout) not in kyc_outpoints]
+            other_total = sum(u.value_sats for u in other_pool)
+            kyc_total = sum(u.value_sats for u in kyc_pool)
+            if kyc_pool and other_pool:
+                chosen = other_pool if other_total >= kyc_total else kyc_pool
+                skipped = kyc_pool if other_total >= kyc_total else other_pool
+                other_side_count: int | None = len(skipped)
+            else:
+                chosen = kyc_pool or other_pool
+                other_side_count = None
+            if len(chosen) > MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS:
+                return {"error": "self_too_many_small"}
+            chosen.sort(key=lambda u: (u.value_sats, u.txid.lower(), u.vout))
+            input_rows = chosen
+            inputs_total = sum(u.value_sats for u in chosen)
+            vsize = estimate_tx_vsize(len(chosen), dest_scripts[:1], None)
+            fee_sats = vsize * fee_rate
+            out_value = inputs_total - fee_sats
+            if out_value < own_dust:
+                # User-facing UI figures (ADR-0012), never a log-bound detail.
+                return {
+                    "error": "insufficient_funds",
+                    "needed_sats": fee_sats + own_dust,
+                    "available_sats": inputs_total,
+                }
+            payment_values = [out_value]
+
+        # 5. Inputs → PSBT sources (contained value-free on any mapping gap).
+        inputs, err = _inputs_for(input_rows)
+        if err is not None:
+            return err
+
+        # 6. Build via the SAME tx engine as create_tx. payment_derivations
+        #    labels the fresh own outputs with their receive coordinates so
+        #    the signing device renders them as internal, not external
+        #    destinations (TCK-HW-003 discipline generalized; the builder
+        #    fail-closes if any claimed derivation does not match its
+        #    script). No change output: the plan's residue folds into fee.
+        purpose = SCRIPT_PURPOSES[parsed.script_type]
+        payment_derivations = [(BRANCH_RECEIVE, d.index) for d in destinations]
+        try:
+            psbt, meta = build_unsigned_psbt(
+                inputs,
+                list(zip(dest_scripts, payment_values, strict=True)),
+                None,
+                None,
+                account_key=parsed.hd_key,
+                account_fingerprint=parsed.hd_key.my_fingerprint,
+                account_path=(purpose + 2**31, MAINNET_COIN_TYPE + 2**31, 2**31),
+                payment_derivations=payment_derivations,
+            )
+            psbt_base64 = psbt_to_base64(psbt)
+        except PsbtError as exc:
+            return {"error": "psbt_failed", "detail": str(exc)}
+
+        # 7. Allocation bookkeeping — strictly AFTER the build, strictly
+        #    BEFORE staging (create_tx's discipline; ADR-0009 self-heal).
+        try:
+            store.upsert_batch(
+                [
+                    AddressRecord(
+                        wallet_id=wallet_id,
+                        branch=BRANCH_RECEIVE,
+                        index=d.index,
+                        address=d.address,
+                        script_type=parsed.script_type,
+                        status=ADDRESS_ALLOCATED,
+                    )
+                    for d in destinations
+                ]
+            )
+            for d in destinations:
+                store.allocate(wallet_id, BRANCH_RECEIVE, d.index)
+                store.bump_next_index(wallet_id, BRANCH_RECEIVE)
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+
+        # 8. Stage (flow owns tx_ref identity) — self_payment_indices marks
+        #    the record; the sign-time intent builder re-derives every
+        #    payment script from these indices (independent re-proof).
+        amount_total = sum(payment_values)
+        try:
+            pending = flow.create(
+                amount_sats=amount_total,
+                recipient=destinations[0].address,
+                fee_rate_sat_vb=fee_rate,
+                fee_sats=meta.expected_fee_sats,
+                psbt_base64=psbt_base64,
+                inputs_count=len(inputs),
+                vsize=meta.vsize,
+                fee_target=target.value,
+                change_sats=None,
+                self_payment_indices=tuple(d.index for d in destinations),
+            )
+        except FlowError:
+            # Unreachable single-threaded after the pending guard; fail
+            # closed with the pending card rather than double-staging.
+            return _tx_pending_result(
+                flow, seconds_since_last_block_fn=seconds_since_last_block_fn
+            )
+
+        eta = _eta_for(pending.fee_target, seconds_since_last_block_fn=seconds_since_last_block_fn)
+        result: dict[str, object] = {
+            "tx_ref": pending.tx_ref,
+            "amount_sats": pending.amount_sats,
+            "recipient": pending.recipient,
+            "fee_sats": pending.fee_sats,
+            "fee_rate_sat_vb": pending.fee_rate_sat_vb,
+            "vsize": pending.vsize,
+            "change_sats": None,
+            "inputs_count": pending.inputs_count,
+            "fee_target": pending.fee_target,
+            "expires_in_s": PENDING_TTL_S,
+            # Self-transfer plan display facts (terminal/renderer material
+            # ONLY — never a FACTS block, never the model transcript):
+            # the card names the SHAPE of the plan; every value verbatim
+            # from the handler's own computation.
+            "self_transfer": True,
+            "self_mode": "split" if split else "consolidate",
+            "self_parts": len(payment_values),
+            "self_each_sats": payment_values[0],
+            "self_inputs_total_sats": inputs_total,
+            "self_new_addresses": len(destinations),
+            # fee_target_defaulted is DELIBERATELY absent: a self-transfer
+            # card never pitches the one-shot speed offer (no re-quote path
+            # exists for a plan; a speed preference must be stated up front
+            # or reached by cancel + re-ask).
+            **({} if eta is None else eta),
+        }
+        if other_side_count:
+            result["self_other_side_count"] = other_side_count
+        return result
+
+    return handler
+
+
 def _make_confirm_tx_handler(flow: TxFlow, session: SendSession) -> Handler:
     """Create the ``confirm_tx`` handler: CREATED → CONFIRMED under the dual key.
 
@@ -2628,9 +3101,52 @@ def _intended_from_confirmed(
     our own record, not trusting external input; any inconsistency with
     the record's scalar fields raises, which the caller turns into a
     value-free internal error (fail closed, nothing signed).
+
+    SELF-TRANSFER RECORDS (TCK-TX-SELF-001): when the record carries
+    ``self_payment_indices``, every payment output is the wallet's OWN
+    receive address and there is NO change output. The intent is proven the
+    same independent way the change output is: each output's script is
+    RE-DERIVED from ``parsed`` at its recorded receive index and must match
+    the staged PSBT position-for-position (a drift between what we staged
+    and what the deriver produces fails closed before anything signs), and
+    ``amount_sats`` (the plan's TOTAL payment value, uniform per output by
+    the handler's construction) must equal the sum of the output values.
+    ``expected_recipient_outputs`` is then the WHOLE output list — the same
+    re-validation gate ``tx/revalidate.py`` applies to external sends, just
+    with every own address as an expected positional output.
     """
     psbt = PSBT.parse(base64.b64decode(confirmed.psbt_base64))
     outputs = [(bytes(out.script_pubkey.data), out.value) for out in psbt.tx.vout]
+
+    if confirmed.self_payment_indices is not None:
+        # Self-transfer: N own receive outputs, never any change.
+        indices = confirmed.self_payment_indices
+        if confirmed.change_sats is not None:
+            raise ValueError("self-transfer record must carry no change")
+        if len(outputs) != len(indices):
+            raise ValueError("confirmed record output count mismatch")
+        if not indices or confirmed.amount_sats % len(indices) != 0:
+            raise ValueError("self-transfer record payment total mismatch")
+        each = confirmed.amount_sats // len(indices)
+        if sum(value for _script, value in outputs) != confirmed.amount_sats:
+            raise ValueError("self-transfer record payment total mismatch")
+        receive_deriver = BranchDeriver(parsed, BRANCH_RECEIVE)
+        expected_recipients: list[tuple[bytes, int]] = []
+        for output, index in zip(outputs, indices, strict=True):
+            expected_script = bytes(address_to_scriptpubkey(receive_deriver.address(index)).data)
+            if output != (expected_script, each):
+                raise ValueError("confirmed record self-output mismatch")
+            expected_recipients.append(output)
+        return IntendedTx(
+            expected_recipient_outputs=tuple(expected_recipients),
+            expected_change=None,
+            expected_inputs_count=confirmed.inputs_count,
+            expected_fee_sats=confirmed.fee_sats,
+            expected_sequence=SEQUENCE_RBF_ENABLED,
+            expected_vsize_max=confirmed.vsize + 1,
+            tx_ref=confirmed.tx_ref,
+        )
+
     expected_len = 2 if confirmed.change_sats is not None else 1
     if len(outputs) != expected_len:
         raise ValueError("confirmed record output count mismatch")
@@ -2993,23 +3509,34 @@ def _make_broadcast_tx_handler(
         #    revalidated positional contract: change rides LAST when present
         #    (tx/psbt.py + the sign-time revalidation), and this SIGNED record
         #    is byte-frozen, so vout = count-1 is ours exactly when
-        #    change_sats is set. A send whose recipient is our own receive
-        #    address inherits nothing there (ponytail: honest-bounds edge —
-        #    the coin appears unlabeled on the next rescan and /label covers
-        #    it; full script-ownership matching is the provenance view's
-        #    problem, not this capture path's). Purely local bookkeeping —
-        #    labeling never causes network I/O — and it must never undo a
-        #    completed broadcast, so EVERY failure is contained value-free.
-        if confirmed is not None and confirmed.change_sats is not None:
+        #    change_sats is set. A self-transfer (TCK-TX-SELF-001) owns EVERY
+        #    output (fresh receive plan, no external destination) — ALL vouts
+        #    inherit, which is what keeps a consolidated/split coin on its
+        #    pool side after the reshuffle. A send whose recipient is our own
+        #    receive address inherits nothing there (ponytail: honest-bounds
+        #    edge — the coin appears unlabeled on the next rescan and /label
+        #    covers it; full script-ownership matching is the provenance
+        #    view's problem, not this capture path's). Purely local
+        #    bookkeeping — labeling never causes network I/O — and it must
+        #    never undo a completed broadcast, so EVERY failure is contained
+        #    value-free.
+        owned_vouts: tuple[int, ...] = ()
+        if confirmed is not None:
             try:
                 signed_psbt = PSBT.parse(base64.b64decode(signed.psbt_base64))
-                spent_inputs = tuple(
-                    (bytes(reversed(vin.txid)).hex(), vin.vout)
-                    for vin in signed_psbt.tx.vin
-                )
-                store.propagate_coin_lineage(
-                    wallet_id, txid, (len(signed_psbt.tx.vout) - 1,), spent_inputs
-                )
+                n_vouts = len(signed_psbt.tx.vout)
+                if confirmed.self_payment_indices is not None:
+                    owned_vouts = tuple(range(n_vouts))
+                elif confirmed.change_sats is not None:
+                    owned_vouts = (n_vouts - 1,)
+                if owned_vouts:
+                    spent_inputs = tuple(
+                        (bytes(reversed(vin.txid)).hex(), vin.vout)
+                        for vin in signed_psbt.tx.vin
+                    )
+                    store.propagate_coin_lineage(
+                        wallet_id, txid, owned_vouts, spent_inputs
+                    )
             except Exception:  # noqa: BLE001 — containment: embit/store errors vary; missed tag-inheritance is annotation loss, never a money or broadcast failure
                 result.setdefault(
                     "store_warning",
@@ -7596,6 +8123,19 @@ class ChainBackendFlow:
             w.flow, client, w.store, w.wallet.id
         )
         w.table[IntentName.TX_STATUS] = _make_tx_status_handler(client, w.flow)
+        # TCK-TX-SELF-001: self_transfer rides the fee estimator (the one
+        # chain call it makes), so it is rebuilt over the new client too —
+        # same scan_fn/gate threading as create_tx.
+        w.table[IntentName.SELF_TRANSFER] = _make_self_transfer_handler(
+            w.store,
+            w.wallet.id,
+            w.parsed,
+            w.flow,
+            FeeEstimator(client),
+            scan.scan_now if scan is not None else (lambda: None),
+            seconds_since_last_block_fn=lambda: _safe_time_since_last_block(client),
+            scan_gate=scan.gate if scan is not None else None,
+        )
 
 
 def _close_quietly(client: ChainClient) -> None:
@@ -9033,6 +9573,8 @@ def _print_turn(
         _print_new_address(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.CREATE_TX:
         _print_create_tx(turn.result or {}, output_fn, session=session)
+    elif envelope.intent is IntentName.SELF_TRANSFER:
+        _print_self_transfer(turn.result or {}, output_fn, session=session)
     elif envelope.intent is IntentName.CONFIRM_TX:
         _print_confirm_tx(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.SIGN_TX:
@@ -9211,6 +9753,153 @@ def _print_new_address(result: Mapping[str, object], output_fn: Callable[[str], 
     )
 
 
+def _print_self_plan(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    session: SendSession | None = None,
+) -> None:
+    """Render a staged self-transfer PLAN card (TCK-TX-SELF-001).
+
+    Same brief-card discipline as the send flow: every value comes verbatim
+    from the handler result dict (an absent/non-int numeric key renders an
+    explicit ``unavailable`` marker — never a fabricated 0, TCK-SEC-004
+    class); no address is ever named (the plan's destinations are internal
+    engine state, not user-review material — the DEVICE shows them, and
+    their count is all the card claims). Shared by the fresh
+    ``self_transfer`` card and the ``tx_pending`` re-show (so a plan that
+    pends while the user tries something else is re-shown AS THE PLAN it
+    is, never as a misleading one-recipient send). The full
+    ``/details`` render (adds Expires + Ref) is cached on ``session``
+    exactly like the send card's.
+    """
+    parts = _card_sats(result, "self_parts")
+    each = _card_sats(result, "self_each_sats")
+    in_total = _card_sats(result, "self_inputs_total_sats")
+    sources = _card_sats(result, "inputs_count")
+    mode = result.get("self_mode")
+    if isinstance(mode, str) and mode == "split" and parts is not None:
+        plan = f"Plan: split 1 coin into {parts} × {each or 'unavailable'} sats"
+        addr_count = _card_sats(result, "self_new_addresses")
+        plan += (
+            f" → {addr_count} fresh addresses"
+            if addr_count is not None
+            else " → fresh addresses"
+        )
+    else:
+        merged = (
+            f"{sources} small coin{'s' if sources != '1' else ''}"
+            if sources is not None
+            else "small coins"
+        )
+        plan = (
+            f"Plan: merge {merged} into 1 × {each or 'unavailable'} sats "
+            "(1 fresh address)"
+        )
+    in_line = (
+        f"In: {in_total} sats" if in_total is not None else "In: unavailable"
+    )
+    if sources is not None:
+        in_line += f" from {sources} {'source' if sources == '1' else 'sources'}"
+    fee_sats = _card_sats(result, "fee_sats")
+    fee = "Fee: unavailable" if fee_sats is None else f"Fee: {fee_sats} sats"
+    if fee_sats is not None:
+        rate = _card_sats(result, "fee_rate_sat_vb")
+        if rate is not None:
+            fee += f" · {rate} sat/vB"
+        vsize = _card_sats(result, "vsize")
+        if vsize is not None:
+            fee += f" × {vsize} vB"
+        target_word = result.get("fee_target")
+        if isinstance(target_word, str) and target_word:
+            fee += f" · {target_word}"
+        eta_wording = result.get("eta_wording")
+        if isinstance(eta_wording, str) and eta_wording:
+            # Verbatim chain/eta.py hedge appended — never re-punctuated.
+            fee += f" — ETA {eta_wording}"
+    lines: list[str] = [_CARD_ASK_LINE, plan, in_line, fee]
+    other = _card_sats(result, "self_other_side_count")
+    if other is not None:
+        # Honest cross-pool note (the privacy pools are never mixed — this
+        # run consolidated one side; the other side's small coins remain
+        # for a second consolidate). Count only, no amounts.
+        lines.append(
+            f"Also {other} small coin{'s' if other != '1' else ''} sit among "
+            "your other marked coins — consolidate again after this to "
+            "merge those too."
+        )
+    lines.append(_CARD_DETAILS_TAIL)
+    if session is not None:
+        # The /details full render: plan lines minus the tail, plus
+        # Expires/Ref (the brief card demotes them, same as the send card).
+        full = list(lines[:-1])
+        expires = result.get("expires_in_s")
+        if isinstance(expires, int) and not isinstance(expires, bool):
+            full.append(f"Expires: ~{expires // 60} min")
+        ref = result.get("tx_ref")
+        if isinstance(ref, str) and ref:
+            full.append(f"Ref: {ref}")
+        session.card_render = full
+    for line in lines:
+        output_fn(sanitize_tool_output(line))
+
+
+def _print_self_transfer(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    *,
+    session: SendSession | None = None,
+) -> None:
+    """Narrate a ``self_transfer`` outcome (TCK-TX-SELF-001).
+
+    Success → the plan card (:func:`_print_self_plan`). The honest
+    value-free refusals print their dispatcher-owned lines;
+    ``insufficient_funds`` reuses the friendly needed/have line (user-facing
+    amounts, ADR-0012 — never a log-bound detail); ``tx_pending`` re-shows
+    whatever plan/send currently pends (through the same shared renderers
+    as ``create_tx``). Everything else goes through :func:`_error_line`.
+    """
+    error = result.get("error")
+    if error is None:
+        _print_self_plan(result, output_fn, session)
+        return
+    if error == "insufficient_funds":
+        output_fn(
+            sanitize_tool_output(
+                f"Insufficient funds: need {result.get('needed_sats', 0)} sats, "
+                f"have {result.get('available_sats', 0)} sats."
+            )
+        )
+        return
+    if error == "self_nothing_below":
+        output_fn(sanitize_tool_output(_SELF_NOTHING_BELOW))
+        return
+    if error == "self_split_below_dust":
+        output_fn(sanitize_tool_output(_SELF_SPLIT_BELOW_DUST))
+        return
+    if error == "self_too_many_small":
+        output_fn(sanitize_tool_output(_SELF_TOO_MANY_SMALL))
+        return
+    if error == "tx_pending":
+        if result.get("self_transfer") is True:
+            output_fn(sanitize_tool_output(_GUIDANCE_STILL_PENDING))
+            _print_self_plan(result, output_fn, session)
+            return
+        notice = result.get("rate_notice")
+        if notice == "ceiling":
+            output_fn(sanitize_tool_output(_CARD_RATE_CEILING))
+            return
+        if notice == "floor":
+            output_fn(sanitize_tool_output(_CARD_RATE_FLOOR))
+            return
+        output_fn(sanitize_tool_output(_GUIDANCE_STILL_PENDING))
+        _print_brief_card(result, output_fn, session)
+        return
+    if error == "wallet_loading":
+        output_fn(sanitize_tool_output(str(result.get("detail", "")) or WALLET_LOADING_REFUSAL))
+        return
+    output_fn(sanitize_tool_output(_error_line(result, "Could not prepare the coin reshuffle")))
+
+
 def _print_create_tx(
     result: Mapping[str, object],
     output_fn: Callable[[str], None],
@@ -9385,6 +10074,14 @@ def _print_brief_card(
     The full classic nine-line render of the same result is cached on
     ``session`` for ``/details``.
     """
+    # TCK-TX-SELF-001: a re-shown pending that is a self-transfer PLAN (the
+    # user tried create_tx while a reshuffle pends) renders as its plan —
+    # never as a single-recipient card that would misrepresent N outputs
+    # as one destination. Checked BEFORE the full-render cache so the
+    # misleading classic card is never what /details would reprint.
+    if result.get("self_transfer") is True:
+        _print_self_plan(result, output_fn, session)
+        return
     if session is not None:
         full: list[str] = []
         _print_confirmation_card(result, full.append)

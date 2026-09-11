@@ -196,6 +196,7 @@ def build_unsigned_psbt(
     account_fingerprint: bytes,
     account_path: Sequence[int],
     change_index: int | None = None,
+    payment_derivations: Sequence[tuple[int, int]] | None = None,
     locktime: int = 0,
     sequence: int = SEQUENCE_RBF_ENABLED,
 ) -> tuple[PSBT, PsbtMeta]:
@@ -229,6 +230,20 @@ def build_unsigned_psbt(
              the change output's bip32 derivation so the signing device
              recognizes the change as its own. Ignored when there is no
              change output.
+        payment_derivations: TCK-TX-SELF-001 — optional ``(branch, index)``
+             coordinates, one per recipient IN ORDER, for payment outputs
+             that are the wallet's OWN addresses (the self-transfer plan's
+             fresh receive outputs). Each child pubkey is re-derived from
+             the account key and its hash160 MUST equal that output's
+             witness program — a mismatch raises (fail closed), so the
+             parameter can CONFIRM ownership of the wallet's own scripts,
+             never label a foreign output as ours. Devices use these
+             BIP174 output derivation fields to render own outputs as
+             internal (the TCK-HW-003 lesson for change, generalized);
+             consensus and :mod:`localwallet.tx.revalidate` read no
+             ``bip32_derivations``, so the re-validation verdict is
+             unchanged by them. ``None`` (every external send) leaves the
+             build byte-for-byte as before.
         locktime: Transaction locktime (0..0xffffffff); 0 = final.
         sequence: nSequence for every input; defaults to
             :data:`SEQUENCE_RBF_ENABLED` (see module docstring / ADR-0012).
@@ -276,6 +291,25 @@ def build_unsigned_psbt(
         raise PsbtError("sequence must be the RBF-signaling policy value")
     if (change_address is None) != (change_sats is None):
         raise PsbtError("change_address and change_sats must be given together")
+    if payment_derivations is not None:
+        # Shape only here; the ownership PROOF (child key hashes to the
+        # output script) runs at emit time, below, fail closed.
+        if len(payment_derivations) != len(recipients):
+            raise PsbtError("payment_derivations must name every payment output")
+        for derivation in payment_derivations:
+            if (
+                not isinstance(derivation, (tuple, list))
+                or len(derivation) != 2
+                or any(
+                    isinstance(part, bool) or not isinstance(part, int)
+                    for part in derivation
+                )
+                or derivation[0] not in (0, 1)
+                or not 0 <= derivation[1] <= 2**31 - 1
+            ):
+                raise PsbtError(
+                    "payment derivations must be (branch, index) integer pairs"
+                )
 
     validated_recipients = [_recipient_from_pair(pair) for pair in recipients]
 
@@ -419,6 +453,28 @@ def build_unsigned_psbt(
         change_scope.bip32_derivations[change_pubkey] = DerivationPath(
             fingerprint, list(account_path) + [_BRANCH_CHANGE, change_index]
         )
+
+    # Payment-output derivations (TCK-TX-SELF-001): a self_transfer plan's
+    # payment outputs are the wallet's OWN fresh receive addresses — the
+    # same BIP174 labeling the change output got from TCK-HW-003, so the
+    # signing device renders them as internal, never as N unfamiliar
+    # external destinations. The structural check is the ownership PROOF:
+    # the re-derived child key must hash to the output's witness program,
+    # so this parameter can confirm the wallet's own scripts and can never
+    # label a foreign output as ours (fail closed, value-free).
+    if payment_derivations is not None:
+        for out_index, ((script, _value), (branch, index)) in enumerate(
+            zip(validated_recipients, payment_derivations)
+        ):
+            child_pubkey = account_key.derive([branch, index]).key
+            child_derived = b"\x00\x14" + _hashes.hash160(child_pubkey.sec())
+            if child_derived != script:
+                raise PsbtError(
+                    "payment output script does not match its wallet derivation"
+                )
+            psbt.outputs[out_index].bip32_derivations[child_pubkey] = DerivationPath(
+                fingerprint, list(account_path) + [branch, index]
+            )
 
     expected_outputs = tuple(
         (script, value) for script, value in validated_recipients

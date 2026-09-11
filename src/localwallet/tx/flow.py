@@ -213,6 +213,18 @@ class PendingTx:
     Field values may contain addresses/amounts (they must — the confirmation
     card renders from them); callers still never place them in logs
     (PROJECT.md §7.8).
+
+    TCK-TX-SELF-001 (additive, default-preserving): ``self_payment_indices``
+    is non-``None`` exactly for ``self_transfer`` records — the tuple of
+    ``branch-0`` (receive) child indices behind the plan's payment outputs,
+    in output order. ``recipient``/``amount_sats`` then describe the FIRST
+    payment output (the other outputs are its positional siblings: a split
+    repeats the same value, a consolidate has exactly one), a self-transfer
+    NEVER carries change (the plan folds any residue into the fee), and the
+    sign-time intent builder re-derives every payment script from these
+    indices to re-prove the staged PSBT against the plan — the same
+    independent re-derivation discipline the change output already gets.
+    External sends keep ``None`` and behave byte-for-byte as before.
     """
 
     tx_ref: str
@@ -226,6 +238,7 @@ class PendingTx:
     psbt_base64: str
     inputs_count: int
     vsize: int
+    self_payment_indices: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +439,7 @@ class TxFlow:
         vsize: int,
         fee_target: str | None = None,
         change_sats: int | None = None,
+        self_payment_indices: tuple[int, ...] | None = None,
     ) -> PendingTx:
         """Stage a new pending transaction (IDLE/CANCELLED/EXPIRED → CREATED).
 
@@ -433,7 +447,9 @@ class TxFlow:
         ``clock``) onto the handler-supplied, already-validated business
         fields; the flow owns pending-identity so the confirmation card,
         the ``confirm_tx`` envelope, and the gate all reference the same
-        immutable record.
+        immutable record. ``self_payment_indices`` (TCK-TX-SELF-001, default
+        ``None``) marks a ``self_transfer`` record and carries the receive
+        indices behind its payment outputs — see :class:`PendingTx`.
 
         From ``CREATED`` this is a dispatcher-owned REPLACEMENT
         (FLOW-REQUOTE, TCK-UX-002 / ADR-0013 amendment): the staged record
@@ -476,6 +492,7 @@ class TxFlow:
             psbt_base64=psbt_base64,
             inputs_count=inputs_count,
             vsize=vsize,
+            self_payment_indices=self_payment_indices,
         )
         self._pending = pending
         self._state = TxFlowStatus.CREATED

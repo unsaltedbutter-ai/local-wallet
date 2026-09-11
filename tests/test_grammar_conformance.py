@@ -447,6 +447,19 @@ ACCEPT = [
     '{"v":0,"intent":"create_tx","params":{"recipient":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx","amount_sats":546,"fee_rate_sat_vb":99999}}',
     # whitespace around the new tail
     '{\n "v" : 0 ,\n "intent" : "create_tx" ,\n "params" : { "recipient" : "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx" , "amount_sats" : 546 , "fee_rate_sat_vb" : 5 }\n}',
+    # ---- TCK-TX-SELF-001: self_transfer drift pins (mode↔key coupling)
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":4}}',
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":20,"fee_target":"fast"}}',
+    '{"v":0,"intent":"self_transfer","params":{"mode":"consolidate","below_size_sats":546}}',
+    '{"v":0,"intent":"self_transfer","params":{"mode":"consolidate","below_size_sats":2100000000000000,"fee_target":"slow"}}',
+    # whitespace around every token of the new branch
+    '{\n "v" : 0 ,\n "intent" : "self_transfer" ,\n "params" : { "mode" : "split" , "parts" : 2 }\n}',
+    # grammar-legal values the schema later bounds: parts 1/99 (outside
+    # 2..20) and below_size 0 (below the 546 floor) and "0" admitted
+    # (schema rejects) — same loose-grammar/tight-schema split as limit
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":1}}',
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":99}}',
+    '{"v":0,"intent":"self_transfer","params":{"mode":"consolidate","below_size_sats":0}}',
 ]
 
 REJECT = [
@@ -590,6 +603,53 @@ REJECT = [
     '{"v":0,"intent":"node_status","params":{"text":"x"}}',
     "node_status params refresh key",
     '{"v":0,"intent":"node_status","params":{"refresh":1}}',
+    # ---- TCK-TX-SELF-001: self_transfer drift pins (money-invention guard)
+    "self_transfer split missing parts (mode↔key coupling makes it impossible)",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split"}}',
+    "self_transfer consolidate missing below_size_sats",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"consolidate"}}',
+    "self_transfer split with the consolidate key (whole-params alternation)",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","below_size_sats":1000}}',
+    "self_transfer consolidate with the split key",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"consolidate","parts":4}}',
+    "self_transfer both number keys on split",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":4,"below_size_sats":1000}}',
+    "self_transfer unknown mode literal (closed enum)",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"merge","parts":4}}',
+    "self_transfer case-sensitive mode literal",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"Split","parts":4}}',
+    "self_transfer mode missing entirely",
+    '{"v":0,"intent":"self_transfer","params":{"parts":4}}',
+    "self_transfer empty params",
+    '{"v":0,"intent":"self_transfer","params":{}}',
+    "self_transfer MODELS A RECIPIENT ADDRESS — unrepresentable by design",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":2,"recipient":"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}}',
+    "self_transfer MODELS AN AMOUNT — unrepresentable by design",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"consolidate","below_size_sats":1000,"amount_sats":500}}',
+    "self_transfer MODELS AN OUTPOINT — unrepresentable by design",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":2,"txid":"' + "a" * 64 + '"}}',
+    "self_transfer fee_rate_sat_vb not offered on this intent (fee_target only)",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":4,"fee_rate_sat_vb":5}}',
+    "self_transfer fee_target before the mode key (strict key order)",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","fee_target":"fast","parts":4}}',
+    "self_transfer parts before mode (strict key order)",
+    '{"v":0,"intent":"self_transfer","params":{"parts":4,"mode":"split"}}',
+    "self_transfer below_size_sats before mode (strict key order)",
+    '{"v":0,"intent":"self_transfer","params":{"below_size_sats":1000,"mode":"consolidate"}}',
+    "self_transfer unknown fee_target literal",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":4,"fee_target":"urgent"}}',
+    "self_transfer parts-int rejects lone 0 ([1-9] [0-9]? idiom)",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":0}}',
+    "self_transfer parts 100 (2-digit syntactic cap; schema bound is semantic)",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":100}}',
+    "self_transfer parts leading zero",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":04}}',
+    "self_transfer parts negative (no sign in the number rules)",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":-2}}',
+    "self_transfer below_size_sats exponent (decimal-only number idiom)",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"consolidate","below_size_sats":1e3}}',
+    "self_transfer below_size_sats string (must be an integer)",
+    '{"v":0,"intent":"self_transfer","params":{"mode":"consolidate","below_size_sats":"1000"}}',
 ]
 
 
@@ -649,6 +709,16 @@ def test_grammar_parses_without_unsupported_constructs(matcher: GbnfMatcher):
         "tx-status",
         "hex-txid",
         "node-status",
+        "self-transfer",
+        "params-self-transfer",
+        "split-params",
+        "consolidate-params",
+        "mode-split",
+        "mode-consolidate",
+        "parts-kv",
+        "parts-int",
+        "below-size-kv",
+        "self-transfer-tail",
         "string",
         "ws",
     }
@@ -670,6 +740,7 @@ def test_grammar_intent_branches_cover_the_closed_enum(matcher: GbnfMatcher):
         "broadcast_tx",
         "tx_status",
         "node_status",
+        "self_transfer",
     ):
         assert f'"{intent}"' in text
 

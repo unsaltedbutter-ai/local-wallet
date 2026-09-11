@@ -1,0 +1,8 @@
+{
+  "id": "golden-047",
+  "prompt": "I want to split my largest coin into smaller ones",
+  "expectation": {
+    "intent": "clarify",
+    "question_nonempty": true
+  }
+}

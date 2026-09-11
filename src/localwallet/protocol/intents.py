@@ -14,8 +14,10 @@ business rules re-check meaning-level properties (non-blank text; for
 address per ADR-0008 and the amount XOR; for ``confirm_tx``/``sign_tx``/
 ``broadcast_tx``: the ``tx_ref`` shape; for ``tx_status``: the ``txid`` is
 EXACTLY 64 lowercase hex characters — the strict charset check that guards
-the URL path this user/model-supplied value is interpolated into) and
-return error strings for the dispatcher to surface. An empty list means
+the URL path this user/model-supplied value is interpolated into; for
+``self_transfer``: the mode↔key pairing — split↔parts / consolidate↔
+below_size_sats, exactly one — and the bound re-checks, TCK-TX-SELF-001)
+and return error strings for the dispatcher to surface. An empty list means
 valid.
 
 Adding rules never widens the model's freedom: rules only reject, they
@@ -43,8 +45,10 @@ from localwallet.protocol.envelope import (
     INTENT_REGISTRY,
     MAX_AMOUNT_SATS,
     MAX_AMOUNT_USD,
+    MAX_SELF_TRANSFER_PARTS,
     MIN_AMOUNT_SATS,
     MIN_AMOUNT_USD,
+    MIN_SELF_TRANSFER_PARTS,
     TXID_LENGTH_CHARS,
     BaseParams,
     BroadcastTxParams,
@@ -58,6 +62,7 @@ from localwallet.protocol.envelope import (
     NewAddressParams,
     NodeStatusParams,
     RespondParams,
+    SelfTransferParams,
     SignTxParams,
     TxStatusParams,
 )
@@ -305,6 +310,58 @@ def _rule_node_status(params: BaseParams) -> list[str]:
     return []
 
 
+def _rule_self_transfer(params: BaseParams) -> list[str]:
+    """``self_transfer``: mode↔key pairing + bounds (TCK-TX-SELF-001).
+
+    Layer-3 re-checks of the pairing the schema and grammar already enforce
+    (defense in depth, reachable via a validation-skipping constructor):
+
+    - ``split`` requires ``parts`` and forbids ``below_size_sats``;
+      ``consolidate`` requires ``below_size_sats`` and forbids ``parts`` —
+      exactly one mode key, "nothing else".
+    - ``parts`` re-checked as a true int in ``MIN..MAX_SELF_TRANSFER_PARTS``
+      and ``below_size_sats`` as a true int in ``MIN..MAX_AMOUNT_SATS``
+      (``bool`` rejected explicitly — the ``get_history.limit`` pattern).
+    - The real money decisions live in the handler: which coin to split,
+      which coins fall below the threshold (against stored values), the
+      per-output dust floors computed from script size in
+      :mod:`localwallet.tx.dust`, and the pool-side privacy rule. Rules
+      only reject; they never pick outputs — the params carry no address or
+      outpoint at all, so an invented output is unrepresentable here.
+    """
+    if not isinstance(params, SelfTransferParams):
+        return ["internal: 'self_transfer' params failed the type check"]
+    if params.mode == "split":
+        if params.below_size_sats is not None:
+            return ["params.below_size_sats is not valid for mode 'split'"]
+        if params.parts is None:
+            return ["mode 'split' requires params.parts"]
+        if isinstance(params.parts, bool) or not (
+            MIN_SELF_TRANSFER_PARTS <= params.parts <= MAX_SELF_TRANSFER_PARTS
+        ):
+            return [
+                (
+                    "params.parts must be an integer between "
+                    f"{MIN_SELF_TRANSFER_PARTS} and {MAX_SELF_TRANSFER_PARTS}"
+                )
+            ]
+        return []
+    if params.parts is not None:
+        return ["params.parts is not valid for mode 'consolidate'"]
+    if params.below_size_sats is None:
+        return ["mode 'consolidate' requires params.below_size_sats"]
+    if isinstance(params.below_size_sats, bool) or not (
+        MIN_AMOUNT_SATS <= params.below_size_sats <= MAX_AMOUNT_SATS
+    ):
+        return [
+            (
+                f"params.below_size_sats must be an integer between {MIN_AMOUNT_SATS} "
+                f"and {MAX_AMOUNT_SATS}"
+            )
+        ]
+    return []
+
+
 #: Layer-3 business rules, per intent. Values are pure functions from the
 #: validated params model to a list of error strings (empty list == valid).
 #: Frozen (``MappingProxyType``) for symmetry with the frozen
@@ -323,5 +380,6 @@ BUSINESS_RULES: Mapping[IntentName, BusinessRule] = MappingProxyType(
         IntentName.BROADCAST_TX: _rule_broadcast_tx,
         IntentName.TX_STATUS: _rule_tx_status,
         IntentName.NODE_STATUS: _rule_node_status,
+        IntentName.SELF_TRANSFER: _rule_self_transfer,
     }
 )

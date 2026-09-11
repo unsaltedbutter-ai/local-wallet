@@ -8,7 +8,7 @@
 #   {"v": 0, "intent": <closed enum>, "params": {...}}
 #
 #   v        : integer 0 exactly
-#   intent   : closed enum of the twelve names
+#   intent   : closed enum of the thirteen names
 #   params   : required object, whose shape depends on intent:
 #                respond     -> {"text": string}
 #                clarify     -> {"question": string}
@@ -37,6 +37,14 @@
 #                                the schema/rule layer re-checks it)
 #                node_status -> {} (the model emits nothing else; the
 #                               dispatcher owns all data)
+#                self_transfer -> {"mode": "split"|"consolidate"} then the
+#                               mode's ONE required key: {"parts": <int>}
+#                               for split | {"below_size_sats": <int>} for
+#                               consolidate, then an OPTIONAL {"fee_target":
+#                               fast|medium|slow} tail. NO address, NO
+#                               outpoint, NO amount key other than the two
+#                               stated numbers is representable (TCK-
+#                               TX-SELF-001: the money plan is engine-derived).
 #
 # KEY ORDER: STRICT. The model must emit keys in order v, intent, params.
 # This is simpler for a small model and removes any ambiguity in the
@@ -102,7 +110,7 @@ envelope ::= "{" ws "\"v\"" ws ":" ws "0" ws "," ws intent-body
 
 # Each intent branch carries its exact params shape and closes the params
 # object and the envelope. This couples intent -> params at decode time.
-intent-body ::= respond | clarify | get-balance | get-history | get-utxos | new-address | create-tx | confirm-tx | sign-tx | broadcast-tx | tx-status | node-status
+intent-body ::= respond | clarify | get-balance | get-history | get-utxos | new-address | create-tx | confirm-tx | sign-tx | broadcast-tx | tx-status | node-status | self-transfer
 
 # intent "respond" -> params {"text": string}
 respond ::= "\"intent\"" ws ":" ws "\"respond\"" ws "," ws "\"params\"" ws ":" ws "{" ws "\"text\"" ws ":" ws string ws "}" ws "}" ws
@@ -221,6 +229,47 @@ hex-txid ::= [0-9a-f]{64}
 # The model emits nothing else; the dispatcher owns all data (detect +
 # doctor guidance). Any key here is syntactically impossible.
 node-status ::= "\"intent\"" ws ":" ws "\"node_status\"" ws "," ws "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
+
+# intent "self_transfer" -> params {"mode": <enum>, (parts | below_size_sats)[, fee_target]}
+# (TCK-TX-SELF-001: explicit on-demand reshuffle — SPLIT one coin into N
+# parts, or CONSOLIDATE small coins below a size into one). The intent
+# branch is paired to its number key by a WHOLE-PARAMS alternation
+# (split-params vs consolidate-params): each mode requires its OWN key and
+# the other mode's key is syntactically impossible, so a
+# split-with-threshold or consolidate-with-parts cannot be decoded. This
+# mirrors the create_tx amount-pair idiom. KEY ORDER (per branch) is FIXED:
+# mode first, then the mode's number key, then an OPTIONAL fee_target tail
+# (reusing the create_tx fee-target rule). CRITICAL: there is NO recipient,
+# address, outpoint, or amount key in either branch — the model literally
+# cannot author or "correct" any money value of a self-transfer; the engine
+# derives every address, amount, and input from dispatcher-owned state.
+self-transfer ::= "\"intent\"" ws ":" ws "\"self_transfer\"" ws "," ws "\"params\"" ws ":" ws params-self-transfer
+
+params-self-transfer ::= split-params | consolidate-params
+
+split-params ::= "{" ws mode-split ws "," ws parts-kv ws self-transfer-tail
+
+consolidate-params ::= "{" ws mode-consolidate ws "," ws below-size-kv ws self-transfer-tail
+
+# mode: the closed enum, quoted literals only (dash names, single-line
+# bodies — the installed-parser dialect, see the PARSER DIALECT header).
+mode-split ::= "\"mode\"" ws ":" ws "\"split\""
+
+mode-consolidate ::= "\"mode\"" ws ":" ws "\"consolidate\""
+
+parts-kv ::= "\"parts\"" ws ":" ws parts-int
+
+# parts: JSON integer, 1..99 syntactic (1-2 digits, no leading zero — same
+# no-zero idiom as limit-int); the semantic bound 2..20
+# (MIN/MAX_SELF_TRANSFER_PARTS) is the schema layer's authority.
+parts-int ::= [1-9] [0-9]?
+
+below-size-kv ::= "\"below_size_sats\"" ws ":" ws sats-int
+
+# The optional fee tail reuses create_tx's fee-target key/rule verbatim; a
+# fee_rate_sat_vb is deliberately NOT offered here (an internal reshuffle
+# never rides the explicit-rate override — the estimator ladder alone bids).
+self-transfer-tail ::= "}" ws "}" ws | "," ws fee-target-kv ws "}" ws "}" ws
 
 # Conservative JSON string: any char except quote, backslash, and control
 # chars (\x00-\x1f), OR a valid escape sequence. No raw control characters.

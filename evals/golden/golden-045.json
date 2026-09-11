@@ -1,0 +1,12 @@
+{
+  "id": "golden-045",
+  "prompt": "sweep my dust — merge everything below 10000 sats, no hurry",
+  "expectation": {
+    "intent": "self_transfer",
+    "params": {
+      "mode": "consolidate",
+      "below_size_sats": 10000,
+      "fee_target": "slow"
+    }
+  }
+}
