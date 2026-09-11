@@ -23,6 +23,7 @@ from localwallet.chain.esplora import (
     TxStatus,
     balance_from_utxos,
     check_backend,
+    classify_failure,
 )
 from localwallet.chain.eta import EtaEstimate, estimate_eta
 from localwallet.chain.fees import FeeEstimate, FeeEstimator, FeeSource, FeeTarget
@@ -68,6 +69,7 @@ __all__ = [
     "WatchedTx",
     "balance_from_utxos",
     "check_backend",
+    "classify_failure",
     "estimate_eta",
     "minor_per_unit",
     "time_since_last_block",

@@ -130,6 +130,9 @@ from localwallet.chain.config import ChainConfig
 from localwallet.chain.esplora import (
     _TXID_CHARSET,
     _TXID_LENGTH_CHARS,
+    AUTH_REQUIRED,
+    HTTP_STATUS,
+    NOT_MAINNET,
     ChainError,
     TipBlock,
     TxStatus,
@@ -138,6 +141,7 @@ from localwallet.chain.esplora import (
     _validate_address,
     _validate_tx_hex,
     _validate_txid,
+    classify_failure,
 )
 from localwallet.chain.fees import FeeTarget
 from localwallet.config import Settings
@@ -296,8 +300,14 @@ class _TransportRetry(Exception):
     """Internal marker: this failure is the RETRYABLE class — exactly the
     httpx ``TransportError``/429/5xx set of the Esplora policy. Every raise
     site carries a value-free surface string (exception CLASS name or HTTP
-    status code); the marker itself never escapes to callers.
-    """
+    status code); the marker itself never escapes to callers. ``failure``
+    is the TCK-DIAG-001 value-free failure-class + exception-name pair
+    surfaced by the retry handler."""
+
+    def __init__(self, surface: str, *, failure_class: str | None = None, exc_name: str | None = None) -> None:
+        super().__init__(surface)
+        self.failure_class = failure_class
+        self.exc_name = exc_name
 
 
 class BitcoindClient:
@@ -835,7 +845,7 @@ class BitcoindClient:
         if not isinstance(info, dict):
             raise ChainError(f"{_KIND_GATE} response was not an object")
         if info.get("chain") != _MAINNET_CHAIN:
-            raise ChainError(f"{_KIND_GATE} backend does not serve mainnet")
+            raise ChainError(f"{_KIND_GATE} backend does not serve mainnet", failure_class=NOT_MAINNET)
         node_info = self._request("getnetworkinfo", [], _KIND_CAPABILITY)
         if not isinstance(node_info, dict):
             raise ChainError(f"{_KIND_CAPABILITY} response was not an object")
@@ -867,16 +877,26 @@ class BitcoindClient:
         """
         budget = self._config.max_retries if retries is None else retries
         last_failure = "no attempt completed"
+        last_transport: _TransportRetry | None = None
         for attempt in range(budget + 1):
             try:
                 return self._attempt(method, params, kind)
             except _TransportRetry as exc:
                 last_failure = str(exc.args[0]) if exc.args else "network error"
+                last_transport = exc
             if attempt < budget:
                 _sleep_for(_backoff_delay(attempt))
         if budget == 0:
-            raise ChainError(f"{kind} failed: {last_failure}")
-        raise ChainError(f"{kind} request failed after {budget} retries: {last_failure}")
+            raise ChainError(
+                f"{kind} failed: {last_failure}",
+                failure_class=last_transport.failure_class if last_transport else None,
+                exc_name=last_transport.exc_name if last_transport else None,
+            )
+        raise ChainError(
+            f"{kind} request failed after {budget} retries: {last_failure}",
+            failure_class=last_transport.failure_class if last_transport else None,
+            exc_name=last_transport.exc_name if last_transport else None,
+        )
 
     def _attempt(self, method: str, params: list[Any], kind: str) -> Any:
         """Exactly one HTTP POST of one RPC; validated envelope in, result out."""
@@ -916,18 +936,33 @@ class BitcoindClient:
                 raw = response.read(_MAX_RESPONSE_BYTES + 1)
                 status = response.status
             except (OSError, http.client.HTTPException) as exc:
-                raise _TransportRetry(f"network error ({type(exc).__name__})") from None
+                raise _TransportRetry(
+                    f"network error ({type(exc).__name__})",
+                    failure_class=classify_failure(exc),
+                    exc_name=type(exc).__name__,
+                ) from None
             if len(raw) > _MAX_RESPONSE_BYTES:
                 raise ChainError(f"{kind} response exceeded the size bound")
             if status in _AUTH_STATUSES:
-                raise ChainError(f"{kind} request refused: authentication failed")
+                raise ChainError(
+                    f"{kind} request refused: authentication failed",
+                    failure_class=AUTH_REQUIRED,
+                )
             if not 200 <= status < 300:
                 envelope = self._try_envelope(raw)
                 if isinstance(envelope, dict) and envelope.get("error"):
                     raise ChainError(f"{kind} request rejected by the server")
                 if status == 429 or status >= 500:
-                    raise _TransportRetry(f"status {status}")
-                raise ChainError(f"{kind} request failed: status {status}")
+                    raise _TransportRetry(
+                        f"status {status}",
+                        failure_class=HTTP_STATUS,
+                        exc_name="HTTPStatus",
+                    )
+                raise ChainError(
+                    f"{kind} request failed: status {status}",
+                    failure_class=HTTP_STATUS,
+                    exc_name="HTTPStatus",
+                )
         finally:
             conn.close()
         try:

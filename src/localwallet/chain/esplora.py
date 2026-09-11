@@ -43,6 +43,8 @@ Design notes:
 from __future__ import annotations
 
 import random
+import socket
+import ssl
 import time
 from dataclasses import dataclass
 from types import TracebackType
@@ -72,6 +74,7 @@ __all__ = [
     "TxStatus",
     "balance_from_utxos",
     "check_backend",
+    "classify_failure",
 ]
 
 # Keep in sync with the version in pyproject.toml.
@@ -114,6 +117,51 @@ MAINNET_GENESIS_HASH: Final[str] = (
 )
 
 
+#: Failure-class taxonomy (TCK-DIAG-001, value-free only). Attached to
+#: :class:`ChainError` by the transport adapters where the raw
+#: httpx/ssl/socket exception is in hand; :func:`classify_failure` derives
+#: the same classes from a raw exception walking its cause chain. These
+#: names are surfaced verbatim in app.py's console/log debug lines — never
+#: hosts, credentials, addresses, or amounts.
+TLS_VERIFY_FAILURE: Final[str] = "tls-verify-failure"
+TLS_HANDSHAKE: Final[str] = "tls-handshake"
+DNS_RESOLUTION: Final[str] = "dns-resolution"
+CONNECT_REFUSED: Final[str] = "connect-refused"
+TIMEOUT: Final[str] = "timeout"
+HTTP_STATUS: Final[str] = "http-status"
+NOT_ESPLORA_SHAPE: Final[str] = "not-esplora-shape"
+NOT_MAINNET: Final[str] = "not-mainnet"
+AUTH_REQUIRED: Final[str] = "auth-required"
+NETWORK_ERROR: Final[str] = "network-error"
+
+
+def classify_failure(exc: BaseException | None) -> str:
+    """Coarse value-free failure class for a raw transport/handshake error.
+
+    Walks the cause chain (httpx nests ssl/socket errors several levels
+    deep, and the adapters re-raise ``from exc`` in places) to pick the
+    first match. Returns :data:`NETWORK_ERROR` when nothing recognizable is
+    found. Value-free by construction — it maps exception TYPES, never
+    messages.
+    """
+    node = exc
+    for _ in range(8):
+        if node is None:
+            break
+        if isinstance(node, ssl.SSLCertVerificationError):
+            return TLS_VERIFY_FAILURE
+        if isinstance(node, ssl.SSLError):
+            return TLS_HANDSHAKE
+        if isinstance(node, (TimeoutError, socket.timeout, httpx.TimeoutException)):
+            return TIMEOUT
+        if isinstance(node, (ConnectionRefusedError, ConnectionResetError)):
+            return CONNECT_REFUSED
+        if isinstance(node, socket.gaierror):
+            return DNS_RESOLUTION
+        node = node.__cause__ or node.__context__
+    return NETWORK_ERROR
+
+
 class ChainError(Exception):
     """A chain-data or chain-transport failure that callers must handle.
 
@@ -123,7 +171,24 @@ class ChainError(Exception):
 
     Message contract: safe for logs and chat narration — never contains full
     addresses, txids, or amounts (log-scrubbing invariant, PROJECT.md §7.8).
+
+    ``failure_class``/``exc_name`` (TCK-DIAG-001) are VALUE-FREE debug
+    companions the app surfaces in its console/log lines: the failure class
+    from :data:`classify_failure`'s taxonomy, and the underlying exception
+    class name (e.g. ``ConnectError``). Both are optional and never carry a
+    value.
     """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        failure_class: str | None = None,
+        exc_name: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.exc_name = exc_name
 
 
 class _ApiRootMismatch(ChainError):
@@ -835,6 +900,8 @@ class EsploraClient:
         """One request against ``{base}{prefix}{path}``, old retry policy."""
         url = f"{self._base_url}{prefix}{path}"
         last_failure = "no attempt completed"
+        last_fc: str | None = None
+        last_name: str | None = None
         for attempt in range(self._config.max_retries + 1):
             try:
                 response = self._client.get(url)
@@ -846,10 +913,16 @@ class EsploraClient:
                 # value-free ChainError: the raw httpx exception (whose own
                 # message can carry a URL fragment) never escapes to the
                 # caller's thread (TCK-ONB-003 review, finding 1).
-                raise ChainError(f"{kind} request failed: invalid base URL") from None
+                raise ChainError(
+                    f"{kind} request failed: invalid base URL",
+                    failure_class=NETWORK_ERROR,
+                    exc_name="InvalidURL",
+                ) from None
             except httpx.TransportError as exc:
                 # Connection errors and timeouts are the retryable class.
                 last_failure = f"network error ({type(exc).__name__})"
+                last_fc = classify_failure(exc)
+                last_name = type(exc).__name__
             else:
                 status = response.status_code
                 if 200 <= status < 300:
@@ -859,19 +932,30 @@ class EsploraClient:
                         # 2xx but the body is not JSON: the frontend (or
                         # some other server) answered, not the API — the
                         # mismatch class, if a prefix is still unresolved.
-                        raise _ApiRootMismatch(str(exc)) from None
+                        raise _ApiRootMismatch(
+                            str(exc),
+                            failure_class=NOT_ESPLORA_SHAPE,
+                        ) from None
                 if status == 429 or status >= 500:
+                    # Retryable HTTP-status class, remembered so an exhausted
+                    # budget classifies as http-status (not network-error).
                     last_failure = f"status {status}"
+                    last_fc = HTTP_STATUS
+                    last_name = "HTTPStatus"
                 else:
                     # 4xx (rate limiting aside) and anything else: fail
                     # now — answered-but-not-here is the mismatch class.
                     raise _ApiRootMismatch(
-                        f"{kind} request failed: status {status}"
+                        f"{kind} request failed: status {status}",
+                        failure_class=HTTP_STATUS,
+                        exc_name="HTTPStatus",
                     )
             if attempt < self._config.max_retries:
                 _sleep_for(_backoff_delay(attempt))
         raise ChainError(
-            f"{kind} request failed after {self._config.max_retries} retries: {last_failure}"
+            f"{kind} request failed after {self._config.max_retries} retries: {last_failure}",
+            failure_class=last_fc or NETWORK_ERROR,
+            exc_name=last_name,
         )
 
 
@@ -881,6 +965,7 @@ def check_backend(
     timeout_s: float = 10.0,
     max_retries: int = 0,
     transport: httpx.BaseTransport | None = None,
+    report: dict[str, str] | None = None,
 ) -> bool:
     """Probe a candidate self-hosted backend (ADR-0023 decision 5).
 
@@ -913,6 +998,11 @@ def check_backend(
     a self-signed cert is only reachable through an explicit
     ``LOCALWALLET_TLS_VERIFY=0`` that also drives the real client — the check
     and the wallet can never disagree on transport policy.
+
+    ``report`` (optional, TCK-DIAG-001): a dict the caller may pass that, on
+    a ``False`` refusal, is populated with value-free debug keys
+    ``failure_class`` and ``exc_name`` (never a host, credential, address, or
+    amount). The bool return and ACCEPT/REJECT semantics are unchanged.
     """
     try:
         client = EsploraClient(
@@ -922,20 +1012,29 @@ def check_backend(
             transport=transport,
         )
     except ValueError:
+        if report is not None:
+            report["failure_class"] = NETWORK_ERROR
+            report["exc_name"] = "ValueError"
         return False  # malformed URL: ChainConfig failed closed at construction
     try:
         client.get_tip_height()
         blocks = client.get_json("/blocks/0", _KIND_BLOCKS_AT_HEIGHT)
-    except (ChainError, httpx.InvalidURL):
+    except (ChainError, httpx.InvalidURL) as exc:
         # The whole request surface collapses to False — ChainError covers
         # transport/HTTP/JSON/shape failures, and httpx.InvalidURL is
         # belt-and-braces for request-time URL breakage (non-numeric port)
         # that _request_json also converts; the contract here is that
         # NOTHING escapes to the caller (finding 1).
+        if report is not None:
+            report["failure_class"] = getattr(exc, "failure_class", None) or classify_failure(exc)
+            report["exc_name"] = getattr(exc, "exc_name", None) or type(exc).__name__
         return False
     finally:
         client.close()
     if not isinstance(blocks, list):
+        if report is not None:
+            report["failure_class"] = NOT_ESPLORA_SHAPE
+            report["exc_name"] = "not-a-list"
         return False
     # Esplora's /blocks/<height> serves block OBJECTS whose "id" is the
     # block hash (the same canonical shape :meth:`EsploraClient.get_tip_block`
@@ -943,4 +1042,9 @@ def check_backend(
     # entries rejected every genuine object-shaped mainnet backend
     # (TCK-ONB-003 review, finding 2).
     ids = [b.get("id") if isinstance(b, dict) else b for b in blocks]
-    return MAINNET_GENESIS_HASH in ids
+    if MAINNET_GENESIS_HASH not in ids:
+        if report is not None:
+            report["failure_class"] = NOT_MAINNET
+            report["exc_name"] = "not-mainnet"
+        return False
+    return True

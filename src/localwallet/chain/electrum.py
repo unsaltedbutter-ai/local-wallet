@@ -88,6 +88,7 @@ from localwallet.chain.esplora import (
     _TXID_CHARSET,
     _TXID_LENGTH_CHARS,
     MAINNET_GENESIS_HASH,
+    NOT_MAINNET,
     ChainError,
     TipBlock,
     TxStatus,
@@ -96,6 +97,7 @@ from localwallet.chain.esplora import (
     _validate_address,
     _validate_tx_hex,
     _validate_txid,
+    classify_failure,
 )
 from localwallet.chain.fees import FeeTarget
 from localwallet.config import Settings
@@ -151,8 +153,13 @@ class _TransportFailure(Exception):
     equivalent from the Esplora client's policy. Every raise site carries a
     bare exception CLASS NAME (never a value), which :meth:`ElectrumClient._rpc`
     surfaces inside the ChainError after the retry budget is exhausted;
-    the marker itself never escapes to callers.
+    the marker itself never escapes to callers. ``failure_class`` is the
+    TCK-DIAG-001 value-free class attached at the raw-exception raise site.
     """
+
+    def __init__(self, exc_name: str, *, failure_class: str | None = None) -> None:
+        super().__init__(exc_name)
+        self.failure_class = failure_class
 
 
 def _require_txid_hex(value: Any, kind: str) -> str:
@@ -566,6 +573,7 @@ class ElectrumClient:
         """
         budget = self._config.max_retries if retries is None else retries
         last_failure = "no attempt completed"
+        last_transport: _TransportFailure | None = None
         for attempt in range(budget + 1):
             try:
                 with self._lock:
@@ -579,11 +587,20 @@ class ElectrumClient:
                 # "network error (ConnectError)" style; str(exc) carries no
                 # values by construction of every raise site below.
                 last_failure = f"network error ({exc.args[0] if exc.args else type(exc).__name__})"
+                last_transport = exc
             if attempt < budget:
                 _sleep_for(_backoff_delay(attempt))
         if budget == 0:
-            raise ChainError(f"{kind} failed: {last_failure}")
-        raise ChainError(f"{kind} request failed after {budget} retries: {last_failure}")
+            raise ChainError(
+                f"{kind} failed: {last_failure}",
+                failure_class=last_transport.failure_class if last_transport else None,
+                exc_name=last_transport.args[0] if last_transport and last_transport.args else None,
+            )
+        raise ChainError(
+            f"{kind} request failed after {budget} retries: {last_failure}",
+            failure_class=last_transport.failure_class if last_transport else None,
+            exc_name=last_transport.args[0] if last_transport and last_transport.args else None,
+        )
 
     def _connect(self) -> None:
         """Open the TLS socket and run the fail-closed handshake.
@@ -604,7 +621,9 @@ class ElectrumClient:
         try:
             raw = socket.create_connection((self._host, self._port), timeout=self._config.timeout_s)
         except OSError as exc:
-            raise _TransportFailure(type(exc).__name__) from None
+            raise _TransportFailure(
+                type(exc).__name__, failure_class=classify_failure(exc)
+            ) from None
         try:
             self._sock = context.wrap_socket(raw, server_hostname=self._host)
         except (OSError, ValueError) as exc:
@@ -616,7 +635,9 @@ class ElectrumClient:
                 raw.close()
             except OSError:
                 pass
-            raise _TransportFailure(type(exc).__name__) from None
+            raise _TransportFailure(
+                type(exc).__name__, failure_class=classify_failure(exc)
+            ) from None
         self._buf = b""
         self._answered = False
         try:
@@ -652,7 +673,10 @@ class ElectrumClient:
             raise ChainError(f"{_KIND_HANDSHAKE} response was not a string or list")
         features = self._raw_request("server.features", [], _KIND_FEATURES)
         if not isinstance(features, dict) or features.get("genesis_hash") != MAINNET_GENESIS_HASH:
-            raise ChainError(f"{_KIND_FEATURES} backend does not serve mainnet")
+            raise ChainError(
+                f"{_KIND_FEATURES} backend does not serve mainnet",
+                failure_class=NOT_MAINNET,
+            )
 
     def _raw_request(self, method: str, params: list[Any], kind: str) -> Any:
         """Send one request line, read lines until the matching answer.
@@ -674,12 +698,16 @@ class ElectrumClient:
         try:
             sock.sendall(frame.encode("utf-8"))
         except OSError as exc:
-            raise _TransportFailure(type(exc).__name__) from None
+            raise _TransportFailure(
+                type(exc).__name__, failure_class=classify_failure(exc)
+            ) from None
         while True:
             try:
                 line = self._read_line()
             except OSError as exc:
-                raise _TransportFailure(type(exc).__name__) from None
+                raise _TransportFailure(
+                    type(exc).__name__, failure_class=classify_failure(exc)
+                ) from None
             if not line.strip():
                 continue
             try:
@@ -720,7 +748,7 @@ class ElectrumClient:
         while b"\n" not in self._buf:
             chunk = sock.recv(4096)
             if not chunk:
-                raise _TransportFailure("ConnectionResetError")
+                raise _TransportFailure("ConnectionResetError", failure_class=classify_failure(ConnectionResetError()))
             self._buf += chunk
         line, self._buf = self._buf.split(b"\n", 1)
         return line

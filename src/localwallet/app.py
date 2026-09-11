@@ -147,6 +147,7 @@ from localwallet.chain import (
     PriceUnavailableError,
     WatchedTx,
     check_backend,
+    classify_failure,
     estimate_eta,
     minor_per_unit,
     time_since_last_block,
@@ -156,6 +157,7 @@ from localwallet.chain.config import (
     BITCOIND_TLS_SCHEME,
     ELECTRUM_SCHEME,
 )
+from localwallet.chain.esplora import NETWORK_ERROR
 from localwallet.config import (
     COIN_SETTING_BOUNDS,
     COIN_SETTING_DEFAULTS,
@@ -4648,6 +4650,7 @@ class ScanFlow:
         gap_limit: int | None,
         startup_plan: wallet_scan.ScanPlan | None = None,
         rescan: bool = False,
+        output: _Output | None = None,
     ) -> None:
         self._store = store
         self._wallet = wallet
@@ -4656,6 +4659,7 @@ class ScanFlow:
         self._gap_limit = gap_limit
         self._startup_plan = startup_plan
         self._rescan = rescan
+        self._output = output
         self._commands: queue.Queue[Any] | None = None
         self.gate = StartupScan(enabled=startup_plan is not None)
         self._started = False
@@ -4861,7 +4865,7 @@ class ScanFlow:
                     sqlite3.Error,
                 ),
             ):
-                self._warn(output_fn, str(exc))
+                self._warn(output_fn, str(exc), exc)
                 self._out_of_window(output_fn)
                 return
             raise exc  # a genuine worker bug must not be swallowed
@@ -4869,7 +4873,7 @@ class ScanFlow:
             summary = wallet_scan.persist_scan(self._store, done.value)  # engine thread
         except (StoreError, sqlite3.Error) as exc:
             self.gate.mark_skipped()
-            self._warn(output_fn, str(exc))
+            self._warn(output_fn, str(exc), exc)
             self._out_of_window(output_fn)
             return
         self.gate.mark_done()
@@ -4893,12 +4897,28 @@ class ScanFlow:
         if out_of_window is not None:
             output_fn(out_of_window)
 
-    def _warn(self, output_fn: Callable[[str], None], detail: str) -> None:
+    def _warn(
+        self,
+        output_fn: Callable[[str], None],
+        detail: str,
+        exc: BaseException | None = None,
+    ) -> None:
         """The scrubbed startup-failure line (scan/chain/store/key errors are
         value-free by their layers' contracts). The REPL still runs; handlers
-        surface store-empty/chain-down states per turn."""
+        surface store-empty/chain-down states per turn. With a ``_Output``
+        router present (web/CLI launch), the line is a TCK-DIAG-001 warning
+        (log + console, never the SSE stream); otherwise it falls back to the
+        caller's narration channel (test harnesses)."""
         label = "rescan" if self._rescan else "startup scan"
-        output_fn(f"warning: {label} failed: {detail} — continuing with cached state.")
+        line = f"warning: {label} failed: {detail} — continuing with cached state."
+        if exc is not None:
+            fc, name = _failure_parts(exc)
+            line += f" [class={fc} exc={name}]"
+        out = self._output
+        if out is not None:
+            out.warning(line)
+        else:
+            output_fn(line)
 
     # ------------------------------------------------------------- blocking scan
 
@@ -7824,19 +7844,21 @@ def _build_chain_client(
     )
 
 
-def _probe_tip(client_factory: Callable[[], Any]) -> bool:
+def _probe_tip(client_factory: Callable[[], Any]) -> tuple[bool, BaseException | None]:
     """Run ONE candidate client through its own handshake (one tip call)
     and bound the wreckage: construction, connect, shape, wrong chain, a
     401 — ANYTHING collapses to ``False``, and the probe client is always
     closed. The caller owns the one honest refusal line; nothing this
-    swallows ever escapes (value-free by construction)."""
+    swallows ever escapes (value-free by construction). Returns
+    ``(accepted, exc)`` where ``exc`` is the swallowed failure (or ``None``)
+    so the caller can emit a TCK-DIAG-001 debug companion."""
     client: Any = None
     try:
         client = client_factory()
         client.get_tip_height()  # connect + handshake + mainnet gate
-        return True
-    except Exception:  # noqa: BLE001 — the collapse-everything contract
-        return False
+        return True, None
+    except Exception as exc:  # noqa: BLE001 — the collapse-everything contract
+        return False, exc
     finally:
         if client is not None:
             try:
@@ -7845,8 +7867,74 @@ def _probe_tip(client_factory: Callable[[], Any]) -> bool:
                 pass
 
 
+#: The CLOSED scheme set :func:`_probe_chain_backend` actually dispatches on.
+#: :func:`_probe_url_class` clamps a candidate to exactly these, so the
+#: ``url-class=`` debug field can never carry a host, address, or credential.
+_KNOWN_PROBE_SCHEMES: Final[tuple[str, ...]] = (
+    ELECTRUM_SCHEME,  # ssl://
+    BITCOIND_SCHEME,  # bitcoind://
+    BITCOIND_TLS_SCHEME,  # bitcoind+tls://
+    "http://",
+    "https://",
+)
+
+
+def _probe_url_class(text: str) -> str:
+    """The value-free URL-class (scheme) for a probe-refusal debug line.
+
+    Clamps to the known dispatch schemes, else the literal ``"unknown"``.
+    The raw ``partition(":")[0]`` of arbitrary user text would echo a host
+    (``192.168.1.5:8332``), an entire address (``bc1…``), or a credential
+    (``user:pass@host``) into the console/log — never allowed (TCK-DIAG-001
+    security review)."""
+    for scheme in _KNOWN_PROBE_SCHEMES:
+        if text.startswith(scheme):
+            return scheme.rstrip(":/")
+    return "unknown"
+
+
+def _failure_parts(exc: BaseException | None) -> tuple[str, str]:
+    """Value-free ``(failure_class, exception_class_name)`` for a debug line
+    (TCK-DIAG-001). Prefers the structured class the chain/ adapters attach
+    to :class:`ChainError`; otherwise derives it from the exception type."""
+    fc = getattr(exc, "failure_class", None) or classify_failure(exc)
+    name = getattr(exc, "exc_name", None) or type(exc).__name__
+    return fc, name
+
+
+def _report_failure_parts(report: dict[str, str]) -> tuple[str, str]:
+    """Like :func:`_failure_parts`, but from ``check_backend``'s ``report``
+    dict (value-free by the chain contract)."""
+    return report.get("failure_class") or "network-error", report.get("exc_name") or "unknown"
+
+
+def _emit_probe_failure(
+    output: _Output | None,
+    *,
+    stage: str,
+    url_class: str,
+    fc: str,
+    name: str,
+) -> None:
+    """The console/log debug companion for a rejected probe URL (TCK-DIAG-001).
+    Value-free: only the failure class, the probe stage, the CLAMPED
+    URL-class (a known scheme or the literal ``unknown`` — never a host,
+    credential, address, or amount), and the exception class name. A no-op
+    when no ``output`` router is present (the test seam / direct-call
+    path)."""
+    if output is None:
+        return
+    output.warning(
+        f"backend probe rejected: stage={stage} url-class={url_class} "
+        f"class={fc} exc={name}"
+    )
+
+
 def _probe_chain_backend(
-    url: str, settings: Settings, auth: _BackendAuth | None = None
+    url: str,
+    settings: Settings,
+    auth: _BackendAuth | None = None,
+    output: _Output | None = None,
 ) -> str | None:
     """The ONE bounded, value-free readiness probe AND kind classifier for a
     CANDIDATE backend URL (TCK-BACKEND-002 deliverable 2; the auto-detect
@@ -7918,8 +8006,18 @@ def _probe_chain_backend(
         return None
     timeout = settings.request_timeout_s
     retries = min(settings.max_retries, 1)
+    # The URL-class for the debug line is the CLAMPED scheme — only schemes
+    # this probe actually dispatches on, else the literal "unknown". Never a
+    # host, address, or credential: scheme-less user text (a pasted bc1…
+    # address, an IP:port, "user:pass@host") can reach the refusal line, and
+    # the raw partition-on-":" would leak it verbatim (TCK-DIAG-001 security
+    # review). The host echo allowance of UX-009 is NOT used here.
+    url_class = _probe_url_class(text)
 
-    def _core_shape(core_url: str) -> bool:
+    def _refuse(stage: str, fc: str, name: str) -> None:
+        _emit_probe_failure(output, stage=stage, url_class=url_class, fc=fc, name=name)
+
+    def _core_shape(core_url: str) -> tuple[bool, BaseException | None]:
         """One bounded Core-RPC handshake against the canonical rewrite; a
         malformed rewrite (e.g. a path riding through) fails the CONSTRUCTION
         guard inside the probe and collapses to False — the Esplora branch
@@ -7935,13 +8033,21 @@ def _probe_chain_backend(
         )
 
     if text.startswith(ELECTRUM_SCHEME):
-        return text if _probe_tip(
+        ok, exc = _probe_tip(
             lambda: ElectrumClient(
                 base_url=text, timeout_s=timeout, max_retries=retries
             )
-        ) else None
+        )
+        if not ok:
+            _refuse("electrum", *_failure_parts(exc))
+            return None
+        return text
     if text.startswith((BITCOIND_SCHEME, BITCOIND_TLS_SCHEME)):
-        return text if _core_shape(text) else None
+        ok, exc = _core_shape(text)
+        if not ok:
+            _refuse("bitcoind-core", *_failure_parts(exc))
+            return None
+        return text
     for scheme, core_scheme in (("http://", BITCOIND_SCHEME), ("https://", BITCOIND_TLS_SCHEME)):
         if not text.startswith(scheme):
             continue
@@ -7951,14 +8057,30 @@ def _probe_chain_backend(
         # input UNCHANGED. A userinfo-carrying candidate skips the Core
         # branch (embedded credentials are refused on the stored rung).
         rest = text[len(scheme) :]
-        if "@" not in rest.partition("/")[0] and _core_shape(core_scheme + rest):
-            return core_scheme + rest
+        core_exc: BaseException | None = None
+        if "@" not in rest.partition("/")[0]:
+            ok, core_exc = _core_shape(core_scheme + rest)
+            if ok:
+                return core_scheme + rest
+        report: dict[str, str] = {}
         try:
-            return text if check_backend(text, timeout_s=timeout, max_retries=retries) else None
-        except Exception:  # noqa: BLE001 — belt-braces: check_backend already collapses
+            ok = check_backend(
+                text, timeout_s=timeout, max_retries=retries, report=report
+            )
+        except Exception as exc:  # noqa: BLE001 — belt-braces: check_backend already collapses
+            _refuse("esplora-shape", *_failure_parts(exc))
             return None
+        if ok:
+            return text
+        # Prefer the Esplora shape's own failure detail (its report is
+        # populated on every refusal path).
+        if report:
+            _refuse("esplora-shape", *_report_failure_parts(report))
+        else:
+            _refuse("bitcoind-core", *_failure_parts(core_exc))
+        return None
+    _refuse("scheme-rejected", NETWORK_ERROR, "ValueError")
     return None
-
 
 def _backend_kind(settings: Settings, *, resolved: bool) -> str:
     """The CLOSED ``backend_kind`` enum NAME for the live backend (badge
@@ -8433,7 +8555,7 @@ def _wire(
     # the settings entry carries requires_restart). TCK-UX-012(b): "on" is
     # the NORMAL state — an on launch prints NOTHING (UX-009's on-line is
     # retired); the off line keeps the settings pointer.
-    scan = ScanFlow(store, wallet_row, worker, gap_limit=env_gap)
+    scan = ScanFlow(store, wallet_row, worker, gap_limit=env_gap, output=output_fn)
     watch_interval, watch_interval_warning = _resolve_watch_interval(settings, store)
     if watch_interval_warning is not None:
         output_fn(watch_interval_warning)
@@ -8492,7 +8614,11 @@ def _wire(
             sqlite3.Error,
         ) as exc:
             label = "rescan" if rescan else "startup scan"
-            output_fn.warning(f"warning: {label} failed: {exc} — continuing with cached state.")
+            fc, name = _failure_parts(exc)
+            output_fn.warning(
+                f"warning: {label} failed: {exc} — continuing with cached state. "
+                f"[class={fc} exc={name}]"
+            )
 
     if not scan.gate.enabled:
         # No startup scan will run (opted out, or planning failed): the
@@ -8529,7 +8655,7 @@ def _wire(
         backend_check_fn
         if backend_check_fn is not None
         else (
-            lambda url: _probe_chain_backend(url, settings, _backend_auth(store))
+            lambda url: _probe_chain_backend(url, settings, _backend_auth(store), output_fn)
         )
     )
     # Late-bound: the onboarding flow's swap hook and the wiring's controller
