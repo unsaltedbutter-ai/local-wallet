@@ -155,6 +155,10 @@ No OPEN failures. Historical, all resolved:
 
 ## 6. Skipped tests — full inventory and why
 
+> **2026-09-11:** superseded by **`skipped-tests.md`** (repo root) — the authoritative 7-skip inventory with fix-or-remove verdicts. Two skips were env-unnecessary and now run (TCK-TEST-001, 998def2): baseline **2909+ passed / 5 skipped**. Substance below still accurate.
+
+> **2026-09-11:** this section's inventory is superseded by **`skipped-tests.md`** (repo root) — the authoritative 7-skip inventory with fix-or-remove verdicts. Two of the skips were env-unnecessary and now run (TCK-TEST-001, 998def2): the baseline is **2909+ passed / 5 skipped** and rising. Substance below still accurate.
+
 The "6 skipped" in the last run are ALL env-gated, by design (hermetic default suite):
 1. **llama-gated agent tests** (`tests/test_agent_loop.py`, `tests/test_agent_prompt_context.py`, 1–3 depending on venv): real llama-cpp-python generation + `LlamaGrammar` parse of the grammar file. Skip when the wheel or a model file is absent. Unblocks: model bootstrap (deferred-run item 10). NOTE: the shared venv has the wheel, so these may show as passes there; on a fresh `.venv` before `pip install -e .` builds llama-cpp-python they skip.
 2. **Live network E2E** (`tests/test_e2e_skeleton.py`, `LOCALWALLET_E2E_LIVE=1`): real mempool.space run. Skipped by default to keep the suite deterministic/offline.
