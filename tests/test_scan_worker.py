@@ -25,6 +25,7 @@ from __future__ import annotations
 import inspect
 import queue
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -47,6 +48,7 @@ from tests.test_e2e_skeleton import (
     _create_tx_envelope_json,
     _mock_client,
     _scan_handler,
+    _scan_requests,
     derive_fixture_addresses,
 )
 
@@ -325,7 +327,7 @@ def _gate(state: str) -> app.StartupScan:
     return gate
 
 
-def _table(store, wallet, wd, scan_gate, scan_fn):
+def _table(store, wallet, wd, scan_gate, scan_fn, **kwargs):
     return app.build_dispatch_table(
         store,
         wallet,
@@ -340,6 +342,7 @@ def _table(store, wallet, wd, scan_gate, scan_fn):
             sats_to_usd=lambda sats, rate: None,
         ),
         scan_gate=scan_gate,
+        **kwargs,
     )
 
 
@@ -737,3 +740,267 @@ def test_print_create_tx_renders_the_loading_refusal(capsys) -> None:
     )
     assert lines == [app.WALLET_LOADING_REFUSAL]  # friendly line, not an error dump
     assert capsys.readouterr().out == ""
+
+
+# ------------------------------------------- TCK-UX-011: defer + kick (web)
+
+_BALANCE = '{"v": 0, "intent": "get_balance", "params": {}}'
+
+
+def test_defer_scans_kick_starts_the_flow_and_never_double_kicks(
+    wallet_store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TCK-UX-011 (ADR-0022 amendment 2): the web/engine ``get_balance``
+    with NO cursor and NO scan in flight STANDS DOWN the inline scan and
+    KICKS the real :class:`ScanFlow` — the kick seam is TEST-PINNED: the
+    stale answer MUST actually start the flow (a silent no-op kick is a
+    review-fail), and it answers from the cache INSTANTLY while the chain
+    fetch is still parked on the worker. AC(a)."""
+    store, wallet, wd = wallet_store
+    started = threading.Event()
+    hold = threading.Event()
+    fetched: list[int] = []
+
+    def fake_fetch(plan, client, *, progress_fn=None):
+        fetched.append(1)
+        started.set()
+        assert hold.wait(10)  # park the fetch: the gate stays ``running``
+
+    monkeypatch.setattr(wallet_scan, "fetch_scan", fake_fetch)
+
+    worker = app.ChainWorker(None)  # client unused: fetch_scan is faked
+    try:
+        flow = app.ScanFlow(store, wallet, worker, gap_limit=None)
+        commands: queue.Queue[Any] = queue.Queue()
+        flow.attach(commands)  # the pump attaches this in production
+        assert not flow.gate.in_progress  # nothing running yet
+
+        table = _table(
+            store,
+            wallet,
+            wd,
+            flow.gate,
+            lambda: pytest.fail("defer_scans must NOT run the inline scan"),
+            defer_scans=True,
+            kick_scan_fn=flow.kick_scan,
+        )
+
+        # AC(a): answers <1s from cache — the fetch is parked, yet this
+        # returns immediately with the honest flags.
+        t0 = time.monotonic()
+        first = table[IntentName.GET_BALANCE](validate_payload(_BALANCE))
+        assert time.monotonic() - t0 < 1.0
+        assert first["freshness"] == "stale"
+        assert first["scan_pending"] is True  # additive tool-owned key
+        assert first["total_sats"] == 0  # honest empty cache, verbatim
+
+        # The kick started the REAL flow: the worker reached fetch_scan and
+        # the gate is now in progress (not a silent no-op).
+        assert started.wait(10) and fetched == [1]
+        assert flow.gate.in_progress
+
+        # AC(b): a second /balance while the scan is in flight does NOT
+        # re-run the inline scan and does NOT re-kick (still one fetch).
+        second = table[IntentName.GET_BALANCE](validate_payload(_BALANCE))
+        assert "scan_pending" not in second  # took the in-flight path
+        assert second["freshness"] == "stale"  # still honest, cache verbatim
+        assert fetched == [1]  # never double-kicked
+    finally:
+        hold.set()
+        worker.stop()
+        store.close()
+
+
+def test_defer_scans_kick_is_a_no_op_when_a_scan_is_in_flight(
+    wallet_store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TCK-UX-011 idempotence (AC(b), the kick seam): ``ScanFlow.kick_scan``
+    is a documented no-op while ANY scan owns the worker — a double
+    ``/balance`` never starts a second fetch even if both reach the kick."""
+    store, wallet, _wd = wallet_store
+    fetched: list[int] = []
+
+    def fake_fetch(plan, client, *, progress_fn=None):
+        fetched.append(1)
+
+    monkeypatch.setattr(wallet_scan, "fetch_scan", fake_fetch)
+    worker = app.ChainWorker(None)
+    try:
+        flow = app.ScanFlow(store, wallet, worker, gap_limit=None)
+        flow.attach(queue.Queue())
+        # A startup scan is already in flight (pending): both kicks no-op.
+        flow.set_startup(wallet_scan.plan_scan(store, wallet, gap_limit=None))
+        assert flow.gate.in_progress
+        assert flow.kick_scan() is False
+        assert flow.kick_scan() is False
+        assert fetched == []  # no second fetch submitted by the kick
+    finally:
+        worker.stop()
+        store.close()
+
+
+def test_cli_world_keeps_the_inline_lazy_scan_and_never_kicks(wallet_store) -> None:
+    """TCK-UX-011 AC(c): ``defer_scans=False`` (the CLI world, incl.
+    ``AUTO_SCAN=0``) keeps the pre-split INLINE scan and never touches the
+    ``kick_scan_fn`` seam — the carve-out is keyed on TRANSPORT, not on
+    gate-absence. Existing CLI tests rely on this exact behavior."""
+    store, wallet, wd = wallet_store
+    inline: list[int] = []
+    kicks: list[int] = []
+
+    def scan_fn() -> object:
+        inline.append(1)
+        store.set_sync_state(wallet.id, wallet_scan.CURSOR_KEY, '{"0": 24, "1": 24}')
+        return object()
+
+    # defer_scans defaults False; kick_scan_fn wired but must be ignored.
+    table = _table(
+        store, wallet, wd, None, scan_fn, kick_scan_fn=lambda: kicks.append(1)
+    )
+    result = table[IntentName.GET_BALANCE](validate_payload(_BALANCE))
+    assert inline == [1]  # the CLI inline scan ran once
+    assert kicks == []  # never kicked (transport carve-out, not gate-None)
+    assert "scan_pending" not in result  # not the web stand-down path
+    assert result["freshness"] == "fresh"  # the inline scan populated cursor
+
+
+def _wiring_for_test(tmp_path, monkeypatch, chain_handler, *, web_mode: bool):
+    """A REAL :func:`app._wire` over the mock chain in the EXACT shape of
+    the user report: AUTO_SCAN=0 (no startup scan armed), backend
+    resolved via the env rung (no ``awaiting_backend`` hold), store never
+    scanned. Returns the finished wiring for transport-keyed pins."""
+    wd = WalletDescriptor.from_key(ZPUB)
+    seed = Store(tmp_path / "wire.db")
+    seed.set_setting("gap_limit", str(TEST_GAP))
+    seed.close()
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(tmp_path / "wire.db"))
+    monkeypatch.setenv(app.AUTO_SCAN_ENV_VAR, "0")
+    monkeypatch.setenv(app.CHAIN_BASE_URL_ENV_VAR, "https://mock.test/api")
+    monkeypatch.setenv(app.WATCH_INTERVAL_ENV_VAR, "0")
+    monkeypatch.delenv(app.GAP_LIMIT_ENV_VAR, raising=False)
+    monkeypatch.setattr(
+        app, "_build_chain_client", lambda _s, _a: _mock_client(chain_handler)
+    )
+    return app._wire(
+        parsed=wd.parsed,
+        descriptor=wd,
+        signer_selection=app.SignerSelection(
+            kind=app.SIGNER_KIND_FILE,
+            dir_path=tmp_path / "signer",
+            fingerprint_hex=wd.parsed.hd_key.my_fingerprint.hex(),
+        ),
+        settings=app.Settings.from_env(),
+        env_gap=None,
+        rescan=False,
+        flow=None,
+        generate=app.stub_generate,
+        node_detect_fn=None,
+        output_fn=lambda _line: None,
+        web_mode=web_mode,
+    )
+
+
+def test_wire_web_mode_threads_the_stand_down_and_real_kick(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TCK-UX-011, PRODUCTION seam: ``_wire(web_mode=True)`` builds a table
+    whose get_balance stands the scan down (instant stale + scan_pending
+    answer) and whose wired ``kick_scan_fn`` is the wiring's OWN
+    :class:`ScanFlow` — the stale answer really reaches the chain through
+    the one existing worker (test-pinned: no silent no-op)."""
+    inner = _scan_handler([])
+    started = threading.Event()
+    hold = threading.Event()
+
+    def gating(request: httpx.Request) -> httpx.Response:
+        if not started.is_set():  # park the kicked scan's first request
+            started.set()
+            assert hold.wait(10)
+        return inner(request)
+
+    wiring = _wiring_for_test(tmp_path, monkeypatch, gating, web_mode=True)
+    try:
+        assert wiring.scan.gate.state == "disabled"  # AUTO_SCAN=0: nothing armed
+        wiring.scan.attach(queue.Queue())  # what the pump does at start
+        t0 = time.monotonic()
+        result = wiring.table[IntentName.GET_BALANCE](validate_payload(_BALANCE))
+        assert time.monotonic() - t0 < 1.0  # instant despite the parked chain
+        assert result["freshness"] == "stale"
+        assert result["scan_pending"] is True
+        assert started.wait(10)  # the kick started the REAL background fetch
+        assert wiring.scan.gate.state == "running"
+    finally:
+        hold.set()
+        wiring.worker.stop()
+        wiring.client.close()
+        wiring.store.close()
+
+
+def test_wire_cli_mode_keeps_the_inline_lazy_scan(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TCK-UX-011 AC(c) at the wiring level: the SAME shape on the CLI
+    transport (``web_mode=False``) keeps the pre-split INLINE blocking
+    scan — the answer is live (fresh, cursor written), no stand-down key,
+    and the gate stays ``disabled`` (nothing armed in the background)."""
+    recorded: list[httpx.Request] = []
+    wiring = _wiring_for_test(
+        tmp_path, monkeypatch, _scan_handler(recorded), web_mode=False
+    )
+    try:
+        result = wiring.table[IntentName.GET_BALANCE](validate_payload(_BALANCE))
+        assert _scan_requests(recorded)  # the scan ran INLINE on this thread
+        assert result["freshness"] == "fresh"
+        assert "scan_pending" not in result
+        assert wiring.scan.gate.state == "disabled"  # never armed
+        assert (
+            wiring.store.get_sync_state(wiring.wallet.id, wallet_scan.CURSOR_KEY)
+            is not None
+        )
+    finally:
+        wiring.worker.stop()
+        wiring.client.close()
+        wiring.store.close()
+
+
+def test_print_balance_scan_pending_note_is_value_free_single_line() -> None:
+    """TCK-UX-011 req 7: a ``scan_pending`` answer prints EXACTLY ONE static
+    value-free line ("first scan running in the background") and suppresses
+    the plain stale note (one honest line, never two); no digits, no
+    address/amount ever ride that line."""
+    lines: list[str] = []
+    app._print_balance(
+        {
+            "confirmed_sats": 0,
+            "unconfirmed_sats": 0,
+            "total_sats": 0,
+            "addresses_scanned": 0,
+            "freshness": "stale",
+            "scan_pending": True,
+        },
+        lines.append,
+    )
+    assert lines.count(app.SCAN_PENDING_NOTE) == 1
+    assert app.FRESHNESS_NOTE not in lines  # subsumed, never doubled
+    assert not any(ch.isdigit() for ch in app.SCAN_PENDING_NOTE)
+    assert "first scan running in the background" in app.SCAN_PENDING_NOTE
+    # The figures still print verbatim from the cache:
+    assert any(line.startswith("Balance (mainnet):") for line in lines)
+
+
+def test_print_balance_stale_without_pending_keeps_freshness_note() -> None:
+    """TCK-UX-011 req 5: the freshness narration PINS are unchanged — a
+    stale answer with NO ``scan_pending`` (e.g. mid-scan from the worker,
+    or a failed/skipped first scan) still prints only the plain stale note."""
+    lines: list[str] = []
+    app._print_balance(
+        {
+            "confirmed_sats": 0,
+            "unconfirmed_sats": 0,
+            "total_sats": 0,
+            "addresses_scanned": 0,
+            "freshness": "stale",
+        },
+        lines.append,
+    )
+    assert lines[-1] == app.FRESHNESS_NOTE

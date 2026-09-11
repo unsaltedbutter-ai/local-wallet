@@ -948,6 +948,17 @@ FRESHNESS_NOTE: Final[str] = (
     "note: wallet cache may be incomplete — the first scan has not finished"
 )
 
+#: TCK-UX-011 (ADR-0022 amendment 2): the ONE honest balance line when the
+#: engine-thread read stood the lazy scan down and KICKED the background
+#: flow instead (web/engine world). Static copy — value-free by
+#: construction (no address/amount/digit); it subsumes the plain
+#: :data:`FRESHNESS_NOTE` on a `scan_pending` answer (one note line, not
+#: two). The tool-owned `scan_pending` result key drives it, never the
+#: model.
+SCAN_PENDING_NOTE: Final[str] = (
+    "note: first scan running in the background — these figures may update when it completes"
+)
+
 #: TCK-SCAN-003 (ADR-0022 decision 6): the friendly, value-free
 #: ``create_tx`` refusal while the FIRST scan has not completed —
 #: dispatcher-owned code gates it (never model judgment), mirroring the
@@ -1285,6 +1296,8 @@ def build_dispatch_table(
     node_detect_fn: Callable[[], LocalNodeReport] | None = None,
     seconds_since_last_block_fn: Callable[[], int | None] | None = None,
     scan_gate: StartupScan | None = None,
+    kick_scan_fn: Callable[[], None] | None = None,
+    defer_scans: bool = False,
 ) -> DispatchTable:
     """Build the allowlist dispatch table for the running app.
 
@@ -1310,6 +1323,21 @@ def build_dispatch_table(
             :data:`WALLET_LOADING_REFUSAL` line. ``None`` (tests, the
             AUTO_SCAN=0 wiring) = no scan in flight — the pre-split
             behavior.
+        kick_scan_fn: The engine-thread seam that STARTS the background
+            :class:`ScanFlow` (TCK-UX-011, ADR-0022 amendment 2; wired to
+            :meth:`ScanFlow.kick_scan`): called by a ``defer_scans``
+            ``get_balance`` that found no sync cursor and no scan in
+            flight, so the stale answer actually kicks off the load it
+            promises. Idempotent by construction (a no-op while any scan
+            is in flight) — the double-``/balance`` never double-kicks.
+        defer_scans: Keyed on TRANSPORT, not gate-None (TCK-UX-011):
+            ``True`` in the web/engine world, where a lazy first scan is
+            NEVER run inline (a minutes-class chain walk must not block
+            the turn) — the read answers from cache, stale-flagged, with
+            the additive ``scan_pending: true`` key, and kicks the flow.
+            ``False`` (default) keeps the pre-split inline scan for the
+            CLI world (incl. the AUTO_SCAN=0 dev opt-out) — the
+            documented CLI exception in ADR-0022 amendment 2.
         flow: The dispatcher-owned send-flow state machine (TCK-P2-004).
             Defaults to a fresh :class:`TxFlow` with the real clock and
             uuid id factory; the REPL and tests share ONE instance.
@@ -1370,6 +1398,7 @@ def build_dispatch_table(
         IntentName.CLARIFY: _clarify_handler,
         IntentName.GET_BALANCE: _make_get_balance_handler(
             store, wallet_id, scan_fn, scan_gate, price_oracle=app_price_oracle,
+            kick_scan_fn=kick_scan_fn, defer_scans=defer_scans,
         ),
         IntentName.GET_HISTORY: _make_get_history_handler(store, wallet_id, scan_gate),
         IntentName.GET_UTXOS: _make_get_utxos_handler(store, wallet_id, scan_gate),
@@ -1429,6 +1458,8 @@ def _make_get_balance_handler(
     scan_fn: Callable[[], object],
     scan_gate: StartupScan | None = None,
     price_oracle: PriceOracle | None = None,
+    kick_scan_fn: Callable[[], None] | None = None,
+    defer_scans: bool = False,
 ) -> Handler:
     """Create the ``get_balance`` handler closed over the store.
 
@@ -1438,7 +1469,13 @@ def _make_get_balance_handler(
     cursor) AND no startup scan is in flight, ``scan_fn`` runs once
     lazily first — this keeps the Phase 0 AC ("What's my balance?"
     returns a correct live balance) working when the startup scan is
-    opted out via :data:`AUTO_SCAN_ENV_VAR`. While the non-blocking
+    opted out via :data:`AUTO_SCAN_ENV_VAR`. That inline blocking scan
+    is the CLI transport only (``defer_scans=False``): in the web/engine
+    world (``defer_scans=True``, TCK-UX-011 / ADR-0022 amendment 2) the
+    same case ANSWERS immediately from the cache with ``freshness:
+    stale`` + the additive ``scan_pending: true`` key and calls
+    ``kick_scan_fn`` to start the background flow instead (idempotent;
+    never a minutes-class turn block). While the non-blocking
     startup scan runs (ADR-0022 decision 6) the lazy scan stands down —
     the chain worker already owns the chain — and the cache answers as
     served. Every answer carries the deterministic, tool-owned
@@ -1462,18 +1499,35 @@ def _make_get_balance_handler(
 
     def handler(envelope: Envelope) -> dict[str, object]:
         del envelope  # get_balance params are empty by schema
+        scan_pending = False
         try:
             in_flight = scan_gate is not None and scan_gate.in_progress
             if (
                 store.get_sync_state(wallet_id, wallet_scan.CURSOR_KEY) is None
                 and not in_flight
             ):
-                try:
-                    scan_fn()
-                except (ChainError, wallet_scan.ScanError, WatchKeyError) as exc:
-                    # detail is scrubbed by the chain/scan layers (value-free
-                    # of addresses/txids/amounts) — safe to surface verbatim.
-                    return {"error": "chain_unavailable", "detail": str(exc)}
+                if defer_scans:
+                    # TCK-UX-011 (ADR-0022 amendment 2): the web/engine
+                    # world never blocks a turn on a minutes-class inline
+                    # scan. Stand down like the SCAN-003 in-flight path —
+                    # cache answers verbatim, stale-flagged, with the
+                    # additive tool-owned ``scan_pending`` key — and KICK
+                    # the background flow so the stale answer actually
+                    # starts the load it promises (engine thread, no new
+                    # threads, no store access off it). A later turn while
+                    # the kicked scan runs sees ``in_flight`` and takes
+                    # the unchanged SCAN-003 path: no second kick.
+                    scan_pending = True
+                    if kick_scan_fn is not None:
+                        kick_scan_fn()
+                else:
+                    try:
+                        scan_fn()
+                    except (ChainError, wallet_scan.ScanError, WatchKeyError) as exc:
+                        # detail is scrubbed by the chain/scan layers
+                        # (value-free of addresses/txids/amounts) — safe
+                        # to surface verbatim.
+                        return {"error": "chain_unavailable", "detail": str(exc)}
             utxos = store.get_utxos_for_wallet(wallet_id)
             tip_raw = store.get_sync_state(wallet_id, wallet_scan.TIP_KEY)
         except (StoreError, sqlite3.Error) as exc:
@@ -1490,6 +1544,12 @@ def _make_get_balance_handler(
             # verbatim either way.
             "freshness": _freshness(store, wallet_id, scan_gate),
         }
+        if scan_pending:
+            # TCK-UX-011 (additive key, ADR-0022 amendment 2): the engine
+            # stood the lazy scan down and kicked the background flow —
+            # the narration line is driven by THIS flag, never by the
+            # model. Absent on every other answer (unchanged shapes).
+            result["scan_pending"] = True
         if tip_raw is not None:
             try:
                 tip = int(tip_raw)
@@ -1505,8 +1565,14 @@ def _make_get_balance_handler(
         # ADR-0022 amendment 1: while the backend choice is unresolved
         # (``awaiting_backend`` hold) the app makes ZERO chain calls —
         # the best-effort price fetch stands down with the lazy scan.
+        # TCK-UX-011 (amendment 2): the same discipline on a
+        # ``scan_pending`` stand-down — an answer that just deferred a
+        # minutes-class scan to the background must not then BLOCK the
+        # turn on a networked price fetch it only shows as display
+        # sugar. The kicked scan's own completion refreshes the figures;
+        # this answer is stale-flagged anyway (sats-only is honest).
         held = scan_gate is not None and scan_gate.state == "awaiting_backend"
-        if price_oracle is not None and not held:
+        if price_oracle is not None and not held and not scan_pending:
             try:
                 rate = price_oracle.fresh()
                 usd_cents = price_oracle.sats_to_usd(result["total_sats"], rate)
@@ -3859,6 +3925,45 @@ class ScanFlow:
         ):
             return False
         self._rescan = True
+        self._started = False  # let begin() submit the fresh plan once
+        self.begin()
+        return self.gate.state in ("pending", "running")
+
+    def kick_scan(self) -> bool:
+        """TCK-UX-011 (ADR-0022 amendment 2): start the background scan for
+        a turn that STOOD the lazy inline scan down — a web/engine
+        ``get_balance`` answers cache-served + stale + ``scan_pending`` and
+        kicks HERE, so the honest "first scan running in the background"
+        is literally true. ENGINE-thread only (the handler dispatch runs
+        there): planning is store-reads-only and the fetch rides the ONE
+        existing worker — no new threads, no store access off the engine.
+
+        Idempotent no-op (``False``) when any scan already owns the worker
+        (gate awaiting/pending/running — the double ``/balance`` never
+        double-kicks), before the pump attaches its command queue, or when
+        planning fails; otherwise arms the gate and starts the fetch
+        exactly once (covers a disabled AUTO_SCAN=0 launch and a
+        failed/abandoned startup scan — gate ``skipped`` — alike: the kick
+        is a user-initiated load, not an auto scan, ADR-0022 amendment 1's
+        distinction). Returns whether the load started."""
+        if self.gate.in_progress or self._commands is None:
+            return False
+        try:
+            plan = wallet_scan.plan_scan(
+                self._store,
+                self._wallet,
+                gap_limit=self._gap_limit,
+                rebuild=self._rescan,
+            )
+        except (
+            ChainError,
+            wallet_scan.ScanError,
+            WatchKeyError,
+            StoreError,
+            sqlite3.Error,
+        ):
+            return False
+        self.set_startup(plan, rescan=self._rescan)
         self._started = False  # let begin() submit the fresh plan once
         self.begin()
         return self.gate.state in ("pending", "running")
@@ -6656,6 +6761,11 @@ class _Wiring:
     #: (TCK-BACKEND-002: the swap follows the same precedence the client
     #: construction does; the ladder itself stays single-sourced in config).
     boot_backend: str = ""
+    #: TCK-UX-011 (ADR-0022 amendment 2): the TRANSPORT the wiring serves
+    #: (True in web/engine mode). The get_balance handler is rebuilt on
+    #: every backend hot-swap and must keep the same stand-down posture,
+    #: so it rides the wiring, not just the initial table build.
+    defer_scans: bool = False
     #: The engine-thread hot-swap controller (TCK-BACKEND-002; built by
     #: :func:`_wire` right after the wiring itself — late-bound because it
     #: owns a reference to the wiring it can mutate).
@@ -7168,6 +7278,11 @@ class ChainBackendFlow:
             scan.scan_now if scan is not None else (lambda: None),
             scan.gate if scan is not None else None,
             price_oracle=price_oracle,
+            # TCK-UX-011: the rebuilt handler keeps the SAME transport
+            # posture — web/engine still defers + kicks, CLI still scans
+            # inline — over the one flow/gate/worker object.
+            kick_scan_fn=scan.kick_scan if scan is not None else None,
+            defer_scans=w.defer_scans,
         )
         w.table[IntentName.CREATE_TX] = _make_create_tx_handler(
             w.store,
@@ -7500,6 +7615,12 @@ def _wire(
         node_detect_fn=node_detect_fn,
         seconds_since_last_block_fn=seconds_since_last_block_fn,
         scan_gate=scan.gate,
+        # TCK-UX-011 (ADR-0022 amendment 2): keyed on TRANSPORT — the
+        # web/engine thread must never inline-scan; the kick seam is the
+        # real flow. CLI (including the AUTO_SCAN=0 dev opt-out) keeps the
+        # inline lazy scan (defer_scans=False, the documented exception).
+        kick_scan_fn=scan.kick_scan,
+        defer_scans=web_mode,
     )
     loop = AgentLoop(generate, table)
     wiring = _Wiring(
@@ -7517,6 +7638,7 @@ def _wire(
         parsed=parsed,
         wallet=wallet_row,
         boot_backend=boot_backend,
+        defer_scans=web_mode,
     )
     # Build last so the controller sees the finished wiring it mutates (the
     # late-bound ``swap`` name above now points here for the onboarding hook).
@@ -8642,7 +8764,11 @@ def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None
     value-free note line — honest display of the tool-owned flag; the
     figures themselves print verbatim from the cache either way. A
     ``usd_total_cents`` supplied by the handler (TCK-FIAT-001) adds one
-    fiat line, verbatim-formatted; absent keys render nothing.
+    fiat line, verbatim-formatted; absent keys render nothing. A
+    ``scan_pending`` answer (TCK-UX-011, ADR-0022 amendment 2) prints the
+    one static "first scan running in the background" line INSTEAD of the
+    plain stale note (one honest line, never two) — static copy, no
+    figures the handler did not already print verbatim.
     """
     if result.get("error") is not None:
         output_fn(sanitize_tool_output(_error_line(result, "Balance lookup failed")))
@@ -8680,7 +8806,13 @@ def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None
             if rate is not None:
                 usd_line += f" · @ ${rate}/BTC"
         output_fn(sanitize_tool_output(usd_line))
-    _print_freshness_note(result, output_fn)
+    if result.get("scan_pending") is True:
+        # TCK-UX-011 (ADR-0022 amendment 2): the tool kicked the background
+        # load for this very answer — ONE static, value-free line,
+        # subsuming the plain stale note (never two notes on one answer).
+        output_fn(sanitize_tool_output(SCAN_PENDING_NOTE))
+    else:
+        _print_freshness_note(result, output_fn)
 
 
 def _print_freshness_note(

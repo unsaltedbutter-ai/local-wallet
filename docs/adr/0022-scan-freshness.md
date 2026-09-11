@@ -4,7 +4,8 @@
   reconciliation recorded 2026-09-08; drafted TOGETHER with ADR-0024 so the
   threading models agree; implementation ticket TCK-SCAN-002/003; amended
   2026-09-09 by ADR-0023 amendment 2 / TCK-ONB-006 — the first-run scan
-  exception in §Amendment 1 below).
+  exception in §Amendment 1; amended 2026-09-10 by TCK-UX-011 — the
+  get_balance engine-thread stand-down in §Amendment 2).
 - **Date:** 2026-09-07 (reconciled 2026-09-08)
 - **Decides:** How the startup scan runs **non-blocking** in BOTH the CLI and
   the web worlds, and how cache-served answers during the first scan are honestly
@@ -197,6 +198,54 @@ of, `AUTO_SCAN=0`) — unchanged.
   launches (the carve-out above).
 - The freshness machinery is untouched: `awaiting_backend` reuses the
   same tool-owned `stale` flag and the same completion cursor semantics.
+
+## Amendment 2 (2026-09-10, TCK-UX-011): the lazy get_balance scan is non-blocking in the web world, blocking in the CLI
+
+A user report dated 2026-09-10 (UX-008 verdict ii) found the last
+blocking path decision 1 was meant to retire: a `get_balance` (the
+`/balance` quick action, or any chat balance ask) on a store with **no
+sync cursor and no scan in flight** — a startup scan that failed/was
+skipped, or an `AUTO_SCAN=0` launch with no gate at all — ran its lazy
+first scan **inline, on the engine thread**, minutes-class turn block
+after the client echo. Decision 1's non-blocking rule is honoured in the
+WEB world by the dedicated worker (decision 2); it never said *how* the
+lazy in-handler scan behaves once the worker is not already busy.
+
+**The split (decided here, keyed on TRANSPORT, not on gate-absence):**
+`build_dispatch_table` gains an explicit `defer_scans: bool`. In the
+web/engine world (`defer_scans=True`) the lazy scan **STANDS DOWN**
+exactly like the SCAN-003 in-flight path — answer immediately from the
+cache (honest empty/verbatim values), tool-owned `freshness: stale`, an
+additive `scan_pending: true` result key, and the value-free narration
+line "first scan running in the background…" while the existing dots
+keep flowing. It then **KICKS** the background `ScanFlow` (a new
+`kick_scan_fn` seam closed over the handler → `ScanFlow.kick_scan`) so
+the load actually starts — **no new thread** (the kick reuses the one
+chain worker decision 2 created) and **no store access off the engine
+thread** (planning + `begin` run on the engine thread; only the pump
+persists, decision 3). The kick is idempotent: a no-op while any scan is
+in flight, so a double `/balance` never double-kicks.
+
+**The CLI inline scan is INTENTIONAL — the documented CLI exception.**
+When `defer_scans=False` (the CLI world, including the `AUTO_SCAN=0` dev
+opt-out that never arms a startup scan) the lazy in-handler scan stays
+**blocking/inline on the engine thread**. The CLI has no dedicated chain
+worker running in this scenario — `AUTO_SCAN=0` launches no background
+fetch, and a failed startup scan's worker is idle — so the terminal's
+own thread is the only one available to make the chain call, and the
+synchronous scan is the shape every CLI test and the Phase 0 AC
+("What's my balance?" returns a correct LIVE balance) are built on. This
+is the one place the blocking startup-scan behavior ADR-0019 had before
+decision 1 supersedes it survives deliberately: in the CLI, blocking the
+terminal on the scan a balance question requires is the expected UX; in
+the web world it is the bug this amendment fixes. The distinction is
+carried by `defer_scans` alone — the same `scan_gate`/worker objects ride
+both paths.
+
+`create_tx`'s pre-first-scan refusal (decision 6) and every freshness
+narration pin are UNCHANGED by this amendment: the stand-down only makes
+a `get_balance` answer cache-served and honest about it while starting
+the load.
 
 ## Why cooperative-chunking lost (consult F1)
 
