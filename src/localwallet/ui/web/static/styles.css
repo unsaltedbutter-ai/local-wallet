@@ -70,6 +70,13 @@
      gutter keeps bubble text from ever reflowing when it appears). */
   --copy-size: 1.5rem;
 
+  /* TCK-QR-001: the receive-QR viewer — the paper well stays white in BOTH
+     palettes (segno's SVG paints dark modules on transparent paper, and a
+     scanner needs light behind the code); the backdrop scrim is the text
+     ink at rest opacity, declared once here like --shadow-* above. */
+  --qr-paper: #ffffff;
+  --qr-scrim: rgba(27, 31, 39, 0.55);
+
   /* TCK-UX-010: privacy-label chip — one ink/surface pair per state family
      (public = danger-red, local = green, trust-dependent = warn-yellow).
      Mapped to the palette tokens so both schemes retint automatically;
@@ -792,3 +799,72 @@ body {
   color: var(--c-text-muted);
   font-size: var(--fs-sm);
 }
+
+/* ---- TCK-QR-001: receive-address QR --------------------------------------- */
+
+/* The inline affordance after a linked address: quiet until touched —
+   same resting-muted register as the bubble copy control. */
+.qr-btn {
+  font: inherit;
+  font-size: var(--fs-xs);
+  line-height: 1;
+  margin-inline: var(--sp-1) 0;
+  padding: 0.15rem var(--sp-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  background: var(--c-surface);
+  color: var(--c-text-muted);
+  cursor: pointer;
+}
+.qr-btn:hover {
+  color: var(--c-text);
+  background: var(--c-surface-2);
+}
+
+/* Modal viewer: scrim + centered card. display:flex overrides the UA
+   [hidden] rule, so the hidden state is restated. */
+.qr-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+  background: var(--qr-scrim);
+}
+.qr-viewer[hidden] { display: none; }
+
+.qr-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  inline-size: min(24rem, 100%);
+  max-block-size: 100%;
+  overflow: auto;
+  padding: var(--sp-5);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-2);
+  text-align: center;
+}
+
+/* Full, copyable, wrap-anywhere — an address is never truncated. */
+.qr-caption {
+  margin: 0;
+  font: var(--fs-sm)/var(--lh) var(--font-mono);
+  overflow-wrap: anywhere;
+  user-select: text;
+  color: var(--c-text-muted);
+}
+
+/* The white well every scanner needs (segno paints no paper of its own). */
+.qr-well {
+  display: inline-block;
+  padding: var(--sp-3);
+  background: var(--qr-paper);
+  border-radius: var(--r-md);
+}
+.qr-img { display: block; }

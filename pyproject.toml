@@ -18,6 +18,9 @@ dependencies = [
     # import itself; our tree imports none (network lint unaffected, ADR-0015
     # amendment).
     "requests>=2.31",
+    # TCK-QR-001: QR encoding for receive addresses (pure-python, zero
+    # transitive deps). Used ONLY by the web transport's /qr endpoint.
+    "segno==1.6.6",
 ]
 
 [project.optional-dependencies]

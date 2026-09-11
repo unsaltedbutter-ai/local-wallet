@@ -103,5 +103,19 @@
   </section>
 </footer>
 
+<!-- TCK-QR-001: receive-address QR viewer (TCK-WEB dialog shape: hidden
+     section toggled by the small "QR" button beside every linked mainnet
+     address in the transcript). The <img> is fed from the token-gated
+     GET /qr via a blob: object URL (an <img> request cannot carry
+     X-Auth-Token; CSP img-src allows exactly 'self' + blob:). The caption
+     is filled by app.js through textContent — the address VERBATIM. -->
+<section id="qr-viewer" class="qr-viewer" role="dialog" aria-modal="true" aria-labelledby="qr-caption" hidden>
+  <div class="qr-card">
+    <p id="qr-caption" class="qr-caption"></p>
+    <span class="qr-well"><img id="qr-img" class="qr-img" alt=""></span>
+    <button id="qr-close" class="btn btn-secondary btn-small" type="button">Close</button>
+  </div>
+</section>
+
 </body>
 </html>

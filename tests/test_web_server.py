@@ -228,6 +228,8 @@ def test_every_endpoint_requires_token_and_replies_http_1_0(serve: Any) -> None:
         ("POST", "/watchkey", {"key": "zpub-some-key"}),
         # TCK-PRIVACY-001B: the public-consent press is a mutation too.
         ("POST", "/consent", None),
+        # TCK-QR-001: the QR encoder is data-bearing too (token-gated GET).
+        ("GET", "/qr?value=bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", None),
     ]
     for method, path, body in cases:
         status, headers, data, response = _request(server, method, path, body)

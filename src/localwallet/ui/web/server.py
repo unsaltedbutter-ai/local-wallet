@@ -26,7 +26,8 @@ Thin stdlib HTTP/SSE transport over the engine pump (:func:`localwallet.app`
   opt-in via ``LOCALWALLET_WEB_PORT``, ADR-0024 §6 amendment); a random
   per-launch token gates every DATA-BEARING endpoint (``/events``,
   ``/state``, ``/turn``, ``/action``, ``/settings``, ``/watchkey``,
-  ``/resync``, ``/consent``) via the ``X-Auth-Token`` header (the
+  ``/resync``, ``/consent``, and the TCK-QR-001 stateless QR encoder
+  ``/qr``) via the ``X-Auth-Token`` header (the
   401 path deliberately does NOT send ``WWW-Authenticate`` — a browser would
   pop a native credential prompt). The shell (``GET /``, ``/index.html``) and
   ``GET /static/*`` are the deliberate token EXEMPTION (TCK-WEB-007): the
@@ -40,9 +41,12 @@ Thin stdlib HTTP/SSE transport over the engine pump (:func:`localwallet.app`
   on POSTs (``_require_same_origin``) as belt-braces (no cookies ⇒ CSRF is
   structurally moot). The token never appears in URLs, logs, error bodies, or
   /state — it reaches the client only through the JSON island injected into
-  the served index.html. A Content-Security-Policy header (ADR-0024 §7,
-  ``csp_header``) allows NO inline script except that island (a per-response
-  nonce), no eval, same-origin styles/connect only. No CORS headers, no
+the served index.html. A Content-Security-Policy header (ADR-0024 §7,
+``csp_header``) allows NO inline script except that island (a per-response
+nonce), no eval, same-origin styles/connect only; ``img-src 'self' blob:``
+additionally admits the receive-address QR the client itself fetches from
+the token-gated ``/qr`` and wraps in a same-document object URL (TCK-QR-001
+— an ``<img>`` cannot carry the auth header). No CORS headers, no
   ``Set-Cookie``, access logging suppressed entirely.
 * **HTTP/1.0 (§2):** the stdlib default, ACCEPTED and PINNED, not "fixed" —
   each browser request gets its own connection, which is exactly the
@@ -59,9 +63,11 @@ from __future__ import annotations
 
 import collections
 import hmac
+import io
 import json
 import mimetypes
 import queue
+import re
 import secrets
 import socket
 import threading
@@ -71,6 +77,9 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Final
+
+import segno
+from embit import bech32
 
 from localwallet.app import (
     STATE_SCHEMA_TRANSPORT_ONLY,
@@ -99,6 +108,15 @@ SEND_TIMEOUT_S: Final[float] = 30.0
 RING_SIZE: Final[int] = 2048
 QUEUE_MAXSIZE: Final[int] = 512
 
+#: TCK-QR-001 shape rule — the EXACT client regex (app.js ``ADDRESS_RE``):
+#: lowercase mainnet bech32 only ("bc1" + BIP-173 charset, total 14..90).
+#: Case-mixed/uppercase/testnet/legacy/base58 never pass, so the endpoint
+#: cannot be used to render a QR of anything that is not a receive-shaped
+#: mainnet string. A checksum/structure check (below) is layered ON TOP.
+_RECEIVE_ADDRESS_RE: Final[re.Pattern[str]] = re.compile(
+    r"\Abc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}\Z"
+)
+
 #: Hosts the server will answer for (ADR-0024 §6, DNS-rebinding primary
 #: defense). The port is ephemeral/variable so the comparison is on the
 #: HOSTNAME ONLY (port stripped); the bound interface is 127.0.0.1 and the
@@ -113,12 +131,18 @@ ALLOWED_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "localhost"})
 #: origin module scripts + stylesheet only. ``default-src 'none'`` closes every
 #: other fetch; ``connect-src 'self'`` is the fetch+SSE stream;
 #: ``base-uri``/``form-action``/``frame-ancestors`` are the standard belt braces.
+#: ``img-src 'self' blob:`` (TCK-QR-001): ``'self'`` covers same-origin images,
+#: ``blob:`` the receive-address QR — an ``<img>`` request cannot carry the
+#: ``X-Auth-Token`` header, so the client fetches the token-gated ``GET /qr``
+#: and hands the response to ``<img>`` via a same-document object URL. The
+#: blob is only ever created by this page's own code; nothing is loosened
+#: beyond that one scheme (no ``data:``, no remote origins).
 CSP_TEMPLATE: Final[str] = (
     "default-src 'none'; "
     "script-src 'self'{nonce}; "
     "style-src 'self'; "
     "connect-src 'self'; "
-    "img-src 'self'; "
+    "img-src 'self' blob:; "
     "font-src 'self'; "
     "base-uri 'none'; "
     "form-action 'none'; "
@@ -135,6 +159,27 @@ def csp_header(nonce: str | None = None) -> str:
 
 class _ClientGone(Exception):
     """A client write failed (reset/dead/stalled peer) — not a server error."""
+
+
+def _is_mainnet_segwit(value: str) -> bool:
+    """True iff ``value`` is a checksum-valid MAINNET segwit address
+    (BIP-173/350: hrp ``bc``, witness v0 with a 20- or 32-byte program, or
+    v1 with a 32-byte one). Offline string math only (embit, no network);
+    mirrors the engine's own recipient rule (protocol/intents.py) so the QR
+    can never encode an address the wallet itself would refuse. The caller
+    has already applied :data:`_RECEIVE_ADDRESS_RE` (lowercase shape)."""
+    encoding, hrp, _data = bech32.bech32_decode(value)
+    if encoding is None or hrp != "bc":
+        return False
+    # embit returns (None, None) — never raises — on any malformed program;
+    # it also already enforces the v0 20/32-byte rule and the bech32/bech32m
+    # encoding-per-version rule, restated below as explicit belt-braces.
+    witver, program = bech32.decode("bc", value)
+    if witver is None or program is None:
+        return False
+    if witver == 0:
+        return len(program) in (20, 32)
+    return witver == 1 and len(program) == 32
 
 
 # --------------------------------------------------------------- event fan-out
@@ -464,6 +509,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._state()
         elif path == "/settings":
             self._settings_get()
+        elif path == "/qr":
+            self._qr()
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -654,6 +701,38 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, {**base, "schema": STATE_SCHEMA_TRANSPORT_ONLY})
             return
         self._send_json(200, {**base, **typed})
+
+    # -- qr (TCK-QR-001) ------------------------------------------------------
+    def _qr(self) -> None:
+        """GET /qr?value=<address> → a standalone SVG QR of a RECEIVE address.
+
+        A pure offline encoder, deliberately stateless: it reads NO engine,
+        store or wallet state (the value rides the query), touches no network,
+        and echoes NOTHING back but the QR itself — never the submitted
+        string, not even on refusal (value-free 400, the same discipline as
+        every engine refusal; access logging is suppressed anyway). The
+        double validation (:data:`_RECEIVE_ADDRESS_RE` then
+        :func:`_is_mainnet_segwit`) makes this endpoint structurally unable
+        to render anything but a mainnet segwit address, so the QR always
+        encodes the address VERBATIM (BIP-173 is all-one-case; our addresses
+        are lowercase; segno encodes the string as given, no normalization —
+        mixed case, were it ever to appear, would encode mixed case).
+        Token-gated like every data-bearing GET: the client fetches with the
+        header and renders the response through a blob: object URL, because
+        an ``<img>`` request cannot carry ``X-Auth-Token`` (see CSP note)."""
+        try:
+            values = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query
+            ).get("value") or []
+        except ValueError:
+            values = []
+        address = values[0] if len(values) == 1 else ""
+        if not _RECEIVE_ADDRESS_RE.match(address) or not _is_mainnet_segwit(address):
+            self._send_json(400, {"error": "not a mainnet bech32 address"})
+            return
+        buffer = io.BytesIO()
+        segno.make(address, error="m").save(buffer, kind="svg", scale=6)
+        self._respond(200, "image/svg+xml", buffer.getvalue(), csp=csp_header())
 
     # -- settings (TCK-WEB-005) ----------------------------------------------
     def _settings_get(self) -> None:

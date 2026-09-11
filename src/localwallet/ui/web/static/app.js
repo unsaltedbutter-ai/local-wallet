@@ -41,6 +41,11 @@ const settingsCloseEl = document.getElementById("settings-close");
 const settingsRetryEl = document.getElementById("settings-retry");
 const settingsStatusEl = document.getElementById("settings-status");
 const settingsListEl = document.getElementById("settings-list");
+// TCK-QR-001: the receive-address QR viewer (see the QR section below).
+const qrViewerEl = document.getElementById("qr-viewer");
+const qrImgEl = document.getElementById("qr-img");
+const qrCaptionEl = document.getElementById("qr-caption");
+const qrCloseEl = document.getElementById("qr-close");
 
 // The leak sentence, shared verbatim by the empty-apply note and the
 // first-run beat (TCK-WEB-013 item 4 reuses the copy pass 2 #52 wording —
@@ -146,6 +151,13 @@ const LABELS = {
     "Opens mempool.space in a new tab — the operator of that site sees this address or txid.",
   copyDone: "Copied",
   copyFailed: "Copy failed",
+  // TCK-QR-001: receive-address QR. The title/aria string is the ticket's
+  // exact wording; the alt repeats it plus the address verbatim (a
+  // screen-reader user can read/copy what the QR encodes); the fail line is
+  // value-free (the server's 400 never echoes, and neither does this).
+  qr: "QR",
+  qrTitle: "Receive address QR — scan with a wallet to send to this address",
+  qrFailed: "Could not show the QR code.",
   // copy pass 2 #44: dim/lit is a state-carrying indicator, so it gets
   // words — a legend line plus a dynamic title/aria-label per badge
   // (recomposed by paintBackendBadges, the sole badge painter).
@@ -231,6 +243,13 @@ const LABELS = {
     "Saved — your environment configuration outranks this one; it applies at next restart.",
   resyncNoteUnchanged: "Already up to date — no re-scan needed.",
   resyncNoteUnavailable: "Saved — no re-scan could start right now.",
+  // TCK-GAP-001 (code-review MINOR): a NARROWED gap_limit needs no auto-rescan
+  // (ADR-0009 amendment — nothing is missed by not scanning); this line says
+  // so and names the manual apply path. The engine's value-free tradeoff note
+  // (data.note) follows on the same line — no clause here repeats it.
+  resyncNoteNoRescan:
+    "Applied — no re-scan needed; the change takes effect on your next scan. " +
+    "Use Resync now to apply it.",
   // TCK-PRIVACY-001B: the explicit public-backend consent button in the
   // pane's chain section. The subline REUSES the pane's own leak sentence
   // (PUBLIC_LEAK_SENTENCE) — one disclosure, never a second voice.
@@ -294,6 +313,7 @@ const RESYNC_NOTES = new Map([
   ["skipped", LABELS.resyncNoteSkipped],
   ["unchanged", LABELS.resyncNoteUnchanged],
   ["unavailable", LABELS.resyncNoteUnavailable],
+  ["no_rescan", LABELS.resyncNoteNoRescan],
 ]);
 
 const state = {
@@ -440,6 +460,12 @@ function appendBubbleText(line, text) {
     a.title = LABELS.explorerLink;
     a.setAttribute("aria-label", LABELS.explorerLink);
     line.appendChild(a);
+    if (ADDRESS_RE.test(m[0])) {
+      // TCK-QR-001: the per-address QR affordance rides right after the
+      // link (txids get none). Its "QR" caption is excluded from bubbleText
+      // (lineText) so copying a message never gains button words.
+      line.appendChild(qrButton(m[0]));
+    }
     last = m.index + m[0].length;
   }
   if (last === 0 || last < text.length) {
@@ -451,10 +477,20 @@ function appendBubbleText(line, text) {
 // message lines only (progress dots and the model-download bar are transient
 // telemetry, not message text); a system bubble holds its text on the li
 // itself. textContent read, textContent copy — the XSS contract never
-// serializes markup here.
+// serializes markup here. TCK-QR-001: the per-address "QR" button labels are
+// affordance words, not message text — lineText skips .qr-btn children.
+function lineText(line) {
+  let text = "";
+  for (const node of line.childNodes) {
+    if (node.nodeType === Node.ELEMENT_NODE && node.classList.contains("qr-btn")) continue;
+    text += node.textContent;
+  }
+  return text;
+}
+
 function bubbleText(turn) {
   const lines = turn.querySelectorAll(".turn-text:not(.turn-progress):not(.turn-model)");
-  if (lines.length > 0) return Array.from(lines, (line) => line.textContent).join("\n").trim();
+  if (lines.length > 0) return Array.from(lines, lineText).join("\n").trim();
   return (turn.textContent || "").trim();
 }
 
@@ -514,6 +550,82 @@ function addCopyButton(turn) {
   });
   turn.appendChild(btn);
 }
+
+// ------------------------------------------------------- receive QR (TCK-QR-001)
+// The "QR" button beside every linked mainnet address opens a modal viewer
+// showing that address as a scannable QR. GET /qr is token-gated and an
+// <img> request cannot carry X-Auth-Token — so the SVG is FETCHED with the
+// header and handed to <img> through a blob: object URL (the only shapes
+// CSP img-src admits: 'self' + blob:). The server re-validates the value
+// (mainnet segwit only) and echoes nothing but the QR; every string here
+// goes in via textContent/setAttribute — the XSS contract stands.
+let qrOpenFor = ""; // the address currently on screen ("" = closed)
+let qrOpener = null; // the button to refocus on close
+let qrSeq = 0; // stale-response guard: only the newest open may paint
+let qrUrl = null; // live object URL (revoked on close/replace)
+
+function closeQr() {
+  qrSeq += 1; // abandon any in-flight fetch
+  qrOpenFor = "";
+  if (qrUrl !== null) {
+    URL.revokeObjectURL(qrUrl);
+    qrUrl = null;
+  }
+  qrImgEl.removeAttribute("src");
+  qrImgEl.setAttribute("alt", "");
+  qrViewerEl.hidden = true;
+  const opener = qrOpener;
+  qrOpener = null;
+  if (opener && document.contains(opener)) opener.focus();
+}
+
+async function openQr(address, opener) {
+  closeQr();
+  qrOpenFor = address;
+  qrOpener = opener;
+  qrViewerEl.hidden = false;
+  qrCaptionEl.textContent = address; // VERBATIM from the bubble's tool output
+  qrCloseEl.focus();
+  const seq = qrSeq;
+  try {
+    const response = await fetch(
+      "/qr?value=" + encodeURIComponent(address),
+      { headers: authHeaders(), cache: "no-store" }
+    );
+    if (!response.ok) throw new Error("qr refused");
+    const blob = await response.blob();
+    if (seq !== qrSeq) return; // closed or replaced while loading
+    qrUrl = URL.createObjectURL(blob);
+    qrImgEl.setAttribute("alt", LABELS.qrTitle + ": " + address);
+    qrImgEl.src = qrUrl;
+  } catch {
+    if (seq !== qrSeq) return;
+    qrCaptionEl.textContent = LABELS.qrFailed;
+  }
+}
+
+function qrButton(address) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "qr-btn";
+  btn.textContent = LABELS.qr;
+  btn.title = LABELS.qrTitle;
+  btn.setAttribute("aria-label", LABELS.qrTitle);
+  btn.addEventListener("click", () => {
+    // A click is a toggle: re-clicking the open address dismisses the viewer.
+    if (!qrViewerEl.hidden && qrOpenFor === address) closeQr();
+    else openQr(address, btn);
+  });
+  return btn;
+}
+
+qrCloseEl.addEventListener("click", closeQr);
+qrViewerEl.addEventListener("click", (event) => {
+  if (event.target === qrViewerEl) closeQr(); // backdrop click
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !qrViewerEl.hidden) closeQr();
+});
 
 function ensureTurn() {
   if (!state.openTurn) {
@@ -1882,7 +1994,15 @@ settingsListEl.addEventListener("click", async (event) => {
         : typeof data.resync === "string" && RESYNC_NOTES.has(data.resync)
           ? RESYNC_NOTES.get(data.resync)
           : LABELS.settingsApplied;
-      status.textContent = note;
+      // TCK-GAP-001 follow-up: when the apply carries an engine tradeoff
+      // note (data.note — today the value-free GAP_NARROW_NOTE on a gap
+      // DECREASE), render it too, on the same status line (the established
+      // prefix + engine-string pattern, e.g. settingsRejectedPrefix above).
+      // Non-string/empty notes render nothing; still textContent-only.
+      status.textContent =
+        typeof data.note === "string" && data.note
+          ? note + " " + data.note
+          : note;
       // confirm from the server's freshly re-read entry, never our own echo
       const fresh = Array.isArray(data.settings) ? data.settings[0] : null;
       if (fresh && Object.prototype.hasOwnProperty.call(fresh, "value")) {
