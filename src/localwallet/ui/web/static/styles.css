@@ -507,6 +507,24 @@ body {
   overflow-wrap: break-word;
 }
 
+/* TCK-LINK-001: explorer links inside chat bubbles. Inline anchors carrying
+   the verbatim token — zero layout shift when absent; the mono font and
+   break-word wrapping are inherited from .turn-text. Restrained affordance:
+   quiet underline at rest, accent color + stronger underline on hover/focus
+   (tokens only; CSP-safe, no inline styles). */
+.explorer-link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--c-border-strong);
+  text-underline-offset: 2px;
+}
+
+.explorer-link:hover,
+.explorer-link:focus-visible {
+  color: var(--c-accent);
+  text-decoration-color: var(--c-accent);
+}
+
 .turn-progress {
   color: var(--c-text-muted);
   letter-spacing: 0.2em;

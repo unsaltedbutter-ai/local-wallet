@@ -168,6 +168,81 @@ def test_privacy_subline_visible_and_trust_badge_keys_off_privacy_mode() -> None
     assert "effectiveChainUrl" not in trust_block
 
 
+# TCK-LINK-001 static pins: chat-bubble linkification is constant-prefix +
+# validated-token by construction, opens in a new tab with the hardening rel,
+# and rides classes/attributes only (no inline style on the generated anchor).
+def test_linkify_client_shape_pins() -> None:
+    raw = (_STATIC / "app.js").read_text(encoding="utf-8")
+    code = _strip_js_comments(raw)
+    # (checked on raw source: the comment-stripper truncates // inside URLs)
+    assert 'const EXPLORER_ORIGIN = "https://mempool.space";' in raw
+    assert 'EXPLORER_ORIGIN + (isTx ? "/tx/" : "/address/") + token' in code
+    assert 'new URL(href).origin === EXPLORER_ORIGIN' in code  # origin assert
+    assert 'a.target = "_blank"' in code
+    assert 'a.rel = "noopener noreferrer"' in code
+    assert "a.textContent = m[0]" in code  # verbatim label
+    assert "a.style" not in code and "setAttribute(\"style\"" not in code
+    # only the two bubble painters call the linkifier (appendText, appendUser);
+    # progress + model lines keep plain createTextNode telemetry.
+    assert code.count("appendBubbleText(line, text);") == 2
+    assert 'el("p", "turn-text turn-progress")' in code  # progress line intact
+
+
+# TCK-LINK-001 behavioral check (runs under node if present): the SHIPPED
+# regexes and explorerHref are extracted from app.js source and fed accept/
+# reject vectors — hostile or malformed tokens never yield an href, and the
+# only hrefs producible are https://mempool.space/{tx,address}/<verbatim>.
+def test_linkify_regexes_and_href_construction_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    address_re = re.search(r"const ADDRESS_RE = (/[^;]+);", code).group(1)
+    txid_re = re.search(r"const TXID_RE = (/[^;]+);", code).group(1)
+    scan_re = re.search(r"const LINK_SCAN_RE =\s*\n?\s*([^;]+);", code).group(1)
+    href_fn = re.search(r"function explorerHref\(token\) \{.*?\n\}", code, re.DOTALL).group(0)
+    script = f"""
+      const ADDRESS_RE = {address_re};
+      const TXID_RE = {txid_re};
+      const LINK_SCAN_RE = {scan_re};
+      const EXPLORER_ORIGIN = "https://mempool.space";
+      {href_fn}
+      function linkify(text) {{
+        const out = [];
+        LINK_SCAN_RE.lastIndex = 0;
+        let m;
+        while ((m = LINK_SCAN_RE.exec(text)) !== null) {{
+          const href = explorerHref(m[0]);
+          if (href !== null) out.push([m[0], href]);
+        }}
+        return out;
+      }}
+      const addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+      const tx = "f".repeat(64);
+      // accepted: standalone tokens, href = constant prefix + verbatim token
+      const a = linkify("send to " + addr + " now");
+      if (a.length !== 1 || a[0][0] !== addr ||
+          a[0][1] !== EXPLORER_ORIGIN + "/address/" + addr) throw new Error("addr");
+      const t = linkify("tx " + tx + " confirmed");
+      if (t.length !== 1 || t[0][1] !== EXPLORER_ORIGIN + "/tx/" + tx) throw new Error("tx");
+      // rejected: uppercase, longer-word embedding, oversized, wrong charset
+      if (linkify("BC1QAR0SRRR7XFKVY5L643LYDNW9RE59GTZZWF5MDQ").length) throw new Error("upper");
+      if (linkify("x" + addr).length) throw new Error("embedded-left");
+      if (linkify("pre" + tx).length) throw new Error("tx-embedded");
+      if (linkify(tx + "f").length) throw new Error("tx-65");
+      if (linkify(addr.slice(0, 3) + "!" + addr.slice(4)).length) throw new Error("charset");
+      // rejected: fragments, noise, and oversized junk never match
+      if (linkify("/address/x bc1q").length) throw new Error("fragment");
+      if (linkify("x".repeat(100)).length) throw new Error("noise");
+      if (explorerHref("javascript\\u003aalert(1)") !== null) throw new Error("schemes");
+      if (explorerHref("b".repeat(100)) !== null) throw new Error("oversize");
+      console.log("ok");
+    """
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 @pytest.mark.parametrize(
     "path", sorted(_RENDER_DIR.glob("*.json")), ids=lambda p: p.stem
 )

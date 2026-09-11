@@ -140,6 +140,10 @@ const LABELS = {
   badgeBitcoind: "bitcoind",
   // TCK-WEB-010: bubble copy control (aria-label + transient title states).
   copyMessage: "Copy message",
+  // TCK-LINK-001: explorer link disclosure (title + aria-label) — keeps the
+  // operator-sees-it hedge of the TCK-PRIVACY-001 direction.
+  explorerLink:
+    "Opens mempool.space in a new tab — the operator of that site sees this address or txid.",
   copyDone: "Copied",
   copyFailed: "Copy failed",
   // copy pass 2 #44: dim/lit is a state-carrying indicator, so it gets
@@ -378,6 +382,62 @@ function authHeaders(extra) {
 
 // ---------------------------------------------------------------- rendering
 
+// TCK-LINK-001: chat-bubble linkification. ONLY these two closed token
+// shapes become links, and ONLY inside engine/user bubbles (progress lines,
+// the model-download bar, and every settings-pane display keep plain text
+// nodes — they never route through appendBubbleText). The href is built as
+// CONSTANT PREFIX + validated token (never a raw bubble slice), so a
+// script-URL or relative-path injection is impossible by construction; the
+// parsed-origin check is a belt-and-braces assert before the value reaches
+// <a>. The visible label is the token VERBATIM (addresses/txids are quoted
+// from tool output; a link never alters displayed characters).
+const EXPLORER_ORIGIN = "https://mempool.space";
+// mainnet bech32: "bc1" + lowercase bech32 charset, total length 14..90.
+const ADDRESS_RE = /^bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}$/;
+const TXID_RE = /^[0-9a-f]{64}$/;
+// Standalone-token scan: the \b guards (plus greedy-length + boundary
+// backtracking) reject a shape-valid token embedded in a longer word.
+const LINK_SCAN_RE =
+  /\b(bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}|[0-9a-f]{64})\b/g;
+
+function explorerHref(token) {
+  const isTx = TXID_RE.test(token);
+  if (!isTx && !ADDRESS_RE.test(token)) return null;
+  const href = EXPLORER_ORIGIN + (isTx ? "/tx/" : "/address/") + token;
+  return new URL(href).origin === EXPLORER_ORIGIN ? href : null;
+}
+
+// Append `text` to a bubble line as text nodes with qualifying tokens turned
+// into anchors. Render-once idempotence: every .turn-text line is built ONCE
+// at its event — the handleEvent event-id duplicate guard drops replayed SSE
+// events before appendText/appendUser ever run — and this transform never
+// re-reads an existing line, so a replay cannot double-wrap or nest anchors.
+function appendBubbleText(line, text) {
+  let last = 0;
+  let m;
+  LINK_SCAN_RE.lastIndex = 0;
+  while ((m = LINK_SCAN_RE.exec(text)) !== null) {
+    const href = explorerHref(m[0]);
+    if (href === null) continue;
+    if (m.index > last) {
+      line.appendChild(document.createTextNode(text.slice(last, m.index)));
+    }
+    const a = document.createElement("a");
+    a.className = "explorer-link";
+    a.href = href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = m[0]; // verbatim label
+    a.title = LABELS.explorerLink;
+    a.setAttribute("aria-label", LABELS.explorerLink);
+    line.appendChild(a);
+    last = m.index + m[0].length;
+  }
+  if (last === 0 || last < text.length) {
+    line.appendChild(document.createTextNode(text.slice(last)));
+  }
+}
+
 // TCK-WEB-010: per-bubble copy control. The copyable text of a turn is its
 // message lines only (progress dots and the model-download bar are transient
 // telemetry, not message text); a system bubble holds its text on the li
@@ -460,7 +520,7 @@ function ensureTurn() {
 function appendText(text) {
   const turn = ensureTurn();
   const line = el("p", "turn-text");
-  line.appendChild(document.createTextNode(text));
+  appendBubbleText(line, text); // TCK-LINK-001: shape-validated explorer links
   turn.appendChild(line);
   addCopyButton(turn); // first copyable line of this engine turn
   state.progressLine = null;
@@ -548,7 +608,7 @@ function appendUser(text, queued) {
   turn.appendChild(el("span", "turn-role", "You"));
   if (queued) turn.appendChild(el("span", "turn-queued-tag", LABELS.queuedTag));
   const line = el("p", "turn-text");
-  line.appendChild(document.createTextNode(text));
+  appendBubbleText(line, text); // TCK-LINK-001: shape-validated explorer links
   turn.appendChild(line);
   addCopyButton(turn);
   transcriptEl.appendChild(turn);
