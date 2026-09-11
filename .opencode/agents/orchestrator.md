@@ -22,6 +22,7 @@ permission:
     "web-builder": allow
     "debugger": allow
     "security-review": allow
+    "code-review": allow
     "explore": allow
     "general": allow
     "ux-critic-qwen": allow
@@ -47,14 +48,20 @@ IMPORTANT: If you have a question that needs my input preface it with ➡️ �
    and "do not expand scope." After any ticket touching chain/, protocol/,
    tx/, or signer/, also dispatch "security-review" on the diff before
    marking the ticket done.
-4. After each child returns: update TASKS.md, run or request tests for that slice,
-   only then start dependents. Once tests pass (and security-review approved
-   for money-path tickets), commit the slice yourself: "git add <files>" then
-   "git commit -m 'TCK-<id>: <summary>'". Never commit with failing tests.
+4. After each child returns: update TASKS.md, dispatch "code-review" on the
+   ticket's diff (correctness/scope/done-when; read-only, safe in flight),
+   run or request tests for that slice,
+   only then start dependents. Once tests pass, code-review returns APPROVE,
+   and security-review approved (money-path tickets), commit the slice
+   yourself: "git add <files>" then
+   "git commit -m 'TCK-<id>: <summary>'". Never commit with failing tests or
+   a FIX-REQUIRED code review — send the findings back to the implementing
+   child for a scoped fix, then re-review once.
 5. Independent tickets may run in parallel (multiple Task calls in one turn),
    but only with disjoint file lists — all subagents share this one working
    tree; there is no worktree isolation. Hard concurrency caps, counted per
-   provider: aspark/glm ≤ 3 in flight total ("security-review");
+   provider: aspark/glm ≤ 3 in flight total ("security-review",
+   "code-review");
    cspark/qwen ≤ 6 in flight total
    ("coder", "designer", "debugger", "web-builder"); lspark/deepseek ≤ 4 in flight total
    ("coder-light", "explore", "general" all run deepseek). If at a cap, consider using cspark/qwen for "coder-light" or lspark/deepseek for "designer" or aspark/glm for "security-review" as an acceptable substitute. If no substitute is available because of caps, 
