@@ -15,7 +15,6 @@ permission:
     "git add*": allow
     "git commit*": allow
   task:
-    "*": deny
     "coder": allow
     "coder-light": allow
     "designer": allow
