@@ -254,10 +254,14 @@ def test_scan_events_interleave_between_turns_and_persist_on_the_engine(
         store.close()
     # The turn ran DURING the scan (prompt-live reality):
     assert seen == [("hello", True)]
-    # Between-turn stream after the turn: one turn marker, then the two
-    # bare dots, then the newline that closes the dot line:
+    # Between-turn stream after the turn: the TCK-WEB-011 user echo rides
+    # BEFORE its turn (both submitted lines echo, exit included — the sink
+    # contract lives in test_engine_pump), then one turn marker, then the
+    # two bare dots, then the newline that closes the dot line:
     assert [(e.kind, e.payload) for e in events] == [
+        (app.EVENT_USER_TEXT, "hello"),
         (app.EVENT_TURN_END, ""),
+        (app.EVENT_USER_TEXT, "exit"),
         (app.EVENT_PROGRESS, "."),
         (app.EVENT_PROGRESS, "."),
         (app.EVENT_PROGRESS, "\n"),

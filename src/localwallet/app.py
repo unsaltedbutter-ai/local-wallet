@@ -718,6 +718,34 @@ def _configured_url_host(url: str) -> str | None:
     return host or None
 
 
+def _url_without_credentials(url: str) -> str:
+    """``url`` with any USERINFO removed from its authority — plain string
+    surgery (urllib is lint-banned here, same style as
+    :func:`_configured_url_host`): ``scheme://user:pass@host:port/path`` →
+    ``scheme://host:port/path``. The effective-chain-backend display field
+    (TCK-WEB-013) rides this so the settings pane can show the user's own
+    configured server WITHOUT the login it embeds (bitcoind:// RPC URLs
+    legitimately carry one). A URL without userinfo is returned unchanged;
+    never raises.
+    """
+    scheme, sep, rest = url.partition("://")
+    authority, slash, tail = rest.partition("/")
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[1]
+    return f"{scheme}{sep}{authority}{'/' + tail if slash else ''}"
+
+
+def _effective_chain_url(settings: Settings) -> str:
+    """THE live chain-backend selection, verbatim (userinfo included): the
+    single selection point (ADR-0018) — ``chain_base_url`` (boot-resolved
+    env/config/stored fold, updated in place by every hot-swap) or the
+    legacy public default when no rung is set. ``_backend_kind`` badges from
+    it; the settings pane DISPLAYS it (TCK-WEB-013) through
+    :func:`_url_without_credentials` — one resolution expression, so the
+    badge and the shown URL can never disagree."""
+    return settings.chain_base_url.strip() or settings.esplora_base_url.strip()
+
+
 def _loopback_host_of(url: str) -> str | None:
     """The host when ``url`` targets a loopback host, else ``None``.
 
@@ -3269,6 +3297,21 @@ EVENT_TURN_END: Final[str] = "turn_end"
 #: in place (carriage-return, like the scan dots).
 EVENT_MODEL_PROGRESS: Final[str] = "model_progress"
 
+#: TCK-WEB-011 (MW-10 #2): the user's OWN utterance echoed onto the shared
+#: event bus, so EVERY other tab renders the user's message (the transcript
+#: is a shared session — ADR-0010; server messages already fan out to all
+#: tabs, the submitter's local echo did not). Emitted at the pump's single
+#: string-command choke point, so every submit path rides it (free text,
+#: canonical action utterances, quick actions, slash commands). The payload
+#: is the utterance verbatim (sanitized exactly like the transcript echo
+#: path, :func:`sanitize_tool_output`) and NOTHING else — no token, no
+#: internal state. It carries the event's own monotonic id, so the
+#: SUBMITTING tab suppresses the echo against its pending local echo
+#: (client-side dedupe; the engine cannot see tabs). The CLI sink ignores
+#: the kind (the terminal already shows the typed line — byte-identical
+#: output, the WEB-001 seam); the ring buffer replays it like any event.
+EVENT_USER_TEXT: Final[str] = "user_text"
+
 #: Command token the web transport stamps on a typed ``/state`` snapshot
 #: request (TCK-WEB-003). Recognized ONLY as the ``command`` label of a
 #: :class:`StateSnapshotRequest` (below) — it is never a model turn and never
@@ -3355,7 +3398,9 @@ def cli_sink(output_fn: Callable[[str], None]) -> Callable[[EngineEvent], None]:
     """The CLI rendering of the event stream — byte-identical to the old
     REPL for text/progress (output_fn line / raw stdout char; scan dots,
     the closing newline), plus the TCK-LAUNCH-002 in-place model-download
-    percent line. Markers stay invisible.
+    percent line. Markers stay invisible, and so does the TCK-WEB-011
+    ``user_text`` echo (the terminal already shows what the user typed —
+    the kind exists for the multi-tab web transcript).
     """
 
     def sink(event: EngineEvent) -> None:
@@ -4916,6 +4961,17 @@ SETTINGS_COMMAND: Final[str] = "/settings"
 #: a rename/removal, with the client in the same ticket).
 SETTINGS_SCHEMA: Final[str] = "settings/1"
 
+#: TCK-WEB-013: the additive ``/settings`` reply field carrying the chain
+#: base URL ACTUALLY in service (env/config/stored fold, or the public
+#: default when the stored rung is unset) — a read-only DISPLAY of the
+#: user's own config for the settings pane, USERINFO STRIPPED by
+#: :func:`_url_without_credentials` (never a credential surface). Additive
+#: under the unchanged ``settings/1`` tag; stamped with ``backend_kind``
+#: at the one seal point, omitted (never fabricated) when no engine chain
+#: wiring exists. The trust badge is NOT this field: it rides the EXISTING
+#: ``/state`` ``privacy_mode`` closed enum (TCK-UX-010).
+SETTINGS_EFFECTIVE_CHAIN_URL_KEY: Final[str] = "effective_chain_base_url"
+
 #: Env rung of the ADR-0023 ladder for the chain backend (displayed as the
 #: honest ``env_override`` flag only — resolution stays in
 #: :func:`localwallet.config.resolve_chain_base_url`; the value is never read).
@@ -5520,9 +5576,8 @@ def handle_settings_request(
             "status": "unavailable",
             "error": "settings not available",
         }
-    kind = backend.kind if backend is not None else None
     if key is None:
-        return _settings_reply({"status": "ok", "settings": _settings_entries(store, backend)}, kind)
+        return _settings_reply({"status": "ok", "settings": _settings_entries(store, backend)}, backend)
     if value is None:
         # Explicit single-key READ (never a write, never the general list).
         # The watch key reads back FULL here — this shape (key set, value
@@ -5531,14 +5586,14 @@ def handle_settings_request(
         # truncated. An unknown read key is refused without naming it back.
         if key == WATCH_KEY_SETTING:
             return _settings_reply(
-                {"status": "ok", "settings": [_watch_key_entry(store, reveal=True)]}, kind
+                {"status": "ok", "settings": [_watch_key_entry(store, reveal=True)]}, backend
             )
         entry = next(
             (e for e in _settings_entries(store, backend) if e["key"] == key), None
         )
         if entry is None:
             return unknown
-        return _settings_reply({"status": "ok", "settings": [entry]}, kind)
+        return _settings_reply({"status": "ok", "settings": [entry]}, backend)
     if key not in _SETTINGS_KEYS or not isinstance(value, str):
         return unknown
     if creds is not None and (
@@ -5559,7 +5614,7 @@ def handle_settings_request(
                 "key": key,
                 "error": "value too long",
             },
-            kind,
+            backend,
         )
     extra: dict[str, object] = {}
     auth_prior: tuple[str | None, str | None, bool] | None = None
@@ -5580,7 +5635,7 @@ def handle_settings_request(
             if error is not None:
                 _restore_backend_auth(store, auth_prior)
                 return _settings_reply(
-                    {"status": "rejected", "key": key, "error": error}, kind
+                    {"status": "rejected", "key": key, "error": error}, backend
                 )
     if key == _CHAIN_BASE_URL_KEY and backend is not None:
         # The hot-swap path OWNS this write (probe → build → typed store
@@ -5591,7 +5646,7 @@ def handle_settings_request(
             # just-written pair is rewound (no new creds against the old URL).
             _restore_backend_auth(store, auth_prior)
             return _settings_reply(
-                {"status": "rejected", "key": key, "error": error}, kind
+                {"status": "rejected", "key": key, "error": error}, backend
             )
     else:
         before = (
@@ -5600,7 +5655,7 @@ def handle_settings_request(
         if (error := _apply_setting_change(store, key, value)) is not None:
             _restore_backend_auth(store, auth_prior)
             return _settings_reply(
-                {"status": "rejected", "key": key, "error": error}, kind
+                {"status": "rejected", "key": key, "error": error}, backend
             )
         if key == wallet_scan.GAP_LIMIT_SETTING:
             after = next(
@@ -5619,20 +5674,30 @@ def handle_settings_request(
                 extra["resync"] = "unavailable"
     entry = next(e for e in _settings_entries(store, backend) if e["key"] == key)
     return _settings_reply(
-        {"status": "applied", "settings": [entry], **extra}, kind
+        {"status": "applied", "settings": [entry], **extra}, backend
     )
 
 
 def _settings_reply(
-    fields: dict[str, object], kind: str | None
+    fields: dict[str, object], backend: ChainBackendFlow | None
 ) -> dict[str, object]:
     """Seal one ``/settings`` reply with its schema tag — and, when an
     engine chain wiring exists, the additive ``backend_kind`` NAME
     (TCK-BACKEND-002 deliverable 10: a closed enum member, value-free;
-    absent when no backend is wired — the additive-``settings/1`` rule)."""
+    absent when no backend is wired — the additive-``settings/1`` rule)
+    and the additive :data:`SETTINGS_EFFECTIVE_CHAIN_URL_KEY` display
+    string (TCK-WEB-013: the chain base URL ACTUALLY in service — env/
+    config/stored fold, or the public default when no rung is set —
+    USERINFO STRIPPED, never a credential surface; user-owned config
+    already displayed in the settings pane). Both fields stamp at THIS
+    one seal point so every wired reply shape carries them together;
+    both are omitted, never fabricated, when nothing is wired. The
+    trust badge is NOT here: it rides the EXISTING /state
+    ``privacy_mode`` closed enum (TCK-UX-010, already shipped)."""
     reply: dict[str, object] = {"schema": SETTINGS_SCHEMA, **fields}
-    if kind is not None:
-        reply["backend_kind"] = kind
+    if backend is not None:
+        reply["backend_kind"] = backend.kind
+        reply[SETTINGS_EFFECTIVE_CHAIN_URL_KEY] = backend.effective_base_url
     return reply
 
 
@@ -6106,9 +6171,21 @@ def _pump(
         # load with PRELOAD_START when its channel is print-safe (the
         # wheel's build-time /dev/null dup2 window is process-wide).
         preload.attach(commands)
+
+    def _watch_line(line: str) -> None:
+        # TCK-WEB-011 fold (UX-012 review MINOR): watch narration lines
+        # (failure / recovered / incoming-tx) close their own turn in web
+        # mode, like the startup lines _Output already does — without the
+        # closer they merge into the NEXT reply bubble. Mid-turn narration
+        # is untouched (it flows through the pump's text channel). The CLI
+        # sink ignores the marker: byte-identical terminal output.
+        output_fn(line)
+        if emitter is not None:
+            emitter.emit(EVENT_TURN_END)
+
     while True:
         if not (scan is not None and scan.in_progress):
-            watch_count = _drain_watch(watcher, output_fn, client=client)
+            watch_count = _drain_watch(watcher, _watch_line, client=client)
             if watch_count:
                 loop.record_event("watch_events", watch_count)
         if ready is not None:
@@ -6255,7 +6332,15 @@ def _pump(
                 emitter.emit(EVENT_TURN_END)
             continue
         if isinstance(command, str):
-            utterance = command.strip().lower()
+            line = command.strip()
+            if line and emitter is not None:
+                # TCK-WEB-011 SINGLE CHOKE POINT: every submitted line —
+                # /turn free text, /action canonical utterances, quickbar
+                # quick actions, slash commands — echoes onto the shared
+                # bus as ``user_text`` BEFORE any branch runs, so no path
+                # can be missed and every tab sees the user's message.
+                emitter.emit(EVENT_USER_TEXT, sanitize_tool_output(line))
+            utterance = line.lower()
             if model is not None:
                 verdict = _model_card_verdict(
                     model,
@@ -7040,7 +7125,7 @@ def _backend_kind(settings: Settings, *, resolved: bool) -> str:
     server the user never picked."""
     if not resolved:
         return BACKEND_KIND_NONE
-    url = (settings.chain_base_url.strip() or settings.esplora_base_url.strip())
+    url = _effective_chain_url(settings)
     if url.startswith(ELECTRUM_SCHEME):
         return BACKEND_KIND_ELECTRUM
     if url.startswith(BITCOIND_SCHEME):
@@ -7127,6 +7212,16 @@ class ChainBackendFlow:
             self._w.settings,
             resolved=_backend_resolved(effective or None, self._w.store),
         )
+
+    @property
+    def effective_base_url(self) -> str:
+        """The chain base URL ACTUALLY in service (TCK-WEB-013): the SAME
+        single selection point ``kind``/``_backend_mode`` read — the boot
+        fold (env > config file > stored) updated in place by every hot-
+        swap, or the shipped public default when no rung is set — rendered
+        through :func:`_url_without_credentials` (the pane may show the
+        user's own server; it may never show a login)."""
+        return _url_without_credentials(_effective_chain_url(self._w.settings))
 
     def _worker_occupied(self) -> bool:
         """Whether a scan FETCH owns the worker right now (pending/running).

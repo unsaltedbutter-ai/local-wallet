@@ -817,3 +817,101 @@ def test_kind_and_flags_ride_the_settings_and_state_surfaces(
         not in app.build_state_snapshot(wiring.flow, wiring.session, None)
     )
     wiring.store.close()
+
+
+# ---------------------------------- effective chain URL display (TCK-WEB-013)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # The point of the helper: userinfo gone, everything else verbatim.
+        ("http://rpcuser:S3cr3t@node.invalid:18443/wallet/x",
+         "http://node.invalid:18443/wallet/x"),
+        ("bitcoind://u:p@127.0.0.1:8332", "bitcoind://127.0.0.1:8332"),
+        ("ssl://pass@host.local:50002", "ssl://host.local:50002"),
+        ("https://mempool.space/api", "https://mempool.space/api"),  # no creds
+        ("http://host:80", "http://host:80"),  # no path, no change
+        ("no-scheme://user:pass@host/p", "no-scheme://host/p"),
+        ("host:8080/x", "host:8080/x"),  # schemeless: authority untouched
+    ],
+)
+def test_url_without_credentials_string_surgery(url: str, expected: str) -> None:
+    """The strip is plain-string surgery (urllib is lint-banned here): only
+    the USERINFO (up to the LAST '@' of the authority) is removed — scheme,
+    host, port and path ride verbatim. (A userinfo containing '/' cannot be
+    parsed by any string helper; the store's typed writer rejects such URLs
+    at write time, and the env rung is the operator's own config.)"""
+    assert app._url_without_credentials(url) == expected
+
+
+def test_settings_reply_carries_the_effective_chain_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """Done-when pins (TCK-WEB-013, additive under the unchanged settings/1
+    tag): (a) an UNSET stored rung still answers the EFFECTIVE URL — the
+    public default; (b) an env rung carrying userinfo is displayed
+    CREDENTIAL-FREE (and no reply byte leaks the login); (c) the stored-rung
+    entry is untouched by the new field (stored and effective are distinct,
+    the env rung shadows); (d) the field follows a live SWAP; (e) a bare
+    pump (no chain wiring) OMITS it — absent, never guessed, the exact
+    ``backend_kind`` rule it stamps beside."""
+    # (a) nothing on any rung: the public default appears beside the null entry.
+    wiring, _commands = _mk_wiring(tmp_path, monkeypatch)
+    flow = ChainBackendFlow(wiring, _probe_true)
+    reply = app.handle_settings_request(wiring.store, None, None, flow)
+    entry = next(e for e in reply["settings"] if e["key"] == "chain_base_url")
+    assert entry["value"] is None  # STORED rung (what GET /settings always was)
+    assert reply[app.SETTINGS_EFFECTIVE_CHAIN_URL_KEY] == "https://mempool.space/api"
+    # (e) bare pump: no wiring → neither additive field is fabricated.
+    bare = app.handle_settings_request(wiring.store, None, None)
+    assert app.SETTINGS_EFFECTIVE_CHAIN_URL_KEY not in bare
+    assert "backend_kind" not in bare
+    wiring.store.close()
+
+    # (b)+(c) env rung (the boot fold) carries a login: display is stripped.
+    subdir = tmp_path / "env"
+    subdir.mkdir()
+    wiring2, _commands2 = _mk_wiring(
+        subdir, monkeypatch, boot_backend="http://rpcuser:S3cr3t@node.invalid:18443/api"
+    )
+    flow2 = ChainBackendFlow(wiring2, _probe_true)
+    reply2 = app.handle_settings_request(wiring2.store, None, None, flow2)
+    assert (
+        reply2[app.SETTINGS_EFFECTIVE_CHAIN_URL_KEY]
+        == "http://node.invalid:18443/api"
+    )
+    for secret in ("rpcuser", "S3cr3t"):
+        assert secret not in repr(reply2)  # no credential byte anywhere
+    # The stored rung (unset — the boot fold shadows it) stays the null entry:
+    # the two fields answer different questions and never overwrite each other.
+    entry2 = next(e for e in reply2["settings"] if e["key"] == "chain_base_url")
+    assert entry2["value"] is None
+
+    # (d) a live swap moves the display with the client it seals beside.
+    wiring2.settings.chain_base_url = GOOD_URL  # simulate the installed swap
+    assert (
+        app.handle_settings_request(wiring2.store, None, None, flow2)[
+            app.SETTINGS_EFFECTIVE_CHAIN_URL_KEY
+        ]
+        == GOOD_URL
+    )
+    wiring2.store.close()
+
+
+def test_effective_url_follows_a_real_hot_swap_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """The seal point stamps at REPLY time, so the APPLIED chain write
+    already answers the NEW server as effective (with the swap's resync
+    drained to keep the worker honest) — the pane never re-GETs to learn
+    its own just-applied truth."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    flow = ChainBackendFlow(wiring, _probe_true)
+    reply = app.handle_settings_request(
+        wiring.store, "chain_base_url", NEW_URL, flow
+    )
+    assert reply["status"] == "applied" and reply["swapped"] is True
+    assert reply[app.SETTINGS_EFFECTIVE_CHAIN_URL_KEY] == NEW_URL
+    _drain(wiring, commands)
+    wiring.store.close()

@@ -315,6 +315,39 @@ def test_action_requires_utterance_field(serve: Any) -> None:
     assert b"utterance" in data
 
 
+def test_user_text_echo_fans_out_to_every_tab_and_replays(
+    serve: Any, echo_turns: list[str]
+) -> None:
+    """TCK-WEB-011: the submitter's OWN utterance rides the same SSE fan-out
+    as server messages — /turn free text and /action canonical utterances
+    both arrive typed as ``user_text`` (verbatim payload, the frame carries
+    its event id so the submitting tab can dedupe its local echo), each echo
+    precedes its reply, and the ring buffer replays echoes to a late tab via
+    Last-Event-ID exactly like any other event. The transport needs no kind
+    registration: the frame writer is generic pass-through (pinned here)."""
+    server = serve(heartbeat_s=30.0)
+    a, b = _Stream(server), _Stream(server)
+    a.read_head(), b.read_head()
+    _request(server, "POST", "/turn", {"text": "hello web"}, token=server.token)
+    _request(server, "POST", "/action", {"utterance": "confirm"}, token=server.token)
+    for stream in (a, b):
+        frame = stream.read_until(b"data: echo:confirm")
+        assert b"event: user_text\ndata: hello web\n\n" in frame
+        assert b"event: user_text\ndata: confirm\n\n" in frame
+        # The echo rides BEFORE the turn it triggered.
+        assert frame.index(b"event: user_text\ndata: hello web") < frame.index(
+            b"data: echo:hello web"
+        )
+        ids = re.findall(rb"id: (\d+)\nevent: user_text", frame)
+        assert len(ids) == 2  # every echo carries its monotonic id (client dedupe)
+    # A tab that connected AFTER both turns replays the echoes from the ring:
+    late = _Stream(server, last_event_id=0)
+    buf = late.read_until(b"data: echo:confirm")
+    assert b"event: user_text\ndata: hello web\n\n" in buf
+    assert b"event: user_text\ndata: confirm\n\n" in buf
+    a.close(), b.close(), late.close()
+
+
 # ----------------------------------------------------------------- SSE §5
 
 
@@ -326,7 +359,10 @@ def test_ring_buffer_replays_after_reconnect_via_last_event_id(
     stream.read_head()
     _request(server, "POST", "/turn", {"text": "one"}, token=server.token)
     first_buf = stream.read_until(b"turn_end")
-    first_id = min(int(i) for i in re.findall(rb"id: (\d+)", first_buf))
+    # Cursor at the END of turn one (the max id of its user_text/text/
+    # turn_end frames) — a cursor set at the start of the turn (its
+    # user_text echo, once the min) would legitimately replay echo:one.
+    first_id = max(int(i) for i in re.findall(rb"id: (\d+)", first_buf))
     _request(server, "POST", "/turn", {"text": "two"}, token=server.token)
     second_buf = stream.read_until(b"echo:two")
     seen_id = max(int(i) for i in re.findall(rb"id: (\d+)", first_buf + second_buf))
@@ -1181,6 +1217,10 @@ def test_settings_get_lists_the_allowlist_shape_only(
         snapshot = json.loads(data)
         assert snapshot["schema"] == "settings/1"
         assert snapshot["status"] == "ok"
+        # TCK-WEB-013: this engine has a store but NO chain wiring, so the
+        # additive effective-URL field is honestly absent end-to-end (the
+        # transport forwards the engine's dict verbatim — no registration).
+        assert app.SETTINGS_EFFECTIVE_CHAIN_URL_KEY not in snapshot
         entries = {entry["key"]: entry for entry in snapshot["settings"]}
         assert set(entries) == {
             "gap_limit",

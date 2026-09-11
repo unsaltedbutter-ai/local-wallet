@@ -96,11 +96,13 @@ def test_pump_is_queue_driven_with_monotonic_ids_and_markers(
 ) -> None:
     """turn in (queue) → events out (ids 1,2,3,...) → QUIT ends between turns.
 
-    Ordering pins: every processed command's texts are followed by exactly
-    one ``turn_end``; blank lines are consumed without a turn or marker;
-    ``/`` commands route to the transcript handler (the real one — even a
+    Ordering pins: every processed command's texts are preceded by its
+    TCK-WEB-011 ``user_text`` echo and followed by exactly one ``turn_end``;
+    blank lines are consumed without an echo, a turn, or a marker; ``/``
+    commands route to the transcript handler (the real one — even a
     deterministic UI turn gets its completion marker); ``exit`` ends the
-    session without ever becoming a turn.
+    session without ever becoming a turn (it still echoes: it is a real
+    utterance the OTHER tabs must show, and the CLI sink ignores the kind).
     """
     events: list[EngineEvent] = []
     emitter = EventEmitter(events.append)
@@ -118,13 +120,16 @@ def test_pump_is_queue_driven_with_monotonic_ids_and_markers(
     )
     assert echo_turns == ["hi"]
     assert [(e.kind, e.payload) for e in events] == [
+        (app.EVENT_USER_TEXT, "hi"),
         (EVENT_TEXT, "echo:hi"),
         (EVENT_TURN_END, ""),
+        (app.EVENT_USER_TEXT, "/details"),
         (EVENT_TEXT, app._DETAILS_NONE),
         (EVENT_TURN_END, ""),
+        (app.EVENT_USER_TEXT, "exit"),
     ]
     ids = [e.id for e in events]
-    assert ids == [1, 2, 3, 4]  # strictly monotonic, no gaps, no reuse
+    assert ids == [1, 2, 3, 4, 5, 6, 7]  # strictly monotonic, no gaps, no reuse
 
 
 def test_pump_card_lines_close_their_own_turns() -> None:
@@ -649,6 +654,173 @@ def test_cli_sink_renders_events_like_the_pre_web_repl(
     assert capsys.readouterr().out == "..\n"
 
 
+# ---------------------------------------------------- user echo across tabs (WEB-011)
+
+
+def test_every_string_submit_path_echoes_user_text_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Done-when (all submit paths): the SINGLE choke point in the pump emits
+    exactly one ``user_text`` per submitted line, BEFORE the line is routed —
+    free text (a model turn), a canonical action utterance, a quick action
+    (``/settings``), and a transcript slash command all echo through the SAME
+    branch. A turn that continues early (quick action) still got its echo; the
+    blank line got none. Payload is the stripped utterance."""
+    turns: list[str] = []
+
+    def spy_turn(*args: Any, **kwargs: Any) -> None:
+        turns.append(args[3])
+
+    monkeypatch.setattr(app, "_run_turn", spy_turn)
+    # /settings is a model-free quick action; stub its dispatch so the test
+    # asserts only that the echo preceded the (early-continuing) branch.
+    quick: list[str] = []
+    monkeypatch.setattr(
+        app, "_run_quick_action", lambda line, *a, **k: quick.append(line)
+    )
+    transcript: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "_handle_transcript_command",
+        lambda line, *a, **k: transcript.append(line),
+    )
+
+    events: list[EngineEvent] = []
+    emitter = EventEmitter(events.append)
+    commands: queue.Queue[Any] = queue.Queue()
+    #  free text | action utterance | blank | quick action | slash command
+    for line in ("send 1 btc", "confirm", "   ", "/settings", "/label note"):
+        commands.put(line)
+    commands.put(app.QUIT)
+    app._pump(
+        _make_loop(),
+        emitter.text,
+        commands,
+        flow=TxFlow(),
+        session=app.SendSession(),
+        table={},
+        emitter=emitter,
+    )
+    echo_kinds = [(e.kind, e.payload) for e in events if e.kind == app.EVENT_USER_TEXT]
+    assert echo_kinds == [
+        (app.EVENT_USER_TEXT, "send 1 btc"),
+        (app.EVENT_USER_TEXT, "confirm"),
+        (app.EVENT_USER_TEXT, "/settings"),
+        (app.EVENT_USER_TEXT, "/label note"),
+    ]  # the blank line echoed nothing; one echo per real submit
+    assert turns == ["send 1 btc", "confirm"]  # routed AFTER their echo
+    assert quick == ["/settings"]  # quick action echoed despite its early continue
+    assert transcript == ["/label note"]  # slash command routed as a transcript line
+
+
+def test_user_text_payload_is_sanitized_and_nothing_but_the_utterance() -> None:
+    """The echo carries the utterance VERBATIM but sanitized exactly like the
+    transcript path (:func:`sanitize_tool_output`: control/format chars
+    stripped), and NOTHING else — no token, no internal state, no wrapping.
+    A structural-injection attempt loses its newlines and cannot forge a
+    second frame."""
+    events: list[EngineEvent] = []
+    emitter = EventEmitter(events.append)
+    commands: queue.Queue[Any] = queue.Queue()
+    # A user line smuggling a fake turn_end/text frame via embedded newlines.
+    commands.put("hi\n\revent: text\ndata: FORGED")
+    commands.put(app.QUIT)
+    from localwallet.agent.context import sanitize_tool_output
+
+    app._pump(
+        _make_loop(),
+        emitter.text,
+        commands,
+        flow=TxFlow(),
+        session=app.SendSession(),
+        table={},
+        emitter=emitter,
+    )
+    echo = next(e for e in events if e.kind == app.EVENT_USER_TEXT)
+    assert echo.payload == sanitize_tool_output("hi\n\revent: text\ndata: FORGED")
+    assert echo.payload == "hievent: textdata: FORGED"  # breaks gone; one frame
+    assert "\n" not in echo.payload and "\r" not in echo.payload  # one line, can't split
+    assert "FORGED" in echo.payload  # the literal TEXT survives (it is the user's own words)
+
+
+def test_cli_sink_ignores_user_text_byte_identical(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """WEB-001 seam, pinned for the new kind: the CLI renders NOTHING for a
+    ``user_text`` event (the terminal already shows what the user typed), so
+    multi-tab echo adds no line to the CLI transcript — byte-identical."""
+    outputs: list[str] = []
+    emitter = cli_emitter(outputs.append)
+    emitter.emit(app.EVENT_USER_TEXT, "what the user typed")
+    emitter.text("the reply")
+    assert outputs == ["the reply"]
+    assert capsys.readouterr().out == ""  # no raw stdout for the echo kind
+
+
+def test_watch_narration_closes_its_own_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """UX-012 review MINOR (folded into WEB-011): a between-turns watch drain
+    line (failure / recovered / incoming-tx) is followed by a ``turn_end`` in
+    the event stream, so the browser stops merging it into the NEXT reply
+    bubble — the same delimiter the startup lines already get. Driven through
+    the pump's real watch path (``_drain_watch`` is handed the closing sink)."""
+
+    def fake_drain(_watcher, output_fn, *, client=None):  # one recovered line
+        output_fn("watch: recovered.")
+        return 1
+
+    monkeypatch.setattr(app, "_drain_watch", fake_drain)
+    events: list[EngineEvent] = []
+    emitter = EventEmitter(events.append)
+    commands: queue.Queue[Any] = queue.Queue()
+    commands.put(app.QUIT)
+    app._pump(
+        _make_loop(),
+        emitter.text,
+        commands,
+        flow=TxFlow(),
+        session=app.SendSession(),
+        table={},
+        watcher=object(),  # non-None so the drain branch runs
+        emitter=emitter,
+    )
+    assert [(e.kind, e.payload) for e in events] == [
+        (EVENT_TEXT, "watch: recovered."),
+        (EVENT_TURN_END, ""),
+    ]
+
+
+def test_watch_turn_end_invisible_to_cli_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The watch turn_end closer does NOT leak to the terminal: the CLI sink
+    ignores the marker, so a between-turns watch line prints exactly as it
+    did before WEB-011 (byte-identical)."""
+
+    def fake_drain(_watcher, output_fn, *, client=None):
+        output_fn("Incoming: received 5000 sats at bc1qx (in mempool, tx abc…).")
+        return 1
+
+    monkeypatch.setattr(app, "_drain_watch", fake_drain)
+    outputs: list[str] = []
+    emitter = cli_emitter(outputs.append)
+    commands: queue.Queue[Any] = queue.Queue()
+    commands.put(app.QUIT)
+    app._pump(
+        _make_loop(),
+        emitter.text,
+        commands,
+        flow=TxFlow(),
+        session=app.SendSession(),
+        table={},
+        watcher=object(),
+        emitter=emitter,
+    )
+    assert outputs == ["Incoming: received 5000 sats at bc1qx (in mempool, tx abc…)."]
+    assert capsys.readouterr().out == ""
+
+
 # ------------------------------------------------------------- seam proof
 
 
@@ -678,7 +850,11 @@ def test_run_session_flows_through_the_queue_harness(
     events = HARNESS["events"]
     ids = [e.id for e in events]
     assert ids[0] == 1 and ids == sorted(ids) and len(ids) == len(set(ids))
-    assert events[-1].kind == EVENT_TURN_END  # turn completed, then exit
+    # TCK-WEB-011: ``exit`` echoes as the user's own utterance at the pump's
+    # choke point (the CLI sink ignores the kind — it never reached ``outputs``),
+    # then ends the session; the hello-there turn closed with a marker first.
+    assert events[-1].kind == app.EVENT_USER_TEXT and events[-1].payload == "exit"
+    assert any(e.kind == EVENT_TURN_END for e in events)  # the turn completed
     texts = [e.payload for e in events if e.kind == EVENT_TEXT]
     assert texts  # the respond turn narrated
     assert all(text in outputs for text in texts)  # CLI forwarding intact

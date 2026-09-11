@@ -888,6 +888,9 @@ class _StubBackend:
 
     kind = "esplora"
     shadowed = False
+    # TCK-WEB-013: the seal point stamps this alongside ``kind`` — the stub
+    # carries a static display URL (the real one derives from live settings).
+    effective_base_url = "https://mempool.space/api"
 
     def __init__(self, error: str | None = None) -> None:
         self._error = error
