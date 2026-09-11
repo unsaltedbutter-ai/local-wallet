@@ -385,3 +385,101 @@ def test_malformed_file_refuses_even_when_env_overrides(
     monkeypatch.setenv("LOCALWALLET_GAP_LIMIT", "5")
     with pytest.raises(ValueError):
         Settings.from_env(config_path=path)
+
+
+# ------------------------------------------------ TCK-FIAT-002 display currency
+
+from localwallet.config import (
+    DEFAULT_DISPLAY_CURRENCY,
+    DISPLAY_CURRENCIES,
+    resolve_display_currency,
+)
+
+ALL_CODES = ["usd", "eur", "gbp", "cad", "chf", "aud", "jpy"]
+
+
+@pytest.mark.parametrize("code", ALL_CODES)
+def test_display_currency_ships_unset_with_usd_default(code: str) -> None:
+    # The field is a blank-string-by-default scalar (like gap_limit): the
+    # default lives in the resolver, so an unset rung never shadows stored.
+    assert Settings().display_currency == ""
+    assert DEFAULT_DISPLAY_CURRENCY == "usd"
+    assert tuple(DISPLAY_CURRENCIES) == tuple(ALL_CODES)
+    assert code in DISPLAY_CURRENCIES
+
+
+@pytest.mark.parametrize(
+    ("env_value", "stored_value", "expected"),
+    [
+        ("eur", "gbp", "eur"),  # env always wins
+        ("eur", None, "eur"),
+        (None, "gbp", "gbp"),
+        (None, None, "usd"),  # no rung set -> shipped default
+        ("", "gbp", "gbp"),  # blank rungs are unset, not malformed
+        ("eur", "", "eur"),
+        ("", "", "usd"),
+        ("  EUR  ", "gbp", "eur"),  # case-insensitive, canonical lowercase
+        ("cad", "  jpy  ", "cad"),
+        (None, "GBP", "gbp"),  # the stored rung canonicalizes too
+    ],
+)
+def test_display_currency_ladder_precedence_and_case(
+    env_value: str | None, stored_value: str | None, expected: str
+) -> None:
+    assert resolve_display_currency(env_value, stored_value) == expected
+
+
+@pytest.mark.parametrize("blank", [None, "", "   ", "\t"])
+def test_display_currency_blank_rungs_are_unset(blank: str | None) -> None:
+    assert resolve_display_currency(blank, blank) == "usd"
+
+
+@pytest.mark.parametrize("bad", ["klingon", "btc", "usdd", "us d", "€", "-1"])
+def test_unknown_display_currency_refused_value_free(bad: str) -> None:
+    for rung in (bad, None):  # env rung and stored rung both refuse
+        env = bad if rung is None else None
+        stored = bad if rung is not None else None
+        with pytest.raises(ValueError) as excinfo:
+            resolve_display_currency(env, stored)
+        message = str(excinfo.value)
+        assert bad not in message  # value-free, always
+    # The message names the closed set so the user can fix it.
+    with pytest.raises(ValueError) as excinfo:
+        resolve_display_currency("klingon", None)
+    assert "usd" in str(excinfo.value) and "jpy" in str(excinfo.value)
+
+
+def test_display_currency_env_rung_name_is_value_free() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        resolve_display_currency("NOPE", None)
+    assert "LOCALWALLET_DISPLAY_CURRENCY" in str(excinfo.value)
+
+
+def test_display_currency_stored_rung_name_is_value_free() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        resolve_display_currency(None, "NOPE")
+    assert "display_currency" in str(excinfo.value) and "LOCALWALLET" not in str(
+        excinfo.value
+    )
+
+
+def test_display_currency_env_parsed_by_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LOCALWALLET_DISPLAY_CURRENCY", "JPY")
+    assert Settings.from_env().display_currency == "JPY"  # raw, resolver canonicalizes
+
+
+def test_display_currency_config_file_rung(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text('{"display_currency": "GBP"}', encoding="utf-8")
+    assert Settings.from_env(config_path=path).display_currency == "GBP"
+
+
+def test_display_currency_env_beats_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_raw(tmp_path, '{"display_currency": "gbp"}')
+    monkeypatch.setenv("LOCALWALLET_DISPLAY_CURRENCY", "aud")
+    got = Settings.from_env(config_path=path).display_currency
+    assert resolve_display_currency(got, "jpy") == "aud"

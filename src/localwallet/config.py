@@ -74,6 +74,29 @@ COIN_SETTING_DEFAULTS: Final[Mapping[str, int]] = {
     CONSOLIDATE_BELOW_SAT_VB_SETTING: 2,
 }
 
+DISPLAY_CURRENCY_SETTING: Final[str] = "display_currency"
+
+#: THE closed display-currency enum (TCK-FIAT-002, ADR-0011 amendment):
+#: exactly the codes the mempool.space ``/v1/prices`` endpoint serves
+#: (confirmed live 2026-09-10), canonical lowercase. Parsing is
+#: case-insensitive; every consumer canonicalizes through
+#: :func:`normalize_display_currency` before use. The LLM never authors a
+#: currency code — this setting is the only currency selector (the model
+#: emits ``get_balance``; the app converts).
+DISPLAY_CURRENCIES: Final[tuple[str, ...]] = (
+    "usd",
+    "eur",
+    "gbp",
+    "cad",
+    "chf",
+    "aud",
+    "jpy",
+)
+
+#: Shipped default: USD (unchanged TCK-FIAT-001 behavior when no rung is set).
+DEFAULT_DISPLAY_CURRENCY: Final[str] = "usd"
+
+
 #: Path of the user-editable config file (TCK-CFG-002): ``~/.localwallet/``
 #: is the per-user config dir for a packaged CLI app (no repo writes, survives
 #: reinstalls, private to the user). The file holds the same scalar fields as
@@ -177,6 +200,15 @@ class Settings:
     store_path: str = "localwallet.db"
     price_ttl_s: float = 60.0
     price_enabled: bool = True
+    #: Display currency (TCK-FIAT-002, ADR-0011 amendment): a DECIMAL-STRING
+    #: -style closed code, same gap-limit shape — empty string = UNSET (fall
+    #: through to the stored settings key, else :data:`
+    #: DEFAULT_DISPLAY_CURRENCY` of "usd"). Env name
+    #: ``LOCALWALLET_DISPLAY_CURRENCY``; config-file key ``display_currency``.
+    #: Case-insensitive on every rung; :func:`resolve_display_currency`
+    #: validates against :data:`DISPLAY_CURRENCIES` and refuses an unknown
+    #: code fail-closed and value-free (startup refusal, ADR-0009 spirit).
+    display_currency: str = ""
     fee_cache_ttl_s: float = 30.0
     # --- Node detection (Phase 4, node/ module; TCK-P4-001) ---
     # Path to a Bitcoin Core RPC cookie file. Empty string means "use the
@@ -252,6 +284,7 @@ class Settings:
         ``LOCALWALLET_UTXO_TARGET_MIN_SATS``,
         ``LOCALWALLET_UTXO_TARGET_MAX_SATS``,
         ``LOCALWALLET_CONSOLIDATE_BELOW_SAT_VB``,
+        ``LOCALWALLET_DISPLAY_CURRENCY``,
         ``LOCALWALLET_WEB_PORT``.
         Unknown variables are ignored.
 
@@ -331,6 +364,49 @@ def resolve_chain_base_url(
         if value is not None and value.strip():
             return value.strip()
     return None
+
+
+def normalize_display_currency(raw: str, source: str) -> str:
+    """Case-insensitively parse one currency code to its canonical lowercase
+    form (TCK-FIAT-002), or raise :class:`ValueError` naming only the
+    ``source`` rung and the closed enum — never the offending value
+    (ADR-0009 value-free discipline: a corrupt setting never silently
+    reverts policy; the caller refuses startup).
+    """
+    code = raw.strip().lower()
+    if code not in DISPLAY_CURRENCIES:
+        raise ValueError(
+            f"{source} must be one of {', '.join(DISPLAY_CURRENCIES)}"
+        )
+    return code
+
+
+def resolve_display_currency(
+    env_value: str | None, stored_value: str | None
+) -> str:
+    """Resolve the display currency (TCK-FIAT-002; ADR-0011 amendment).
+
+    Pure function — no env reads, no I/O, no store import (same shape as
+    :func:`resolve_chain_base_url`). The first argument is the value already
+    merged by ``Settings.from_env`` — env and config-file collapsed into one
+    rung (env wins over file inside the merge). Precedence::
+
+        env  >  config file  >  stored settings key  >  "usd"
+
+    Each rung treats ``None``, the empty string, and whitespace-only as
+    *unset* (the chain_base_url convention); a present rung is parsed
+    case-insensitively against :data:`DISPLAY_CURRENCIES`. An unknown code on
+    ANY rung raises :class:`ValueError` (fail closed, value-free) — the app
+    turns that into a startup refusal; the oracle never fetches a currency
+    it cannot name.
+    """
+    for raw, source in (
+        (env_value, "LOCALWALLET_DISPLAY_CURRENCY"),
+        (stored_value, f"setting {DISPLAY_CURRENCY_SETTING!r}"),
+    ):
+        if raw is not None and raw.strip():
+            return normalize_display_currency(raw, source)
+    return DEFAULT_DISPLAY_CURRENCY
 
 
 @dataclass(frozen=True, slots=True)

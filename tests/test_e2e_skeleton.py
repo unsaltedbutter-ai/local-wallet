@@ -2622,6 +2622,12 @@ def _send_chain_handler(
         if path.endswith("/v1/prices"):
             if state.get("prices_fail"):
                 return httpx.Response(500, json=None)
+            # TCK-FIAT-002 seam: a full multi-currency body for the
+            # display-currency tests (default: the FIAT-001-era USD-only
+            # payload, unchanged).
+            payload = state.get("prices_payload")
+            if payload is not None:
+                return httpx.Response(200, json=payload)
             return httpx.Response(
                 200, json={"time": 1_700_000_000, "USD": state.get("usd", SEND_PRICE_USD)}
             )
@@ -6031,4 +6037,298 @@ def test_malformed_selection_settings_refuse_the_selection(
         assert flow.pending is None
     finally:
         client.close()
+        store.close()
+
+
+# ===================== TCK-FIAT-002: multi-currency display =================
+#
+# The display-currency setting (closed enum usd/eur/gbp/cad/chf/aud/jpy)
+# rides the whole fiat surface: the oracle converts in the configured
+# currency, the handler answers carry currency-tagged keys (USD keeps the
+# byte-identical TCK-FIAT-001 shape), and the narration follows — values
+# verbatim from the tool result, currency labeled, the stale ladder per
+# ADR-0011. The model never authors a currency code.
+
+EUR_PRICES_PAYLOAD: Final[dict[str, Any]] = {
+    "time": 1_700_000_000,
+    "USD": 20_000,
+    "EUR": 62_000.0,
+    "JPY": 8_900_000.0,
+}
+
+
+def _fiat_state_table(
+    currency: str, *, state: dict[str, Any] | None = None
+) -> tuple[dict[IntentName, Any], Store, EsploraClient, dict[str, Any]]:
+    """Send-fixture dispatch table over a EUR/JPY-serving price endpoint
+    with the oracle wired to the given display currency."""
+    prices_state = state if state is not None else {}
+    table, store, _wallet, client, _rec, _flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(
+            rec,
+            utxos_by_addr={derive_fixture_addresses(1)[0]: [SEND_UTXO]},
+            state=prices_state,
+        ),
+        make_price_oracle=lambda client_: PriceOracle(
+            client_, ttl_s=60.0, currency=currency
+        ),
+    )
+    return table, store, client, prices_state
+
+
+def test_get_balance_usd_default_keeps_fiat001_keys_no_tagging() -> None:
+    """USD wire-compat pin (handler level): the legacy keys EXACTLY, no
+    fiat_* trio alongside (the create_tx key-set pin in
+    test_send_flow_handler_result_card_fields is the card-side twin)."""
+    table, store, client, _state = _fiat_state_table("usd")
+    try:
+        result = table[IntentName.GET_BALANCE](validate_payload(GET_BALANCE_JSON))
+    finally:
+        client.close()
+        store.close()
+    assert result["total_sats"] == 100_000
+    assert result["usd_total_cents"] == 2_000  # 100k sats @ 20_000 USD
+    assert result["btc_usd"] == 20_000.0
+    assert not any(k.startswith("fiat_") for k in result)
+
+
+def test_get_balance_eur_answer_carries_the_tagged_trio() -> None:
+    table, store, client, state = _fiat_state_table("eur")
+    state.setdefault("prices_payload", EUR_PRICES_PAYLOAD)
+    try:
+        result = table[IntentName.GET_BALANCE](validate_payload(GET_BALANCE_JSON))
+    finally:
+        client.close()
+        store.close()
+    assert result["total_sats"] == 100_000
+    # 100_000 sats @ 62_000 EUR/BTC = 62.00 EUR -> 6_200 euro cents.
+    assert result["fiat_total_minor"] == 6_200
+    assert result["fiat_currency"] == "eur"
+    assert result["fiat_per_btc"] == 62_000.0
+    # A EUR figure NEVER rides a USD-shaped key:
+    assert "usd_total_cents" not in result
+    assert "btc_usd" not in result
+
+
+def test_create_tx_eur_card_shape_and_amount_usd_converts_in_eur() -> None:
+    """Non-USD card fields: the legacy USD keys stay honestly None, the
+    trio carries the figures — and ``amount_usd`` (historical field name,
+    grammar unchanged) is interpreted in the DISPLAY currency: 31 EUR at
+    62_000 EUR/BTC is 50_000 sats, full stop."""
+    table, store, client, state = _fiat_state_table("eur")
+    state.setdefault("prices_payload", EUR_PRICES_PAYLOAD)
+    try:
+        created = table[IntentName.CREATE_TX](
+            validate_payload(_create_tx_envelope_json({"amount_usd": 31.0}))
+        )
+        assert created.get("error") is None, created
+        assert created["amount_sats"] == 50_000  # the EUR conversion
+        assert created["usd_cents"] is None and created["btc_usd"] is None
+        assert created["fiat_total_minor"] == 3_100  # 50_000 sats back to EUR
+        assert created["fiat_currency"] == "eur"
+        assert created["fiat_per_btc"] == 62_000.0
+        lines: list[str] = []
+        app_module._print_brief_card(created, lines.append)
+        assert lines[2] == "Pay: 50,000 sats (31.00 EUR · @ 62,000 EUR/BTC)"
+    finally:
+        client.close()
+        store.close()
+
+
+# -- narration pins (renderer level, exact strings) --------------------------
+
+
+_BALANCE_FIAT_BASE: dict[str, Any] = {
+    "confirmed_sats": 123_450_000,
+    "unconfirmed_sats": 0,
+    "total_sats": 123_450_000,
+    "addresses_scanned": 2,
+    "tip_height": 900_000,
+    "freshness": "fresh",
+}
+
+
+def _balance_lines(result: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    app_module._print_balance(result, lines.append)
+    return lines
+
+
+def test_print_balance_eur_line_labels_the_currency() -> None:
+    lines = _balance_lines(
+        {
+            **_BALANCE_FIAT_BASE,
+            "fiat_total_minor": 1_234_567,
+            "fiat_currency": "eur",
+            "fiat_per_btc": 62_000.0,
+        }
+    )
+    assert "≈ 12,345.67 EUR · @ 62,000 EUR/BTC" in lines
+    assert not any("$" in line for line in lines)
+
+
+def test_print_balance_jpy_line_has_no_minor_unit() -> None:
+    lines = _balance_lines(
+        {
+            **_BALANCE_FIAT_BASE,
+            "fiat_total_minor": 1_234_567,
+            "fiat_currency": "jpy",
+            "fiat_per_btc": 8_900_000.0,
+        }
+    )
+    # JPY minor unit == the yen itself: no ".00", thousands-separated.
+    assert "≈ 1,234,567 JPY · @ 8,900,000 JPY/BTC" in lines
+
+
+def test_print_balance_usd_line_unchanged_byte_for_byte() -> None:
+    """TCK-FIAT-001 legacy rendering survives the generalization EXACTLY
+    (the test_fiat_balance.py pins are the pair; this is the third eye)."""
+    lines = _balance_lines(
+        {**_BALANCE_FIAT_BASE, "usd_total_cents": 1_234_567, "btc_usd": 97_000.0}
+    )
+    assert "≈ $12,345.67 · @ $97,000/BTC" in lines
+
+
+def test_print_balance_fiat_stale_ladder_wording_unchanged() -> None:
+    """The ADR-0011 stale-but-served marker rides the same wording in any
+    currency (age instead of the now-untrusted rate figure)."""
+    lines = _balance_lines(
+        {
+            **_BALANCE_FIAT_BASE,
+            "fiat_total_minor": 1_234_567,
+            "fiat_currency": "eur",
+            "fiat_per_btc": 62_000.0,
+            "rate_stale": True,
+            "rate_age_s": 1_000,
+        }
+    )
+    assert "≈ 12,345.67 EUR · rate age 1000s · stale" in lines
+
+
+def test_confirmation_card_eur_amount_line_and_jpy_pay_line() -> None:
+    lines: list[str] = []
+    app_module._print_confirmation_card(
+        {
+            "amount_sats": 60_000,
+            "fiat_total_minor": 3_720,
+            "fiat_currency": "eur",
+            "fiat_per_btc": 62_000.0,
+            "recipient": "bc1qtest",
+            "fee_sats": 282,
+            "vsize": 141,
+            "inputs_count": 1,
+            "expires_in_s": 600,
+            "tx_ref": "abc12345",
+        },
+        lines.append,
+    )
+    assert lines[0] == "Amount: 60000 sats (37.20 EUR · @ 62,000 EUR/BTC)"
+    lines = []
+    app_module._print_brief_card(
+        {
+            "recipient": "bc1qtest",
+            "amount_sats": 60_000,
+            "fiat_total_minor": 5_340,
+            "fiat_currency": "jpy",
+            "fiat_per_btc": 8_900_000.0,
+            "fee_sats": 282,
+            "inputs_count": 1,
+        },
+        lines.append,
+    )
+    assert lines[2] == "Pay: 60,000 sats (5340 JPY · @ 8,900,000 JPY/BTC)"
+
+
+# -- the settings surface + live ladder (no restart) -------------------------
+
+
+def test_display_currency_settings_entry_is_a_bounded_enum_live_surface(
+    tmp_path: Path,
+) -> None:
+    """Bounded enum entry: closed options, shipped default, honest
+    requires_restart FALSE (the oracle re-reads the ladder per fetch —
+    changeable without restart) and the env-override flag without its
+    value."""
+    store = Store(tmp_path / "dc.db")
+    try:
+        reply = app_module.handle_settings_request(store, None, None)
+        entry = next(
+            e for e in reply["settings"] if e["key"] == "display_currency"  # type: ignore[index]
+        )
+        assert entry == {
+            "key": "display_currency",
+            "type": "enum",
+            "value": None,  # unset stored rung -> default applies
+            "default": "usd",
+            "options": ["usd", "eur", "gbp", "cad", "chf", "aud", "jpy"],
+            "min": None,
+            "max": None,
+            "requires_restart": False,  # oracle reads the ladder per fetch
+            "env_override": False,
+        }
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("submitted", "stored"),
+    [("eur", "eur"), ("  EUR  ", "eur"), ("Gbp", "gbp"), ("jpy", "jpy")],
+)
+def test_display_currency_write_canonicalizes_case_insensitively(
+    tmp_path: Path, submitted: str, stored: str
+) -> None:
+    store = Store(tmp_path / "dcw.db")
+    try:
+        reply = app_module.handle_settings_request(
+            store, "display_currency", submitted
+        )
+        assert reply["status"] == "applied", reply
+        assert reply["settings"][0]["value"] == stored
+        assert store.get_setting("display_currency") == stored  # canonical
+        # "" clears the stored rung (back to env/file/default on the ladder):
+        cleared = app_module.handle_settings_request(store, "display_currency", "")
+        assert cleared["settings"][0]["value"] == ""
+    finally:
+        store.close()
+
+
+def test_display_currency_unknown_code_refused_value_free(tmp_path: Path) -> None:
+    store = Store(tmp_path / "dcr.db")
+    try:
+        reply = app_module.handle_settings_request(store, "display_currency", "klingon")
+        assert reply["status"] == "rejected"
+        assert "klingon" not in json.dumps(reply)  # the submitted value never rides
+        assert "usd" in str(reply["error"])  # the closed enum is named
+        assert store.get_setting("display_currency") is None  # nothing written
+    finally:
+        store.close()
+
+
+def test_display_currency_reader_ladder_is_live_no_restart(
+    tmp_path: Path,
+) -> None:
+    """The oracle's reader re-resolves env/file > stored > default on every
+    call: a settings change flips the NEXT fetch with no restart (the
+    requires_restart False made true); an env rung shadows the stored one;
+    a hand-tampered stored row degrades to the boot-validated answer."""
+    store = Store(tmp_path / "dcl.db")
+    try:
+        settings = Settings()
+        read = app_module._display_currency_reader(settings, store)
+        assert read() == "usd"  # nothing on any rung
+        store.set_setting("display_currency", "eur")
+        assert read() == "eur"  # the very next read sees the panel write
+        store.set_setting("display_currency", "JPY")  # case-insensitive rung
+        assert read() == "jpy"
+        # Env rung (boot snapshot) shadows the stored one:
+        read_env = app_module._display_currency_reader(
+            Settings(display_currency="GBP"), store
+        )
+        assert read_env() == "gbp"
+        # Tampered stored row (only the surface validates writes): degrade
+        # to the boot-validated env/file/default answer, never raise.
+        store.set_setting("display_currency", "doubloons")
+        assert read() == "usd"
+        assert read_env() == "gbp"
+    finally:
         store.close()

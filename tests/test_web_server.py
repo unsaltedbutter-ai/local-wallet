@@ -1241,6 +1241,9 @@ def test_settings_get_lists_the_allowlist_shape_only(
             "utxo_target_min_sats",
             "utxo_target_max_sats",
             "consolidate_below_sat_vb",
+            # TCK-FIAT-002: the display currency (bounded enum entry, live
+            # per-fetch reader -> requires_restart False).
+            "display_currency",
         }
         # The M3 never-echo pin: even the PASSWORD key's entry carries no
         # value anywhere in the reply bytes (the raw response is what the

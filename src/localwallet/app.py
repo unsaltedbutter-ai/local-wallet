@@ -148,6 +148,7 @@ from localwallet.chain import (
     WatchedTx,
     check_backend,
     estimate_eta,
+    minor_per_unit,
     time_since_last_block,
 )
 from localwallet.chain.config import BITCOIND_SCHEME, ELECTRUM_SCHEME
@@ -155,9 +156,13 @@ from localwallet.config import (
     COIN_SETTING_BOUNDS,
     COIN_SETTING_DEFAULTS,
     COIN_SETTING_KEYS,
+    DEFAULT_DISPLAY_CURRENCY,
+    DISPLAY_CURRENCIES,
+    DISPLAY_CURRENCY_SETTING,
     Settings,
     resolve_chain_base_url,
     resolve_coin_selection_settings,
+    resolve_display_currency,
 )
 from localwallet.node import LocalNodeReport, NodeStatus, detect_local_nodes
 from localwallet.node.doctor import NodeDoctor
@@ -248,6 +253,8 @@ __all__ = [
     "AUTO_SCAN_ENV_VAR",
     "DEFAULT_HISTORY_LIMIT",
     "DEFAULT_SIGNER_DIR",
+    "DISPLAY_CURRENCY_ENV_VAR",
+    "DISPLAY_CURRENCY_SETTING",
     "EVENT_MODEL_PROGRESS",
     "GAP_LIMIT_ENV_VAR",
     "MODEL_CARD_QUESTION",
@@ -573,6 +580,12 @@ WATCH_INTERVAL_STALE_WARNING: Final[str] = (
     "The stored background-watch interval is invalid — using the default."
 )
 
+#: Environment rung of the display-currency ladder (TCK-FIAT-002, ADR-0011
+#: amendment): env > config file > stored ``display_currency`` setting >
+#: default ``usd``. The closed enum and the fail-closed value-free resolver
+#: live in :mod:`localwallet.config` (single source, like the coin keys).
+DISPLAY_CURRENCY_ENV_VAR: Final[str] = "LOCALWALLET_DISPLAY_CURRENCY"
+
 #: Environment variable selecting the signing backend (``--signer``
 #: overrides it): ``"file"`` (airgap transfer folder, ADR-0014 — the
 #: default) or ``"hwi"`` (USB hardware wallet via HWI-as-a-library,
@@ -833,6 +846,44 @@ def _resolve_watch_interval(settings: Settings, store: Store) -> tuple[float, st
     if not WATCH_INTERVAL_MIN <= stored <= WATCH_INTERVAL_MAX:
         return WATCH_INTERVAL_DEFAULT_S, WATCH_INTERVAL_STALE_WARNING
     return float(stored), None
+
+
+def _stored_display_currency(store: Store) -> str | None:
+    """The stored ``display_currency`` rung, read fail-quiet (an unreadable
+    store = rung unset, never a stall — the watch-interval precedent)."""
+    try:
+        return store.get_setting(DISPLAY_CURRENCY_SETTING)
+    except (StoreError, sqlite3.Error):
+        return None
+
+
+def _display_currency_reader(settings: Settings, store: Store) -> Callable[[], str]:
+    """The price oracle's LIVE display-currency reader (TCK-FIAT-002,
+    ADR-0011 amendment). The ladder — env > config-file > stored > default
+    — is re-resolved on EVERY oracle fetch decision, so a settings-panel
+    change lands on the next quote with no restart (the honest
+    ``requires_restart`` False; same per-read shape as the coin-policy keys
+    in the create_tx handler). The env/config-file rung is the immutable
+    boot snapshot (``Settings.from_env`` already merged them; only the
+    startup-validated values ever ride it).
+
+    The returned callable NEVER raises: :func:`_wire` refuses startup on an
+    invalid rung and the settings surface validates every write fail-closed,
+    so a ValueError after boot can only mean a hand-tampered DB row — the
+    ladder then degrades to the boot-validated env/file/default answer
+    (never a silent currency change, never a crash inside a price fetch).
+    """
+    boot = resolve_display_currency(settings.display_currency, None)
+
+    def read() -> str:
+        try:
+            return resolve_display_currency(
+                settings.display_currency, _stored_display_currency(store)
+            )
+        except ValueError:
+            return boot
+
+    return read
 
 
 def _open_browser(url: str) -> bool:
@@ -1375,9 +1426,10 @@ def build_dispatch_table(
             ADR-0013). Defaults to a fresh :class:`SendSession`.
         fee_estimator: Fee-rate source for ``create_tx``; defaults to a
             :class:`FeeEstimator` over ``client``.
-        price_oracle: USD/BTC rate source for ``create_tx`` and
-            ``get_balance`` (best-effort fiat display, TCK-FIAT-001);
-            defaults to a :class:`PriceOracle` over ``client``.
+        price_oracle: per-BTC rate source in the display currency for
+            ``create_tx`` and ``get_balance`` (best-effort fiat display,
+            TCK-FIAT-001 / TCK-FIAT-002); defaults to a
+            :class:`PriceOracle` over ``client``.
         signer_selection: Signing-backend configuration for
             ``sign_tx`` (TCK-P3-005). Defaults to the file signer over
             :data:`SIGNER_DIR_ENV_VAR` / :data:`DEFAULT_SIGNER_DIR` with
@@ -1518,13 +1570,17 @@ def _make_get_balance_handler(
     ``{"error": "store_error", ...}``. A failed/absent tip height omits
     the ``tip_height`` key entirely — never a fabricated value.
 
-    Best-effort fiat (TCK-FIAT-001, no new intent): when ``price_oracle``
-    is wired, the answer gains ``usd_total_cents`` + ``btc_usd`` (and
-    the ``rate_stale``/``rate_age_s`` markers on the ADR-0011 degrade
-    ladder) computed from the sats total. ANY price outcome short of a
-    rate — unavailable feed, capability-absent backend, disabled oracle,
-    or an unexpected failure — leaves those keys ABSENT: a sats-only
-    answer, never an error, never a fabricated number.
+    Best-effort fiat (TCK-FIAT-001, no new intent; TCK-FIAT-002 multi-
+    currency): when ``price_oracle`` is wired, the answer gains the USD
+    pair ``usd_total_cents`` + ``btc_usd`` under the default display
+    currency (byte-identical FIAT-001 wire shape) — or, for a non-USD
+    display currency, the currency-tagged trio ``fiat_total_minor`` +
+    ``fiat_currency`` + ``fiat_per_btc`` — plus the ``rate_stale``/
+    ``rate_age_s`` markers on the ADR-0011 degrade ladder, all computed
+    from the sats total. ANY price outcome short of a rate — unavailable
+    feed, capability-absent backend, disabled oracle, or an unexpected
+    failure — leaves those keys ABSENT: a sats-only answer, never an
+    error, never a fabricated number.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -1606,16 +1662,34 @@ def _make_get_balance_handler(
         # this answer is stale-flagged anyway (sats-only is honest).
         held = scan_gate is not None and scan_gate.state == "awaiting_backend"
         if price_oracle is not None and not held and not scan_pending:
+            currency = None
             try:
                 rate = price_oracle.fresh()
-                usd_cents = price_oracle.sats_to_usd(result["total_sats"], rate)
+                fiat_minor = price_oracle.sats_to_usd(result["total_sats"], rate)
+                currency = rate.currency
             except (PriceUnavailableError, ConfigDisabled):
                 pass  # outage / capability-absent / opt-out → sats-only
             except Exception:  # noqa: BLE001, S110 — containment: never fail a balance answer over display sugar
                 pass
             else:
-                result["usd_total_cents"] = usd_cents
-                result["btc_usd"] = rate.usd_per_btc
+                # Currency-aware fiat keys (TCK-FIAT-002, ADR-0011 amendment):
+                # USD answers keep the byte-identical TCK-FIAT-001 wire shape
+                # (``usd_total_cents`` + ``btc_usd`` — the web client and the
+                # FIAT-001 pins consume them unchanged); a non-USD display
+                # currency instead carries the explicit trio
+                # ``fiat_total_minor`` (whole minor units: cents for the
+                # two-decimal codes, yen for JPY) + ``fiat_currency``
+                # (canonical lowercase code from the closed enum) +
+                # ``fiat_per_btc`` (whole currency units per BTC — the
+                # endpoint's unit semantics). The USD keys stay ABSENT for
+                # non-USD: a EUR figure never rides a USD-shaped key.
+                if currency == DEFAULT_DISPLAY_CURRENCY:
+                    result["usd_total_cents"] = fiat_minor
+                    result["btc_usd"] = rate.per_btc
+                else:
+                    result["fiat_total_minor"] = fiat_minor
+                    result["fiat_currency"] = currency
+                    result["fiat_per_btc"] = rate.per_btc
                 if rate.stale:
                     # Stale-but-served (offline degrade): the narration
                     # marks the age exactly like the send card does.
@@ -2061,13 +2135,16 @@ def _make_create_tx_handler(
        the answer to the ceiling ask) is NOT bound by the rung guard —
        it replaces through the same commit-only-on-success path at the
        user-quoted literal rate.
-    2. Amount resolution: ``amount_sats`` is taken direct;
-       ``amount_usd`` requires the price oracle (:meth:`PriceOracle.fresh`).
-       A price failure on the USD path refuses the whole request with
-       ``{"error": "price_unavailable", ...}`` and NO flow entry (the
-       user retries, or gives sats). On the sats path the oracle is
-       consulted best-effort for the card's USD display only — a failure
-       there degrades to ``usd_cents=None`` and never blocks the send.
+     2. Amount resolution: ``amount_sats`` is taken direct;
+        ``amount_usd`` requires the price oracle (:meth:`PriceOracle.fresh`)
+        and is an amount in the display currency (TCK-FIAT-002: the
+        conversion rides the setting — the field name is historical, the
+        model never authors a currency).
+        A price failure on the USD path refuses the whole request with
+        ``{"error": "price_unavailable", ...}`` and NO flow entry (the
+        user retries, or gives sats). On the sats path the oracle is
+        consulted best-effort for the card's fiat display only — a failure
+        there degrades to ``usd_cents=None`` and never blocks the send.
        A stale-but-served rate (ADR-0011 ladder) is marked ``rate_stale``
        with its age; the rate's fetch timestamp is included either way.
     3. Fee rate: the two fee knobs are mutually exclusive at the schema
@@ -2168,7 +2245,13 @@ def _make_create_tx_handler(
                     "rate_notice": notice,
                 }
 
-        # 2. Amount resolution (sats direct; USD via the price oracle).
+        # 2. Amount resolution (sats direct; the fiat amount via the price
+        #    oracle). TCK-FIAT-002: ``amount_usd`` is an amount in the
+        #    USER'S DISPLAY CURRENCY — "the conversion rides the setting".
+        #    The closed protocol field keeps its historical name (no
+        #    grammar churn); the model never authors a currency code, and
+        #    the card labels the figure with the actual currency, so a
+        #    non-USD quote never silently reads as dollars.
         rate = None
         if params.amount_sats is not None:
             amount_sats = params.amount_sats
@@ -2184,11 +2267,23 @@ def _make_create_tx_handler(
                 return {"error": "price_unavailable", "detail": str(exc)}
             amount_sats = price_oracle.usd_to_sats(params.amount_usd, rate)
 
-        usd_cents = price_oracle.sats_to_usd(amount_sats, rate) if rate is not None else None
+        currency = rate.currency if rate is not None else DEFAULT_DISPLAY_CURRENCY
+        fiat_minor = (
+            price_oracle.sats_to_usd(amount_sats, rate) if rate is not None else None
+        )
+        # Wire-compat (TCK-FIAT-002, same key design as the balance
+        # answer): the USD default keeps the exact FIAT-001 card fields;
+        # a non-USD display leaves the USD-shaped keys honestly None and
+        # adds the currency-tagged trio below.
+        usd_cents = fiat_minor if currency == DEFAULT_DISPLAY_CURRENCY else None
+        btc_usd = (
+            rate.per_btc
+            if rate is not None and currency == DEFAULT_DISPLAY_CURRENCY
+            else None
+        )
         rate_stale = rate.stale if rate is not None else False
         rate_age_s = int(rate.age_s()) if rate is not None else None
         rate_fetched_at = rate.fetched_at if rate is not None else None
-        btc_usd = rate.usd_per_btc if rate is not None else None
 
         # 3 (cont.). Fee rate: the literal user-quoted sat/vB rate when
         # present (no estimator call — the user's number is quoted verbatim
@@ -2412,8 +2507,7 @@ def _make_create_tx_handler(
             "rate_stale": rate_stale,
             "rate_age_s": rate_age_s,
             "rate_fetched_at": rate_fetched_at,
-            "btc_usd": btc_usd,
-            "fee_target": pending.fee_target,
+            "btc_usd": btc_usd,            "fee_target": pending.fee_target,
             # Display-only card-view selectors (TCK-UX-002; NOT flow
             # state): variant A of the card tail when the envelope carried
             # neither fee knob (the one-shot speed offer — a user-quoted
@@ -2425,6 +2519,15 @@ def _make_create_tx_handler(
             "expires_in_s": PENDING_TTL_S,
             **({} if eta is None else eta),
         }
+        if rate is not None and currency != DEFAULT_DISPLAY_CURRENCY:
+            # TCK-FIAT-002 currency-tagged card fields (same design as the
+            # balance answer): ``fiat_total_minor`` = the send amount in the
+            # display currency's minor units, ``fiat_currency`` = canonical
+            # code, ``fiat_per_btc`` = whole units per BTC. The USD-shaped
+            # keys above stay None — never a mislabeled figure.
+            result["fiat_total_minor"] = fiat_minor
+            result["fiat_currency"] = currency
+            result["fiat_per_btc"] = rate.per_btc
         if requote and staged is not None:
             if params.fee_rate_sat_vb is not None:
                 # Explicit-rate re-quote: no rungs to compare — direction is
@@ -5102,6 +5205,12 @@ _SETTINGS_KEYS: Final[frozenset[str]] = frozenset(
         # _resolve_watch_interval (env > stored > default) — the setting
         # the "Change it in settings" line claims.
         WATCH_INTERVAL_SETTING,
+        # TCK-FIAT-002: the display currency (closed enum, single-sourced
+        # from localwallet.config). Allowlisted because the price oracle
+        # RE-READS the ladder on every fetch decision
+        # (:func:`_display_currency_reader`) — the next quote already
+        # converts in the new currency, no restart.
+        DISPLAY_CURRENCY_SETTING,
         # TCK-ONB-004 M3: the backend credential keys (SECRET entries —
         # readable as SET/UNSET only, never value). They have live readers
         # (the engine's credential resolver feeding probe + client build).
@@ -5295,6 +5404,24 @@ def _settings_entries(
             "requires_restart": True,
             "env_override": _env_overridden(WATCH_INTERVAL_ENV_VAR),
         },
+        # TCK-FIAT-002: the display currency — a CLOSED-ENUM entry (the
+        # config module owns the codes and the ladder; "options" is that
+        # fixed list, never user data). The price oracle re-reads the
+        # ladder per fetch, so a stored change is live on the NEXT quote:
+        # the honest requires_restart is False (the coin-policy shape, not
+        # the watcher's). An env/config-file rung shadows the stored one
+        # (flag only — its value is never read or echoed here).
+        {
+            "key": DISPLAY_CURRENCY_SETTING,
+            "type": "enum",
+            "value": store.get_setting(DISPLAY_CURRENCY_SETTING),
+            "default": DEFAULT_DISPLAY_CURRENCY,
+            "options": list(DISPLAY_CURRENCIES),
+            "min": None,
+            "max": None,
+            "requires_restart": False,
+            "env_override": _env_overridden(DISPLAY_CURRENCY_ENV_VAR),
+        },
         # TCK-WEB-008 follow-up (a), TCK-LAUNCH-002: the watch key rides the
         # SAME read surface, display-TRUNCATED (a public account key, never a
         # secret; never in logs). It is READ-ONLY here — the write allowlist
@@ -5471,6 +5598,20 @@ def _apply_setting_change(store: Store, key: str, value: str) -> str | None:
             )
         try:
             store.set_setting(key, str(interval))  # canonical decimal string
+        except (StoreError, sqlite3.Error):
+            return f"could not save {key}"
+        return None
+    if key == DISPLAY_CURRENCY_SETTING:
+        # TCK-FIAT-002: the closed-enum write — parsed CASE-INSENSITIVELY
+        # and stored CANONICAL lowercase ("" clears the stored rung back to
+        # env/file/default on the ladder). Anything outside the enum is
+        # refused WITHOUT echoing the submitted value; the oracle's per-
+        # fetch ladder read makes an applied change live on the next quote.
+        text = value.strip().lower()
+        if text and text not in DISPLAY_CURRENCIES:
+            return f"{key} must be one of {', '.join(DISPLAY_CURRENCIES)}"
+        try:
+            store.set_setting(key, text)  # canonical lowercase (or clear)
         except (StoreError, sqlite3.Error):
             return f"could not save {key}"
         return None
@@ -7393,8 +7534,11 @@ class ChainBackendFlow:
         # oracle rebuilt per swap, shared by get_balance (fiat display) and
         # create_tx (USD resolution) — the single-cache invariant the
         # initial wiring establishes (build_dispatch_table), restored here
-        # instead of two private caches over the same client.
-        price_oracle = PriceOracle(client)
+        # instead of two private caches over the same client. TCK-FIAT-002:
+        # the rebuilt oracle keeps the SAME live display-currency ladder.
+        price_oracle = PriceOracle(
+            client, currency=_display_currency_reader(w.settings, w.store)
+        )
         w.table[IntentName.GET_BALANCE] = _make_get_balance_handler(
             w.store,
             w.wallet.id,
@@ -7522,10 +7666,21 @@ def _wire(
     # the client and every banner/mode surface resolve the SAME value. This
     # site must NOT hardcode a public default that would bypass the Phase 4
     # backend switch (ADR-0018).
+    # TCK-FIAT-002 (ADR-0011 amendment): the display-currency ladder is
+    # VALIDATED AT STARTUP — an unknown code on any rung (env, config file,
+    # or stored) is a fail-closed, VALUE-FREE startup refusal, the same
+    # exit-2 config-error path as the watch interval. A corrupt currency
+    # setting never silently changes what fiat figures mean. The resolved
+    # value is not kept here — the oracle re-reads the whole ladder live
+    # (see :func:`_display_currency_reader`).
+    try:
+        resolve_display_currency(settings.display_currency, _stored_display_currency(store))
+    except ValueError as exc:
+        raise _WiringError(f"Configuration error: {exc}") from exc
     # Fee/price wrappers share the ONE chain client (no second transport);
     # construction is network-free — they fetch lazily, per their TTLs.
     fee_estimator = FeeEstimator(client)
-    price_oracle = PriceOracle(client)
+    price_oracle = PriceOracle(client, currency=_display_currency_reader(settings, store))
     tx_flow = flow if flow is not None else TxFlow()
 
     # The dedicated chain worker (ADR-0022 decision 2): ALL scan/watch chain
@@ -8886,9 +9041,10 @@ def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None
 
     A ``stale`` freshness flag (TCK-SCAN-003, ADR-0022 decision 5) adds one
     value-free note line — honest display of the tool-owned flag; the
-    figures themselves print verbatim from the cache either way. A
-    ``usd_total_cents`` supplied by the handler (TCK-FIAT-001) adds one
-    fiat line, verbatim-formatted; absent keys render nothing. A
+    figures themselves print verbatim from the cache either way. Handler-
+    supplied fiat (TCK-FIAT-001's USD keys or TCK-FIAT-002's currency-
+    tagged trio) adds one fiat line, verbatim-formatted; absent keys
+    render nothing. A
     ``scan_pending`` answer (TCK-UX-011, ADR-0022 amendment 2) prints the
     one static "first scan running in the background" line INSTEAD of the
     plain stale note (one honest line, never two) — static copy, no
@@ -8912,24 +9068,26 @@ def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None
     output_fn(
         f"Total {total} sats · {scanned} addresses with UTXOs · {tip_label}"
     )
-    # Fiat line (TCK-FIAT-001): rendered iff the handler supplied the
-    # keys — figures verbatim from the result dict, formatted like the
-    # send card's USD segment (``_card_rate`` thousands separation, the
-    # same stale/age marker wording); absent keys print nothing (a sats-
-    # only answer never grows a dishonest fiat line).
-    usd_cents = result.get("usd_total_cents")
-    if isinstance(usd_cents, int) and not isinstance(usd_cents, bool):
-        usd_line = f"≈ ${usd_cents // 100:,}.{usd_cents % 100:02d}"
+    # Fiat line (TCK-FIAT-001; TCK-FIAT-002 multi-currency): rendered iff
+    # the handler supplied fiat keys — figures verbatim from the result
+    # dict, formatted like the send card's USD segment (``_card_rate``
+    # thousands separation, the same stale/age marker wording), the
+    # currency LABEL riding the tagged keys (``1,234.56 EUR`` /
+    # ``8,900,000 JPY``); absent keys print nothing (a sats-only answer
+    # never grows a dishonest fiat line).
+    fiat = _fiat_pair(result)
+    if fiat is not None:
+        fiat_line = f"≈ {_fiat_text(fiat[0], fiat[1], grouped=True)}"
         if result.get("rate_stale"):
             rate_age = result.get("rate_age_s")
             if rate_age is not None:
-                usd_line += f" · rate age {rate_age}s"
-            usd_line += " · stale"
+                fiat_line += f" · rate age {rate_age}s"
+            fiat_line += " · stale"
         else:
-            rate = _card_rate(result)
-            if rate is not None:
-                usd_line += f" · @ ${rate}/BTC"
-        output_fn(sanitize_tool_output(usd_line))
+            segment = _card_rate_segment(result)
+            if segment is not None:
+                fiat_line += f" · {segment}"
+        output_fn(sanitize_tool_output(fiat_line))
     if result.get("scan_pending") is True:
         # TCK-UX-011 (ADR-0022 amendment 2): the tool kicked the background
         # load for this very answer — ONE static, value-free line,
@@ -9102,13 +9260,84 @@ def _card_sats(result: Mapping[str, object], key: str) -> str | None:
 
 
 def _card_rate(result: Mapping[str, object]) -> str | None:
-    """Thousands-separated USD/BTC rate, whole dollars when the source gave
-    whole dollars (the price provider does — ADR-0011 §4), else 2 decimals.
-    ``None`` when absent/not numeric (fail-closed: never a fabricated rate)."""
+    """Thousands-separated per-BTC rate, whole units when the source gave
+    whole units (the price provider does — ADR-0011 §4), else 2 decimals.
+    Reads the legacy USD key first, the currency-tagged ``fiat_per_btc``
+    otherwise (TCK-FIAT-002). ``None`` when absent/not numeric
+    (fail-closed: never a fabricated rate)."""
     value = result.get("btc_usd")
+    if value is None:
+        value = result.get("fiat_per_btc")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return f"{int(value):,}" if float(value).is_integer() else f"{value:,.2f}"
+
+
+def _card_rate_segment(result: Mapping[str, object]) -> str | None:
+    """The fresh-rate segment the fiat lines append: ``@ $97,000/BTC`` for
+    the USD default (byte-identical to the TCK-FIAT-001 wording) or
+    ``@ 8,900,000 JPY/BTC`` for a currency-tagged result (TCK-FIAT-002) —
+    ``None`` when no rate figure is present (fail-closed)."""
+    rate = _card_rate(result)
+    if rate is None:
+        return None
+    currency = result.get("fiat_currency")
+    if (
+        isinstance(currency, str)
+        and currency
+        and currency != DEFAULT_DISPLAY_CURRENCY
+    ):
+        return f"@ {rate} {currency.upper()}/BTC"
+    return f"@ ${rate}/BTC"
+
+
+def _fiat_pair(result: Mapping[str, object]) -> tuple[int, str] | None:
+    """The fiat display pair (minor-unit amount, currency code) from a
+    handler result — values verbatim from tool output, fail-closed. The
+    TCK-FIAT-002 key design: the currency-tagged ``fiat_total_minor`` +
+    ``fiat_currency`` pair (a non-USD answer) is read first; the legacy
+    USD keys (``usd_total_cents`` on the balance answer, ``usd_cents`` on
+    the send card — the FIAT-001 shapes) resolve to ``("…", "usd")``.
+    ``None`` (absent / not-an-int / null) renders no fiat line."""
+    minor = result.get("fiat_total_minor")
+    currency = result.get("fiat_currency")
+    if (
+        isinstance(minor, int)
+        and not isinstance(minor, bool)
+        and isinstance(currency, str)
+        and currency
+    ):
+        return minor, currency
+    for key in ("usd_total_cents", "usd_cents"):
+        value = result.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value, DEFAULT_DISPLAY_CURRENCY
+    return None
+
+
+def _fiat_text(minor: int, currency: str, *, grouped: bool) -> str:
+    """Format a minor-unit fiat amount for display (the same display-only
+    formatting class as ``_card_rate``'s thousands separation — the figure
+    is the tool's, never recomputed). The USD default keeps its exact
+    legacy shape (``$1,234.57`` with ``grouped``, ``$1234.56`` without —
+    the balance line groups, the card segments historically do not); any
+    other code LABELS itself (``1,234.56 EUR``, ``8,900,000 JPY`` — the
+    zero-decimal shape comes from ``minor_per_unit``, not a guess). An
+    out-of-enum code (only hand-forged tool data can produce one) keeps
+    two decimals and still never claims a ``$``.
+    """
+    try:
+        per = minor_per_unit(currency)
+    except ValueError:
+        per = 100
+    whole, frac = divmod(minor, per)
+    num = f"{whole:,}" if grouped else f"{whole}"
+    if currency == DEFAULT_DISPLAY_CURRENCY:
+        return f"${num}.{frac:02d}"
+    label = currency.upper()
+    if per == 100:
+        return f"{num}.{frac:02d} {label}"
+    return f"{num} {label}"
 
 
 def _print_brief_card(
@@ -9144,9 +9373,12 @@ def _print_brief_card(
     amount = _card_sats(result, "amount_sats")
     if amount is not None:
         pay = f"Pay: {amount} sats"
-        usd_cents = result.get("usd_cents")
-        if isinstance(usd_cents, int):
-            pay += f" (${usd_cents // 100}.{usd_cents % 100:02d}"
+        fiat = _fiat_pair(result)
+        if fiat is not None:
+            # TCK-FIAT-002: the Pay parenthetical follows the display
+            # currency (figures verbatim from the result; USD renders the
+            # exact legacy shape, a tagged currency labels itself).
+            pay += f" ({_fiat_text(fiat[0], fiat[1], grouped=False)}"
             if result.get("rate_stale"):
                 # Stale per the ADR-0011 ladder: surface WHY the number may
                 # be off (age) instead of the (now-untrusted) rate figure.
@@ -9155,9 +9387,9 @@ def _print_brief_card(
                     pay += f" · rate age {rate_age}s"
                 pay += " · stale"
             else:
-                rate = _card_rate(result)
-                if rate is not None:
-                    pay += f" · @ ${rate}/BTC"
+                segment = _card_rate_segment(result)
+                if segment is not None:
+                    pay += f" · {segment}"
             pay += ")"
     output_fn(sanitize_tool_output(pay))
     fee_sats = _card_sats(result, "fee_sats")
@@ -9209,9 +9441,10 @@ def _print_confirmation_card(
     Every value is verbatim from the handler result dict — the renderer
     only formats (USD cents → dollars, TTL seconds → minutes, the same
     display-only class as txid truncation). The recipient is quoted ONLY
-    from ``result["recipient"]`` (tool-output verbatim rule); the USD
-    segment appears only when the handler supplied ``usd_cents``, with
-    the rate age and the stale marker when present.
+    from ``result["recipient"]`` (tool-output verbatim rule); the fiat
+    segment appears only when the handler supplied fiat keys (legacy
+    ``usd_cents`` or the TCK-FIAT-002 tagged trio — :func:`_fiat_pair`),
+    with the rate age and the stale marker when present.
 
     Absent numeric keys render an explicit ``unavailable`` marker — never a
     fabricated value (SR-006 class, TCK-SEC-004 change 4; the same failure
@@ -9223,9 +9456,9 @@ def _print_confirmation_card(
         amount_line = f"Amount: {result['amount_sats']} sats"
     else:
         amount_line = "Amount: unavailable"
-    usd_cents = result.get("usd_cents")
-    if isinstance(usd_cents, int):
-        amount_line += f" (${usd_cents // 100}.{usd_cents % 100:02d}"
+    fiat = _fiat_pair(result)
+    if fiat is not None:
+        amount_line += f" ({_fiat_text(fiat[0], fiat[1], grouped=False)}"
         if result.get("rate_stale"):
             # Stale per the ADR-0011 ladder: surface WHY the number may be
             # off (age) instead of the (now-untrusted) rate figure.
@@ -9234,9 +9467,9 @@ def _print_confirmation_card(
                 amount_line += f" · rate age {rate_age}s"
             amount_line += " · stale"
         else:
-            rate = _card_rate(result)
-            if rate is not None:
-                amount_line += f" · @ ${rate}/BTC"
+            segment = _card_rate_segment(result)
+            if segment is not None:
+                amount_line += f" · {segment}"
         amount_line += ")"
     output_fn(sanitize_tool_output(amount_line))
     output_fn(sanitize_tool_output(f"To: {result.get('recipient', '')}"))

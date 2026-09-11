@@ -157,3 +157,56 @@ live mempool.space on 2026-09-08: `mempool-blocks` carries 7-quantile
 ascending `feeRange` per projected block; `/v1/blocks` (no height)
 carries NO fee stats — the block fee data lives under `extras.feeRange`
 on `/v1/blocks/{height}`.
+
+## Amendment (2026-09-11, TCK-FIAT-002): multi-currency display
+
+User use-case wave (2026-09-10): balances in currencies beyond USD. The
+same `/v1/prices` payload already carries `USD, EUR, GBP, CAD, CHF, AUD,
+JPY` (confirmed live 2026-09-10), so the multi-currency display introduces
+no new endpoint, host, or privacy surface — §1 is unchanged apart from
+which field of the ONE response is extracted.
+
+**Decision:**
+
+1. **Display currency is a setting, never a model choice.** A new
+   `display_currency` setting resolves through the one documented ladder
+   (env `LOCALWALLET_DISPLAY_CURRENCY` > config file > stored settings key
+   > shipped default `usd`) against a CLOSED enum — exactly the seven
+   codes the endpoint serves — parsed case-insensitively, canonical
+   lowercase. An unknown code on any rung is a fail-closed, value-free
+   **startup refusal** (ADR-0009: a corrupt setting never silently flips
+   policy); the settings-surface write path validates the same enum at
+   write. USD remains the default and every USD wire shape (the
+   TCK-FIAT-001 `usd_total_cents`/`btc_usd`/`usd_cents` result keys and
+   the `$x,xxx.xx` narration) is byte-compatible when unset.
+2. **The model never authors a currency code.** The intent protocol is
+   unchanged (no new intent, no new params): fiat-phrased balance asks in
+   ANY currency wording ("balance in euros / GBP / pounds …") still emit
+   `get_balance`, and the conversion rides the user's setting. Narration
+   quotes the currency tag verbatim from the tool result
+   (`fiat_currency`), exactly like addresses and amounts. For the same
+   reason `create_tx.amount_usd` (historical field name, unchanged
+   grammar) is interpreted in the DISPLAY currency: the app's setting is
+   the only currency selector, and the confirmation card labels the fiat
+   figure with the actual code, so a quote never silently reads as
+   dollars.
+3. **Oracle/caching:** `PriceOracle` fetches the configured currency's
+   field of the same payload; a cache entry is tagged with its currency
+   and is only ever served for that currency — switching display currency
+   refetches, and during an outage after a switch the ladder degrades to
+   sats-only rather than serving a wrong-currency number. The stored rung
+   is re-read per fetch decision, so a settings change is live on the
+   next quote with no restart (`requires_restart: false`, honestly).
+4. **Units:** unchanged §5-style money math — the endpoint value is whole
+   MAJOR units per BTC (dollars, euros, yen — not minor units); minor-unit
+   integers are computed on conversion, with the currency's minor scale
+   (100 for the two-decimal codes, 1 for JPY — zero decimals come from the
+   code's minor scale, never a hardcoded cents constant). Plausibility
+   bound §6 now applies per-currency (`0 < per_btc <= 1e9` in major
+   units — headroom for JPY's ~1e8 magnitude).
+
+**Revisit triggers:** other currencies (e.g. SEK, INR, BTC-as-display) are
+only worth adding if the endpoint starts serving them AND users ask —
+each new code widens the enum, the eval fixtures, and the formatting
+matrix; an arbitrary ISO-4217 passthrough is rejected (a fetch of a field
+the provider may not carry, and a label the model could hallucinate).

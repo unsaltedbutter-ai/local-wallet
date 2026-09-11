@@ -26,6 +26,7 @@ from localwallet.chain.price import (
     PriceOracle,
     PriceUnavailableError,
     Rate,
+    minor_per_unit,
 )
 from localwallet.chain.watch import (
     IncomingEvent,
@@ -62,5 +63,6 @@ __all__ = [
     "balance_from_utxos",
     "check_backend",
     "estimate_eta",
+    "minor_per_unit",
     "time_since_last_block",
 ]

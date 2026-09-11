@@ -1,6 +1,11 @@
 """Tests for the price oracle (mempool.space /v1/prices).
 
 All HTTP traffic is served by ``httpx.MockTransport`` — no real network.
+
+TCK-FIAT-002: the oracle is generalized from USD-only to the display
+currency (closed enum usd/eur/gbp/cad/chf/aud/jpy, case-insensitive parse,
+canonical lowercase). The USD default is pinned byte-compat throughout —
+every pre-existing test below runs on the ``usd`` default unchanged.
 """
 
 import sys
@@ -76,7 +81,7 @@ def test_fresh_parses_usd_rate():
     with server.client() as client:
         oracle = PriceOracle(client, ttl_s=60.0)
         rate = oracle.fresh()
-    assert rate.usd_per_btc == 67_500.5
+    assert rate.per_btc == 67_500.5
     assert rate.stale is False
     request = server.requests[0]
     assert request.method == "GET"
@@ -105,7 +110,7 @@ def test_fresh_serves_cache_within_ttl(monkeypatch: pytest.MonkeyPatch):
         oracle.fresh()
         set_time(2_000_000.0 + 30.0)  # < 60s TTL
         rate = oracle.fresh()
-    assert rate.usd_per_btc == 67_500.5
+    assert rate.per_btc == 67_500.5
     assert rate.stale is False
     assert len(server.requests) == 1  # no refetch while fresh
 
@@ -118,7 +123,7 @@ def test_fresh_refetches_after_ttl(monkeypatch: pytest.MonkeyPatch):
         oracle.fresh()
         set_time(2_000_000.0 + 61.0)  # past TTL
         rate = oracle.fresh()
-    assert rate.usd_per_btc == 67_500.5
+    assert rate.per_btc == 67_500.5
     assert rate.stale is False
     assert len(server.requests) == 2
 
@@ -132,10 +137,10 @@ def test_fresh_uses_new_value_after_refetch(monkeypatch: pytest.MonkeyPatch):
     with server.client() as client:
         oracle = PriceOracle(client, ttl_s=60.0)
         first = oracle.fresh()
-        assert first.usd_per_btc == 67_500.5
+        assert first.per_btc == 67_500.5
         set_time(2_000_000.0 + 61.0)
         second = oracle.fresh()
-        assert second.usd_per_btc == 70_000.0
+        assert second.per_btc == 70_000.0
     assert len(server.requests) == 2
 
 
@@ -164,7 +169,7 @@ def test_fetch_failure_with_cache_serves_stale(monkeypatch: pytest.MonkeyPatch):
         oracle.fresh()  # populate cache at t0
         set_time(2_000_000.0 + 61.0)  # past TTL -> next call refetches
         rate = oracle.fresh()  # fetch fails, serve cached stale
-    assert rate.usd_per_btc == 67_500.5
+    assert rate.per_btc == 67_500.5
     assert rate.stale is True  # age-warning flag for the UI
     assert len(server.requests) == 2  # one populate + one failed refetch
 
@@ -192,7 +197,7 @@ def test_stale_ok_serves_cache_past_ttl_without_fetch(monkeypatch: pytest.Monkey
         oracle.fresh()  # populate cache
         set_time(2_000_000.0 + 1000.0)  # way past TTL
         rate = oracle.stale_ok()
-    assert rate.usd_per_btc == 67_500.5
+    assert rate.per_btc == 67_500.5
     assert len(server.requests) == 1  # no refetch: stale is acceptable
 
 
@@ -201,7 +206,7 @@ def test_stale_ok_with_cold_cache_fetches():
     with server.client() as client:
         oracle = PriceOracle(client, ttl_s=60.0)
         rate = oracle.stale_ok()
-    assert rate.usd_per_btc == 67_500.5
+    assert rate.per_btc == 67_500.5
     assert len(server.requests) == 1
 
 
@@ -339,11 +344,11 @@ def test_absurd_rate_is_never_cached_over_a_good_rate(monkeypatch: pytest.Monkey
         oracle.fresh()  # populate cache with the good rate
         set_time(2_000_000.0 + 61.0)
         rate = oracle.fresh()  # malformed 200 -> cached-stale degrade
-        assert rate.usd_per_btc == 67_500.5
+        assert rate.per_btc == 67_500.5
         assert rate.stale is True
         # Nothing from the bad payload entered the cache (white-box pin):
         assert oracle._cache is not None
-        assert oracle._cache.usd_per_btc == 67_500.5
+        assert oracle._cache.per_btc == 67_500.5
     assert len(server.requests) == 2
 
 
@@ -363,7 +368,7 @@ def test_malformed_200_degrades_to_cached_stale_like_transport_failure(
         oracle.fresh()  # populate cache at t0
         set_time(2_000_000.0 + 61.0)  # past TTL -> next call refetches
         rate = oracle.fresh()  # malformed 200 -> cached-stale degrade
-    assert rate.usd_per_btc == 67_500.5
+    assert rate.per_btc == 67_500.5
     assert rate.stale is True
     assert len(server.requests) == 2
 
@@ -401,7 +406,7 @@ def test_fresh_at_exactly_the_stale_cap_still_degrades(
         oracle.fresh()
         set_time(2_000_000.0 + price_module.MAX_STALE_AGE_S)  # boundary: <= cap
         rate = oracle.fresh()
-    assert rate.usd_per_btc == 67_500.5
+    assert rate.per_btc == 67_500.5
     assert rate.stale is True
 
 
@@ -415,7 +420,7 @@ def test_stale_ok_still_serves_beyond_the_stale_cap(monkeypatch: pytest.MonkeyPa
         oracle.fresh()
         set_time(2_000_000.0 + price_module.MAX_STALE_AGE_S + 1.0)
         rate = oracle.stale_ok()
-    assert rate.usd_per_btc == 67_500.5
+    assert rate.per_btc == 67_500.5
     assert len(server.requests) == 1  # no refetch attempted
 
 
@@ -431,7 +436,7 @@ def test_retries_on_429_then_succeeds(monkeypatch: pytest.MonkeyPatch):
     server = ScriptedServer(httpx.Response(429), httpx.Response(200, json=PRICES))
     with server.client(max_retries=2) as client:
         oracle = PriceOracle(client, ttl_s=60.0)
-        assert oracle.fresh().usd_per_btc == 67_500.5
+        assert oracle.fresh().per_btc == 67_500.5
     assert len(server.requests) == 2
     assert len(sleeps) == 1
 
@@ -450,8 +455,8 @@ def test_retry_exhaustion_raises_price_unavailable(monkeypatch: pytest.MonkeyPat
 # -- conversion / rounding -------------------------------------------------
 
 
-def _rate(usd_per_btc: float) -> Rate:
-    return Rate(usd_per_btc=usd_per_btc, fetched_at=0.0)
+def _rate(per_btc: float, currency: str = "usd") -> Rate:
+    return Rate(per_btc=per_btc, fetched_at=0.0, currency=currency)
 
 
 def test_sats_to_usd_basic():
@@ -602,3 +607,226 @@ def test_disabled_via_env_on_oracle(monkeypatch: pytest.MonkeyPatch):
         with pytest.raises(ConfigDisabled):
             oracle.fresh()
     assert server.requests == []
+
+
+# -- TCK-FIAT-002: multi-currency display ------------------------------------
+
+MULTI_PRICES = {
+    "time": 1_700_000_000,
+    "USD": 67_500,
+    "EUR": 62_000,
+    "GBP": 53_000,
+    "CAD": 91_000,
+    "CHF": 60_000,
+    "AUD": 102_000,
+    "JPY": 8_900_000,
+}
+
+
+def test_default_currency_is_usd_and_tags_the_rate():
+    server = ScriptedServer(httpx.Response(200, json=MULTI_PRICES))
+    with server.client() as client:
+        rate = PriceOracle(client, ttl_s=60.0).fresh()
+    assert rate.currency == "usd"
+    assert rate.per_btc == 67_500.0
+
+
+def test_configured_currency_fetches_that_field_case_insensitively():
+    server = ScriptedServer(httpx.Response(200, json=MULTI_PRICES))
+    with server.client() as client:
+        oracle = PriceOracle(client, ttl_s=60.0, currency="EUR")
+        rate = oracle.fresh()
+    assert rate.currency == "eur"  # canonical lowercase on the Rate
+    assert rate.per_btc == 62_000.0
+
+
+def test_every_closed_code_parses():
+    server = ScriptedServer(httpx.Response(200, json=MULTI_PRICES))
+    for code, expected in (
+        ("usd", 67_500.0),
+        ("eur", 62_000.0),
+        ("gbp", 53_000.0),
+        ("cad", 91_000.0),
+        ("chf", 60_000.0),
+        ("aud", 102_000.0),
+        ("jpy", 8_900_000.0),
+    ):
+        with server.client() as client:
+            rate = PriceOracle(client, ttl_s=60.0, currency=code).fresh()
+        assert (rate.currency, rate.per_btc) == (code, expected)
+
+
+def test_missing_field_for_currency_fails_closed_value_free():
+    # Only USD served (the TCK-FIAT-001-era payload shape): a EUR oracle
+    # treats it as a malformed payload — degrade exactly like an outage.
+    server = ScriptedServer(httpx.Response(200, json={"time": 1, "USD": 67_500}))
+    with server.client() as client, pytest.raises(PriceUnavailableError) as excinfo:
+        PriceOracle(client, ttl_s=60.0, currency="eur").fresh()
+    assert "price unavailable" == str(excinfo.value)
+
+
+def test_parse_error_names_the_currency_field_not_the_value():
+    with pytest.raises(price_module.ChainError) as excinfo:
+        price_module._parse_rate({"EUR": -1}, KIND, "eur")
+    message = str(excinfo.value)
+    assert "EUR" in message  # structural field name, allowed
+    assert "-1" not in message
+
+
+def test_currency_switch_refetches_never_retags_the_cache(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _freeze_clock(monkeypatch)
+    server = ScriptedServer(httpx.Response(200, json=MULTI_PRICES))
+    code = {"current": "usd"}
+    with server.client() as client:
+        oracle = PriceOracle(client, ttl_s=60.0, currency=lambda: code["current"])
+        assert oracle.fresh().currency == "usd"
+        # Within TTL the cache answers — until the currency changes:
+        code["current"] = "eur"
+        rate = oracle.fresh()
+        assert rate.currency == "eur"
+        assert rate.per_btc == 62_000.0
+        assert len(server.requests) == 2  # a switch ALWAYS refetches
+        assert oracle.fresh() is rate  # new-currency cache now serves
+
+
+def test_stale_ladder_never_serves_a_foreign_currency_rate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # A USD cache + a switch to EUR + a failing endpoint: there is NO
+    # same-currency cache to degrade to — sats-only, never a $ figure
+    # labeled as euros.
+    set_time = _freeze_clock(monkeypatch)
+    server = ScriptedServer(
+        httpx.Response(200, json=MULTI_PRICES), httpx.Response(503)
+    )
+    code = {"current": "usd"}
+    with server.client(max_retries=0) as client:
+        oracle = PriceOracle(client, ttl_s=60.0, currency=lambda: code["current"])
+        oracle.fresh()
+        code["current"] = "eur"
+        set_time(2_000_000.0 + 61.0)
+        with pytest.raises(PriceUnavailableError):
+            oracle.fresh()
+        # stale_ok (the explicit offline variant) refuses too:
+        with pytest.raises(PriceUnavailableError):
+            oracle.stale_ok()
+
+
+def test_same_currency_stale_degrade_still_works_after_a_failed_switch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    set_time = _freeze_clock(monkeypatch)
+    server = ScriptedServer(
+        httpx.Response(200, json=MULTI_PRICES), httpx.Response(503)
+    )
+    code = {"current": "usd"}
+    with server.client(max_retries=0) as client:
+        oracle = PriceOracle(client, ttl_s=60.0, currency=lambda: code["current"])
+        oracle.fresh()
+        code["current"] = "eur"
+        set_time(2_000_000.0 + 61.0)
+        with pytest.raises(PriceUnavailableError):
+            oracle.fresh()
+        code["current"] = "usd"  # back to the cached currency
+        rate = oracle.fresh()
+        assert rate.currency == "usd"
+        assert rate.stale is True
+
+
+def test_invalid_currency_refused_at_construction_value_free():
+    server = ScriptedServer(httpx.Response(200, json=PRICES))
+    with server.client() as client, pytest.raises(ValueError) as excinfo:
+        PriceOracle(client, currency="klingon")
+    assert "klingon" not in str(excinfo.value)  # value-free
+    assert "usd" in str(excinfo.value)  # the closed enum is named
+    assert server.requests == []
+
+
+def test_live_reader_out_of_enum_refuses_fail_closed():
+    server = ScriptedServer(httpx.Response(200, json=PRICES))
+    with server.client() as client:
+        # An invalid answer is caught eagerly at construction (wiring bug
+        # surfaces at once, not on the first user-visible fetch):
+        with pytest.raises(ValueError) as excinfo:
+            PriceOracle(client, currency=lambda: "doubloons")
+        assert "doubloons" not in str(excinfo.value)  # value-free
+        # A reader that turns invalid LATER still refuses at fetch,
+        # fail-closed, before any request leaves:
+        code = {"cur": "usd"}
+        oracle = PriceOracle(client, ttl_s=60.0, currency=lambda: code["cur"])
+        code["cur"] = "doubloons"
+        with pytest.raises(ValueError) as excinfo:
+            oracle.fresh()
+        assert "doubloons" not in str(excinfo.value)
+    assert server.requests == []
+
+
+def test_default_currency_follows_the_env_rung(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LOCALWALLET_DISPLAY_CURRENCY", "gbp")
+    server = ScriptedServer(httpx.Response(200, json=MULTI_PRICES))
+    with server.client() as client:
+        rate = PriceOracle(client, ttl_s=60.0).fresh()  # currency=None
+    assert rate.currency == "gbp"
+    assert rate.per_btc == 53_000.0
+
+
+# -- multi-currency money math (floor to the currency's minor unit) ---------
+
+
+def test_sats_to_usd_name_now_converts_in_the_rate_currency():
+    server = ScriptedServer(httpx.Response(200, json=MULTI_PRICES))
+    with server.client() as client:
+        oracle = PriceOracle(client, ttl_s=60.0)
+        # EUR cents: 1_000_000 sats @ 62_000 EUR/BTC = 620.00 EUR -> 62000
+        assert oracle.sats_to_usd(1_000_000, _rate(62_000.0, "eur")) == 62_000
+        # JPY has no minor unit: 1_000_000 sats @ 8_900_000 JPY/BTC = 89000
+        assert oracle.sats_to_usd(1_000_000, _rate(8_900_000.0, "jpy")) == 89_000
+        # sub-yen floors to 0 (same ROUND_FLOOR policy as cents)
+        assert oracle.sats_to_usd(1, _rate(8_900_000.0, "jpy")) == 0
+    assert server.requests == []  # pure helper
+
+
+def test_usd_to_sats_converts_major_units_of_the_rate_currency():
+    server = ScriptedServer(httpx.Response(200, json=MULTI_PRICES))
+    with server.client() as client:
+        oracle = PriceOracle(client, ttl_s=60.0)
+        # 620 EUR @ 62_000 EUR/BTC = 0.01 BTC = 1_000_000 sats
+        assert oracle.usd_to_sats(620.0, _rate(62_000.0, "eur")) == 1_000_000
+        # 8_900 JPY @ 8_900_000 JPY/BTC = 0.001 BTC = 100_000 sats
+        assert oracle.usd_to_sats(8_900.0, _rate(8_900_000.0, "jpy")) == 100_000
+    assert server.requests == []  # pure helper
+
+
+def test_rate_with_unsupported_currency_is_refused():
+    server = ScriptedServer(httpx.Response(200, json=PRICES))
+    with server.client() as client:
+        oracle = PriceOracle(client, ttl_s=60.0)
+        with pytest.raises(ValueError):
+            oracle.sats_to_usd(1_000, _rate(1000.0, "klingon"))
+    assert server.requests == []
+
+
+def test_minor_per_unit_is_the_single_scale_source():
+    assert price_module.minor_per_unit("usd") == 100
+    assert price_module.minor_per_unit("jpy") == 1
+    with pytest.raises(ValueError):
+        price_module.minor_per_unit("btc")
+
+
+def test_jpy_rate_within_the_plausibility_bound():
+    # JPY per-BTC figures live ~1e7-1e8: the currency-agnostic bound
+    # (_MAX_FIAT_PER_BTC = 1e9) must pass real figures and still fail an
+    # absurd payload.
+    server = ScriptedServer(
+        httpx.Response(200, json={"JPY": 8_900_000}),
+        httpx.Response(200, json={"JPY": 1e300}),
+    )
+    with server.client() as client:
+        oracle = PriceOracle(client, ttl_s=60.0, currency="jpy")
+        assert oracle.fresh().per_btc == 8_900_000.0
+    with server.client() as client:
+        oracle = PriceOracle(client, ttl_s=60.0, currency="jpy")
+        with pytest.raises(ChainError):
+            oracle.fresh()

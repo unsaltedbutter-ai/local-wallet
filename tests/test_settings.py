@@ -106,6 +106,10 @@ def test_allowlist_is_exactly_the_live_db_keys(env_clean: None, tmp_path: Path) 
             "utxo_target_min_sats",
             "utxo_target_max_sats",
             "consolidate_below_sat_vb",
+            # TCK-FIAT-002: the display currency (closed enum; the price
+            # oracle re-reads its ladder per fetch, so requires_restart
+            # False).
+            "display_currency",
         }
         for secret_key in (
             "backend_auth_user",

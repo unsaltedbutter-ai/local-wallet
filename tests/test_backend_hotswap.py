@@ -308,7 +308,10 @@ def test_hot_swap_rebinds_one_shared_price_oracle(
     wiring, commands = _mk_wiring(tmp_path, monkeypatch)
     built: list[object] = []
 
-    def _counting_oracle(client: object) -> object:
+    def _counting_oracle(client: object, **_kwargs: object) -> object:
+        # TCK-FIAT-002: the rebind passes the live display-currency reader
+        # as a kwarg — accepted and ignored here (the client identity is
+        # what this pin counts).
         built.append(client)
         return client  # never fetched on this path
 
