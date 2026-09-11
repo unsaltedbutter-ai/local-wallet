@@ -238,6 +238,11 @@ body {
   gap: var(--sp-2);
 }
 
+/* TCK-PRIVACY-001B: the public-consent block in the chain row — leak
+   subline (.setting-flag) stacked above the button (.setting-line); the
+   block itself only needs separation from the beat above it. */
+.chain-consent { margin-block-start: var(--sp-2); }
+
 .chain-now {
   margin: 0;
   font-family: var(--font-mono);

@@ -188,6 +188,32 @@ def test_linkify_client_shape_pins() -> None:
     assert 'el("p", "turn-text turn-progress")' in code  # progress line intact
 
 
+# TCK-PRIVACY-001B static pins: the ONE web trigger of public-backend consent
+# is the chain row's "Use public server" button — exactly one fetch path to
+# /consent, reached only by that button; the pane-close path fires NO request
+# (closing ≠ consent, the client half); the button's visibility rides ONLY the
+# typed /state privacy_mode closed enum (no client-side inference), repainted
+# by the same chip pass as the trust badges; and the disclosure reuses the
+# pane's own leak sentence verbatim (one voice, no invented copy).
+def test_consent_button_is_the_only_consent_path_and_state_gated() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    assert code.count('fetch("/consent"') == 1  # one handler, no bypass routes
+    assert code.count("requestPublicConsent(") == 2  # definition + button wiring
+    close = code[code.index("function closeSettings"):
+                 code.index("settingsToggleEl.addEventListener")]
+    assert "fetch(" not in close  # pane close sends NOTHING: never an implied consent
+    # visibility: built gated on the enum, retired by the chip's own pass.
+    assert 'consent.hidden = state.privacyMode !== "awaiting_backend";' in code
+    painter = code[code.index("function paintConsentRow"):
+                    code.index("function applyPrivacyChip")]
+    assert 'state.privacyMode === "awaiting_backend"' in painter
+    chip = code[code.index("function applyPrivacyChip"):
+                code.index("function applyBackendKind")]
+    assert "paintConsentRow();" in chip
+    # honest copy: the button subline IS the pane's leak sentence.
+    assert 'consentSubline: "The public mempool.space server — " + PUBLIC_LEAK_SENTENCE' in code
+
+
 # TCK-LINK-001 behavioral check (runs under node if present): the SHIPPED
 # regexes and explorerHref are extracted from app.js source and fed accept/
 # reject vectors — hostile or malformed tokens never yield an href, and the

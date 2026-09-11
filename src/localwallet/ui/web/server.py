@@ -26,7 +26,7 @@ Thin stdlib HTTP/SSE transport over the engine pump (:func:`localwallet.app`
   opt-in via ``LOCALWALLET_WEB_PORT``, ADR-0024 §6 amendment); a random
   per-launch token gates every DATA-BEARING endpoint (``/events``,
   ``/state``, ``/turn``, ``/action``, ``/settings``, ``/watchkey``,
-  ``/resync``) via the ``X-Auth-Token`` header (the
+  ``/resync``, ``/consent``) via the ``X-Auth-Token`` header (the
   401 path deliberately does NOT send ``WWW-Authenticate`` — a browser would
   pop a native credential prompt). The shell (``GET /``, ``/index.html``) and
   ``GET /static/*`` are the deliberate token EXEMPTION (TCK-WEB-007): the
@@ -496,6 +496,26 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(503, {"error": "engine busy"})
                 return
             code = {"started": 202, "busy": 409}.get(result.get("status"), 503)
+            self._send_json(code, result)
+            return
+        if path == "/consent":
+            # TCK-PRIVACY-001B: the web "Use public server" consent button —
+            # the ONE web trigger of a public-backend choice. No body, no
+            # data: the transport marshals an empty typed ConsentRequest
+            # THROUGH the pump (the ENGINE thread runs the existing
+            # record+release seam — this thread never touches it) and echoes
+            # only the closed value-free status. The outcome flows back via
+            # /state (scan_state, privacy_mode) + the pump's turn_end.
+            self._drain_body()
+            result = (
+                None
+                if self.engine.error is not None
+                else self.engine.request_consent(self.state_timeout_s)
+            )
+            if result is None:
+                self._send_json(503, {"error": "engine busy"})
+                return
+            code = 200 if result.get("status") in ("loading", "recorded") else 503
             self._send_json(code, result)
             return
         if path not in ("/turn", "/action", "/settings", "/watchkey"):

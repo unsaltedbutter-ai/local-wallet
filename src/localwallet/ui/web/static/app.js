@@ -231,6 +231,15 @@ const LABELS = {
     "Saved — your environment configuration outranks this one; it applies at next restart.",
   resyncNoteUnchanged: "Already up to date — no re-scan needed.",
   resyncNoteUnavailable: "Saved — no re-scan could start right now.",
+  // TCK-PRIVACY-001B: the explicit public-backend consent button in the
+  // pane's chain section. The subline REUSES the pane's own leak sentence
+  // (PUBLIC_LEAK_SENTENCE) — one disclosure, never a second voice.
+  consentPublic: "Use public server",
+  consentSubline: "The public mempool.space server — " + PUBLIC_LEAK_SENTENCE,
+  consentSaving: "Recording…",
+  consentLoading: "Consent recorded — the wallet is loading now.",
+  consentRecorded: "Consent recorded.",
+  consentFailed: "Could not record consent — try again.",
 };
 
 // Which buttons the typed /state snapshot shows, per flow position. The
@@ -849,6 +858,18 @@ function paintTrustBadges() {
   }
 }
 
+// TCK-PRIVACY-001B: the consent button's visibility rides ONLY the persisted
+// privacy_mode NAME from typed /state truth (awaiting_backend = unresolved
+// first-run hold = show; a resolved choice = hide — the "Now using" line and
+// the trust badge then carry the truth). Re-painted in place with the badges
+// so a background /state flip retires the button without a pane rebuild.
+function paintConsentRow() {
+  const show = state.privacyMode === "awaiting_backend";
+  for (const box of settingsListEl.querySelectorAll(".chain-consent")) {
+    box.hidden = !show;
+  }
+}
+
 // TCK-UX-010 + TCK-WEB-012 (f): two upgrades over the original chip. (1) The chip PERSISTS the last known mode
 // across state/0 (engine-busy) snapshots — it must not blink out mid-turn;
 // only a contradicting TYPED snapshot (a different valid name, or an
@@ -867,6 +888,7 @@ function applyPrivacyChip(snap) {
   }
   const mode = state.privacyMode;
   paintTrustBadges(); // TCK-WEB-013 (2): the pane badge rides the same truth
+  paintConsentRow(); // TCK-PRIVACY-001B: likewise the public-consent button
   if (!mode) {
     privacyChipEl.hidden = true;
     privacyChipEl.removeAttribute("data-privacy");
@@ -1302,6 +1324,23 @@ function chainBaseRow(entry) {
     li.appendChild(el("p", "setting-flag chain-beat", LABELS.firstRunBeat));
   }
 
+  // TCK-PRIVACY-001B: the ONLY web trigger of public-backend consent. It
+  // shows while the typed /state privacy_mode enum says the backend choice
+  // is unresolved (awaiting_backend) and hides the moment a choice exists
+  // (engine truth repainted by paintConsentRow — never a client guess).
+  // Closing the pane, asking a balance, or any other action never rides
+  // this path. The leak disclosure sits right above the button.
+  const consent = el("div", "chain-consent");
+  consent.appendChild(el("p", "setting-flag", LABELS.consentSubline));
+  const consentLine = el("div", "setting-line");
+  const consentBtn = el("button", "btn btn-secondary btn-small", LABELS.consentPublic);
+  consentBtn.type = "button";
+  consentBtn.addEventListener("click", () => requestPublicConsent(consentBtn, status));
+  consentLine.appendChild(consentBtn);
+  consent.appendChild(consentLine);
+  consent.hidden = state.privacyMode !== "awaiting_backend";
+  li.appendChild(consent);
+
   const line = el("div", "setting-line");
   const input = document.createElement("input");
   input.className = "setting-input";
@@ -1612,6 +1651,42 @@ async function requestResync(btn, status) {
     status.textContent = note;
     btn.disabled = false;
     refreshState(); // the scan chip is the truth, never this echo
+  }
+}
+
+// TCK-PRIVACY-001B: ONE fetch path, reached ONLY by the consent button above.
+// POST /consent carries no data; the ENGINE pump performs the record+release
+// and answers the closed status (loading = the held first-run scan started —
+// the F2 contract; recorded = choice stands with nothing held). The chips,
+// the beat and the button's own visibility then follow from the next /state
+// snapshot — never from this echo (same discipline as requestResync).
+async function requestPublicConsent(btn, status) {
+  if (btn.disabled || state.stopped) return;
+  btn.disabled = true;
+  status.dataset.kind = "";
+  status.textContent = LABELS.consentSaving;
+  let note = LABELS.consentFailed;
+  let kind = "error";
+  try {
+    const response = await fetch("/consent", { method: "POST", headers: authHeaders() });
+    const data = await response.json().catch(() => null);
+    const closed =
+      data && data.schema === "consent/1" && typeof data.status === "string"
+        ? data.status
+        : null;
+    if (response.status === 200 && closed !== null && closed !== "unavailable") {
+      note = closed === "loading" ? LABELS.consentLoading : LABELS.consentRecorded;
+      kind = "warn"; // a leak disclosure earns the beat's warn tone, not "ok"
+    } else if (response.status === 401) {
+      note = LABELS.sessionStale; // a retry can never fix a stale token
+    }
+  } catch {
+    note = LABELS.unreachable;
+  } finally {
+    status.dataset.kind = kind;
+    status.textContent = note;
+    btn.disabled = false;
+    refreshState(); // engine truth repaints the chips and retires the button
   }
 }
 

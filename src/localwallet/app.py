@@ -5997,6 +5997,34 @@ class ResyncRequest:
     reply: queue.Queue[dict[str, object]]
 
 
+#: Command label the web transport stamps on a public-backend consent press
+#: (TCK-PRIVACY-001B; the sibling of :data:`RESYNC_COMMAND`): recognized ONLY
+#: as the ``command`` field of a :class:`ConsentRequest`, it is never a model
+#: turn and never a chat line.
+CONSENT_COMMAND: Final[str] = "/consent"
+
+#: ``/consent`` reply schema tag (additive-tag rule as for ``resync/1``).
+CONSENT_SCHEMA: Final[str] = "consent/1"
+
+
+@dataclass(frozen=True)
+class ConsentRequest:
+    """A typed public-backend-consent trigger queued THROUGH the engine pump
+    (TCK-PRIVACY-001B — the seam :func:`set_public_backend_consent`'s web
+    rider). The browser's button carries NO data; the ENGINE thread (which
+    owns the store, the gate and the scan) runs the existing seam — the HTTP
+    transport thread never touches either. The reply is the closed value-free
+    status: ``loading`` ONLY when the held first-run scan actually started
+    (the F2 contract), ``recorded`` when the choice stands with nothing held
+    to release, ``unavailable`` when no store is wired. A press is consent
+    itself; NO other web action rides this command (engine-side, nothing
+    else ever records the choice).
+    """
+
+    command: str
+    reply: queue.Queue[dict[str, object]]
+
+
 def _env_overridden(env_var: str) -> bool:
     """Whether an env var is set to a non-blank value (the honest
     ``env_override`` flag: the stored rung is shadowed until restart with the
@@ -6663,6 +6691,22 @@ class EngineHandle:
         except queue.Empty:
             return None
 
+    def request_consent(self, timeout: float) -> dict[str, object] | None:
+        """Record an explicit public-backend consent THROUGH the pump
+        (TCK-PRIVACY-001B — the web consent button). Same discipline as
+        :meth:`request_resync`: the transport carries no data and never
+        touches the seam — the ENGINE thread runs
+        :func:`set_public_backend_consent` (record + release) and answers
+        with the closed value-free status. ``None`` on timeout = never-cancel
+        stands (the queued press may still land; the client re-reads /state —
+        scan_state/privacy_mode are the truth)."""
+        reply: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+        self.commands.put(ConsentRequest(CONSENT_COMMAND, reply))
+        try:
+            return reply.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
     def shutdown(self) -> None:
         """End the session AFTER the current turn completes (never-cancel)."""
         self.commands.put(QUIT)
@@ -7188,6 +7232,28 @@ def _pump(
             # /state (scan_state flipped).
             status = backend.resync() if backend is not None else "unavailable"
             command.reply.put({"schema": RESYNC_SCHEMA, "status": status})
+            if emitter is not None:
+                emitter.emit(EVENT_TURN_END)
+            continue
+        if isinstance(command, ConsentRequest):
+            # TCK-PRIVACY-001B: the web consent button — the ONE web trigger
+            # of a public-backend choice, executed HERE on the engine thread
+            # via the EXISTING seam (record the ONB-006 marker + release the
+            # held first-run scan; no store wired = refuse). turn_end so the
+            # client re-reads /state: the released scan's chip and the
+            # resolved privacy_mode ride the existing machinery (no new
+            # client-side inference). The closed status is value-free.
+            started = store is not None and set_public_backend_consent(store, scan)
+            command.reply.put(
+                {
+                    "schema": CONSENT_SCHEMA,
+                    "status": (
+                        "loading" if started
+                        else "recorded" if store is not None
+                        else "unavailable"
+                    ),
+                }
+            )
             if emitter is not None:
                 emitter.emit(EVENT_TURN_END)
             continue

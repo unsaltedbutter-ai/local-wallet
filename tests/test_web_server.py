@@ -226,6 +226,8 @@ def test_every_endpoint_requires_token_and_replies_http_1_0(serve: Any) -> None:
         ("POST", "/settings", {"key": "gap_limit", "value": "5"}),
         # TCK-LAUNCH-001: the first-run watch-key entry is data-bearing too.
         ("POST", "/watchkey", {"key": "zpub-some-key"}),
+        # TCK-PRIVACY-001B: the public-consent press is a mutation too.
+        ("POST", "/consent", None),
     ]
     for method, path, body in cases:
         status, headers, data, response = _request(server, method, path, body)
