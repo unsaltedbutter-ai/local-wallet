@@ -1397,7 +1397,11 @@ function updateCredsVisibility(row, input) {
   const value = input.value.trim().toLowerCase();
   creds.hidden = !(
     input.readOnly === false &&
-    (value.startsWith("http://") || value.startsWith("bitcoind://"))
+    (
+      value.startsWith("http://") ||
+      value.startsWith("bitcoind://") ||
+      value.startsWith("bitcoind+tls://")
+    )
   );
 }
 
