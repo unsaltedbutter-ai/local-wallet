@@ -157,7 +157,7 @@ from localwallet.chain.config import (
     BITCOIND_TLS_SCHEME,
     ELECTRUM_SCHEME,
 )
-from localwallet.chain.esplora import NETWORK_ERROR
+from localwallet.chain.esplora import NETWORK_ERROR, RPC_ERROR
 from localwallet.config import (
     COIN_SETTING_BOUNDS,
     COIN_SETTING_DEFAULTS,
@@ -4643,6 +4643,34 @@ class ChainWorker:
         self._thread.join(timeout)
 
 
+#: The chain/ endpoint kind a bitcoind ``scantxoutset`` refusal carries
+#: (the error message prefix; the ONLY part of the failure detail the scan
+#: guidance below pattern-matches on — value-free by the chain contract).
+_KIND_UTXO_SCAN_REFUSAL: Final[str] = "utxo-scan"
+
+#: The value-free suspect list for an rpc-error UTXO-scan refusal
+#: (TCK-BACKEND-004): the node answered at the RPC layer and refused the
+#: request — name the suspects, invent nothing. The numeric RPC code rides
+#: the class tag; the server's message text never surfaces anywhere.
+_SCAN_RPC_REFUSAL_HINT: Final[str] = (
+    " The request was rejected by the server's RPC layer — check the RPC"
+    " role/permissions for this user, the request shape, or the scan timeout."
+)
+
+
+def _scan_failure_suffix(exc: BaseException) -> str:
+    """The ``[class=… exc=…]`` debug suffix (TCK-DIAG-001, plus the
+    value-free RPC code of an ``rpc-error`` refusal — TCK-DIAG-002) and the
+    scantxoutset suspect-list guidance, shared by EVERY scan-failure line
+    (the engine-thread :meth:`ScanFlow._warn` and the launch-time sync
+    rescan path format the same sentence)."""
+    fc, name, extra = _failure_parts(exc)
+    suffix = f" [class={fc} exc={name}{extra}]"
+    if fc == RPC_ERROR and _KIND_UTXO_SCAN_REFUSAL in str(exc):
+        suffix += _SCAN_RPC_REFUSAL_HINT
+    return suffix
+
+
 class ScanFlow:
     """The engine-side startup-scan controller + the shared blocking scan
     (TCK-SCAN-003, ADR-0022 decisions 1/3/4).
@@ -4930,8 +4958,7 @@ class ScanFlow:
         label = "rescan" if self._rescan else "startup scan"
         line = f"warning: {label} failed: {detail} — continuing with cached state."
         if exc is not None:
-            fc, name = _failure_parts(exc)
-            line += f" [class={fc} exc={name}]"
+            line += _scan_failure_suffix(exc)
         out = self._output
         if out is not None:
             out.warning(line)
@@ -5474,11 +5501,14 @@ WATCHKEY_REQUIRED_NOTICE: Final[str] = (
 # ---------------------------------------------------------------------------
 
 #: Startup beats on a FRESH needs_watch_key launch ONLY (a configured
-#: launch never emits them): emitted by :func:`_pump` as SEPARATE output_fn
-#: events each closing its own turn (the TCK-UX-012 pump pattern). ORDER
-#: vs the model-absent surfaces is PINNED (critique Q6): these beats come
-#: FIRST, the model card after them; the model-absent BANNER rides the
-#: buffered startup narration, which flushes before the pump runs at all.
+#: launch never emits them): emitted by :func:`_pump` as ONE output_fn line
+#: — the three sentences joined with ``\n`` closing a single turn, so the
+#: web client renders ONE bubble with line breaks (user direction,
+#: 2026-09-11; the SSE frame carries the payload verbatim and .turn-text is
+#: pre-wrap). ORDER vs the model-absent surfaces is PINNED (critique Q6):
+#: these beats come FIRST, the model card after them; the model-absent
+#: BANNER rides the buffered startup narration, which flushes before the
+#: pump runs at all.
 CHAT_ONB_GREETING: Final[str] = "Hi, I'd like to be your new Bitcoin wallet."
 CHAT_ONB_KEY_ASK: Final[str] = "Enter your xpub or zpub to get started."
 CHAT_ONB_KEY_HELP_OFFER: Final[str] = (
@@ -5490,9 +5520,12 @@ _CHAT_ONB_OPENING: Final[tuple[str, ...]] = (
     CHAT_ONB_KEY_HELP_OFFER,
 )
 
-#: Key landed through chat: the ack, then the backend beat bubbles (shown
-#: only while the backend choice is genuinely unresolved — an operator
-#: rung that already resolves it asks nothing, per ONB-006).
+#: Key landed through chat: the ack (its OWN bubble), then the backend beat
+#: as ONE grouped bubble (ask + the two option lines joined with ``\n`` —
+#: the mirror of the greeting group, pinned; the static-half user
+#: correction 2026-09-11), shown only while the backend choice is genuinely
+#: unresolved — an operator rung that already resolves it asks nothing, per
+#: ONB-006.
 CHAT_ONB_KEY_SAVED: Final[str] = "Great. I saved that."
 CHAT_ONB_BACKEND_ASK: Final[str] = (
     "Now, where should I go to get blockchain information?"
@@ -7264,14 +7297,16 @@ def _pump(
     pre-amendment behavior.
 
     Chat-first onboarding (TCK-ONB-007, user copy VERBATIM): a FRESH
-    needs_watch_key launch opens with the deterministic greeting beats
-    (separate output_fn events, each closing its own turn — the UX-012
-    pattern; a configured launch never emits them). While unprovisioned,
+    needs_watch_key launch opens with the deterministic greeting GROUP —
+    the three lines joined with ``\\n`` into ONE output_fn event closing
+    ONE turn (the web renders one bubble with line breaks; user direction
+    2026-09-11; a configured launch never emits it). While unprovisioned,
     key-shaped chat lines ride the EXISTING parse+provision path PRE-MODEL
     (the gated refusals are that path's own value-free lines) and, on
-    success, the ack + backend beat bubbles follow; the pinned "ask me how"
-    matcher answers with the deterministic export guidance; everything
-    else keeps the watch-key refusal notice. While PROVISIONED with the
+    success, the ack bubble + the grouped backend beat follow; the pinned
+    "ask me how" matcher answers with the deterministic export guidance;
+    everything else keeps the watch-key refusal notice. While PROVISIONED
+    with the
     backend still UNRESOLVED, a chat message that is a backend URL rides
     the settings-POST probe→store→swap discipline (``ChainBackend``.
     ``apply`` — url_class clamp + DIAG-001 companion included) and a short
@@ -7281,9 +7316,11 @@ def _pump(
     """
 
     def _onb_line(line: str) -> None:
-        # One onboarding narration line = one closed turn (TCK-UX-012 pump
-        # pattern — the web client renders one bubble per beat; the CLI
-        # sink ignores the marker, byte-identical terminal output).
+        # One onboarding BUBBLE = one output_fn line closing one turn
+        # (TCK-UX-012 pump pattern). A bubble may carry several display
+        # lines joined with "\n" — the web renders them inside ONE bubble
+        # (.turn-text is pre-wrap); the CLI sink ignores the marker,
+        # byte-identical terminal output.
         output_fn(line)
         if emitter is not None:
             emitter.emit(EVENT_TURN_END)
@@ -7365,12 +7402,13 @@ def _pump(
         scan.begin()
     if provision is not None and provision.wiring is None:
         # TCK-ONB-007 fresh needs_watch_key launch ONLY: the chat-first
-        # greeting beats, ORDER-PINNED before the model-absent card below
-        # (the model-absent banner flushes ahead of the pump — see the
-        # docstring). Ordinary output_fn lines: the CLI transport renders
-        # them identically (requirement 6).
-        for _beat in _CHAT_ONB_OPENING:
-            _onb_line(_beat)
+        # greeting GROUP — the three lines joined with \n, ONE bubble and
+        # ONE turn (static-half user correction 2026-09-11), ORDER-PINNED
+        # before the model-absent card below (the model-absent banner
+        # flushes ahead of the pump — see the docstring). An ordinary
+        # output_fn line: the CLI transport renders it identically
+        # (requirement 6).
+        _onb_line("\n".join(_CHAT_ONB_OPENING))
     if model is not None:
         model.attach(commands)
         if model.state == "absent":
@@ -7603,8 +7641,8 @@ def _pump(
             # path — the mainnet-only, watch-only and seed refusals are
             # THAT path's own value-free lines, reused, never duplicated —
             # and on success the pump rebinds exactly like the typed
-            # submit, then the ack + backend beat bubbles follow (backend
-            # bubbles only while the choice is genuinely unresolved; an
+            # submit, then the ack + the grouped backend beat follow (the
+            # beat fires only while the choice is genuinely unresolved; an
             # operator rung that already resolves it asks nothing).
             # ORDER (security/code review MINOR 2): HELP BEFORE key-
             # material — a long-lowercase help question is BIP39-SHAPE-
@@ -7624,8 +7662,10 @@ def _pump(
                     if not _backend_resolved(
                         settings.chain_base_url.strip() or None, store
                     ):
-                        for _beat in _CHAT_ONB_BACKEND_BEATS:
-                            _onb_line(_beat)
+                        # ONE grouped bubble (the greeting group's mirror
+                        # structure — pinned; static-half user
+                        # correction 2026-09-11).
+                        _onb_line("\n".join(_CHAT_ONB_BACKEND_BEATS))
                 else:
                     error = reply.get("error")
                     _onb_line(
@@ -8304,19 +8344,29 @@ def _probe_url_class(text: str) -> str:
     return "unknown"
 
 
-def _failure_parts(exc: BaseException | None) -> tuple[str, str]:
-    """Value-free ``(failure_class, exception_class_name)`` for a debug line
-    (TCK-DIAG-001). Prefers the structured class the chain/ adapters attach
-    to :class:`ChainError`; otherwise derives it from the exception type."""
+def _failure_parts(exc: BaseException | None) -> tuple[str, str, str]:
+    """Value-free ``(failure_class, exception_class_name, debug-extra)`` for
+    a debug line (TCK-DIAG-001). Prefers the structured class the chain/
+    adapters attach to :class:`ChainError`; otherwise derives it from the
+    exception type. The third element is a pre-formatted, value-free suffix
+    — currently only the NUMERIC JSON-RPC error code an ``rpc-error``
+    refusal carried (TCK-DIAG-002: protocol constants, not user data; the
+    server's message text never rides)."""
     fc = getattr(exc, "failure_class", None) or classify_failure(exc)
     name = getattr(exc, "exc_name", None) or type(exc).__name__
-    return fc, name
+    code = getattr(exc, "rpc_code", None)
+    extra = f" code={code}" if isinstance(code, int) and not isinstance(code, bool) else ""
+    return fc, name, extra
 
 
-def _report_failure_parts(report: dict[str, str]) -> tuple[str, str]:
+def _report_failure_parts(report: dict[str, str]) -> tuple[str, str, str]:
     """Like :func:`_failure_parts`, but from ``check_backend``'s ``report``
     dict (value-free by the chain contract)."""
-    return report.get("failure_class") or "network-error", report.get("exc_name") or "unknown"
+    return (
+        report.get("failure_class") or "network-error",
+        report.get("exc_name") or "unknown",
+        "",
+    )
 
 
 def _emit_probe_failure(
@@ -8326,18 +8376,19 @@ def _emit_probe_failure(
     url_class: str,
     fc: str,
     name: str,
+    extra: str = "",
 ) -> None:
     """The console/log debug companion for a rejected probe URL (TCK-DIAG-001).
     Value-free: only the failure class, the probe stage, the CLAMPED
     URL-class (a known scheme or the literal ``unknown`` — never a host,
-    credential, address, or amount), and the exception class name. A no-op
-    when no ``output`` router is present (the test seam / direct-call
-    path)."""
+    credential, address, or amount), the exception class name, and the
+    optional value-free debug extra (an RPC error CODE). A no-op when no
+    ``output`` router is present (the test seam / direct-call path)."""
     if output is None:
         return
     output.warning(
         f"backend probe rejected: stage={stage} url-class={url_class} "
-        f"class={fc} exc={name}"
+        f"class={fc} exc={name}{extra}"
     )
 
 
@@ -8425,8 +8476,10 @@ def _probe_chain_backend(
     # review). The host echo allowance of UX-009 is NOT used here.
     url_class = _probe_url_class(text)
 
-    def _refuse(stage: str, fc: str, name: str) -> None:
-        _emit_probe_failure(output, stage=stage, url_class=url_class, fc=fc, name=name)
+    def _refuse(stage: str, fc: str, name: str, extra: str = "") -> None:
+        _emit_probe_failure(
+            output, stage=stage, url_class=url_class, fc=fc, name=name, extra=extra
+        )
 
     def _core_shape(core_url: str) -> tuple[bool, BaseException | None]:
         """One bounded Core-RPC handshake against the canonical rewrite; a
@@ -9025,10 +9078,9 @@ def _wire(
             sqlite3.Error,
         ) as exc:
             label = "rescan" if rescan else "startup scan"
-            fc, name = _failure_parts(exc)
             output_fn.warning(
-                f"warning: {label} failed: {exc} — continuing with cached state. "
-                f"[class={fc} exc={name}]"
+                f"warning: {label} failed: {exc} — continuing with cached state."
+                + _scan_failure_suffix(exc)
             )
 
     if not scan.gate.enabled:
