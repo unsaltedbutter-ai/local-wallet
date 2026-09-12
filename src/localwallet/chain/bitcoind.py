@@ -64,8 +64,9 @@ The scan problem — the plan's option (a), watch-only exact:
   :meth:`get_address_utxos` directly (``amount`` BTC → exact-satoshi
   ``value`` via Decimal; ``height > 0`` → confirmed).
 * :meth:`get_address_txs` assembles what history the data allows: the
-  funding transactions of the address's UNSPENT outputs (one verbose
-  ``getrawtransaction`` per distinct txid). **Documented limitation (plan
+  funding transactions of the address's UNSPENT outputs (one verbosity-2
+  ``getrawtransaction`` per distinct txid — the input ``prevout`` objects
+  only ride level 2). **Documented limitation (plan
   §2; OQ-1 default):** Core without a wallet/address-index cannot
   enumerate spent history — ``scantxoutset`` sees ONLY UNSPENT outputs, so
   fully-spent addresses surface NO history, and mempool outputs never
@@ -93,7 +94,8 @@ app's watch surface, ADR-0023 decision 5); ``bestblockhash`` → verbose
 ``getblockheader`` → :class:`TipBlock` (``time``; absent/malformed →
 ``None`` clean-unavailable, never fabricated); verbose
 ``getrawtransaction`` → :class:`TxStatus` (``confirmations > 0``;
-``blockheight``/``blocktime`` only when confirmed — a mempool tx's
+height (``height``, legacy ``blockheight``)/``blocktime`` only when
+confirmed — a mempool tx's
 first-seen ``time`` is deliberately NOT reported as a block time, the
 electrum parity rule); ``sendrawtransaction`` → :meth:`broadcast_tx` with
 the SAME single-attempt + embit txid-binding semantics as every other
@@ -126,7 +128,7 @@ import http.client
 import json
 import ssl
 import threading
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Final, Self
@@ -141,6 +143,7 @@ from localwallet.chain.esplora import (
     _TXID_LENGTH_CHARS,
     AUTH_REQUIRED,
     HTTP_STATUS,
+    NOT_CORE_SHAPE,
     NOT_MAINNET,
     RPC_ERROR,
     ChainError,
@@ -250,13 +253,21 @@ _HEX64: Final[frozenset[str]] = frozenset("0123456789abcdef")
 
 
 def _require_txid_hex(value: Any, kind: str) -> str:
-    """Validate a server-supplied txid as 64 lowercase hex (fail closed)."""
+    """Validate a server-supplied txid as 64 lowercase hex (fail closed).
+
+    A malformed txid on any Core answer is a SHAPE refusal (not a network
+    loss — debugger handoff 2026-09-12, fix 4): the class rides so the app
+    line never degrades to ``network-error``.
+    """
     if (
         not isinstance(value, str)
         or len(value) != _TXID_LENGTH_CHARS
         or not set(value) <= _TXID_CHARSET
     ):
-        raise ChainError(f"{kind} response has a missing or malformed 'txid'")
+        raise ChainError(
+            f"{kind} response has a missing or malformed 'txid'",
+            failure_class=NOT_CORE_SHAPE,
+        )
     return value
 
 
@@ -265,6 +276,31 @@ def _require_plain_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _tx_block_height(obj: dict[str, Any]) -> int | None:
+    """Lenient block-height read from a dict carrying one (fix 1).
+
+    Real Core names the field ``height`` (as everywhere in Core);
+    ``blockheight`` was the legacy ``getrawtransaction`` outlier (Core
+    21-28). Try ``blockheight`` then ``height`` and accept a plain int, a
+    digit-string, or a Decimal (bodies parse with ``parse_float=Decimal``,
+    so ``800000.0`` arrives as one). ``None`` when nothing readable is
+    present — the caller decides: confirmed verbose tx = shape refusal,
+    scan row = honest unconfirmed.
+    """
+    for field in ("blockheight", "height"):
+        value = obj.get(field)
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            number = Decimal(str(value))
+        except InvalidOperation:
+            continue
+        if not number.is_finite() or number != number.to_integral_value():
+            continue
+        return int(number)
+    return None
 
 
 def _btc_to_sats(value: Any, kind: str, field: str) -> int:
@@ -278,13 +314,21 @@ def _btc_to_sats(value: Any, kind: str, field: str) -> int:
     logged).
     """
     if isinstance(value, bool) or not isinstance(value, (Decimal, int)):
-        raise ChainError(f"{kind} response has a missing or malformed '{field}'")
+        raise ChainError(
+            f"{kind} response has a missing or malformed '{field}'",
+            failure_class=NOT_CORE_SHAPE,
+        )
     sats = Decimal(value) * _SATS_PER_BTC
     if sats != sats.to_integral_value():
-        raise ChainError(f"{kind} response '{field}' is not a whole number of satoshis")
+        raise ChainError(
+            f"{kind} response '{field}' is not a whole number of satoshis",
+            failure_class=NOT_CORE_SHAPE,
+        )
     total = int(sats)
     if total < 0:
-        raise ChainError(f"{kind} response '{field}' is negative")
+        raise ChainError(
+            f"{kind} response '{field}' is negative", failure_class=NOT_CORE_SHAPE
+        )
     return total
 
 
@@ -560,7 +604,8 @@ class BitcoindClient:
         """History for ``address`` as far as the data allows, Esplora shape.
 
         The funding transactions of the address's UNSPENT outputs (one
-        verbose ``getrawtransaction`` per distinct txid). Plan §2's
+        verbosity-2 ``getrawtransaction`` per distinct txid — only level 2
+        carries the input ``prevout`` objects). Plan §2's
         documented limit: Core without a wallet/address-index cannot
         enumerate spent history, so a fully-spent address — and one funded
         only in the mempool, which never enters the UTXO set — answers
@@ -578,7 +623,12 @@ class BitcoindClient:
             txids = list(dict.fromkeys(entry["txid"] for entry in unspents))
             entries: list[dict[str, Any]] = []
             for txid in txids:
-                verbose = self._rpc("getrawtransaction", [txid, True], _KIND_ADDRESS_TXS)
+                # VERBOSITY 2 (fix 3, debugger handoff): only level 2
+                # carries the input ``prevout`` objects the sender-address
+                # mapping below reads — verbosity 1 ("True") silently lost
+                # every input's sender. The Core-22 capability floor
+                # guarantees level 2 exists.
+                verbose = self._rpc("getrawtransaction", [txid, 2], _KIND_ADDRESS_TXS)
                 entries.append(self._tx_entry(verbose, txid))
             return entries
 
@@ -668,7 +718,9 @@ class BitcoindClient:
         ``getrawtransaction``.
 
         ``confirmed`` = ``confirmations > 0``; ``block_height``/``block_time``
-        come from ``blockheight``/``blocktime`` when confirmed and are
+        come from the verbose tx's height field (``height`` on modern Core,
+        the legacy ``blockheight`` name still accepted — fix 1) and
+        ``blocktime`` when confirmed, and are
         ``None`` otherwise (a mempool tx's first-seen ``time`` is
         deliberately NOT reported as a block time — the electrum parity
         rule; Core, unlike ElectrumX, ALWAYS sends ``confirmations`` — 0
@@ -679,22 +731,32 @@ class BitcoindClient:
         _validate_txid(txid)
         verbose = self._rpc("getrawtransaction", [txid, True], _KIND_TX_STATUS)
         if not isinstance(verbose, dict):
-            raise ChainError(f"{_KIND_TX_STATUS} response was not an object")
+            raise ChainError(
+                f"{_KIND_TX_STATUS} response was not an object",
+                failure_class=NOT_CORE_SHAPE,
+            )
         confirmations = _require_plain_int(verbose.get("confirmations"))
         if confirmations is None or confirmations < 0:
             raise ChainError(
-                f"{_KIND_TX_STATUS} response has a missing or invalid 'confirmations'"
+                f"{_KIND_TX_STATUS} response has a missing or invalid 'confirmations'",
+                failure_class=NOT_CORE_SHAPE,
             )
         confirmed = confirmations > 0
         block_height: int | None = None
         block_time: int | None = None
         if confirmed:
-            # 'blockheight' exists from Core 21 (older nodes are refused at
-            # the capability gate); a confirmed tx WITHOUT it is a broken
-            # payload.
-            block_height = _require_plain_int(verbose.get("blockheight"))
+            # A confirmed tx WITHOUT a readable height is a broken
+            # payload — refused with the SHAPE class (never the
+            # network-error collapse). The field is named ``height`` on
+            # real Core (the legacy ``blockheight`` spelling is still
+            # read first for old nodes; the capability gate already
+            # refused pre-22).
+            block_height = _tx_block_height(verbose)
             if block_height is None or block_height < 0:
-                raise ChainError(f"{_KIND_TX_STATUS} response has invalid 'blockheight'")
+                raise ChainError(
+                    f"{_KIND_TX_STATUS} response has a missing or invalid block height",
+                    failure_class=NOT_CORE_SHAPE,
+                )
             stamp = _require_plain_int(verbose.get("blocktime"))
             block_time = stamp if stamp is not None and stamp >= 0 else None
         return TxStatus(
@@ -807,25 +869,43 @@ class BitcoindClient:
             timeout_s=_SCAN_TIMEOUT_S,
         )
         if not isinstance(result, dict):
-            raise ChainError(f"{_KIND_UTXO_SCAN} response was not an object")
+            raise ChainError(
+                f"{_KIND_UTXO_SCAN} response was not an object",
+                failure_class=NOT_CORE_SHAPE,
+            )
         if result.get("success") is not True:
-            raise ChainError(f"{_KIND_UTXO_SCAN} scan did not complete")
+            raise ChainError(
+                f"{_KIND_UTXO_SCAN} scan did not complete",
+                failure_class=NOT_CORE_SHAPE,
+            )
         if "complete" in result and result["complete"] is not True:
-            raise ChainError(f"{_KIND_UTXO_SCAN} scan did not complete")
+            raise ChainError(
+                f"{_KIND_UTXO_SCAN} scan did not complete",
+                failure_class=NOT_CORE_SHAPE,
+            )
         scan_height = _require_plain_int(result.get("height"))
         if scan_height is None or scan_height < 0:
-            raise ChainError(f"{_KIND_UTXO_SCAN} response has a missing or invalid 'height'")
+            raise ChainError(
+                f"{_KIND_UTXO_SCAN} response has a missing or invalid 'height'",
+                failure_class=NOT_CORE_SHAPE,
+            )
         unspents = result.get("unspents")
         if not isinstance(unspents, list) or any(
             not isinstance(entry, dict) for entry in unspents
         ):
-            raise ChainError(f"{_KIND_UTXO_SCAN} response 'unspents' is not a list of objects")
+            raise ChainError(
+                f"{_KIND_UTXO_SCAN} response 'unspents' is not a list of objects",
+                failure_class=NOT_CORE_SHAPE,
+            )
         snapshot: dict[str, list[dict[str, Any]]] = {}
         for index, entry in enumerate(unspents):
             txid = _require_txid_hex(entry.get("txid"), _KIND_UTXO_SCAN)
             vout = _require_plain_int(entry.get("vout"))
             if vout is None or vout < 0:
-                raise ChainError(f"utxo entry {index} has a missing or invalid 'vout'")
+                raise ChainError(
+                    f"utxo entry {index} has a missing or invalid 'vout'",
+                    failure_class=NOT_CORE_SHAPE,
+                )
             script = entry.get("scriptPubKey")
             if (
                 not isinstance(script, str)
@@ -833,16 +913,17 @@ class BitcoindClient:
                 or not script
             ):
                 raise ChainError(
-                    f"utxo entry {index} has a missing or malformed 'scriptPubKey'"
+                    f"utxo entry {index} has a missing or malformed 'scriptPubKey'",
+                    failure_class=NOT_CORE_SHAPE,
                 )
             value = _btc_to_sats(entry.get("amount"), _KIND_UTXO_SCAN, "amount")
-            block_height = _require_plain_int(entry.get("height"))
-            if block_height is None:
-                raise ChainError(f"utxo entry {index} has a missing or invalid 'height'")
-            # UTXO-set entries are confirmed by construction (height > 0);
-            # a non-positive height is a broken payload mapped honestly as
-            # unconfirmed rather than dropped (never silently undercount).
-            confirmed = block_height > 0
+            # Fix 2 (debugger handoff): an UNREADABLE height reads as an
+            # honest UNCONFIRMED entry — never a raise. A confirmed coin
+            # without a provable height must not kill the whole scan after
+            # the minutes-class walk already succeeded; the never-silently-
+            # undercount rule keeps the entry (mirrored height > 0 rail).
+            block_height = _tx_block_height(entry)
+            confirmed = block_height is not None and block_height > 0
             status: dict[str, Any] = {"confirmed": confirmed}
             if confirmed:
                 status["block_height"] = block_height
@@ -867,20 +948,36 @@ class BitcoindClient:
         ``/txs`` shape (the electrum adapter's twin mapping)."""
         kind = _KIND_ADDRESS_TXS
         if not isinstance(verbose, dict):
-            raise ChainError(f"{kind} transaction detail was not an object")
+            raise ChainError(
+                f"{kind} transaction detail was not an object",
+                failure_class=NOT_CORE_SHAPE,
+            )
         txid = _require_txid_hex(verbose.get("txid"), kind)
         if txid != requested_txid:
             # Bind the answer to the tx we asked for — a mislabeled
             # verbose tx must never be attributed to the queried address.
-            raise ChainError(f"{kind} transaction detail does not match the requested txid")
+            raise ChainError(
+                f"{kind} transaction detail does not match the requested txid",
+                failure_class=NOT_CORE_SHAPE,
+            )
         confirmations = _require_plain_int(verbose.get("confirmations"))
         if confirmations is None or confirmations < 0:
-            raise ChainError(f"{kind} transaction detail has a missing or invalid 'confirmations'")
+            raise ChainError(
+                f"{kind} transaction detail has a missing or invalid 'confirmations'",
+                failure_class=NOT_CORE_SHAPE,
+            )
         status: dict[str, Any] = {"confirmed": confirmations > 0}
         if confirmations > 0:
-            block_height = _require_plain_int(verbose.get("blockheight"))
+            # THE live bug (debugger handoff): real Core names the field
+            # ``height``, not the legacy ``blockheight`` — the shared
+            # lenient reader takes either; an unreadable one on a
+            # confirmed tx is a SHAPE refusal (never network-error).
+            block_height = _tx_block_height(verbose)
             if block_height is None or block_height < 0:
-                raise ChainError(f"{kind} transaction detail has invalid 'blockheight'")
+                raise ChainError(
+                    f"{kind} transaction detail has a missing or invalid block height",
+                    failure_class=NOT_CORE_SHAPE,
+                )
             status["block_height"] = block_height
             stamp = _require_plain_int(verbose.get("blocktime"))
             if stamp is not None and stamp >= 0:
@@ -893,7 +990,10 @@ class BitcoindClient:
         if not isinstance(vin, list) or not isinstance(vout, list) or any(
             not isinstance(item, dict) for item in [*vin, *vout]
         ):
-            raise ChainError(f"{kind} transaction detail has malformed 'vin'/'vout'")
+            raise ChainError(
+                f"{kind} transaction detail has malformed 'vin'/'vout'",
+                failure_class=NOT_CORE_SHAPE,
+            )
         inputs: list[dict[str, Any]] = []
         for item in vin:
             # Core 22+ attaches the input's prevout (scriptPubKey and

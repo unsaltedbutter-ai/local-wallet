@@ -130,6 +130,13 @@ CONNECT_REFUSED: Final[str] = "connect-refused"
 TIMEOUT: Final[str] = "timeout"
 HTTP_STATUS: Final[str] = "http-status"
 NOT_ESPLORA_SHAPE: Final[str] = "not-esplora-shape"
+#: The bitcoind twin of :data:`NOT_ESPLORA_SHAPE` (debugger handoff
+#: 2026-09-12): a Bitcoin Core RPC answer that does not match Core's shape.
+#: Deliberately a DISTINCT name rather than a reuse of "not-esplora-shape":
+#: the class string rides the app's value-free debug line verbatim, and an
+#: operator must be able to tell WHICH adapter family refused (the whole
+#: point is that a shape refusal never collapses to ``network-error``).
+NOT_CORE_SHAPE: Final[str] = "not-core-shape"
 NOT_MAINNET: Final[str] = "not-mainnet"
 AUTH_REQUIRED: Final[str] = "auth-required"
 NETWORK_ERROR: Final[str] = "network-error"

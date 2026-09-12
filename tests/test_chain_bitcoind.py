@@ -35,7 +35,13 @@ Coverage (ticket gates):
   shared backoff, "network error (Class)" surface); value-free errors
   everywhere; ``ChainConfig``/scheme selection (``bitcoind://`` → the
   BitcoindClient, https stays Esplora), the app's probe dispatch, and the
-  structural ``ChainClient`` protocol conformance.
+  structural ``ChainClient`` protocol conformance;
+* the debugger handoff (2026-09-12): verbose-tx height read from ``height``
+  (modern Core) OR the legacy ``blockheight``, scan rows without a height
+  read as unconfirmed, verbosity-2 funding-tx requests (prevout mapping),
+  and shape refusals carrying ``not-core-shape`` (never the
+  network-error collapse). Fixtures serve the shape a REAL Core answers
+  for the verbosity actually requested.
 """
 
 from __future__ import annotations
@@ -76,6 +82,7 @@ from localwallet.chain import (
     TxStatus,
 )
 from localwallet.chain import bitcoind as bitcoind_module
+from localwallet.chain.esplora import NOT_CORE_SHAPE
 from localwallet.chain.watch import time_since_last_block
 from localwallet.config import Settings
 from localwallet.wallet import scan as wallet_scan
@@ -494,15 +501,27 @@ class TestMainnetAndCapabilityGates:
 # ------------------------------------------------- scan snapshot + shapes
 
 
-def _unspent_row(txid: str, vout: int, address: str, sats: int, height: int) -> dict[str, Any]:
-    return {
+#: Sentinel for a scan row that OMITS the 'height' field entirely (real
+#: nodes have been seen doing exactly that — debugger handoff 2026-09-12).
+_NO_HEIGHT: Any = object()
+
+
+def _unspent_row(
+    txid: str, vout: int, address: str, sats: int, height: Any = TIP
+) -> dict[str, Any]:
+    """One ``scantxoutset`` unspent row. ``height`` rides verbatim: pass an
+    int, a digit-string, ``None`` (explicit null) or :data:`_NO_HEIGHT`
+    (field absent) to pin the lenient mapping."""
+    row: dict[str, Any] = {
         "txid": txid,
         "vout": vout,
         "scriptPubKey": _SCRIPT_OF[address],
         "descriptor": f"desc(raw({_SCRIPT_OF[address]}))",
         "amount": _btc(sats),
-        "height": height,
     }
+    if height is not _NO_HEIGHT:
+        row["height"] = height
+    return row
 
 
 def _scan_result(rows: list[dict[str, Any]], height: int = TIP) -> dict[str, Any]:
@@ -611,8 +630,10 @@ class TestScanTranslation:
     )
     def test_scan_result_shape_junk_fails_closed(self, bitcoind: Any, entry: Any) -> None:
         server = bitcoind(script={"scantxoutset": lambda p: entry})
-        with _client(server) as client, pytest.raises(ChainError):
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
             client.get_address_utxos(ADDRS[0][0])
+        # Fix 4: a Core answer in the wrong shape carries the SHAPE class.
+        assert excinfo.value.failure_class == NOT_CORE_SHAPE
 
     @pytest.mark.parametrize("flag", [{"success": False}, {"complete": False}])
     def test_incomplete_walks_fail_closed(self, bitcoind: Any, flag: dict) -> None:
@@ -629,13 +650,36 @@ class TestScanTranslation:
             {"txid": "a" * 64, "vout": 0, "scriptPubKey": "", "amount": 1.0, "height": 1},
             {"txid": "a" * 64, "vout": 0, "scriptPubKey": "ff", "amount": "1.0", "height": 1},
             {"txid": "a" * 64, "vout": 0, "scriptPubKey": "ff", "amount": -1.0, "height": 1},
-            {"txid": "a" * 64, "vout": 0, "scriptPubKey": "ff", "amount": 1.0, "height": None},
         ]
         for row in bad_rows:
             server = bitcoind(script={"scantxoutset": lambda p, row=row: _scan_result([row])})
-            with _client(server) as client, pytest.raises(ChainError):
+            with _client(server) as client, pytest.raises(ChainError) as excinfo:
                 client.get_address_utxos(ADDRS[0][0])
+            assert excinfo.value.failure_class == NOT_CORE_SHAPE  # fix 4
             server.stop()
+
+    @pytest.mark.parametrize("height", [_NO_HEIGHT, None, 0])
+    def test_unspent_row_without_a_height_reads_unconfirmed_never_raises(
+        self, bitcoind: Any, height: Any
+    ) -> None:
+        # Fix 2 (debugger handoff): the minutes-class walk SUCCEEDED — an
+        # absent/null/zero row height is an honest UNCONFIRMED entry, not
+        # a raise that throws the whole scan away.
+        address = ADDRS[0][0]
+        row = _unspent_row("a" * 64, 0, address, 9_000, height=height)
+        server = bitcoind(script={"scantxoutset": lambda p: _scan_result([row])})
+        with _client(server) as client:
+            (entry,) = client.get_address_utxos(address)
+        assert entry == {"txid": "a" * 64, "vout": 0, "value": 9_000, "status": {"confirmed": False}}
+
+    def test_unspent_row_with_string_height_reads_confirmed(self, bitcoind: Any) -> None:
+        # A digit-string height is read as the int it means.
+        address = ADDRS[0][0]
+        row = _unspent_row("a" * 64, 0, address, 9_000, height="800010")
+        server = bitcoind(script={"scantxoutset": lambda p: _scan_result([row])})
+        with _client(server) as client:
+            (entry,) = client.get_address_utxos(address)
+        assert entry["status"] == {"confirmed": True, "block_height": 800_010}
 
 
 class TestSnapshotCache:
@@ -705,6 +749,12 @@ class TestSnapshotCache:
 # ------------------------------------------------- history (tx verbose)
 
 
+def _verbosity_requested(param: Any) -> int:
+    """The verbosity a scripted request actually asked for (``True`` is
+    Core's legacy alias for 1; the history path asks for 2)."""
+    return 2 if param == 2 else 1
+
+
 def _core_verbose(
     txid: str,
     *,
@@ -714,13 +764,18 @@ def _core_verbose(
     height: int = 800_000,
     block_time: int | None = TIP_TIME,
     fee_sats: int | None = 1_500,
+    verbosity: int = 2,
 ) -> dict[str, Any]:
-    """A verbose ``getrawtransaction`` shaped like Bitcoin Core 22+.
+    """A verbose ``getrawtransaction`` as a REAL Bitcoin Core 31 node
+    answers the verbosity actually requested.
 
-    Inputs carry the ``prevout`` object (the 22.0 addition the capability
-    floor exists for); outputs carry ``address`` + derivable ``hex``.
-    Addresses not encodable at all (the fixture's garbage sender string)
-    fall back to ``address``-only — both mapping paths are exercised.
+    Real Core names the confirmation height field ``height`` (the old
+    fixture served ``blockheight`` — the legacy outlier — and that union
+    shape no node emits is exactly what hid the live scan failure,
+    debugger handoff 2026-09-12). The input ``prevout`` objects ride
+    ONLY at verbosity 2 (the capability floor guarantees 22+). Addresses
+    not encodable at all (the fixture's garbage sender string) fall back
+    to ``address``-only — both mapping paths are exercised.
     """
 
     def spk(address: str) -> dict[str, Any]:
@@ -732,7 +787,15 @@ def _core_verbose(
     tx: dict[str, Any] = {
         "txid": txid,
         "vin": [
-            {"txid": "e" * 64, "vout": 0, "prevout": {"scriptPubKey": spk(a), "value": 1.0}}
+            {
+                "txid": "e" * 64,
+                "vout": 0,
+                **(
+                    {"prevout": {"scriptPubKey": spk(a), "value": 1.0}}
+                    if verbosity >= 2
+                    else {}
+                ),
+            }
             for a in vins
         ],
         "vout": [
@@ -742,7 +805,7 @@ def _core_verbose(
     }
     if confirmed:
         tx["blockhash"] = "be" * 32
-        tx["blockheight"] = height
+        tx["height"] = height
         if block_time is not None:
             tx["blocktime"] = block_time
     if fee_sats is not None:
@@ -816,8 +879,64 @@ class TestHistoryTranslation:
         address = ADDRS[0][0]
         rows = [_unspent_row("a" * 64, 0, address, 9_000, 800_000)]
         server = self._serve(bitcoind, rows, _core_verbose("f" * 64))
-        with _client(server) as client, pytest.raises(ChainError, match="does not match"):
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
             client.get_address_txs(address)
+        assert "does not match" in str(excinfo.value)
+        assert excinfo.value.failure_class == NOT_CORE_SHAPE
+
+    def test_funding_txs_are_requested_at_verbosity_2(self, bitcoind: Any) -> None:
+        # Fix 3 (debugger handoff): ``prevout`` is a verbosity-2-ONLY
+        # field; the legacy [txid, True] request silently stripped every
+        # input's sender address. The request shape AND the mapping it
+        # exists for are pinned together.
+        address = ADDRS[0][0]
+        rows = [_unspent_row("a" * 64, 0, address, 9_000, 800_000)]
+        server = self._serve(bitcoind, rows, _core_verbose("a" * 64, vouts=(address,)))
+        with _client(server) as client:
+            (entry,) = client.get_address_txs(address)
+        assert [x for m, x in server.requests if m == "getrawtransaction"] == [["a" * 64, 2]]
+        assert entry["vin"] == [{"prevout": {"scriptpubkey_address": _EXTERNAL}}]
+
+    @pytest.mark.parametrize(
+        "field",
+        [("height", 800_000), ("blockheight", 800_000), ("height", "800000")],
+    )
+    def test_confirmed_history_height_read_from_height_or_legacy_name(
+        self, bitcoind: Any, field: tuple[str, Any]
+    ) -> None:
+        # Fix 1: modern Core names the verbose-tx height field ``height``;
+        # the legacy ``blockheight`` outlier and digit-strings are still
+        # accepted (this exact matrix — blockheight-only fixture — is what
+        # hid the live "invalid 'blockheight'" scan failure).
+        name, value = field
+        address = ADDRS[0][0]
+        rows = [_unspent_row("a" * 64, 0, address, 9_000, 800_000)]
+        verbose = _core_verbose("a" * 64, vouts=(address,))
+        del verbose["height"]
+        verbose[name] = value
+        server = self._serve(bitcoind, rows, verbose)
+        with _client(server) as client:
+            (entry,) = client.get_address_txs(address)
+        assert entry["status"]["block_height"] == 800_000
+
+    @pytest.mark.parametrize(
+        "junk", [{}, {"height": None}, {"height": "x"}, {"height": -1}, {"height": True}]
+    )
+    def test_confirmed_history_without_readable_height_is_shape_refused(
+        self, bitcoind: Any, junk: dict[str, Any]
+    ) -> None:
+        # Fixes 1+4: confirmations > 0 and NOTHING readable in
+        # blockheight/height is a broken payload — refused carrying the
+        # SHAPE class, never degrading to the network-error collapse.
+        address = ADDRS[0][0]
+        rows = [_unspent_row("a" * 64, 0, address, 9_000, 800_000)]
+        verbose = _core_verbose("a" * 64, vouts=(address,))
+        del verbose["height"]
+        verbose.update(junk)
+        server = self._serve(bitcoind, rows, verbose)
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.get_address_txs(address)
+        assert excinfo.value.failure_class == NOT_CORE_SHAPE
 
     def test_scan_error_payload_never_echoes_server_text(self, bitcoind: Any) -> None:
         # The node's rejection text can carry the queried txid — kind only.
@@ -1143,17 +1262,55 @@ class TestTipAndStatus:
 
     def test_tx_status_confirmed(self, bitcoind: Any) -> None:
         server = bitcoind(
-            script={"getrawtransaction": lambda p: _core_verbose(p[0], height=800_000)}
+            script={
+                "getrawtransaction": lambda p: _core_verbose(
+                    p[0], height=800_000, verbosity=_verbosity_requested(p[1])
+                )
+            }
         )
         with _client(server) as client:
             assert client.get_tx_status("a" * 64) == TxStatus(
                 txid="a" * 64, confirmed=True, block_height=800_000, block_time=TIP_TIME
             )
 
+    @pytest.mark.parametrize(
+        "field",
+        [("height", 800_000), ("blockheight", 800_000), ("height", "800000")],
+    )
+    def test_tx_status_height_read_from_height_or_legacy_name(
+        self, bitcoind: Any, field: tuple[str, Any]
+    ) -> None:
+        # Fix 1 rides get_tx_status too (confirm AND watch die together).
+        name, value = field
+        verbose = _core_verbose("a" * 64, height=800_000, verbosity=1)
+        del verbose["height"]
+        verbose[name] = value
+        server = bitcoind(script={"getrawtransaction": lambda p: verbose})
+        with _client(server) as client:
+            status = client.get_tx_status("a" * 64)
+        assert status.confirmed is True
+        assert status.block_height == 800_000
+
+    @pytest.mark.parametrize(
+        "junk", [{}, {"height": None}, {"height": "x"}, {"height": -1}, {"height": True}]
+    )
+    def test_tx_status_confirmed_without_readable_height_is_shape_refused(
+        self, bitcoind: Any, junk: dict[str, Any]
+    ) -> None:
+        # Fix 4: the app's debug line reads class=not-core-shape, never
+        # the network-error collapse.
+        verbose = _core_verbose("a" * 64, verbosity=1)
+        del verbose["height"]
+        verbose.update(junk)
+        server = bitcoind(script={"getrawtransaction": lambda p: verbose})
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.get_tx_status("a" * 64)
+        assert excinfo.value.failure_class == NOT_CORE_SHAPE
+
     def test_tx_status_mempool_tx_never_reports_first_seen_as_block_time(
         self, bitcoind: Any
     ) -> None:
-        verbose = _core_verbose("a" * 64, confirmed=False)
+        verbose = _core_verbose("a" * 64, confirmed=False, verbosity=1)
         verbose["time"] = 1_755_000_000  # Core's first-seen time for a mempool tx
         server = bitcoind(script={"getrawtransaction": lambda p: verbose})
         with _client(server) as client:
