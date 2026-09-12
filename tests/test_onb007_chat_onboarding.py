@@ -3,16 +3,20 @@ and PRE-MODEL chat intercepts, zero model contact.
 
 Pins (the ticket's done-when criteria; critique decisions Q1-Q6):
 
-* startup beats on a FRESH needs_watch_key launch ONLY, each its own closed
-  turn (UX-012 pump pattern), ORDER-PINNED against the model-absent card
-  (beats first, pinned at the pump) and banner (banner flushes ahead of the
-  pump — pinned at the live SSE stream);
+* startup beats on a FRESH needs_watch_key launch ONLY, the greeting trio
+  as ONE grouped bubble (three lines joined with "\n", ONE closed turn —
+  static-half user correction 2026-09-11), ORDER-PINNED against the
+  model-absent card (beats first, pinned at the pump) and the model PRELOAD
+  notices (they follow the greeting group, each its own bubble — pinned at
+  the pump) and the model-absent BANNER (banner flushes ahead of the pump —
+  pinned at the live SSE stream);
 * zpub-in-chat: a key-shaped chat line while unprovisioned rides the
   EXISTING gated parse+provision path (mainnet/private/seed refusals are
-  that path's own value-free lines); success emits "Great. I saved that." +
-  the three backend beat bubbles, the held scan STILL held (zero chain
-  traffic — the ONB-006 promise); once wired, a pasted key is NOT
-  intercepted (re-provision stays /watchkey replace only — negative pin);
+  that path's own value-free lines); success emits "Great. I saved that."
+  (its own bubble) + the backend beat as ONE grouped bubble, the held scan
+  STILL held (zero chain traffic — the ONB-006 promise); once wired, a
+  pasted key is NOT intercepted (re-provision stays /watchkey replace only
+  — negative pin);
 * the pinned "ask me how" matcher (accept/reject vectors);
 * chat-URL intercept STATE-GATED on the backend being UNRESOLVED: it rides
   the settings-POST probe/store/swap discipline (url_class clamp + DIAG-001
@@ -30,6 +34,8 @@ The user's copy strings are asserted VERBATIM (they are spec).
 from __future__ import annotations
 
 import queue
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -88,6 +94,12 @@ BEAT_PUBLIC = (
     "But if you don't have one of those, you can use a public server "
     "like mempool.space."
 )
+
+# THE GROUPED BUBBLES (static-half user correction 2026-09-11): each trio
+# rides the stream as ONE text event, its sentences joined with "\n" —
+# one bubble with line breaks, one turn_end.
+GREETING_BUBBLE = f"{GREET}\n{KEY_ASK}\n{HELP_OFFER}"
+BACKEND_BUBBLE = f"{BEAT_ASK}\n{BEAT_OWN}\n{BEAT_PUBLIC}"
 
 
 @pytest.fixture
@@ -153,12 +165,14 @@ def _closed_turns(events: list[EngineEvent]) -> list[str]:
 # ------------------------------------------------------------------ 1. beats
 
 
-def test_fresh_launch_beats_are_separate_turns_and_precede_the_card(
+def test_fresh_launch_beats_are_one_grouped_bubble_and_precede_the_card(
     tmp_path: Path, env_clean: None
 ) -> None:
-    """The greeting beats fire on a FRESH needs_watch_key launch, each line
-    its own closed turn, and the ORDER vs the model-absent card is PINNED
-    (critique Q6): all three beats first, the card after."""
+    """The greeting group fires on a FRESH needs_watch_key launch as ONE
+    text event with the lines joined by "\n" closing ONE turn (the web
+    renders a single bubble with line breaks), and the ORDER vs the
+    model-absent card is PINNED (critique Q6): the group first, the card
+    after (the card's own lines stay one-bubble-per-line)."""
     events: list[EngineEvent] = []
     emitter = EventEmitter(events.append)
     commands: queue.Queue[Any] = queue.Queue()
@@ -178,9 +192,7 @@ def test_fresh_launch_beats_are_separate_turns_and_precede_the_card(
         model=model,
     )
     assert [(e.kind, e.payload) for e in events] == [
-        (EVENT_TEXT, GREET), (EVENT_TURN_END, ""),
-        (EVENT_TEXT, KEY_ASK), (EVENT_TURN_END, ""),
-        (EVENT_TEXT, HELP_OFFER), (EVENT_TURN_END, ""),
+        (EVENT_TEXT, GREETING_BUBBLE), (EVENT_TURN_END, ""),
         (EVENT_TEXT, app.MODEL_CARD_QUESTION), (EVENT_TURN_END, ""),
         (EVENT_TEXT, app.MODEL_CARD_HINT), (EVENT_TURN_END, ""),
     ]
@@ -221,8 +233,9 @@ def test_configured_launch_emits_no_beats(
 def test_beats_are_ordinary_output_lines_for_the_cli_transport(
     tmp_path: Path, env_clean: None
 ) -> None:
-    """CLI parity (requirement 6): the beats are plain output_fn lines — a
-    transport without an emitter renders them verbatim, nothing else."""
+    """CLI parity (requirement 6): the greeting group is a plain output_fn
+    line — a transport without an emitter renders it verbatim (the joined
+    "\n" prints as the same three terminal lines), nothing else."""
     lines: list[str] = []
     commands: queue.Queue[Any] = queue.Queue()
     commands.put(app.QUIT)
@@ -236,7 +249,64 @@ def test_beats_are_ordinary_output_lines_for_the_cli_transport(
         table={},
         provision=prov,
     )
-    assert lines == [GREET, KEY_ASK, HELP_OFFER]
+    assert lines == [GREETING_BUBBLE]
+
+
+class _InstantRuntime:
+    """Duck-typed ModelRuntime whose ``load()`` returns at once (test_launch
+    pattern; a real GGUF is never touched)."""
+
+    def load(self) -> None:
+        return None
+
+
+def test_startup_bubble_sequence_grouped_greeting_then_preload_notices(
+    tmp_path: Path, env_clean: None
+) -> None:
+    """THE startup bubble sequence pin (UX-012/UX-009 + static-half
+    correction): a fresh launch with a resolved model runs
+    [greeting group] → [Loading local llm.] → [Local llm fully loaded.] —
+    the grouped greeting is ONE closed turn at pump entry (before the loop
+    reads any command), and each preload notice arrives as its OWN
+    text-then-turn_end pair (its own bubble): the transport arms
+    PRELOAD_START only after its launch lines print, so it always follows
+    the beats."""
+    events: list[EngineEvent] = []
+    emitter = EventEmitter(events.append)
+    commands: queue.Queue[Any] = queue.Queue()
+    prov = _fresh_provision(tmp_path, lambda _s: None)
+    flow = app.ModelPreloadFlow(
+        _InstantRuntime(),  # type: ignore[arg-type]
+        model_path=str(tmp_path / "m.gguf"),
+    )
+    thread = threading.Thread(
+        target=lambda: app._pump(
+            _make_loop(),
+            emitter.text,
+            commands,
+            flow=TxFlow(),
+            session=app.SendSession(),
+            table={},
+            emitter=emitter,
+            provision=prov,
+            preload=flow,
+        ),
+        daemon=True,
+    )
+    thread.start()
+    commands.put(app.PRELOAD_START)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and flow.state != "ready":
+        time.sleep(0.02)
+    assert flow.state == "ready", "preload marker never consumed"
+    commands.put(app.QUIT)
+    thread.join(15)
+    assert not thread.is_alive()
+    assert _closed_turns(events) == [
+        GREETING_BUBBLE,
+        app.MODEL_PRELOAD_NOTICE,
+        app.MODEL_PRELOADED_NOTICE,
+    ]
 
 
 # ------------------------------------------------------ 2. zpub-in-chat (pump)
@@ -300,13 +370,14 @@ def test_chat_zpub_provisions_and_emits_saved_and_backend_beats(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None,
     echo_turns: list[str],
 ) -> None:
-    """The golden chat path: greeting beats → the pasted key (echoed only
-    REDACTED) → "Great. I saved that." → the three backend beat bubbles.
+    """The golden chat path: the grouped greeting bubble → the pasted key
+    (echoed only REDACTED) → "Great. I saved that." (its own bubble) → the
+    backend beat as ONE grouped bubble.
     The key persisted through the existing gated path, the scan stayed HELD
     (zero chain traffic), and the key never rode any event verbatim."""
     events, prov = _drive_fresh(tmp_path, monkeypatch, [ZPUB])
     assert _closed_turns(events) == [
-        GREET, KEY_ASK, HELP_OFFER, SAVED, BEAT_ASK, BEAT_OWN, BEAT_PUBLIC,
+        GREETING_BUBBLE, SAVED, BACKEND_BUBBLE,
     ]
     # The paste echoes onto the bus ONLY as the user's own user_text line
     # (the WEB-011 single-choke-point contract — a chat line never vanishes
@@ -331,7 +402,7 @@ def test_chat_zpub_provisions_and_emits_saved_and_backend_beats(
 def test_backend_beats_suppressed_when_a_rung_already_resolves(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
 ) -> None:
-    """The backend beat bubbles are gated on the choice being genuinely
+    """The backend beat bubble is gated on the choice being genuinely
     OPEN: when an operator rung already resolves the backend (the way
     Settings.from_env folds env/config into settings.chain_base_url before
     the pump ever runs), the key still saves — but the app never asks for a
@@ -374,7 +445,9 @@ def test_backend_beats_suppressed_when_a_rung_already_resolves(
     )
     texts = _texts(events)
     assert SAVED in texts  # the key landed
-    assert BEAT_ASK not in texts  # no ask for an already-chosen server
+    # no ask for an already-chosen server (substring proof: the beats may
+    # never appear alone OR inside a grouped bubble)
+    assert not any(BEAT_ASK in t for t in texts)
     if prov.wiring is not None:
         prov.wiring.worker.stop()
         prov.wiring.client.close()
@@ -799,9 +872,14 @@ def test_banner_precedes_beats_on_the_live_stream(
         stream.read_until(GREET.encode(), timeout=20)
         cut = len(stream.buf)
         assert head  # banner arrived before the first beat
-        # the remaining beats follow, in order, and nothing provisioned yet:
-        stream.read_until(KEY_ASK.encode(), timeout=20)
-        stream.read_until(HELP_OFFER.encode(), timeout=20)
+        # the greeting GROUP is ONE SSE event (all three lines ride the
+        # same frame as consecutive data: lines — one bubble, replayed as
+        # one) and it precedes anything provisioning-shaped:
+        frames = stream.buf.split(b"\n\n")
+        greeting_frames = [f for f in frames if GREET.encode() in f]
+        assert len(greeting_frames) == 1
+        assert KEY_ASK.encode() in greeting_frames[0]
+        assert HELP_OFFER.encode() in greeting_frames[0]
         assert SAVED.encode() not in stream.buf[:cut]
         assert app.NO_MODEL_DEMO_BANNER.encode() in head
     finally:
@@ -829,8 +907,14 @@ def test_chat_zpub_provisions_through_the_real_web_transport(
         assert status == 202
         stream.read_until(SAVED.encode(), timeout=20)
         stream.read_until(BEAT_ASK.encode(), timeout=20)
-        stream.read_until(BEAT_OWN.encode(), timeout=20)
-        stream.read_until(BEAT_PUBLIC.encode(), timeout=20)
+        # the backend beat GROUP is ONE SSE event (the greeting group's
+        # mirror structure), and SAVED rode its own frame before it:
+        saved_frame = [f for f in stream.buf.split(b"\n\n") if SAVED.encode() in f]
+        assert len(saved_frame) == 1 and BEAT_ASK.encode() not in saved_frame[0]
+        beat_frames = [f for f in stream.buf.split(b"\n\n") if BEAT_ASK.encode() in f]
+        assert len(beat_frames) == 1
+        assert BEAT_OWN.encode() in beat_frames[0]
+        assert BEAT_PUBLIC.encode() in beat_frames[0]
         snap = _session_state(server)
         assert "needs_watch_key" not in snap
         assert snap["scan_state"] == "awaiting_backend"

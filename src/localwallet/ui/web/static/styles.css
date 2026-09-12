@@ -62,7 +62,7 @@
   --c-settings-surface: var(--c-surface-2);
   --settings-max: calc(100dvh - 10rem);
 
-  /* TCK-UX-008: the turn-busy pulse — dot size and its dim floor. */
+  /* TCK-UX-008: the busy pulse — dot size and its dim floor. */
   --busy-dot: 0.35rem;
   --busy-dot-min: 0.25;
 
@@ -663,10 +663,12 @@ body {
   color: var(--c-text-muted);
 }
 
-/* TCK-UX-008: turn-busy in-flight pulse — three static-markup dots beside
-   the "Working…" label, staggered by animation-delay only (no JS timers,
-   no inline styles; CSP-clean). Follows .meta's muted color via currentColor
-   and hides with #turn-busy's hidden attribute (setBusy toggles it). */
+/* TCK-UX-008 (re-homed by TCK-WEB-015): the in-flight pulse — three dots
+   staggered by animation-delay only (no JS timers, no inline styles;
+   CSP-clean). It now rides INSIDE the transcript's transient pending
+   bubble (.turn-pending, built by app.js showPendingBubble) instead of the
+   removed below-input widget, and follows the muted text color via
+   currentColor. */
 .busy-dots {
   display: inline-flex;
   gap: var(--sp-2);
@@ -692,6 +694,22 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .busy-dots > span { animation: none; }
+}
+
+/* TCK-WEB-015: the transient pending bubble — a real transcript <li> (never
+   persisted, never replayed content) carrying the dots above. Bubble skin
+   like its siblings but muted and compact: it holds no copyable text, so it
+   takes no copy gutter and no shadow weight. */
+.turn-pending {
+  align-self: flex-start;
+  color: var(--c-text-muted);
+  background: var(--c-surface-2);
+  box-shadow: none;
+  padding: var(--sp-2) var(--sp-4);
+}
+
+.turn-pending .busy-dots {
+  margin-inline-start: 0;
 }
 
 /* -------------------------------------------------------- actions (TCK-WEB-004) */

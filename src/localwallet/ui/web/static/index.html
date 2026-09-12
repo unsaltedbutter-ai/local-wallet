@@ -73,10 +73,11 @@
     <input id="turn-text" name="text" type="text" placeholder="Ask your wallet…" maxlength="4096" required>
     <button id="turn-send" class="btn btn-primary" type="submit">Send</button>
   </form>
-  <!-- TCK-UX-008: animated 3-dot in-flight pulse beside the label — pure CSS
-       keyframes (styles.css), no JS interval, aria-hidden static decoration
-       that show/hides with the parent via setBusy(). -->
-  <p id="turn-busy" class="meta" hidden>Working…<span class="busy-dots" aria-hidden="true"><span></span><span></span><span></span></span></p>
+  <!-- TCK-UX-008's below-input turn pulse was REMOVED by TCK-WEB-015 (user
+       direction): the in-flight indicator is now a transient pending bubble
+       IN the transcript (app.js showPendingBubble; the UX-008 CSS keyframes
+       live on inside it). The connection status up in the header stays —
+       connection status ≠ turn status. -->
   <!-- TCK-WEB-004: action buttons (labels are designer-owned copy). Each click is the
        user's second key: its data-utterance (a canonical engine phrase) is POSTed to
        /action and runs the FULL turn pipeline, exactly like typing it. Visibility is

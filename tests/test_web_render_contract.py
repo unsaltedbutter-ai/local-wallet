@@ -99,6 +99,89 @@ def test_client_dismisses_the_form_on_accept_and_reuses_watchkey_endpoint() -> N
     assert "replaceStage" in code and "watchKeyRow" in code
 
 
+# TCK-ONB-007 STATIC half (user correction 2026-09-11) first-run pins: the
+# settings pane NEVER self-opens and chat is NEVER disabled while the wallet
+# still needs its key — the engine's chat beats own first-run. The pane
+# opens ONLY from its explicit controls (header Settings toggle / quick
+# action), and the whole WEB-008/009-era auto-open episode machinery is
+# gone from the shipped client. The needs-key placeholder rides the TYPED
+# snapshot (restore keyed on it too — no local flag), and the grouped
+# greeting bubble renders its "\n" line breaks because .turn-text is
+# pre-wrap (the SSE/parser round-trip already joins data: lines with \n).
+def test_first_run_never_opens_the_pane_and_chat_stays_enabled() -> None:
+    raw = (_STATIC / "app.js").read_text(encoding="utf-8")
+    code = _strip_js_comments(raw)
+    # the retired episode machinery is gone ENTIRELY (not just re-gated):
+    for dead in ("settingsAutoShown", "firstRunBeat", "revealFirstRunBeat"):
+        assert dead not in raw, f"app.js still carries {dead!r}"
+    # the watch-key gate neither disables chat nor touches the pane:
+    gate = code[code.index("function applyWatchKeyGate"):
+                code.index("function dismissWatchKeyForm")]
+    assert "openSettings" not in gate and "closeSettings" not in gate
+    assert "inputEl.disabled" not in gate and "sendBtn.disabled" not in gate
+    # placeholder flips ON the typed needs (restore rides the same flag):
+    assert (
+        "inputEl.placeholder = needs ? LABELS.chatNeedsKeyPlaceholder : chatPlaceholder;"
+        in gate
+    )
+    # openSettings has exactly three occurrences: definition + the two
+    # EXPLICIT controls (the settings quick action + the header toggle).
+    assert code.count("openSettings()") == 3
+    # the needs-key ask copy (engine beats own the rest of the prose):
+    assert 'chatNeedsKeyPlaceholder: "Paste your xpub or zpub to get started…"' in code
+    # the normal placeholder lives in the markup (app.js reads it once):
+    index_html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    assert 'placeholder="Ask your wallet…"' in index_html
+    assert "const chatPlaceholder = inputEl.placeholder;" in code
+    # multi-line bubbles: the transcript paints \n as breaks (pre-wrap).
+    styles = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    turn_text = styles[styles.index(".turn-text {"):]
+    turn_text = turn_text[: turn_text.index("}")]
+    assert "white-space: pre-wrap" in turn_text
+
+
+# TCK-ONB-007 static half, behavioral (node if present): the SHIPPED
+# applyWatchKeyGate runs against DOM stubs — a needs_watch_key snapshot
+# leaves chat ENABLED with the key placeholder, opens NOTHING, and the next
+# provisioned snapshot restores the normal placeholder (typed truth, no
+# local flag).
+def test_watch_key_gate_keeps_chat_open_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    gate = re.search(
+        r"function applyWatchKeyGate\(snap\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    script = """
+      const LABELS = { chatNeedsKeyPlaceholder: "Paste your xpub or zpub to get started…" };
+      const chatPlaceholder = "Ask your wallet…";
+      const state = { watchKeyDismissed: false, watchKeyPresent: null, watchKeyNeeded: false };
+      const inputEl = { disabled: false, placeholder: chatPlaceholder };
+      const sendBtn = { disabled: false };
+      const quickbarEl = { hidden: true };
+      const settingsPanelEl = { hidden: true }; // stays closed: NOTHING may open it
+      let openCalls = 0, closeCalls = 0, renders = 0;
+      const openSettings = () => { settingsPanelEl.hidden = false; openCalls++; };
+      const closeSettings = () => { closeCalls++; };
+      const renderSettings = () => { renders++; };
+      const focusWatchInput = () => {};
+      __GATE__
+      applyWatchKeyGate({ schema: "state/1", needs_watch_key: true });
+      if (inputEl.disabled || sendBtn.disabled) throw new Error("chat-disabled");
+      if (inputEl.placeholder !== LABELS.chatNeedsKeyPlaceholder) throw new Error("placeholder");
+      if (openCalls || closeCalls || !settingsPanelEl.hidden) throw new Error("pane-touched");
+      if (state.watchKeyNeeded !== true) throw new Error("needed-not-tracked");
+      applyWatchKeyGate({ schema: "state/1", needs_watch_key: false });
+      if (inputEl.placeholder !== chatPlaceholder) throw new Error("placeholder-restore");
+      if (openCalls || closeCalls) throw new Error("pane-touched-2");
+      console.log("ok");
+    """.replace("__GATE__", gate)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 # TCK-UX-010 static pin: the persistent privacy chip renders ONLY the closed
 # privacy_mode enum NAMES (unknown/absent → hidden), styles it via the
 # data-privacy attribute (CSP-clean: classes/attrs, never inline styles), and
@@ -353,6 +436,188 @@ def test_linkify_regexes_and_click_to_copy_under_node() -> None:
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 
+# TCK-WEB-015 static pins (user direction): the in-flight indicator is a
+# TRANSIENT pending bubble IN the transcript — the old below-input busy
+# element is gone from markup, client and stylesheet (no id, no ref, no
+# selector; the connection-status area survives). The bubble's lifecycle
+# hooks are pinned at every seam: both submit paths (shared submit()) and
+# the remote user_text echo show it, noteTurnEnd and a failed submit clear
+# it under the SAME !busy guard (replace-on-turn_end, queue-shared), and
+# every transcript append re-tails the single node (so replay/echo storms
+# can never duplicate it — show is guarded and appendChild MOVES). The
+# UX-008 animation (keyframes + reduced-motion opt-out) still exists and
+# now rides inside the bubble; the bubble itself carries no text nodes
+# (transient — never copyable, never persisted).
+def test_pending_bubble_lives_in_the_transcript_and_the_old_indicator_is_gone() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    index_html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    styles = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    # the removed below-input widget leaves NOTHING behind (comments too):
+    assert "turn-busy" not in code + index_html + styles
+    assert "busyEl" not in code
+    # connection status ≠ turn status: the header conn-status machinery stays.
+    assert 'id="conn-status"' in index_html and "function setStatus" in code
+    # lifecycle seams: show on submit + remote echo; a failed submit clears
+    # behind the !busy (drained-queue) guard; noteTurnEnd clears ONLY with
+    # nothing promoted — a promoted queued turn is still in flight and its
+    # echo dedupes, so the single bubble must ride on for it (MINOR fix).
+    submit_fn = re.search(
+        r"async function submit\(path, field, value\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    note_end = re.search(r"function noteTurnEnd\(\) \{.*?\n\}", code, re.DOTALL).group(0)
+    render_user = re.search(
+        r"function renderUserText\(text\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert "showPendingBubble();" in submit_fn
+    assert re.search(r"if \(!state\.busy\) clearPendingBubble\(\);", submit_fn)
+    assert "showPendingBubble();" in render_user
+    assert re.search(r"if \(!next\) clearPendingBubble\(\);", note_end)
+    assert "if (!state.busy) clearPendingBubble();" not in note_end
+    # single tail node: guarded show + one shared retailer used by every
+    # transcript appender (ensureTurn, appendSystem, appendUser, show).
+    assert code.count("if (!state.pendingBubble) {") == 1  # the guarded show
+    assert code.count("tailPendingBubble();") == 4
+    # the bubble is the dots, not content: no .turn-text line (the copy
+    # selectors never see it), aria name is the relocated UX-008 word.
+    assert 'el("li", "turn turn-pending")' in code
+    assert '"busy-dots"' in code and "LABELS.turnWorking" in code
+    assert "turnWorking: " in code and "Working…" in code  # existing word, not new copy
+    # transient: the client persists nothing, ever (the bubble included).
+    assert "localStorage" not in code and "sessionStorage" not in code
+    # the animation survived the move: keyframes + reduced-motion opt-out,
+    # plus the bubble's own style rule.
+    assert "@keyframes busy-dot" in styles
+    assert "prefers-reduced-motion: reduce" in styles
+    assert ".turn-pending" in styles
+
+
+# TCK-WEB-015 behavioral check (node if present): the SHIPPED bubble trio +
+# renderUserText + noteTurnEnd run against a moving-child DOM stub — a
+# remote user_text echo shows the bubble at the tail, repeated echoes and
+# own-echo dedupe never duplicate it, a content append re-tails the single
+# node, turn_end with a non-empty queue KEEPS it (the queue shares the one
+# bubble), the turn_end PROMOTING the last queued turn keeps it too (the
+# promoted turn is in flight — review MINOR), and only the turn_end with
+# nothing left to promote removes it.
+def test_pending_bubble_lifecycle_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    fns = [
+        re.search(rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL).group(0)
+        for name in (
+            "showPendingBubble", "clearPendingBubble", "tailPendingBubble",
+            "renderUserText", "noteTurnEnd",
+        )
+    ]
+    script = """
+      const mkNode = (tag) => ({
+        tag, className: "", textContent: "", attrs: {}, children: [], parent: null,
+        setAttribute(k, v) { this.attrs[k] = v; },
+        appendChild(n) {
+          if (n.parent) {
+            const i = n.parent.children.indexOf(n);
+            if (i !== -1) n.parent.children.splice(i, 1);
+          }
+          n.parent = this; this.children.push(n); return n;
+        },
+        append(...ns) { for (const n of ns) this.appendChild(n); },
+        remove() {
+          if (!this.parent) return;
+          const i = this.parent.children.indexOf(this);
+          if (i !== -1) this.parent.children.splice(i, 1);
+          this.parent = null;
+        },
+        querySelector() { return null; },
+        get classList() {
+          const self = this;
+          const set = () => new Set(self.className.split(/\\s+/).filter(Boolean));
+          return {
+            add(c) { const s = set(); s.add(c); self.className = [...s].join(" "); },
+            remove(c) { const s = set(); s.delete(c); self.className = [...s].join(" "); },
+            contains(c) { return set().has(c); },
+          };
+        },
+      });
+      globalThis.document = { createElement: (t) => mkNode(t) };
+      const el = (tag, className, text) => {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      };
+      const LABELS = { turnWorking: "Working…" };
+      const state = {
+        busy: true, openTurn: null, progressLine: null, queue: [],
+        pendingEchos: [], pendingBubble: null,
+      };
+      const transcriptEl = mkNode("ol");
+      const appendUser = (text) => { state._echoes = (state._echoes || 0) + 1; return mkNode("li"); };
+      const setBusy = (b) => { state.busy = b; };
+      const scrollToEnd = () => {};
+      const refreshState = () => {};
+      const bubbles = () =>
+        transcriptEl.children.filter((n) => n.className.includes("turn-pending"));
+      __SHOW__
+      __CLEAR__
+      __TAIL__
+      __RENDER__
+      __END__
+      // 1. remote echo (other tab/CLI): the bubble appears at the tail
+      renderUserText("hello from the CLI");
+      if (bubbles().length !== 1) throw new Error("show-remote");
+      // 2. replay storm: repeated echoes never duplicate (guarded show)
+      renderUserText("hello from the CLI");
+      if (bubbles().length !== 1) throw new Error("no-duplicate");
+      // 3. own-echo dedupe: suppressed event adds no bubble, keeps the one
+      state.pendingEchos.push("mine");
+      renderUserText("mine");
+      if (bubbles().length !== 1 || state._echoes !== 2) throw new Error("own-echo");
+      // 4. content appended mid-stream re-tails the SINGLE node
+      const content = mkNode("li");
+      transcriptEl.appendChild(content);
+      tailPendingBubble();
+      if (bubbles().length !== 1) throw new Error("retail-dup");
+      if (transcriptEl.children[transcriptEl.children.length - 1] !== bubbles()[0])
+        throw new Error("retail-tail");
+      // 5. no text nodes inside (transient, copy-invisible): just the dots
+      const b = bubbles()[0];
+      if (b.children.some((n) => n.textContent !== "")) throw new Error("bubble-text");
+      if (b.attrs["aria-label"] !== LABELS.turnWorking) throw new Error("bubble-name");
+      // 6. turn_end with a still-full queue: the shared tail bubble KEEPS
+      state.busy = true;
+      state.queue.push(mkNode("li"), mkNode("li"));
+      state.queue[0].classList.add("turn-queued");
+      noteTurnEnd();
+      if (bubbles().length !== 1 || !state.busy) throw new Error("queue-keeps-bubble");
+      // 7. the LAST queued turn's PROMOTION at turn_end keeps the bubble
+      //    too (the review MINOR): busy flips false but the promoted turn is
+      //    in flight and its echo dedupes — nothing else would re-show it.
+      noteTurnEnd();
+      if (bubbles().length !== 1 || state.busy) throw new Error("promoted-keeps-bubble");
+      // 8. turn_end with nothing promoted and the queue empty: removed
+      //    (replace-on-turn_end, pinned)
+      noteTurnEnd();
+      if (bubbles().length !== 0 || state.pendingBubble !== null)
+        throw new Error("drain-clears");
+      // 9. a later submit re-shows a FRESH node (old ref gone)
+      showPendingBubble();
+      if (bubbles().length !== 1 || bubbles()[0] === b) throw new Error("reshow");
+      console.log("ok");
+    """
+    script = (
+        script.replace("__SHOW__", fns[0])
+        .replace("__CLEAR__", fns[1])
+        .replace("__TAIL__", fns[2])
+        .replace("__RENDER__", fns[3])
+        .replace("__END__", fns[4])
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 # TCK-WEB-016 behavioral check (node if present): the SHIPPED submit() and
 # the form listener are extracted from app.js and run against a stubbed
 # fetch — a 401 (stale-tab token from a previous launch) renders the
@@ -380,6 +645,10 @@ def test_submit_401_and_stopped_tab_label_the_stale_session_under_node() -> None
       let systemLines = [];
       const appendSystem = (s) => systemLines.push(s);
       const setBusy = (b) => { state.busy = b; };
+      // TCK-WEB-015: submit shows/clears the transient transcript bubble.
+      let bubbles = 0;
+      const showPendingBubble = () => { bubbles++; };
+      const clearPendingBubble = () => { bubbles--; };
       const authHeaders = (h) => h;
       let lastEcho = null;
       const appendUser = (value) => {
@@ -421,6 +690,9 @@ def test_submit_401_and_stopped_tab_label_the_stale_session_under_node() -> None
         formHandler({ preventDefault: () => {} });
         if (systemLines[0] !== LABELS.sessionStale) throw new Error("stopped-line");
         if (inputEl.value === "") throw new Error("stopped-consumed");
+        // TCK-WEB-015: every failed submit cleared its own bubble; only the
+        // one accepted turn's shared bubble remains (never one per submit).
+        if (bubbles !== 1) throw new Error("bubble-count");
         console.log("ok");
       };
       main().catch((e) => { console.error(e); process.exit(1); });

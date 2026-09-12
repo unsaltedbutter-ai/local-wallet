@@ -17,6 +17,10 @@
 // note instead of the write path, first run stays in the pane under a
 // one-time public-default leak beat, and a 401 on any pane POST says
 // "reload" rather than "try again".
+// TCK-WEB-015: the in-flight indicator is a TRANSIENT pending bubble IN the
+// transcript (shown by submit / remote user_text echoes, shared by queued
+// turns, removed at a queue-draining turn_end) — the old below-input
+// busy element is gone.
 
 const island = window.__LOCALWALLET__;
 const token = island && typeof island.token === "string" ? island.token : "";
@@ -26,8 +30,10 @@ const hintEl = document.getElementById("hint");
 const statusEl = document.getElementById("conn-status");
 const formEl = document.getElementById("turn-form");
 const inputEl = document.getElementById("turn-text");
+// The NORMAL chat placeholder, read from the markup once (index.html owns
+// the copy; TCK-ONB-007 static half flips it only while the key is needed).
+const chatPlaceholder = inputEl.placeholder;
 const sendBtn = document.getElementById("turn-send");
-const busyEl = document.getElementById("turn-busy");
 const scrollerEl = document.getElementById("scroller");
 const actionsEl = document.getElementById("actions");
 const quickbarEl = document.getElementById("quickbar");
@@ -59,6 +65,15 @@ const PUBLIC_LEAK_SENTENCE =
 const LABELS = {
   resyncGap: "Reconnected — some earlier messages may be missing.",
   queuedTag: "queued",
+  // TCK-WEB-015: the transient pending bubble's accessible name — the same
+  // "Working…" word UX-008 used below the input (relocated, not new copy);
+  // the visible bubble is dots-only.
+  turnWorking: "Working…",
+  // TCK-ONB-007 static half (user correction 2026-09-11): chat is the
+  // first-run entry point — while the wallet still needs its key the input
+  // stays ENABLED and asks for the key; the normal placeholder (index.html
+  // markup) returns from the engine snapshot the moment a key is wired.
+  chatNeedsKeyPlaceholder: "Paste your xpub or zpub to get started…",
   unreachable:
     "Could not reach the wallet server — is it still running? Check the terminal where you started it.",
   // scan chip (TCK-WEB-005) — honest states straight from /state's scan_state
@@ -209,22 +224,19 @@ const LABELS = {
     "Switched to the public mempool.space server — " +
     PUBLIC_LEAK_SENTENCE +
     " Enter your own server's address to switch back.",
-  // TCK-WEB-013: (1) the effective-backend line (the ADDITIVE
+  // TCK-WEB-013 (1): the effective-backend line (the ADDITIVE
   // effective_chain_base_url from the /settings replies — the public
   // default becomes VISIBLE when the stored rung is empty; absent = the
-  // line is omitted, never fabricated). (4) the one-time first-run beat,
-  // the same leak named up front instead of only after an empty Apply.
+  // line is omitted, never fabricated). (4)'s pane beat is GONE (TCK-ONB-007
+  // static half, user correction 2026-09-11): the backend ask rides the
+  // engine's chat bubble; the pane keeps the chain field and the 001B
+  // consent button.
   settingsNowUsing: "Now using:",
-  firstRunBeat:
-    "You are on the public mempool.space server — " +
-    PUBLIC_LEAK_SENTENCE +
-    " Add your own server's address below — or close Settings to continue " +
-    "for now.",
   // (5) the env rung's honest note (value-free: names the mechanism and
   // the file, never the env VALUE beyond the URL already shown).
   chainEnvOverride:
-    "Set by environment variable — change it there or in " +
-    "~/.localwallet/config.json.",
+    "Set by environment variable — change it there or in the " +
+    "local-wallet folder\u2019s config.json.",
   settingsCancel: "Cancel",
   // (2) the chain row's trust badge — rides the /state privacy_mode
   // closed enum ONLY (never derived from the URL string client-side).
@@ -334,6 +346,10 @@ const state = {
   // ``user_text`` echo (see renderUserText). Memory only; order = submit
   // order; the engine's bus order matches it.
   pendingEchos: [],
+  // TCK-WEB-015: the transient pending bubble (the busy face IN the
+  // transcript). ONE shared tail node for a whole busy period (queue
+  // included); never persisted, never replayed content — null when idle.
+  pendingBubble: null,
   // TCK-WEB-012 (f): the last KNOWN privacy_mode NAME from a typed
   // snapshot — state/0 (engine busy) must not blank the chip mid-turn.
   privacyMode: "",
@@ -342,12 +358,6 @@ const state = {
   watchKeyPresent: null, // null = unknown | true | false (typed state/1 only)
   watchKeyNeeded: false, // the pane renders the zpub ENTRY form iff true
   sessionWatchKey: "",
-  settingsAutoShown: false, // first-run auto-open episode armed/active
-  // TCK-WEB-013 (4): the one-time first-run backend beat. Set on a
-  // successful Connect DURING the auto-open episode (the pane then stays
-  // open under it); cleared when the user closes the pane themselves —
-  // that close is the explicit "not now" (no re-open loop, no re-show).
-  firstRunBeat: false,
   // TCK-WEB-013 (1): the effective chain base URL from the last settings
   // read (creds-stripped server-side; null = field absent = omit the
   // "Now using" line, never fabricate). Memory only, like every value.
@@ -393,8 +403,10 @@ function setStatus(kind, label) {
 
 function setBusy(busy) {
   // Send stays enabled: the server queues turns (queued rendering below).
+  // TCK-WEB-015: the busy face is the IN-TRANSCRIPT pending bubble (see
+  // showPendingBubble), toggled where this flag is set/cleared; the old
+  // below-input busy indicator is gone.
   state.busy = busy;
-  busyEl.hidden = !busy;
 }
 
 function scrollToEnd() {
@@ -644,6 +656,7 @@ function ensureTurn() {
     state.openTurn.appendChild(el("span", "turn-role", "Wallet"));
     state.progressLine = null;
     transcriptEl.appendChild(state.openTurn);
+    tailPendingBubble(); // TCK-WEB-015: the pending bubble rides the TAIL
   }
   hintEl.hidden = true;
   return state.openTurn;
@@ -731,6 +744,7 @@ function appendSystem(text) {
   const turn = el("li", "turn turn-system", text);
   addCopyButton(turn);
   transcriptEl.appendChild(turn);
+  tailPendingBubble(); // TCK-WEB-015: stays the last line in the transcript
   hintEl.hidden = true;
   scrollToEnd();
 }
@@ -744,9 +758,59 @@ function appendUser(text, queued) {
   turn.appendChild(line);
   addCopyButton(turn);
   transcriptEl.appendChild(turn);
+  tailPendingBubble(); // TCK-WEB-015: queued echoes land ABOVE the bubble
   hintEl.hidden = true;
   scrollToEnd();
   return turn;
+}
+
+// TCK-WEB-015 (user direction): the in-flight indicator is a TRANSIENT chat
+// bubble IN the transcript, not a widget below the input. Lifecycle, pinned
+// by the TCK-WEB-015 decisions:
+//  * shown on every submit (/turn AND /action — the shared submit()) right
+//    after the user's own echo, and on any REMOTE user_text echo (other tab
+//    or CLI) — so a reload/reconnect mid-turn re-shows it from the replayed
+//    echo, honestly, at the transcript tail;
+//  * ONE node per busy period (showPendingBubble is idempotent — replayed or
+//    repeated events can never duplicate it), and it rides the TAIL: every
+//    transcript append re-moves it after the new content, so engine output
+//    streams above it while the turn runs;
+//  * REPLACED (removed) at turn_end — the pinned D11 decision, not the first
+//    reply — but ONLY when the local queue has drained AND nothing was
+//    promoted (a promoted queued turn is still in flight and its echo
+//    dedupes, so the bubble rides on for it); a failed submit clears it
+//    under its own drained-queue (!busy) guard;
+//  * never persisted, never replayed as content (it holds no text nodes —
+//    only the aria-label word "Working…" relocated from UX-008's markup);
+//    the copy selectors ignore it (no .turn-text line, no copy button).
+// The dots are TCK-UX-008's CSS animation verbatim (styles.css keyframes +
+// reduced-motion opt-out, now inside the bubble). This bubble is the
+// APP-COMPUTING face ONLY — device-wait/transport-down rungs are
+// TCK-WEB-018's scope, not this one.
+function showPendingBubble() {
+  if (!state.pendingBubble) {
+    state.pendingBubble = el("li", "turn turn-pending");
+    state.pendingBubble.setAttribute("role", "status");
+    state.pendingBubble.setAttribute("aria-label", LABELS.turnWorking);
+    const dots = el("span", "busy-dots"); // the UX-008 animation carrier
+    dots.setAttribute("aria-hidden", "true");
+    dots.append(el("span"), el("span"), el("span"));
+    state.pendingBubble.appendChild(dots);
+  }
+  tailPendingBubble();
+  scrollToEnd();
+}
+
+function clearPendingBubble() {
+  if (!state.pendingBubble) return;
+  state.pendingBubble.remove();
+  state.pendingBubble = null;
+}
+
+// appendChild MOVES an existing node, so this both (re)tails the bubble and
+// guarantees it can never exist twice in the transcript.
+function tailPendingBubble() {
+  if (state.pendingBubble) transcriptEl.appendChild(state.pendingBubble);
 }
 
 // TCK-WEB-011: the engine echoes EVERY accepted line (typed text, button
@@ -771,6 +835,10 @@ function renderUserText(text) {
     return;
   }
   appendUser(text, false);
+  // TCK-WEB-015: an UNMATCHED echo is another surface's submit (tab/CLI) —
+  // a turn is now in flight here too, so this tab shows the shared pending
+  // bubble (idempotent: replayed echoes can never duplicate it).
+  showPendingBubble();
 }
 
 // One turn_end closed the engine's current turn. Promote the oldest locally
@@ -788,6 +856,12 @@ function noteTurnEnd() {
     if (tag) tag.remove();
   }
   setBusy(state.queue.length > 0);
+  // TCK-WEB-015 (review MINOR): replace-on-turn_end, but a PROMOTED queued
+  // turn is still in flight and its echo dedupes (renderUserText suppresses
+  // it), so this seam is the only thing that could keep its bubble — clear
+  // ONLY with nothing promoted (queue then empty by construction, busy
+  // false). Promoted → keep the single shared bubble for the next turn.
+  if (!next) clearPendingBubble();
   refreshState();
 }
 
@@ -845,17 +919,16 @@ function applyModelPrompt(snap) {
   }
 }
 
-// TCK-LAUNCH-001 first-run (TCK-WEB-009 (a): now a SETTINGS-PANE state, the
-// standalone card is gone): the zpub entry form shows iff the typed
-// snapshot's additive ``needs_watch_key`` is true. While it is up, chat is
-// disabled — there is no wallet to talk to yet — and the header balance
-// buttons stay hidden. The pane's own submit (POST /watchkey) clears the
-// state; we NEVER infer provisioning from local state, only from the
-// engine's next snapshot — with the TCK-WEB-008 exception kept: a 200
-// ``accepted`` is the ENGINE'S OWN confirmation that the key parsed, gated
-// and persisted, so the entry state DISMISSES on the spot (no lingering
-// form while the pump is busy with the post-provision banner). A terminal
-// dismiss is never re-shown by a stale snapshot.
+// TCK-LAUNCH-001 first-run, chat-first per TCK-ONB-007's STATIC half (user
+// correction 2026-09-11): needs_watch_key NEVER opens the settings pane and
+// NEVER disables chat — the engine's greeting/backend beats run the
+// first-run conversation IN CHAT; the pane opens only from its explicit
+// controls and stays fully functional for later editing. The placeholder
+// rides the TYPED snapshot (with the WEB-008 exception kept: a 200
+// ``accepted`` is the ENGINE'S OWN confirmation the key parsed, gated and
+// persisted, so the entry state DISMISSES on the spot — a terminal dismiss
+// is never re-shown by a stale snapshot). The header balance buttons stay
+// hidden until a wallet is provisioned (typed truth only).
 function applyWatchKeyGate(snap) {
   const typed = !!snap && snap.schema === "state/1";
   let needs = typed && snap.needs_watch_key === true;
@@ -863,62 +936,28 @@ function applyWatchKeyGate(snap) {
   if (typed) state.watchKeyPresent = !needs;
   const wasNeeded = state.watchKeyNeeded;
   state.watchKeyNeeded = needs;
-  inputEl.disabled = needs;
-  sendBtn.disabled = needs;
+  inputEl.placeholder = needs ? LABELS.chatNeedsKeyPlaceholder : chatPlaceholder;
   // TCK-WEB-009 (h): the header quick buttons appear once a wallet is
   // provisioned and never before (typed truth only — unknown = hidden).
   quickbarEl.hidden = state.watchKeyPresent !== true;
   if (needs !== wasNeeded) renderSettings(); // flip the pane's zpub row
   if (needs && !wasNeeded && settingsPanelEl.hidden === false) focusWatchInput();
-  // TCK-WEB-008 fix 3: an unset wallet opens the settings panel on its own
-  // and the panel closes itself once the key lands. A configured launch
-  // never opens; a state/0 (unknown) never fires either direction.
-  if (needs && !state.settingsAutoShown) {
-    state.settingsAutoShown = true;
-    openSettings();
-  } else if (typed && !needs && state.settingsAutoShown) {
-    state.settingsAutoShown = false;
-    closeSettings(inputEl); // same episode end via snapshot: focus chat
-  }
 }
 
 // The terminal success path of a watch-key submit (TCK-WEB-008 fix 1,
 // TCK-WEB-009 (b)): collapse the pane's zpub row to the read-only truncated
-// display. TCK-WEB-013 (4): during a first-run auto-open episode the pane
-// now STAYS OPEN under the backend beat instead of auto-closing — the
-// WEB-012 dismiss→chat-focus handoff moved to closeSettings (it fires when
-// the user actually closes the pane, which is the explicit "not now").
+// display; the dismiss makes the NEXT gated pass (any /state reply — the
+// terminal engine truth WEB-008 keeps) restore the normal placeholder. The
+// pane stays exactly as the user left it — TCK-ONB-007 killed the
+// auto-open episode this used to hand off to.
 function dismissWatchKeyForm(key) {
   state.sessionWatchKey = key; // memory only: the display fallback pre-/settings-read
   state.watchKeyDismissed = true;
   state.watchKeyPresent = true;
   state.watchKeyNeeded = false;
   state.watchKeyReplaceOpen = false; // applied → the row returns collapsed (§1)
-  inputEl.disabled = false;
-  sendBtn.disabled = false;
   quickbarEl.hidden = false;
-  if (state.settingsAutoShown) {
-    state.settingsAutoShown = false; // the auto-open episode hands off to the beat
-    state.firstRunBeat = true;
-    renderSettings();
-    // The chain row (the beat's host) is engine truth: read it fresh, then
-    // scroll/focus. A failed read shows the pane's honest retry line.
-    loadSettings().then(revealFirstRunBeat);
-    return;
-  }
   renderSettings();
-}
-
-// (4): reveal the beat — put the cursor where the user acts (the empty,
-// directly-typeable chain field; focus() scrolls it into view), or on the
-// pane heading when the settings read could not land a chain row yet.
-function revealFirstRunBeat() {
-  if (!state.firstRunBeat || settingsPanelEl.hidden) return;
-  const field = settingsListEl.querySelector(
-    ".setting-chain .setting-line > input.setting-input",
-  );
-  const target = field || settingsHeadingEl;
-  if (target.isConnected) target.focus();
 }
 
 // The scan chip reflects ONLY the typed snapshot's scan_state (additive under
@@ -1164,6 +1203,7 @@ async function submit(path, field, value) {
   // local echo so renderUserText can suppress its own copy.
   state.pendingEchos.push(value);
   setBusy(true);
+  showPendingBubble(); // TCK-WEB-015: the busy face, right below the echo
   let status = 0;
   try {
     const response = await fetch(path, {
@@ -1180,6 +1220,7 @@ async function submit(path, field, value) {
     const pe = state.pendingEchos.indexOf(value);
     if (pe !== -1) state.pendingEchos.splice(pe, 1); // the engine never saw the line
     setBusy(state.queue.length > 0);
+    if (!state.busy) clearPendingBubble(); // same replace rule: no busy, no bubble
     // TCK-WEB-016: a 401 is the per-launch token of a PREVIOUS wallet run
     // (stale tab) — "unreachable" would send the user hunting a live server.
     // Same honest sentence as the stream/resync/consent paths; only a
@@ -1355,7 +1396,6 @@ function watchKeyRow(serverEntry) {
       }
     });
     watchForm = { input, submit: btn };
-    if (state.settingsAutoShown) focusWatchInput(); // first-run episode: once, on reveal
     return li;
   }
 
@@ -1451,12 +1491,6 @@ function chainBaseRow(entry) {
     const badge = trustBadge();
     if (badge) nowLine.appendChild(badge);
     li.appendChild(nowLine);
-  }
-
-  // (4): the one-time first-run beat, above the field the "add your own
-  // node below" sentence points at.
-  if (state.firstRunBeat) {
-    li.appendChild(el("p", "setting-flag chain-beat", LABELS.firstRunBeat));
   }
 
   // TCK-PRIVACY-001B: the ONLY web trigger of public-backend consent. It
@@ -2040,11 +2074,6 @@ settingsListEl.addEventListener("click", async (event) => {
         const cancel = row.querySelector(".setting-cancel");
         if (cancel) cancel.hidden = input.readOnly;
         input.dataset.dirty = "0";
-        // (4): an Apply answers the first-run beat's ask — it retires here
-        // too (the pane-close path clears it in closeSettings).
-        state.firstRunBeat = false;
-        const beat = row.querySelector(".chain-beat");
-        if (beat) beat.remove();
         // (1): this reply is a sealed one too — follow the effective URL,
         // with the GET's reset-if-absent rule (TCK-WEB-013 (1)): an applied
         // reply without the field means bare pump now — null it and drop the
@@ -2154,25 +2183,16 @@ function openSettings() {
   }
 }
 
-// TCK-WEB-012 (c/d): closing returns focus to a chosen element — by default
-// the header Settings toggle (so the keyboard never drops to <body>), or
-// the chat compose input for the first-run auto-close after Connect (the
-// promise dismissWatchKeyForm's comment makes: the user is done with the
-// pane and ready to type).
-function closeSettings(returnFocusTo) {
+// TCK-WEB-012 (c/d): closing returns focus to the header Settings toggle (so
+// the keyboard never drops to <body>). TCK-ONB-007 static half: no
+// first-run/beat handoff lives here anymore — the pane is purely explicit-
+// control driven, and the WEB-013 (4) beat retired with it (closing is just
+// closing; never an implied consent, never a re-open trigger).
+function closeSettings() {
   if (!settingsPanelEl.hidden) {
     settingsPanelEl.hidden = true;
     settingsToggleEl.setAttribute("aria-expanded", "false");
-    if (state.firstRunBeat) {
-      // TCK-WEB-013 (4): this close (X / Escape / header toggle) IS the
-      // explicit "not now" — the beat retires one-time (never re-shown,
-      // no re-open loop; the engine's awaiting_backend gate defers the
-      // first-run scan on its own) and the WEB-012 chat handoff fires here.
-      state.firstRunBeat = false;
-      if (!returnFocusTo) returnFocusTo = inputEl;
-    }
-    const target = returnFocusTo || settingsToggleEl;
-    if (!target.disabled) target.focus();
+    settingsToggleEl.focus();
   }
 }
 
