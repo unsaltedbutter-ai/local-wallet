@@ -241,6 +241,11 @@ from localwallet.tx.selection import (
 from localwallet.ui.onboarding import (
     BACKEND_CHOICE_PUBLIC,
     BACKEND_CHOICE_SETTING,
+    CONFIRMED,
+    PUBLIC_CHOSEN_ACK,
+    PUBLIC_LOADING_NOW,
+    SWITCH_AFTER_SCAN,
+    SWITCHING_NOW,
     WEB_SETUP_HINT,
     OnboardingFlow,
     _looks_like_seed,
@@ -5461,6 +5466,159 @@ WATCHKEY_REQUIRED_NOTICE: Final[str] = (
     "(zpub/xpub/ypub) using the form on this page to begin."
 )
 
+# ---------------------------------------------------------------------------
+# TCK-ONB-007 (chat-first onboarding): deterministic engine beats and the
+# PRE-MODEL chat intercepts. USER COPY VERBATIM — the beat strings below are
+# spec, not editable prose. Zero model contact on every path here; all lines
+# value-free (no user key, URL, address, or amount can enter any of them).
+# ---------------------------------------------------------------------------
+
+#: Startup beats on a FRESH needs_watch_key launch ONLY (a configured
+#: launch never emits them): emitted by :func:`_pump` as SEPARATE output_fn
+#: events each closing its own turn (the TCK-UX-012 pump pattern). ORDER
+#: vs the model-absent surfaces is PINNED (critique Q6): these beats come
+#: FIRST, the model card after them; the model-absent BANNER rides the
+#: buffered startup narration, which flushes before the pump runs at all.
+CHAT_ONB_GREETING: Final[str] = "Hi, I'd like to be your new Bitcoin wallet."
+CHAT_ONB_KEY_ASK: Final[str] = "Enter your xpub or zpub to get started."
+CHAT_ONB_KEY_HELP_OFFER: Final[str] = (
+    "If you don't know where to get that, ask me how and I'll get you some help."
+)
+_CHAT_ONB_OPENING: Final[tuple[str, ...]] = (
+    CHAT_ONB_GREETING,
+    CHAT_ONB_KEY_ASK,
+    CHAT_ONB_KEY_HELP_OFFER,
+)
+
+#: Key landed through chat: the ack, then the backend beat bubbles (shown
+#: only while the backend choice is genuinely unresolved — an operator
+#: rung that already resolves it asks nothing, per ONB-006).
+CHAT_ONB_KEY_SAVED: Final[str] = "Great. I saved that."
+CHAT_ONB_BACKEND_ASK: Final[str] = (
+    "Now, where should I go to get blockchain information?"
+)
+CHAT_ONB_BACKEND_OWN: Final[str] = (
+    "If you have a bitcoin node, or an electrum server, or maybe "
+    "mempool.space running on an Umbrel, MyNode, Start9 that would be "
+    "better for privacy."
+)
+CHAT_ONB_BACKEND_PUBLIC: Final[str] = (
+    "But if you don't have one of those, you can use a public server "
+    "like mempool.space."
+)
+_CHAT_ONB_BACKEND_BEATS: Final[tuple[str, ...]] = (
+    CHAT_ONB_BACKEND_ASK,
+    CHAT_ONB_BACKEND_OWN,
+    CHAT_ONB_BACKEND_PUBLIC,
+)
+
+#: The deterministic "ask me how" answer (NO model — the AI may not even be
+#: running yet). Implementation-time copy (designer mini-pass, critique Q6):
+#: generic device guidance only — Jade's export menu, Sparrow's wallet
+#: settings — no user values, and the seed-phrase refusal with hardware-
+#: only guidance rides the line itself (watch-only invariant, AGENTS.md).
+CHAT_ONB_KEY_HOWTO: Final[str] = (
+    "Your xpub or zpub comes from the wallet device or app itself — never "
+    "your seed words. On a Jade: open the menu and choose the public-key "
+    "export (the account xpub or zpub) and copy what it shows. In Sparrow "
+    "Wallet: open your wallet, go to Settings, and the account's public "
+    "key is shown there for copying. It is one long string starting with "
+    "xpub, ypub, or zpub — paste it here when you have it. This app is "
+    "hardware-wallet-only and watch-only: seed phrases and private keys "
+    "are always refused, never needed."
+)
+
+#: SLIP-132 token prefixes (public + private siblings, testnet rungs
+#: included — the testnet/private shapes exist HERE only so the paste
+#: routes to the EXISTING gated parser that refuses them; the refusal
+#: machinery is never duplicated here).
+_WATCHKEY_TOKEN_PREFIXES: Final[tuple[str, ...]] = (
+    "xpub", "ypub", "zpub", "tpub", "vpub", "upub",
+    "xprv", "yprv", "zprv", "tprv", "vprv", "uprv",
+)
+
+
+def _chat_key_material(line: str) -> bool:
+    """Whether a chat line while unprovisioned should ride the EXISTING
+    parse+provision path (which owns the mainnet-only, watch-only and
+    seed refusals). Two shapes only: a WHITESPACE-FREE token carrying a
+    known key prefix (a pasted key, truncated or not — the gated parser
+    judges it), or BIP39-SHAPED input (the seed refusal surfaces). Ordinary
+    prose is never treated as key material."""
+    text = line.strip()
+    if not text:
+        return False
+    if _looks_like_seed(text):
+        return True
+    if any(ch.isspace() for ch in text):
+        return False
+    return text.lower().startswith(_WATCHKEY_TOKEN_PREFIXES)
+
+
+def _chat_key_help_ask(line: str) -> bool:
+    """The PINNED help matcher (critique Q6, asked while needs_watch_key):
+    the word ``how`` together with one key topic word, whole words only
+    (edge punctuation stripped). ``where is my xpub`` (no "how") and ``how
+    are you`` (no topic) stay the ordinary refusal."""
+    words = [w.strip(punctuation) for w in line.lower().split()]
+    return "how" in words and any(
+        w in ("xpub", "zpub", "key", "help") for w in words
+    )
+
+
+#: Words that make a "public" line a QUESTION or a REJECTION about the
+#: public server rather than a choice OF it — presence anywhere vetoes the
+#: match (fail toward asking, never toward consenting: the consent marker
+#: is DURABLE, one ambiguous utterance must never pin the public posture).
+#: Contractions arrive APOSTROPHE-STRIPPED (see :func:`_chat_public_choice`)
+#: — the full ``n't`` family is listed in its stripped form.
+_CHAT_PUBLIC_VETO_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "what", "why", "how", "who", "when", "where", "is", "am", "are",
+        "was", "were", "do", "does", "did", "have", "has", "had", "can",
+        "could", "cannot", "cant", "should", "tell", "explain", "define",
+        "mean", "means", "meaning", "difference", "versus", "vs", "about",
+        "think", "not", "no", "never", "without", "instead", "rather",
+        "skip", "avoid",
+        "dont", "doesnt", "didnt", "isnt", "arent", "wasnt", "werent",
+        "wont", "shouldnt", "wouldnt", "couldnt", "hasnt", "havent",
+        "mightnt", "mustnt", "neednt", "aint",
+    }
+)
+#: Answer-shaped length ceiling: a sentence discussing public is ordinary
+#: chat (the model may explain), never consent.
+_CHAT_PUBLIC_MAX_WORDS: Final[int] = 6
+
+
+def _chat_public_choice(line: str) -> bool:
+    """The PINNED public matcher: a short ANSWER containing the whole word
+    ``public``, with no question/negation veto word and no trailing ``?``.
+    "use public" / "public" / "I'll use the public server" match; "what
+    does public mean", "I don't want public" and "is public safer?" do
+    not. Consent itself still rides the 001B seam — a match can never be
+    an un-flagged accept (the leak disclosure is the ack that follows)."""
+    raw = line.strip().lower()
+    if not raw or raw.endswith("?"):
+        return False
+    words = [
+        w.strip(punctuation).replace("'", "").replace("\u2019", "")
+        for w in raw.split()
+    ]
+    if "public" not in words or len(words) > _CHAT_PUBLIC_MAX_WORDS:
+        return False
+    return _CHAT_PUBLIC_VETO_WORDS.isdisjoint(words)
+
+
+def _chat_backend_url_candidate(line: str) -> str | None:
+    """A chat line that IS a backend URL — one whitespace-free token with an
+    accepted scheme prefix (the SAME :data:`_KNOWN_PROBE_SCHEMES` the entry
+    probe dispatches on; free prose merely mentioning a URL stays ordinary
+    chat). Classification/refusal judgment belongs to the probe, not here."""
+    text = line.strip()
+    if not text or any(ch.isspace() for ch in text):
+        return None
+    return text if text.lower().startswith(_KNOWN_PROBE_SCHEMES) else None
+
 
 @dataclass(frozen=True)
 class WatchKeyRequest:
@@ -7104,10 +7262,115 @@ def _pump(
     deferred. A deferred swap whose session ends first is dropped — the
     stored value simply takes effect at next launch, exactly the
     pre-amendment behavior.
+
+    Chat-first onboarding (TCK-ONB-007, user copy VERBATIM): a FRESH
+    needs_watch_key launch opens with the deterministic greeting beats
+    (separate output_fn events, each closing its own turn — the UX-012
+    pattern; a configured launch never emits them). While unprovisioned,
+    key-shaped chat lines ride the EXISTING parse+provision path PRE-MODEL
+    (the gated refusals are that path's own value-free lines) and, on
+    success, the ack + backend beat bubbles follow; the pinned "ask me how"
+    matcher answers with the deterministic export guidance; everything
+    else keeps the watch-key refusal notice. While PROVISIONED with the
+    backend still UNRESOLVED, a chat message that is a backend URL rides
+    the settings-POST probe→store→swap discipline (``ChainBackend``.
+    ``apply`` — url_class clamp + DIAG-001 companion included) and a short
+    public-answer routes through the 001B consent seam with the leak
+    disclosure; a resolved launch swallows NOTHING (post-setup URLs are
+    ordinary chat). Zero model contact on all of it.
     """
+
+    def _onb_line(line: str) -> None:
+        # One onboarding narration line = one closed turn (TCK-UX-012 pump
+        # pattern — the web client renders one bubble per beat; the CLI
+        # sink ignores the marker, byte-identical terminal output).
+        output_fn(line)
+        if emitter is not None:
+            emitter.emit(EVENT_TURN_END)
+
+    def _adopt_wiring() -> None:
+        """Rebind the pump onto the provisioned wiring — the ONE rebind
+        path shared by the typed ``/watchkey`` submit (TCK-LAUNCH-001) and
+        the chat-provision intercept (TCK-ONB-007), so the two entries can
+        never drift. Engine thread only (like every pump mutation)."""
+        nonlocal loop, flow, session, table, watcher, client, store, scan
+        nonlocal backend, settings
+        assert provision is not None and provision.wiring is not None
+        wiring = provision.wiring
+        loop = wiring.loop
+        flow = wiring.flow
+        session = wiring.session
+        table = wiring.table
+        watcher = wiring.watcher
+        client = wiring.client
+        store = wiring.store
+        scan = wiring.scan
+        # TCK-BACKEND-002: the fresh wiring owns its own swap controller
+        # (built by _wire) — the pump follows.
+        backend = wiring.swap
+        # TCK-UX-010: the privacy_mode source moves with the wiring — the
+        # SAME settings object the swap mutates in place (and the
+        # provisioned first-run path's boot-resolved settings before
+        # any wiring existed: the rebind simply follows the live one).
+        settings = wiring.settings
+        if scan is not None:
+            scan.attach(commands)
+            scan.begin()
+
+    def _chat_backend_intent(line: str) -> bool:
+        """The chat surface of the backend choice, WHILE IT IS UNRESOLVED
+        ONLY (TCK-ONB-007; critique Q4's state gate): a pasted backend URL
+        rides the EXISTING probe→store→SWAP path (the /setup outcome, the
+        settings-POST security discipline inherited — the probe is the ONE
+        closure that carries the output router, so _emit_probe_failure
+        surfaces the value-free DIAG-001 companion and the url_class clamp
+        stays intact); a short public-answer rides the 001B consent seam
+        (:func:`set_public_backend_consent` — record + release, never an
+        un-flagged accept: the ack re-names the leak). A RESOLVED launch
+        consumes NOTHING here — post-setup URLs are ordinary chat, never
+        swallowed (pinned)."""
+        nonlocal client
+        if store is None or backend is None or settings is None:
+            return False
+        if _backend_resolved(settings.chain_base_url.strip() or None, store):
+            return False
+        url = _chat_backend_url_candidate(line)
+        if url is not None:
+            error, fields = backend.apply(url)
+            client = backend.client  # rebind on an immediate swap (no-op else)
+            if error is not None:
+                # value-free refusal (BACKEND_PROBE_FAIL et al)
+                _onb_line(error)
+            else:
+                # Reviewer MINOR fold: every ack line closes its OWN turn
+                # (the beat pattern) — no two-texts-one-bubble grouping.
+                _onb_line(CONFIRMED)
+                if fields.get("swapped") is True:
+                    _onb_line(SWITCHING_NOW)
+                elif fields.get("resync") in ("deferred", "busy"):
+                    _onb_line(SWITCH_AFTER_SCAN)
+            return True
+        if _chat_public_choice(line):
+            started = set_public_backend_consent(store, scan)
+            _onb_line(PUBLIC_CHOSEN_ACK)
+            if started:
+                # F2 honesty (identical to the CLI flow's public branch):
+                # "loading now" only when the release REPORTED a start.
+                _onb_line(PUBLIC_LOADING_NOW)
+            return True
+        return False
+
     if scan is not None:
         scan.attach(commands)
         scan.begin()
+    if provision is not None and provision.wiring is None:
+        # TCK-ONB-007 fresh needs_watch_key launch ONLY: the chat-first
+        # greeting beats, ORDER-PINNED before the model-absent card below
+        # (the model-absent banner flushes ahead of the pump — see the
+        # docstring). Ordinary output_fn lines: the CLI transport renders
+        # them identically (requirement 6).
+        for _beat in _CHAT_ONB_OPENING:
+            _onb_line(_beat)
     if model is not None:
         model.attach(commands)
         if model.state == "absent":
@@ -7196,27 +7459,7 @@ def _pump(
             )
             command.reply.put(reply)
             if reply.get("status") in ("accepted", "replaced"):
-                wiring = provision.wiring
-                assert wiring is not None
-                loop = wiring.loop
-                flow = wiring.flow
-                session = wiring.session
-                table = wiring.table
-                watcher = wiring.watcher
-                client = wiring.client
-                store = wiring.store
-                scan = wiring.scan
-                # TCK-BACKEND-002: the fresh wiring owns its own swap
-                # controller (built by _wire) — the pump follows.
-                backend = wiring.swap
-                # TCK-UX-010: the privacy_mode source moves with the wiring —
-                # the SAME settings object the swap mutates in place (and the
-                # provisioned first-run path's boot-resolved settings before
-                # any wiring existed: the rebind simply follows the live one).
-                settings = wiring.settings
-                if scan is not None:
-                    scan.attach(commands)
-                    scan.begin()
+                _adopt_wiring()
                 if reply.get("status") == "replaced":
                     output_fn(_WATCHKEY_REPLACED_NOTE)
             continue
@@ -7350,12 +7593,51 @@ def _pump(
         if provision is not None and provision.wiring is None:
             # TCK-LAUNCH-001 first-run: NO wallet exists yet, so the
             # placeholder loop/table MUST never run a turn — every ordinary
-            # user line is refused with the value-free watch-key notice
-            # (there is nothing to ask about until the key lands). The
-            # transport's typed requests are handled above, untouched.
-            output_fn(WATCHKEY_REQUIRED_NOTICE)
-            if emitter is not None:
-                emitter.emit(EVENT_TURN_END)
+            # user line is refused value-free (there is nothing to ask about
+            # until the key lands). The transport's typed requests are
+            # handled above, untouched. TCK-ONB-007 chat-first exceptions,
+            # both PRE-MODEL and gated on needs_watch_key: the pinned "ask
+            # me how" matcher answers with the deterministic export
+            # guidance (no model); key-shaped chat (single key-prefixed
+            # token, or BIP39-shaped) rides the EXISTING parse+provision
+            # path — the mainnet-only, watch-only and seed refusals are
+            # THAT path's own value-free lines, reused, never duplicated —
+            # and on success the pump rebinds exactly like the typed
+            # submit, then the ack + backend beat bubbles follow (backend
+            # bubbles only while the choice is genuinely unresolved; an
+            # operator rung that already resolves it asks nothing).
+            # ORDER (security/code review MINOR 2): HELP BEFORE key-
+            # material — a long-lowercase help question is BIP39-SHAPE-
+            # matching (the scrubber regex is shape-only), while "how" is
+            # NO BIP39 word, so a real seed phrase can never hit the help
+            # matcher; the converse order swallowed the help ask.
+            text = command.strip() if isinstance(command, str) else ""
+            if text and _chat_key_help_ask(text):
+                _onb_line(CHAT_ONB_KEY_HOWTO)
+                continue
+            if text and _chat_key_material(text):
+                reply = provision.provision(text, allow_replace=False)
+                if reply.get("status") == "accepted":
+                    _adopt_wiring()
+                    _onb_line(CHAT_ONB_KEY_SAVED)
+                    assert settings is not None and store is not None
+                    if not _backend_resolved(
+                        settings.chain_base_url.strip() or None, store
+                    ):
+                        for _beat in _CHAT_ONB_BACKEND_BEATS:
+                            _onb_line(_beat)
+                else:
+                    error = reply.get("error")
+                    _onb_line(
+                        error
+                        if isinstance(error, str) and error
+                        else _WATCHKEY_UNAVAILABLE
+                    )
+                continue
+            if text and _chat_key_help_ask(text):
+                _onb_line(CHAT_ONB_KEY_HOWTO)
+                continue
+            _onb_line(WATCHKEY_REQUIRED_NOTICE)
             continue
         line = command.strip()
         if not line:
@@ -7377,8 +7659,19 @@ def _pump(
             # channel (the node ask's own vocabulary; armed only by the
             # first-run startup ask or a /setup command) — never model
             # context, never the dispatcher. A dormant flow consumes
-            # nothing. Everything else below stays an ordinary turn.
+            # nothing. The CLI ask owns its vocabulary FIRST, so this
+            # branch always precedes the chat-backend intercept below.
             pass
+        elif _chat_backend_intent(line):
+            # TCK-ONB-007: chat URL paste / public answer while the backend
+            # is UNRESOLVED (web chat; a CLI launch's armed flow consumed
+            # its own vocabulary above). Every ack/refusal line already
+            # closed its OWN turn (the _onb_line pattern, code-review
+            # MINOR fold) — skip the shared closer so no empty marker
+            # follows. Ordinary lines, and EVERYTHING on a resolved launch,
+            # fall through to the turn below — post-setup URLs are never
+            # swallowed (state gate pinned).
+            continue
         else:
             _run_turn(
                 loop, flow, session, line, output_fn, client=client, table=table,
