@@ -67,3 +67,31 @@ public block-explorer API or must require a user-run node from day one.
 - Phase 4 must preserve response-shape parity (address txs / UTXOs / tip);
   the fixture shapes in `tests/test_chain_esplora.py` are the contract the
   replacement backend must satisfy.
+
+## Amendment (2026-09-12, TCK-DESCOPE-M3A): mempool.space demoted to PUBLIC-INFO only
+
+USER REDIRECTION 2026-09-11 supersedes this ADR's decision for the WALLET
+role: **wallet information comes only from Electrum or Bitcoin Core** (the
+two adapters shipped by the TCK-ONB-004 plan). Concretely:
+
+1. The public Esplora API is no longer the wallet's chain backend and
+   **no longer a default**: an unset `Settings.chain_base_url` is
+   UNRESOLVED (no client, held scan, explicit first-run choice required),
+   never a silent fallback to `https://mempool.space/api`. Decisions 1/2's
+   "default chain backend … behind the same interface" survive only as the
+   PUBLIC-INFO read path.
+2. What STAYS of this ADR, honestly restated: mempool.space remains a
+   third-party operator for PUBLIC aggregations only — the recommended
+   fees / mempool-blocks / recent-blocks / price reads of
+   `chain/publicinfo.py` (ADR-0011 as amended). Those payloads carry **no
+   wallet addresses**: the disclosure on that path is the app's IP and
+   request timing, not address correlation. The §9 privacy caveat this ADR
+   recorded applies in full to the CONSENTED PUBLIC ELECTRUM choice (see
+   ADR-0023 amendment 3) — where decision 3's warning copy still fires,
+   now naming the public Electrum operator.
+3. Decision 3's UI-warning rule migrates intact: whenever the wallet rides
+   the explicit public Electrum server the banner reads in the public
+   ("the operator can associate queried addresses with your IP") shape.
+4. Decision 4's retry/fail-closed adapter discipline is untouched — it now
+   governs the public-info fetcher as well as (the dead-in-this-repo)
+   Esplora wallet paths pending their TCK-DESCOPE-M4 deletion.

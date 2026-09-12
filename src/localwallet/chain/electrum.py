@@ -209,10 +209,11 @@ class ElectrumClient:
 
     Satisfies :class:`~localwallet.chain.esplora.ChainClient`. Construction
     is network-free (connect + handshake happen lazily on the first call);
-    the URL, per-call timeout, retry budget and TLS trust resolve through
-    the SAME single selection point as the Esplora client —
-    :meth:`ChainConfig.from_settings` (``Settings.chain_base_url`` /
-    ``LOCALWALLET_CHAIN_BASE_URL`` with an ``ssl://`` scheme; ``tls_verify``
+    the app's ONE construction site (``app._build_chain_client``, fed by
+    ``ChainConfig.from_settings``) passes the selected URL + scalars
+    explicitly; a direct construction without them falls back to the env/
+    config-file ``chain_base_url`` rung, and timeout/retry/TLS-trust
+    defaults read the same merged ``Settings`` scalars (``tls_verify``
     env > config file > fail-closed ``True``, ADR-0018 amendment):
     electrum servers on Start9/Umbrel-style boxes ship self-signed certs
     too, so the ``tls_verify=False`` escape hatch (plus the app's honest
@@ -240,13 +241,24 @@ class ElectrumClient:
         timeout_s: float | None = None,
         max_retries: int | None = None,
     ) -> None:
-        defaults = ChainConfig.from_settings(Settings.from_env())
+        # TCK-DESCOPE-M3A decoupling: the SCALAR defaults (timeout, retry
+        # budget, TLS trust) come straight from ``Settings.from_env()`` —
+        # NOT ``ChainConfig.from_settings`` (which now refuses an empty
+        # ``chain_base_url`` as UNRESOLVED). ``_build_chain_client`` and the
+        # entry probe pass an explicit ``base_url`` (possibly a stored/env
+        # URL the fresh env read cannot see), so resolving the wallet base
+        # through the selection point here would spuriously raise; an
+        # omitted ``base_url`` with an empty ``chain_base_url`` still fails
+        # closed in ``ChainConfig.__post_init__`` (a value-free
+        # ``ValueError``, never a nonsense connection).
+        defaults = Settings.from_env()
         self._config = ChainConfig(
-            base_url=defaults.base_url if base_url is None else base_url,
-            timeout_s=defaults.timeout_s if timeout_s is None else timeout_s,
+            base_url=defaults.chain_base_url if base_url is None else base_url,
+            timeout_s=defaults.request_timeout_s if timeout_s is None else timeout_s,
             max_retries=defaults.max_retries if max_retries is None else max_retries,
-            # Same resolution as Esplora (env > config file > fail-closed
-            # True). Electrum TLS certs are frequently self-signed too.
+            # Same resolution as the other adapters (env > config file >
+            # fail-closed True). Electrum TLS certs are frequently
+            # self-signed too.
             tls_verify=defaults.tls_verify,
         )
         parsed = urlsplit(self._config.base_url)

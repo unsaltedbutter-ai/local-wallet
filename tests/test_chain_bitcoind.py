@@ -1314,18 +1314,19 @@ class TestSelectionAndProtocol:
         client_x = app_module._build_chain_client(
             Settings(chain_base_url="ssl://127.0.0.1:59999", request_timeout_s=5.0, max_retries=0)
         )
-        client_e = app_module._build_chain_client(
-            Settings(chain_base_url="https://mempool.space/api", request_timeout_s=5.0, max_retries=0)
-        )
+        # TCK-DESCOPE-M3A: http(s) is no longer a wallet backend — the
+        # construction site refuses it value-free (public info only).
         try:
             assert isinstance(client_b, BitcoindClient)
             assert isinstance(client_x, ElectrumClient)
-            assert isinstance(client_e, EsploraClient)
             assert (client_b._host, client_b._port) == ("127.0.0.1", 59999)
+            with pytest.raises(ValueError):
+                app_module._build_chain_client(
+                    Settings(chain_base_url="https://mempool.space/api", request_timeout_s=5.0, max_retries=0)
+                )
         finally:
             client_b.close()
             client_x.close()
-            client_e.close()
 
     def test_build_chain_client_default_port_is_mainnet_rpc(self) -> None:
         client = app_module._build_chain_client(

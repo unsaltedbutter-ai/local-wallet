@@ -119,9 +119,11 @@ def test_write_validation_fails_closed_and_value_free(bad: str) -> None:
 
 
 def test_resolution_flows_through_the_one_selection_point() -> None:
-    # ADR-0018: ChainConfig.from_settings stays the ONLY backend selection.
-    # The resolved value (either rung) rides Settings.chain_base_url; with no
-    # rung set, the public default path is bit-identical to pre-ONB behavior.
+    # ADR-0018 (as amended by TCK-DESCOPE-M3A): ChainConfig.from_settings
+    # stays the ONLY wallet backend selection. The resolved value (either
+    # rung) rides Settings.chain_base_url; with NO rung set the selection is
+    # UNRESOLVED — it fails closed instead of falling back to any public
+    # default (mempool.space serves public fees/prices only now).
     with Store.memory() as store:
         store.set_chain_base_url(STORED_URL)
         stored = store.get_chain_base_url()
@@ -131,9 +133,8 @@ def test_resolution_flows_through_the_one_selection_point() -> None:
     assert resolve_chain_base_url(Settings().chain_base_url, None) is None
 
     assert ChainConfig.from_settings(Settings(chain_base_url=STORED_URL)).base_url == STORED_URL
-    assert (
-        ChainConfig.from_settings(Settings()).base_url == "https://mempool.space/api"
-    )
+    with pytest.raises(ValueError):  # empty = UNRESOLVED, never a silent default
+        ChainConfig.from_settings(Settings())
 
 
 # =============================================================================

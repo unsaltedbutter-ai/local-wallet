@@ -485,3 +485,58 @@ option stays available forever), validation, precedence, no-silent-fallback
   choice, not a fate — a self-hoster's address queries stop leaving the
   machine at first run instead of at some later config discovery. The
   public path's honest banner is unchanged.
+
+## Amendment 3 (2026-09-12, TCK-DESCOPE-M3A): no public DEFAULT; "public" = the named public Electrum server; headless refuses
+
+USER REDIRECTION 2026-09-11 (docs/descope-esplora-plan.md; ADR-0003/0018
+amendments) re-targets this ADR's choices. What SURVIVES unchanged is the
+whole consent *machinery* (amendment 2: unresolved ⇒ no call, explicit-
+public marker, skip ≠ consent, `/consent` as the one web trigger, the
+red leak warning discipline — ONB-006/PRIVACY-001B). What changes:
+
+1. **Decision 2 ("the default stays public") is SUPERSEDED.** There is no
+   wallet public default anymore: an empty `chain_base_url` is UNRESOLVED
+   (first run REQUIRES the user to name a server — Electrum `ssl://` or
+   Bitcoin Core `bitcoind://`/`bitcoind+tls://` — or explicitly pick the
+   public option). Wallet data never flows until one of those happens
+   (the interactive/web hold; see 3 for headless).
+2. **The public option becomes an EXPLICIT PUBLIC ELECTRUM choice**:
+   `ssl://electrum.blockstream.info:50002` (live-verified reachable +
+   mainnet 2026-09-11). The consent marker (`chain_backend_choice =
+   "public"`) is unchanged in shape and still deliberately NOT in the web
+   `/settings` allowlist — but it now RECORDS A URL, not a default: every
+   launch resolves the marker onto that named server through the same
+   single selection point, and an in-session consent INSTALLS it via the
+   hot-swap seam (`set_public_backend_consent` → the public choice releases
+   the held scan onto the server the user just accepted, never onto a
+   background default). Its leak warning (decision 1's copy rule) is
+   unchanged in substance: the operator sees every queried address, links
+   them to the IP, watches transactions move.
+3. **The headless carve-out (amendment 2, decision 3's "a headless
+   scripted launch stays exactly as before") is AMENDED.** Headless could
+   never carry the ask, and the public default it silently scanned is
+   gone; a headless launch with an UNRESOLVED backend now REFUSES the
+   startup scan — one value-free line naming the missing backend config,
+   the gate held, zero chain calls. "The command line is the operator's
+   decision" now means an EXPLICIT server on the command line (env/
+   config-file rung) or a recorded public consent. A resolved headless
+   launch scans as before.
+4. **Mempool/Esplora are OUT of the wallet choice set entirely** (decisions
+   1/5/7's Esplora vocabulary): the entry ladder accepts Electrum/Core
+   only; an env/config/stored rung naming an http(s) Esplora URL fails
+   closed at startup (value-free, names the accepted families). Entry copy
+   and badges follow in TCK-DESCOPE-M3B; the wallet Esplora code is
+   deleted in M4.
+
+## Consequences of amendment 3
+
+- A pre-existing install with an EMPTY rung (yesterday's silent public
+  user) meets the honest `awaiting_backend` hold and the mandatory ask —
+  the one-time re-prompt plan §6 accepts; the headless flavor of the same
+  install now refuses its scan instead of leaking it.
+- A pre-existing install with a stored/private Esplora URL refuses to
+  start until its owner names an Electrum/Core server — loud, never a
+  silent fallback (decision 4 stands as the reason).
+- `Settings.esplora_base_url` survives as the PUBLIC-INFO base only
+  (fees/prices, ADR-0011 amendment); no consent gate rides it, because no
+  wallet address ever rides it.

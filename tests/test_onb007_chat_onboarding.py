@@ -85,14 +85,18 @@ HELP_OFFER = (
 )
 SAVED = "Great. I saved that."
 BEAT_ASK = "Now, where should I go to get blockchain information?"
+# TCK-DESCOPE-M3A beat copy: wallet backends are an Electrum server or a
+# Bitcoin Core node (mempool.space is public fee/price info only, never a
+# wallet choice); the public tier is the NAMED public Electrum server with
+# its leak stated.
 BEAT_OWN = (
-    "If you have a bitcoin node, or an electrum server, or maybe "
-    "mempool.space running on an Umbrel, MyNode, Start9 that would be "
-    "better for privacy."
+    "If you run your own Bitcoin node or an Electrum server — Start9, "
+    "Umbrel and MyNode all do — that would be better for privacy."
 )
 BEAT_PUBLIC = (
-    "But if you don't have one of those, you can use a public server "
-    "like mempool.space."
+    "But if you don't have one of those, you can use the public Electrum "
+    "server electrum.blockstream.info — chosen with eyes open: whoever "
+    "runs it sees every address you check and can link it to your IP."
 )
 
 # THE GROUPED BUBBLES (static-half user correction 2026-09-11): each trio
@@ -361,7 +365,8 @@ def _drive_fresh(
     )
     if prov.wiring is not None:
         prov.wiring.worker.stop()
-        prov.wiring.client.close()
+        if prov.wiring.client is not None:  # unresolved launch: no client
+            prov.wiring.client.close()
         prov.wiring.store.close()
     return events, prov
 
@@ -393,10 +398,12 @@ def test_chat_zpub_provisions_and_emits_saved_and_backend_beats(
         assert active.descriptor == WalletDescriptor.from_key(ZPUB).descriptor
     finally:
         store.close()
-    # ONB-006 promise: provisioning started NO chain work.
+    # ONB-006 promise: provisioning started NO chain work — since
+    # TCK-DESCOPE-M3A the pin is stronger: unresolved means there is NO
+    # wallet client to fetch with at all (no silent public stand-in).
     assert prov.wiring.scan is not None
     assert prov.wiring.scan.gate.state == "awaiting_backend"
-    assert prov.wiring.client.fetches == 0
+    assert prov.wiring.client is None
 
 
 def test_backend_beats_suppressed_when_a_rung_already_resolves(
@@ -450,7 +457,8 @@ def test_backend_beats_suppressed_when_a_rung_already_resolves(
     assert not any(BEAT_ASK in t for t in texts)
     if prov.wiring is not None:
         prov.wiring.worker.stop()
-        prov.wiring.client.close()
+        if prov.wiring.client is not None:  # unresolved launch: no client
+            prov.wiring.client.close()
         prov.wiring.store.close()
 
 
@@ -931,7 +939,14 @@ def test_chat_zpub_provisions_through_the_real_web_transport(
         )
         assert status == 202
         stream.read_until(b"chosen with eyes open", timeout=20)
-        assert capture["calls"]  # traffic began AFTER the explicit public choice
+        # Traffic began AFTER the explicit public choice — the released
+        # scan fetches on the CHAIN worker thread, so give the worker a
+        # moment to land its first request (the pre-consent assert above
+        # already pins that nothing reached the chain earlier).
+        deadline = time.monotonic() + 10
+        while not capture["calls"] and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert capture["calls"]
     finally:
         stream.close()
         server.stop()

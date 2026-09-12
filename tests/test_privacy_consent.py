@@ -259,31 +259,43 @@ def test_fee_and_price_wrapper_construction_is_network_free() -> None:
 def test_set_public_backend_consent_records_and_releases(
     held_store: tuple[Store, int],
 ) -> None:
-    """Deliverable 3: the engine-side explicit-consent seam the web button
-    (001B) rides — writes ONB-006's ``chain_backend_choice`` = ``public``
-    and releases the held scan, reporting whether the load started (the F2
-    contract). A second call is a no-op release (``False``)."""
+    """Deliverable 3 (TCK-DESCOPE-M3A re-shape): the engine-side explicit-
+    consent seam the web button (001B) and the chat public answer ride —
+    writes ONB-006's ``chain_backend_choice`` = ``public`` and delegates the
+    INSTALL of the named public Electrum server (which releases the held
+    first-run scan) to the hot-swap controller, reporting whether the load
+    started (the F2 contract). A failed install never leaves the clientless
+    wiring half-swapped (that path is pinned in test_backend_hotswap; here
+    the seam's record + delegate + report contract is what matters)."""
     store, _wallet_id = held_store
-    wallet = store.get_active_wallet()
-    assert wallet is not None
-    calls: list[str] = []
-    worker = app.ChainWorker(_counting_client(calls))
-    try:
-        flow = app.ScanFlow(store, wallet, worker, gap_limit=None)
-        flow.set_startup_deferred()
-        assert flow.gate.state == "awaiting_backend"
-        assert app._backend_resolved(None, store) is False
+    installs: list[int] = []
 
-        assert app.set_public_backend_consent(store, flow) is True
-        assert store.get_setting(BACKEND_CHOICE_SETTING) == BACKEND_CHOICE_PUBLIC
-        assert app._backend_resolved(None, store) is True
-        assert flow.gate.state == "pending"  # released (no pump queue here)
-        # No queue attached: begin() never fired, so nothing fetched — the
-        # release SEMANTICS are pinned here, the fetch by the scan tests.
-        assert calls == []
-        assert app.set_public_backend_consent(store, flow) is False
+    class _FakeSwap:
+        def install_public(self) -> bool:
+            installs.append(1)
+            return len(installs) == 1  # first releases, second is a no-op
+
+    swap = _FakeSwap()
+    assert app._backend_resolved(None, store) is False
+
+    assert app.set_public_backend_consent(store, swap) is True
+    assert store.get_setting(BACKEND_CHOICE_SETTING) == BACKEND_CHOICE_PUBLIC
+    assert app._backend_resolved(None, store) is True
+    assert installs == [1]
+    # A second consent re-records and re-attempts the install; the swap
+    # reports it started nothing (already resolved → not held).
+    assert app.set_public_backend_consent(store, swap) is False
+    assert installs == [1, 1]
+
+    # No wired swap (degenerate) → the record still lands, nothing installs.
+    store2 = Store.memory()
+    try:
+        assert app.set_public_backend_consent(store2, None) is False
+        assert (
+            store2.get_setting(BACKEND_CHOICE_SETTING) == BACKEND_CHOICE_PUBLIC
+        )
     finally:
-        worker.stop()
+        store2.close()
 
 
 # ------------------------------------------------- the real first-run beat
@@ -316,7 +328,6 @@ def _launch_first_run(
 
     calls: list[str] = []
     capture: dict[str, Any] = {"calls": calls, "store_path": store_path}
-    real_client = app.EsploraClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(f"{request.url.host}{request.url.path}")
@@ -325,13 +336,16 @@ def _launch_first_run(
             return httpx.Response(200, json=870_000)
         return httpx.Response(200, json=[])
 
-    def counting_client(**kwargs: Any) -> Any:
-        kwargs["transport"] = httpx.MockTransport(handler)
-        kwargs.setdefault("timeout_s", 2.0)
-        kwargs.setdefault("max_retries", 0)
-        return real_client(**kwargs)
+    def counting_client(*_args: Any, **_kwargs: Any) -> Any:
+        # TCK-DESCOPE-M3A seam shape: injected at _build_chain_client /
+        # _public_info_client (construction-args ignored) — an Esplora-
+        # shaped counting client still answers every protocol method the
+        # held gates would stand down anyway; a non-empty ``calls`` IS the
+        # leak.
+        return _counting_client(calls)
 
-    monkeypatch.setattr(app, "EsploraClient", counting_client)
+    monkeypatch.setattr(app, "_build_chain_client", counting_client)
+    monkeypatch.setattr(app, "_public_info_client", counting_client)
     outputs: list[str] = []
     gate = threading.Event()
 

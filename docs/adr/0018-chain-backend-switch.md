@@ -528,3 +528,44 @@ hint a static line already carries.
 
 `tools/probe_backend_diag.py` is updated to mirror all of this (the /api
 auto-try on the Esplora probe, https Core RPC on the `bitcoind+tls` scheme).
+
+## Amendment (2026-09-12, TCK-DESCOPE-M3A): wallet backends = Electrum + bitcoind only; mempool.space public-info only
+
+The 2026-09-11 redirection (docs/descope-esplora-plan.md) re-scopes this
+ADR's selection discipline:
+
+1. **The family closes.** `Settings.chain_base_url` selects only the
+   Electrum (`ssl://`) and Bitcoin Core RPC (`bitcoind://`/`bitcoind+tls://`)
+   adapters. An http(s) (Esplora-shaped) URL is no longer a wallet backend:
+   `app._build_chain_client` REFUSES construction of one (value-free), and
+   `ChainConfig.from_settings` treats an EMPTY selection as UNRESOLVED
+   (raises value-free) — decision 1's `chain_base_url unset -> use
+   esplora_base_url` fallback line, and decision 2's backward-compat
+   promise for the WALLET rung, are SUPERSEDED. `esplora_base_url` survives
+   repurposed as the PUBLIC-INFO base (fees/prices; ADR-0003/0011
+   amendments), which `EsploraClient`/`PublicInfoClient` resolve directly —
+   the public-info transport no longer rides the wallet selection.
+2. **The selection/swap/hot-swap discipline of this ADR (decisions 1-5 and
+   the 2026-09-09 amendment) now governs the Electrum/bitcoind pair
+   unchanged**: one construction site, scheme dispatch, probe-before-save,
+   engine-thread install, deferred-behind-the-scan, BOUNDED close, honest
+   `requires_restart` for shadowed operator rungs, fail-closed malformed
+   config. The explicit PUBLIC consent (ADR-0023 amendment 3) resolves to
+   the named server `ssl://electrum.blockstream.info:50002` and installs
+   through the SAME seam — it is a chosen backend, badged and swapped like
+   any other.
+3. **Fees/prices leave the wallet client** (plan §4): the estimator and
+   price oracle ride a standalone `chain/publicinfo.py` fetcher pinned to
+   `esplora_base_url`, constructed once, never rebuilt on a hot-swap.
+   A self-hosted deployment that relied on decision 1's "flipping the
+   backend is a one-variable config change" for FEES too now gets fees from
+   the public source regardless of backend (payloads carry no addresses;
+   IP/timing only) — the trade the redirection accepted.
+4. **Mid-migration honesty:** an existing install whose stored/env rung
+   names an Esplora URL fails startup with the value-free
+   "not a supported wallet backend — name an Electrum (ssl://) or Bitcoin
+   Core (bitcoind://) server" refusal (never a silent fallback); an install
+   with an EMPTY rung holds at `awaiting_backend` (interactive/web) or
+   refuses the scan (headless, ADR-0023 amendment 3). M3B re-scopes the
+   entry badges/autodetect/copy to the closed two-family enum; the Esplora
+   wallet-code deletion lands in M4.

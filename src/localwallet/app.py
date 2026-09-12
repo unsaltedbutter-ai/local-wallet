@@ -138,13 +138,13 @@ from localwallet.chain import (
     ChainError,
     ConfigDisabled,
     ElectrumClient,
-    EsploraClient,
     FeeEstimator,
     FeeTarget,
     IncomingEvent,
     IncomingWatcher,
     PriceOracle,
     PriceUnavailableError,
+    PublicInfoClient,
     WatchedTx,
     check_backend,
     classify_failure,
@@ -165,6 +165,7 @@ from localwallet.config import (
     DEFAULT_DISPLAY_CURRENCY,
     DISPLAY_CURRENCIES,
     DISPLAY_CURRENCY_SETTING,
+    PUBLIC_ELECTRUM_URL,
     Settings,
     resolve_chain_base_url,
     resolve_coin_selection_settings,
@@ -642,16 +643,28 @@ DEFAULT_HISTORY_LIMIT: Final[int] = 20
 _NEVER_CONFIRMED: Final[int] = 2**63 - 1
 
 #: The §9 honest privacy indicator, shown verbatim at startup (PROJECT.md
-#: §9 / R7 — never over-claim privacy while querying a public explorer).
-#: This is the PUBLIC-API wording (3-state banner, TCK-SEC-004 change 5):
-#: when the chain backend is the user's own node the banner instead shows
+#: §9 / R7 — never over-claim privacy while querying a public server).
+#: TCK-DESCOPE-M3A: the PUBLIC tier is no longer mempool.space-by-default —
+#: it is the explicitly consented public Electrum server
+#: (:data:`localwallet.config.PUBLIC_ELECTRUM_URL`), whose operator sees
+#: every queried address plus the IP (3-state banner, TCK-SEC-004 change 5):
+#: when the chain backend is the user's own server the banner instead shows
 #: :data:`PRIVACY_INDICATOR_OWN_NODE_LOCAL` (loopback host) or
 #: :data:`PRIVACY_INDICATOR_OWN_NODE_REMOTE` (any other configured host),
 #: selected by :func:`privacy_indicator` off the same single selection
 #: point the chain client uses.
 PRIVACY_INDICATOR: Final[str] = (
-    "Querying public mempool.space — the operator can associate queried "
-    "addresses with your IP."
+    "Querying the public Electrum server — the operator can associate "
+    "queried addresses with your IP."
+)
+
+#: TCK-DESCOPE-M3A: the §9 indicator while the wallet backend is UNRESOLVED
+#: (no rung, no consent): the silent public default is gone, so the honest
+#: banner says NOTHING has been queried — never a stale "public" claim for
+#: a server the user never chose.
+PRIVACY_INDICATOR_UNCHOSEN: Final[str] = (
+    "No server chosen yet — no wallet address has been queried anywhere; "
+    "balances and history stay empty until you pick a backend."
 )
 
 #: The §9 privacy indicator for a self-hosted backend on THIS machine
@@ -715,14 +728,23 @@ PRIVACY_MODES: Final[frozenset[str]] = frozenset(
 _LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "localhost", "::1"})
 
 #: The ``node_status`` narration predicates (TCK-SEC-004 change 5, approved
-#: copy) — "You are " + one of these, mirroring the banner's 3-way split.
-#: The public wording is unchanged from the pre-change narration. The
-#: REMOTE predicate carries the SAME host insertion as the banner
-#: (TCK-UX-009 lockstep), falling back to the generic line when no host
-#: is parseable.
+#: copy) — "You are " + one of these, mirroring the banner's split. The
+#: PUBLIC predicate names the consented public Electrum tier (its
+#: operator/leak shape is unchanged from the old public default,
+#: TCK-DESCOPE-M3A). The REMOTE predicate carries the SAME host insertion
+#: as the banner (TCK-UX-009 lockstep), falling back to the generic line
+#: when no host is parseable. The UNCHOSEN predicate (TCK-DESCOPE-M3A) is
+#: the honest UNRESOLVED answer — with no silent public default there is
+#: no server to point at, and the line says so.
+_NODE_STATUS_UNCHOSEN: Final[str] = (
+    "No server has been chosen yet — the app has not queried any address "
+    "of your wallet. Pick one (your own Electrum or Bitcoin Core server, "
+    "or explicitly the public Electrum server with its leak warning) to "
+    "load the wallet."
+)
 _NODE_STATUS_PUBLIC: Final[str] = (
-    "You are querying the public API — the operator can associate queried "
-    "addresses with your IP."
+    "You are querying the public Electrum server — the operator can "
+    "associate queried addresses with your IP."
 )
 _NODE_STATUS_OWN_NODE_LOCAL: Final[str] = (
     "You are querying your own node on this machine — addresses and lookups "
@@ -777,14 +799,42 @@ def _url_without_credentials(url: str) -> str:
 
 
 def _effective_chain_url(settings: Settings) -> str:
-    """THE live chain-backend selection, verbatim (userinfo included): the
-    single selection point (ADR-0018) — ``chain_base_url`` (boot-resolved
-    env/config/stored fold, updated in place by every hot-swap) or the
-    legacy public default when no rung is set. ``_backend_kind`` badges from
-    it; the settings pane DISPLAYS it (TCK-WEB-013) through
-    :func:`_url_without_credentials` — one resolution expression, so the
-    badge and the shown URL can never disagree."""
-    return settings.chain_base_url.strip() or settings.esplora_base_url.strip()
+    """THE live wallet chain-backend selection, verbatim (userinfo included):
+    the single selection point (ADR-0018 as amended by TCK-DESCOPE-M3A) —
+    ``chain_base_url`` (boot-resolved env/config/stored fold, updated in
+    place by every hot-swap and by an explicit public consent). EMPTY means
+    UNRESOLVED: there is no public fallback anymore (the old
+    ``esplora_base_url`` default is gone — mempool.space serves public
+    fee/price info only). ``_backend_kind`` badges from it; the settings
+    pane DISPLAYS it (TCK-WEB-013) through :func:`_url_without_credentials`
+    — one resolution expression, so the badge and the shown URL can never
+    disagree."""
+    return settings.chain_base_url.strip()
+
+
+#: The HOST of :data:`PUBLIC_ELECTRUM_URL` (derived, never a second
+#: literal — the single-source rule the old ``_PUBLIC_DEFAULT_HOST``
+#: followed). The explicit public electrum choice banners as PUBLIC: its
+#: operator is a third party by definition.
+_PUBLIC_ELECTRUM_HOST: Final[str] = (
+    _configured_url_host(PUBLIC_ELECTRUM_URL) or ""
+)
+
+#: TCK-DESCOPE-M3A (ADR-0023 amendment 2 / its own amendment): the honest,
+#: value-free startup line for a HEADLESS (non-interactive, non-web) launch
+#: whose backend is UNRESOLVED. The old carve-out let such a launch scan the
+#: silent public default (ADR-0023's "the command line is the operator's
+#: decision"); with no public default there is nothing to scan — a headless
+#: launch with no server on any rung and no recorded public consent has no
+#: one to ask, so the startup scan is REFUSED (the gate holds at
+#: ``awaiting_backend``; every wallet path stays leak-free).
+HEADLESS_BACKEND_REFUSAL: Final[str] = (
+    "No chain backend is configured (set LOCALWALLET_CHAIN_BASE_URL / the "
+    "config-file key to an Electrum (ssl://) or Bitcoin Core "
+    "(bitcoind://) server, or run the app interactively once to choose) — "
+    "startup scan REFUSED: nothing was looked up and no address left this "
+    "machine."
+)
 
 
 def _loopback_host_of(url: str) -> str | None:
@@ -968,17 +1018,19 @@ def privacy_indicator(settings: Settings) -> str:
     """Return the §9 privacy banner for the given backend selection.
 
     The wording is gated on the SAME single selection point the chain
-    client uses (ADR-0018 ``ChainConfig.from_settings``) and classifies the
-    configured backend three ways (TCK-SEC-004 change 5): the public
-    default, the user's own node on this machine (loopback host), or the
-    user's own node on another machine. The 3-way split keeps the banner
-    honest for a remote LAN/VPS instance — "addresses and lookups stay on
-    this machine" would over-claim there (R7). Reading the knob here —
-    rather than re-hardcoding a public default — keeps the banner and the
-    node_status narration from ever diverging from what the client actually
-    uses.
+    client uses (:func:`_effective_chain_url`) and classifies the
+    configured backend (TCK-DESCOPE-M3A): UNRESOLVED (no rung — nothing
+    queried, the honest empty), the consented PUBLIC ELECTRUM server, the
+    user's own server on this machine (loopback host), or the user's own
+    server on another machine. The split keeps the banner honest for a
+    remote LAN/VPS instance — "addresses and lookups stay on this machine"
+    would over-claim there (R7). Reading the knob here — rather than
+    re-hardcoding a public default — keeps the banner and the node_status
+    narration from ever diverging from what the client actually uses.
     """
     mode = _backend_mode(settings)
+    if mode == PRIVACY_MODE_AWAITING_BACKEND:
+        return PRIVACY_INDICATOR_UNCHOSEN
     if mode == BACKEND_MODE_OWN_NODE_LOCAL:
         return PRIVACY_INDICATOR_OWN_NODE_LOCAL
     if mode == BACKEND_MODE_OWN_NODE_REMOTE:
@@ -1465,7 +1517,7 @@ def build_dispatch_table(
     store: Store,
     wallet: WalletRecord,
     parsed: ParsedKey,
-    client: ChainClient,
+    client: ChainClient | None,
     scan_fn: Callable[[], object],
     *,
     flow: TxFlow | None = None,
@@ -3532,7 +3584,7 @@ def _make_sign_tx_handler(
 
 def _make_broadcast_tx_handler(
     flow: TxFlow,
-    client: EsploraClient,
+    client: ChainClient,
     store: Store,
     wallet_id: int,
 ) -> Handler:
@@ -3679,7 +3731,7 @@ def _make_broadcast_tx_handler(
 
 
 def _make_tx_status_handler(
-    client: EsploraClient, flow: TxFlow, scan_gate: StartupScan | None = None
+    client: ChainClient, flow: TxFlow, scan_gate: StartupScan | None = None
 ) -> Handler:
     """Create the ``tx_status`` handler: quoted txid → Esplora status.
 
@@ -3745,31 +3797,42 @@ def _make_tx_status_handler(
 
 
 def _backend_mode(settings: Settings) -> str:
-    """The chain-backend privacy mode — 3-way (TCK-SEC-004 change 5).
+    """The chain-backend privacy mode (3-way classification, TCK-SEC-004
+    change 5; the PUBLIC meaning re-targeted and the UNRESOLVED answer
+    added by TCK-DESCOPE-M3A).
 
     Derived from the SAME single selection point the chain client uses
-    (ADR-0018 ``ChainConfig.from_settings``):
+    (:func:`_effective_chain_url`, ADR-0018 as amended):
 
-    - :data:`BACKEND_MODE_PUBLIC` — no ``Settings.chain_base_url``: the
-      public explorer serves the lookups (R7 honesty: its operator can
-      associate queried addresses with the user's IP).
+    - :data:`PRIVACY_MODE_AWAITING_BACKEND` — no ``chain_base_url``: the
+      wallet backend is UNRESOLVED (no public default anymore); nothing is
+      being consulted and no mode claim is honest.
+    - :data:`BACKEND_MODE_PUBLIC` — the consented PUBLIC ELECTRUM server
+      (:data:`PUBLIC_ELECTRUM_URL`'s host): a third-party operator sees
+      every queried address plus the IP (the red leak warning).
     - :data:`BACKEND_MODE_OWN_NODE_LOCAL` — a configured URL whose host is
       loopback: the user's own node on this machine.
     - :data:`BACKEND_MODE_OWN_NODE_REMOTE` — any other configured host
-      (LAN/VPS instance): still the user's own node, but NOT on this
+      (LAN/VPS instance): still the user's own server, but NOT on this
       machine, so copy must not claim lookups "stay on this machine".
 
     The node_status narration mirrors this function (and the privacy banner
     renders its REMOTE host through it), so neither can disagree with the
     banner about which backend is actually in use. The ``/state``
-    ``privacy_mode`` field rides this classification too (TCK-UX-010),
-    overridden by the ONB-006 ``awaiting_backend`` hold when a first-run
-    backend choice is still outstanding.
+    ``privacy_mode`` field rides this classification too (TCK-UX-010); the
+    ONB-006 ``awaiting_backend`` gate override agrees with the empty-rung
+    answer by construction.
     """
     configured = settings.chain_base_url.strip()
     if not configured:
-        return BACKEND_MODE_PUBLIC
+        return PRIVACY_MODE_AWAITING_BACKEND
     host = _configured_url_host(configured)
+    # Code-review fix 3 (TCK-DESCOPE-M3A): DNS hosts are case-insensitive —
+    # a hand-typed ``ssl://Electrum.Blockstream.info`` is the SAME consented
+    # public server and must banner PUBLIC, not own-node (lowercase both
+    # sides, the loopback branch's discipline).
+    if host is not None and host.lower() == _PUBLIC_ELECTRUM_HOST:
+        return BACKEND_MODE_PUBLIC
     if host is not None and host.lower() in _LOOPBACK_HOSTS:
         return BACKEND_MODE_OWN_NODE_LOCAL
     return BACKEND_MODE_OWN_NODE_REMOTE
@@ -3872,7 +3935,7 @@ def _make_node_status_handler(
     return handler
 
 
-def _last_block_suffix(client: EsploraClient) -> str | None:
+def _last_block_suffix(client: ChainClient) -> str | None:
     """The "last block ~N min ago" narration suffix for ONE drain.
 
     Computed ONCE per drain (never per event) from the single injected
@@ -3937,7 +4000,8 @@ def _make_watch_probe(
     The probe refreshes the chain state through ``scan_fn`` (which in the app
     is :meth:`ScanFlow.scan_now` — the ADR-0022 split run as ONE blocking
     scan: plan on the engine, the derive+fetch on the dedicated chain worker
-    over the SINGLE config-selected EsploraClient, persist by the engine;
+    over the SINGLE config-selected wallet backend (Electrum or bitcoind —
+    TCK-DESCOPE-M3A), persist by the engine;
     ADR-0018 — a self-hosted poll hits the user's node, never the public
     API), then reads the wallet's transactions
     and UTXOs back from the store and shapes them into
@@ -3997,7 +4061,7 @@ def _drain_watch(
     watcher: IncomingWatcher | None,
     output_fn: Callable[[str], None],
     *,
-    client: EsploraClient | None = None,
+    client: ChainClient | None = None,
 ) -> int:
     """Run one due watch cycle (if any) and narrate its events to the user.
 
@@ -4372,34 +4436,55 @@ def _has_completed_scan(store: Store, wallet_id: int) -> bool:
         return False
 
 
-def _backend_resolved(effective_backend: str | None, store: Store) -> bool:
-    """THE single source of truth for "a chain backend has been chosen"
-    (TCK-ONB-006; ADR-0022 amendment 1 + ADR-0023 amendment 2). Resolved =
-    a URL on any rung of the resolution ladder (env > config file > stored
-    — exactly what :func:`resolve_chain_base_url` returns), OR an explicit
-    public opt-in record (:data:`BACKEND_CHOICE_SETTING`, written ONLY by an
-    explicit public consent — the warned onboarding conversation or
-    :func:`set_public_backend_consent`). An UNSET stored rung means "never
-    chose", NOT "chose public" — that's why the marker exists. Fail closed:
-    an unreadable record counts as unresolved (defer + ask, never
-    leak-by-accident). While unresolved, a first-run startup scan holds at
-    ``awaiting_backend`` and the onboarding ask (re-)arms."""
-    if effective_backend is not None:
-        return True
+def _public_consent_recorded(store: Store) -> bool:
+    """Whether the EXPLICIT public-backend consent record exists
+    (:data:`BACKEND_CHOICE_SETTING` == ``"public"``, written ONLY by a
+    warned choice — the onboarding conversation, the chat public answer, or
+    :func:`set_public_backend_consent`). Fail closed: an unreadable record
+    counts as "never chose" (defer + ask, never leak-by-accident). Since
+    TCK-DESCOPE-M3A the record names a concrete server —
+    :data:`~localwallet.config.PUBLIC_ELECTRUM_URL`, folded onto the
+    selection ladder by :func:`_wire` and the consent seam — never a silent
+    mempool.space default."""
     try:
         return store.get_setting(BACKEND_CHOICE_SETTING) == BACKEND_CHOICE_PUBLIC
     except (StoreError, sqlite3.Error):
         return False
 
 
-def set_public_backend_consent(store: Store, scan: ScanFlow | None = None) -> bool:
-    """TCK-PRIVACY-001: the ENGINE-SIDE way to record an EXPLICIT
-    public-backend consent — the seam the web consent button
-    (TCK-PRIVACY-001B) rides. Two effects, identical to the warned CLI
-    conversation's public branch (:meth:`OnboardingFlow._accept_public`):
-    write the ONB-006 marker (:data:`BACKEND_CHOICE_SETTING` =
-    ``"public"``, so every FUTURE launch resolves as chosen-what-it-is),
-    then release a HELD first-run startup scan on the current client.
+def _backend_resolved(effective_backend: str | None, store: Store) -> bool:
+    """THE single source of truth for "a chain backend has been chosen"
+    (TCK-ONB-006; ADR-0022 amendment 1 + ADR-0023 amendment 2, as amended
+    by TCK-DESCOPE-M3A). Resolved = a URL on any rung of the resolution
+    ladder (env > config file > stored — exactly what
+    :func:`resolve_chain_base_url` returns), OR an explicit public opt-in
+    record (:data:`_public_consent_recorded`) — which resolves the wallet
+    onto the NAMED public Electrum server, never a silent default. An UNSET
+    stored rung means "never chose", NOT "chose public" — that's why the
+    marker exists. While unresolved, a first-run startup scan holds at
+    ``awaiting_backend`` and the onboarding ask (re-)arms; a headless
+    launch REFUSES the scan (:data:`HEADLESS_BACKEND_REFUSAL`)."""
+    if effective_backend is not None:
+        return True
+    return _public_consent_recorded(store)
+
+
+def set_public_backend_consent(store: Store, swap: ChainBackendFlow | None) -> bool:
+    """The ENGINE-SIDE way to record an EXPLICIT public-backend consent —
+    the seam the web consent button (TCK-PRIVACY-001B) and the chat public
+    answer ride. Since TCK-DESCOPE-M3A "public" is a NAMED server: two
+    effects, identical to the warned CLI conversation's public branch
+    (:meth:`OnboardingFlow._accept_public`): write the ONB-006 marker
+    (:data:`BACKEND_CHOICE_SETTING` = ``"public"``, so every FUTURE launch
+    resolves onto the public Electrum server through the same fold), then
+    INSTALL :data:`~localwallet.config.PUBLIC_ELECTRUM_URL` as the live
+    wallet client through the hot-swap seam
+    (:meth:`ChainBackendFlow.install_public`) and release a HELD first-run
+    startup scan ON IT. There is no public-default client to release onto
+    anymore — but consent only ever INSTALLS into a HELD (unresolved) scan:
+    a POST while a RESOLVED backend serves records the choice and moves
+    NOTHING (code-review fix 2; the sanctioned resolved→public switch is
+    /setup's revert, never a stray consent press).
 
     Callers must be consent itself, never a proxy for it: closing the
     onboarding pane, asking a balance, skipping the ask, or any other user
@@ -4410,14 +4495,15 @@ def set_public_backend_consent(store: Store, scan: ScanFlow | None = None) -> bo
     the ask re-appears next launch (toward asking, never toward leaking);
     THIS session's consent and release stand either way.
 
-    Returns whether a held scan actually started loading (security review
-    F2 contract: report "loading now" only on ``True``; ``False`` when no
-    scan is held, none exists, or planning failed and it stood down)."""
+    Returns whether the held first-run scan actually started loading on
+    the public Electrum server (security review F2 contract: report
+    "loading now" only on ``True``; ``False`` when no scan is held, no
+    engine swap controller exists, or planning failed and it stood down)."""
     try:
         store.set_setting(BACKEND_CHOICE_SETTING, BACKEND_CHOICE_PUBLIC)
     except (StoreError, sqlite3.Error):
         pass
-    return scan is not None and scan.release_backend()
+    return swap.install_public() if swap is not None else False
 
 
 def _freshness(store: Store, wallet_id: int, gate: StartupScan | None) -> str:
@@ -4570,7 +4656,11 @@ class ChainWorker:
     synchronous scan did, but with no chain I/O on the engine thread).
     """
 
-    def __init__(self, client: ChainClient) -> None:
+    def __init__(self, client: ChainClient | None) -> None:
+        # TCK-DESCOPE-M3A: ``None`` = the wallet backend is UNRESOLVED. No
+        # job is ever submitted while the startup gate holds, so the worker
+        # thread never dereferences it; a consent/save installs the real
+        # client through :meth:`set_client` before anything can fetch.
         self._client = client
         self._jobs: queue.Queue[Any] = queue.Queue()
         self._thread = threading.Thread(target=self._run, name="chain-worker", daemon=True)
@@ -5530,14 +5620,19 @@ CHAT_ONB_KEY_SAVED: Final[str] = "Great. I saved that."
 CHAT_ONB_BACKEND_ASK: Final[str] = (
     "Now, where should I go to get blockchain information?"
 )
+# TCK-DESCOPE-M3A (USER REDIRECTION 2026-09-11): a WALLET backend is an
+# Electrum server or a Bitcoin Core node — mempool.space is public fee/price
+# info only and is never offered here as a wallet choice. The public tier is
+# the NAMED public Electrum server, and its leak is named with it (the red
+# warning, ONB-006/001B discipline — an explicit choice, never a default).
 CHAT_ONB_BACKEND_OWN: Final[str] = (
-    "If you have a bitcoin node, or an electrum server, or maybe "
-    "mempool.space running on an Umbrel, MyNode, Start9 that would be "
-    "better for privacy."
+    "If you run your own Bitcoin node or an Electrum server — Start9, "
+    "Umbrel and MyNode all do — that would be better for privacy."
 )
 CHAT_ONB_BACKEND_PUBLIC: Final[str] = (
-    "But if you don't have one of those, you can use a public server "
-    "like mempool.space."
+    "But if you don't have one of those, you can use the public Electrum "
+    "server electrum.blockstream.info — chosen with eyes open: whoever "
+    "runs it sees every address you check and can link it to your IP."
 )
 _CHAT_ONB_BACKEND_BEATS: Final[tuple[str, ...]] = (
     CHAT_ONB_BACKEND_ASK,
@@ -5800,7 +5895,7 @@ class WatchKeyProvision:
             old = self.wiring
             assert old is not None
             old.worker.stop()
-            old.client.close()
+            _close_quietly(old.client)
             old.store.close()
         self.wiring = wiring
         return {
@@ -5829,7 +5924,7 @@ class EngineContext:
     session: SendSession
     table: DispatchTable
     watcher: IncomingWatcher | None = None
-    client: EsploraClient | None = None
+    client: ChainClient | None = None
     #: The non-blocking startup-scan controller (TCK-SCAN-003, ADR-0022);
     #: the pump attaches it to the command queue and drives its events.
     scan: ScanFlow | None = None
@@ -7210,7 +7305,7 @@ def _pump(
     session: SendSession,
     table: DispatchTable,
     watcher: IncomingWatcher | None = None,
-    client: EsploraClient | None = None,
+    client: ChainClient | None = None,
     emitter: EventEmitter | None = None,
     ready: threading.Event | None = None,
     scan: ScanFlow | None = None,
@@ -7388,7 +7483,13 @@ def _pump(
                     _onb_line(SWITCH_AFTER_SCAN)
             return True
         if _chat_public_choice(line):
-            started = set_public_backend_consent(store, scan)
+            started = set_public_backend_consent(store, backend)
+            # Code-review fix 1 (TCK-DESCOPE-M3A): a consent install IS a
+            # client swap — the pump's local follows the live client exactly
+            # like the sibling URL/settings/deferred branches rebind, or the
+            # watch drain and the ETA facts keep narrating off the stale
+            # (None/retired) client for the whole session.
+            client = backend.client
             _onb_line(PUBLIC_CHOSEN_ACK)
             if started:
                 # F2 honesty (identical to the CLI flow's public branch):
@@ -7576,7 +7677,14 @@ def _pump(
             # client re-reads /state: the released scan's chip and the
             # resolved privacy_mode ride the existing machinery (no new
             # client-side inference). The closed status is value-free.
-            started = store is not None and set_public_backend_consent(store, scan)
+            started = store is not None and set_public_backend_consent(store, backend)
+            # Code-review fix 1 (TCK-DESCOPE-M3A): a consent install moves
+            # the live client — rebind the pump's local to it (no-op when
+            # nothing installed), exactly like the settings-swap branch, so
+            # the watch drain + ETA facts serve from the client that is
+            # ACTUALLY running this session.
+            if backend is not None:
+                client = backend.client
             command.reply.put(
                 {
                     "schema": CONSENT_SCHEMA,
@@ -8127,7 +8235,8 @@ def run(
         pass  # clean exit on Ctrl-C
     finally:
         wiring.worker.stop()  # join the chain worker before closing its client
-        wiring.client.close()
+        if wiring.client is not None:
+            wiring.client.close()
         wiring.store.close()
         # The remote debug bridge also owns a client (httpx) — close it
         # alongside the Esplora client when it exposes close().
@@ -8152,7 +8261,12 @@ class _Wiring:
     ``check_same_thread`` is the guard)."""
 
     store: Store
-    client: EsploraClient
+    #: The WALLET chain client (Electrum or bitcoind, ADR-0018 as amended),
+    #: or ``None`` while the backend is UNRESOLVED (TCK-DESCOPE-M3A: there
+    #: is no silent public client anymore — unresolved means nothing to
+    #: query, and every chain-riding surface is gate-held until a consent
+    #: or a save installs the real client through the hot-swap seam).
+    client: ChainClient | None
     loop: AgentLoop
     flow: TxFlow
     session: SendSession
@@ -8194,6 +8308,20 @@ class _Wiring:
     #: :func:`_wire` right after the wiring itself — late-bound because it
     #: owns a reference to the wiring it can mutate).
     swap: ChainBackendFlow | None = None
+    #: TCK-DESCOPE-M3A (plan §4): the ONE standalone PUBLIC-INFO fetcher
+    #: (mempool.space fees/prices) the fee estimator and price oracle ride
+    #: REGARDLESS of the wallet backend — constructed once, never rebuilt
+    #: on a hot-swap, never carries wallet data.
+    public_info: PublicInfoClient | None = None
+    #: The one shared :class:`FeeEstimator` (over ``public_info``) — kept
+    #: on the wiring so a hot-swap rebind reuses it (one source, one
+    #: cache, one TTL; the swap no longer touches the fee path at all).
+    fee_estimator: FeeEstimator | None = None
+    #: The one shared :class:`PriceOracle` (over ``public_info`` and the
+    #: live display-currency ladder), same single-instance rule as the
+    #: estimator (TCK-FIAT-001's shared-cache invariant, backend-free
+    #: since M3A).
+    price_oracle: PriceOracle | None = None
 
 
 @dataclass(frozen=True)
@@ -8254,21 +8382,26 @@ def _bitcoind_auth_kwargs(auth: _BackendAuth | None) -> dict[str, object]:
 def _build_chain_client(
     settings: Settings, auth: _BackendAuth | None = None
 ) -> ChainClient:
-    """Construct the config-selected chain backend (TCK-ONB-004 M1/M2;
-    the M3 ``auth`` overlay threads the stored credential keys).
+    """Construct the config-selected WALLET chain backend (TCK-ONB-004
+    M1/M2; the M3 ``auth`` overlay threads the stored credential keys;
+    TCK-DESCOPE-M3A closes the family).
 
     The URL SCHEME picks the adapter through the single selection point
     (:meth:`ChainConfig.from_settings`, ADR-0018 as amended): an
     ``ssl://host[:port]`` base rides the Electrum-protocol client, a
-    ``bitcoind://host[:port]`` base the Bitcoin Core RPC client, http(s)
-    the Esplora client as ever. Construction is network-free in all three
-    kinds (clients connect lazily; the Electrum and Core handshakes —
-    including the mainnet-only proof, ADR-0021 — run on the first call),
-    and timeout/retry/TLS-trust values come from the SAME resolved
-    settings, so the privacy banner, the watch-mode line and the transport
-    can never disagree. A malformed selection fails closed here with the
-    value-free :class:`ValueError` ``ChainConfig`` has always raised at
-    construction.
+    ``bitcoind://``/``bitcoind+tls://`` base the Bitcoin Core RPC client.
+    An http(s) (Esplora-shaped) base REFUSES construction here: since the
+    2026-09-11 redirection, wallet information comes only from Electrum or
+    bitcoind — mempool.space serves public fees/prices through
+    :class:`~localwallet.chain.publicinfo.PublicInfoClient`, never wallet
+    data. Construction is network-free in both kinds (clients connect
+    lazily; the Electrum and Core handshakes — including the mainnet-only
+    proof, ADR-0021 — run on the first call), and timeout/retry/TLS-trust
+    values come from the SAME resolved settings, so the privacy banner,
+    the watch-mode line and the transport can never disagree. A missing
+    selection (empty ``chain_base_url`` = UNRESOLVED) or a malformed one
+    fails closed here with the value-free :class:`ValueError`
+    ``ChainConfig`` has always raised at construction.
     """
     config = ChainConfig.from_settings(settings)
     if config.kind == "bitcoind":
@@ -8287,12 +8420,22 @@ def _build_chain_client(
             rpc_cookie_path=settings.rpc_cookie_path,
             **_bitcoind_auth_kwargs(auth),
         )
-    client_cls = ElectrumClient if config.kind == "electrum" else EsploraClient
-    return client_cls(
-        base_url=config.base_url,
-        timeout_s=config.timeout_s,
-        max_retries=config.max_retries,
-    )
+    if config.kind == "electrum":
+        return ElectrumClient(
+            base_url=config.base_url,
+            timeout_s=config.timeout_s,
+            max_retries=config.max_retries,
+        )
+    # TCK-DESCOPE-M3A: no other kind is a WALLET backend (the Esplora
+    # shape is public-info-only; see the docstring). Value-free.
+    raise ValueError("wallet chain backend must be an Electrum or bitcoind URL")
+
+
+def _public_info_client(settings: Settings) -> PublicInfoClient:
+    """The ONE public fee/price fetcher (TCK-DESCOPE-M3A, plan §4): built
+    ONCE per wiring, independent of the wallet backend and never rebuilt
+    on a hot-swap (public aggregations — payloads carry no addresses)."""
+    return PublicInfoClient(settings)
 
 
 def _probe_tip(client_factory: Callable[[], Any]) -> tuple[bool, BaseException | None]:
@@ -8624,9 +8767,11 @@ class ChainBackendFlow:
     # ------------------------------------------------------------- surfaces
 
     @property
-    def client(self) -> ChainClient:
+    def client(self) -> ChainClient | None:
         """The CURRENTLY SERVING chain client (the pump rebinds its local
-        after any swap via this property)."""
+        after any swap via this property), or ``None`` while the wallet
+        backend is still unresolved (TCK-DESCOPE-M3A: unresolved has no
+        client — the hold, not a silent public stand-in)."""
         return self._w.client
 
     @property
@@ -8726,7 +8871,16 @@ class ChainBackendFlow:
         live client moved to the saved URL and the resync was started),
         ``deferred`` (validated + stored, install queued behind the
         in-flight scan), ``skipped`` (an env/config-file rung shadows the
-        stored one — the honest next-launch copy)."""
+        stored one — the honest next-launch copy). An EMPTY url is the
+        /setup REVERT-to-public (TCK-DESCOPE-M3A): with the public marker
+        just recorded by the conversation there is no "clear the rung and
+        ride a default" meaning anymore — a revert INSTALLS the named
+        public Electrum server, same as a fresh consent would."""
+        if not url.strip():
+            if not _public_consent_recorded(self._w.store):
+                return "skipped"  # cleared with no consent = unresolved
+            outcome, _started = self._install_public()
+            return outcome
         text = url.strip()
         if self.shadowed:
             return "skipped"
@@ -8746,6 +8900,56 @@ class ChainBackendFlow:
             return "deferred"
         self._install(text, new_client)
         return "swapped"
+
+    def install_public(self) -> bool:
+        """TCK-PRIVACY-001 as re-targeted by TCK-DESCOPE-M3A: the consent
+        seam's INSTALL half — build the named public Electrum client
+        (:data:`~localwallet.config.PUBLIC_ELECTRUM_URL`) through the SAME
+        scheme-dispatch construction + hot-swap path every other backend
+        choice rides, install it (rebinding worker/handlers, closing the
+        old client BOUNDED), and release a held first-run scan ON IT.
+        There is no public-default client to release onto anymore.
+
+        Code-review fix 2 (TCK-DESCOPE-M3A): consent INSTALLS only into the
+        HELD first-run scan (gate ``awaiting_backend`` — the unresolved
+        state consent actually answers). A stale/duplicate consent POST
+        while a RESOLVED backend already serves the wallet must NEVER move
+        queries to the public Electrum server or fire a resync: the record
+        write stands (it changes nothing while a rung wins the ladder), the
+        install is a NO-OP. The sanctioned resolved→public switch is /setup
+        (``install_saved("")``, marker-first) or an explicit ``apply()`` —
+        both deliberately route past this guard.
+        Fail-closed: a build failure (or a shadowing env/config-file rung)
+        installs nothing and leaves the wiring untouched. Returns whether
+        the held scan ACTUALLY started loading (F2 contract)."""
+        scan = self._w.scan
+        if scan is None or scan.gate.state != "awaiting_backend":
+            return False
+        outcome, started = self._install_public()
+        return outcome == "swapped" and started
+
+    def _install_public(self) -> tuple[str, bool]:
+        """The public-Electrum install shared by :meth:`install_public`
+        (chat/web consent) and the ``/setup`` revert (``install_saved("")``
+        with the marker recorded). Returns ``(swapped|deferred|skipped,
+        held-scan-started)`` — the started flag is honest only when the
+        release/report says the load began (security review F2)."""
+        if self.shadowed:
+            # An operator rung outranks the stored consent; the next
+            # launch resolves through the ladder as always.
+            return "skipped", False
+        try:
+            new_client = _build_chain_client(
+                replace(self._w.settings, chain_base_url=PUBLIC_ELECTRUM_URL),
+                _backend_auth(self._w.store),
+            )
+        except ValueError:
+            return "skipped", False  # never strand the live client
+        if self._worker_occupied():
+            self._deferred = (PUBLIC_ELECTRUM_URL, new_client)
+            return "deferred", False
+        status = self._install(PUBLIC_ELECTRUM_URL, new_client)
+        return "swapped", status == "started"
 
     def resync(self) -> str:
         """The ``Resync now`` action (deliverable 5, user direction 6): the
@@ -8816,22 +9020,43 @@ class ChainBackendFlow:
 
     def _rebind_handlers(self, client: ChainClient) -> None:
         """Rebuild the client-riding dispatch-table entries over the
-        new client (fee/price wrappers re-attached) IN PLACE — the table is
-        the same dict object the pump, the AgentLoop and every pending
-        consult share, so no consumer can hold the dead closure set after
-        the swap returns. The other handlers read only the store/flow and
-        are structurally unaffected."""
+        new client IN PLACE — the table is the same dict object the pump,
+        the AgentLoop and every pending consult share, so no consumer can
+        hold the dead closure set after the swap returns. The other
+        handlers read only the store/flow and are structurally
+        unaffected.
+
+        TCK-DESCOPE-M3A (plan §4): the fee/price wrappers do NOT ride the
+        swap anymore — the estimator and the oracle live on the ONE
+        standalone public-info fetcher (:attr:`_Wiring.public_info`),
+        backend-independent by construction, so the swap re-attaches the
+        SAME shared instances (one source, one cache, one TTL — and no
+        rebind even needs to touch them beyond passing the shared oracle
+        into the rebuilt handlers)."""
         w = self._w
         scan = w.scan
         # TCK-FIAT-001 security-review LOW (folded into TCK-UX-009): ONE
-        # oracle rebuilt per swap, shared by get_balance (fiat display) and
-        # create_tx (USD resolution) — the single-cache invariant the
-        # initial wiring establishes (build_dispatch_table), restored here
-        # instead of two private caches over the same client. TCK-FIAT-002:
-        # the rebuilt oracle keeps the SAME live display-currency ladder.
-        price_oracle = PriceOracle(
-            client, currency=_display_currency_reader(w.settings, w.store)
-        )
+        # oracle shared by get_balance (fiat display) and create_tx (USD
+        # resolution) — the single-cache invariant the initial wiring
+        # establishes (build_dispatch_table), restored here. TCK-FIAT-002:
+        # the shared oracle keeps the SAME live display-currency ladder.
+        price_oracle = w.price_oracle
+        if price_oracle is None:  # pragma: no cover — _wire always sets it
+            price_oracle = PriceOracle(
+                w.public_info
+                if w.public_info is not None
+                else PublicInfoClient(w.settings),
+                currency=_display_currency_reader(w.settings, w.store),
+            )
+            w.price_oracle = price_oracle
+        fee_estimator = w.fee_estimator
+        if fee_estimator is None:  # pragma: no cover — _wire always sets it
+            fee_estimator = FeeEstimator(
+                w.public_info
+                if w.public_info is not None
+                else PublicInfoClient(w.settings)
+            )
+            w.fee_estimator = fee_estimator
         w.table[IntentName.GET_BALANCE] = _make_get_balance_handler(
             w.store,
             w.wallet.id,
@@ -8849,7 +9074,7 @@ class ChainBackendFlow:
             w.wallet.id,
             w.parsed,
             w.flow,
-            FeeEstimator(client),
+            fee_estimator,
             price_oracle,
             scan.scan_now if scan is not None else (lambda: None),
             seconds_since_last_block_fn=lambda: _safe_time_since_last_block(client),
@@ -8862,26 +9087,30 @@ class ChainBackendFlow:
         w.table[IntentName.TX_STATUS] = _make_tx_status_handler(
             client, w.flow, scan.gate if scan is not None else None
         )
-        # TCK-TX-SELF-001: self_transfer rides the fee estimator (the one
-        # chain call it makes), so it is rebuilt over the new client too —
-        # same scan_fn/gate threading as create_tx.
+        # TCK-TX-SELF-001: self_transfer rides the fee estimator (now the ONE
+        # backend-independent shared instance); same scan_fn/gate threading
+        # as create_tx.
         w.table[IntentName.SELF_TRANSFER] = _make_self_transfer_handler(
             w.store,
             w.wallet.id,
             w.parsed,
             w.flow,
-            FeeEstimator(client),
+            fee_estimator,
             scan.scan_now if scan is not None else (lambda: None),
             seconds_since_last_block_fn=lambda: _safe_time_since_last_block(client),
             scan_gate=scan.gate if scan is not None else None,
         )
 
 
-def _close_quietly(client: ChainClient) -> None:
+def _close_quietly(client: ChainClient | None) -> None:
     """Bounded, best-effort close of a retired client: BOTH adapters'
     close() are synchronous and local (httpx pool discard / socket close),
     and a close failure can never be allowed to unwind an APPLIED settings
-    write — the value is stored and serving regardless."""
+    write — the value is stored and serving regardless. ``None`` (the
+    TCK-DESCOPE-M3A unresolved state — there was no client to retire) is a
+    no-op."""
+    if client is None:
+        return
     try:
         client.close()
     except Exception:  # noqa: BLE001, S110 — containment: retirement never raises
@@ -8950,10 +9179,15 @@ def _wire(
     # store-free, so the stored value rides in as a plain argument). The
     # effective selection (env > config file > stored) is written back onto
     # ``settings.chain_base_url``, the single selection point (ADR-0018):
-    # the chain client, the 3-state privacy banner, the watch-mode line, and
-    # the node_status narration all read that one field and can therefore
-    # never disagree (decision 6). With nothing on any rung, the value stays
-    # empty and behavior is bit-identical to the public default.
+    # the chain client, the privacy banner, the watch-mode line, and the
+    # node_status narration all read that one field and can therefore never
+    # disagree (decision 6). TCK-DESCOPE-M3A: with nothing on any rung the
+    # backend is UNRESOLVED — no client is constructed and no wallet call
+    # can happen (the old silent public-esplora default is removed; the
+    # scan holds at ``awaiting_backend`` interactively/web, and a headless
+    # launch REFUSES the scan). An explicit public consent record resolves
+    # the wallet onto the NAMED public Electrum server (folded below, the
+    # one place consent becomes a URL).
     # TCK-BACKEND-002: the PRE-fold value is the env/config-file rung, kept
     # on the wiring as ``boot_backend`` — the hot-swap's honest
     # shadowed/requires_restart answer follows the SAME precedence without
@@ -8962,18 +9196,35 @@ def _wire(
     effective_backend = resolve_chain_base_url(
         settings.chain_base_url, store.get_chain_base_url()
     )
+    if effective_backend is None and _public_consent_recorded(store):
+        # Consent from an earlier warned conversation IS a choice — of this
+        # named server (never a silent default; ADR-0003 amendment).
+        effective_backend = PUBLIC_ELECTRUM_URL
     if effective_backend is not None:
         settings.chain_base_url = effective_backend
-
-    client = _build_chain_client(settings, _backend_auth(store))
-    # The scheme-selecting construction helper (TCK-ONB-004 M1): it resolves
-    # through the single selection point (ChainConfig.from_settings —
-    # Settings.chain_base_url when set, else the legacy esplora_base_url)
-    # and picks Esplora (http(s)) or Electrum (ssl://) from the URL scheme.
-    # The stored rung was folded into ``settings.chain_base_url`` above, so
-    # the client and every banner/mode surface resolve the SAME value. This
-    # site must NOT hardcode a public default that would bypass the Phase 4
-    # backend switch (ADR-0018).
+        try:
+            client: ChainClient | None = _build_chain_client(
+                settings, _backend_auth(store)
+            )
+        except ValueError as exc:
+            # An operator rung (env/config file) naming a non-wallet
+            # backend (an http(s) Esplora URL — no longer a wallet family,
+            # or a malformed scheme): fail closed with the value-free
+            # startup refusal, never a silent fallback (ADR-0023 decision
+            # 4: a chosen backend that cannot be served is named, not
+            # papered over). The value-free line names the accepted
+            # families only.
+            raise _WiringError(
+                "Configuration error: LOCALWALLET_CHAIN_BASE_URL (or the "
+                "config-file key) is not a supported wallet backend — name "
+                "an Electrum (ssl://) or Bitcoin Core (bitcoind://) server"
+            ) from exc
+    else:
+        # UNRESOLVED: the wallet has NO chain client. Every chain-riding
+        # surface is structurally held (awaiting_backend gate / refused
+        # headless scan); a consent or a save installs the real client
+        # through the hot-swap seam.
+        client = None
     # TCK-FIAT-002 (ADR-0011 amendment): the display-currency ladder is
     # VALIDATED AT STARTUP — an unknown code on any rung (env, config file,
     # or stored) is a fail-closed, VALUE-FREE startup refusal, the same
@@ -8985,10 +9236,16 @@ def _wire(
         resolve_display_currency(settings.display_currency, _stored_display_currency(store))
     except ValueError as exc:
         raise _WiringError(f"Configuration error: {exc}") from exc
-    # Fee/price wrappers share the ONE chain client (no second transport);
-    # construction is network-free — they fetch lazily, per their TTLs.
-    fee_estimator = FeeEstimator(client)
-    price_oracle = PriceOracle(client, currency=_display_currency_reader(settings, store))
+    # TCK-DESCOPE-M3A (plan §4): fees and prices ride the ONE standalone
+    # PUBLIC-INFO fetcher (mempool.space, payloads carry no wallet
+    # addresses) REGARDLESS of which wallet backend resolves — constructed
+    # once here, never rebuilt on a hot-swap. The floor-follower and the
+    # ADR-0011 price ladder behave exactly as they did on an Esplora
+    # wallet backend; a public-source failure degrades per the existing
+    # fail-closed shapes (recommended fallback / stale → sats-only).
+    public_info = _public_info_client(settings)
+    fee_estimator = FeeEstimator(public_info)
+    price_oracle = PriceOracle(public_info, currency=_display_currency_reader(settings, store))
     tx_flow = flow if flow is not None else TxFlow()
 
     # The dedicated chain worker (ADR-0022 decision 2): ALL scan/watch chain
@@ -9041,26 +9298,33 @@ def _wire(
     # backend choice exists on ANY rung (env > config file > stored >
     # explicit-public record), an interactive or web launch HOLDS the gate
     # at ``awaiting_backend`` until the backend branch resolves —
-    # user-confirmed 2026-09-09: wallet addresses must never reach the
-    # public default before an explicit choice. The hold is INDEPENDENT of
-    # AUTO_SCAN (security review F1, the blocker): turning off the
-    # AUTOMATIC scan is not consent to an unchosen server — the held gate
-    # stands the lazy in-handler scan and the watch drain down too, so an
-    # AUTO_SCAN=0 launch stays leak-free while unresolved and the
-    # mandatory ask re-arms on EVERY unresolved interactive launch (a
-    # consent-released load is user-initiated, not an auto scan). Every
-    # run with a resolved choice scans immediately (or stays lazy-
-    # opted-out), unchanged. A headless scripted launch keeps ADR-0023's
-    # never-blocked contract: no ask can appear there, so it behaves
-    # exactly as before the amendment — the command line is the operator's
-    # explicit decision (the documented carve-out; ADR-0022 amendment 1).
+    # user-confirmed 2026-09-09: wallet addresses must never reach a server
+    # before an explicit choice. The hold is INDEPENDENT of AUTO_SCAN
+    # (security review F1, the blocker): turning off the AUTOMATIC scan is
+    # not consent to an unchosen server — the held gate stands the lazy
+    # in-handler scan and the watch drain down too, so an AUTO_SCAN=0
+    # launch stays leak-free while unresolved and the mandatory ask re-arms
+    # on EVERY unresolved interactive launch (a consent-released load is
+    # user-initiated, not an auto scan). Every run with a resolved choice
+    # scans immediately (or stays lazy-opted-out), unchanged.
+    # TCK-DESCOPE-M3A AMENDS THE HEADLESS CARVE-OUT (ADR-0023 amendment 3):
+    # a non-interactive scripted launch cannot answer the ask, and the
+    # silent public default it used to fall through to is GONE — scanning
+    # an unchosen server is the leak the whole consent discipline exists to
+    # prevent, so an unresolved headless launch REFUSES the startup scan
+    # with the value-free :data:`HEADLESS_BACKEND_REFUSAL` line and holds
+    # the gate at ``awaiting_backend`` forever (no wallet call can happen;
+    # the handlers refuse with :data:`NO_BACKEND_REFUSAL`). "The command
+    # line is the operator's decision" now means AN EXPLICIT server on the
+    # command line (env/config-file rung), not the absence of one.
     auto_scan = os.environ.get(AUTO_SCAN_ENV_VAR, "").strip() != "0"
     backend_choice_resolved = _backend_resolved(effective_backend, store)
-    defer_startup = (
-        not backend_choice_resolved and (cli_interactive or web_mode)
-    )
-    if defer_startup:
+    defer_startup = False
+    if not backend_choice_resolved:
         scan.set_startup_deferred(rescan=rescan)
+        defer_startup = True
+        if not (cli_interactive or web_mode):
+            output_fn.warning(HEADLESS_BACKEND_REFUSAL)
     elif rescan or auto_scan:
         output_fn(SCAN_PROGRESS_NOTICE)
         try:
@@ -9160,12 +9424,18 @@ def _wire(
             loopback_host=_loopback_host_of,
             armed=ask_at_startup,
             deferred=defer_startup,
-            # Explicit public consent (recorded by the flow itself) releases
-            # the held scan ON THE CURRENT (public-default) client — the only
-            # in-session release that needs no swap. No-op unless the gate is
-            # actually awaiting, and it REPORTS whether the load started (the
-            # flow gates its "loading now" line on that answer, F2).
-            public_chosen=scan.release_backend,
+            # Explicit public consent (recorded by the flow itself) now
+            # INSTALLS the named public Electrum server through the
+            # hot-swap seam and releases the held scan ON IT
+            # (TCK-DESCOPE-M3A — there is no public-default client to
+            # release onto). No-op unless the gate is actually awaiting, and
+            # it REPORTS whether the load started (the flow gates its
+            # "loading now" line on that answer, F2). Late-bound like
+            # ``backend_saved``: only the pump runs it, after the tail
+            # builds the controller.
+            public_chosen=(
+                lambda: swap.install_public() if swap is not None else False
+            ),
             # TCK-BACKEND-002: an OWN-server save now hot-swaps the live
             # client and resyncs in-session (the ADR-0018 amendment) — the
             # conversation reports swapped/deferred/skipped and adjusts its
@@ -9188,8 +9458,12 @@ def _wire(
     session = SendSession()
     # The confirmation-ETA mempool hint (TCK-P5-002): consulted per create_tx
     # and per CREATED turn (lazily, fail-closed to no congestion adjustment);
-    # narration-only — never a gate input.
-    seconds_since_last_block_fn = lambda: time_since_last_block(client)
+    # narration-only — never a gate input. TCK-DESCOPE-M3A: an UNRESOLVED
+    # backend has no client to ask — the hint degrades to None (the wallet
+    # is gated off long before this narration could run anyway).
+    seconds_since_last_block_fn = (
+        lambda: time_since_last_block(client) if client is not None else None
+    )
     table = build_dispatch_table(
         store,
         wallet_row,
@@ -9229,6 +9503,9 @@ def _wire(
         wallet=wallet_row,
         boot_backend=boot_backend,
         defer_scans=web_mode,
+        public_info=public_info,
+        fee_estimator=fee_estimator,
+        price_oracle=price_oracle,
     )
     # Build last so the controller sees the finished wiring it mutates (the
     # late-bound ``swap`` name above now points here for the onboarding hook).
@@ -9482,7 +9759,8 @@ def _run_web(
             # autocommit (isolation_level=None), everything written was
             # already durable, and the connection dies with the process.
             wiring.worker.stop()
-            wiring.client.close()
+            if wiring.client is not None:
+                wiring.client.close()
         close = getattr(generate, "close", None)
         if callable(close):
             close()
@@ -9672,7 +9950,7 @@ def _repl(
     flow: TxFlow,
     session: SendSession,
     watcher: IncomingWatcher | None = None,
-    client: EsploraClient | None = None,
+    client: ChainClient | None = None,
     table: DispatchTable,
     emitter: EventEmitter | None = None,
     scan: ScanFlow | None = None,
@@ -10110,7 +10388,7 @@ def _run_turn(
     line: str,
     output_fn: Callable[[str], None],
     *,
-    client: EsploraClient | None = None,
+    client: ChainClient | None = None,
     table: DispatchTable,
     scan_gate: StartupScan | None = None,
 ) -> None:
@@ -11218,7 +11496,12 @@ def _print_node_status(result: Mapping[str, object], output_fn: Callable[[str], 
         output_fn(sanitize_tool_output(_error_line(result, "Node status lookup failed")))
         return
     backend = result.get("backend_mode")
-    if backend == BACKEND_MODE_OWN_NODE_LOCAL:
+    if backend == PRIVACY_MODE_AWAITING_BACKEND:
+        # TCK-DESCOPE-M3A: no silent default means no server to name — the
+        # honest unchosen answer, never the public-leak line for a server
+        # the user never picked.
+        output_fn(sanitize_tool_output(_NODE_STATUS_UNCHOSEN))
+    elif backend == BACKEND_MODE_OWN_NODE_LOCAL:
         output_fn(sanitize_tool_output(_NODE_STATUS_OWN_NODE_LOCAL))
     elif backend == BACKEND_MODE_OWN_NODE_REMOTE:
         # Same host insertion as the banner (TCK-UX-009 lockstep); generic

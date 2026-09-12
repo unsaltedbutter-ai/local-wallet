@@ -52,15 +52,13 @@ class ChainConfig:
     """Connection parameters for the chain adapter.
 
     Attributes:
-        base_url: backend URL — an Esplora API root such as
-            ``https://mempool.space/api`` (public default, ADR-0003) or a
-            user's self-hosted instance selected via
-            ``Settings.chain_base_url`` (ADR-0018), an Electrum-protocol
-            endpoint             ``ssl://host[:port]`` which selects the Electrum
-            adapter, OR a Bitcoin Core RPC endpoint
-            ``bitcoind://[user:pass@]host[:port]`` (plain-http JSON-RPC) /
-            ``bitcoind+tls://[user:pass@]host[:port]`` (https JSON-RPC,
-            TCK-BACKEND-003) which selects the Core-RPC adapter
+        base_url: backend URL — a user-selected wallet backend via
+            ``Settings.chain_base_url`` (ADR-0018 as amended by
+            TCK-DESCOPE-M3A: Electrum ``ssl://host[:port]`` or Bitcoin Core
+            RPC ``bitcoind://[user:pass@]host[:port]`` /
+            ``bitcoind+tls://…``), OR an Esplora API root such as
+            ``https://mempool.space/api`` constructed DIRECTLY by the
+            public-info fetcher (fees/prices only — no wallet default)
             (TCK-ONB-004 M2; ADR-0018 amendment — see :attr:`kind`). The
             single selection lives in :meth:`from_settings`. Core userinfo
             is permitted ONLY on the env/config-file rungs (the store's
@@ -219,35 +217,47 @@ class ChainConfig:
     def from_settings(cls, settings: Settings) -> ChainConfig:
         """Build a ChainConfig from the root Settings (no env reads here).
 
-        The chain backend is selected here — the single, unambiguous
-        selection point (Phase 4, TCK-P4-002; ADR-0018):
+        The WALLET chain backend is selected here — the single, unambiguous
+        selection point (Phase 4, TCK-P4-002; ADR-0018 as amended by
+        TCK-DESCOPE-M3A):
 
-        - if ``settings.chain_base_url`` is set (non-empty), it is the
-          authoritative backend base for the WHOLE wallet (every
-          client-mediated call: address txs/utxos, tip, fees, price,
-          broadcast) — flipping the backend to a user's own instance is a
-          config-only operation;
-        - otherwise ``settings.esplora_base_url`` is used, preserving the
-          ADR-0003 public default and full backward compatibility with
-          ``LOCALWALLET_ESPLORA_BASE_URL``.
+        - ``settings.chain_base_url`` set (non-empty) is the authoritative
+          backend base for the WHOLE wallet (every client-mediated call:
+          address txs/utxos, tip, watch, broadcast, tx_status) — flipping
+          the backend to a user's own instance is a config-only operation;
+        - ``settings.chain_base_url`` EMPTY means UNRESOLVED: there is no
+          wallet default anymore (the old ``esplora_base_url`` public
+          fallback is removed — mempool.space is a PUBLIC-INFO source for
+          fees/prices only, ADR-0003/0011/0023 amendments). Constructing a
+          wallet client while unresolved fails closed with a value-free
+          :class:`ValueError`; the app holds the first-run scan at
+          ``awaiting_backend`` instead (never a silent public scan).
 
-        The URL SCHEME selects the adapter kind (TCK-ONB-004 M1; ADR-0018
+        The URL SCHEME selects the adapter kind (TCK-ONB-004 M1/M2; ADR-0018
         amendment): ``ssl://host[:port]`` → the Electrum-protocol client
-        (:attr:`kind` == ``"electrum"``, consumed at the single construction
-        site ``app._build_chain_client``); http(s) → Esplora as before.
+        (:attr:`kind` == ``"electrum"``), ``bitcoind[+tls]://`` → the Core
+        RPC client; http(s) stays a well-formed ChainConfig shape (the
+        public-info Esplora path and the M4-retired probe construct it
+        directly) but the WALLET construction site refuses that kind.
 
-        A malformed selected URL (non-http(s), or an ``ssl://`` URL without
-        a well-formed host[:port]) fails closed here with a value-free
-        :class:`ValueError` at construction time — never a mid-request crash.
+        A malformed selected URL (a foreign scheme, or an ``ssl://`` URL
+        without a well-formed host[:port]) fails closed here with a
+        value-free :class:`ValueError` at construction time — never a
+        mid-request crash.
         """
         selected = settings.chain_base_url.strip() if settings.chain_base_url else ""
         # A non-empty chain_base_url that strips to nothing (whitespace-only)
-        # is malformed — the user set it deliberately, so silently falling back
-        # to the public default would undo their intent. Fail closed. Only a
-        # truly absent/empty value falls back to the legacy default.
+        # is malformed — the user set it deliberately, so silently treating
+        # it as unset would undo their intent. Fail closed.
         if settings.chain_base_url and not selected:
             raise ValueError("chain_base_url must not be blank when set")
-        base_url = selected or settings.esplora_base_url
+        if not selected:
+            # TCK-DESCOPE-M3A: empty is UNRESOLVED, never a public default
+            # (value-free — there is nothing to echo).
+            raise ValueError(
+                "no wallet chain backend is configured (chain_base_url is empty)"
+            )
+        base_url = selected
         return cls(
             base_url=base_url,
             timeout_s=settings.request_timeout_s,

@@ -1062,19 +1062,21 @@ class TestSelectionAndProtocol:
         assert check_backend(server.url, timeout_s=0.5, max_retries=0) is False
 
     def test_build_chain_client_picks_by_scheme(self) -> None:
+        # TCK-DESCOPE-M3A: the wallet construction site dispatches the two
+        # wallet families and REFUSES the Esplora (http) shape value-free —
+        # mempool.space is public fee/price info only (PublicInfoClient).
         client_x = app_module._build_chain_client(
             Settings(chain_base_url="ssl://127.0.0.1:59999", request_timeout_s=5.0, max_retries=0)
         )
-        client_e = app_module._build_chain_client(
-            Settings(chain_base_url="https://mempool.space/api", request_timeout_s=5.0, max_retries=0)
-        )
         try:
             assert isinstance(client_x, ElectrumClient)
-            assert isinstance(client_e, EsploraClient)
             assert (client_x._host, client_x._port) == ("127.0.0.1", 59999)
+            with pytest.raises(ValueError):
+                app_module._build_chain_client(
+                    Settings(chain_base_url="https://mempool.space/api", request_timeout_s=5.0, max_retries=0)
+                )
         finally:
             client_x.close()
-            client_e.close()
 
     def test_build_chain_client_default_port(self) -> None:
         client = app_module._build_chain_client(

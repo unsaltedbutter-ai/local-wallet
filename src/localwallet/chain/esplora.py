@@ -6,19 +6,19 @@ the Esplora API shape served by mempool.space and by self-hosted mempool /
 electrs instances — the Phase 4 backend swap targets this same interface
 (ADR-0003).
 
-Backend selection (Phase 4, TCK-P4-002; ADR-0018): the base URL is resolved
-from :class:`localwallet.config.Settings` in
-:meth:`ChainConfig.from_settings` — the single, unambiguous selection point.
-``Settings.chain_base_url`` (``LOCALWALLET_CHAIN_BASE_URL``) is authoritative
-when set, so flipping the wallet onto the user's own instance is a
-config-only operation and EVERY EsploraClient-mediated call (address
-txs/utxos, tip, fees, price, broadcast) hits the configured instance with
-zero requests to the public default. When it is unset, the legacy
-``Settings.esplora_base_url`` (``LOCALWALLET_ESPLORA_BASE_URL``) is used,
-preserving the ADR-0003 public default. A self-hosted URL must serve
-testnet4 (ADR-0004); the client's path shapes are identical regardless of
-host. A malformed selected URL fails closed with a value-free
-:class:`ValueError` at construction — never a mid-request crash.
+Backend selection (TCK-DESCOPE-M3A amendment of ADR-0018): this client is
+no longer the wallet's chain backend — wallet information comes ONLY from
+the Electrum/bitcoind adapters (USER REDIRECTION 2026-09-11). Its base URL
+comes from ``Settings.esplora_base_url`` (``LOCALWALLET_ESPLORA_BASE_URL``,
+the repurposed PUBLIC-INFO base, default ``https://mempool.space/api``) or
+an explicit constructor argument — never from the wallet selection point
+``ChainConfig.from_settings`` (an unset ``chain_base_url`` there now means
+UNRESOLVED, not "public default"). The remaining WALLET-shaped methods are
+dead-code-pending-M4 (deleted in TCK-DESCOPE-M4); the live post-M3 consumer
+is :class:`localwallet.chain.publicinfo.PublicInfoClient`, which wraps this
+client's GET path for fees/prices only. A malformed selected URL fails
+closed with a value-free :class:`ValueError` at construction — never a
+mid-request crash.
 
 Design notes:
 
@@ -537,10 +537,10 @@ class EsploraClient:
     when that setting is active.
 
     Args:
-        base_url: Esplora API root; when ``None`` it resolves through the
-            single selection point ``ChainConfig.from_settings`` —
-            ``Settings.chain_base_url`` when set (self-hosted), else the
-            legacy ``Settings.esplora_base_url`` public default (ADR-0018).
+        base_url: Esplora API root; when ``None`` it defaults to
+            ``Settings.esplora_base_url`` — the PUBLIC-INFO base
+            (TCK-DESCOPE-M3A; NOT the wallet selection point, which resolves
+            only through ``ChainConfig.from_settings``).
         timeout_s: Per-request timeout in seconds; defaults to Settings.
         max_retries: Retries after the initial attempt; defaults to Settings.
         transport: Optional ``httpx.BaseTransport`` injection point (test
@@ -569,10 +569,19 @@ class EsploraClient:
         *,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        defaults = ChainConfig.from_settings(Settings.from_env())
+        defaults = Settings.from_env()
         self._config = ChainConfig(
-            base_url=defaults.base_url if base_url is None else base_url,
-            timeout_s=defaults.timeout_s if timeout_s is None else timeout_s,
+            # TCK-DESCOPE-M3A: the Esplora shape is PUBLIC-INFO surface now
+            # (fees/prices via ``chain.publicinfo``; the wallet-role removal
+            # lands in M4). The default base therefore comes from the
+            # repurposed ``esplora_base_url`` public-info base, NEVER from
+            # the wallet selection point ``ChainConfig.from_settings`` (an
+            # unset ``chain_base_url`` is UNRESOLVED there now, and an
+            # ``ssl://``/``bitcoind://`` wallet URL is not this client's).
+            base_url=(
+                defaults.esplora_base_url if base_url is None else base_url
+            ),
+            timeout_s=defaults.request_timeout_s if timeout_s is None else timeout_s,
             max_retries=defaults.max_retries if max_retries is None else max_retries,
             # TLS trust rides the SAME resolution as base_url (ADR-0018
             # amendment, TCK-BACKEND-001): no explicit argument — env >

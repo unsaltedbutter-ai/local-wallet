@@ -1,8 +1,11 @@
-"""Chain subsystem: THE ONLY networked module (Esplora, Electrum, bitcoind, fees, price).
+"""Chain subsystem: THE ONLY networked module (Electrum, bitcoind, fees, price).
 
-Network I/O lives exclusively here and is lint-enforced by
-``tools/lint_network.py``: only ``src/localwallet/chain/**`` may import
-network modules.
+Wallet information flows only through the two wallet adapters (Electrum /
+Bitcoin Core RPC, TCK-DESCOPE-M3A); the mempool.space Esplora shape remains
+solely as the PUBLIC-INFO source behind :class:`PublicInfoClient` (fees and
+prices — payloads carry no wallet addresses). Network I/O lives exclusively
+here and is lint-enforced by ``tools/lint_network.py``: only
+``src/localwallet/chain/**`` may import network modules.
 """
 
 from localwallet.chain.bitcoind import BitcoindClient
@@ -34,6 +37,7 @@ from localwallet.chain.price import (
     Rate,
     minor_per_unit,
 )
+from localwallet.chain.publicinfo import PublicInfoClient
 from localwallet.chain.watch import (
     IncomingEvent,
     IncomingWatcher,
@@ -63,6 +67,7 @@ __all__ = [
     "IncomingWatcher",
     "PriceOracle",
     "PriceUnavailableError",
+    "PublicInfoClient",
     "Rate",
     "TipBlock",
     "TxStatus",

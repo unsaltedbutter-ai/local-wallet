@@ -277,27 +277,24 @@ class TestClientBuildOverlay:
         assert "no_credentials" not in seen
         assert seen["base_url"] == "bitcoind://h:8332"
 
-    def test_http_and_ssl_kinds_ignore_credentials(
+    def test_non_core_kind_ignores_credentials(
         self, monkeypatch: pytest.MonkeyPatch, env_clean: None
     ) -> None:
-        # Creds are inert for non-Core kinds (plan OQ-5): the Esplora and
-        # Electrum constructors never even see them.
+        # Creds are inert for non-Core kinds (plan OQ-5): the Electrum
+        # constructor never even sees them. (TCK-DESCOPE-M3A removed the
+        # old Esplora half of this pin — http(s) is no longer a WALLET
+        # build at this seam; see test_chain_backend_switch for the
+        # refusal.)
         built: list[tuple[str, dict[str, Any]]] = []
 
-        monkeypatch.setattr(
-            app,
-            "EsploraClient",
-            lambda **kw: built.append(("esplora", kw)),
-        )
         monkeypatch.setattr(
             app,
             "ElectrumClient",
             lambda **kw: built.append(("electrum", kw)),
         )
         auth = _BackendAuth(user=USER, password=PASSWORD)
-        _build_chain_client(Settings(chain_base_url="https://x.example/api"), auth)
         _build_chain_client(Settings(chain_base_url="ssl://x:50002"), auth)
-        assert [kind for kind, _ in built] == ["esplora", "electrum"]
+        assert [kind for kind, _ in built] == ["electrum"]
         for _, kwargs in built:
             assert "rpc_user" not in kwargs and "no_credentials" not in kwargs
 

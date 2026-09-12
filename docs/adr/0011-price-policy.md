@@ -210,3 +210,31 @@ only worth adding if the endpoint starts serving them AND users ask —
 each new code widens the enum, the eval fixtures, and the formatting
 matrix; an arbitrary ISO-4217 passthrough is rejected (a fetch of a field
 the provider may not carry, and a label the model could hallucinate).
+
+## Amendment (2026-09-12, TCK-DESCOPE-M3A): price/fee source decoupled from the wallet backend
+
+The wallet no longer rides an Esplora API (ADR-0003/0018 amendments): chain
+data comes only from Electrum or Bitcoin Core. §1's rationale — "same host
+as the chain queries, so no *additional* third party" — **no longer holds
+and the ADR now says so honestly**: fees and prices ALWAYS come from
+mempool.space as an INDEPENDENT third-party public source (the standalone
+`chain/publicinfo.py` fetcher pinned to the repurposed `esplora_base_url`),
+regardless of which wallet backend is configured.
+
+- **Privacy posture restated:** the fee/price payloads are public
+  aggregations and carry **no wallet addresses** — the disclosure to this
+  third party is the app's IP and request timing only. That is a smaller
+  leak than any chain query and needs no consent gate (a price/fee fetch
+  cannot name a wallet); `LOCALWALLET_PRICE_ENABLED`'s opt-out stays the
+  user's switch over it.
+- **Behavior unchanged:** the floor-follower (2026-09-08 amendment) and
+  the §4 degrade ladder run byte-equivalently whenever the public source
+  is reachable, and their existing fail-closed shapes (recommended
+  fallback / stale-with-age / sats-only) apply when it is not — including
+  on an Electrum/bitcoind backend, where the old per-backend
+  `estimate_fee`/`supports_price=False` capability seam simply no longer
+  decides anything (it stays on the adapters, unused by the estimator).
+- §1's "extracting the USD field of `/v1/prices`" and the 2026-09-11
+  multi-currency amendment are untouched: same endpoint, same closed
+  currency enum, same TTLs — only the injection point moved from the
+  wallet client to the public-info fetcher.

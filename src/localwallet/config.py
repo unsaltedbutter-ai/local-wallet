@@ -173,20 +173,39 @@ def _load_config_file(path: Path, known: tuple) -> dict[str, object]:
     return out
 
 
+#: The EXPLICIT PUBLIC ELECTRUM server (TCK-DESCOPE-M3A; ADR-0003/0023
+#: amendments): "public" is no longer a silent mempool.space default — it is
+#: this named server, reachable + mainnet-verified 2026-09-11, chosen only
+#: through the warned consent flow (``app.set_public_backend_consent`` / the
+#: onboarding conversation), carrying the red leak warning (its operator sees
+#: every queried address plus the IP and transaction timing).
+PUBLIC_ELECTRUM_URL: Final[str] = "ssl://electrum.blockstream.info:50002"
+
+
 @dataclass
 class Settings:
     """Small, explicitly-settable runtime settings."""
 
+    # PUBLIC-INFO base only (TCK-DESCOPE-M3A; ADR-0011 amendment): the
+    # mempool.space API root the standalone public fetcher (fees + prices —
+    # payloads with NO wallet addresses) reads. It is NOT a wallet backend
+    # and NEVER was a wallet-selection fallback after M3: wallet information
+    # comes only from Electrum or bitcoind (USER REDIRECTION 2026-09-11).
+    # Still env/config-overridable (LOCALWALLET_ESPLORA_BASE_URL) like every
+    # scalar here.
     esplora_base_url: str = "https://mempool.space/api"
-    # THE single chain-backend selection point (Phase 4, TCK-P4-002; ADR-0018).
-    # When set (non-empty), this URL is the authoritative Esplora base for the
-    # WHOLE wallet: every EsploraClient-mediated call (address txs/utxos, tip,
-    # fees, price, broadcast) hits it. When empty (the default), the legacy
-    # ``esplora_base_url`` is used instead — preserving the ADR-0003 public
-    # default and full backward compatibility with LOCALWALLET_ESPLORA_BASE_URL.
-    # The instance must serve mainnet (mainnet-only invariant, ADR-0021); the
-    # client's path shapes are identical regardless of host. Validation is
-    # fail-closed at client construction (ChainConfig), never mid-request.
+    # THE single wallet chain-backend selection point (Phase 4, TCK-P4-002;
+    # ADR-0018 as amended by TCK-DESCOPE-M3A). When set (non-empty), this URL
+    # is the authoritative backend for ALL wallet data (scan/utxo/history/
+    # tip/watch/broadcast/tx_status): only the Electrum (``ssl://``) and
+    # Bitcoin Core (``bitcoind://``/``bitcoind+tls://``) families are
+    # accepted; an http(s) URL is no longer a wallet backend. When EMPTY the
+    # backend is UNRESOLVED — there is no public fallback: the first-run scan
+    # holds at ``awaiting_backend`` until the user names a server or gives
+    # explicit public consent (which resolves to PUBLIC_ELECTRUM_URL above,
+    # never to this field). The instance must serve mainnet (ADR-0021);
+    # validation is fail-closed at construction (ChainConfig), never
+    # mid-request.
     chain_base_url: str = ""
     # TLS trust for the chain backend's https transport (TCK-BACKEND-001;
     # ADR-0018 amendment). ``True`` (fail-closed shipped default) verifies the
@@ -200,8 +219,9 @@ class Settings:
     # here (price_enabled, node_detection_enabled) is env/file-only too. When
     # this resolves False the app prints one honest value-free warning line at
     # startup (app.TLS_UNVERIFIED_WARNING). Same construction path as
-    # ``chain_base_url`` (ChainConfig.from_settings → EsploraClient), so a
-    # self-hosted config gets both knobs from one place.
+    # ``chain_base_url`` (ChainConfig.from_settings → Electrum/bitcoind
+    # adapter; and the public-info fetcher independently), so a self-hosted
+    # config gets both knobs from one place.
     tls_verify: bool = True
     request_timeout_s: float = 10.0
     max_retries: int = 3
@@ -352,14 +372,15 @@ class Settings:
 def resolve_chain_base_url(
     env_value: str | None, stored_value: str | None
 ) -> str | None:
-    """Resolve the chain backend selection (ADR-0023 precedence; TCK-ONB-002).
+    """Resolve the wallet chain-backend selection (ADR-0023 precedence, as
+    amended by TCK-DESCOPE-M3A; TCK-ONB-002).
 
     Pure function — no env reads, no I/O, no store import. The first argument
     is the value already merged by ``Settings.from_env`` — env and config-file
     (TCK-CFG-002) collapsed into one rung (env wins over file inside the
     merge). Precedence::
 
-        env  >  config file  >  stored choice  >  None
+        env  >  config file  >  stored choice  >  None (UNRESOLVED)
 
     i.e. the caller injects ``Settings.chain_base_url`` (env-or-file) as
     ``env_value`` and the stored value as ``stored_value``. Each rung treats
@@ -367,12 +388,14 @@ def resolve_chain_base_url(
     *unset* (an exported empty var is indistinguishable from an absent one —
     both mean "no override"). The winning value is returned stripped; a
     whitespace-only setting never resolves to a usable URL, so it falls
-    through to the next rung instead. ``None`` means *no rung is set*: the
-    caller keeps ``Settings.chain_base_url`` empty and the existing public
-    default applies unchanged (zero change when unset, ADR-0018 decision 2 /
-    ADR-0023 decision 3). Validation of a stored value happened at write time
-    (``Store.set_chain_base_url``); the env rung keeps failing closed in
-    ``ChainConfig.from_settings`` as before.
+    through to the next rung instead. ``None`` means *no wallet backend is
+    resolved* — there is NO public default (M3A removed the old
+    ``esplora_base_url`` fallback: empty is UNRESOLVED, held at
+    ``awaiting_backend``, never silently public). The caller may still reach
+    a backend through the EXPLICIT public consent record (``app._wire`` folds
+    a recorded consent onto ``config.PUBLIC_ELECTRUM_URL`` — a warned,
+    chosen server, never a default). Validation of the resolved URL still
+    fails closed in ``ChainConfig.from_settings`` / ``_build_chain_client``.
     """
     for value in (env_value, stored_value):
         if value is not None and value.strip():

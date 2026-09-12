@@ -132,8 +132,7 @@ def _mk_wiring(
 
     def _built(sink: list[_FakeChain], settings: Settings) -> _FakeChain:
         client = _FakeChain(
-            resolve_chain_base_url(settings.chain_base_url, None)
-            or settings.esplora_base_url
+            resolve_chain_base_url(settings.chain_base_url, None) or ""
         )
         sink.append(client)
         return client
@@ -149,8 +148,7 @@ def _mk_wiring(
         store_path=str(tmp_path / "swap.db"), chain_base_url=boot_backend or ""
     )
     initial = _FakeChain(
-        resolve_chain_base_url(settings.chain_base_url, stored_url)
-        or settings.esplora_base_url
+        resolve_chain_base_url(settings.chain_base_url, stored_url) or ""
     )
     worker = app.ChainWorker(initial)  # type: ignore[arg-type]
     scan = app.ScanFlow(store, wallet, worker, gap_limit=None)
@@ -383,23 +381,34 @@ def test_mid_scan_swap_defers_until_scan_done(
     wiring.store.close()
 
 
-def test_clear_write_swaps_back_to_the_public_default(
+def test_clear_write_without_consent_is_refused_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
 ) -> None:
-    """The typed writer's ``""``-clears convention rides the SAME hot-swap
-    path: clearing the stored rung swaps the live client back onto the
-    built-in public default and resyncs (no probe — the default is shipped,
-    not user-supplied)."""
+    """TCK-DESCOPE-M3A: with no public default to swap BACK to, a plain
+    ``""`` settings-clear is REFUSED value-free (building an unresolved
+    wallet client fails closed) — the store and the live client untouched,
+    the current backend still serving. The sanctioned way to change the
+    backend is a NEW address (probe→store→swap) or the warned public
+    revert (which records the consent marker and installs the public
+    Electrum server — see the install_saved("") pins)."""
     wiring, commands = _mk_wiring(tmp_path, monkeypatch, stored_url=GOOD_URL)
     old = wiring.client
     flow, seen = _mk_flow(wiring, commands)
+
+    # Faithfully mirror the production build: an empty chain_base_url raises
+    # (there is no wallet client to build while unresolved) — _mk_wiring's
+    # fake is too permissive to exercise this guard itself.
+    def _strict_build(settings, auth=None):
+        if not settings.chain_base_url.strip():
+            raise ValueError("unresolved")
+        return wiring.client  # any object: never used (build fails first)
+
+    monkeypatch.setattr(app, "_build_chain_client", _strict_build)
     error, fields = flow.apply("")
-    assert error is None and fields["swapped"] is True
-    assert seen == []  # clearing is never probed
-    assert wiring.store.get_chain_base_url() is None
-    assert wiring.client is not old and old.closed is True
-    assert wiring.client.base_url == Settings().esplora_base_url
-    _drain(wiring, commands)
+    assert error == BACKEND_PROBE_FAIL and fields == {}
+    assert seen == []  # nothing probed, nothing stored, nothing swapped
+    assert wiring.store.get_chain_base_url() == GOOD_URL
+    assert wiring.client is old and not old.closed
     wiring.store.close()
 
 
@@ -790,17 +799,30 @@ def test_backend_kind_follows_the_live_client_after_a_swap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
 ) -> None:
     """The badge answers what is SERVING (the boot-resolved selection point,
-    folded + updated by the swap), not what is merely stored: public before
-    any choice resolves, electrum after an ssl:// swap — and ``none`` while a
-    first-run choice is still unmade."""
+    folded + updated by the swap), not what is merely stored — TCK-DESCOPE-M3A
+    edition: ``none`` while a first-run choice is unmade (no silent public
+    client to badge); an explicit PUBLIC CONSENT serves the public Electrum
+    server, which badges as ``electrum`` (the public/private trust dimension
+    rides ``privacy_mode``, not the kind); an ssl:// swap badges likewise;
+    a cleared selection returns to ``none``."""
     wiring, commands = _mk_wiring(tmp_path, monkeypatch)
     store = wiring.store
     # Unresolved first-run: no marker, no rung → nothing is being consulted.
+    # The scan is HELD for the choice (the real consent scenario — since
+    # code-review fix 2 the consent seam installs ONLY into a held gate).
+    wiring.scan.set_startup_deferred()
     flow = ChainBackendFlow(wiring, _probe_true)
     assert flow.kind == "none"
-    store.set_setting(app.BACKEND_CHOICE_SETTING, app.BACKEND_CHOICE_PUBLIC)
-    assert flow.kind == "public"  # the warned consent → the folded default
-    store.set_setting(app.BACKEND_CHOICE_SETTING, "")  # back to unresolved
+    # The consent seam (marker + install of the named public Electrum).
+    assert app.set_public_backend_consent(store, flow) is True  # released
+    assert wiring.settings.chain_base_url == app.PUBLIC_ELECTRUM_URL
+    assert flow.kind == "electrum"
+    assert app._backend_mode(wiring.settings) == "public"  # trust dimension
+    _drain(wiring, commands)  # settle the consent's resync before the next swap
+    # Clearing the selection (rung + marker) → unresolved again: no client.
+    wiring.settings.chain_base_url = ""
+    store.set_setting(app.BACKEND_CHOICE_SETTING, "")
+    assert flow.kind == "none"
     error, fields = flow.apply(SSL_URL)
     assert error is None and fields["swapped"] is True
     assert flow.kind == "electrum"
@@ -872,20 +894,20 @@ def test_settings_reply_carries_the_effective_chain_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
 ) -> None:
     """Done-when pins (TCK-WEB-013, additive under the unchanged settings/1
-    tag): (a) an UNSET stored rung still answers the EFFECTIVE URL — the
-    public default; (b) an env rung carrying userinfo is displayed
+    tag; TCK-DESCOPE-M3A): (a) an UNSET rung answers the EFFECTIVE URL as
+    the EMPTY string — unresolved, never a public default; (b) an env rung carrying userinfo is displayed
     CREDENTIAL-FREE (and no reply byte leaks the login); (c) the stored-rung
     entry is untouched by the new field (stored and effective are distinct,
     the env rung shadows); (d) the field follows a live SWAP; (e) a bare
     pump (no chain wiring) OMITS it — absent, never guessed, the exact
     ``backend_kind`` rule it stamps beside."""
-    # (a) nothing on any rung: the public default appears beside the null entry.
+    # (a) nothing on any rung: EMPTY effective (unresolved — no public default).
     wiring, _commands = _mk_wiring(tmp_path, monkeypatch)
     flow = ChainBackendFlow(wiring, _probe_true)
     reply = app.handle_settings_request(wiring.store, None, None, flow)
     entry = next(e for e in reply["settings"] if e["key"] == "chain_base_url")
     assert entry["value"] is None  # STORED rung (what GET /settings always was)
-    assert reply[app.SETTINGS_EFFECTIVE_CHAIN_URL_KEY] == "https://mempool.space/api"
+    assert reply[app.SETTINGS_EFFECTIVE_CHAIN_URL_KEY] == ""
     # (e) bare pump: no wiring → neither additive field is fabricated.
     bare = app.handle_settings_request(wiring.store, None, None)
     assert app.SETTINGS_EFFECTIVE_CHAIN_URL_KEY not in bare

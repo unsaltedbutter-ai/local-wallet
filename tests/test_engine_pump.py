@@ -481,8 +481,12 @@ def test_state_snapshot_carries_each_privacy_mode_name() -> None:
     host behind it (the pinned contract: names over the wire)."""
     from localwallet.config import Settings
 
+    # TCK-DESCOPE-M3A: an empty selection is AWAITING (no silent public
+    # default); the public name belongs to the consented public Electrum
+    # server host only.
     for url, expected in (
-        ("", "public"),
+        ("", "awaiting_backend"),
+        ("ssl://electrum.blockstream.info:50002", "public"),
         ("ssl://127.0.0.1:50002", "own_node_local"),
         ("http://node.example.invalid:3006", "own_node_remote"),
     ):

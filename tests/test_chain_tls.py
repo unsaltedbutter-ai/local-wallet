@@ -276,10 +276,13 @@ def test_chain_config_carries_flag_from_settings(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("LOCALWALLET_TLS_VERIFY", "0")
+    # TCK-DESCOPE-M3A: a WALLET selection needs a named backend (no public
+    # default) — the knob resolution is otherwise untouched.
+    monkeypatch.setenv("LOCALWALLET_CHAIN_BASE_URL", "ssl://h:50002")
     settings = Settings.from_env(config_path=tmp_path / "absent.json")
     config = ChainConfig.from_settings(settings)
     assert config.tls_verify is False
-    assert config.base_url  # URL resolution untouched alongside the knob
+    assert config.base_url == "ssl://h:50002"
 
 
 def test_chain_config_default_and_strict_type() -> None:
@@ -307,7 +310,17 @@ def _run_with_mock_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> li
     monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "0")
     monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
     monkeypatch.setenv("LOCALWALLET_NODE_DETECTION_ENABLED", "0")
-    monkeypatch.setattr(app_module, "EsploraClient", lambda **_kw: _NullClient())
+    # TCK-DESCOPE-M3A: the app builds the wallet client and the decoupled
+    # public-info fetcher through two named seams — inject the null client
+    # at both (a resolved backend keeps the headless launch off the new
+    # refuse-the-scan path, which is not what these TLS pins test).
+    monkeypatch.setenv("LOCALWALLET_CHAIN_BASE_URL", "ssl://tls.test:50002")
+    monkeypatch.setattr(
+        app_module, "_build_chain_client", lambda *_a, **_k: _NullClient()
+    )
+    monkeypatch.setattr(
+        app_module, "_public_info_client", lambda *_a, **_k: _NullClient()
+    )
 
     outputs: list[str] = []
     code = run(

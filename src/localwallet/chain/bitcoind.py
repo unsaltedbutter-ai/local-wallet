@@ -371,12 +371,13 @@ class BitcoindClient:
 
     Satisfies :class:`~localwallet.chain.esplora.ChainClient`. Construction
     is network-free (the fail-closed handshake runs on the first call); the
-    URL, timeout, retry budget and cookie path resolve through the SAME
-    single selection point as every other backend —
-    :meth:`ChainConfig.from_settings` (``Settings.chain_base_url`` /
-    ``LOCALWALLET_CHAIN_BASE_URL`` with a ``bitcoind://``-family scheme) and
-    ``Settings.rpc_cookie_path`` (env > config-file > data-dir default,
-    ladder unchanged, ADR-0018 amendment). ``tls_verify`` rides the
+    app's ONE construction site (``app._build_chain_client``, fed by
+    ``ChainConfig.from_settings``) passes the selected URL + scalars
+    explicitly; a direct construction without them falls back to the env/
+    config-file ``chain_base_url`` rung with the same merged ``Settings``
+    timeout/retry/TLS scalars, and ``Settings.rpc_cookie_path`` (env >
+    config-file > data-dir default, ladder unchanged, ADR-0018 amendment).
+    ``tls_verify`` rides the
     construction ONLY for the TLS sibling: the plain-http transport has no
     TLS layer to trust or downgrade, the https transport verifies by
     default and is downgraded only by the explicit env/file rung (the app
@@ -412,17 +413,24 @@ class BitcoindClient:
         no_credentials: bool = False,
     ) -> None:
         settings = Settings.from_env()
-        defaults = ChainConfig.from_settings(settings)
+        # TCK-DESCOPE-M3A decoupling (mirrors ElectrumClient/EsploraClient):
+        # the SCALAR defaults come straight from the merged env/file
+        # Settings — NOT ``ChainConfig.from_settings`` (which now refuses an
+        # empty ``chain_base_url`` as UNRESOLVED and would spuriously raise
+        # when the caller supplies an explicit base_url the fresh env read
+        # cannot see, e.g. a stored-rung probe). An omitted ``base_url`` with
+        # an empty ``chain_base_url`` still fails closed in
+        # ``ChainConfig.__post_init__``.
         self._config = ChainConfig(
-            base_url=defaults.base_url if base_url is None else base_url,
-            timeout_s=defaults.timeout_s if timeout_s is None else timeout_s,
-            max_retries=defaults.max_retries if max_retries is None else max_retries,
+            base_url=settings.chain_base_url if base_url is None else base_url,
+            timeout_s=settings.request_timeout_s if timeout_s is None else timeout_s,
+            max_retries=settings.max_retries if max_retries is None else max_retries,
             # TCK-BACKEND-003: the ladder rides through, exactly as the
             # Esplora/Electrum constructions do it. inert on the plain-http
             # scheme (no TLS layer); decides certificate trust on the
             # bitcoind+tls:// sibling. There is no per-call override seam:
             # probe and live client can never disagree on transport policy.
-            tls_verify=defaults.tls_verify,
+            tls_verify=settings.tls_verify,
         )
         parsed = urlsplit(self._config.base_url)
         if parsed.scheme not in ("bitcoind", "bitcoind+tls"):

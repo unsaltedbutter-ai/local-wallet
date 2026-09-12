@@ -71,7 +71,7 @@ from localwallet.app import (
     stub_generate,
 )
 from localwallet.chain import EsploraClient, PriceOracle
-from localwallet.config import Settings
+from localwallet.config import PUBLIC_ELECTRUM_URL, Settings
 from localwallet.node import LocalNodeReport, NodeStatus
 from localwallet.node.detect import CoreHealth, CoreRpcProbe
 from localwallet.protocol import Envelope, IntentName, validate_payload
@@ -343,6 +343,33 @@ def _mock_client(
         timeout_s=5.0,
         max_retries=max_retries,
         transport=httpx.MockTransport(handler),
+    )
+
+
+def _patch_run_backends(
+    monkeypatch: pytest.MonkeyPatch,
+    make_client: Callable[[], EsploraClient],
+    *,
+    chain_url: str | None = None,
+) -> None:
+    """TCK-DESCOPE-M3A harness rewire for ``run()``-based tests. The old
+    world auto-resolved a silent public-Esplora DEFAULT (and these fixtures
+    patched ``app.EsploraClient``); the new one has NO wallet default, so
+    the harness NAMES the backend on the env rung — the consented PUBLIC
+    ELECTRUM server by default, keeping the PUBLIC banner these tests
+    assert — and injects the mock Esplora-shaped client at BOTH seams the
+    app now builds through: ``_build_chain_client`` (wallet data) and
+    ``_public_info_client`` (fees/prices, decoupled from the wallet client
+    — one shared mock handler keeps the recorded-request lists the count
+    assertions read)."""
+    monkeypatch.setenv(
+        "LOCALWALLET_CHAIN_BASE_URL", chain_url or PUBLIC_ELECTRUM_URL
+    )
+    monkeypatch.setattr(
+        app_module, "_build_chain_client", lambda *_a, **_k: make_client()
+    )
+    monkeypatch.setattr(
+        app_module, "_public_info_client", lambda *_a, **_k: make_client()
     )
 
 
@@ -1214,9 +1241,7 @@ def _run_captured(
     if store_path is not None:
         monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
     monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "1" if auto_scan else "0")
-    monkeypatch.setattr(
-        app_module, "EsploraClient", lambda **_: _mock_client(handler)
-    )
+    _patch_run_backends(monkeypatch, lambda: _mock_client(handler))
     inputs = iter(lines)
     outputs: list[str] = []
     state = {"first": True}
@@ -1337,7 +1362,7 @@ def test_auto_scan_opt_out_balance_scans_lazily_on_first_ask(
     monkeypatch.delenv("LOCALWALLET_MODEL_PATH", raising=False)
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
     monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "0")
-    monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
+    _patch_run_backends(monkeypatch, lambda: _mock_client(handler))
     lines = iter(["What's my balance?", "exit"])
     marks: dict[str, int] = {}
 
@@ -1447,15 +1472,16 @@ def _run_node_repl(
     monkeypatch.delenv("LOCALWALLET_LLM_MODEL", raising=False)
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
     monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "0")
-    if chain_base_url is None:
-        monkeypatch.delenv("LOCALWALLET_CHAIN_BASE_URL", raising=False)
-    else:
-        monkeypatch.setenv("LOCALWALLET_CHAIN_BASE_URL", chain_base_url)
     if node_detection_enabled:
         monkeypatch.setenv("LOCALWALLET_NODE_DETECTION_ENABLED", "1")
     else:
         monkeypatch.setenv("LOCALWALLET_NODE_DETECTION_ENABLED", "0")
-    monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
+    # TCK-DESCOPE-M3A: no chain rung = no client at all, so this harness
+    # always NAMES one (unset param → the consented PUBLIC ELECTRUM server,
+    # which is what these narration tests mean by "public").
+    _patch_run_backends(
+        monkeypatch, lambda: _mock_client(handler), chain_url=chain_base_url
+    )
 
     detect_calls: list[LocalNodeReport] = []
 
@@ -1492,9 +1518,10 @@ def test_node_status_repl_detects_and_narrates_facts(
     assert code == 0
     assert len(detect_calls) == 1, "detection must have actually run"
     joined = "\n".join(outputs)
-    # Public default: banner + node_status narration agree on public API.
+    # Public electrum (the consented public backend): banner + node_status
+    # narration agree on the public server wording (TCK-DESCOPE-M3A).
     assert PRIVACY_INDICATOR in joined
-    assert "You are querying the public API" in joined
+    assert "You are querying the public Electrum server" in joined
     # FACTS quoted verbatim: core + indexer + doctor guidance.
     assert "A Bitcoin Core node is reachable and synced." in joined
     assert "Indexer reachable: mempool." in joined
@@ -1534,7 +1561,7 @@ def test_node_status_own_node_narration_and_banner_flip(
         "You are querying your own node on this machine — addresses and "
         "lookups stay here." in joined
     )
-    assert "You are querying the public API" not in joined
+    assert "You are querying the public Electrum server" not in joined
     # Watch line: TCK-UX-012(b) copy — "on" is the NORMAL state, so an
     # on-launch prints NOTHING (UX-009's on-line retired; the stored rung
     # still reaches the watcher, pinned below).
@@ -1572,7 +1599,7 @@ def test_node_status_remote_own_node_narration_and_banner(
         "You are querying 192.168.1.50 for transaction information. This "
         "is only private if you trust this machine." in joined
     )
-    assert "You are querying the public API" not in joined
+    assert "You are querying the public Electrum server" not in joined
     assert "lookups stay on this machine" not in joined
     # Watch line: TCK-UX-012(b) — watch on prints nothing.
     assert "Background watch" not in joined
@@ -1675,13 +1702,18 @@ def test_watch_stored_setting_malformed_warns_once_and_defaults(
 
 
 def test_backend_mode_three_state_classification() -> None:
-    """The 3-way classification (TCK-SEC-004 change 5): no configured URL ⇒
-    public; loopback host ⇒ own_node_local; anything else ⇒
+    """The mode classification (TCK-SEC-004 change 5, re-targeted by
+    TCK-DESCOPE-M3A): no configured URL ⇒ UNRESOLVED (awaiting_backend —
+    the silent public default is gone); the consented PUBLIC ELECTRUM host
+    ⇒ public; loopback host ⇒ own_node_local; anything else ⇒
     own_node_remote."""
-    from localwallet.app import _backend_mode
-    from localwallet.config import Settings
+    from localwallet.app import PRIVACY_MODE_AWAITING_BACKEND, _backend_mode
+    from localwallet.config import PUBLIC_ELECTRUM_URL, Settings
 
-    assert _backend_mode(Settings()) == BACKEND_MODE_PUBLIC
+    assert _backend_mode(Settings()) == PRIVACY_MODE_AWAITING_BACKEND
+    assert _backend_mode(Settings(chain_base_url=PUBLIC_ELECTRUM_URL)) == (
+        BACKEND_MODE_PUBLIC
+    )
     assert (
         _backend_mode(Settings(chain_base_url="http://127.0.0.1:3006"))
         == BACKEND_MODE_OWN_NODE_LOCAL
@@ -1741,9 +1773,15 @@ def test_privacy_indicator_function_selects_wording_from_settings() -> None:
     REMOTE branch names the host, and a URL with no extractable host falls
     back to the generic wording (TCK-UX-009) rather than printing a broken
     line."""
+    from localwallet.app import PRIVACY_INDICATOR_UNCHOSEN
     from localwallet.config import Settings
 
-    assert privacy_indicator(Settings()) == PRIVACY_INDICATOR
+    # TCK-DESCOPE-M3A: unset is UNRESOLVED (nothing queried), the public
+    # wording belongs to the CONSENTED public Electrum server only.
+    assert privacy_indicator(Settings()) == PRIVACY_INDICATOR_UNCHOSEN
+    assert privacy_indicator(
+        Settings(chain_base_url=PUBLIC_ELECTRUM_URL)
+    ) == PRIVACY_INDICATOR
     own = Settings(chain_base_url="http://127.0.0.1:3006")
     assert privacy_indicator(own) == PRIVACY_INDICATOR_OWN_NODE_LOCAL
     remote = Settings(chain_base_url="http://192.168.1.50:3006")
@@ -1804,6 +1842,7 @@ def test_node_status_handler_facts_shape() -> None:
         client,
         lambda: scan_wallet(store, client, wallet),
         node_detect_fn=lambda: _core_ready_report(),
+        settings=Settings(chain_base_url=PUBLIC_ELECTRUM_URL),
     )
     envelope = validate_payload({"v": 0, "intent": "node_status", "params": {}})
     result = table[IntentName.NODE_STATUS](envelope)
@@ -1836,7 +1875,9 @@ def test_node_status_detection_disabled_facts_state() -> None:
         wd.parsed,
         client,
         lambda: scan_wallet(store, client, wallet),
-        settings=Settings(node_detection_enabled=False),
+        settings=Settings(
+            node_detection_enabled=False, chain_base_url=PUBLIC_ELECTRUM_URL
+        ),
     )
     envelope = validate_payload({"v": 0, "intent": "node_status", "params": {}})
     result = table[IntentName.NODE_STATUS](envelope)
@@ -2439,7 +2480,7 @@ def test_no_resolvable_default_falls_back_to_the_demo_stub(
     monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
     recorded: list[httpx.Request] = []
     handler = _scan_handler(recorded)
-    monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
+    _patch_run_backends(monkeypatch, lambda: _mock_client(handler))
 
     outputs: list[str] = []
     code = run(
@@ -2870,7 +2911,7 @@ def _run_send_repl(
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, value)
-    monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
+    _patch_run_backends(monkeypatch, lambda: _mock_client(handler))
     tx_flow = flow if flow is not None else TxFlow()
     fake = generate if generate is not None else _send_generate(tx_flow, plan, create_params)
     inputs = iter(lines)
@@ -5652,7 +5693,7 @@ def test_prompt_is_live_while_startup_scan_still_runs(
     monkeypatch.delenv("LOCALWALLET_LLM_MODEL", raising=False)
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
     monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "1")
-    monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(gating))
+    _patch_run_backends(monkeypatch, lambda: _mock_client(gating))
     try:
         code = run(
             ["--stub-llm", "--zpub", ZPUB],
@@ -5739,7 +5780,7 @@ def test_prompt_live_and_startup_failure_narrated_after_hint(
     monkeypatch.delenv("LOCALWALLET_LLM_MODEL", raising=False)
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
     monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "1")
-    monkeypatch.setattr(app_module, "EsploraClient", lambda **_: _mock_client(handler))
+    _patch_run_backends(monkeypatch, lambda: _mock_client(handler))
 
     code = run(
         ["--stub-llm", "--zpub", ZPUB],

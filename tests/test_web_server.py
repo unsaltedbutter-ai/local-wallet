@@ -1774,21 +1774,28 @@ def _launch_first_run(
     calls: list[str] = []
     capture: dict[str, Any] = {"calls": calls, "store_path": store_path}
 
-    real_client = app.EsploraClient
+    from localwallet.chain import EsploraClient as _Esplora
 
     def handler(request: Any) -> Any:
         calls.append(request.url.path)
         return httpx.Response(599, json={})  # never legitimately reached
 
-    def counting_client(**kwargs: Any) -> Any:
-        # _wire always passes base_url/timeout_s/max_retries; keep those and
-        # only inject the mock transport so no call can leave the process.
-        kwargs["transport"] = httpx.MockTransport(handler)
-        kwargs.setdefault("timeout_s", 2.0)
-        kwargs.setdefault("max_retries", 0)
-        return real_client(**kwargs)
+    def counting_client(*_args: Any, **_kwargs: Any) -> Any:
+        # TCK-DESCOPE-M3A: the app builds the wallet client and the public-
+        # info fetcher through two seams; both are pinned to a request-
+        # counting MockTransport client here (base_url etc. are what the
+        # real seams would pass; the mock transport guarantees nothing can
+        # leave the process — the FIRST-RUN path should not construct a
+        # wallet client at all, and any chain request is a leak: 599).
+        return _Esplora(
+            base_url="https://mempool.space/api",
+            timeout_s=2.0,
+            max_retries=0,
+            transport=httpx.MockTransport(handler),
+        )
 
-    monkeypatch.setattr(app, "EsploraClient", counting_client)
+    monkeypatch.setattr(app, "_build_chain_client", counting_client)
+    monkeypatch.setattr(app, "_public_info_client", counting_client)
     outputs: list[str] = []
     gate = threading.Event()
 

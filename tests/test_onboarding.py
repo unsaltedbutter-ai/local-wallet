@@ -27,12 +27,13 @@ import pytest
 from localwallet import app as app_module
 from localwallet.app import (
     AUTO_SCAN_ENV_VAR,
-    PRIVACY_INDICATOR,
     PRIVACY_INDICATOR_OWN_NODE_LOCAL,
+    PRIVACY_INDICATOR_UNCHOSEN,
     run,
     stub_generate,
 )
 from localwallet.chain import MAINNET_GENESIS_HASH, EsploraClient, check_backend
+from localwallet.config import Settings
 from localwallet.node import LocalNodeReport, NodeStatus
 from localwallet.node.detect import CoreHealth, CoreRpcProbe
 from localwallet.store import Store
@@ -185,9 +186,18 @@ def _drive(
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(store_path))
     monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "1" if auto_scan else "0")
     monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
-    monkeypatch.setattr(
-        app_module, "EsploraClient", client or (lambda **_kw: _fake_client())
-    )
+    # TCK-DESCOPE-M3A harness rewire: the app builds the wallet client via
+    # ``_build_chain_client`` (electrum/bitcoind only) and the fee/price
+    # path via ``_public_info_client`` — the harness injects the mock
+    # Esplora-shaped client at both seams, forwarding the constructed
+    # base_url so the ``target``-tagged leak pins keep telling servers apart.
+    _factory = client or (lambda **_kw: _fake_client())
+
+    def _fake_build(settings: Settings, auth: Any = None) -> EsploraClient:
+        return _factory(base_url=settings.chain_base_url)
+
+    monkeypatch.setattr(app_module, "_build_chain_client", _fake_build)
+    monkeypatch.setattr(app_module, "_public_info_client", lambda *_a: _fake_client())
 
     state = {"probes": 0, "detects": 0, "model": 0}
 
@@ -711,7 +721,7 @@ def test_auto_scan_zero_does_not_escape_the_hold(tmp_path: Path, monkeypatch) ->
     assert "Startup scan complete" not in rec.joined
     assert stored is None
     assert _public_marker(tmp_path) is None
-    assert PRIVACY_INDICATOR in rec.joined  # banner still names the fallback
+    assert PRIVACY_INDICATOR_UNCHOSEN in rec.joined  # unresolved = nothing queried
     assert ob.LOAD_NARRATION not in rec.joined  # nothing "loading" is claimed
 
 
@@ -916,7 +926,8 @@ def test_web_launch_gets_hint_only(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(web_db))
     monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "0")
     monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
-    monkeypatch.setattr(app_module, "EsploraClient", lambda **_kw: _fake_client())
+    monkeypatch.setattr(app_module, "_build_chain_client", lambda *_a, **_k: _fake_client())
+    monkeypatch.setattr(app_module, "_public_info_client", lambda *_a: _fake_client())
 
     outputs: list[str] = []
     capture: dict[str, Any] = {}
@@ -991,8 +1002,13 @@ def test_web_first_run_defers_the_scan(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(tmp_path / "web-defer.db"))
     monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "1")
     monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0")
+    # TCK-DESCOPE-M3A: both build seams share the counting client, so the
+    # "never touched the default" pin counts wallet AND fee/price traffic.
     monkeypatch.setattr(
-        app_module, "EsploraClient", lambda **_kw: _counting_client(calls)
+        app_module, "_build_chain_client", lambda *_a, **_k: _counting_client(calls)
+    )
+    monkeypatch.setattr(
+        app_module, "_public_info_client", lambda *_a, **_k: _counting_client(calls)
     )
 
     outputs: list[str] = []
@@ -1042,8 +1058,13 @@ def test_web_auto_scan_zero_watch_never_probes_the_default(
     monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(tmp_path / "web-watch.db"))
     monkeypatch.setenv(AUTO_SCAN_ENV_VAR, "0")  # the formerly-leaky combo
     monkeypatch.setenv("LOCALWALLET_WATCH_INTERVAL_S", "0.05")  # watch ON
+    # TCK-DESCOPE-M3A: both build seams share the counting client, so the
+    # "never touched the default" pin counts wallet AND fee/price traffic.
     monkeypatch.setattr(
-        app_module, "EsploraClient", lambda **_kw: _counting_client(calls)
+        app_module, "_build_chain_client", lambda *_a, **_k: _counting_client(calls)
+    )
+    monkeypatch.setattr(
+        app_module, "_public_info_client", lambda *_a, **_k: _counting_client(calls)
     )
 
     outputs: list[str] = []
