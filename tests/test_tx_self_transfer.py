@@ -812,12 +812,12 @@ class TestLifecycle:
 class TestCardAndFacts:
     def _staged(self):
         addrs = derive_fixture_addresses(6)
-        t, s, w, c, _rec, flow, _se = _table({addrs[0]: [_utxo("d" * 64, 0, 100_000)]})
+        t, s, w, c, _rec, flow, se = _table({addrs[0]: [_utxo("d" * 64, 0, 100_000)]})
         res = t[IntentName.SELF_TRANSFER](_self_env({"mode": "split", "parts": 3}))
-        return t, s, w, c, flow, res
+        return t, s, w, c, flow, res, se
 
     def test_split_brief_card_lines_are_verbatim(self) -> None:
-        _t, s, _w, c, _flow, res = self._staged()
+        _t, s, _w, c, _flow, res, _se = self._staged()
         out: list[str] = []
         app_module._print_self_transfer(res, out.append)
         assert out == [
@@ -829,6 +829,29 @@ class TestCardAndFacts:
         ]
         # No address ever reaches the card (counts + values only).
         assert not any("bc1" in line for line in out)
+        s.close()
+        c.close()
+
+    def test_split_details_show_destinations_verbatim(self) -> None:
+        """TCK-UX-013/014: the ``/details`` render of a split plan shows the
+        fresh destination addresses verbatim, one per line with its amount,
+        and the ref with its purpose. The brief card stays destination-free
+        and ref-free (TCK-UX-014 demotion)."""
+        _t, s, _w, c, _flow, res, se = self._staged()
+        out: list[str] = []
+        app_module._print_self_transfer(res, out.append, session=se)
+        card = se.card_render
+        assert card is not None
+        # Destinations verbatim, each on its own To: line with its amount.
+        to_lines = [line for line in card if line.startswith("To: ")]
+        assert len(to_lines) == 3
+        for line, dest in zip(to_lines, res["self_destinations"], strict=True):
+            assert line == f"To: {dest['address']} ({dest['amount_sats']} sats)"
+        # The brief card never names a destination; /details only.
+        assert not any("bc1" in line for line in out)
+        # Ref carries its purpose on /details, never on the card.
+        assert any("Ref: " in line and "names this pending transaction" in line for line in card)
+        assert not any("Ref:" in line for line in out)
         s.close()
         c.close()
 
@@ -876,7 +899,7 @@ class TestCardAndFacts:
         assert "0 sats" not in "".join(out + out2)
 
     def test_pending_plan_reshow_renders_plan_not_a_single_send(self) -> None:
-        _t, s, _w, c, flow, _res = self._staged()
+        _t, s, _w, c, flow, _res, _se = self._staged()
         # create_tx re-show path: _print_create_tx → _print_brief_card
         # delegates to the plan renderer.
         reshow = app_module._tx_pending_result(flow)
@@ -893,7 +916,7 @@ class TestCardAndFacts:
         c.close()
 
     def test_facts_never_contain_own_addresses_of_a_plan(self) -> None:
-        _t, s, _w, c, flow, res = self._staged()
+        _t, s, _w, c, flow, res, _se = self._staged()
         facts = app_module._flow_facts(flow)
         assert facts["pending_tx_ref"] == res["tx_ref"]
         assert "self-transfer split into 3 equal parts" in str(facts["pending_tx_plan"])

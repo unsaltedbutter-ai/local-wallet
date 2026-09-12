@@ -2947,7 +2947,13 @@ def _card_refs(outputs: list[str]) -> list[str]:
     in order. The TCK-UX-002 brief card deliberately has no Ref line —
     refs reach a human via ``/details`` and the sign-time filename
     re-print (doc §1 Ref-row: the demotion leans on those re-prints)."""
-    return [line.split("Ref: ", 1)[1] for line in outputs if line.startswith("Ref: ")]
+    # The ref line carries an app-generated handle plus its purpose
+    # (TCK-UX-014); strip the " — purpose" tail so callers get the raw ref.
+    return [
+        line.split("Ref: ", 1)[1].split(" — ", 1)[0]
+        for line in outputs
+        if line.startswith("Ref: ")
+    ]
 
 
 #: The exact brief-card line sequence for the canonical fixture send
@@ -3123,7 +3129,10 @@ def test_confirmation_card_full_payload_is_byte_identical_to_previous_format() -
         "Inputs: 1",
         "Change: 39718 sats",
         "Expires: ~10 min",
-        "Ref: abc12345",
+        (
+            "Ref: abc12345 — names this pending transaction if you ask to "
+            "cancel or reprint it before it expires."
+        ),
     ]
 
 

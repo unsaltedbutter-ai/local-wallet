@@ -3201,6 +3201,12 @@ def _make_self_transfer_handler(
             "self_each_sats": payment_values[0],
             "self_inputs_total_sats": inputs_total,
             "self_new_addresses": len(destinations),
+            # Destinations verbatim (renderer /details material, TCK-UX-013):
+            # each fresh receive address paired with its output amount.
+            "self_destinations": [
+                {"address": d.address, "amount_sats": amt}
+                for d, amt in zip(destinations, payment_values, strict=True)
+            ],
             # fee_target_defaulted is DELIBERATELY absent: a self-transfer
             # card never pitches the one-shot speed offer (no re-quote path
             # exists for a plan; a speed preference must be stated up front
@@ -10895,14 +10901,33 @@ def _print_self_plan(
     lines.append(_CARD_DETAILS_TAIL)
     if session is not None:
         # The /details full render: plan lines minus the tail, plus
-        # Expires/Ref (the brief card demotes them, same as the send card).
+        # Destinations/Expires/Ref (the brief card demotes them, same as the
+        # send card). Destinations are the plan's fresh receive addresses,
+        # verbatim from the handler result, one per line with its amount.
         full = list(lines[:-1])
+        dests = result.get("self_destinations")
+        if isinstance(dests, list):
+            for entry in dests:
+                if not isinstance(entry, dict):
+                    continue
+                addr = entry.get("address")
+                amt = entry.get("amount_sats")
+                if not isinstance(addr, str) or not addr:
+                    continue
+                if isinstance(amt, int) and not isinstance(amt, bool):
+                    full.append(f"To: {addr} ({amt} sats)")
+                else:
+                    full.append(f"To: {addr}")
         expires = result.get("expires_in_s")
         if isinstance(expires, int) and not isinstance(expires, bool):
             full.append(f"Expires: ~{expires // 60} min")
         ref = result.get("tx_ref")
         if isinstance(ref, str) and ref:
-            full.append(f"Ref: {ref}")
+            # Value-free app-generated handle with its purpose (TCK-UX-014).
+            full.append(
+                f"Ref: {ref} — names this pending transaction if you ask to "
+                "cancel or reprint it before it expires."
+            )
         session.card_render = full
     for line in lines:
         output_fn(sanitize_tool_output(line))
@@ -11308,7 +11333,18 @@ def _print_confirmation_card(
     eta_wording = result.get("eta_wording")
     if isinstance(eta_wording, str) and eta_wording:
         output_fn(sanitize_tool_output(f"ETA: {eta_wording}"))
-    output_fn(sanitize_tool_output(f"Ref: {result.get('tx_ref', '')}"))
+    ref = result.get("tx_ref", "")
+    # The ref is an app-generated handle for the pending transaction (cancel
+    # / requote / reprint before expiry) — value-free, presented with its
+    # purpose (TCK-UX-014).
+    ref_line = f"Ref: {ref}" if ref else "Ref: unavailable"
+    output_fn(
+        sanitize_tool_output(
+            ref_line
+            + " — names this pending transaction if you ask to cancel or "
+            "reprint it before it expires."
+        )
+    )
 
 
 def _print_confirm_tx(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
