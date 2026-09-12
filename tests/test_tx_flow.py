@@ -82,7 +82,7 @@ def stage(flow: TxFlow, **overrides) -> PendingTx:
         "amount_sats": 50_000,
         "recipient": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
         "fee_target": "fast",
-        "fee_rate_sat_vb": 2,
+        "fee_rate_centisat_vb": 200,
         "fee_sats": 282,
         "change_sats": 49_718,
         "psbt_base64": "cHNidP8BAFICAAAAAane",
@@ -148,7 +148,7 @@ def test_create_from_created_replaces_pending_requote():
     flow, ticks = make_flow()
     stage(flow)
     ticks[-1] = T0 + 42
-    second = stage(flow, fee_target="fast", fee_rate_sat_vb=3, fee_sats=423)
+    second = stage(flow, fee_target="fast", fee_rate_centisat_vb=300, fee_sats=423)
     assert flow.state is TxFlowStatus.CREATED
     assert flow.pending is second
     assert second.tx_ref == "ref-2", "replacement stamps a fresh identity"

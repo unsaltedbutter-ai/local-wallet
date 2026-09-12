@@ -32,6 +32,7 @@ from localwallet.tx.selection import (
     SelectionResult,
     coin_partition,
     estimate_tx_vsize,
+    fee_sats_for,
     select_coins,
 )
 
@@ -53,6 +54,7 @@ __all__ = [
     # dust
     "dust_threshold",
     "estimate_tx_vsize",
+    "fee_sats_for",
     "min_relay_fee_vbytes",
     "psbt_to_base64",
     "script_is_witness_program",

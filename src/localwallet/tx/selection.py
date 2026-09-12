@@ -11,8 +11,9 @@ THE ALGORITHM (authoritative, deterministic — same inputs, same output)
 -----------------------------------------------------------------------
 Inputs: ``utxos`` (the wallet's spendable UTXO snapshot, duck-typed on
 ``value_sats: int > 0``, ``txid: str``, ``vout: int >= 0``), ``amount_sats``
-(recipient value), ``fee_rate_sat_vb`` (integer sat/vB), and
-``change_cost_vbytes`` (vB cost of appending the change output — 31 for
+(recipient value), ``fee_rate_centisat_vb`` (integer centisat/vB,
+1 sat/vB = 100 — fractional rates are whole integers in the new unit,
+TCK-FEE-003/ADR-0011), and ``change_cost_vbytes`` (vB cost of appending the change output — 31 for
 P2WPKH change, computed by the caller from the change script size; this
 module never hardcodes it).
 
@@ -112,8 +113,9 @@ Given a candidate set S of n inputs:
 - Case A (change output exists): the change output's weight is taken as
   ``4 * change_cost_vbytes`` (the caller-supplied vB cost, validated
   against the change script's minimum serialization), so
-  ``vsize_A = ceil(weight_A / 4)``, ``fee_A = vsize_A * rate`` (integer
-  sat/vB rates make the product exact), and
+  ``vsize_A = ceil(weight_A / 4)``, ``fee_A = ceil(vsize_A * rate_c / 100)``
+  (integer-exact; byte-identical to ``vsize_A * rate`` for whole sat/vB
+  rates — every pre-TCK-FEE-003 value), and
   ``change_A = inputs_total - amount - fee_A``. Case A holds when
   ``change_A >= change_dust`` (dust computed from the change script size
   via :func:`localwallet.tx.dust.dust_threshold` — never a hardcoded
@@ -124,13 +126,15 @@ Given a candidate set S of n inputs:
   else to put it), which by construction exceeds the rate-determined
   target for the changeless shape. The residue is *not* added to the
   recipient, whose value must stay exactly what the user confirmed. Case B
-  holds when ``inputs_total - amount >= vsize_B * rate``. Because Case B
+  holds when ``inputs_total - amount >= ceil(vsize_B * rate_c / 100)``. Because Case B
   only fires when Case A's change was below dust, the folded amount is
   bounded by the change dust threshold plus the rate-determined fee.
 
 Fee convention: fees are computed on vsize (Core-style), so at most
 3 weight-units of rounding headroom per tx — never under the min-relay
-floor for rates >= 1 sat/vB.
+floor for rates >= 1 sat/vB. The fee is the CEILING of vsize x rate so a
+fractional rate is never under-bid by its own rounding (the ceil is the
+sanity bound, ADR-0011).
 
 Conservation invariant: :func:`select_coins` asserts
 ``inputs_total == amount + fee + change (or 0)`` when constructing
@@ -175,6 +179,7 @@ __all__ = [
     "SelectionResult",
     "coin_partition",
     "estimate_tx_vsize",
+    "fee_sats_for",
     "select_coins",
 ]
 
@@ -213,7 +218,11 @@ _P2WPKH_SCRIPT_TEMPLATE = b"\x00\x14" + b"\x00" * 20
 #: (MAX_STANDARD_TX_WEIGHT = 400_000 WU) and matches the PSBT builder.
 _MAX_INPUTS = 1000
 _MAX_OUTPUTS = 1000
-_MAX_FEE_RATE_SAT_VB = 10_000
+#: Fee-rate sanity bound in centisat/vB: 1_000_000 = 10_000 sat/vB (the
+#: pre-fractional ceiling, unit-converted), 1 = 0.01 sat/vB (the floor of
+#: the fractional ladder, TCK-FEE-003). The min-relay standardness gate in
+#: the PSBT builder still applies on top, unchanged.
+_MAX_FEE_RATE_CENTISAT_VB = 1_000_000
 _MAX_CHANGE_COST_VBYTES = 100_000
 
 # v1 sends are P2WPKH-only on the input side (ADR-0008); the dust/vsize
@@ -317,6 +326,16 @@ def _validate_int(value: int, name: str, lo: int, hi: int) -> int:
     return value
 
 
+def fee_sats_for(vsize: int, rate_centisat_vb: int) -> int:
+    """Integer-exact fee for a vsize at a centisat/vB rate: ceil(vsize*c/100).
+
+    The ceil makes the rate a TRUE floor for fractional bids (a whole-sat
+    rate multiplies out exactly — every pre-TCK-FEE-003 value is unchanged).
+    Pure integer arithmetic; no float money (docs/fee-fractional-plan.md).
+    """
+    return -(-vsize * rate_centisat_vb // 100)
+
+
 def _utxo_sort_key(utxo: Any) -> tuple[int, str, int]:
     txid = getattr(utxo, "txid", None)
     if not isinstance(txid, str) or not txid:
@@ -406,14 +425,14 @@ class _Selector:
         self,
         ordered: list[Any],
         amount_sats: int,
-        fee_rate_sat_vb: int,
+        fee_rate_centisat_vb: int,
         change_cost_vbytes: int,
         output_script: bytes,
         change_script: bytes,
     ) -> None:
         self.ordered = ordered
         self.amount = amount_sats
-        self.rate = fee_rate_sat_vb
+        self.rate_c = fee_rate_centisat_vb
         self.change_cost = change_cost_vbytes
         self.output_script = output_script
         self.change_script = change_script
@@ -435,7 +454,7 @@ class _Selector:
         total = sum(u.value_sats for u in selected)
         # Case A: change output exists.
         vsize_a = self._vsize(len(selected), with_change=True)
-        fee_a = vsize_a * self.rate
+        fee_a = fee_sats_for(vsize_a, self.rate_c)
         change_a = total - self.amount - fee_a
         if change_a >= self.change_dust:
             return _Finalized(fee_a, change_a, vsize_a, total)
@@ -446,7 +465,7 @@ class _Selector:
         # changeless shape.
         vsize_b = self._vsize(len(selected), with_change=False)
         residue = total - self.amount
-        if residue >= vsize_b * self.rate:
+        if residue >= fee_sats_for(vsize_b, self.rate_c):
             return _Finalized(residue, None, vsize_b, total)
         return None
 
@@ -457,7 +476,7 @@ class _Policy:
     a ``None`` setting switches its layer off = pre-amendment behavior)."""
 
     amount_sats: int
-    fee_rate_sat_vb: int
+    fee_rate_centisat_vb: int
     change_cost_vbytes: int
     output_script: bytes
     change_script: bytes
@@ -479,7 +498,7 @@ def _select_from_pool(ordered: list[Any], policy: _Policy) -> SelectionResult | 
     selector = _Selector(
         ordered,
         policy.amount_sats,
-        policy.fee_rate_sat_vb,
+        policy.fee_rate_centisat_vb,
         policy.change_cost_vbytes,
         policy.output_script,
         policy.change_script,
@@ -492,7 +511,7 @@ def _select_from_pool(ordered: list[Any], policy: _Policy) -> SelectionResult | 
     # poison every greedy prefix (TCK-P2-002 review). The skip is a pure
     # function of value and rate — deterministic. The improvement passes
     # below still see every UTXO; finalize() remains the real gate there.
-    min_useful_value = (P2WPKH_INPUT_WEIGHT_WU // 4) * policy.fee_rate_sat_vb
+    min_useful_value = fee_sats_for(P2WPKH_INPUT_WEIGHT_WU // 4, policy.fee_rate_centisat_vb)
     chosen: list[Any] = []
     finalized: _Finalized | None = None
     for utxo in ordered:
@@ -546,7 +565,8 @@ def _select_from_pool(ordered: list[Any], policy: _Policy) -> SelectionResult | 
     if (
         policy.target_min_sats is not None
         and policy.consolidate_below_sat_vb is not None
-        and policy.fee_rate_sat_vb <= policy.consolidate_below_sat_vb
+        # the setting is whole sat/vB; the comparison unit-converts it
+        and policy.fee_rate_centisat_vb <= policy.consolidate_below_sat_vb * 100
     ):
         selected_keys = {(u.txid.lower(), u.vout) for u in chosen}
         fold_candidates = [
@@ -555,7 +575,9 @@ def _select_from_pool(ordered: list[Any], policy: _Policy) -> SelectionResult | 
             and u.value_sats < policy.target_min_sats
         ]
         if len(fold_candidates) >= 2:  # §2.2 trigger: pool holds >= 2 small coins
-            fold_passage = 2 * (P2WPKH_INPUT_WEIGHT_WU // 4) * policy.fee_rate_sat_vb
+            fold_passage = 2 * fee_sats_for(
+                P2WPKH_INPUT_WEIGHT_WU // 4, policy.fee_rate_centisat_vb
+            )
             for utxo in fold_candidates:
                 if folded >= _MAX_CONSOLIDATE or utxo.value_sats < fold_passage:
                     break
@@ -593,7 +615,7 @@ def _select_from_pool(ordered: list[Any], policy: _Policy) -> SelectionResult | 
 def select_coins(
     utxos: Sequence[Any],
     amount_sats: int,
-    fee_rate_sat_vb: int,
+    fee_rate_centisat_vb: int,
     change_cost_vbytes: int,
     output_script: bytes,
     *,
@@ -613,7 +635,9 @@ def select_coins(
             modules are never touched here.
         amount_sats: Recipient value in sats. Must be at least the dust
             threshold of ``output_script`` (computed, not hardcoded).
-        fee_rate_sat_vb: Integer fee rate in sat/vB, 1..10000.
+        fee_rate_centisat_vb: Integer fee rate in CENTISAT/vB (1 sat/vB =
+            100), 1..1_000_000 — fractional sat/vB bids (TCK-FEE-003) are
+            exact integers here; fees are ``ceil(vsize × rate / 100)`` sats.
         change_cost_vbytes: vB cost of appending the change output
             (31 for a P2WPKH change script; validated against the change
             script's minimum serialization).
@@ -651,8 +675,8 @@ def select_coins(
     amount_sats = _validate_int(
         amount_sats, "amount_sats", 0, 2_100_000_000_000_000
     )
-    fee_rate_sat_vb = _validate_int(
-        fee_rate_sat_vb, "fee_rate_sat_vb", 1, _MAX_FEE_RATE_SAT_VB
+    fee_rate_centisat_vb = _validate_int(
+        fee_rate_centisat_vb, "fee_rate_centisat_vb", 1, _MAX_FEE_RATE_CENTISAT_VB
     )
     target_min_sats = (
         None
@@ -699,7 +723,7 @@ def select_coins(
         raise SelectionError("output_script is unspendable (OP_RETURN)")
     if not utxos:
         raise InsufficientFundsError(
-            needed=_needed_floor(amount_sats, fee_rate_sat_vb, output_script),
+            needed=_needed_floor(amount_sats, fee_rate_centisat_vb, output_script),
             available=0,
         )
 
@@ -735,7 +759,7 @@ def select_coins(
 
     policy = _Policy(
         amount_sats=amount_sats,
-        fee_rate_sat_vb=fee_rate_sat_vb,
+        fee_rate_centisat_vb=fee_rate_centisat_vb,
         change_cost_vbytes=change_cost_vbytes,
         output_script=output_script,
         change_script=change_script,
@@ -775,22 +799,27 @@ def _insufficient(ordered: list[Any], policy: _Policy) -> InsufficientFundsError
     selector = _Selector(
         ordered,
         policy.amount_sats,
-        policy.fee_rate_sat_vb,
+        policy.fee_rate_centisat_vb,
         policy.change_cost_vbytes,
         policy.output_script,
         policy.change_script,
     )
     needed = (
         policy.amount_sats
-        + selector._vsize(len(ordered), with_change=False) * policy.fee_rate_sat_vb
+        + fee_sats_for(
+            selector._vsize(len(ordered), with_change=False),
+            policy.fee_rate_centisat_vb,
+        )
     )
     return InsufficientFundsError(needed=needed, available=selector.wallet_total)
 
 
-def _needed_floor(amount_sats: int, fee_rate_sat_vb: int, output_script: bytes) -> int:
+def _needed_floor(
+    amount_sats: int, fee_rate_centisat_vb: int, output_script: bytes
+) -> int:
     """Minimal conceivable need for the empty-wallet error: 1-input tx."""
     weight = _tx_overhead_weight_wu(1, 1)
     weight += P2WPKH_INPUT_WEIGHT_WU
     weight += output_weight_wu(len(output_script))
     vsize = -(-weight // 4)
-    return amount_sats + vsize * fee_rate_sat_vb
+    return amount_sats + fee_sats_for(vsize, fee_rate_centisat_vb)

@@ -2641,6 +2641,9 @@ def _send_chain_handler(
 
     - ``state["fees_fail"]`` / ``state["prices_fail"]`` flip those
       endpoints to 500 mid-test;
+    - ``state["mempool_blocks"]`` serves a projected-blocks payload on
+      ``/v1/fees/mempool-blocks`` (TCK-FEE-003; absent = 404 = recommended
+      fallback, the historical behavior);
     - ``state["broadcast_fail"]`` flips the broadcast POST to 500;
     - ``state["broadcast_txid"]`` overrides the txid the POST returns
       (default: the txid COMPUTED from the posted transaction — the
@@ -2672,6 +2675,13 @@ def _send_chain_handler(
             return httpx.Response(
                 200, json={"time": 1_700_000_000, "USD": state.get("usd", SEND_PRICE_USD)}
             )
+        if path.endswith("/v1/fees/mempool-blocks"):
+            # TCK-FEE-003 wave: state["mempool_blocks"] serves the target-
+            # follower endpoint (default: unrouted 404 -> recommended
+            # fallback, i.e. every pre-existing card number unchanged).
+            payload = state.get("mempool_blocks")
+            if payload is not None:
+                return httpx.Response(200, json=payload)
         if path.endswith("/blocks/tip"):
             return httpx.Response(200, json=tip)
         if path.endswith("/tx") and request.method == "POST":
@@ -2978,7 +2988,8 @@ def test_brief_card_full_line_sequence_variant_a() -> None:
             "btc_usd": 20_000.0,
             "rate_age_s": 0,
             "fee_sats": 282,
-            "fee_rate_sat_vb": 2,
+            "fee_rate_centisat_vb": 200,
+            "fee_rate_display": "2",
             "vsize": 141,
             "fee_target": "medium",
             "eta_wording": "~60-70 min — estimate only, not a guarantee",
@@ -3003,7 +3014,8 @@ def test_brief_card_variant_b_tail_no_preference_asked_twice() -> None:
             "btc_usd": 20_000.0,
             "rate_age_s": 0,
             "fee_sats": 282,
-            "fee_rate_sat_vb": 2,
+            "fee_rate_centisat_vb": 200,
+            "fee_rate_display": "2",
             "vsize": 141,
             "fee_target": "medium",
             "eta_wording": "~60-70 min — estimate only, not a guarantee",
@@ -3092,7 +3104,8 @@ def test_confirmation_card_full_payload_is_byte_identical_to_previous_format() -
         "rate_age_s": 0,
         "recipient": "bc1qtest",
         "fee_sats": 282,
-        "fee_rate_sat_vb": 2,
+        "fee_rate_centisat_vb": 200,
+        "fee_rate_display": "2",
         "fee_target": "medium",
         "vsize": 141,
         "inputs_count": 1,
@@ -3125,7 +3138,8 @@ def test_confirmation_card_stale_rate_keeps_age_wording() -> None:
         "rate_stale": True,
         "recipient": "bc1qtest",
         "fee_sats": 282,
-        "fee_rate_sat_vb": 2,
+        "fee_rate_centisat_vb": 200,
+        "fee_rate_display": "2",
         "fee_target": "medium",
         "vsize": 141,
         "inputs_count": 1,
@@ -3147,7 +3161,8 @@ def test_confirmation_card_no_rate_omits_both_segments() -> None:
         "usd_cents": 1_200,
         "recipient": "bc1qtest",
         "fee_sats": 282,
-        "fee_rate_sat_vb": 2,
+        "fee_rate_centisat_vb": 200,
+        "fee_rate_display": "2",
         "fee_target": "medium",
         "vsize": 141,
         "inputs_count": 1,
@@ -3229,7 +3244,8 @@ def test_send_flow_handler_result_card_fields(
         "amount_sats",
         "recipient",
         "fee_sats",
-        "fee_rate_sat_vb",
+        "fee_rate_centisat_vb",
+        "fee_rate_display",
         "vsize",
         "change_sats",
         "inputs_count",
@@ -3256,7 +3272,7 @@ def test_send_flow_handler_result_card_fields(
     assert result["mixed"] is False
     assert result["folded_count"] == 0
     assert result["recipient"] == SEND_RECIPIENT
-    assert result["fee_sats"] == result["vsize"] * result["fee_rate_sat_vb"]
+    assert result["fee_sats"] == result["vsize"] * result["fee_rate_centisat_vb"] // 100
     assert result["amount_sats"] == SEND_AMOUNT_SATS
     assert result["change_sats"] == SEND_CHANGE_SATS
     assert result["usd_cents"] == SEND_USD_CENTS
@@ -3551,6 +3567,44 @@ def _send_table(
     return table, store, client, flow, session
 
 
+def test_fractional_ladder_bids_formats_and_narrates_exactly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-FEE-003 wave end to end: the user's live payload bids 1.21 sat/vB.
+
+    Projected next block feeRange[0] = 1.05567928730512 -> MEDIUM = x1.15
+    -> 1.21 sat/vB (centisat 121). The engine pays ceil(141 vB x 1.21) = 171
+    sats — the integer sat/vB world would have paid 282 (ceil-to-2) — and
+    the card quotes "1.21 sat/vB" verbatim from the tool result.
+    """
+    addr0 = derive_fixture_addresses(1)[0]
+    state: dict[str, Any] = {
+        "mempool_blocks": [
+            {"blockSize": 1_000_000, "medianFee": 4.0,
+             "feeRange": [1.05567928730512, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]},
+            {"blockSize": 1_000_000, "medianFee": 3.0,
+             "feeRange": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]},
+        ]
+    }
+    table = _build_send_table(
+        lambda rec: _send_chain_handler(
+            rec, utxos_by_addr={addr0: [SEND_UTXO]}, state=state
+        )
+    )[0]
+    result = table[IntentName.CREATE_TX](validate_payload(_create_tx_envelope_json()))
+    assert result.get("error") is None
+    assert result["fee_rate_centisat_vb"] == 121  # 1.21 sat/vB, exact int
+    assert result["fee_rate_display"] == "1.21"
+    assert result["fee_sats"] == -(-SEND_VSIZE * 121 // 100) == 171
+    assert result["change_sats"] == 100_000 - SEND_AMOUNT_SATS - 171
+    # the card line quotes the rate verbatim from the tool result
+    lines: list[str] = []
+    app_module._print_create_tx(result, lines.append)
+    assert any("· 1.21 sat/vB × 141 vB" in line for line in lines), lines
+
+
+
+
 def test_faster_requote_replaces_pending_fresh_ref_ttl_and_inert_old(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3574,7 +3628,7 @@ def test_faster_requote_replaces_pending_fresh_ref_ttl_and_inert_old(
     assert faster["fee_target"] == "fast"
     assert faster["fee_target_defaulted"] is False  # explicit → offer retired
     # The ladder is estimator-driven: fast rung = 3 sat/vB on this fixture.
-    assert faster["fee_rate_sat_vb"] == 3
+    assert faster["fee_rate_centisat_vb"] == 300
     assert faster["fee_sats"] == faster["vsize"] * 3 > first["fee_sats"]
     assert faster["change_sats"] < first["change_sats"]  # money math re-ran
     assert faster["eta_minutes"] < first["eta_minutes"]  # ETA refreshed too
@@ -3622,7 +3676,7 @@ def test_slower_and_same_rung_medium_requotes(
     assert medium["fee_target_defaulted"] is False  # explicit → offer retired
     slower = table[IntentName.CREATE_TX](_requote_envelope("slow"))
     assert slower["requote_direction"] == "slower"
-    assert slower["fee_rate_sat_vb"] == 1
+    assert slower["fee_rate_centisat_vb"] == 100
     assert slower["fee_sats"] < first["fee_sats"]
     assert flow.state is TxFlowStatus.CREATED
     client.close()
@@ -3667,7 +3721,7 @@ def test_explicit_rate_fresh_create_bids_the_literal_rate(
     )
     result = table[IntentName.CREATE_TX](_rate_envelope(5))
     assert result.get("error") is None
-    assert result["fee_rate_sat_vb"] == 5
+    assert result["fee_rate_centisat_vb"] == 500
     assert result["fee_sats"] == result["vsize"] * 5  # the literal bid, verbatim
     assert result["fee_target"] is None  # explicit rate: no rung recorded
     assert result["fee_target_defaulted"] is False  # stated preference → offer retired
@@ -3677,7 +3731,7 @@ def test_explicit_rate_fresh_create_bids_the_literal_rate(
     assert not any(r.url.path.endswith("/v1/fees/recommended") for r in recorded)
     pending = flow.pending
     assert pending is not None
-    assert pending.fee_rate_sat_vb == 5 and pending.fee_target is None
+    assert pending.fee_rate_centisat_vb == 500 and pending.fee_target is None
     # Full card render survives the None rung (no "None target" line ever).
     lines: list[str] = []
     app_module._print_confirmation_card(result, lines.append)
@@ -3700,7 +3754,7 @@ def test_ceiling_answer_with_explicit_rate_rebuilds(
         monkeypatch, tmp_path, SEND_UTXO, clock=lambda: ticks["now"]
     )
     fast = table[IntentName.CREATE_TX](_requote_envelope("fast"))
-    assert fast["fee_rate_sat_vb"] == 3  # ladder's top rung on this fixture
+    assert fast["fee_rate_centisat_vb"] == 300  # ladder's top rung on this fixture
     ceiling = table[IntentName.CREATE_TX](_requote_envelope("fast"))
     assert ceiling["error"] == "tx_pending" and ceiling["rate_notice"] == "ceiling"
 
@@ -3709,7 +3763,7 @@ def test_ceiling_answer_with_explicit_rate_rebuilds(
     assert answered.get("error") is None  # the ask's answer DOES rebuild
     assert answered["fee_requote"] is True
     assert answered["requote_direction"] == "faster"  # 5 > the staged 3 sat/vB
-    assert answered["fee_rate_sat_vb"] == 5
+    assert answered["fee_rate_centisat_vb"] == 500
     assert answered["fee_sats"] > fast["fee_sats"]  # money math re-ran
     assert answered["tx_ref"] != fast["tx_ref"] and answered["expires_in_s"] == 600
     assert flow.pending.tx_ref == answered["tx_ref"] and flow.pending.created_at == 1_060.0
@@ -3882,7 +3936,8 @@ def test_requote_narration_and_ceiling_copy(
             "amount_sats": 60_000,
             "recipient": "bc1qtest",
             "fee_sats": 423,
-            "fee_rate_sat_vb": 3,
+            "fee_rate_centisat_vb": 300,
+            "fee_rate_display": "3",
             "vsize": 141,
             "change_sats": 39_577,
             "inputs_count": 1,
@@ -5899,7 +5954,8 @@ def test_requote_renarrates_the_mix_warning_present_and_absent() -> None:
         "amount_sats": 100_000,
         "recipient": "bc1qtest",
         "fee_sats": 627,
-        "fee_rate_sat_vb": 3,
+        "fee_rate_centisat_vb": 300,
+        "fee_rate_display": "3",
         "vsize": 209,
         "change_sats": None,
         "inputs_count": 2,

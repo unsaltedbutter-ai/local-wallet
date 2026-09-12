@@ -29,7 +29,13 @@ from localwallet.chain.esplora import (
     classify_failure,
 )
 from localwallet.chain.eta import EtaEstimate, estimate_eta
-from localwallet.chain.fees import FeeEstimate, FeeEstimator, FeeSource, FeeTarget
+from localwallet.chain.fees import (
+    FeeEstimate,
+    FeeEstimator,
+    FeeSource,
+    FeeTarget,
+    format_sat_vb,
+)
 from localwallet.chain.price import (
     ConfigDisabled,
     PriceOracle,
@@ -76,6 +82,7 @@ __all__ = [
     "check_backend",
     "classify_failure",
     "estimate_eta",
+    "format_sat_vb",
     "minor_per_unit",
     "time_since_last_block",
 ]

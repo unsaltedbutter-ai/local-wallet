@@ -415,7 +415,7 @@ def test_build_state_snapshot_is_value_free() -> None:
     flow = TxFlow()
     pending = PendingTx(
         tx_ref="REFSECRET", created_at=0.0, amount_sats=654321,
-        recipient="bc1qLEAK", fee_target=None, fee_rate_sat_vb=1, fee_sats=1000,
+        recipient="bc1qLEAK", fee_target=None, fee_rate_centisat_vb=100, fee_sats=1000,
         change_sats=None, psbt_base64="cHNidP8LEAK", inputs_count=1, vsize=100,
     )
     flow._state = app.TxFlowStatus.CREATED

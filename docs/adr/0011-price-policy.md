@@ -238,3 +238,71 @@ regardless of which wallet backend is configured.
   multi-currency amendment are untouched: same endpoint, same closed
   currency enum, same TTLs — only the injection point moved from the
   wallet client to the public-info fetcher.
+
+## Amendment (2026-09-12, TCK-FEE-003): target-follower fee policy v2 + fractional rates
+
+User live run (2026-09-12): the FEE-001 floor-follower still bid **2 sat/vB**
+(next block's floor 1.0557, `ceil` to whole sats) — "still too high". The
+user's binding spec refines the mapping to a fractional ladder sourced from
+ONE endpoint: `GET /v1/fees/mempool-blocks` (`feeRange[0]` = that projected
+block's floor; `B₀` first block, `B₁` second).
+
+**Decision — fee policy v2 (replaces the FEE-001 FAST/MEDIUM/SLOW mapping):**
+
+- `MEDIUM` (the target) = `B₀ × 1.15` rounded HALF-EVEN to 2 decimals,
+  clamped UP (ceil-2dp of `B₀`) whenever the rounding would land below `B₀`
+  — a bid never undercuts its own floor. User pin:
+  `1.05567928730512 × 1.15 = 1.21403… → 1.21` (normal 2-dp rounding — the
+  user rejected ceil-to-1.22 AND the old ceil-to-2).
+- `FAST` (faster) = `2 × MEDIUM` (the doubling acts on the ROUNDED target:
+  2 × 1.21 = 2.42 exactly), still additionally floored by the recommended
+  payload's `minimumFee` ("min fee to get into the next block" bounds the
+  next-block rung — FEE-001's protection, kept).
+- `SLOW` (slower) = `B₁` ceil-rounded to 2 dp, no markup; with only ONE
+  projected block, `B₀` itself (the floor).
+- Fail-closed unchanged: ANY mempool-blocks transport/HTTP/shape failure
+  degrades to the §amendment-1 recommended mapping; the parser's
+  non-increasing-bottoms rule (FEE-001's security-review MEDIUM) is KEPT —
+  it now underwrites the code invariant `FAST ≥ MEDIUM ≥ SLOW` (`B₁ ≤ B₀`),
+  and both original counterexamples stay pinned.
+- Dropped: the recent-blocks floor `R₅` and its tip + `/v1/blocks/{tip}`
+  GETs (the spec names one source; the ×1.15 markup covers R₅'s
+  anti-underbid role — FEE-001's motivating case bids 0.34 ≥ the 0.34 the
+  blocks confirmed at). Combined refresh is now two small GETs.
+- FEE-001's binding observed case survives: FAST = `max(2 × 0.34, 1)` =
+  **1 sat/vB**, still "no more than 1".
+
+**Decision — fractional rates end to end (USER DIRECTION 2026-09-12: "we
+need to support less than 1 sat/vB and fractional values like 1.5"):**
+
+Rates travel as **integer centisat/vB** (`121` = 1.21 sat/vB) —
+`FeeEstimate.rate_centisat_vb`, `select_coins(fee_rate_centisat_vb,
+1..1_000_000)`, `PendingTx.fee_rate_centisat_vb`. Transaction fees become
+`fee_sats_for(vsize, c) = ceil(vsize × c / 100)` — integer-exact (the §
+"integers only for sats/fees/vsize" invariant HOLDS; no float or Decimal
+ever enters `tx/`), byte-identical to the old `vsize × rate` at whole
+sat/vB (every pre-existing fee value is unchanged), and the CEIL keeps a
+fractional rate from being under-paid by its own rounding. The card quotes
+a `fee_rate_display` string formatted from the integer by the chain-owned
+`format_sat_vb` (verbatim-tool-output rule preserved; whole sats render as
+`"2"`, fractional as `"1.21"`, `"0.55"`). Estimator math is `Decimal`
+inside `chain/fees.py` ONLY (shortest-repr of the JSON floats, half-even
+target, ceil floors) and leaves as integer centisat. The protocol's
+explicit `create_tx.fee_rate_sat_vb` stays whole-sat int 1..10_000 (GBNF
+unchanged; fractional explicit entry = follow-up FEE-004) and is scaled
+×100 at the handler edge. The PSBT builder's min-relay STANDARDNESS gate
+(Core default 1 sat/vB, computed from vsize, ADR-0012 §3) is UNCHANGED —
+sub-1 BIDS are legal data through estimation/selection/display, and a tx
+whose folded fee would dip under the relay floor still fails closed at
+build time before any signature; relaxing that floor is a relay-policy
+decision for the operator backend, not a fee-math side effect.
+
+Pins: both user example payloads from the 2026-09-12 spec (1.0557…→1.21,
+1.0→1.0; 2×→2.42) run byte-exact in `tests/test_chain_fees.py`; the
+half-even tie (0.3 × 1.15 = 0.345 → 0.34), the sub-floor clamp (tiny
+bottoms), the single-block slow case, `minimumFee` fast-only flooring, the
+2-GET refresh, and an end-to-end card line quoting "1.21 sat/vB" with
+`ceil(141 × 1.21) = 171` sats in `tests/test_e2e_skeleton.py`; engine ceil
+exactness + sub-1 selection in `tests/test_tx_fractional_fees.py`.
+ETA narration, the estimate-only hedge, the explicit-rate path and the
+top-rung ceiling-ask copy are unchanged (numbers only).

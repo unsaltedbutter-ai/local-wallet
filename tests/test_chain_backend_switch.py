@@ -238,7 +238,7 @@ def test_fees_and_prices_decoupled_from_the_wallet_backend() -> None:
     oracle = PriceOracle(public, ttl_s=60.0)
 
     fast = estimator.estimate(FeeTarget.FAST)
-    assert fast.sat_per_vb == 30  # fastestFee (recommended fallback here)
+    assert fast.rate_centisat_vb == 3000  # fastestFee (recommended fallback here)
     rate = oracle.fresh()
     assert rate.per_btc == 20_000.0
     assert set(public_host.hosts) == {PUBLIC_HOST}

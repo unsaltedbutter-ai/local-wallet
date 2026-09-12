@@ -67,7 +67,7 @@ class TestBasicSelection:
         # No single coin can cover 60k + fee at rate 2, so both are taken,
         # smallest first.
         result = select_coins(
-            [utxo(1, 50_000), utxo(2, 30_000)], 60_000, 2, CHANGE_COST, RECIPIENT
+            [utxo(1, 50_000), utxo(2, 30_000)], 60_000, 200, CHANGE_COST, RECIPIENT
         )
         assert [u.value_sats for u in result.selected] == [30_000, 50_000]
         assert result.inputs_total == 80_000
@@ -79,14 +79,14 @@ class TestBasicSelection:
     def test_tie_break_by_txid_then_vout(self):
         a = utxo(2, 40_000, vout=1)
         b = utxo(1, 40_000, vout=0)
-        result = select_coins([a, b], 40_000, 1, CHANGE_COST, RECIPIENT)
+        result = select_coins([a, b], 40_000, 100, CHANGE_COST, RECIPIENT)
         assert [u.txid for u in result.selected] == sorted(
             [u.txid for u in result.selected]
         )
         assert result.selected[0].txid == f"{1:064x}"
 
     def test_single_input_exact_change_viable(self):
-        result = select_coins([utxo(9, 200_000)], 60_000, 2, CHANGE_COST, RECIPIENT)
+        result = select_coins([utxo(9, 200_000)], 60_000, 200, CHANGE_COST, RECIPIENT)
         assert [u.value_sats for u in result.selected] == [200_000]
         assert result.estimated_vsize == expected_vsize(1, 1, with_change=True)
         assert result.fee_sats == result.estimated_vsize * 2
@@ -98,7 +98,7 @@ class TestChangePolicies:
         # With-change fee for 1 input at rate 2:
         fee_with_change = expected_vsize(1, 1, with_change=True) * 2
         result = select_coins(
-            [utxo(3, 60_000 + fee_with_change)], 60_000, 2, CHANGE_COST, RECIPIENT
+            [utxo(3, 60_000 + fee_with_change)], 60_000, 200, CHANGE_COST, RECIPIENT
         )
         # change would be 0 (< dust) -> dropped; the entire residue is the fee.
         assert result.change_sats is None
@@ -109,13 +109,13 @@ class TestChangePolicies:
     def test_change_below_dust_folds_into_fee(self):
         # Residue 250: below dust (294) as change, above the changeless
         # fee target (110 vB * 2) -> fold; fee becomes the whole residue.
-        result = select_coins([utxo(4, 60_250)], 60_000, 2, CHANGE_COST, RECIPIENT)
+        result = select_coins([utxo(4, 60_250)], 60_000, 200, CHANGE_COST, RECIPIENT)
         assert result.change_sats is None
         assert result.fee_sats == 250  # the full residue, not 110*2
         assert result.estimated_vsize == expected_vsize(1, 1, with_change=False)
 
     def test_residue_is_never_added_to_the_recipient(self):
-        result = select_coins([utxo(4, 60_250)], 60_000, 2, CHANGE_COST, RECIPIENT)
+        result = select_coins([utxo(4, 60_250)], 60_000, 200, CHANGE_COST, RECIPIENT)
         assert result.fee_sats + 60_000 == result.inputs_total
 
     def test_custom_change_script_changes_dust_threshold(self):
@@ -123,7 +123,7 @@ class TestChangePolicies:
         result = select_coins(
             [utxo(5, 60_000 + 400)],
             60_000,
-            2,
+            200,
             8 + 1 + 34,
             RECIPIENT,
             change_script=b"\x00\x20" + b"\x33" * 32,
@@ -139,7 +139,7 @@ class TestSingleCoinImprovement:
         result = select_coins(
             [utxo(1, 50_000), utxo(2, 30_000), utxo(3, 200_000)],
             60_000,
-            2,
+            200,
             CHANGE_COST,
             RECIPIENT,
         )
@@ -156,7 +156,7 @@ class TestSingleCoinImprovement:
         result = select_coins(
             [utxo(1, 50_000), utxo(2, 30_000), utxo(3, 60_000 + greedy_fee)],
             60_000,
-            2,
+            200,
             CHANGE_COST,
             RECIPIENT,
         )
@@ -170,7 +170,7 @@ class TestSingleCoinImprovement:
         result = select_coins(
             [utxo(1, 50_000), utxo(2, 30_000), utxo(3, 60_500)],
             60_000,
-            2,
+            200,
             CHANGE_COST,
             RECIPIENT,
         )
@@ -181,7 +181,7 @@ class TestSingleCoinImprovement:
         result = select_coins(
             [utxo(1, 50_000), utxo(2, 30_000), utxo(3, 55_000)],
             60_000,
-            2,
+            200,
             CHANGE_COST,
             RECIPIENT,
         )
@@ -199,7 +199,7 @@ class TestDustInputSkip:
         # to poison every greedy prefix (InsufficientFunds). The skip rule
         # must select the big coin.
         utxos = [utxo(i + 1, 1) for i in range(200)] + [utxo(1000, 61_200)]
-        result = select_coins(utxos, 60_000, 10, CHANGE_COST, RECIPIENT)
+        result = select_coins(utxos, 60_000, 1_000, CHANGE_COST, RECIPIENT)
         assert [u.value_sats for u in result.selected] == [61_200]
         # The big coin funds it changelessly: the whole residue is the fee.
         assert result.change_sats is None
@@ -219,24 +219,24 @@ class TestDustInputSkip:
         # 1-sat coins can never finalize, even in the thousands.
         utxos = [utxo(i + 1, 1) for i in range(1000)]
         with pytest.raises(InsufficientFundsError):
-            select_coins(utxos, 60_000, 1, CHANGE_COST, RECIPIENT)
+            select_coins(utxos, 60_000, 100, CHANGE_COST, RECIPIENT)
 
     def test_all_dust_wallet_reports_insufficient_funds(self):
         # Every input below 68 x rate: nothing is selectable, so the honest
         # answer is InsufficientFunds, not a doomed selection.
         utxos = [utxo(i + 1, 50) for i in range(100)]  # 50 < 68 x 2
         with pytest.raises(InsufficientFundsError) as exc:
-            select_coins(utxos, 60_000, 2, CHANGE_COST, RECIPIENT)
+            select_coins(utxos, 60_000, 200, CHANGE_COST, RECIPIENT)
         assert exc.value.available == 100 * 50
 
     def test_skip_is_deterministic_under_shuffling(self):
         utxos = [utxo(i + 1, 1) for i in range(200)] + [utxo(1000, 61_200)]
         rng = random.Random(7)
-        reference = select_coins(utxos, 60_000, 10, CHANGE_COST, RECIPIENT)
+        reference = select_coins(utxos, 60_000, 1_000, CHANGE_COST, RECIPIENT)
         for _ in range(10):
             shuffled = list(utxos)
             rng.shuffle(shuffled)
-            assert select_coins(shuffled, 60_000, 10, CHANGE_COST, RECIPIENT) == reference
+            assert select_coins(shuffled, 60_000, 1_000, CHANGE_COST, RECIPIENT) == reference
 
 
 class TestConservationInvariant:
@@ -249,23 +249,23 @@ class TestConservationInvariant:
 
     def test_viable_change_conserves(self):
         result = select_coins(
-            [utxo(1, 50_000), utxo(2, 30_000)], 60_000, 2, CHANGE_COST, RECIPIENT
+            [utxo(1, 50_000), utxo(2, 30_000)], 60_000, 200, CHANGE_COST, RECIPIENT
         )
         assert result.change_sats is not None
         assert self._conserves(result, 60_000)
 
     def test_folded_residue_conserves(self):
-        result = select_coins([utxo(4, 60_250)], 60_000, 2, CHANGE_COST, RECIPIENT)
+        result = select_coins([utxo(4, 60_250)], 60_000, 200, CHANGE_COST, RECIPIENT)
         assert result.change_sats is None
         assert self._conserves(result, 60_000)
 
     def test_single_coin_conserves(self):
-        result = select_coins([utxo(9, 200_000)], 60_000, 2, CHANGE_COST, RECIPIENT)
+        result = select_coins([utxo(9, 200_000)], 60_000, 200, CHANGE_COST, RECIPIENT)
         assert self._conserves(result, 60_000)
 
     def test_dust_skip_result_conserves(self):
         utxos = [utxo(i + 1, 1) for i in range(200)] + [utxo(1000, 61_200)]
-        result = select_coins(utxos, 60_000, 10, CHANGE_COST, RECIPIENT)
+        result = select_coins(utxos, 60_000, 1_000, CHANGE_COST, RECIPIENT)
         assert self._conserves(result, 60_000)
 
 
@@ -284,14 +284,14 @@ class TestNoShatteringDustSweep:
         changeless_vsize = expected_vsize(299, 1, with_change=False)
         amount = selected_total - changeless_vsize * rate - 100  # 63_244
 
-        result = select_coins(utxos, amount, rate, CHANGE_COST, RECIPIENT)
+        result = select_coins(utxos, amount, rate * 100, CHANGE_COST, RECIPIENT)
 
         assert len(result.selected) == n_total  # slightly larger input set
         assert result.change_sats is not None  # viable change output
         assert result.change_sats >= 294
         # And the sweep never runs without cause in normal wallets:
         normal = select_coins(
-            [utxo(1, 50_000), utxo(2, 30_000)], 60_000, 2, CHANGE_COST, RECIPIENT
+            [utxo(1, 50_000), utxo(2, 30_000)], 60_000, 200, CHANGE_COST, RECIPIENT
         )
         assert [u.value_sats for u in normal.selected] == [30_000, 50_000]
 
@@ -299,7 +299,7 @@ class TestNoShatteringDustSweep:
         result = select_coins(
             [utxo(1, 50_000), utxo(2, 30_000), utxo(3, 900_000)],
             60_000,
-            2,
+            200,
             CHANGE_COST,
             RECIPIENT,
         )
@@ -312,7 +312,7 @@ class TestInsufficientFunds:
     def test_residue_below_fee_target_is_insufficient(self):
         # 60_100 - 60_000 = 100 < changeless fee target 220 at rate 2.
         with pytest.raises(InsufficientFundsError) as exc:
-            select_coins([utxo(1, 60_100)], 60_000, 2, CHANGE_COST, RECIPIENT)
+            select_coins([utxo(1, 60_100)], 60_000, 200, CHANGE_COST, RECIPIENT)
         assert exc.value.needed > exc.value.available
         assert exc.value.available == 60_100
 
@@ -320,7 +320,7 @@ class TestInsufficientFunds:
         # ADR-0012: needed/available amounts are deliberate UI text for the
         # chat surface; they must never be placed into logs by callers.
         with pytest.raises(InsufficientFundsError) as exc:
-            select_coins([utxo(1, 10_000)], 60_000, 2, CHANGE_COST, RECIPIENT)
+            select_coins([utxo(1, 10_000)], 60_000, 200, CHANGE_COST, RECIPIENT)
         message = str(exc.value)
         assert "10000" in message or "10 000" in message
         assert str(exc.value.needed) in message
@@ -328,19 +328,19 @@ class TestInsufficientFunds:
 
     def test_empty_wallet(self):
         with pytest.raises(InsufficientFundsError) as exc:
-            select_coins([], 1_000, 2, CHANGE_COST, RECIPIENT)
+            select_coins([], 1_000, 200, CHANGE_COST, RECIPIENT)
         assert exc.value.available == 0
 
     def test_amount_above_total(self):
         with pytest.raises(InsufficientFundsError):
-            select_coins([utxo(1, 50_000)], 500_000, 2, CHANGE_COST, RECIPIENT)
+            select_coins([utxo(1, 50_000)], 500_000, 200, CHANGE_COST, RECIPIENT)
 
 
 class TestDeterminism:
     def test_same_inputs_same_result(self):
         utxos = [utxo(1, 50_000), utxo(2, 30_000), utxo(3, 200_000)]
-        first = select_coins(utxos, 60_000, 2, CHANGE_COST, RECIPIENT)
-        second = select_coins(utxos, 60_000, 2, CHANGE_COST, RECIPIENT)
+        first = select_coins(utxos, 60_000, 200, CHANGE_COST, RECIPIENT)
+        second = select_coins(utxos, 60_000, 200, CHANGE_COST, RECIPIENT)
         assert first == second
         assert [id(u) for u in first.selected] == [
             id(u) for u in second.selected
@@ -349,15 +349,15 @@ class TestDeterminism:
     def test_shuffled_input_order_same_result(self):
         utxos = [utxo(i, 30_000 + 7_000 * i) for i in range(1, 8)]
         rng = random.Random(42)
-        reference = select_coins(utxos, 60_000, 2, CHANGE_COST, RECIPIENT)
+        reference = select_coins(utxos, 60_000, 200, CHANGE_COST, RECIPIENT)
         for _ in range(20):
             shuffled = list(utxos)
             rng.shuffle(shuffled)
-            assert select_coins(shuffled, 60_000, 2, CHANGE_COST, RECIPIENT) == reference
+            assert select_coins(shuffled, 60_000, 200, CHANGE_COST, RECIPIENT) == reference
 
     def test_selected_returned_in_canonical_order(self):
         utxos = [utxo(7, 30_000), utxo(2, 20_000), utxo(5, 10_000)]
-        result = select_coins(utxos, 55_000, 1, CHANGE_COST, RECIPIENT)
+        result = select_coins(utxos, 55_000, 100, CHANGE_COST, RECIPIENT)
         values = [u.value_sats for u in result.selected]
         assert values == sorted(values)
 
@@ -369,9 +369,9 @@ class TestValidationFailClosed:
             {"amount_sats": -1},
             {"amount_sats": True},
             {"amount_sats": 1.5},
-            {"fee_rate_sat_vb": 0},
-            {"fee_rate_sat_vb": -2},
-            {"fee_rate_sat_vb": 10_001},
+            {"fee_rate_centisat_vb": 0},
+            {"fee_rate_centisat_vb": -2},
+            {"fee_rate_centisat_vb": 1_000_001},
             {"change_cost_vbytes": 30},  # below 8 + 1 + 22
             {"change_cost_vbytes": -1},
             {"output_script": b""},
@@ -382,7 +382,7 @@ class TestValidationFailClosed:
         params = {
             "utxos": [utxo(1, 200_000)],
             "amount_sats": 60_000,
-            "fee_rate_sat_vb": 2,
+            "fee_rate_centisat_vb": 200,
             "change_cost_vbytes": CHANGE_COST,
             "output_script": RECIPIENT,
         }
@@ -393,7 +393,7 @@ class TestValidationFailClosed:
     def test_recipient_below_dust_refused(self):
         with pytest.raises(SelectionError):
             select_coins(
-                [utxo(1, 200_000)], 100, 2, CHANGE_COST, RECIPIENT
+                [utxo(1, 200_000)], 100, 200, CHANGE_COST, RECIPIENT
             )
 
     def test_op_return_output_script_refused(self):
@@ -402,31 +402,31 @@ class TestValidationFailClosed:
         # unspendable output (B5).
         with pytest.raises(SelectionError) as exc:
             select_coins(
-                [utxo(1, 200_000)], 60_000, 2, CHANGE_COST, b"\x6a\x04test"
+                [utxo(1, 200_000)], 60_000, 200, CHANGE_COST, b"\x6a\x04test"
             )
         assert "unspendable" in str(exc.value)
         # A 1-sat amount on an OP_RETURN output would have passed the dust
         # check (threshold 0) — the refusal must come first.
         with pytest.raises(SelectionError):
-            select_coins([utxo(1, 200_000)], 1, 2, CHANGE_COST, b"\x6a\x04test")
+            select_coins([utxo(1, 200_000)], 1, 200, CHANGE_COST, b"\x6a\x04test")
 
     def test_duplicate_utxo_refused(self):
         with pytest.raises(SelectionError):
             select_coins(
                 [utxo(1, 50_000), utxo(1, 50_000)],
                 60_000,
-                2,
+                200,
                 CHANGE_COST,
                 RECIPIENT,
             )
 
     def test_bad_utxo_fields_refused(self):
         with pytest.raises(SelectionError):
-            select_coins([utxo(1, 0)], 60_000, 2, CHANGE_COST, RECIPIENT)
+            select_coins([utxo(1, 0)], 60_000, 200, CHANGE_COST, RECIPIENT)
         with pytest.raises(SelectionError):
-            select_coins([Utxo("short", 0, 50_000)], 60_000, 2, CHANGE_COST, RECIPIENT)
+            select_coins([Utxo("short", 0, 50_000)], 60_000, 200, CHANGE_COST, RECIPIENT)
         with pytest.raises(SelectionError):
-            select_coins([Utxo(f"{1:064x}", -1, 50_000)], 60_000, 2, CHANGE_COST, RECIPIENT)
+            select_coins([Utxo(f"{1:064x}", -1, 50_000)], 60_000, 200, CHANGE_COST, RECIPIENT)
 
 
 class TestVsizeAgainstEmbit:
@@ -463,7 +463,7 @@ class TestVsizeAgainstEmbit:
 
     def test_selection_vsize_matches_embit_built_tx(self):
         result = select_coins(
-            [utxo(1, 50_000), utxo(2, 30_000)], 60_000, 2, CHANGE_COST, RECIPIENT
+            [utxo(1, 50_000), utxo(2, 30_000)], 60_000, 200, CHANGE_COST, RECIPIENT
         )
         change_script = CHANGE_P2WPKH if result.change_sats is not None else None
         assert result.estimated_vsize == self._embit_vsize(

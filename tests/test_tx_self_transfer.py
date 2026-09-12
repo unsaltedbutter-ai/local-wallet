@@ -376,7 +376,8 @@ class TestSplitPlan:
         res = t[IntentName.SELF_TRANSFER](
             _self_env({"mode": "split", "parts": 3, "fee_target": "slow"})
         )
-        assert res["fee_rate_sat_vb"] == 1
+        assert res["fee_rate_centisat_vb"] == 100  # 1 sat/vB, exact
+        assert res["fee_rate_display"] == "1"
         assert res["fee_sats"] == 172  # vsize 172 × 1
         s.close()
         c.close()

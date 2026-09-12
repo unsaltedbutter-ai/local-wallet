@@ -234,7 +234,10 @@ class PendingTx:
     amount_sats: int
     recipient: str
     fee_target: str | None
-    fee_rate_sat_vb: int
+    #: Fee bid in centisat/vB (1 sat/vB = 100; TCK-FEE-003 wave —
+    #: the estimator's fractional ladder is exact here; whole sats carry
+    #: exact multiples of 100).
+    fee_rate_centisat_vb: int
     fee_sats: int
     change_sats: int | None
     psbt_base64: str
@@ -434,7 +437,7 @@ class TxFlow:
         *,
         amount_sats: int,
         recipient: str,
-        fee_rate_sat_vb: int,
+        fee_rate_centisat_vb: int,
         fee_sats: int,
         psbt_base64: str,
         inputs_count: int,
@@ -488,7 +491,7 @@ class TxFlow:
             amount_sats=amount_sats,
             recipient=recipient,
             fee_target=fee_target,
-            fee_rate_sat_vb=fee_rate_sat_vb,
+            fee_rate_centisat_vb=fee_rate_centisat_vb,
             fee_sats=fee_sats,
             change_sats=change_sats,
             psbt_base64=psbt_base64,

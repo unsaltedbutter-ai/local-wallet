@@ -1187,7 +1187,7 @@ class TestFees:
             estimator = FeeEstimator(client, ttl_s=30.0)
             fast = estimator.estimate(FeeTarget.FAST)
             slow = estimator.estimate(FeeTarget.SLOW)
-            assert (fast.sat_per_vb, slow.sat_per_vb) == (6, 1)
+            assert (fast.rate_centisat_vb, slow.rate_centisat_vb) == (600, 100)
             assert fast.source is FeeSource.RECOMMENDED  # single-source honesty
             estimator.estimate(FeeTarget.MEDIUM)  # cache hit: no new fetch
         assert server.counts["estimatesmartfee"] == 3  # one refresh total
@@ -1205,7 +1205,7 @@ class TestFees:
         )
         with _client(server) as client:
             estimator = FeeEstimator(client, ttl_s=30.0)
-            assert estimator.estimate(FeeTarget.FAST).sat_per_vb == 2
+            assert estimator.estimate(FeeTarget.FAST).rate_centisat_vb == 200
             estimator.invalidate()
             with pytest.raises(ChainError):
                 estimator.estimate(FeeTarget.FAST)  # no lower layer, never fabricated

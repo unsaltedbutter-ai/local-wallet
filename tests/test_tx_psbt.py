@@ -82,7 +82,7 @@ def source(txid: str, vout: int, value_sats: int, branch: int = 0, index: int | 
 def build_pair(inputs, amount_sats, rate=2, with_change=True):
     """Selection + PSBT build through the real public API."""
     result = select_coins(
-        inputs, amount_sats, rate, 8 + 1 + 22, recipient_script()
+        inputs, amount_sats, rate * 100, 8 + 1 + 22, recipient_script()  # sat/vB->centisat
     )
     return build_unsigned_psbt(
         result.selected,

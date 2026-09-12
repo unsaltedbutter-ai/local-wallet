@@ -149,6 +149,7 @@ from localwallet.chain import (
     check_backend,
     classify_failure,
     estimate_eta,
+    format_sat_vb,
     minor_per_unit,
     time_since_last_block,
 )
@@ -237,6 +238,7 @@ from localwallet.tx.selection import (
     SelectionError,
     coin_partition,
     estimate_tx_vsize,
+    fee_sats_for,
     select_coins,
 )
 from localwallet.ui.onboarding import (
@@ -2320,7 +2322,8 @@ def _tx_pending_result(
                 "amount_sats": pending.amount_sats,
                 "recipient": pending.recipient,
                 "fee_sats": pending.fee_sats,
-                "fee_rate_sat_vb": pending.fee_rate_sat_vb,
+                "fee_rate_centisat_vb": pending.fee_rate_centisat_vb,
+                "fee_rate_display": format_sat_vb(pending.fee_rate_centisat_vb),
                 "vsize": pending.vsize,
                 "change_sats": pending.change_sats,
                 "inputs_count": pending.inputs_count,
@@ -2423,7 +2426,8 @@ def _make_create_tx_handler(
        with its age; the rate's fetch timestamp is included either way.
     3. Fee rate: the two fee knobs are mutually exclusive at the schema
        layer (ADR-0012 amendment, TCK-FEE-002). An explicit
-       ``fee_rate_sat_vb`` is used VERBATIM as the bid — no estimator call,
+       ``fee_rate_sat_vb`` is used VERBATIM as the bid (scaled exactly to
+       the engine's centisat/vB unit) — no estimator call,
        no rung is recorded (``fee_target=None``, no fabricated ETA), and the
        card retires the speed offer like any stated preference. Otherwise
        ``fee_target`` maps onto :class:`FeeTarget`; when the model omits it
@@ -2567,13 +2571,16 @@ def _make_create_tx_handler(
 
         # 3 (cont.). Fee rate: the literal user-quoted sat/vB rate when
         # present (no estimator call — the user's number is quoted verbatim
-        # and is the whole point of the ceiling-ask answer), else the ladder
-        # (MEDIUM default when neither knob is given).
+        # and is the whole point of the ceiling-ask answer; it arrives in
+        # whole sats/vB and scales exactly to centisat/vB here), else the
+        # ladder (MEDIUM default when neither knob is given). From here on
+        # ``fee_rate`` is ALWAYS integer centisat/vB (1 sat/vB = 100) — the
+        # engine unit (docs/fee-fractional-plan.md, TCK-FEE-003 wave).
         if params.fee_rate_sat_vb is not None:
-            fee_rate = params.fee_rate_sat_vb
+            fee_rate = params.fee_rate_sat_vb * 100
         else:
             try:
-                fee_rate = fee_estimator.estimate(target).sat_per_vb
+                fee_rate = fee_estimator.estimate(target).rate_centisat_vb
             except ChainError as exc:
                 return {"error": "chain_unavailable", "detail": str(exc)}
 
@@ -2746,7 +2753,7 @@ def _make_create_tx_handler(
             pending = flow.create(
                 amount_sats=amount_sats,
                 recipient=params.recipient,
-                fee_rate_sat_vb=fee_rate,
+                fee_rate_centisat_vb=fee_rate,
                 fee_sats=selection.fee_sats,
                 psbt_base64=psbt_base64,
                 inputs_count=len(inputs),
@@ -2770,7 +2777,8 @@ def _make_create_tx_handler(
             "amount_sats": pending.amount_sats,
             "recipient": pending.recipient,
             "fee_sats": pending.fee_sats,
-            "fee_rate_sat_vb": pending.fee_rate_sat_vb,
+            "fee_rate_centisat_vb": pending.fee_rate_centisat_vb,
+            "fee_rate_display": format_sat_vb(pending.fee_rate_centisat_vb),
             "vsize": pending.vsize,
             "change_sats": pending.change_sats,
             "inputs_count": pending.inputs_count,
@@ -2812,9 +2820,9 @@ def _make_create_tx_handler(
             if params.fee_rate_sat_vb is not None:
                 # Explicit-rate re-quote: no rungs to compare — direction is
                 # the literal rate vs the staged record's (display-only).
-                if fee_rate > staged.fee_rate_sat_vb:
+                if fee_rate > staged.fee_rate_centisat_vb:
                     result["requote_direction"] = "faster"
-                elif fee_rate < staged.fee_rate_sat_vb:
+                elif fee_rate < staged.fee_rate_centisat_vb:
                     result["requote_direction"] = "slower"
             else:
                 direction = _requote_direction(staged.fee_target, target)
@@ -2985,7 +2993,7 @@ def _make_self_transfer_handler(
         #    makes — exactly like create_tx; no new chain surface).
         target = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.MEDIUM
         try:
-            fee_rate = fee_estimator.estimate(target).sat_per_vb
+            fee_rate = fee_estimator.estimate(target).rate_centisat_vb
         except ChainError as exc:
             return {"error": "chain_unavailable", "detail": str(exc)}
 
@@ -3026,7 +3034,7 @@ def _make_self_transfer_handler(
             if not utxos:
                 # Empty wallet: needed = fee for the changeless 1-in/N-out
                 # shape + the N dust floors (user-facing UI, ADR-0012).
-                needed = estimate_tx_vsize(1, dest_scripts, None) * fee_rate + parts * own_dust
+                needed = fee_sats_for(estimate_tx_vsize(1, dest_scripts, None), fee_rate) + parts * own_dust
                 return {
                     "error": "insufficient_funds",
                     "needed_sats": needed,
@@ -3041,7 +3049,7 @@ def _make_self_transfer_handler(
             input_rows = [coin]
             inputs_total = coin.value_sats
             vsize = estimate_tx_vsize(1, dest_scripts, None)
-            fee_floor = vsize * fee_rate
+            fee_floor = fee_sats_for(vsize, fee_rate)
             each = (inputs_total - fee_floor) // parts
             if each < own_dust:
                 # pre-build dust refusal, value-free (the friendly line):
@@ -3085,7 +3093,7 @@ def _make_self_transfer_handler(
             input_rows = chosen
             inputs_total = sum(u.value_sats for u in chosen)
             vsize = estimate_tx_vsize(len(chosen), dest_scripts[:1], None)
-            fee_sats = vsize * fee_rate
+            fee_sats = fee_sats_for(vsize, fee_rate)
             out_value = inputs_total - fee_sats
             if out_value < own_dust:
                 # User-facing UI figures (ADR-0012), never a log-bound detail.
@@ -3154,7 +3162,7 @@ def _make_self_transfer_handler(
             pending = flow.create(
                 amount_sats=amount_total,
                 recipient=destinations[0].address,
-                fee_rate_sat_vb=fee_rate,
+                fee_rate_centisat_vb=fee_rate,
                 fee_sats=meta.expected_fee_sats,
                 psbt_base64=psbt_base64,
                 inputs_count=len(inputs),
@@ -3176,7 +3184,8 @@ def _make_self_transfer_handler(
             "amount_sats": pending.amount_sats,
             "recipient": pending.recipient,
             "fee_sats": pending.fee_sats,
-            "fee_rate_sat_vb": pending.fee_rate_sat_vb,
+            "fee_rate_centisat_vb": pending.fee_rate_centisat_vb,
+            "fee_rate_display": format_sat_vb(pending.fee_rate_centisat_vb),
             "vsize": pending.vsize,
             "change_sats": None,
             "inputs_count": pending.inputs_count,
@@ -10859,7 +10868,7 @@ def _print_self_plan(
     fee_sats = _card_sats(result, "fee_sats")
     fee = "Fee: unavailable" if fee_sats is None else f"Fee: {fee_sats} sats"
     if fee_sats is not None:
-        rate = _card_sats(result, "fee_rate_sat_vb")
+        rate = _card_fee_rate_text(result)
         if rate is not None:
             fee += f" · {rate} sat/vB"
         vsize = _card_sats(result, "vsize")
@@ -11033,6 +11042,16 @@ def _card_sats(result: Mapping[str, object], key: str) -> str | None:
     return f"{value:,}"
 
 
+def _card_fee_rate_text(result: Mapping[str, object]) -> str | None:
+    """The fee-rate card segment (formatted sats/vB text like ``"1.21"``),
+    or ``None`` when absent/not-a-string — the same fail-closed rule as
+    :func:`_card_sats`: never a fabricated figure, drop the segment. The
+    text is the chain-owned ``format_sat_vb`` of the tool result's integer
+    centisat/vB rate, quoted verbatim (TCK-FEE-003 wave)."""
+    value = result.get("fee_rate_display")
+    return value if isinstance(value, str) and value else None
+
+
 def _card_rate(result: Mapping[str, object]) -> str | None:
     """Thousands-separated per-BTC rate, whole units when the source gave
     whole units (the price provider does — ADR-0011 §4), else 2 decimals.
@@ -11177,7 +11196,7 @@ def _print_brief_card(
     fee_sats = _card_sats(result, "fee_sats")
     fee = "Fee: unavailable" if fee_sats is None else f"Fee: {fee_sats} sats"
     if fee_sats is not None:
-        rate = _card_sats(result, "fee_rate_sat_vb")
+        rate = _card_fee_rate_text(result)
         if rate is not None:
             fee += f" · {rate} sat/vB"
         vsize = _card_sats(result, "vsize")
@@ -11258,8 +11277,9 @@ def _print_confirmation_card(
     if "fee_sats" in result:
         fee_line = f"Fee: {result['fee_sats']} sats"
         fee_parts: list[str] = []
-        if result.get("fee_rate_sat_vb") is not None:
-            fee_parts.append(f"{result['fee_rate_sat_vb']} sat/vB")
+        fee_rate_text = _card_fee_rate_text(result)
+        if fee_rate_text is not None:
+            fee_parts.append(f"{fee_rate_text} sat/vB")
         # None/absent ⇒ no segment: an explicit-rate record carries no rung
         # (TCK-FEE-002) — never render "None target".
         target_word = result.get("fee_target")

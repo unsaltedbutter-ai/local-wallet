@@ -53,7 +53,7 @@ def coin(n: int, value_sats: int, kyc: bool | None = None) -> Coin:
 
 def run(coins, amount=AMOUNT, rate=1, **policy):
     return select_coins(
-        coins, amount, rate, CHANGE_COST, RECIPIENT,
+        coins, amount, rate * 100, CHANGE_COST, RECIPIENT,  # sat/vB -> centisat
         change_script=CHANGE_P2WPKH, **policy,
     )
 
