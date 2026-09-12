@@ -145,10 +145,9 @@ const LABELS = {
   badgeBitcoind: "bitcoind",
   // TCK-WEB-010: bubble copy control (aria-label + transient title states).
   copyMessage: "Copy message",
-  // TCK-LINK-001: explorer link disclosure (title + aria-label) — keeps the
-  // operator-sees-it hedge of the TCK-PRIVACY-001 direction.
-  explorerLink:
-    "Opens mempool.space in a new tab — the operator of that site sees this address or txid.",
+  // TCK-WEB-014: the in-bubble token affordance is a copy control now (no
+  // navigation, so the old mempool.space disclosure is gone with D8).
+  clickToCopy: "Click to copy",
   copyDone: "Copied",
   copyFailed: "Copy failed",
   // TCK-QR-001: receive-address QR. The title/aria string is the ticket's
@@ -411,16 +410,20 @@ function authHeaders(extra) {
 
 // ---------------------------------------------------------------- rendering
 
-// TCK-LINK-001: chat-bubble linkification. ONLY these two closed token
-// shapes become links, and ONLY inside engine/user bubbles (progress lines,
-// the model-download bar, and every settings-pane display keep plain text
-// nodes — they never route through appendBubbleText). The href is built as
-// CONSTANT PREFIX + validated token (never a raw bubble slice), so a
-// script-URL or relative-path injection is impossible by construction; the
-// parsed-origin check is a belt-and-braces assert before the value reaches
-// <a>. The visible label is the token VERBATIM (addresses/txids are quoted
-// from tool output; a link never alters displayed characters).
-const EXPLORER_ORIGIN = "https://mempool.space";
+// TCK-LINK-001 + TCK-WEB-014: chat-bubble token affordances. ONLY these two
+// closed token shapes are treated specially, and ONLY inside engine/user
+// bubbles (progress lines, the model-download bar, and every settings-pane
+// display keep plain text nodes — they never route through appendBubbleText).
+// WEB-014 (user direction, reverses LINK-001's navigation): a qualifying
+// token renders as a COPY BUTTON, not a link — there is no href, no external
+// origin, no navigation (mempool.space is never opened from a bubble). The
+// visible label is the token VERBATIM (addresses/txids are quoted from tool
+// output; the affordance never alters displayed characters), and the string
+// handed to the clipboard is that same verbatim token. A <button> (not a
+// href-less <a>) because copy is an action and a button is focusable and
+// keyboard-operable by construction; styles.css resets it to the exact
+// inline text layout of the old anchor (overflow-wrap:anywhere keeps the
+// same mid-token break at phone width — verified no layout shift).
 // mainnet bech32: "bc1" + lowercase bech32 charset, total length 14..90.
 const ADDRESS_RE = /^bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}$/;
 const TXID_RE = /^[0-9a-f]{64}$/;
@@ -429,41 +432,25 @@ const TXID_RE = /^[0-9a-f]{64}$/;
 const LINK_SCAN_RE =
   /\b(bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}|[0-9a-f]{64})\b/g;
 
-function explorerHref(token) {
-  const isTx = TXID_RE.test(token);
-  if (!isTx && !ADDRESS_RE.test(token)) return null;
-  const href = EXPLORER_ORIGIN + (isTx ? "/tx/" : "/address/") + token;
-  return new URL(href).origin === EXPLORER_ORIGIN ? href : null;
-}
-
 // Append `text` to a bubble line as text nodes with qualifying tokens turned
-// into anchors. Render-once idempotence: every .turn-text line is built ONCE
-// at its event — the handleEvent event-id duplicate guard drops replayed SSE
-// events before appendText/appendUser ever run — and this transform never
-// re-reads an existing line, so a replay cannot double-wrap or nest anchors.
+// into copy buttons. Render-once idempotence: every .turn-text line is built
+// ONCE at its event — the handleEvent event-id duplicate guard drops replayed
+// SSE events before appendText/appendUser ever run — and this transform never
+// re-reads an existing line, so a replay cannot double-wrap or nest controls.
 function appendBubbleText(line, text) {
   let last = 0;
   let m;
   LINK_SCAN_RE.lastIndex = 0;
   while ((m = LINK_SCAN_RE.exec(text)) !== null) {
-    const href = explorerHref(m[0]);
-    if (href === null) continue;
     if (m.index > last) {
       line.appendChild(document.createTextNode(text.slice(last, m.index)));
     }
-    const a = document.createElement("a");
-    a.className = "explorer-link";
-    a.href = href;
-    a.target = "_blank";
-    a.rel = "noopener noreferrer";
-    a.textContent = m[0]; // verbatim label
-    a.title = LABELS.explorerLink;
-    a.setAttribute("aria-label", LABELS.explorerLink);
-    line.appendChild(a);
+    line.appendChild(copyTokenButton(m[0]));
     if (ADDRESS_RE.test(m[0])) {
-      // TCK-QR-001: the per-address QR affordance rides right after the
-      // link (txids get none). Its "QR" caption is excluded from bubbleText
-      // (lineText) so copying a message never gains button words.
+      // TCK-QR-001 (D9: preserved): the per-address QR affordance rides
+      // right after the token (txids get none). Its "QR" caption is excluded
+      // from bubbleText (lineText) so copying a message never gains button
+      // words; the token button's text IS the verbatim token, so it stays.
       line.appendChild(qrButton(m[0]));
     }
     last = m.index + m[0].length;
@@ -471,6 +458,47 @@ function appendBubbleText(line, text) {
   if (last === 0 || last < text.length) {
     line.appendChild(document.createTextNode(text.slice(last)));
   }
+}
+
+// localhost is a secure context so navigator.clipboard normally exists; a
+// missing API or a rejected write reports false and lands in the visible
+// fail state (class + title only — never an alert, never an inline style).
+async function clipboardWrite(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The WEB-010 copy feedback pattern, shared by both copy controls: ok/fail
+// class colors the control for 1.6s, then the base title returns.
+function flashCopyResult(ctrl, ok, baseTitle) {
+  ctrl.classList.remove("copy-ok", "copy-fail");
+  ctrl.classList.add(ok ? "copy-ok" : "copy-fail");
+  ctrl.title = ok ? LABELS.copyDone : LABELS.copyFailed;
+  clearTimeout(ctrl._copyReset);
+  ctrl._copyReset = setTimeout(() => {
+    ctrl.classList.remove("copy-ok", "copy-fail");
+    ctrl.title = baseTitle;
+  }, 1600);
+}
+
+// TCK-WEB-014: the in-bubble underlined token, now a copy affordance. Its
+// only content is the verbatim token (no label text nodes), so lineText
+// keeps copying message text exactly (D9).
+function copyTokenButton(token) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "explorer-link";
+  btn.textContent = token; // verbatim label
+  btn.title = LABELS.clickToCopy;
+  btn.setAttribute("aria-label", LABELS.clickToCopy);
+  btn.addEventListener("click", async () => {
+    flashCopyResult(btn, await clipboardWrite(token), LABELS.clickToCopy);
+  });
+  return btn;
 }
 
 // TCK-WEB-010: per-bubble copy control. The copyable text of a turn is its
@@ -516,10 +544,8 @@ function copyIcon() {
 }
 
 // One button per bubble, added when the bubble first carries copyable text
-// (empty / progress-only bubbles get none). localhost is a secure context so
-// navigator.clipboard normally exists; a missing API or a rejected write
-// lands in the visible fail state (class + title only — never an alert,
-// never an inline style).
+// (empty / progress-only bubbles get none). The ok/fail feedback is the
+// shared WEB-010 pattern (flashCopyResult).
 function addCopyButton(turn) {
   if (turn.querySelector(".copy-btn") || !bubbleText(turn)) return;
   const btn = document.createElement("button");
@@ -528,25 +554,10 @@ function addCopyButton(turn) {
   btn.setAttribute("aria-label", LABELS.copyMessage);
   btn.title = LABELS.copyMessage;
   btn.appendChild(copyIcon());
-  let resetTimer = 0;
   btn.addEventListener("click", async () => {
     const text = bubbleText(turn);
     if (!text) return;
-    let ok = false;
-    try {
-      await navigator.clipboard.writeText(text);
-      ok = true;
-    } catch {
-      ok = false;
-    }
-    btn.classList.remove("copy-ok", "copy-fail");
-    btn.classList.add(ok ? "copy-ok" : "copy-fail");
-    btn.title = ok ? LABELS.copyDone : LABELS.copyFailed;
-    clearTimeout(resetTimer);
-    resetTimer = setTimeout(() => {
-      btn.classList.remove("copy-ok", "copy-fail");
-      btn.title = LABELS.copyMessage;
-    }, 1600);
+    flashCopyResult(btn, await clipboardWrite(text), LABELS.copyMessage);
   });
   turn.appendChild(btn);
 }
@@ -641,7 +652,7 @@ function ensureTurn() {
 function appendText(text) {
   const turn = ensureTurn();
   const line = el("p", "turn-text");
-  appendBubbleText(line, text); // TCK-LINK-001: shape-validated explorer links
+  appendBubbleText(line, text); // TCK-WEB-014: click-to-copy token buttons
   turn.appendChild(line);
   addCopyButton(turn); // first copyable line of this engine turn
   state.progressLine = null;
@@ -729,7 +740,7 @@ function appendUser(text, queued) {
   turn.appendChild(el("span", "turn-role", "You"));
   if (queued) turn.appendChild(el("span", "turn-queued-tag", LABELS.queuedTag));
   const line = el("p", "turn-text");
-  appendBubbleText(line, text); // TCK-LINK-001: shape-validated explorer links
+  appendBubbleText(line, text); // TCK-WEB-014: click-to-copy token buttons
   turn.appendChild(line);
   addCopyButton(turn);
   transcriptEl.appendChild(turn);

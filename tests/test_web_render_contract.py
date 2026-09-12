@@ -168,22 +168,40 @@ def test_privacy_subline_visible_and_trust_badge_keys_off_privacy_mode() -> None
     assert "effectiveChainUrl" not in trust_block
 
 
-# TCK-LINK-001 static pins: chat-bubble linkification is constant-prefix +
-# validated-token by construction, opens in a new tab with the hardening rel,
-# and rides classes/attributes only (no inline style on the generated anchor).
+# TCK-LINK-001 (revised by TCK-WEB-014, critique D8) static pins: the
+# qualifying-token scan is unchanged, but the affordance is a COPY BUTTON —
+# the visible label is the verbatim token, no navigation machinery survives
+# (no EXPLORER_ORIGIN, no explorerHref, no href/target/rel, no mempool
+# disclosure string), and the feedback reuses the shared WEB-010 ok/fail
+# pattern. Classes/attributes only (no inline style on the generated control).
 def test_linkify_client_shape_pins() -> None:
     raw = (_STATIC / "app.js").read_text(encoding="utf-8")
     code = _strip_js_comments(raw)
-    # (checked on raw source: the comment-stripper truncates // inside URLs)
-    assert 'const EXPLORER_ORIGIN = "https://mempool.space";' in raw
-    assert 'EXPLORER_ORIGIN + (isTx ? "/tx/" : "/address/") + token' in code
-    assert 'new URL(href).origin === EXPLORER_ORIGIN' in code  # origin assert
-    assert 'a.target = "_blank"' in code
-    assert 'a.rel = "noopener noreferrer"' in code
-    assert "a.textContent = m[0]" in code  # verbatim label
-    assert "a.style" not in code and "setAttribute(\"style\"" not in code
-    # only the two bubble painters call the linkifier (appendText, appendUser);
-    # progress + model lines keep plain createTextNode telemetry.
+    # regexes unchanged: only the navigation died, not the scanner
+    assert "const ADDRESS_RE = " in raw
+    assert "const TXID_RE = " in raw
+    assert "const LINK_SCAN_RE =" in raw  # (its literal wraps to the next line)
+    # D8: the dead explorer machinery and its privacy disclosure are gone
+    assert "EXPLORER_ORIGIN" not in raw
+    assert "explorerHref" not in raw
+    assert "explorerLink" not in raw
+    assert "Opens mempool.space" not in raw
+    # no navigation of any kind: an <a> is never built, href/target/rel absent
+    assert 'createElement("a")' not in code
+    assert "href" not in code
+    assert "_blank" not in code and "noopener" not in code
+    # copy affordance: button with the verbatim token as its only content
+    assert 'btn.className = "explorer-link"' in code
+    assert "btn.textContent = token;" in code
+    assert "clipboardWrite(token)" in code
+    assert "navigator.clipboard.writeText" in code
+    assert '"Click to copy"' in raw
+    # WEB-010 ok/fail feedback pattern shared: one helper, both copy controls
+    assert code.count("flashCopyResult(") == 3
+    assert code.count("1600") == 1  # the revert window lives in the helper only
+    assert ".style" not in code and "setAttribute(\"style\"" not in code
+    # only the two bubble painters call the token pass (appendText,
+    # appendUser); progress + model lines keep plain createTextNode telemetry.
     assert code.count("appendBubbleText(line, text);") == 2
     assert 'el("p", "turn-text turn-progress")' in code  # progress line intact
 
@@ -214,11 +232,15 @@ def test_consent_button_is_the_only_consent_path_and_state_gated() -> None:
     assert 'consentSubline: "The public mempool.space server — " + PUBLIC_LEAK_SENTENCE' in code
 
 
-# TCK-LINK-001 behavioral check (runs under node if present): the SHIPPED
-# regexes and explorerHref are extracted from app.js source and fed accept/
-# reject vectors — hostile or malformed tokens never yield an href, and the
-# only hrefs producible are https://mempool.space/{tx,address}/<verbatim>.
-def test_linkify_regexes_and_href_construction_under_node() -> None:
+# TCK-LINK-001 regexes + TCK-WEB-014 behavior (runs under node if present):
+# the SHIPPED scanner regexes are extracted and fed the same accept/reject
+# vectors (unchanged), and the SHIPPED copyTokenButton/clipboardWrite/
+# flashCopyResult run against DOM stubs: the control is a <button> with the
+# verbatim token as its only content and NO navigation attributes, a click
+# writes the verbatim token to the clipboard and lands in the WEB-010 ok
+# state (reverting after the 1.6s window), and a rejected write lands in the
+# visible fail state.
+def test_linkify_regexes_and_click_to_copy_under_node() -> None:
     import shutil
     import subprocess
 
@@ -228,44 +250,106 @@ def test_linkify_regexes_and_href_construction_under_node() -> None:
     address_re = re.search(r"const ADDRESS_RE = (/[^;]+);", code).group(1)
     txid_re = re.search(r"const TXID_RE = (/[^;]+);", code).group(1)
     scan_re = re.search(r"const LINK_SCAN_RE =\s*\n?\s*([^;]+);", code).group(1)
-    href_fn = re.search(r"function explorerHref\(token\) \{.*?\n\}", code, re.DOTALL).group(0)
-    script = f"""
-      const ADDRESS_RE = {address_re};
-      const TXID_RE = {txid_re};
-      const LINK_SCAN_RE = {scan_re};
-      const EXPLORER_ORIGIN = "https://mempool.space";
-      {href_fn}
-      function linkify(text) {{
+    copy_fn = re.search(
+        r"function copyTokenButton\(token\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    clip_fn = re.search(
+        r"async function clipboardWrite\(text\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    flash_fn = re.search(
+        r"function flashCopyResult\(ctrl, ok, baseTitle\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    script = """
+      const ADDRESS_RE = __ADDR_RE__;
+      const TXID_RE = __TX_RE__;
+      const LINK_SCAN_RE = __SCAN_RE__;
+      function linkify(text) {
         const out = [];
         LINK_SCAN_RE.lastIndex = 0;
         let m;
-        while ((m = LINK_SCAN_RE.exec(text)) !== null) {{
-          const href = explorerHref(m[0]);
-          if (href !== null) out.push([m[0], href]);
-        }}
+        while ((m = LINK_SCAN_RE.exec(text)) !== null) out.push(m[0]);
         return out;
-      }}
+      }
       const addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
       const tx = "f".repeat(64);
-      // accepted: standalone tokens, href = constant prefix + verbatim token
-      const a = linkify("send to " + addr + " now");
-      if (a.length !== 1 || a[0][0] !== addr ||
-          a[0][1] !== EXPLORER_ORIGIN + "/address/" + addr) throw new Error("addr");
-      const t = linkify("tx " + tx + " confirmed");
-      if (t.length !== 1 || t[0][1] !== EXPLORER_ORIGIN + "/tx/" + tx) throw new Error("tx");
+      // accepted: standalone tokens only — the scan yields the token verbatim
+      let a = linkify("send to " + addr + " now");
+      if (a.length !== 1 || a[0] !== addr) throw new Error("addr");
+      a = linkify("tx " + tx + " confirmed");
+      if (a.length !== 1 || a[0] !== tx) throw new Error("tx");
       // rejected: uppercase, longer-word embedding, oversized, wrong charset
       if (linkify("BC1QAR0SRRR7XFKVY5L643LYDNW9RE59GTZZWF5MDQ").length) throw new Error("upper");
       if (linkify("x" + addr).length) throw new Error("embedded-left");
       if (linkify("pre" + tx).length) throw new Error("tx-embedded");
       if (linkify(tx + "f").length) throw new Error("tx-65");
       if (linkify(addr.slice(0, 3) + "!" + addr.slice(4)).length) throw new Error("charset");
-      // rejected: fragments, noise, and oversized junk never match
       if (linkify("/address/x bc1q").length) throw new Error("fragment");
       if (linkify("x".repeat(100)).length) throw new Error("noise");
-      if (explorerHref("javascript\\u003aalert(1)") !== null) throw new Error("schemes");
-      if (explorerHref("b".repeat(100)) !== null) throw new Error("oversize");
-      console.log("ok");
+      if (linkify("b".repeat(100)).length) throw new Error("oversize");
+      // --- the copy control itself, shipped functions on DOM stubs ---
+      const LABELS = { clickToCopy: "Click to copy", copyDone: "OK", copyFailed: "FAIL" };
+      let resetFn = null;
+      globalThis.setTimeout = (fn) => { resetFn = fn; return 1; };
+      globalThis.clearTimeout = () => { resetFn = null; };
+      globalThis.document = { createElement: (tag) => {
+        if (tag !== "button") throw new Error("not-a-button: " + tag);
+        const classes = new Set();
+        return {
+          type: "", className: "", textContent: "", title: "",
+          setAttribute(name, value) { this[name] = value; },
+          addEventListener(_name, fn) { this._click = fn; },
+          classList: {
+            add: (c) => classes.add(c),
+            remove: (c) => classes.delete(c),
+            contains: (c) => classes.has(c),
+          },
+        };
+      }};
+      let copied = null;
+      let refuse = false;
+      // navigator is a getter-only global on modern node — define, don't assign
+      Object.defineProperty(globalThis, "navigator", {
+        configurable: true,
+        value: { clipboard: { writeText: async (t) => {
+          if (refuse) throw new Error("denied");
+          copied = t;
+        } } },
+      });
+      __COPY_FN__
+      __CLIP_FN__
+      __FLASH_FN__
+      const main = async () => {
+        const btn = copyTokenButton(addr);
+        if (btn.type !== "button") throw new Error("no-type");
+        if (btn.textContent !== addr) throw new Error("label-not-verbatim");
+        // no navigation machinery on the control (it is not a link at all)
+        if ("href" in btn || "target" in btn || "rel" in btn) throw new Error("navigation");
+        if (btn.title !== LABELS.clickToCopy) throw new Error("title");
+        if (btn["aria-label"] !== LABELS.clickToCopy) throw new Error("aria");
+        await btn._click(); // clipboard receives the VERBATIM token
+        if (copied !== addr) throw new Error("clipboard-value");
+        if (!btn.classList.contains("copy-ok") || btn.classList.contains("copy-fail"))
+          throw new Error("ok-state");
+        if (btn.title !== LABELS.copyDone) throw new Error("ok-title");
+        resetFn(); // the 1.6s window reverts class + base title
+        if (btn.classList.contains("copy-ok") || btn.title !== LABELS.clickToCopy)
+          throw new Error("revert");
+        refuse = true; // a rejected write = visible fail state, no silent swallow
+        await btn._click();
+        if (!btn.classList.contains("copy-fail") || btn.title !== LABELS.copyFailed)
+          throw new Error("fail-state");
+        console.log("ok");
+      };
+      main().catch((e) => { console.error(e); process.exit(1); });
     """
+    script = (
+        script.replace("__ADDR_RE__", address_re)
+        .replace("__TX_RE__", txid_re)
+        .replace("__SCAN_RE__", scan_re)
+        .replace("__COPY_FN__", copy_fn)
+        .replace("__CLIP_FN__", clip_fn)
+        .replace("__FLASH_FN__", flash_fn)
+    )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 

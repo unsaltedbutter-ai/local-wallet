@@ -519,13 +519,25 @@ body {
   overflow-wrap: break-word;
 }
 
-/* TCK-LINK-001: explorer links inside chat bubbles. Inline anchors carrying
-   the verbatim token — zero layout shift when absent; the mono font and
-   break-word wrapping are inherited from .turn-text. Restrained affordance:
-   quiet underline at rest, accent color + stronger underline on hover/focus
+/* TCK-LINK-001 + TCK-WEB-014: click-to-copy token buttons inside chat
+   bubbles. Inline <button>s reset to the exact layout of plain inline text
+   carrying the verbatim token (display:inline + overflow-wrap:anywhere keep
+   mid-token breaking identical to the old anchor — verified no layout
+   shift); the mono font is inherited from .turn-text via font:inherit.
+   Restrained affordance unchanged: quiet underline at rest, accent color +
+   stronger underline on hover/focus, pointer cursor. The WEB-010 copy-ok /
+   copy-fail states tint the token for the 1.6s feedback window.
    (tokens only; CSP-safe, no inline styles). */
 .explorer-link {
+  display: inline;
+  overflow-wrap: anywhere;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
   color: inherit;
+  cursor: pointer;
   text-decoration: underline;
   text-decoration-color: var(--c-border-strong);
   text-underline-offset: 2px;
@@ -536,6 +548,9 @@ body {
   color: var(--c-accent);
   text-decoration-color: var(--c-accent);
 }
+
+.explorer-link.copy-ok { color: var(--c-ok); text-decoration-color: var(--c-ok); }
+.explorer-link.copy-fail { color: var(--c-danger); text-decoration-color: var(--c-danger); }
 
 .turn-progress {
   color: var(--c-text-muted);
