@@ -125,6 +125,16 @@ _TARGET_MARKUP = Decimal("1.15")
 #: One centisat/vB quantize step (rates are integer centisat/vB end to end).
 _CENT = Decimal("0.01")
 
+#: Magnitude ceiling for a projected/observed feeRange bottom (sats/vB),
+#: mirroring price.py's plausible-rate bound (ADR-0011 §6): it equals the
+#: tx engine's own maximum bid (10_000 sat/vB = 1000x min-relay — dust.py),
+#: so a bottom above it is a broken payload, not a pricey one — and every
+#: accepted value keeps the Decimal math inside the default 28-digit
+#: context (a finite-but-absurd ``1e40`` would otherwise blow
+#: ``quantize`` out of the documented ChainError fallback as an
+#: InvalidOperation).
+_MAX_BOTTOM_SAT_VB = 10_000
+
 
 def _now() -> float:
     """Indirection over ``time.time`` so tests can control the clock."""
@@ -410,7 +420,13 @@ class FeeEstimator:
 
 
 def _to_cents(value: Decimal, rounding: str) -> int:
-    """Quantize a sats/vB Decimal to 2 dp (``rounding``) as integer centisat/vB."""
+    """Quantize a sats/vB Decimal to 2 dp (``rounding``) as integer centisat/vB.
+
+    Safe by construction: every input derives from a parsed bottom bounded
+    by :data:`_MAX_BOTTOM_SAT_VB` (times the exact 1.15 / 2 factors), so the
+    default 28-digit Decimal context can never overflow into
+    ``InvalidOperation`` here.
+    """
     return int(value.quantize(_CENT, rounding=rounding).scaleb(2).to_integral_value())
 
 
@@ -422,7 +438,9 @@ def _fee_range_bottom(container: dict[str, Any], kind: str, index: int) -> Decim
     value's shortest repr is returned — all fee math is Decimal, never
     binary float. Zero/negative/bool/string/NaN/Infinity are all malformed
     — :class:`ChainError`, value-free (never echoes the fee). Huge JSON ints
-    overflow-convert defensively.
+    overflow-convert defensively, and a finite-but-absurd magnitude beyond
+    :data:`_MAX_BOTTOM_SAT_VB` is refused the same way (price.py §6 pattern —
+    it keeps every later ``quantize`` inside the default Decimal context).
     """
     fee_range = container.get("feeRange")
     if not isinstance(fee_range, list) or not fee_range:
@@ -436,6 +454,8 @@ def _fee_range_bottom(container: dict[str, Any], kind: str, index: int) -> Decim
         raise ChainError(f"{kind} entry {index} has non-finite 'feeRange' bottom") from exc
     if not math.isfinite(value):
         raise ChainError(f"{kind} entry {index} has non-finite 'feeRange' bottom")
+    if value > _MAX_BOTTOM_SAT_VB:
+        raise ChainError(f"{kind} entry {index} has implausible 'feeRange' bottom")
     return Decimal(str(bottom))
 
 

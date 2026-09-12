@@ -8,10 +8,19 @@ rate for fractional bids (sub-1 included).
 
 import pytest
 
+from localwallet.tx.psbt import PsbtError, build_unsigned_psbt
 from localwallet.tx.selection import (
     SelectionError,
     fee_sats_for,
     select_coins,
+)
+from tests.test_tx_psbt import (  # shared fixture material (pattern: test_tx_revalidate)
+    ACCOUNT_PATH,
+    account_key,
+    change_address,
+    fingerprint,
+    recipient_script,
+    source,
 )
 
 RECIPIENT = b"\x00\x14" + b"\x11" * 20
@@ -80,3 +89,42 @@ def test_rate_floor_one_centisat_is_accepted():
     # SEPARATE, later gate in the PSBT builder — ADR-0012 §3, unchanged).
     result = select_coins([utxo(1, 200_000)], 60_000, 1, CHANGE_COST, RECIPIENT)
     assert result.fee_sats == 2  # ceil(141 x 0.01) = 1.41 -> 2
+
+
+def _build(result, amount_sats):
+    return build_unsigned_psbt(
+        result.selected,
+        [(recipient_script(), amount_sats)],
+        change_address() if result.change_sats is not None else None,
+        result.change_sats,
+        account_key=account_key(),
+        account_fingerprint=fingerprint(),
+        account_path=ACCOUNT_PATH,
+        change_index=7,
+    )
+
+
+def test_sub_one_bid_refuses_at_the_min_relay_gate_before_signing():
+    # Code-review MINOR pin: a sub-1 centisat bid is valid DATA through the
+    # selection engine (pure ceil fee math, above), but the PSBT builder's
+    # min-relay STANDARDNESS gate (Core default 1 sat/vB, computed from the
+    # built vsize — ADR-0012 §3, deliberately unchanged) refuses to build
+    # it: fail closed at QUOTE time, before any device signature, with the
+    # floor named in the message. The user re-quotes a rung up.
+    inputs = [source("ab" * 32, 0, 200_000, index=3)]
+    result = select_coins(inputs, 60_000, 55, CHANGE_COST, recipient_script())
+    assert result.fee_sats == 78  # ceil(141 x 0.55) < the 141-sat relay floor
+    with pytest.raises(PsbtError) as exc:
+        _build(result, 60_000)
+    assert "min-relay" in str(exc.value)
+    assert "78" not in str(exc.value)  # value-free, as everywhere in tx/
+
+
+def test_fractional_bid_above_the_floor_builds_normally():
+    # Positive control: the user's 1.21 target pays ceil(141 x 1.21) = 171
+    # sats >= the 141-sat relay floor and builds clean.
+    inputs = [source("ab" * 32, 0, 200_000, index=3)]
+    result = select_coins(inputs, 60_000, 121, CHANGE_COST, recipient_script())
+    assert result.fee_sats == 171
+    _psbt, meta = _build(result, 60_000)
+    assert meta.expected_fee_sats == 171

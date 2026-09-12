@@ -577,6 +577,11 @@ def _raw_json(text: str) -> httpx.Response:
         _raw_json('[{"feeRange": [NaN, 2.0]}]'),
         _raw_json('[{"feeRange": [Infinity, 2.0]}]'),
         httpx.Response(200, json=[{"feeRange": [10**400, 2.0]}]),
+        # security-review (TCK-FEE-003): a FINITE-but-absurd magnitude must
+        # degrade too — quantize on it would raise InvalidOperation, which
+        # is NOT a ChainError and would escape the documented fallback.
+        httpx.Response(200, json=[{"feeRange": [1e40, 2.0]}]),
+        httpx.Response(200, json=[{"feeRange": [10_000.5, 2.0]}]),
         # security-review MEDIUM (FEE-001, kept): parser-accepted non-
         # monotonic bottoms that would break TARGET >= SLOW must fail closed.
         # Both original review counterexamples stay pinned, plus the direct
@@ -693,5 +698,19 @@ def test_floor_error_messages_are_value_free():
         fees_module._parse_projected_bottoms([{"feeRange": [-777.5]}], "k")
     assert "777" not in str(excinfo.value)
     with pytest.raises(ChainError) as excinfo:
+        fees_module._parse_projected_bottoms([{"feeRange": [1e40]}], "k")
+    assert "40" not in str(excinfo.value)  # the magnitude bound fires, value-free
+    with pytest.raises(ChainError) as excinfo:
         fees_module._parse_projected_bottoms([], "k")
     assert "non-empty" in str(excinfo.value)
+
+
+def test_bottom_magnitude_boundary_is_the_engine_ceiling():
+    # 10_000 sat/vB = the tx engine's own max bid (1000x min-relay, dust.py)
+    # — at it the payload is accepted (and the Decimal math stays inside
+    # the default context), beyond it fails closed like any garbage.
+    assert fees_module._parse_projected_bottoms(
+        [{"feeRange": [10_000]}, {"feeRange": [1e-9]}], "k"
+    ) == [Decimal(10_000), Decimal("1e-9")]
+    with pytest.raises(ChainError):
+        fees_module._parse_projected_bottoms([{"feeRange": [10_000.0001]}], "k")
