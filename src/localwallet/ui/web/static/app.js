@@ -1153,13 +1153,15 @@ async function submit(path, field, value) {
   // local echo so renderUserText can suppress its own copy.
   state.pendingEchos.push(value);
   setBusy(true);
+  let status = 0;
   try {
     const response = await fetch(path, {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ [field]: value }),
     });
-    if (!response.ok) throw new Error(String(response.status));
+    status = response.status;
+    if (!response.ok) throw new Error(String(status));
   } catch {
     echo.remove();
     const at = state.queue.indexOf(echo);
@@ -1167,14 +1169,24 @@ async function submit(path, field, value) {
     const pe = state.pendingEchos.indexOf(value);
     if (pe !== -1) state.pendingEchos.splice(pe, 1); // the engine never saw the line
     setBusy(state.queue.length > 0);
-    appendSystem(LABELS.unreachable);
+    // TCK-WEB-016: a 401 is the per-launch token of a PREVIOUS wallet run
+    // (stale tab) — "unreachable" would send the user hunting a live server.
+    // Same honest sentence as the stream/resync/consent paths; only a
+    // reload/the new URL fixes it.
+    appendSystem(status === 401 ? LABELS.sessionStale : LABELS.unreachable);
   }
 }
 
 formEl.addEventListener("submit", (event) => {
   event.preventDefault();
   const text = inputEl.value.trim();
-  if (!text || state.stopped) return;
+  if (!text) return;
+  if (state.stopped) {
+    // TCK-WEB-016: a stopped tab (stale token/401) must not swallow the
+    // press silently with the text still in the box — show the same line.
+    appendSystem(LABELS.sessionStale);
+    return;
+  }
   inputEl.value = "";
   submit("/turn", "text", text);
 });

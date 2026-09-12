@@ -319,6 +319,61 @@ def test_action_requires_utterance_field(serve: Any) -> None:
     assert b"utterance" in data
 
 
+def test_dead_engine_turn_and_action_are_a_value_free_503(serve: Any) -> None:
+    """TCK-WEB-016 (a): POST /turn//action check ``engine.error`` like
+    /resync and /consent already do — a dead engine gets the honest,
+    value-free 503 BEFORE submit(), never a 202 into a queue nobody
+    drains (the "first message lost" stranding). Nothing reaches the
+    command queue and no internals ride the body."""
+    server = serve()
+    try:
+        server.handle.error = RuntimeError("bootstrap died")
+        for path, body in (
+            ("/turn", {"text": "hello"}),
+            ("/action", {"utterance": "confirm"}),
+        ):
+            status, _h, data, _r = _request(
+                server, "POST", path, body, token=server.token
+            )
+            assert status == 503 and b"engine busy" in data
+            assert b"bootstrap" not in data and b"died" not in data
+        assert server.handle.commands.qsize() == 0  # refused BEFORE submit()
+    finally:
+        server.stop()
+
+
+def test_pump_death_sets_handle_error_and_closes_the_turn(
+    serve: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TCK-WEB-016 (b): a turn raising OUTSIDE the contained path kills the
+    pump — the ``start_engine`` guard must set ``handle.error`` AND emit
+    ``turn_end`` so no client is stranded mid-turn. Ordering (error first,
+    marker after) is pinned through the real bus: by the time the turn_end
+    frame is observable on the SSE socket, the handle is already flagged
+    (same-thread happens-before), so the client's /state re-read and any
+    retry hit the 503 fast-fails, never a doomed 202."""
+
+    def explode(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("turn exploded")
+
+    monkeypatch.setattr(app, "_run_turn", explode)
+    server = serve(heartbeat_s=30.0)
+    stream = _Stream(server)
+    stream.read_head()
+    status, _h, _d, _r = _request(
+        server, "POST", "/turn", {"text": "kill the pump"}, token=server.token
+    )
+    assert status == 202  # the engine was alive when the line was queued
+    stream.read_until(b"event: turn_end")  # raises on stranding — the pin
+    assert server.handle.error is not None
+    assert isinstance(server.handle.error, RuntimeError)
+    thread = server.handle.thread
+    assert thread is not None
+    thread.join(10)
+    assert not thread.is_alive()  # dead, loudly: the joiner sees the error
+    stream.close()
+
+
 def test_user_text_echo_fans_out_to_every_tab_and_replays(
     serve: Any, echo_turns: list[str]
 ) -> None:

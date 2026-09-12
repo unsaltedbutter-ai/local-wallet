@@ -597,6 +597,13 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(value, str):
             self._send_json(400, {"error": f"'{field}' must be a string"})
             return
+        # TCK-WEB-016: a dead engine never drains the queue — mirror the
+        # /resync and /consent discipline and answer the honest, value-free
+        # 503 BEFORE submit() would hand the line to a queue nobody reads
+        # (an echo + spinner forever is the alternative).
+        if self.engine.error is not None:
+            self._send_json(503, {"error": "engine busy"})
+            return
         # The ONLY engine call any route makes: bytes onto the command queue.
         # /action is the button path (ADR-0024 §8): its canonical utterance
         # runs the FULL pump pipeline (confirm gate -> loop -> allowlist) as

@@ -6785,24 +6785,34 @@ def start_engine(
             # narration flushes to the SSE stream and provisioning narration
             # routes there directly (single emitter writer: engine thread).
             ctx.output.bind_emitter(handle.emitter)
-        _pump(
-            ctx.loop,
-            handle.emitter.text,
-            handle.commands,
-            flow=ctx.flow,
-            session=ctx.session,
-            table=ctx.table,
-            watcher=ctx.watcher,
-            client=ctx.client,
-            emitter=handle.emitter,
-            scan=ctx.scan,
-            store=ctx.store,
-            provision=ctx.provision,
-            model=ctx.model,
-            preload=ctx.preload,
-            backend=ctx.backend,
-            settings=ctx.settings,
-        )
+        # TCK-WEB-016: a pump death OUTSIDE the contained turn path (the
+        # re-raised _PumpError, a store fault, any bug) must never strand a
+        # client mid-turn: flag the handle FIRST (every transport's
+        # engine.error check and /state fast-fail then precede any client
+        # reaction to the marker), then close the turn so open bubbles
+        # render and re-read /state instead of spinning on the echo.
+        try:
+            _pump(
+                ctx.loop,
+                handle.emitter.text,
+                handle.commands,
+                flow=ctx.flow,
+                session=ctx.session,
+                table=ctx.table,
+                watcher=ctx.watcher,
+                client=ctx.client,
+                emitter=handle.emitter,
+                scan=ctx.scan,
+                store=ctx.store,
+                provision=ctx.provision,
+                model=ctx.model,
+                preload=ctx.preload,
+                backend=ctx.backend,
+                settings=ctx.settings,
+            )
+        except BaseException as exc:  # noqa: BLE001 — engine-thread pump death
+            handle.error = exc
+            handle.emitter.emit(EVENT_TURN_END)
 
     handle.thread = threading.Thread(target=body, name="engine", daemon=True)
     handle.thread.start()

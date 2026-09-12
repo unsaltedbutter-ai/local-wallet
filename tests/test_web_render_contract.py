@@ -269,6 +269,81 @@ def test_linkify_regexes_and_href_construction_under_node() -> None:
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 
+# TCK-WEB-016 behavioral check (node if present): the SHIPPED submit() and
+# the form listener are extracted from app.js and run against a stubbed
+# fetch — a 401 (stale-tab token from a previous launch) renders the
+# session-stale/reload line, NOT "server unreachable"; other failures keep
+# the unreachable line; a stopped tab shows the stale line instead of
+# swallowing the press with the text still in the box.
+def test_submit_401_and_stopped_tab_label_the_stale_session_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    submit_fn = re.search(
+        r"async function submit\(path, field, value\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    form_listener = re.search(
+        r'formEl\.addEventListener\("submit", \(event\) => \{.*?\n\}\);',
+        code,
+        re.DOTALL,
+    ).group(0)
+    script = """
+      const LABELS = { unreachable: "UNREACHABLE-LINE", sessionStale: "STALE-LINE" };
+      const state = { busy: false, stopped: false, queue: [], pendingEchos: [] };
+      let systemLines = [];
+      const appendSystem = (s) => systemLines.push(s);
+      const setBusy = (b) => { state.busy = b; };
+      const authHeaders = (h) => h;
+      let lastEcho = null;
+      const appendUser = (value) => {
+        lastEcho = { removed: false, remove() { this.removed = true; } };
+        return lastEcho;
+      };
+      let fetchImpl = null;
+      const fetch = (path, opts) => fetchImpl(path, opts);
+      __SUBMIT__
+      let formHandler = null;
+      const formEl = { addEventListener: (_n, fn) => { formHandler = fn; } };
+      const inputEl = { value: "" };
+      __FORM__
+      const main = async () => {
+        // accepted: echo stays, no system line
+        fetchImpl = async () => ({ status: 202, ok: true });
+        await submit("/turn", "text", "hello");
+        if (lastEcho.removed || systemLines.length) throw new Error("202-path");
+        // 401: the stale-session line (never "unreachable"), echo un-rendered
+        fetchImpl = async () => ({ status: 401, ok: false });
+        systemLines = [];
+        await submit("/turn", "text", "hello");
+        if (!lastEcho.removed) throw new Error("401-kept-echo");
+        if (systemLines.length !== 1 || systemLines[0] !== LABELS.sessionStale)
+          throw new Error("401-label");
+        // 503 / transport failure: the unreachable line stands
+        fetchImpl = async () => ({ status: 503, ok: false });
+        systemLines = [];
+        await submit("/turn", "text", "hello");
+        if (systemLines[0] !== LABELS.unreachable) throw new Error("503-label");
+        fetchImpl = async () => { throw new TypeError("network"); };
+        systemLines = [];
+        await submit("/turn", "text", "hello");
+        if (systemLines[0] !== LABELS.unreachable) throw new Error("throw-label");
+        // stopped tab: the press is NOT swallowed — stale line, text kept
+        systemLines = [];
+        inputEl.value = "typed into a stopped tab";
+        state.stopped = true;
+        formHandler({ preventDefault: () => {} });
+        if (systemLines[0] !== LABELS.sessionStale) throw new Error("stopped-line");
+        if (inputEl.value === "") throw new Error("stopped-consumed");
+        console.log("ok");
+      };
+      main().catch((e) => { console.error(e); process.exit(1); });
+    """.replace("__SUBMIT__", submit_fn).replace("__FORM__", form_listener)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 @pytest.mark.parametrize(
     "path", sorted(_RENDER_DIR.glob("*.json")), ids=lambda p: p.stem
 )
