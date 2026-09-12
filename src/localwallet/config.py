@@ -7,7 +7,7 @@ settings. Stdlib only. No secrets are stored or logged here.
 
 Every keyed setting resolves through ONE documented ladder (TCK-CFG-002)::
 
-    env (LOCALWALLET_*)  >  config file (~/.localwallet/config.json)  >  stored (DB)  >  shipped default
+    env (LOCALWALLET_*)  >  config file (<repo/install root>/config.json)  >  stored (DB)  >  shipped default
 
 The config-file rung is merged inside ``from_env()`` (env > file; a file key
 is ignored only when the same key's env var is set). The stored rung is NOT
@@ -97,13 +97,22 @@ DISPLAY_CURRENCIES: Final[tuple[str, ...]] = (
 DEFAULT_DISPLAY_CURRENCY: Final[str] = "usd"
 
 
-#: Path of the user-editable config file (TCK-CFG-002): ``~/.localwallet/``
-#: is the per-user config dir for a packaged CLI app (no repo writes, survives
-#: reinstalls, private to the user). The file holds the same scalar fields as
-#: the ``LOCALWALLET_*`` env vars (lowercase field names), slotting between
-#: env and the store-backed settings in the ONE ladder. Absent file = no
-#: change. Malformed content is a value-free startup refusal (fail closed).
-CONFIG_FILE_PATH: Final[Path] = Path.home() / ".localwallet" / "config.json"
+#: Path of the user-editable config file (TCK-CFG-003): ``config.json`` at the
+#: INSTALL/REPO ROOT, next to the code — NOT ``~/.localwallet/config.json``.
+#: Anchor rule: resolved from the package location, not the launch CWD, so it
+#: works for source checkouts AND ``install.sh`` layouts alike. The package
+#: lives at ``<root>/src/localwallet/config.py`` (source checkout) or the
+#: editable-install's clone at ``$INSTALL_ROOT/src/localwallet/config.py``;
+#: ``Path(__file__).resolve().parents[2]`` is that shared ``<root>`` — the
+#: directory that CONTAINS ``src/``. ``os.getcwd()`` is never consulted, so
+#: the launch directory cannot move the file. The file holds the same scalar
+#: fields as the ``LOCALWALLET_*`` env vars (lowercase field names), slotting
+#: between env and the store-backed settings in the ONE ladder. Absent file =
+#: no change. Malformed content is a value-free startup refusal (fail closed).
+#: An existing ``~/.localwallet/config.json`` is simply no longer read by
+#: default (no silent migration); set ``LOCALWALLET_CONFIG_PATH`` to keep
+#: reading any file you choose.
+CONFIG_FILE_PATH: Final[Path] = Path(__file__).resolve().parents[2] / "config.json"
 
 
 def _field_kind(field) -> type:
@@ -296,7 +305,10 @@ class Settings:
 
             env LOCALWALLET_*  >  config file  >  stored (DB, via resolve_*)  >  shipped default
 
-        ``config_path`` defaults to :data:`CONFIG_FILE_PATH`. The config file
+        ``config_path`` defaults to :data:`CONFIG_FILE_PATH`. Set the
+        ``LOCALWALLET_CONFIG_PATH`` env var to read any other file instead
+        (the escape hatch if the repo-root ``config.json`` isn't where you
+        want it). The config file
         uses the lowercase field names (``gap_limit``, ``chain_base_url``,
         …) with per-field JSON types (bool/int/float/string); a key already
         set by env is left to env. A malformed file raises :class:`ValueError`
@@ -327,7 +339,9 @@ class Settings:
                 values[field.name] = _coerce(field.name, raw)
         # Config-file rung: fills in any key env did not set (env > file).
         # Strict fail-closed parse of the WHOLE file regardless of env.
-        path = Path(config_path) if config_path is not None else CONFIG_FILE_PATH
+        path = Path(config_path) if config_path is not None else Path(
+            os.environ.get("LOCALWALLET_CONFIG_PATH") or CONFIG_FILE_PATH
+        )
         for name, value in _load_config_file(path, fields(cls)).items():
             env_name = f"LOCALWALLET_{name.upper()}"
             if os.environ.get(env_name) is None:

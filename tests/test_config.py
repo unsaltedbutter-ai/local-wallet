@@ -14,7 +14,7 @@ import json
 import pytest
 
 from localwallet.chain.config import ChainConfig
-from localwallet.config import Settings, resolve_chain_base_url
+from localwallet.config import CONFIG_FILE_PATH, Settings, resolve_chain_base_url
 from localwallet.store.db import Store, StoreError
 
 ENV_URL = "https://env-node.local:3006/api"
@@ -274,6 +274,26 @@ def test_config_file_absent_is_zero_change(tmp_path: Path) -> None:
     assert got.price_enabled is True
     assert got.request_timeout_s == 10.0
     assert got.chain_base_url == ""
+
+
+def test_default_config_path_is_repo_root_next_to_code(monkeypatch) -> None:
+    # TCK-CFG-003: default config.json lives at the install/repo root (the
+    # directory that CONTAINS src/), NOT ~/.localwallet/config.json, and is
+    # anchored to the package location, never the launch CWD.
+    assert CONFIG_FILE_PATH.name == "config.json"
+    assert (CONFIG_FILE_PATH.parent / "src").is_dir()  # the dir containing src/
+    assert str(CONFIG_FILE_PATH) != str(Path.home() / ".localwallet" / "config.json")
+
+
+def test_localwallet_config_path_env_overrides_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # LOCALWALLET_CONFIG_PATH is the escape hatch: any file can stand in for
+    # the default repo-root config.json.
+    path = _write_config(tmp_path, {"gap_limit": "9"})
+    monkeypatch.setenv("LOCALWALLET_CONFIG_PATH", str(path))
+    got = Settings.from_env()
+    assert got.gap_limit == "9"
 
 
 def test_file_populates_gap_limit_and_other_scalars(tmp_path: Path) -> None:

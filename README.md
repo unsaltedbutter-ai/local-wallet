@@ -112,18 +112,24 @@ Every keyed setting resolves through one ladder (TCK-CFG-002):
 | Rung | Source | Example |
 |------|--------|---------|
 | 1 (highest) | env var `LOCALWALLET_*` | `LOCALWALLET_GAP_LIMIT=30` |
-| 2 | config file `~/.localwallet/config.json` | `{"gap_limit": "30"}` |
+| 2 | config file `config.json` (repo root) | `{"gap_limit": "30"}` |
 | 3 | stored setting (DB) | `/set gap_limit 30` |
 | 4 (lowest) | shipped default | gap 20 |
 
 ### Config file
 
-The optional JSON file at **`~/.localwallet/config.json`** sets the same
+The optional JSON file at **`config.json`** (repo/install root, next to the
+code) sets the same
 scalar fields as the `LOCALWALLET_*` env vars (lowercase field names —
 `gap_limit`, `chain_base_url`, `request_timeout_s`, `price_enabled`, …).
-The `~/.localwallet/` per-user path keeps config private to the user and
-survives reinstalls — no repo writes. An absent file changes nothing; env
+An absent file changes nothing; env
 always wins over the file.
+
+**Migration note (TCK-CFG-003):** the default file is now `config.json` at
+the repo/install root next to the code — the old `~/.localwallet/config.json`
+is no longer read by default (no silent migration; copy your settings over
+if you want them). To read any other file instead, set the
+`LOCALWALLET_CONFIG_PATH` env var to its path (escape hatch).
 
 Values are type-checked per field (boolean / integer / number / string), so
 use real JSON types. The **`gap_limit`** worked example — the per-scan
