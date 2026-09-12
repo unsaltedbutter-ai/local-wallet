@@ -16,8 +16,9 @@ Coverage (ticket gates):
   refused deterministically, not retried) and the capability floor
   (``getnetworkinfo.version`` >= 220000);
 * ``scantxoutset`` → the EXACT Esplora ``/utxo`` shape ``scan.py`` parses,
-  descriptors built from our OWN scripts only (``desc(raw(<hex>))`` —
-  never keys, never the node wallet), the per-tip snapshot cache
+  descriptors built from our OWN scripts only (bare ``raw(<hex>)`` since
+  TCK-BACKEND-004 — never keys, never the node wallet), the per-tip
+  snapshot cache
   (reuse / descriptor-union extension / tip invalidation / incomplete
   walk fails closed), Decimal-exact satoshi conversion;
 * SCAN EQUIVALENCE vs the Esplora mock on one shared scenario — the M1
@@ -523,10 +524,15 @@ class TestScanTranslation:
             assert client.get_address_utxos(address) == []
         (_method, params), = [(m, x) for m, x in server.requests if m == "scantxoutset"]
         assert params[0] == "start"
-        assert params[1] == [f"desc(raw({_spk_hex(address)}))"]
+        # TCK-BACKEND-004: BARE ``raw(<hex>)`` — the shape Core's own
+        # scantxoutset example documents. ``desc(raw(<hex>))`` is Core's
+        # OUTPUT form; the input grammar (EvalDescriptorStringOrObject →
+        # descriptor::Parse) has no ``desc`` function and REFUSES the whole
+        # start request — this pin is the bug's memorial.
+        assert params[1] == [f"raw({_spk_hex(address)})"]
         # The watch-only contract: only our script hex rode the request —
         # no key material of any kind exists in it.
-        assert all("desc(raw(" in d for d in params[1])
+        assert all(d.startswith("raw(") and not d.startswith("desc(") for d in params[1])
 
     def test_utxo_entries_indistinguishable_from_esplora_shape(self, bitcoind: Any) -> None:
         address = ADDRS[0][0]
@@ -649,8 +655,8 @@ class TestSnapshotCache:
         walks = [x for m, x in server.requests if m == "scantxoutset"]
         assert len(walks) == 2
         assert walks[1][1] == [
-            f"desc(raw({_spk_hex(ADDRS[0][0])}))",
-            f"desc(raw({_spk_hex(ADDRS[0][1])}))",
+            f"raw({_spk_hex(ADDRS[0][0])})",
+            f"raw({_spk_hex(ADDRS[0][1])})",
         ]
 
     def test_tip_movement_invalidates(self, bitcoind: Any) -> None:
@@ -856,7 +862,7 @@ def _bitcoind_script_from_scenario(txs: dict, utxos: dict) -> dict[str, Any]:
                     )
 
     def scantx(params: list[Any]) -> dict[str, Any]:
-        scripts = [d[len("desc(raw(") : -2] for d in params[1]]
+        scripts = [d[len("raw(") : -1] for d in params[1]]
         rows = [r for s in scripts for r in unspent.get(s, [])]
         return _scan_result(rows)
 

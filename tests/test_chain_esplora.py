@@ -16,6 +16,7 @@ if str(_SRC) not in sys.path:
 
 from localwallet.chain import ChainError, EsploraClient
 from localwallet.chain import esplora as esplora_module
+from localwallet.chain.esplora import NOT_ESPLORA_SHAPE
 
 BASE_URL = "https://mempool.space/api"
 ADDRESS = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
@@ -166,7 +167,6 @@ def test_tip_height_single_element_list():
 @pytest.mark.parametrize(
     "payload",
     [
-        [],  # empty list
         [{}],  # missing height
         [{"height": "100"}],  # non-int height
         [{"height": -1}],  # negative height
@@ -176,10 +176,16 @@ def test_tip_height_single_element_list():
     ],
 )
 def test_tip_height_malformed_list_raises_chain_error(payload):
+    # The EMPTY list [] is deliberately absent: since TCK-BACKEND-004 it
+    # is a tolerated shape that falls back to the tip-first /blocks page
+    # (see test_tip_height_empty_list_* in tests/test_backend_004.py).
     server = ScriptedServer(httpx.Response(200, json=payload))
-    with server.client() as client, pytest.raises(ChainError):
+    with server.client() as client, pytest.raises(ChainError) as excinfo:
         client.get_tip_height()
     assert len(server.requests) == 1  # shape errors are not retried
+    # TCK-BACKEND-004: shape refusals carry their CLASS at the raise site
+    # (the probe report stopped collapsing them into network-error).
+    assert excinfo.value.failure_class == NOT_ESPLORA_SHAPE
 
 
 def test_retries_on_429_then_succeeds(monkeypatch: pytest.MonkeyPatch):

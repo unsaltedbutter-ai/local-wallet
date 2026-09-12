@@ -54,12 +54,15 @@ mis-attribute an outgoing spend as incoming, so it is refused instead).
 
 The scan problem — the plan's option (a), watch-only exact:
 
-* ``scantxoutset("start", ["desc(raw(<script hex>))", ...])`` takes ONLY
-  output scripts (built here from the addresses ``scan.py`` hands us — our
-  own receive/change scripts; ``importprivkey``/``importdescriptors`` are
-  NEVER called: no keys ever touch the node wallet). The returned UTXO
-  snapshot answers :meth:`get_address_utxos` directly (``amount`` BTC →
-  exact-satoshi ``value`` via Decimal; ``height > 0`` → confirmed).
+* ``scantxoutset("start", ["raw(<script hex>)", ...])`` takes ONLY bare
+  output-script descriptors — built here from the addresses ``scan.py``
+  hands us, our own receive/change scripts, and NEVER the ``desc(...)``
+  wrapper (that is Core's OUTPUT form; the input grammar refuses it,
+  TCK-BACKEND-004; see :meth:`BitcoindClient._scan_snapshot`);
+  ``importprivkey``/``importdescriptors`` are NEVER called: no keys ever
+  touch the node wallet. The returned UTXO snapshot answers
+  :meth:`get_address_utxos` directly (``amount`` BTC → exact-satoshi
+  ``value`` via Decimal; ``height > 0`` → confirmed).
 * :meth:`get_address_txs` assembles what history the data allows: the
   funding transactions of the address's UNSPENT outputs (one verbose
   ``getrawtransaction`` per distinct txid). **Documented limitation (plan
@@ -74,7 +77,11 @@ The scan problem — the plan's option (a), watch-only exact:
 * One ``scantxoutset`` walks the WHOLE UTXO set, so the answer is cached
   as one snapshot per tip height: every script asked about so far (all
   ours) accumulates into the descriptor set of the next walk, and a cached
-  hit is validated by one cheap ``getblockchaininfo`` per probe. Ceiling
+  hit is validated by one cheap ``getblockchaininfo`` per probe. The walk
+  is SYNCHRONOUS server-side (Core answers only after it completes), so
+  the start call runs with the dedicated :data:`_SCAN_TIMEOUT_S` budget and
+  ZERO retries — see the constant for the timeout→retry→"Scan already in
+  progress" trap that pairing fixes. Ceiling
   (``ponytail:`` comment at the cache): a same-height reorg between probes
   keeps the stale snapshot until the next block lands — watch polls make
   that window minutes on a live node.
@@ -105,8 +112,10 @@ error envelope) retry read-only calls with the SHARED backoff policy; auth
 refusal (401/403), other non-2xx, malformed JSON, error envelopes and
 malformed shapes raise immediately with value-free :class:`ChainError`
 messages (endpoint *kinds* only — the server's own error text is untrusted
-input that can embed txids/amounts and is NEVER echoed; no host, address,
-txid, credential or amount ever leaves this module in an error string). No
+input that can embed txids/amounts and is NEVER echoed; a JSON-RPC error
+envelope instead classifies as ``rpc-error`` and carries its NUMERIC code,
+a protocol constant — TCK-DIAG-002). No host, address, txid, credential or
+amount ever leaves this module in an error string. No
 logging, no printing.
 """
 
@@ -133,6 +142,7 @@ from localwallet.chain.esplora import (
     AUTH_REQUIRED,
     HTTP_STATUS,
     NOT_MAINNET,
+    RPC_ERROR,
     ChainError,
     TipBlock,
     TxStatus,
@@ -173,6 +183,25 @@ _MAX_COOKIE_BYTES: Final[int] = 512
 #: (TCK-SEC-002) with orders of magnitude to spare. A larger body is a
 #: broken/evil server, not our wallet.
 _MAX_RESPONSE_BYTES: Final[int] = 64 * 1024 * 1024
+
+#: Timeout budget for the ``scantxoutset("start", ...)`` walk, INDEPENDENT
+#: of the generic per-request timeout (TCK-BACKEND-004 fix d, pinned):
+#: Core's start action answers only AFTER the scan completes (its own RPC
+#: contract) — a full-UTXO-set walk is minutes-class on real mainnet
+#: hardware (it walks the coins-DB cursor; the coinstatsindex does NOT
+#: speed scantxoutset up). The generic
+#: ``request_timeout_s`` (default 10 s) guaranteed a mid-scan read timeout,
+#: and the retry loop then re-sent ``start`` while the first scan still
+#: held the server-side reserver — Core refused the duplicate with the
+#: documented "Scan already in progress" RPC error. That client-created
+#: timeout→retry→rejection loop WAS the user's "request rejected by the
+#: server" (MW-16 round 2; permissions proven fine by their direct
+#: ``status`` call). 30 minutes is a BOUNDED ceiling (a wedged server
+#: cannot hang the worker forever) on the minutes-class realistic worst
+#: case for a small descriptor set; the scan call runs with retries=0, so
+#: a genuine loss surfaces honestly ONCE as a timeout-class failure rather
+#: than as a self-inflicted rpc-error.
+_SCAN_TIMEOUT_S: Final[float] = 1800.0
 
 #: Our confirmation targets → ``estimatesmartfee`` block targets (plan §2;
 #: the mapping is documented there; Core clamps targets beyond its
@@ -284,6 +313,32 @@ def _script_address(spk: Any) -> str | None:
         except Exception:  # noqa: BLE001 — containment: any unmappable script is "no address"
             return None
     return None
+
+
+def _rpc_error_code(envelope: Any) -> int | None:
+    """The NUMERIC code of a JSON-RPC error member, or ``None`` when absent
+    or malformed. RPC codes are protocol constants (``-8``
+    INVALID_PARAMETER, ``-34`` already-in-progress…) — TCK-DIAG-002 deems
+    them safe to carry on the value-free debug line; the error's TEXT is
+    untrusted server data and never leaves this module."""
+    error = envelope.get("error") if isinstance(envelope, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    if isinstance(code, bool) or not isinstance(code, int):
+        return None
+    return code
+
+
+def _rpc_rejected(kind: str, envelope: Any) -> ChainError:
+    """The shared refusal for a JSON-RPC error envelope: the value-free
+    ``rpc-error`` class (TCK-DIAG-002 — the taxonomy slot these rejections
+    used to collapse into network-error), ``RPCError`` as the debug
+    exception name, and the numeric code carried for the app's line."""
+    return ChainError(
+        f"{kind} request rejected by the server",
+        failure_class=RPC_ERROR,
+        exc_name="RPCError",
+        rpc_code=_rpc_error_code(envelope),
+    )
 
 
 def _constant_rejected(constant: str) -> Decimal:
@@ -683,7 +738,7 @@ class BitcoindClient:
 
         Every address this adapter is handed is a mainnet script derived
         from the wallet's own xpub (ADR-0021); the script hex is what
-        enters the ``desc(raw(...))`` descriptor — scripts only, no key
+        enters the ``raw(...)`` scan descriptor — scripts only, no key
         ever touches the node. An unconvertible string is a value-free
         ChainError (the Esplora charset rule runs first, so a malformed
         argument never even frames a request).
@@ -718,8 +773,31 @@ class BitcoindClient:
             and queried in self._snapshot_scripts
         ):
             return self._snapshot
-        descriptors = [f"desc(raw({script}))" for script in sorted(self._scripts)]
-        result = self._rpc("scantxoutset", ["start", descriptors], _KIND_UTXO_SCAN)
+        # BARE ``raw(<hex>)`` descriptors — the shape scantxoutset's own
+        # documented example uses. NOT ``desc(raw(...))``: the ``desc(...)``
+        # wrapper is Core's canonical OUTPUT form (LISTDESC and scan results
+        # print it); the input grammar (rpc/util.cpp
+        # EvalDescriptorStringOrObject → descriptor::Parse) has no ``desc``
+        # function, so a wrapped string parses as an unknown descriptor and
+        # the node REFUSES the whole start request (TCK-BACKEND-004's
+        # rejection: an RPC error envelope our old code collapsed into
+        # network-error). The optional checksum is validated only when
+        # present; ours is computed at read time, so we send the bare form.
+        descriptors = [f"raw({script})" for script in sorted(self._scripts)]
+        # Own timeout budget and NO retries (see _SCAN_TIMEOUT_S): a
+        # ``start`` walk answers only when it completes; retrying a request
+        # whose response we timed out would meet the still-running scan's
+        # reserver and be refused ("Scan already in progress") — the same
+        # self-inflicted rejection class, from the other side. The gate has
+        # already run (get_tip_height above), so _request is the right
+        # layer; retries=0 makes ANY transport loss surface once, honestly.
+        result = self._request(
+            "scantxoutset",
+            ["start", descriptors],
+            _KIND_UTXO_SCAN,
+            retries=0,
+            timeout_s=_SCAN_TIMEOUT_S,
+        )
         if not isinstance(result, dict):
             raise ChainError(f"{_KIND_UTXO_SCAN} response was not an object")
         if result.get("success") is not True:
@@ -861,7 +939,13 @@ class BitcoindClient:
             return self._request(method, params, kind)
 
     def _request(
-        self, method: str, params: list[Any], kind: str, *, retries: int | None = None
+        self,
+        method: str,
+        params: list[Any],
+        kind: str,
+        *,
+        retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> Any:
         """One JSON-RPC call with Esplora-consistent failure discipline.
 
@@ -874,13 +958,17 @@ class BitcoindClient:
         bad shapes raise immediately. Messages carry only the endpoint
         kind, the HTTP status CODE, or the exception CLASS name — never a
         credential, host, address, txid, amount, or server text.
+
+        ``timeout_s`` overrides the per-request budget for ONE call (the
+        ``scantxoutset`` walk uses :data:`_SCAN_TIMEOUT_S`, not the generic
+        read timeout); ``None`` means the configured value.
         """
         budget = self._config.max_retries if retries is None else retries
         last_failure = "no attempt completed"
         last_transport: _TransportRetry | None = None
         for attempt in range(budget + 1):
             try:
-                return self._attempt(method, params, kind)
+                return self._attempt(method, params, kind, timeout_s=timeout_s)
             except _TransportRetry as exc:
                 last_failure = str(exc.args[0]) if exc.args else "network error"
                 last_transport = exc
@@ -898,8 +986,11 @@ class BitcoindClient:
             exc_name=last_transport.exc_name if last_transport else None,
         )
 
-    def _attempt(self, method: str, params: list[Any], kind: str) -> Any:
+    def _attempt(
+        self, method: str, params: list[Any], kind: str, *, timeout_s: float | None = None
+    ) -> Any:
         """Exactly one HTTP POST of one RPC; validated envelope in, result out."""
+        request_timeout = self._config.timeout_s if timeout_s is None else timeout_s
         body = json.dumps(
             {"jsonrpc": "1.0", "id": 1, "method": method, "params": params}
         ).encode("utf-8")
@@ -922,12 +1013,12 @@ class BitcoindClient:
             conn = http.client.HTTPSConnection(
                 self._host,
                 self._port,
-                timeout=self._config.timeout_s,
+                timeout=request_timeout,
                 context=self._ssl_context,
             )
         else:
             conn = http.client.HTTPConnection(
-                self._host, self._port, timeout=self._config.timeout_s
+                self._host, self._port, timeout=request_timeout
             )
         try:
             try:
@@ -951,7 +1042,9 @@ class BitcoindClient:
             if not 200 <= status < 300:
                 envelope = self._try_envelope(raw)
                 if isinstance(envelope, dict) and envelope.get("error"):
-                    raise ChainError(f"{kind} request rejected by the server")
+                    # Core signals its OWN method rejections as HTTP 500
+                    # WITH an error envelope — class + code, never text.
+                    raise _rpc_rejected(kind, envelope)
                 if status == 429 or status >= 500:
                     raise _TransportRetry(
                         f"status {status}",
@@ -976,8 +1069,10 @@ class BitcoindClient:
         if not isinstance(envelope, dict) or "result" not in envelope:
             raise ChainError(f"{kind} response was not a JSON-RPC envelope")
         if envelope.get("error") is not None:
-            # Same rule on a 2xx: the server's error text is untrusted.
-            raise ChainError(f"{kind} request rejected by the server")
+            # Same rule on a 2xx: the server's error text is untrusted,
+            # but the numeric code is a protocol constant and rides the
+            # rpc-error debug class (TCK-DIAG-002).
+            raise _rpc_rejected(kind, envelope)
         return envelope["result"]
 
     def _credential_header(self) -> str | None:

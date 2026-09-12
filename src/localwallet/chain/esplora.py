@@ -133,6 +133,13 @@ NOT_ESPLORA_SHAPE: Final[str] = "not-esplora-shape"
 NOT_MAINNET: Final[str] = "not-mainnet"
 AUTH_REQUIRED: Final[str] = "auth-required"
 NETWORK_ERROR: Final[str] = "network-error"
+#: A well-formed JSON-RPC envelope answering with a non-null ``error``
+#: member (TCK-DIAG-002, folded into TCK-BACKEND-004): the server understood
+#: the request and REFUSED it at the RPC layer. Distinct from transport
+#: loss and from HTTP-status noise — the numeric RPC code rides the debug
+#: line on :class:`ChainError` (codes are protocol constants, not user
+#: data); the server's message text stays untrusted and never surfaces.
+RPC_ERROR: Final[str] = "rpc-error"
 
 
 def classify_failure(exc: BaseException | None) -> str:
@@ -177,6 +184,11 @@ class ChainError(Exception):
     from :data:`classify_failure`'s taxonomy, and the underlying exception
     class name (e.g. ``ConnectError``). Both are optional and never carry a
     value.
+
+    ``rpc_code`` (TCK-DIAG-002) is the optional NUMERIC JSON-RPC error code
+    a bitcoind refusal carried. It is a protocol constant (e.g. -8
+    ``INVALID_PARAMETER``), not user data — the app may print it in the
+    same debug line; the server's message text never rides anything.
     """
 
     def __init__(
@@ -185,10 +197,12 @@ class ChainError(Exception):
         *,
         failure_class: str | None = None,
         exc_name: str | None = None,
+        rpc_code: int | None = None,
     ) -> None:
         super().__init__(message)
         self.failure_class = failure_class
         self.exc_name = exc_name
+        self.rpc_code = rpc_code
 
 
 class _ApiRootMismatch(ChainError):
@@ -389,25 +403,59 @@ def _require_object_list(payload: Any, kind: str) -> list[dict[str, Any]]:
     return payload
 
 
+#: Static endpoint names for the tip-fallback refusal detail (TCK-BACKEND-004:
+#: the honest message NAMES the endpoints tried — paths are fixed constants,
+#: never host/URL values, so the value-free contract holds).
+_TIP_ENDPOINTS: Final[str] = "/blocks/tip and /blocks"
+
+
 def _max_block_list_height(payload: list[Any], kind: str) -> int:
     """Return the maximum ``height`` across a list of block objects (fail closed).
 
     Accepts only a non-empty list of dicts each carrying an integer
     ``height`` >= 0 (bools rejected). Any other entry, malformed ``height``,
-    or an empty list raises :class:`ChainError`. The tip is the highest
-    known block.
+    or an empty list raises a :class:`ChainError` classed
+    :data:`NOT_ESPLORA_SHAPE` (TCK-BACKEND-004: shape refusals carry their
+    class at the raise site — the probe's debug report stopped collapsing
+    them into ``network-error``). The tip is the highest known block.
     """
     if not payload:
-        raise ChainError(f"{kind} response was an empty block list")
+        raise ChainError(
+            f"{kind} response was an empty block list", failure_class=NOT_ESPLORA_SHAPE
+        )
     max_height = -1
     for index, entry in enumerate(payload):
         if not isinstance(entry, dict):
-            raise ChainError(f"{kind} response block {index} is not an object")
+            raise ChainError(
+                f"{kind} response block {index} is not an object",
+                failure_class=NOT_ESPLORA_SHAPE,
+            )
         height = entry.get("height")
         if isinstance(height, bool) or not isinstance(height, int) or height < 0:
-            raise ChainError(f"{kind} response block {index} has invalid 'height'")
+            raise ChainError(
+                f"{kind} response block {index} has invalid 'height'",
+                failure_class=NOT_ESPLORA_SHAPE,
+            )
         max_height = max(max_height, height)
     return max_height
+
+
+def _tip_block_page(payload: Any, kind: str) -> dict[str, Any]:
+    """The tip-first ``GET {api}/blocks`` page's first entry (TCK-BACKEND-004).
+
+    Observed shape (private mempool.space instance, 2026-09): some servers
+    answer ``/blocks/tip`` with an EMPTY list ``[]``. The Esplora
+    convention for that loss is the recent-blocks page: ``GET {api}/blocks``
+    lists recent blocks TIP-FIRST, so ``[0]`` is the tip. Anything that is
+    not a non-empty list of objects fails closed as :data:`NOT_ESPLORA_SHAPE`
+    naming both endpoints tried — a tip is never fabricated.
+    """
+    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+        raise ChainError(
+            f"{kind} response shape unsupported at {_TIP_ENDPOINTS}",
+            failure_class=NOT_ESPLORA_SHAPE,
+        )
+    return payload[0]
 
 
 @runtime_checkable
@@ -609,23 +657,48 @@ class EsploraClient:
         Mempool.space has been observed (2026-08) to serve this endpoint as
         a JSON *list* of recent block objects (each carrying an integer
         ``height``) rather than the documented bare integer, on both
-        testnet4 and mainnet. We therefore tolerate both shapes: a bare
-        non-negative integer (the documented Esplora shape), or a non-empty
-        list of block objects whose maximum ``height`` is returned as the
-        tip (highest known block). Anything else fails closed as
+        testnet4 and mainnet. A private mempool.space instance was observed
+        (2026-09, TCK-BACKEND-004) answering the EMPTY list ``[]`` — that
+        shape falls back to ``GET {api}/blocks`` (Esplora convention: the
+        recent-blocks page is tip-first) and takes ``[0].height``; when the
+        fallback page does not answer in that shape either the refusal
+        names both endpoints tried. Tolerated shapes: a bare non-negative
+        integer (the documented Esplora shape), a non-empty list of block
+        objects whose maximum ``height`` is the tip (highest known block),
+        or the empty list with a well-shaped fallback page. Anything else
+        fails closed as a :data:`NOT_ESPLORA_SHAPE`-classed
         :class:`ChainError` — we never fabricate or guess a height.
         """
         payload = self._request_json(_KIND_TIP_HEIGHT, "/blocks/tip")
+        if isinstance(payload, list) and not payload:
+            page = self._request_json(_KIND_TIP_HEIGHT, "/blocks")
+            entry = _tip_block_page(page, _KIND_TIP_HEIGHT)
+            height = entry.get("height")
+            if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+                raise ChainError(
+                    f"{_KIND_TIP_HEIGHT} fallback block has invalid 'height'",
+                    failure_class=NOT_ESPLORA_SHAPE,
+                )
+            return height
         if isinstance(payload, bool):
-            raise ChainError(f"{_KIND_TIP_HEIGHT} response was not an integer or block list")
+            raise ChainError(
+                f"{_KIND_TIP_HEIGHT} response was not an integer or block list",
+                failure_class=NOT_ESPLORA_SHAPE,
+            )
         if isinstance(payload, int):
             parsed = payload
         elif isinstance(payload, list):
             parsed = _max_block_list_height(payload, _KIND_TIP_HEIGHT)
         else:
-            raise ChainError(f"{_KIND_TIP_HEIGHT} response was not an integer or block list")
+            raise ChainError(
+                f"{_KIND_TIP_HEIGHT} response was not an integer or block list",
+                failure_class=NOT_ESPLORA_SHAPE,
+            )
         if parsed < 0:
-            raise ChainError(f"{_KIND_TIP_HEIGHT} response was a negative integer")
+            raise ChainError(
+                f"{_KIND_TIP_HEIGHT} response was a negative integer",
+                failure_class=NOT_ESPLORA_SHAPE,
+            )
         return parsed
 
     def get_tip_block(self) -> TipBlock:
@@ -638,27 +711,52 @@ class EsploraClient:
         non-empty list of block objects yields the entry with the maximum
         ``height``, carrying its ``timestamp`` when present (a malformed or
         absent ``timestamp`` is the clean ``None`` unavailable state, never
-        a fabricated value). Anything else fails closed as
-        :class:`ChainError` — we never guess a tip or a timestamp.
+        a fabricated value). The TCK-BACKEND-004 empty-list shape
+        (``/blocks/tip`` answering ``[]``) falls back to the tip-first entry
+        of ``GET {api}/blocks``, its ``timestamp`` riding the same tolerant
+        per-entry rule. Anything else fails closed as a
+        :data:`NOT_ESPLORA_SHAPE`-classed :class:`ChainError` — we never
+        guess a tip or a timestamp.
         """
         payload = self._request_json(_KIND_TIP_BLOCK, "/blocks/tip")
+        if isinstance(payload, list) and not payload:
+            payload = [
+                _tip_block_page(
+                    self._request_json(_KIND_TIP_BLOCK, "/blocks"), _KIND_TIP_BLOCK
+                )
+            ]
         if isinstance(payload, bool):
-            raise ChainError(f"{_KIND_TIP_BLOCK} response was not an integer or block list")
+            raise ChainError(
+                f"{_KIND_TIP_BLOCK} response was not an integer or block list",
+                failure_class=NOT_ESPLORA_SHAPE,
+            )
         if isinstance(payload, int):
             if payload < 0:
-                raise ChainError(f"{_KIND_TIP_BLOCK} response was a negative integer")
+                raise ChainError(
+                    f"{_KIND_TIP_BLOCK} response was a negative integer",
+                    failure_class=NOT_ESPLORA_SHAPE,
+                )
             return TipBlock(height=payload, timestamp=None)
         if isinstance(payload, list):
             if not payload:
-                raise ChainError(f"{_KIND_TIP_BLOCK} response was an empty block list")
+                raise ChainError(
+                    f"{_KIND_TIP_BLOCK} response was an empty block list",
+                    failure_class=NOT_ESPLORA_SHAPE,
+                )
             best_index = 0
             best_height = -1
             for index, entry in enumerate(payload):
                 if not isinstance(entry, dict):
-                    raise ChainError(f"{_KIND_TIP_BLOCK} response block {index} is not an object")
+                    raise ChainError(
+                        f"{_KIND_TIP_BLOCK} response block {index} is not an object",
+                        failure_class=NOT_ESPLORA_SHAPE,
+                    )
                 height = entry.get("height")
                 if isinstance(height, bool) or not isinstance(height, int) or height < 0:
-                    raise ChainError(f"{_KIND_TIP_BLOCK} response block {index} has invalid 'height'")
+                    raise ChainError(
+                        f"{_KIND_TIP_BLOCK} response block {index} has invalid 'height'",
+                        failure_class=NOT_ESPLORA_SHAPE,
+                    )
                 if height > best_height:
                     best_height = height
                     best_index = index
@@ -667,7 +765,10 @@ class EsploraClient:
             if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
                 timestamp = None
             return TipBlock(height=best_height, timestamp=timestamp)
-        raise ChainError(f"{_KIND_TIP_BLOCK} response was not an integer or block list")
+        raise ChainError(
+            f"{_KIND_TIP_BLOCK} response was not an integer or block list",
+            failure_class=NOT_ESPLORA_SHAPE,
+        )
 
     def broadcast_tx(self, tx_hex: str) -> str:
         """Broadcast a signed transaction (``POST {base}/tx``, single attempt).
@@ -976,11 +1077,12 @@ def check_backend(
     is a bare frontend host whose root does not answer in API shape, at
     ``{base}/api`` (the mempool.space-style API-root segment, auto-tried
     and latched by :meth:`EsploraClient._request_json`, TCK-BACKEND-003),
-    and (c) serves **mainnet** — its
-    block-height-0 list must contain a block whose hash is
-    :data:`MAINNET_GENESIS_HASH` (canonical Esplora entries are block
-    objects carrying ``"id"``; a bare hash string is tolerated). A
-    testnet/other-network instance fails (c) and is refused (ADR-0021).
+    and     (c) serves **mainnet** — its
+    block-height-0 answer (a list or a wrapped/list-wrapped object) must
+    contain the genesis proof: a bare hash equal to
+    :data:`MAINNET_GENESIS_HASH`, or an object carrying that ``"id"`` AND
+    ``"height": 0``. A testnet/other-network instance fails (c) and is
+    refused (ADR-0021).
 
     Every failure collapses to ``False`` — construction, transport, HTTP,
     parse and shape alike, including any httpx request error outside the
@@ -1031,20 +1133,32 @@ def check_backend(
         return False
     finally:
         client.close()
-    if not isinstance(blocks, list):
+    if not isinstance(blocks, (list, dict)):
         if report is not None:
             report["failure_class"] = NOT_ESPLORA_SHAPE
             report["exc_name"] = "not-a-list"
         return False
-    # Esplora's /blocks/<height> serves block OBJECTS whose "id" is the
-    # block hash (the same canonical shape :meth:`EsploraClient.get_tip_block`
-    # parses); a bare-hash list is tolerated leniently. Matching the raw
+    # Esplora's /blocks/<height> canonically serves the list of BLOCK HASHES
+    # at that height; mempool.space-style servers answer block OBJECTS whose
+    # "id" is the hash (the same canonical shape :meth:`EsploraClient.get_tip_block`
+    # parses), including LIST-WRAPPED genesis objects (private mempool.space
+    # instance, 2026-09, TCK-BACKEND-004) and bare hashes. Matching the raw
     # entries rejected every genuine object-shaped mainnet backend
-    # (TCK-ONB-003 review, finding 2).
-    ids = [b.get("id") if isinstance(b, dict) else b for b in blocks]
-    if MAINNET_GENESIS_HASH not in ids:
-        if report is not None:
-            report["failure_class"] = NOT_MAINNET
-            report["exc_name"] = "not-mainnet"
-        return False
-    return True
+    # (TCK-ONB-003 review, finding 2). Object entries must prove BOTH the
+    # mainnet genesis hash AND the height-0 position (fail closed — a hash
+    # riding at any other height is not a genesis proof); bare-hash entries
+    # carry no height and keep their lenient hash-equality tolerance.
+    for entry in blocks if isinstance(blocks, list) else [blocks]:
+        if isinstance(entry, str) and entry == MAINNET_GENESIS_HASH:
+            return True
+        if (
+            isinstance(entry, dict)
+            and entry.get("id") == MAINNET_GENESIS_HASH
+            and entry.get("height") == 0
+            and not isinstance(entry.get("height"), bool)
+        ):
+            return True
+    if report is not None:
+        report["failure_class"] = NOT_MAINNET
+        report["exc_name"] = "not-mainnet"
+    return False
