@@ -67,6 +67,11 @@
   </ol>
 </main>
 
+<!-- TCK-WEB-026: the ONE shared click-to-copy live region both copy controls
+     announce through (flashCopyResult writes value-free state sentences here
+     via textContent — never the copied value). -->
+<p id="copy-status" class="visually-hidden" role="status" aria-live="polite"></p>
+
 <footer class="bar bar-compose">
   <form id="turn-form" class="compose" autocomplete="off">
     <label class="visually-hidden" for="turn-text">Message</label>

@@ -18,6 +18,8 @@
   --c-warn: #9a6700;
   --c-warn-soft: #f4e9cf;
   --c-ok: #1f6f43;
+  --c-copy-ok: #0f5132;         /* TCK-WEB-026: copy-ok ink, de-aliased from
+                                   the hover accent (identical value today) */
   --c-offline: #8a8f99;
 
   /* state colors for the connection dot */
@@ -100,6 +102,7 @@
     --c-text-muted: #9aa1ac;
     --c-accent: #4caf72;
     --c-accent-ink: #0d1310;
+    --c-copy-ok: #86d9a8;
     --c-accent-soft: #234030;
     --c-danger: #e07a7a;
     --c-danger-soft: #402325;
@@ -522,23 +525,33 @@ body {
 /* TCK-LINK-001 + TCK-WEB-014: click-to-copy token buttons inside chat
    bubbles. Inline <button>s reset to the exact layout of plain inline text
    carrying the verbatim token (display:inline + overflow-wrap:anywhere keep
-   mid-token breaking identical to the old anchor — verified no layout
-   shift); the mono font is inherited from .turn-text via font:inherit.
+   mid-token breaking identical to the old anchor); the mono font is
+   inherited from .turn-text via font:inherit.
    Restrained affordance unchanged: quiet underline at rest, accent color +
-   stronger underline on hover/focus, pointer cursor. The WEB-010 copy-ok /
-   copy-fail states tint the token for the 1.6s feedback window.
-   (tokens only; CSP-safe, no inline styles). */
+   stronger underline on hover/focus, pointer cursor. TCK-WEB-026: the rest
+   underline is DOTTED (de-links the copy muscle memory from real links),
+   the text is user-selectable (manual fallback when the clipboard refuses —
+   a button's text is unselectable by default), and the tap target grows via
+   padding-block (zero layout shift: an inline box's vertical padding paints
+   outside the line box). The copy-ok / copy-fail states are tint + soft
+   background + the shared ::after word (non-color cues, WCAG 1.4.1); ok
+   reverts after the window, fail holds (app.js). (tokens only; CSP-safe,
+   no inline styles). */
 .explorer-link {
   display: inline;
+  position: relative; /* anchor for the floating ::after word */
   overflow-wrap: anywhere;
   margin: 0;
-  padding: 0;
+  padding-inline: 0;
+  padding-block: 0.25rem;
   border: 0;
   background: none;
   font: inherit;
   color: inherit;
   cursor: pointer;
-  text-decoration: underline;
+  -webkit-user-select: text;
+  user-select: text;
+  text-decoration: underline dotted;
   text-decoration-color: var(--c-border-strong);
   text-underline-offset: 2px;
 }
@@ -549,8 +562,48 @@ body {
   text-decoration-color: var(--c-accent);
 }
 
-.explorer-link.copy-ok { color: var(--c-ok); text-decoration-color: var(--c-ok); }
-.explorer-link.copy-fail { color: var(--c-danger); text-decoration-color: var(--c-danger); }
+.explorer-link.copy-ok {
+  color: var(--c-copy-ok);
+  text-decoration-color: var(--c-copy-ok);
+  background: var(--c-accent-soft);
+}
+.explorer-link.copy-fail {
+  color: var(--c-danger);
+  text-decoration-color: var(--c-danger);
+  background: var(--c-danger-soft);
+}
+
+/* TCK-WEB-026 (decision 8): the floating copy-state word, ONE shared
+   ::after contract for both copy controls (.explorer-link token and the
+   bubble .copy-btn). The word lives in CSS content only — no DOM text node
+   is ever created, so lineText/bubbleText stay verbatim and a copied
+   message never gains button words; both controls are aria-labelled, and a
+   label overrides the name-from-contents, so the word is invisible to SRs
+   too (the live region is their channel). Static appear — no animation,
+   reduced-motion moot. */
+.copy-ok::after,
+.copy-fail::after {
+  position: absolute;
+  inset-block-end: calc(100% + var(--sp-1));
+  inset-inline-start: 0;
+  z-index: 1;
+  font-family: var(--font-sans);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  font-style: normal;
+  line-height: 1;
+  white-space: nowrap;
+  padding-block: var(--sp-1);
+  padding-inline: var(--sp-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  background: var(--c-surface);
+  box-shadow: var(--shadow-1);
+  color: var(--c-text);
+  pointer-events: none;
+}
+.copy-ok::after { content: "Copied ✓"; }
+.copy-fail::after { content: "Copy failed"; }
 
 .turn-progress {
   color: var(--c-text-muted);
@@ -600,8 +653,19 @@ body {
 }
 
 .copy-btn:hover { color: var(--c-text); background: var(--c-surface-2); }
-.copy-btn.copy-ok { color: var(--c-ok); }
-.copy-btn.copy-fail { color: var(--c-danger); }
+/* TCK-WEB-026: tint + soft background (non-color cue) + the shared ::after
+   word, floated to the button's left so it never pokes above the transcript
+   at the bubble's top edge. */
+.copy-btn.copy-ok { color: var(--c-copy-ok); background: var(--c-accent-soft); }
+.copy-btn.copy-fail { color: var(--c-danger); background: var(--c-danger-soft); }
+.copy-btn.copy-ok::after,
+.copy-btn.copy-fail::after {
+  inset-block-end: auto;
+  inset-block-start: 50%;
+  inset-inline-start: auto;
+  inset-inline-end: calc(100% + var(--sp-1));
+  transform: translateY(-50%);
+}
 
 /* --------------------------------------------------------------- compose */
 
@@ -774,34 +838,13 @@ body {
 .watchkey-display-line { align-items: baseline; }
 .watchkey-display-line .watchkey-value { flex: 1; min-inline-size: 0; }
 
-/* (e) + TCK-WEB-012: backend badges — quiet family chips; the active kind's
-   chip takes the accent. All three families (mempool, electrum, bitcoind)
-   are LIVE (TCK-ONB-004 M3): dim now means "not the current backend", and
-   a dim badge is a legible muted pill (surface tone + border + normal
-   --c-text-muted ink), NOT 0.45-opacity text hiding near 2:1 contrast. */
-.backend-badges {
-  display: flex;
-  gap: var(--sp-2);
-  flex-wrap: wrap;
-}
+/* (e) TCK-DESCOPE-M3B: the backend KIND badge chips (the family pills the
+   pane used to paint next to the chain-base field) are DELETED per user
+   direction: the server family is not a trust dimension; the trust badge
+   (.trust-badge, above) is the settings pane's only badge. The
+   Resync-now line below keeps its own quiet spacing without them. */
 
-.backend-badge {
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--c-text-muted);
-  background: var(--c-surface);
-  border: 1px solid var(--c-border-strong);
-  border-radius: 999px;
-  padding: 0 var(--sp-2);
-}
-
-.backend-badge[data-active="true"] {
-  color: var(--c-accent);
-  border-color: var(--c-accent);
-  background: var(--c-accent-soft);
-}
-
-/* (f): the Resync-now action sits on its own quiet line under the badges. */
+/* (f): the Resync-now action sits on its own quiet line under the field. */
 .setting-resync-line { align-items: center; }
 
 /* (h): header quick balance buttons, one row below the top bar. */

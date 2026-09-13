@@ -251,6 +251,42 @@ def test_privacy_subline_visible_and_trust_badge_keys_off_privacy_mode() -> None
     assert "effectiveChainUrl" not in trust_block
 
 
+# TCK-DESCOPE-M3B static pins (user direction 2026-09-11): the settings
+# pane's backend-KIND badges are ELIMINATED — the whole client machinery
+# (family mapping, painters, state field, per-badge LABELS words) is gone
+# from app.js, the kind chips are gone from the stylesheet, and no
+# mempool/esplora/public kind string survives in the shipped client. The
+# TRUST badge (privacy_mode) is untouched — the pins above stay green; the
+# engine-side additive ``backend_kind`` field (closed enum
+# none/electrum/bitcoind) keeps its pins in tests/test_backend_hotswap.py.
+def test_kind_badges_eliminated_and_trust_badge_survives() -> None:
+    raw = (_STATIC / "app.js").read_text(encoding="utf-8")
+    code = _strip_js_comments(raw)
+    for gone in (
+        "BADGE_FAMILIES",
+        "paintBackendBadges(",
+        "applyBackendKind(",
+        "badgeMempool",
+        "badgeElectrum",
+        "badgeBitcoind",
+        "badgeLegend",
+        "badgeInUse",
+        "badgeIdle",
+        "settingsEmptyApplied",
+        "backendKind",
+        "backend-badge",
+    ):
+        assert gone not in code, gone
+    for stale_kind in ('"mempool"', '"esplora"', '"public"'):
+        assert stale_kind not in code, stale_kind
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    assert ".backend-badge" not in css
+    # no coverage loss on the trust badge: word map + painter still shipped.
+    assert "const TRUST_BADGE_WORDS" in code
+    assert "function paintTrustBadges" in code
+    assert ".trust-badge" in css
+
+
 # TCK-LINK-001 (revised by TCK-WEB-014, critique D8) static pins: the
 # qualifying-token scan is unchanged, but the affordance is a COPY BUTTON —
 # the visible label is the verbatim token, no navigation machinery survives
@@ -309,20 +345,27 @@ def test_consent_button_is_the_only_consent_path_and_state_gated() -> None:
                     code.index("function applyPrivacyChip")]
     assert 'state.privacyMode === "awaiting_backend"' in painter
     chip = code[code.index("function applyPrivacyChip"):
-                code.index("function applyBackendKind")]
+                 code.index("async function refreshState")]
     assert "paintConsentRow();" in chip
-    # honest copy: the button subline IS the pane's leak sentence.
-    assert 'consentSubline: "The public mempool.space server — " + PUBLIC_LEAK_SENTENCE' in code
+    # honest copy: the button subline IS the pane's leak sentence, and —
+    # TCK-DESCOPE-M3B — it names the CONSENTED public Electrum server, never
+    # mempool.space (which is public fee/price info, not a wallet backend).
+    assert 'consentSubline:' in code
+    assert '"The public Electrum server electrum.blockstream.info — "' in code
+    assert "PUBLIC_LEAK_SENTENCE," in code
+    assert "The public mempool.space server" not in code
 
 
-# TCK-LINK-001 regexes + TCK-WEB-014 behavior (runs under node if present):
-# the SHIPPED scanner regexes are extracted and fed the same accept/reject
-# vectors (unchanged), and the SHIPPED copyTokenButton/clipboardWrite/
-# flashCopyResult run against DOM stubs: the control is a <button> with the
-# verbatim token as its only content and NO navigation attributes, a click
-# writes the verbatim token to the clipboard and lands in the WEB-010 ok
-# state (reverting after the 1.6s window), and a rejected write lands in the
-# visible fail state.
+# TCK-LINK-001 regexes + TCK-WEB-014 behavior + TCK-WEB-026 upgrade (runs
+# under node if present): the SHIPPED scanner regexes are extracted and fed
+# the same accept/reject vectors (unchanged), and the SHIPPED
+# copyTokenButton/clipboardWrite/flashCopyResult run against DOM stubs: the
+# control is a <button> with the verbatim token as its only content and NO
+# navigation attributes, its accessible NAME carries the whole value ("Copy
+# address bc1q…"), a click writes the verbatim token to the clipboard, lands
+# in the ok state (title AND aria-label swapped, shared live region
+# announced), reverts after the 1.6s window, and a rejected write lands in
+# the visible fail state — which HOLDS (no revert timer on fail).
 def test_linkify_regexes_and_click_to_copy_under_node() -> None:
     import shutil
     import subprocess
@@ -340,7 +383,8 @@ def test_linkify_regexes_and_click_to_copy_under_node() -> None:
         r"async function clipboardWrite\(text\) \{.*?\n\}", code, re.DOTALL
     ).group(0)
     flash_fn = re.search(
-        r"function flashCopyResult\(ctrl, ok, baseTitle\) \{.*?\n\}", code, re.DOTALL
+        r"function flashCopyResult\(ctrl, ok, baseTitle, baseAria\) \{.*?\n\}",
+        code, re.DOTALL,
     ).group(0)
     script = """
       const ADDRESS_RE = __ADDR_RE__;
@@ -370,7 +414,12 @@ def test_linkify_regexes_and_click_to_copy_under_node() -> None:
       if (linkify("x".repeat(100)).length) throw new Error("noise");
       if (linkify("b".repeat(100)).length) throw new Error("oversize");
       // --- the copy control itself, shipped functions on DOM stubs ---
-      const LABELS = { clickToCopy: "Click to copy", copyDone: "OK", copyFailed: "FAIL" };
+      const LABELS = {
+        clickToCopy: "Click to copy", copyDone: "OK",
+        copyOk: "COPIED-LIVE", copyFail: "FAILED-LIVE",
+        copyAddress: "Copy address", copyTxid: "Copy transaction id",
+      };
+      const copyStatusEl = { textContent: "" }; // shared live-region stub
       let resetFn = null;
       globalThis.setTimeout = (fn) => { resetFn = fn; return 1; };
       globalThis.clearTimeout = () => { resetFn = null; };
@@ -408,19 +457,36 @@ def test_linkify_regexes_and_click_to_copy_under_node() -> None:
         // no navigation machinery on the control (it is not a link at all)
         if ("href" in btn || "target" in btn || "rel" in btn) throw new Error("navigation");
         if (btn.title !== LABELS.clickToCopy) throw new Error("title");
-        if (btn["aria-label"] !== LABELS.clickToCopy) throw new Error("aria");
+        // TCK-WEB-026: the accessible NAME carries the WHOLE value (the old
+        // "Click to copy" name erased the token from the SR queue) and the
+        // ADDRESS_RE discriminates address vs txid wording.
+        if (btn["aria-label"] !== LABELS.copyAddress + " " + addr) throw new Error("aria");
+        if (copyTokenButton(tx)["aria-label"] !== LABELS.copyTxid + " " + tx)
+          throw new Error("aria-txid");
         await btn._click(); // clipboard receives the VERBATIM token
         if (copied !== addr) throw new Error("clipboard-value");
         if (!btn.classList.contains("copy-ok") || btn.classList.contains("copy-fail"))
           throw new Error("ok-state");
         if (btn.title !== LABELS.copyDone) throw new Error("ok-title");
-        resetFn(); // the 1.6s window reverts class + base title
+        if (btn["aria-label"] !== LABELS.copyDone) throw new Error("ok-aria");
+        if (copyStatusEl.textContent !== LABELS.copyOk) throw new Error("ok-live");
+        resetFn(); // the 1.6s window reverts class + base title + base (value-bearing) aria
         if (btn.classList.contains("copy-ok") || btn.title !== LABELS.clickToCopy)
           throw new Error("revert");
+        if (btn["aria-label"] !== LABELS.copyAddress + " " + addr) throw new Error("revert-aria");
         refuse = true; // a rejected write = visible fail state, no silent swallow
         await btn._click();
-        if (!btn.classList.contains("copy-fail") || btn.title !== LABELS.copyFailed)
-          throw new Error("fail-state");
+        // TCK-WEB-026 review fix: the fail CLASS holds (no revert timer) and
+        // the live sentence announces it — but the title/aria-label revert to
+        // the value-bearing base immediately, so the SR user still hears
+        // WHICH token failed. The name never loses the value.
+        if (!btn.classList.contains("copy-fail")) throw new Error("fail-state");
+        if (btn.title !== LABELS.clickToCopy) throw new Error("fail-title-reverts");
+        if (btn["aria-label"] !== LABELS.copyAddress + " " + addr)
+          throw new Error("fail-aria-keeps-value");
+        if (copyStatusEl.textContent !== LABELS.copyFail) throw new Error("fail-live");
+        // the state itself HOLDS: no revert timer is ever registered on fail.
+        if (resetFn !== null) throw new Error("fail-class-must-hold");
         console.log("ok");
       };
       main().catch((e) => { console.error(e); process.exit(1); });
@@ -434,6 +500,57 @@ def test_linkify_regexes_and_click_to_copy_under_node() -> None:
         .replace("__FLASH_FN__", flash_fn)
     )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# TCK-WEB-026 static pins: click-to-copy made unambiguous. ONE shared
+# visually-hidden role=status live region in the markup (exactly one) driven
+# by flashCopyResult through textContent with the value-free LABELS sentences
+# (the copied token NEVER enters it); the token button's base aria-label is
+# the VALUE-bearing name; the CSS carries the non-color cues (soft
+# backgrounds, the ::after words — which live ONLY in the stylesheet, never
+# as DOM text, so the lineText/bubbleText verbatim contract stands), the
+# manual-fallback user-select, the padding-block tap target, the dotted rest
+# underline, and the copy-ok ink de-aliased from the hover accent.
+def test_copy_affordance_upgrade_pins() -> None:
+    html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    # (1) one shared SR channel: exactly one #copy-status, hidden + polite
+    assert html.count('id="copy-status"') == 1
+    node = html[html.index('<p id="copy-status"'):]
+    node = node[: node.index(">")]
+    assert 'class="visually-hidden"' in node
+    assert 'role="status"' in node and 'aria-live="polite"' in node
+    assert 'getElementById("copy-status")' in code
+    # the live write is textContent with the value-free sentences only
+    assert 'copyStatusEl.textContent = ok ? LABELS.copyOk : LABELS.copyFail;' in code
+    assert 'copyOk: "Copied.",' in code
+    assert 'copyFail: "Copy failed — select it and copy manually.",' in code
+    # (2) the name carries the whole value; title keeps the hover garnish
+    assert 'copyAddress: "Copy address",' in code
+    assert 'copyTxid: "Copy transaction id",' in code
+    assert "LABELS.copyAddress : LABELS.copyTxid" in code  # ADDRESS_RE discriminates
+    assert 'btn.setAttribute("aria-label", name);' in code
+    # (4) fail holds the CLASS only: ONE 1600 revert timer, in the ok branch;
+    # the fail branch reverts title + value-bearing aria-label immediately.
+    assert code.count("1600") == 1
+    assert code.count("_copyReset = setTimeout") == 1
+    assert 'ctrl.setAttribute("aria-label", baseAria);' in code  # both reverts
+    # (5) manual fallback + tap target + de-linked dotted rest underline
+    assert "user-select: text;" in css
+    assert "padding-block: 0.25rem;" in css
+    assert "text-decoration: underline dotted;" in css
+    # (3) non-color cues: soft backgrounds from the existing state tokens
+    assert "background: var(--c-accent-soft);" in css
+    assert "background: var(--c-danger-soft);" in css
+    # (8) the ::after words live ONLY in the stylesheet (never DOM text —
+    # no JS string builds them; textContent contract untouched)
+    assert 'content: "Copied ✓";' in css and 'content: "Copy failed";' in css
+    assert "Copied ✓" not in code
+    # de-alias: copy-ok ink differs from the hover accent value
+    accent = re.search(r"--c-accent: (#[0-9a-f]{6});", css).group(1)
+    copy_ok = re.search(r"--c-copy-ok: (#[0-9a-f]{6});", css).group(1)
+    assert accent != copy_ok
 
 
 # TCK-WEB-015 static pins (user direction): the in-flight indicator is a

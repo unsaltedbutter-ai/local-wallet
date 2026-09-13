@@ -9,8 +9,10 @@
 // (TCK-BACKEND-002). TCK-WEB-009: the settings pane is the ONLY first-run
 // surface (zpub entry moved into it; the separate card is gone), the set
 // watch key collapses to a read-only truncated display, the chain-base row
-// is an Edit→Apply read-only cycle with backend badges + a Resync-now
-// action, and the header carries the model-free balance quick actions.
+// is an Edit→Apply read-only cycle with a Resync-now action, and the header
+// carries the model-free balance quick actions. TCK-DESCOPE-M3B (user
+// direction 2026-09-11): the backend KIND badges are eliminated — the trust
+// badge (privacy_mode) is the pane's only badge.
 // TCK-WEB-013: the chain row always shows the effective backend URL with a
 // privacy_mode-driven trust badge, the empty field is directly typeable
 // (Edit/Cancel only once a value exists), the env rung gets one honest
@@ -47,15 +49,19 @@ const settingsCloseEl = document.getElementById("settings-close");
 const settingsRetryEl = document.getElementById("settings-retry");
 const settingsStatusEl = document.getElementById("settings-status");
 const settingsListEl = document.getElementById("settings-list");
+// TCK-WEB-026: the ONE shared click-to-copy live region (role=status,
+// aria-live=polite, visually hidden). flashCopyResult writes its value-free
+// state sentence here so both copy controls give SR + touch feedback.
+const copyStatusEl = document.getElementById("copy-status");
 // TCK-QR-001: the receive-address QR viewer (see the QR section below).
 const qrViewerEl = document.getElementById("qr-viewer");
 const qrImgEl = document.getElementById("qr-img");
 const qrCaptionEl = document.getElementById("qr-caption");
 const qrCloseEl = document.getElementById("qr-close");
 
-// The leak sentence, shared verbatim by the empty-apply note and the
-// first-run beat (TCK-WEB-013 item 4 reuses the copy pass 2 #52 wording —
-// one string, so the two disclosures can never drift).
+// The leak sentence, shared verbatim by the pane's public-consent subline
+// and the first-run beat (one string, so the two disclosures can never
+// drift).
 const PUBLIC_LEAK_SENTENCE =
   "whoever runs it sees every address you check, can link those to your IP, " +
   "and watches when your transactions move.";
@@ -101,11 +107,14 @@ const LABELS = {
   settingsBusy: "The wallet is busy — try again.",
   settingsFailed: "Could not save — try again.",
   settingsRestart: "Takes effect after restart.",
-  // split per docs/ux-web-copy.md §3: short form in the field, full
-  // privacy-disclosure line under it
-  settingsEmptyPlaceholder: "Empty = public default",
+  // split per docs/ux-web-copy.md §3, RE-SCOPED by TCK-DESCOPE-M3B: an
+  // empty rung is UNRESOLVED (TCK-DESCOPE-M3A killed the silent public
+  // default), so the strings say that — no leak claim for a server that
+  // is never consulted.
+  settingsEmptyPlaceholder: "Empty = no server chosen",
   settingsEmptyIsDefault:
-    "Empty = public default — its operator can link your queries to your IP.",
+    "Empty = no server chosen — the app looks nothing up until you set " +
+    "one or record consent to the public Electrum server.",
   settingsEnvOverride: "Set via environment variable — edit there or remove it.",
   settingsRange: (min, max) => `Enter a whole number between ${min} and ${max}.`,
   settingsSectionWatchKey: "Wallet",
@@ -152,19 +161,20 @@ const LABELS = {
     "Paste the public account key (xpub, ypub, or zpub) of the wallet you " +
     "want to watch instead.",
   watchKeyReplaceSubmit: "Replace wallet",
-  // backend badges (TCK-WEB-009 e) — the words are the closed enum family
-  // names the engine's backend_kind maps onto (TCK-ONB-004 M3: every
-  // family in the closed enum is live and emittable now).
-  badgeMempool: "mempool",
-  badgeElectrum: "electrum",
-  badgeBitcoind: "bitcoind",
   // TCK-WEB-010: bubble copy control (aria-label + transient title states).
   copyMessage: "Copy message",
   // TCK-WEB-014: the in-bubble token affordance is a copy control now (no
   // navigation, so the old mempool.space disclosure is gone with D8).
   clickToCopy: "Click to copy",
   copyDone: "Copied",
-  copyFailed: "Copy failed",
+  // TCK-WEB-026: the shared live-region sentence (value-free — the copied
+  // token never enters it) + the value-bearing name parts for token buttons
+  // ("Copy address bc1q…"/"Copy transaction id <full hash>" — the token is
+  // quoted whole, never truncated mid-hash).
+  copyOk: "Copied.",
+  copyFail: "Copy failed — select it and copy manually.",
+  copyAddress: "Copy address",
+  copyTxid: "Copy transaction id",
   // TCK-QR-001: receive-address QR. The title/aria string is the ticket's
   // exact wording; the alt repeats it plus the address verbatim (a
   // screen-reader user can read/copy what the QR encodes); the fail line is
@@ -172,18 +182,10 @@ const LABELS = {
   qr: "QR",
   qrTitle: "Receive address QR — scan with a wallet to send to this address",
   qrFailed: "Could not show the QR code.",
-  // copy pass 2 #44: dim/lit is a state-carrying indicator, so it gets
-  // words — a legend line plus a dynamic title/aria-label per badge
-  // (recomposed by paintBackendBadges, the sole badge painter).
-  badgeLegend:
-    "The highlighted name is the kind of server the app asks about your " +
-    "addresses.",
-  badgeInUse:
-    "In use — the app checks your addresses against this kind of server.",
-  badgeIdle: "Not in use.",
-  // TCK-ONB-004 M3: the bitcoind badge is a LIVE family now (Core RPC is
-  // selectable and auto-detected) — the old "not available yet" line was
-  // retired with the M2/M3 flip; every badge now shares in-use/idle words.
+  // copy pass 2 #44 dim/lit badge words (TCK-WEB-009 e): RETIRED by
+  // TCK-DESCOPE-M3B — the settings pane no longer badges the backend kind
+  // at all (user direction 2026-09-11: mempool/electrum/bitcoind are not
+  // trust tiers; the trust badge is the pane's only badge).
   // Backend credentials (TCK-ONB-004 M3): the chain-base row's login block,
   // shown while EDITING an http:// (ambiguous — could be Core RPC) or
   // bitcoind:// address. The password never comes back from the server (the
@@ -216,14 +218,12 @@ const LABELS = {
   // gap-limit and chain-base writes report whether a resync followed.
   resyncNoteStarted:
     "Saved — re-scanning with the new value; the status line at the top follows.",
-  // copy pass 2 #52 (UNDER-WARN fix): an EMPTY chain-base apply that lands
-  // (the engine hot-swaps to the public default) must name the leak AS IT
-  // LANDS — the placeholder hint above the field is not the consent beat.
-  // Tested for emptiness only; the value itself is never echoed (value-free).
-  settingsEmptyApplied:
-    "Switched to the public mempool.space server — " +
-    PUBLIC_LEAK_SENTENCE +
-    " Enter your own server's address to switch back.",
+  // TCK-DESCOPE-M3B: the old settingsEmptyApplied note ("Switched to the
+  // public mempool.space server — …") is GONE with the family it named:
+  // since TCK-DESCOPE-M3A an empty chain-base apply cannot land on a wired
+  // engine (the write is refused — there is no silent public default), and
+  // on an unwired pump it merely clears the choice, which reads as the
+  // plain "Applied." line.
   // TCK-WEB-013 (1): the effective-backend line (the ADDITIVE
   // effective_chain_base_url from the /settings replies — the public
   // default becomes VISIBLE when the stored rung is empty; absent = the
@@ -265,7 +265,9 @@ const LABELS = {
   // pane's chain section. The subline REUSES the pane's own leak sentence
   // (PUBLIC_LEAK_SENTENCE) — one disclosure, never a second voice.
   consentPublic: "Use public server",
-  consentSubline: "The public mempool.space server — " + PUBLIC_LEAK_SENTENCE,
+  consentSubline:
+    "The public Electrum server electrum.blockstream.info — " +
+    PUBLIC_LEAK_SENTENCE,
   consentSaving: "Recording…",
   consentLoading: "Consent recorded — the wallet is loading now.",
   consentRecorded: "Consent recorded.",
@@ -288,24 +290,12 @@ const FLOW_STATES = new Set([
   "idle", "created", "confirmed", "signed", "broadcast", "cancelled", "expired",
 ]);
 
-// TCK-WEB-009 (e): the three dimmed badges next to the chain-base field and
-// the closed backend_kind → badge mapping (the engine's enum, app.py
-// BACKEND_KINDS). mempool/electrum/bitcoind are the badge families: every
-// http(s) Esplora-shaped backend (the public mempool.space default, a
-// self-hosted mempool /api install, a root-served electrs/esplora) is the
-// "mempool" family; ssl:// is electrum; bitcoind is the M2/M3 Core-RPC
-// adapter (emitted since the M3 stored rung — including the http://
-// auto-detect rewrite). "none"/unknown: all dim.
-// ponytail: one badge per family, not per enum name — a fourth "esplora"
-// badge only earns its pixels when the two ever behave differently here.
-const BADGE_FAMILIES = {
-  mempool: new Set(["mempool", "public", "esplora"]),
-  electrum: new Set(["electrum"]),
-  bitcoind: new Set(["bitcoind"]),
-};
-const BACKEND_KINDS = new Set([
-  "none", "electrum", "public", "mempool", "esplora", "bitcoind",
-]);
+// TCK-DESCOPE-M3B (user direction 2026-09-11): the backend-KIND badges are
+// ELIMINATED from the settings pane — no BADGE_FAMILIES mapping, no client
+// BACKEND_KINDS set, no painter. The engine still serves the additive
+// ``backend_kind`` NAME (closed enum none/electrum/bitcoind) under the
+// unchanged state/1 + settings/1 tags; the shipped client simply does not
+// consume it. The trust badge (privacy_mode) is the pane's only badge.
 // Keys the pane renders specially (own rows / own block) — everything else
 // on the allowlist falls through to the generic text row. The credential
 // trio (TCK-ONB-004 M3) belongs to the chain-base row's login block.
@@ -368,12 +358,12 @@ const state = {
   // fed by the int-only model_progress events (percent + bytes, value-free).
   downloadLine: null, // <p> currently receiving the inline download bar
   // TCK-WEB-009: the pane's data. The last successfully read settings
-  // entries (in memory only — never persisted, never logged) plus the live
-  // backend_kind NAME, so the zpub row can flip form↔display on a /state
-  // transition without a refetch storm (the engine is routinely busy —
-  // refetching right after a provisioning accept would 503).
+  // entries (in memory only — never persisted, never logged) so the zpub
+  // row can flip form↔display on a /state transition without a refetch
+  // storm (the engine is routinely busy — refetching right after a
+  // provisioning accept would 503). (The backend_kind NAME this also
+  // carried for the kind badges was retired with them, TCK-DESCOPE-M3B.)
   settings: null, // null | Map<key, entry>
-  backendKind: "",
   // copy pass 2 §1: the SET row's Edit⇄form toggle (client-side only — no
   // request happens until the form's Replace-wallet submit).
   watchKeyReplaceOpen: false,
@@ -484,31 +474,54 @@ async function clipboardWrite(text) {
   }
 }
 
-// The WEB-010 copy feedback pattern, shared by both copy controls: ok/fail
-// class colors the control for 1.6s, then the base title returns.
-function flashCopyResult(ctrl, ok, baseTitle) {
+// The WEB-010 copy feedback pattern, shared by both copy controls, upgraded
+// once by TCK-WEB-026 so both inherit: class state (color PLUS a soft
+// background and a floating CSS ::after word — non-color cues that survive
+// forced-colors), swapped title AND aria-label, and the ONE shared
+// value-free live region announcing "Copied." / the fail sentence. A fail
+// HOLDS (its class and live sentence survive to the next click — a stale
+// clipboard on money is not a 1.6s-and-forget situation) but its title and
+// aria-label revert IMMEDIATELY, so the accessible name keeps carrying WHICH
+// token failed; an ok swaps them for the window, then reverts.
+function flashCopyResult(ctrl, ok, baseTitle, baseAria) {
   ctrl.classList.remove("copy-ok", "copy-fail");
   ctrl.classList.add(ok ? "copy-ok" : "copy-fail");
-  ctrl.title = ok ? LABELS.copyDone : LABELS.copyFailed;
+  copyStatusEl.textContent = ok ? LABELS.copyOk : LABELS.copyFail;
   clearTimeout(ctrl._copyReset);
-  ctrl._copyReset = setTimeout(() => {
-    ctrl.classList.remove("copy-ok", "copy-fail");
+  if (ok) {
+    ctrl.title = LABELS.copyDone;
+    ctrl.setAttribute("aria-label", LABELS.copyDone);
+    ctrl._copyReset = setTimeout(() => {
+      ctrl.classList.remove("copy-ok", "copy-fail");
+      ctrl.title = baseTitle;
+      ctrl.setAttribute("aria-label", baseAria);
+    }, 1600);
+  } else {
+    // fail: the held CLASS and the live sentence carry the state; the NAME
+    // (and desktop-hover title) return to the value-bearing base at once.
     ctrl.title = baseTitle;
-  }, 1600);
+    ctrl.setAttribute("aria-label", baseAria);
+  }
 }
 
 // TCK-WEB-014: the in-bubble underlined token, now a copy affordance. Its
 // only content is the verbatim token (no label text nodes), so lineText
-// keeps copying message text exactly (D9).
+// keeps copying message text exactly (D9). TCK-WEB-026: the accessible NAME
+// carries the value — "Copy address bc1q…" / "Copy transaction id <full
+// hash>" (ADDRESS_RE discriminates; the old "Click to copy" name erased the
+// token from the SR queue) — while the hover-only title keeps the plain
+// garnish. The whole token is quoted, never truncated.
 function copyTokenButton(token) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "explorer-link";
   btn.textContent = token; // verbatim label
+  const name =
+    (ADDRESS_RE.test(token) ? LABELS.copyAddress : LABELS.copyTxid) + " " + token;
   btn.title = LABELS.clickToCopy;
-  btn.setAttribute("aria-label", LABELS.clickToCopy);
+  btn.setAttribute("aria-label", name);
   btn.addEventListener("click", async () => {
-    flashCopyResult(btn, await clipboardWrite(token), LABELS.clickToCopy);
+    flashCopyResult(btn, await clipboardWrite(token), LABELS.clickToCopy, name);
   });
   return btn;
 }
@@ -569,7 +582,12 @@ function addCopyButton(turn) {
   btn.addEventListener("click", async () => {
     const text = bubbleText(turn);
     if (!text) return;
-    flashCopyResult(btn, await clipboardWrite(text), LABELS.copyMessage);
+    flashCopyResult(
+      btn,
+      await clipboardWrite(text),
+      LABELS.copyMessage,
+      LABELS.copyMessage,
+    );
   });
   turn.appendChild(btn);
 }
@@ -903,7 +921,6 @@ function applyState(snap) {
   applyPrivacyChip(snap);
   applyWatchKeyGate(snap);
   applyModelPrompt(snap);
-  applyBackendKind(snap);
 }
 
 // TCK-LAUNCH-002: the Yes/No card buttons and the model-free quick-action
@@ -1071,20 +1088,11 @@ function applyPrivacyChip(snap) {
   privacyChipEl.hidden = false;
 }
 
-// TCK-WEB-009 (e): the badge strip follows the additive backend_kind NAME
-// from /state (and from every /settings reply — both carry it). An absent
-// or unknown value keeps the last known kind (additive-field rule: the
-// engine may legitimately answer state/0 while busy; that is not "no
-// backend").
-function applyBackendKind(snap) {
-  if (!snap || snap.schema !== "state/1") return;
-  if (typeof snap.backend_kind === "string" && BACKEND_KINDS.has(snap.backend_kind)) {
-    if (snap.backend_kind !== state.backendKind) {
-      state.backendKind = snap.backend_kind;
-      paintBackendBadges();
-    }
-  }
-}
+// TCK-DESCOPE-M3B: applyBackendKind/paintBackendBadges (the kind-badge
+// machinery) are deleted with the badges themselves — the additive
+// backend_kind NAME on /state and /settings replies is simply ignored now
+// (additive-field rule: clients may stop consuming fields without a tag
+// bump; the trust-badge pass below is untouched).
 
 async function refreshState() {
   // Newest-wins (TCK-WEB-008): a snapshot that started before a provisioning
@@ -1489,8 +1497,10 @@ function chainBaseRow(entry) {
   const envRung = entry.env_override === true;
 
   // TCK-WEB-013 (1/2): the effective backend is ALWAYS shown when the
-  // server carries it (this is how the public default becomes visible
-  // under an empty stored field), with the trust badge riding the
+  // server carries it (an empty stored field answers EMPTY since
+  // TCK-DESCOPE-M3A — unresolved, no silent public default; a recorded
+  // public consent lands the named public Electrum server on this line),
+  // with the trust badge riding the
   // privacy_mode enum beside it. Field absent (bare pump) → line omitted.
   if (state.effectiveChainUrl) {
     const nowLine = el("div", "chain-now-line");
@@ -1558,23 +1568,10 @@ function chainBaseRow(entry) {
   else line.appendChild(input);
   li.appendChild(line);
 
-  // copy pass 2 #44: the legend is the visible text alternative to dim/lit,
-  // and each badge gets a dynamic title/aria in paintBackendBadges (the
-  // badges stay a plain group — a container role="img" would hide the
-  // per-badge names from screen readers).
-  li.appendChild(el("p", "setting-hint", LABELS.badgeLegend));
-  const badges = el("div", "backend-badges");
-  for (const [family, labelText] of [
-    ["mempool", LABELS.badgeMempool],
-    ["electrum", LABELS.badgeElectrum],
-    ["bitcoind", LABELS.badgeBitcoind],
-  ]) {
-    const badge = el("span", "backend-badge", labelText);
-    badge.dataset.badge = family;
-    badge.setAttribute("role", "img"); // makes the aria-label authoritative
-    badges.appendChild(badge);
-  }
-  li.appendChild(badges);
+  // TCK-DESCOPE-M3B: the kind-badge strip (legend + mempool/electrum/
+  // bitcoind chips) is DELETED here — user direction: the kind of server
+  // is not a trust dimension and earns no pixels; the trust badge above
+  // and the leak disclosure carry the whole truth.
 
   const resyncLine = el("div", "setting-line setting-resync-line");
   const resyncBtn = el("button", "btn btn-ghost btn-small", LABELS.resyncNow);
@@ -1583,7 +1580,7 @@ function chainBaseRow(entry) {
   resyncLine.appendChild(resyncBtn);
   li.appendChild(resyncLine);
 
-  // (5): the "Empty = public default" hint lies under an env rung (the
+  // (5): the "Empty = no server chosen" hint lies under an env rung (the
   // effective URL line above carries the truth instead) — suppressed there.
   if (!envRung) {
     li.appendChild(el("p", "setting-hint", LABELS.settingsEmptyIsDefault));
@@ -1599,8 +1596,9 @@ function chainBaseRow(entry) {
   // report only SET/UNSET (never the value), so the fields start empty on
   // every render; the checkbox mirrors the stored none-flag. Visibility:
   // while EDITING an http:// (ambiguous — may be Core RPC) or bitcoind://
-  // address only; https answers as Esplora (creds inert) and ssl://
-  // Electrum has no standard auth — the fields never appear for those.
+  // address only; https is a Core-RPC input alias (creds ride the dedicated
+  // keys — fields never appear for it) and ssl:// Electrum has no standard
+  // auth — the fields never appear for those.
   const credFlags = backendCredFlags();
   if (credFlags.none) {
     li.appendChild(el("p", "setting-flag creds-note", LABELS.credsNoneSaved));
@@ -1775,22 +1773,8 @@ async function clearBackendCreds(btn, status, row) {
   }
 }
 
-// (e): dimmed by default (low-opacity token styling), highlighted only for
-// the family the current backend_kind belongs to. Copy pass 2 #44: the
-// dim/lit state is styling, so this sole painter also recomposes each
-// badge's title + aria-label (lit → in-use; dim → idle). The accessible
-// name keeps the family word + the sentence.
-function paintBackendBadges() {
-  for (const badge of settingsListEl.querySelectorAll(".backend-badge")) {
-    const family = BADGE_FAMILIES[badge.dataset.badge];
-    const active = !!(family && state.backendKind && family.has(state.backendKind));
-    if (active) badge.dataset.active = "true";
-    else badge.removeAttribute("data-active");
-    const words = active ? LABELS.badgeInUse : LABELS.badgeIdle;
-    badge.title = words;
-    badge.setAttribute("aria-label", badge.textContent + " — " + words);
-  }
-}
+// (e): the badge painter (paintBackendBadges) is DELETED by TCK-DESCOPE-M3B
+// along with the kind badges — see the note in the settings section.
 
 // (f): POST /resync carries no data; the transport maps the closed engine
 // status (started→202, busy→409, anything else→503). 202: the scan chip
@@ -1905,7 +1889,6 @@ function renderSettings() {
   } else {
     settingsListEl.replaceChildren(walletCol);
   }
-  paintBackendBadges();
 }
 
 function settingsCol(title, rows) {
@@ -1949,9 +1932,8 @@ async function loadSettings() {
       typeof data.effective_chain_base_url === "string"
         ? data.effective_chain_base_url
         : null;
-    if (typeof data.backend_kind === "string" && BACKEND_KINDS.has(data.backend_kind)) {
-      state.backendKind = data.backend_kind;
-    }
+    // (the additive backend_kind NAME this used to read badges nothing
+    // anymore — TCK-DESCOPE-M3B; the field stays server-side, unconsumed).
     renderSettings();
   } catch {
     showSettingsUnavailable();
@@ -2043,21 +2025,13 @@ settingsListEl.addEventListener("click", async (event) => {
     });
     const data = await response.json().catch(() => null);
     if (response.status === 200 && data && data.status === "applied") {
-      // Copy pass 2 #52: an EMPTY chain-base write that lands hot-swaps to
-      // the public server — the applied note must name the leak as it lands
-      // (ADR-0023 amendment 2 consent duty). Not when the engine says the
-      // value changed nothing ("unchanged") or the env override outranks it
-      // ("skipped"): there the switch is not happening now.
-      const switched =
-        data.resync === undefined ||
-        data.resync === "started" ||
-        data.resync === "busy" ||
-        data.resync === "deferred";
-      const emptyApplied = isChain && submitted === "" && switched;
-      status.dataset.kind = emptyApplied ? "warn" : "ok";
-      const note = emptyApplied
-        ? LABELS.settingsEmptyApplied
-        : typeof data.resync === "string" && RESYNC_NOTES.has(data.resync)
+      // TCK-DESCOPE-M3B: the empty-chain-base special note is GONE. Since
+      // TCK-DESCOPE-M3A a wired engine REFUSES an empty apply (no silent
+      // public default to switch to) and an unwired pump merely clears the
+      // choice — both read honestly through the plain/RESYNC notes below.
+      status.dataset.kind = "ok";
+      const note =
+        typeof data.resync === "string" && RESYNC_NOTES.has(data.resync)
           ? RESYNC_NOTES.get(data.resync)
           : LABELS.settingsApplied;
       // TCK-GAP-001 follow-up: when the apply carries an engine tradeoff
@@ -2128,10 +2102,8 @@ settingsListEl.addEventListener("click", async (event) => {
       if (state.settings && fresh && typeof fresh.key === "string") {
         state.settings.set(fresh.key, fresh);
       }
-      if (typeof data.backend_kind === "string" && BACKEND_KINDS.has(data.backend_kind)) {
-        state.backendKind = data.backend_kind; // a swap may have moved the kind
-        paintBackendBadges();
-      }
+      // (a swap may have moved the backend_kind NAME — TCK-DESCOPE-M3B:
+      // the client no longer reads it, the kind badges are gone).
       if (data.resync === "started" || data.resync === "deferred") {
         refreshState(); // the scan chip follows, from engine truth
       }
