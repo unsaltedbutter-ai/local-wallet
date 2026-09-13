@@ -338,5 +338,51 @@ integer settings do).
    (default 2): `settings` keys with typed fail-closed store writers
    (`Store.set_coin_setting`, bounds single-sourced from `config`), pure
    env > stored > default resolution in `config`
-   (`resolve_coin_selection_settings`), malformed value = startup refusal,
-   value-free errors — the ADR-0009 / ADR-0023 pattern.
+    (`resolve_coin_selection_settings`), malformed value = startup refusal,
+    value-free errors — the ADR-0009 / ADR-0023 pattern.
+
+## Amendment (TCK-CPFP-001, 2026-09): child-pays-for-parent builder — the parent-fee-unknown bound
+
+> Pure tx-layer core `tx/cpfp.py` (`build_cpfp_child_plan`), the CPFP twin
+> of the `tx/replacement.py` (TCK-RBF-002) builder. It reuses decisions 3
+> (dust/min-relay from script size), 4 (`estimate_tx_vsize`, never a
+> measured vsize), 5 (every input carries `SEQUENCE_RBF_ENABLED` — the
+> child stays bumpable by `bump_fee` later) and the TCK-FEE-003 integer
+> centisat/vB units verbatim; no new policy constant is introduced.
+
+The intent-side shape (an additive `cpfp` mode on `self_transfer`, registry
+STILL fourteen) is ADR-0002's amendment; this note covers the money math.
+
+1. **The child's fee is bounded below by what the PARENT needs, not just its
+   own size.** CPFP raises the *package* fee rate, so when the recorded
+   parent's `fee_sats`/`parent_vsize` are BOTH known (a lineage row this
+   wallet broadcast, store v3), the child pays
+   `max(child_self_cost, ceil((child_vsize + parent_vsize) × rate) − parent_fee)`
+   — the parent's shortfall at the same bid. Integer-exact via
+   `fee_sats_for`; the chosen rate is a true floor for the package, and
+   `package_fee_rate_centisat_vb` reports the effective combined rate as an
+   integer-DOWNED floor (never rounded up).
+2. **Honest unknown bound — never fabricate a parent fee.** A stuck INBOUND
+   is usually a foreign transaction: watch-only sees its output, not its
+   inputs, so its fee is unknowable. `StuckParent` allows `fee_sats`/`vsize`
+   to be `None` (all-or-nothing: a half-picture bounds nothing, so a mix is
+   refused). When unknown the child bids the chosen rate on its own vsize
+   ONLY, and the plan record states it honestly: `parent_fee_known=False`,
+   `package_fee_rate_centisat_vb=None`. No package claim is manufactured —
+   a parent that paid under the bid drags the package average below it, and
+   that hedge (the reorg/underpay copy on the plan card) is CPFP-002's job,
+   sourced from these fields.
+3. **Child relay floor is independent.** The child must clear
+   `min_relay_fee_vbytes` on its OWN size (refusal `rate_below_min_relay`)
+   so it relays even without package-relay support — never leaning on the
+   stuck parent to lift the ancestor fee rate.
+4. **Shape refusals are value-free.** `fee_exceeds_funds` and
+   `output_below_dust` carry the machine-readable reason + a value-free
+   message (the `replacement.py` `RbfFloorError` precedent is deliberately
+   NOT followed for the amounts: CPFP-002 renders the plan card from the
+   returned record, so the builder never quotes sats in an error path).
+   Input selection (which unconfirmed inbound coin, which optional merge
+   coin) is caller-owned deterministic policy — this builder accepts the
+   coins it is handed and re-verifies only that the inbound coin's parent IS
+   `StuckParent.txid` (fail closed on a mismatched pair).
+

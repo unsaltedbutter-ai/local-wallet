@@ -299,3 +299,45 @@ invalidated).
   the cross-reference rule; handler wiring lands in RBF-004 (until then a
   `bump_fee` envelope surfaces `dispatch_error` via the not-wired stub).
 
+## v0 amendment (2026-09, TCK-CPFP-001): `self_transfer` gains a `cpfp` mode
+
+CPFP (child-pays-for-parent) — unsticking a stuck **inbound** payment by
+spending its unconfirmed output in a fresh high-fee child — is an ADDITIVE
+`mode` value on the existing `self_transfer` intent, NOT a new intent: the
+**registry stays FOURTEEN**. This is a pure backward-compatible widening
+(the same bump-policy reasoning as every extension above): a new enum value
+in an existing closed field plus one new optional key. No previously-valid
+`self_transfer` envelope changes shape or meaning, so `v` stays `0`.
+
+- `self_transfer.mode` widened `"split"|"consolidate"` → `"split"|
+  "consolidate"|"cpfp"`. `cpfp` requires NO number key (`parts` and
+  `below_size_sats` are both forbidden for it — the engine resolves which
+  unconfirmed inbound coin is stuck, so the model names no coin).
+- `cpfp` solely owns one new OPTIONAL key `{"merge_coin": true|false}` — a
+  strict JSON boolean (lax bool coercions closed at the schema layer)
+  carrying the user's stated wish to merge a SECOND own coin into the child
+  (the third reshuffle flavour the council asked for). It steers the child's
+  SHAPE only; WHICH coin is deterministic handler policy — no outpoint or
+  address is representable, so the params still cannot smuggle an invented
+  money value past the confirm gate. `merge_coin` is rejected for `split`
+  and `consolidate` (mode↔key pairing, layer 2 + re-checked layer 3).
+- `cpfp` shares the `fee_target` tail (no `fee_rate_sat_vb`: an internal
+  reshuffle never rides the explicit-rate override — the estimator ladder
+  bids the child; the builder's rate parameter is fed handler-side in
+  centisat/vB, TCK-FEE-003). The child builder and its honest
+  parent-fee-unknown bound live in `tx/cpfp.py` (ADR-0012 amendment).
+
+Grammar (`self-transfer` now alternates `split-params | consolidate-params |
+cpfp-params`), schema, system prompt (cpfp routed on INBOUND phrasings and
+explicitly distinguished from `bump_fee`, which is for the user's OWN
+in-flight transaction), drift pins, and eval fixtures (golden-053..055 +
+`selftransfer-bypass-001` re-pinned to try the new mode for a bypass) moved
+IN LOCKSTEP. The `self_transfer` handler's cpfp refusal-guard (value-free
+"not yet available", mirroring the `_bump_fee_not_wired` stub) + full wiring
+ride TCK-RBF-004 (that ticket owns `app.py` in flight). Until they land an
+unwired `cpfp` envelope is FAIL-CLOSED — it trips the handler's
+consolidate-branch invariant (`assert below_size_sats is not None`) and the
+dispatcher's blanket `except Exception` containment surfaces a structured
+`dispatch_error`; nothing is ever built, staged, or broadcast — but the
+clean early refusal (before the fee-estimator call) is RBF-004's job.
+

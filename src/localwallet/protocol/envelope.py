@@ -45,11 +45,16 @@ Canonical envelope contract v0 — the model-emitted wire format::
   ``node_status`` → ``{}`` exactly — no user-quoted values needed; the
   handler runs the advise-only node doctor (detect + guidance) and returns
   the dispatcher-owned FACTS for narration (Phase 4, TCK-P4-003).
-  ``self_transfer`` (TCK-TX-SELF-001) → ``{"mode": "split"|"consolidate"}``
-  plus the mode's ONE required key and nothing else: ``split`` requires
+  ``self_transfer`` (TCK-TX-SELF-001; cpfp mode added by TCK-CPFP-001 as an
+  additive v0 extension) → ``{"mode": "split"|"consolidate"|"cpfp"}`` plus
+  the mode's ONE required key and nothing else: ``split`` requires
   ``{"parts": int, 2..20}`` (the closed-world validator forbids
   ``below_size_sats``); ``consolidate`` requires
-  ``{"below_size_sats": int, 546..21e15}`` (forbids ``parts``). The
+  ``{"below_size_sats": int, 546..21e15}`` (forbids ``parts``); ``cpfp``
+  requires NO number key (both are forbidden — the engine resolves which
+  unconfirmed inbound payment is stuck) and owns the ONLY optional extra,
+  ``{"merge_coin": true|false}`` (the user's stated wish to merge a second
+  own coin into the child; WHICH coin stays engine-derived). The
   optional ``{"fee_target": "fast"|"medium"|"slow"}`` tail matches
   ``create_tx`` (no ``fee_rate_sat_vb`` — an internal reshuffle never gets
   a literal-rate override; the estimator ladder alone bids it). CRITICAL:
@@ -252,6 +257,7 @@ _KNOWN_LOC_FIELDS: Final[frozenset[str]] = frozenset(
         "mode",
         "parts",
         "below_size_sats",
+        "merge_coin",
         "tx_ref",
         "signer",
         "txid",
@@ -311,9 +317,14 @@ class IntentName(StrEnum):
     intent whose params carry no money value at all — no recipient, no
     amount, no outpoint: the engine derives every address, amount, and
     input deterministically. Like ``create_tx`` it is only the first step
-    of the dispatcher-owned flow (``create → confirm_tx → sign_tx →
+    of     the dispatcher-owned flow (``create → confirm_tx → sign_tx →
     broadcast_tx``, dual-key confirm gate unchanged — the handler stages
-    the plan through :meth:`localwallet.tx.flow.TxFlow.create`).
+    the plan through :meth:`localwallet.tx.flow.TxFlow.create`). TCK-CPFP-001
+    widened its mode set additively with ``cpfp`` (unstick a stuck INBOUND
+    payment with a high-fee child the engine builds in
+    :mod:`localwallet.tx.cpfp`) — the intent registry STAYS FOURTEEN: no
+    new intent joined, only a mode value (ADR-0002 bump policy: additive
+    enum values keep ``v`` at ``0``).
 
     TCK-RBF-003 v0 extension (backward-compatible — see
     ``docs/adr/0002-envelope-spec.md``): ``bump_fee`` joins as the explicit
@@ -658,50 +669,66 @@ class NodeStatusParams(BaseParams):
 
 
 class SelfTransferParams(_OmitNoneDump):
-    """Params for ``self_transfer``: mode + its ONE required key + fee rung.
+    """Params for ``self_transfer``: mode + its keys + fee rung.
 
-    Contract (TCK-TX-SELF-001 v0 extension, ADR-0002 bump policy; ADR-0013
-    confirm discipline unchanged). The closed-world rule that makes the
-    flow SAFE: **no address, no outpoint, no recipient amount is
-    expressible here** — the money plan is derived entirely by the engine
-    handler from dispatcher-owned state (the wallet's own fresh receive
-    addresses and its tag-pure UTXO pools). The model can only relay the
-    two numbers the USER stated:
+    Contract (TCK-TX-SELF-001 v0 extension + the TCK-CPFP-001 additive mode,
+    ADR-0002 bump policy; ADR-0013 confirm discipline unchanged). The
+    closed-world rule that makes the flow SAFE: **no address, no outpoint,
+    no recipient amount is expressible here** — the money plan is derived
+    entirely by the engine handler from dispatcher-owned state (the wallet's
+    own fresh receive addresses and its tag-pure UTXO pools). The model can
+    only relay the numbers/flags the USER stated:
 
-    - ``mode``: REQUIRED enum literal ``"split"`` (one coin into N parts)
-      or ``"consolidate"`` (many small coins into one).
+    - ``mode``: REQUIRED enum literal ``"split"`` (one coin into N parts),
+      ``"consolidate"`` (many small coins into one) or ``"cpfp"`` (unstick a
+      stuck INBOUND payment — the engine resolves which unconfirmed inbound
+      coin and builds the high-fee child; see :mod:`localwallet.tx.cpfp`).
     - ``parts``: for ``split``, a REQUIRED TRUE JSON integer
       (strict-int pattern from ``amount_sats``; strings/bools/floats/null
       rejected), bounded ``MIN_SELF_TRANSFER_PARTS..MAX_SELF_TRANSFER_PARTS``
       (2..20). The GBNF grammar's syntactic bound is looser (1..99) — the
       schema is the authority, the same loose-grammar/tight-schema split as
-      ``limit``. Forbidden for ``consolidate``.
+      ``limit``. Forbidden for ``consolidate`` and ``cpfp``.
     - ``below_size_sats``: for ``consolidate``, a REQUIRED TRUE JSON
       integer, bounded ``MIN_AMOUNT_SATS..MAX_AMOUNT_SATS`` — coarse
       transport bounds mirroring ``create_tx.amount_sats`` (floor = the
       canonical legacy-output dust figure; the real "is a coin below
       this" decision compares stored values against it, and every
       per-output dust check is computed from script size in
-      :mod:`localwallet.tx.dust`, never here). Forbidden for ``split``.
+      :mod:`localwallet.tx.dust`, never here). Forbidden for ``split``
+      and ``cpfp``.
+    - ``merge_coin``: ONLY valid for ``cpfp`` — an optional TRUE JSON
+      boolean (``bool`` strictly; ints/strings/``null`` rejected, pydantic's
+      lax bool coercions closed by a before-validator) carrying the user's
+      stated wish to merge a second own coin into the child ("…and throw
+      one of my small coins in"). WHICH coin is deterministic handler
+      policy (TCK-CPFP-002) — no outpoint is expressible here, so the flag
+      steers the SHAPE, never the money. Forbidden for ``split`` and
+      ``consolidate``.
     - ``fee_target``: optional enum literal ``"fast"|"medium"|"slow"``
       (omitted ⇒ the handler's MEDIUM default, exactly like ``create_tx``).
       Explicit ``null`` rejected — omission means leaving the key out.
       Deliberately NO ``fee_rate_sat_vb`` sibling: an internal reshuffle
-      never rides the explicit-rate override (TCK-FEE-002 stays send-only).
+      never rides the explicit-rate override (TCK-FEE-002 stays send-only);
+      the cpfp child's bid comes from the estimator rung named here —
+      whether a stuck child defaults above MEDIUM is CPFP-002's handler
+      policy, not this schema's promise.
 
     The mode↔key pairing (split requires parts / consolidate requires
-    below_size_sats, "nothing else") is enforced HERE (model validator) and
-    re-checked at layer 3; the GBNF grammar makes every mismatched
-    combination syntactically impossible at decode time.
+    below_size_sats / cpfp requires NO number key and owns only
+    ``merge_coin``, each mode "nothing else") is enforced HERE (model
+    validator) and re-checked at layer 3; the GBNF grammar makes every
+    mismatched combination syntactically impossible at decode time.
     """
 
-    mode: Literal["split", "consolidate"]
+    mode: Literal["split", "consolidate", "cpfp"]
     parts: int | None = Field(
         default=None, ge=MIN_SELF_TRANSFER_PARTS, le=MAX_SELF_TRANSFER_PARTS
     )
     below_size_sats: int | None = Field(
         default=None, ge=MIN_AMOUNT_SATS, le=MAX_AMOUNT_SATS
     )
+    merge_coin: bool | None = None
     fee_target: Literal["fast", "medium", "slow"] | None = None
 
     @field_validator("parts", mode="before")
@@ -725,6 +752,20 @@ class SelfTransferParams(_OmitNoneDump):
             return value
         raise ValueError("below_size_sats must be an integer when present")
 
+    @field_validator("merge_coin", mode="before")
+    @classmethod
+    def _merge_coin_must_be_true_bool(cls, value: object) -> object:
+        """Close pydantic's lax bool coercions for ``merge_coin``.
+
+        Lax mode would happily turn ``1``/``"true"``/``"no"`` into a bool;
+        the contract admits only the JSON literals ``true``/``false`` (the
+        grammar's ``bool-lit``), and explicit ``null`` is rejected too —
+        omission means leaving the key out.
+        """
+        if isinstance(value, bool):
+            return value
+        raise ValueError("merge_coin must be a boolean when present")
+
     @field_validator("fee_target", mode="before")
     @classmethod
     def _fee_target_must_be_present_when_not_omitted(cls, value: object) -> object:
@@ -739,26 +780,38 @@ class SelfTransferParams(_OmitNoneDump):
 
     @model_validator(mode="after")
     def _mode_owns_exactly_one_key(self) -> SelfTransferParams:
-        """``split`` ↔ ``parts`` XOR ``consolidate`` ↔ ``below_size_sats``.
+        """``split``↔``parts`` / ``consolidate``↔``below_size_sats`` / ``cpfp``↔nothing required.
 
-        Each mode REQUIRES its own key and FORBIDS the other's — a
-        split-with-threshold or a consolidate-with-parts is ambiguous
-        reshuffle intent, rejected here so the loop re-prompts once and
-        falls back to ``clarify`` rather than guessing (never a silent
-        money plan; fail closed per PROJECT.md §5.5). The GBNF branch
-        alternation already makes both shapes syntactically impossible for
-        a grammar-constrained decode; this covers every other producer.
+        Each mode REQUIRES its own key (cpfp: none — the engine resolves
+        the stuck inbound coin) and FORBIDS the other modes' keys;
+        ``merge_coin`` is cpfp's ONLY optional extra. A split-with-
+        threshold, a consolidate-with-parts or a cpfp-with-numbers is
+        ambiguous reshuffle intent, rejected here so the loop re-prompts
+        once and falls back to ``clarify`` rather than guessing (never a
+        silent money plan; fail closed per PROJECT.md §5.5). The GBNF
+        branch alternation already makes every mismatch syntactically
+        impossible for a grammar-constrained decode; this covers every
+        other producer.
         """
         if self.mode == "split":
             if self.parts is None:
                 raise ValueError("mode 'split' requires params.parts")
             if self.below_size_sats is not None:
                 raise ValueError("params.below_size_sats is not valid for mode 'split'")
+            if self.merge_coin is not None:
+                raise ValueError("params.merge_coin is not valid for mode 'split'")
+        elif self.mode == "cpfp":
+            if self.parts is not None:
+                raise ValueError("params.parts is not valid for mode 'cpfp'")
+            if self.below_size_sats is not None:
+                raise ValueError("params.below_size_sats is not valid for mode 'cpfp'")
         else:
             if self.below_size_sats is None:
                 raise ValueError("mode 'consolidate' requires params.below_size_sats")
             if self.parts is not None:
                 raise ValueError("params.parts is not valid for mode 'consolidate'")
+            if self.merge_coin is not None:
+                raise ValueError("params.merge_coin is not valid for mode 'consolidate'")
         return self
 
 

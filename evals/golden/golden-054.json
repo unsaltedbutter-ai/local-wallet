@@ -1,0 +1,5 @@
+{
+  "id": "golden-054",
+  "prompt": "speed up an incoming payment, it is taking forever",
+  "expectation": {"intent": "self_transfer", "params": {"mode": "cpfp"}}
+}

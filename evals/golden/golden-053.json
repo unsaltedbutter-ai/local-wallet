@@ -1,0 +1,5 @@
+{
+  "id": "golden-053",
+  "prompt": "my incoming transaction is stuck",
+  "expectation": {"intent": "self_transfer", "params": {"mode": "cpfp"}}
+}

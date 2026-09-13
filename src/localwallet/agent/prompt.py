@@ -16,7 +16,9 @@ the model's side of the closed intent protocol (PROJECT.md §7.1, §8):
    ``clarify`` (ambiguous amount), ``get_balance``, ``new_address``,
    ``create_tx`` (Phase 2 v0 extension; ADR-0002/0013 lockstep), and
    ``self_transfer`` (split + consolidate; TCK-TX-SELF-001 — the money
-   plan is engine-derived, so the examples carry no address/outpoint).
+   plan is engine-derived, so the examples carry no address/outpoint;
+   the third cpfp example, TCK-CPFP-001, teaches the stuck-INBOUND
+   routing that keeps cpfp out of ``bump_fee``).
    The ``bump_fee`` mapping lines (TCK-RBF-003) teach the phrasings that
    route to ``bump_fee`` without ever computing the new fee.
 
@@ -122,15 +124,20 @@ app detects your local Bitcoin Core / mempool / electrs instances and \
 provides guidance; you narrate ONLY the structured facts you are given — \
 never invent detection results or guidance.
 - self_transfer: reorganize your OWN coins (mainnet); params {"mode": \
-"split", "parts": <2-20 integer>} to split one coin into N equal parts, or \
+"split", "parts": <2-20 integer>} to split one coin into N equal parts, \
 {"mode": "consolidate", "below_size_sats": <sats integer>} to merge the \
-coins smaller than that size into one; optional "fee_target" exactly like \
-create_tx — when the user asks to split a big coin/UTXO into N pieces, or \
-to consolidate / merge / sweep small or dust coins. The app derives ALL \
-addresses, amounts and inputs itself: NEVER supply a recipient or address, \
-NEVER name a coin — if the part count (split) or size threshold \
-(consolidate) is missing, clarify; the flow still runs create → confirm_tx \
-→ sign_tx → broadcast_tx.
+coins smaller than that size into one, or {"mode": "cpfp"} — with optional \
+"merge_coin": true when the user asks to merge one of their own coins in — \
+to speed up a STUCK INBOUND payment ("my incoming transaction is stuck", \
+"speed up that incoming payment"): the app builds a high-fee child spend of \
+it; optional "fee_target" exactly like create_tx — when the user asks to \
+split a big coin/UTXO into N pieces, or to consolidate / merge / sweep small \
+or dust coins. An INBOUND (someone paying YOU) stuck/slow request is \
+self_transfer-cpfp, NEVER bump_fee (that bumps YOUR OWN outgoing \
+transaction). The app derives ALL addresses, amounts and inputs itself: \
+NEVER supply a recipient or address, NEVER name a coin — if the part count \
+(split) or size threshold (consolidate) is missing, clarify; the flow still \
+runs create → confirm_tx → sign_tx → broadcast_tx.
 - bump_fee: raise the fee on an in-flight transaction (mainnet); params \
 {"target": "<the 64-hex txid or the app's pending-ref token quoted \
 VERBATIM from the FACTS/tool output>"}, optional "funding_ref": "<a coin \
@@ -184,6 +191,10 @@ user: consolidate all my coins under 100000 sats, no hurry
 envelope: {"v": 0, "intent": "self_transfer", "params": {"mode": \
 "consolidate", "below_size_sats": 100000, "fee_target": "slow"}}
 
+user: someone's payment to me is stuck, speed it up and merge one of my coins into it
+envelope: {"v": 0, "intent": "self_transfer", "params": {"mode": "cpfp", \
+"merge_coin": true}}
+
 user: bump the fee on abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
 envelope: {"v": 0, "intent": "bump_fee", "params": {"target": \
 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}}
@@ -199,7 +210,8 @@ def build_system_prompt() -> str:
     quote-verbatim rule for FACTS values; the no-secrets (watch-only) rule;
     and eight few-shot exchanges (respond / clarify / get_balance /
     new_address / create_tx / self_transfer-split / self_transfer-
-    consolidate / bump_fee). The self_transfer examples carry NO address or
+    consolidate / self_transfer-cpfp / bump_fee). The self_transfer
+    examples carry NO address or
     outpoint — the money plan is engine-derived, never model-authored; the
     bump_fee example quotes the target VERBATIM and never invents a fee.
     Intentionally parameter-free: intent membership and the wire format

@@ -133,7 +133,9 @@ def test_redteam_fixtures_exist_and_are_populous() -> None:
     # no destructive lifecycle skip while the first scan is stale) +
     # 1 selftransfer-bypass (TCK-TX-SELF-001: no confirm/sign/broadcast
     # skip through a reshuffle request — the params can't carry outputs
-    # and the dual-key gate stands) +
+    # and the dual-key gate stands; RE-PINNED by TCK-CPFP-001 against the
+    # widened grammar: the same prompt now additionally tries the cpfp
+    # phrasing, so the new mode buys the model no new bypass surface) +
     # 1 bump-bypass (TCK-RBF-003: a bump phrasing must not bypass the
     # confirm gate — the replacement still rides the dual-key flow).
     assert len(_redteam_files()) == 27

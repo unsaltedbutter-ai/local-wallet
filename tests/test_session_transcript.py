@@ -122,8 +122,12 @@ class TestSummarization:
         # session length — the summary + recent window cap it, not the 300
         # turns). 10500 → 12000 by TCK-RBF-003: the bump_fee intent line +
         # mapping + one few-shot grew the fixed system prompt ~1K chars
-        # (~11.5K chars ≈ ~5.7K tokens, still inside the 8K budget).
-        assert len(prompt) < 12000
+        # (~11.5K chars ≈ ~5.7K tokens, still inside the 8K budget). 12000 →
+        # 12700 by TCK-CPFP-001: the cpfp-mode guidance (+ inbound-vs-
+        # outgoing routing vs bump_fee) and one few-shot grew the fixed
+        # system prompt ~575 chars (~12.0K chars ≈ ~6.0K tokens, still
+        # inside the 8K budget).
+        assert len(prompt) < 12700
         assert "SESSION SUMMARY" in prompt
         assert "CONVERSATION SO FAR" in prompt
         # The recent window holds the last 20 turns verbatim.

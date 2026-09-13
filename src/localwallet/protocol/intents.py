@@ -319,14 +319,17 @@ def _rule_node_status(params: BaseParams) -> list[str]:
 
 
 def _rule_self_transfer(params: BaseParams) -> list[str]:
-    """``self_transfer``: mode↔key pairing + bounds (TCK-TX-SELF-001).
+    """``self_transfer``: mode↔key pairing + bounds (TCK-TX-SELF-001; the
+    additive ``cpfp`` mode per TCK-CPFP-001, ADR-0002 bump policy).
 
     Layer-3 re-checks of the pairing the schema and grammar already enforce
     (defense in depth, reachable via a validation-skipping constructor):
 
     - ``split`` requires ``parts`` and forbids ``below_size_sats``;
-      ``consolidate`` requires ``below_size_sats`` and forbids ``parts`` —
-      exactly one mode key, "nothing else".
+      ``consolidate`` requires ``below_size_sats`` and forbids ``parts``;
+      ``cpfp`` requires NO number key (the engine resolves the stuck
+      inbound coin) and solely owns the optional ``merge_coin`` flag
+      (strictly a bool) — exactly the mode's keys, "nothing else".
     - ``parts`` re-checked as a true int in ``MIN..MAX_SELF_TRANSFER_PARTS``
       and ``below_size_sats`` as a true int in ``MIN..MAX_AMOUNT_SATS``
       (``bool`` rejected explicitly — the ``get_history.limit`` pattern).
@@ -342,6 +345,8 @@ def _rule_self_transfer(params: BaseParams) -> list[str]:
     if params.mode == "split":
         if params.below_size_sats is not None:
             return ["params.below_size_sats is not valid for mode 'split'"]
+        if params.merge_coin is not None:
+            return ["params.merge_coin is not valid for mode 'split'"]
         if params.parts is None:
             return ["mode 'split' requires params.parts"]
         if isinstance(params.parts, bool) or not (
@@ -354,8 +359,18 @@ def _rule_self_transfer(params: BaseParams) -> list[str]:
                 )
             ]
         return []
+    if params.mode == "cpfp":
+        if params.parts is not None:
+            return ["params.parts is not valid for mode 'cpfp'"]
+        if params.below_size_sats is not None:
+            return ["params.below_size_sats is not valid for mode 'cpfp'"]
+        if params.merge_coin is not None and not isinstance(params.merge_coin, bool):
+            return ["params.merge_coin must be a boolean"]
+        return []
     if params.parts is not None:
         return ["params.parts is not valid for mode 'consolidate'"]
+    if params.merge_coin is not None:
+        return ["params.merge_coin is not valid for mode 'consolidate'"]
     if params.below_size_sats is None:
         return ["mode 'consolidate' requires params.below_size_sats"]
     if isinstance(params.below_size_sats, bool) or not (

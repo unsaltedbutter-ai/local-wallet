@@ -37,14 +37,19 @@
 #                                the schema/rule layer re-checks it)
 #                node_status -> {} (the model emits nothing else; the
 #                               dispatcher owns all data)
-#                self_transfer -> {"mode": "split"|"consolidate"} then the
-#                               mode's ONE required key: {"parts": <int>}
+#                self_transfer -> {"mode": "split"|"consolidate"|"cpfp"} then
+#                               the mode's ONE required key: {"parts": <int>}
 #                               for split | {"below_size_sats": <int>} for
-#                               consolidate, then an OPTIONAL {"fee_target":
+#                               consolidate | NOTHING required for cpfp,
+#                               whose only optional extra is {"merge_coin":
+#                               true|false}, then an OPTIONAL {"fee_target":
 #                               fast|medium|slow} tail. NO address, NO
 #                               outpoint, NO amount key other than the two
 #                               stated numbers is representable (TCK-
-#                               TX-SELF-001: the money plan is engine-derived).
+#                               TX-SELF-001 + the TCK-CPFP-001 additive mode:
+#                               the money plan is engine-derived; merge_coin
+#                               steers the child's SHAPE only — which coin
+#                               merges is decided by the engine).
 #                bump_fee     -> {"target": string} then OPTIONAL
 #                               {"funding_ref": string} then AT MOST ONE of
 #                               {"fee_target": fast|medium|slow} |
@@ -241,30 +246,53 @@ node-status ::= "\"intent\"" ws ":" ws "\"node_status\"" ws "," ws "\"params\"" 
 
 # intent "self_transfer" -> params {"mode": <enum>, (parts | below_size_sats)[, fee_target]}
 # (TCK-TX-SELF-001: explicit on-demand reshuffle — SPLIT one coin into N
-# parts, or CONSOLIDATE small coins below a size into one). The intent
-# branch is paired to its number key by a WHOLE-PARAMS alternation
-# (split-params vs consolidate-params): each mode requires its OWN key and
-# the other mode's key is syntactically impossible, so a
-# split-with-threshold or consolidate-with-parts cannot be decoded. This
+# parts, or CONSOLIDATE small coins below a size into one; the TCK-CPFP-001
+# additive mode CPFP unsticks a stuck INBOUND payment with an engine-built
+# child). The intent branch is paired to its keys by a WHOLE-PARAMS
+# alternation (split-params vs consolidate-params vs cpfp-params): each
+# mode requires its OWN key (cpfp: none) and the other modes' keys are
+# syntactically impossible, so a split-with-threshold, a
+# consolidate-with-parts or a cpfp-with-numbers cannot be decoded. This
 # mirrors the create_tx amount-pair idiom. KEY ORDER (per branch) is FIXED:
-# mode first, then the mode's number key, then an OPTIONAL fee_target tail
-# (reusing the create_tx fee-target rule). CRITICAL: there is NO recipient,
-# address, outpoint, or amount key in either branch — the model literally
-# cannot author or "correct" any money value of a self-transfer; the engine
-# derives every address, amount, and input from dispatcher-owned state.
+# mode first, then the mode's key (cpfp: optional merge_coin), then an
+# OPTIONAL fee_target tail (reusing the create_tx fee-target rule).
+# CRITICAL: there is NO recipient, address, outpoint, or amount key in ANY
+# branch — the model literally cannot author or "correct" any money value
+# of a self-transfer; the engine derives every address, amount, and input
+# from dispatcher-owned state.
 self-transfer ::= "\"intent\"" ws ":" ws "\"self_transfer\"" ws "," ws "\"params\"" ws ":" ws params-self-transfer
 
-params-self-transfer ::= split-params | consolidate-params
+params-self-transfer ::= split-params | consolidate-params | cpfp-params
 
 split-params ::= "{" ws mode-split ws "," ws parts-kv ws self-transfer-tail
 
 consolidate-params ::= "{" ws mode-consolidate ws "," ws below-size-kv ws self-transfer-tail
+
+# cpfp-params (TCK-CPFP-001): mode first, then an OPTIONAL merge_coin flag,
+# then the shared fee_target tail — the bump_fee optional-tail chain idiom
+# (nothing | merge_coin [fee knob] | fee knob), so key order stays strict,
+# at most one of each appears, and no other key can slip in.
+cpfp-params ::= "{" ws mode-cpfp ws cpfp-tail
 
 # mode: the closed enum, quoted literals only (dash names, single-line
 # bodies — the installed-parser dialect, see the PARSER DIALECT header).
 mode-split ::= "\"mode\"" ws ":" ws "\"split\""
 
 mode-consolidate ::= "\"mode\"" ws ":" ws "\"consolidate\""
+
+mode-cpfp ::= "\"mode\"" ws ":" ws "\"cpfp\""
+
+cpfp-tail ::= "}" ws "}" ws | "," ws merge-coin-kv ws cpfp-tail-after-merge | "," ws fee-target-kv ws "}" ws "}" ws
+
+cpfp-tail-after-merge ::= "}" ws "}" ws | "," ws fee-target-kv ws "}" ws "}" ws
+
+# merge_coin: the shape flag ONLY cpfp owns — the JSON boolean literals
+# exactly (schema layer enforces a true bool; ints/strings are syntactically
+# impossible here). It steers the child's SHAPE (merge a second own coin);
+# which coin is engine policy — no outpoint is representable.
+merge-coin-kv ::= "\"merge_coin\"" ws ":" ws bool-lit
+
+bool-lit ::= "true" | "false"
 
 parts-kv ::= "\"parts\"" ws ":" ws parts-int
 

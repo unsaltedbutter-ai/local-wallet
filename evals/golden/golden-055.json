@@ -1,0 +1,5 @@
+{
+  "id": "golden-055",
+  "prompt": "someone's payment to me is stuck — hurry it along and merge one of my coins into it",
+  "expectation": {"intent": "self_transfer", "params": {"mode": "cpfp", "merge_coin": true}}
+}

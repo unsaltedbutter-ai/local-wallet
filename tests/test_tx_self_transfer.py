@@ -159,6 +159,26 @@ class TestSchema:
             "fee_target": "slow",
         }
 
+    # ---- TCK-CPFP-001: the additive cpfp mode ---------------------------
+
+    def test_cpfp_valid_bare_and_roundtrips_grammar_shape(self) -> None:
+        env = _self_env({"mode": "cpfp"})
+        assert env.params.model_dump() == {"mode": "cpfp"}
+        assert json.loads(env.model_dump_json())["params"] == {"mode": "cpfp"}
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {"mode": "cpfp", "merge_coin": True},
+            {"mode": "cpfp", "merge_coin": False},
+            {"mode": "cpfp", "fee_target": "fast"},
+            {"mode": "cpfp", "merge_coin": True, "fee_target": "slow"},
+        ],
+    )
+    def test_cpfp_optional_keys_valid(self, params: dict[str, object]) -> None:
+        env = _self_env(params)
+        assert env.params.model_dump() == params
+
     @pytest.mark.parametrize(
         "params",
         [
@@ -181,6 +201,20 @@ class TestSchema:
             {"mode": "consolidate", "below_size_sats": 1000, "fee_target": None},  # null knob
             {"mode": "consolidate", "below_size_sats": 1000, "fee_target": "urgent"},
             {"mode": "split", "parts": 2, "fee_rate_sat_vb": 5},  # knob not offered here
+            # TCK-CPFP-001: the cpfp mode's accept/reject half of the matrix
+            {"mode": "cpfp", "parts": 2},  # cpfp owns no number key
+            {"mode": "cpfp", "below_size_sats": 1000},
+            {"mode": "cpfp", "merge_coin": None},  # explicit null != omission
+            {"mode": "cpfp", "merge_coin": 1},  # lax bool coercion closed
+            {"mode": "cpfp", "merge_coin": 0},
+            {"mode": "cpfp", "merge_coin": "true"},
+            {"mode": "cpfp", "merge_coin": "yes"},
+            {"mode": "cpfp", "fee_target": None},
+            {"mode": "cpfp", "fee_target": "urgent"},
+            {"mode": "cpfp", "fee_rate_sat_vb": 5},  # knob not offered here either
+            {"mode": "split", "parts": 2, "merge_coin": True},  # only cpfp owns it
+            {"mode": "consolidate", "below_size_sats": 1000, "merge_coin": False},
+            {"mode": "cpfp2"},  # unknown mode literal
             {},  # no mode at all
         ],
     )
@@ -201,6 +235,12 @@ class TestSchema:
             {"mode": "consolidate", "below_size_sats": 1000, "txid": "a" * 64},
             {"mode": "consolidate", "below_size_sats": 1000, "outpoints": ["a" * 64 + ":0"]},
             {"mode": "consolidate", "below_size_sats": 1000, "confirm": True},
+            # TCK-CPFP-001: the cpfp mode cannot carry money material either —
+            # which inbound coin and which fresh own address stay engine-side.
+            {"mode": "cpfp", "recipient": SEND_RECIPIENT},
+            {"mode": "cpfp", "txid": "a" * 64},
+            {"mode": "cpfp", "coin": "1"},
+            {"mode": "cpfp", "merge_coin": True, "amount_sats": 50_000},
         ],
     )
     def test_invented_money_material_is_unrepresentable(self, params: dict[str, object]) -> None:
@@ -245,6 +285,37 @@ class TestBusinessRules:
         assert BUSINESS_RULES[IntentName.SELF_TRANSFER](
             SimpleNamespace()  # not a SelfTransferParams at all
         ) == ["internal: 'self_transfer' params failed the type check"]
+
+    @pytest.mark.parametrize(
+        ("kwargs", "needle"),
+        [
+            # TCK-CPFP-001: the layer-3 half of the cpfp accept/reject matrix
+            # (constructor-skipped payloads — defense in depth).
+            ({"mode": "cpfp", "parts": 2}, "not valid for mode 'cpfp'"),
+            ({"mode": "cpfp", "below_size_sats": 1000}, "not valid for mode 'cpfp'"),
+            ({"mode": "cpfp", "merge_coin": "yes"}, "merge_coin must be a boolean"),
+            ({"mode": "cpfp", "merge_coin": 1}, "merge_coin must be a boolean"),
+            ({"mode": "split", "parts": 2, "merge_coin": True}, "not valid for mode 'split'"),
+            (
+                {"mode": "consolidate", "below_size_sats": 1000, "merge_coin": True},
+                "not valid for mode 'consolidate'",
+            ),
+        ],
+    )
+    def test_layer3_cpfp_pairing(self, kwargs: dict[str, object], needle: str) -> None:
+        bypassed = SelfTransferParams.model_construct(**kwargs)
+        failures = BUSINESS_RULES[IntentName.SELF_TRANSFER](bypassed)
+        assert failures and needle in failures[0]
+
+    def test_layer3_cpfp_bare_is_valid(self) -> None:
+        # cpfp requires NO number key: the bare mode passes layer 3 (the
+        # handler resolves the stuck inbound coin — nothing to pair here).
+        assert BUSINESS_RULES[IntentName.SELF_TRANSFER](
+            SelfTransferParams.model_construct(mode="cpfp")
+        ) == []
+        assert BUSINESS_RULES[IntentName.SELF_TRANSFER](
+            SelfTransferParams.model_construct(mode="cpfp", merge_coin=False)
+        ) == []
 
 
 # =========================================================================

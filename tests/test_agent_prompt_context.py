@@ -289,6 +289,7 @@ class TestSystemPrompt:
             assert params.model_dump() in (
                 {"mode": "split", "parts": 3},
                 {"mode": "consolidate", "below_size_sats": 100000, "fee_target": "slow"},
+                {"mode": "cpfp", "merge_coin": True},
             )
             assert "bc1" not in raw and "txid" not in raw
 
@@ -322,9 +323,28 @@ class TestSystemPrompt:
         # 7600 → 7800 by TCK-PROMPT-001: the persona line in the prompt
         # header (+142 chars) ships the designer §4f copy. Raised
         # 7800 → 9000 by TCK-RBF-003: the bump_fee intent line + mapping +
-        # one few-shot ship the closed protocol (~960 chars). ~8.7K chars is
-        # still ~4.4K tokens, a small fraction of the 8K budget.
-        assert len(build_system_prompt()) < 9000
+        # one few-shot ship the closed protocol (~960 chars). Raised
+        # 9000 → 9500 by TCK-CPFP-001: the self_transfer line grows the
+        # additive cpfp mode guidance (+ inbound-vs-outgoing routing vs
+        # bump_fee) and one cpfp few-shot (~575 chars). ~9.3K chars is
+        # still ~4.7K tokens, a small fraction of the 8K budget.
+        assert len(build_system_prompt()) < 9500
+
+    def test_self_transfer_line_routes_stuck_inbound_to_cpfp(self) -> None:
+        # TCK-CPFP-001: the prompt must teach the INBOUND/OUTBOUND split —
+        # a stuck payment TO the user is self_transfer-cpfp, a bump of the
+        # user's OWN in-flight tx stays bump_fee. A model that confuses the
+        # two reaches the wrong (or no) handler; this pin keeps the routing
+        # words in the self_transfer line.
+        prompt = build_system_prompt()
+        line = next(
+            ln
+            for ln in prompt.splitlines()
+            if ln.startswith("- self_transfer:")
+        )
+        assert '"cpfp"' in line
+        assert "INBOUND" in line
+        assert "bump_fee" in line  # the never-redirect is stated, not implied
 
     def test_get_utxos_line_maps_count_and_pending_phrasings(self) -> None:
         # TCK-PENDING-001 (user report MW-11 #3: "how many utxo do I have?"
