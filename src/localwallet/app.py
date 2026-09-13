@@ -5982,6 +5982,11 @@ class EngineContext:
     #: degenerate first-run placeholder (no backend chosen yet → the field
     #: is OMITTED, never fabricated — same rule as ``backend_kind``).
     settings: Settings | None = None
+    #: TCK-HW-005 slice A: the stateless HWI signer the chat probe/unlock
+    #: interception runs on (constructed by :func:`_wire` for THIS wallet's
+    #: key; ``None`` on the first-run placeholder — there is no wallet to
+    #: probe against yet, and every ordinary line is refused anyway).
+    hwi: HwiUsbSigner | None = None
 
 
 @dataclass(frozen=True)
@@ -7110,6 +7115,7 @@ def start_engine(
                 preload=ctx.preload,
                 backend=ctx.backend,
                 settings=ctx.settings,
+                hwi=ctx.hwi,
             )
         except BaseException as exc:  # noqa: BLE001 — engine-thread pump death
             handle.error = exc
@@ -7331,6 +7337,7 @@ def _pump(
     preload: ModelPreloadFlow | None = None,
     backend: ChainBackendFlow | None = None,
     settings: Settings | None = None,
+    hwi: HwiUsbSigner | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
     ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
@@ -7441,7 +7448,7 @@ def _pump(
         the chat-provision intercept (TCK-ONB-007), so the two entries can
         never drift. Engine thread only (like every pump mutation)."""
         nonlocal loop, flow, session, table, watcher, client, store, scan
-        nonlocal backend, settings
+        nonlocal backend, settings, hwi
         assert provision is not None and provision.wiring is not None
         wiring = provision.wiring
         loop = wiring.loop
@@ -7460,6 +7467,9 @@ def _pump(
         # provisioned first-run path's boot-resolved settings before
         # any wiring existed: the rebind simply follows the live one).
         settings = wiring.settings
+        # TCK-HW-005 slice A: the probe signer belongs to the WALLET (its
+        # account fingerprint comes from the key) — the rebind follows it.
+        hwi = wiring.hwi
         if scan is not None:
             scan.attach(commands)
             scan.begin()
@@ -8245,6 +8255,7 @@ def run(
             model=model_flow,
             preload=preload_flow,
             backend=wiring.swap,
+            hwi=wiring.hwi,
         )
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
@@ -8337,6 +8348,11 @@ class _Wiring:
     #: estimator (TCK-FIAT-001's shared-cache invariant, backend-free
     #: since M3A).
     price_oracle: PriceOracle | None = None
+    #: TCK-HW-005 slice A: the stateless HWI signer for the chat
+    #: probe/unlock interception (built by :func:`_wire` from THIS wallet's
+    #: account key — construction is cheap, hwilib imports lazily inside
+    #: it, and the object signs nothing on this path).
+    hwi: HwiUsbSigner | None = None
 
 
 @dataclass(frozen=True)
@@ -9471,6 +9487,15 @@ def _wire(
             scan.on_first_scan_done = onboarding.emit_load_complete
 
     session = SendSession()
+    # TCK-HW-005 slice A: the chat probe/unlock signer, built ONCE per
+    # wiring from THIS wallet's account key (fingerprint + descriptor
+    # account path — mirroring the lazy sign build in the sign_tx handler).
+    # CONFIG-INDEPENDENT by design: a file-signer launch can still be
+    # asked "can you see my Jade?". Construction never imports hwilib
+    # (lazy, inside the signer); the probe/report path cannot sign.
+    hwi_probe = HwiUsbSigner(
+        signer_selection.fingerprint_hex, _descriptor_account_path(parsed)
+    )
     # The confirmation-ETA mempool hint (TCK-P5-002): consulted per create_tx
     # and per CREATED turn (lazily, fail-closed to no congestion adjustment);
     # narration-only — never a gate input. TCK-DESCOPE-M3A: an UNRESOLVED
@@ -9521,6 +9546,7 @@ def _wire(
         public_info=public_info,
         fee_estimator=fee_estimator,
         price_oracle=price_oracle,
+        hwi=hwi_probe,
     )
     # Build last so the controller sees the finished wiring it mutates (the
     # late-bound ``swap`` name above now points here for the onboarding hook).
@@ -9684,6 +9710,7 @@ def _run_web(
             output=output,
             backend=wiring.swap,
             settings=wiring.settings,
+            hwi=wiring.hwi,
         )
 
     try:
@@ -9974,6 +10001,7 @@ def _repl(
     model: ModelDownloadFlow | None = None,
     preload: ModelPreloadFlow | None = None,
     backend: ChainBackendFlow | None = None,
+    hwi: HwiUsbSigner | None = None,
 ) -> None:
     """The CLI transport over the engine pump (TCK-WEB-001, ADR-0024 §3).
 
@@ -10035,6 +10063,7 @@ def _repl(
             model=model,
             preload=preload,
             backend=backend,
+            hwi=hwi,
         )
     finally:
         stop.set()
@@ -10396,6 +10425,82 @@ def _handle_label_command(
         return
 
 
+# ---------------------------------------------------------------------------
+# TCK-HW-005 SLICE A: hardware-wallet probe/unlock chat intercept (deterministic,
+# PRE-MODEL). USER LIVE FINDINGS 2026-09-12: "can you see my hardware wallet?"
+# → the model's "what do you mean" is WRONG (probe + report); "unlock my
+# hardware wallet" → "I cannot access your hardware wallet" is WRONG (the app
+# CAN, via hwi); "I connected my hardware wallet" → report AND run the unlock
+# for device classes that have a host-driven one. The matcher is code-owned
+# and TIGHT (v1): a device TOPIC word (a class name, "hardware", or "device")
+# plus a verb from exactly one family, whole words only (the
+# _chat_public_choice word shape). Show-address / pre-sign check / static
+# button are later slices — this one only probes, reports, and unlocks.
+# ---------------------------------------------------------------------------
+
+_HW_CLASS_WORDS: Final[frozenset[str]] = frozenset(
+    {"jade", "bitbox", "bitbox02", "trezor", "ledger", "coldcard", "keepkey"}
+)
+_HW_TOPIC_WORDS: Final[frozenset[str]] = _HW_CLASS_WORDS | frozenset(
+    {"hardware", "device", "devices"}
+)
+_HW_UNLOCK_WORDS: Final[frozenset[str]] = frozenset(
+    {"unlock", "unlocks", "unlocking"}
+)
+_HW_CONNECT_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "connect", "connects", "connected", "connection", "plug", "plugged",
+        "locked",
+    }
+)
+_HW_SEE_WORDS: Final[frozenset[str]] = frozenset(
+    {"see", "sees", "seen", "detect", "detects", "detected"}
+)
+
+
+def _hardware_chat_verb(line: str) -> str | None:
+    """``'unlock'`` | ``'connect'`` | ``'see'`` | ``None`` (priority order).
+
+    ``'see'`` answers with probe+report ONLY; ``'unlock'`` and
+    ``'connect'`` (the "I connected my hardware wallet" report) also drive
+    the host-unlockable classes. Bare "unlock" (no topic), "unlock my
+    wallet" (no HARDWARE/device/class word), "can you see my balance",
+    and "connect to my node" match nothing here and stay ordinary chat.
+    """
+    words = {
+        w.strip(punctuation).replace("'", "").replace("\u2019", "")
+        for w in line.lower().split()
+    }
+    if words.isdisjoint(_HW_TOPIC_WORDS):
+        return None
+    if words & _HW_UNLOCK_WORDS:
+        return "unlock"
+    if words & _HW_CONNECT_WORDS:
+        return "connect"
+    if words & _HW_SEE_WORDS:
+        return "see"
+    return None
+
+
+def _run_hardware_probe(
+    hwi: HwiUsbSigner, line: str, output_fn: Callable[[str], None]
+) -> bool:
+    """Answer a matched hardware utterance straight from the device probe.
+
+    Every narration line is code-owned, value-free signer text —
+    :meth:`HwiUsbSigner.probe_and_report` never raises and never leaks a
+    path/fingerprint, and failures ride the EXISTING guidance family
+    verbatim (never a generic manufacturer deflection). Printed verbatim
+    like all tool output; the model never composes a device answer, and
+    no sign path is touched (this slice cannot sign or select)."""
+    verb = _hardware_chat_verb(line)
+    if verb is None:
+        return False
+    for text in hwi.probe_and_report(attempt_unlock=verb != "see"):
+        output_fn(sanitize_tool_output(text))
+    return True
+
+
 def _run_turn(
     loop: AgentLoop,
     flow: TxFlow,
@@ -10406,6 +10511,7 @@ def _run_turn(
     client: ChainClient | None = None,
     table: DispatchTable,
     scan_gate: StartupScan | None = None,
+    hwi: HwiUsbSigner | None = None,
 ) -> None:
     """Run ONE REPL turn: gate classification → agent → flow narration.
 
@@ -10439,6 +10545,14 @@ def _run_turn(
       envelope dispatches to; the model can never reach here without the
       user typing "retry", and an LLM "retry" is never consulted). Every
       other state and every other utterance takes the unchanged pipeline.
+    - Hardware probe/unlock utterances (TCK-HW-005 slice A): the
+      deterministic :func:`_hardware_chat_verb` matcher intercepts the
+      "can you see / I connected / unlock my hardware wallet" family
+      BEFORE the gate and the model — the live signer answers with the
+      value-free probe report (and drives the Jade/BitBox02 host unlock
+      on the unlock/connect families). No intent, no envelope, no sign
+      path; the model never deflects with "I cannot access your hardware
+      wallet" (a WRONG answer — the app CAN, via hwi).
     - GATE-MERGE (TCK-UX-002, ADR-0013 amendment): when the turn's
       ``confirm_tx`` succeeds, the device handoff (``sign_tx`` handler,
       code-built envelope from the dispatcher-owned confirmed ref) runs in
@@ -10484,6 +10598,12 @@ def _run_turn(
             output_fn,
             session=session,
         )
+        return
+    # TCK-HW-005 slice A: deterministic hardware probe/unlock intercept —
+    # BEFORE the gate and the model. The envelope-free narration comes
+    # straight from the signer's value-free report or the EXISTING guidance
+    # family; nothing signs, selects, or reaches the model on a match.
+    if hwi is not None and _run_hardware_probe(hwi, line, output_fn):
         return
     session.gate_decision = (
         ConfirmGate.classify(line)

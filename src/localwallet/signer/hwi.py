@@ -158,6 +158,18 @@ _MSG_UNEXPECTED = (
     "The device returned an unexpected response — say 'retry' to try again."
 )
 
+# Chat probe/unlock narration (TCK-HW-005 slice A). Only the per-device
+# STATE lines are new; every locked/failure/no-device line REUSES the
+# guidance family above verbatim (designer rule: zero new device strings).
+# ``model`` is hwilib enumerate's own value (tool output) — narrated as-is.
+_MSG_HW_READY = "Found your {model} — it's unlocked and ready."
+_MSG_HW_LOCKED_FOUND = "Found your {model} — it's locked."
+_MSG_HW_UNLOCKING = (
+    "Unlocking now — follow the prompts on your {model}'s screen "
+    "(this app never sees your PIN or passphrase)."
+)
+_MSG_HW_UNLOCKED = "Your {model} is unlocked and ready."
+
 # hwilib exception class names → (our subclass, guidance). Name-based
 # matching keeps the mapping stable across hwilib versions and works with
 # injected test fakes; real-hwilib subclasses still fall through to the
@@ -338,6 +350,103 @@ class HwiUsbSigner(Signer):
                 )
             )
         return devices
+
+    # -- probe & report (chat unlock, TCK-HW-005 slice A) -------------------
+
+    def probe_and_report(self, *, attempt_unlock: bool = False) -> tuple[str, ...]:
+        """Probe connected devices and narrate what is found; value-free.
+
+        The honest chat answer to "can you see my hardware wallet?" /
+        "I connected my hardware wallet" / "unlock my Jade" (user live
+        findings 2026-09-12 — the model's "I cannot access your hardware
+        wallet" is a WRONG answer; the app can, via hwi). Runs the SAME
+        lazy-hwilib enumerate path as :meth:`enumerate_devices`, so the
+        report is built from the value-free per-device facts preserved by
+        TCK-HW-001: kind/model, whether a fingerprint was readable
+        (initialized/unlocked) and the ``needs_pin_sent`` /
+        ``needs_passphrase_sent`` flags. No device → the existing
+        ``_MSG_NO_DEVICES`` family.
+
+        ``attempt_unlock`` additionally drives the unlock for the two
+        device classes that HAVE a host-driven unlock: Blockstream Jade
+        and BitBox02 — for these, CONSTRUCTING the hwilib client IS the
+        unlock trigger (Jade: hwilib relays blinded PIN-server blobs
+        while the user enters the scrambled PIN on-device — TCK-HW-001;
+        BitBox02: the unlock is confirmed on the device itself). Host-pin
+        classes (locked Trezor/Ledger shapes) are REPORTED with the
+        existing companion-app guidance and never driven
+        (promptpin/sendpin stay out of scope, ADR-0015 amendment).
+
+        Scope: probe/report/unlock ONLY — nothing here signs, selects, or
+        touches the account-key trust gate; the bind in
+        :meth:`_open_matched_client` remains the only trust decision
+        (ADR-0015 + amendment #2). Client handles opened for an unlock
+        are always released. The function NEVER raises: every failure
+        (including a bare Jadepy cancel) maps through
+        :meth:`_map_hwi_error` and surfaces as the existing guidance line,
+        so paths, fingerprints, and device error text can never leak.
+
+        ponytail: a locked Jade's client construction blocks while the
+        user enters the PIN (same HW-001 enumerate ceiling as above) —
+        acceptable on the interactive engine thread, revisit if headless.
+        """
+        try:
+            devices = self.enumerate_devices()
+        except DeviceError as exc:
+            return (str(exc),)
+        if not devices:
+            return (_MSG_NO_DEVICES,)
+        commands = self._ensure_commands()
+        lines: list[str] = []
+        for device in devices:
+            lines.extend(self._probe_lines(commands, device, attempt_unlock))
+        return tuple(lines)
+
+    def _probe_lines(
+        self, commands: Any, device: DeviceInfo, attempt_unlock: bool
+    ) -> list[str]:
+        """Narration for ONE enumerated device (see probe_and_report)."""
+        kind = device.type.lower()
+        jade = kind.startswith("jade")
+        bitbox = kind.startswith("bitbox")
+        if jade and device.fingerprint_hex is not None:
+            return [_MSG_HW_READY.format(model=device.model)]
+        if bitbox and device.fingerprint_hex is not None and (
+            not device.needs_passphrase_sent
+        ):
+            return [_MSG_HW_READY.format(model=device.model)]
+        if not jade and not bitbox and device.fingerprint_hex is not None and (
+            not device.needs_pin_sent and not device.needs_passphrase_sent
+        ):
+            return [_MSG_HW_READY.format(model=device.model)]
+        lines = [_MSG_HW_LOCKED_FOUND.format(model=device.model)]
+        if (jade or bitbox) and attempt_unlock:
+            lines.append(_MSG_HW_UNLOCKING.format(model=device.model))
+            lines.append(self._drive_unlock(commands, device))
+        elif jade:
+            lines.append(_MSG_JADE_LOCKED)
+        elif device.needs_pin_sent or device.needs_passphrase_sent:
+            lines.append(_MSG_HOST_PIN)
+        else:
+            lines.append(_MSG_LOCKED)
+        return lines
+
+    def _drive_unlock(self, commands: Any, device: DeviceInfo) -> str:
+        """Jade/BitBox02 host-driven unlock: construct the client (that IS
+        the unlock trigger, TCK-HW-001) and release it. Success is
+        construction itself — a locked Jade raises long BEFORE any auth
+        completes, so a client in hand means the device unlocked."""
+        try:
+            client = commands.get_client(
+                device.type, device.path, chain=self._chain_enum(commands)
+            )
+        except Exception as exc:  # noqa: BLE001 — containment: the report
+            # never raises; every failure returns its guidance line instead.
+            return str(self._map_hwi_error(exc))
+        if client is None:
+            return _MSG_CLIENT_GONE
+        self._close_client(client)
+        return _MSG_HW_UNLOCKED.format(model=device.model)
 
     # -- fingerprint trust gate (ADR-0015 + amendment #2) ------------------
 
