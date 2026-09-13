@@ -220,22 +220,20 @@ _SETTINGS = Settings(request_timeout_s=2.0, max_retries=0)
 
 
 class TestRepro1ApiTolerance:
-    def test_probe_and_save_bare_host_with_tls_off(
-        self, esplora_factory: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    def test_probe_rejects_the_bare_host_for_the_wallet_seam(
+        self, esplora_factory: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """check_backend AND the settings-write probe reach the API through
-        the auto-tried /api segment with LOCALWALLET_TLS_VERIFY=0, and the
-        bare URL SAVES (stored as-is — no /api rewrite)."""
+        """TCK-DESCOPE-M3B split: check_backend (the CHAIN-level Esplora
+        readiness probe, alive until M4's deletion) still tolerates the
+        bare host via the auto-tried /api segment with
+        LOCALWALLET_TLS_VERIFY=0 — but the SETTINGS/ONBOARDING entry probe
+        no longer accepts an Esplora shape as a wallet backend at all:
+        it gets ONE Core-RPC attempt, fails, and REFUSES (None — nothing
+        to store). The URL never reaches the store's typed writer."""
         url, _paths = esplora_factory()
         monkeypatch.setenv("LOCALWALLET_TLS_VERIFY", "0")
         assert check_backend(url, timeout_s=5.0, max_retries=0) is True
-        assert app_module._probe_chain_backend(url, _SETTINGS) == url
-        store = Store(tmp_path / "r1.db")
-        try:
-            store.set_chain_base_url(url)  # the save the probe authorizes
-            assert store.get_chain_base_url() == url
-        finally:
-            store.close()
+        assert app_module._probe_chain_backend(url, _SETTINGS) is None
 
     def test_live_client_joins_the_saved_bare_url(
         self, esplora_factory: Any, monkeypatch: pytest.MonkeyPatch
@@ -267,14 +265,14 @@ class TestRepro1ApiTolerance:
     def test_api_suffixed_url_unchanged_single_join(
         self, esplora_factory: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A base already ending /api (the public default's shape) is
-        PRE-RESOLVED: never double-requested, never /api/api'd; the probe
-        stores the URL unchanged."""
+        """A base already ending /api (the old public default's shape) is
+        PRE-RESOLVED at the CHAIN level: never double-requested, never
+        /api/api'd. (The wallet-entry refusal of this shape is pinned next
+        door — _probe_chain_backend gets ONE Core attempt and answers None.)"""
         url, paths = esplora_factory()
         monkeypatch.setenv("LOCALWALLET_TLS_VERIFY", "0")
         suffixed = f"{url}/api"
         assert check_backend(suffixed, timeout_s=5.0, max_retries=0) is True
-        assert app_module._probe_chain_backend(suffixed, _SETTINGS) == suffixed
         assert "/api/api" not in "".join(paths.seen)  # no doubled segment
         assert "/blocks/tip" not in paths.seen  # bare join never attempted
 
@@ -500,12 +498,15 @@ class TestStoredRung:
 class TestRefusalHints:
     def test_hints_present_and_value_free(self) -> None:
         assert "LOCALWALLET_TLS_VERIFY=0" in BACKEND_PROBE_FAIL
-        assert "/api" in BACKEND_PROBE_FAIL
+        # TCK-DESCOPE-M3B: the /api API-root hint died with the Esplora-
+        # shape acceptance (the wallet probe tries ONE thing: Core RPC).
+        assert "/api" not in BACKEND_PROBE_FAIL
         # Honest about the escape hatch (transport auth goes off).
         assert "authentication is then OFF" in BACKEND_PROBE_FAIL
-        # The TCK-BACKEND-002 glosses survive the append:
-        assert "Esplora (mempool.space-style) http(s)" in BACKEND_PROBE_FAIL
-        assert "Bitcoin Core RPC (bitcoind://)" in BACKEND_PROBE_FAIL
+        # The accepted families are named; the refused one is not offered:
+        assert "Esplora" not in BACKEND_PROBE_FAIL
+        assert "Electrum (ssl://)" in BACKEND_PROBE_FAIL
+        assert "bitcoind://" in BACKEND_PROBE_FAIL
         assert "nothing was saved and the current backend stays in service" in (
             BACKEND_PROBE_FAIL
         )

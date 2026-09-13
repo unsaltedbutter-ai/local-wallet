@@ -1578,12 +1578,12 @@ class TestProbeDispatch:
             )
             == app_module.BACKEND_KIND_BITCOIND
         )
-        # https stays Esplora-primary even after M3's autodetect: the
-        # Core shape is tried on http:// only (https RPC is inexpressible,
-        # M2 scope — the shape probe never pretends otherwise)
+        # TCK-DESCOPE-M3B: an http(s) Esplora-shaped URL is NOT a wallet
+        # backend anymore (the auto-detect only STORES the Core rewrite;
+        # a bare https shape answers ``none`` — nothing of it can serve).
         assert (
             app_module._backend_kind(Settings(chain_base_url="https://x.example/api"), resolved=True)
-            == app_module.BACKEND_KIND_MEMPOOL
+            == app_module.BACKEND_KIND_NONE
         )
         # bitcoin:// (a typo scheme) is NOT the Core badge
         assert (
@@ -1609,14 +1609,16 @@ class TestHttpAutodetect:
         detected = app_module._probe_chain_backend(http_url, settings)
         assert detected == server.url  # bitcoind://host:port canonical
 
-    def test_http_wrong_chain_refuses_after_both_shapes(self, bitcoind: Any) -> None:
+    def test_http_wrong_chain_refused_after_the_core_attempt(
+        self, bitcoind: Any
+    ) -> None:
         server = bitcoind(chain="signet")
         http_url = "http://" + server.url.partition("://")[2]
         settings = Settings(request_timeout_s=2.0, max_retries=0)
-        # The Core handshake gate refuses non-mainnet AT ENTRY; the Esplora
-        # fallback cannot read genesis off the RPC root either → the single
-        # value-free None refusal (what was TRIED is named by the caller's
-        # line, never by this answer).
+        # The Core handshake gate refuses non-mainnet AT ENTRY — and since
+        # TCK-DESCOPE-M3B there is no second (Esplora) shape to try: the
+        # single value-free None refusal (what was TRIED is named by the
+        # caller's line, never by this answer).
         assert app_module._probe_chain_backend(http_url, settings) is None
 
     def test_http_core_probe_carries_the_credential_overlay(
@@ -1626,7 +1628,7 @@ class TestHttpAutodetect:
         http_url = "http://" + server.url.partition("://")[2]
         settings = Settings(request_timeout_s=2.0, max_retries=0)
         # No stored login, no cookie here → the Core shape 401s → None
-        # (the Esplora fallback answers the same verdict).
+        # (TCK-DESCOPE-M3B: that ONE attempt is the whole verdict).
         assert app_module._probe_chain_backend(http_url, settings) is None
         auth = app_module._BackendAuth(user="rpcu", password="rpcp")
         assert app_module._probe_chain_backend(http_url, settings, auth) == server.url
@@ -1647,10 +1649,10 @@ class TestHttpAutodetect:
         server = bitcoind(expect_credentials=("rpcu", "rpcp"))
         hostport = server.url.partition("://")[2]
         settings = Settings(request_timeout_s=2.0, max_retries=0)
-        # URL-embedded credentials do not reach the Core branch on the
-        # stored rung at all (they are refused there — logins ride the
-        # dedicated keys), and the Esplora branch fails closed on userinfo
-        # at construction WITHOUT a socket: the fixture saw nothing.
+        # URL-embedded credentials do not reach the Core branch at all
+        # (they are refused on the stored rung — logins ride the dedicated
+        # keys), and TCK-DESCOPE-M3B left no fallback branch behind: the
+        # refusal happens WITHOUT a socket, the fixture saw nothing.
         assert (
             app_module._probe_chain_backend(f"http://rpcu:rpcp@{hostport}", settings)
             is None

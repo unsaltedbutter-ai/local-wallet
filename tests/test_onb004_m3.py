@@ -782,11 +782,16 @@ class TestRewords2h:
         assert "recommended" not in MODEL_INTEGRITY_WARNING
 
     def test_row_73_backend_probe_fail_gloss(self) -> None:
-        # Designer gloss "(mempool.space-style)" for Esplora, the "or"
-        # joining, and the value-free tail kept verbatim; the Core-RPC
-        # clause STAYS (the probe really does accept bitcoind:// since M2).
-        assert "Esplora (mempool.space-style) http(s)" in BACKEND_PROBE_FAIL
-        assert "Bitcoin Core RPC (bitcoind://)" in BACKEND_PROBE_FAIL
+        # TCK-DESCOPE-M3B: the value-free refusal names the TWO accepted
+        # families only — Electrum (ssl://) and Bitcoin Core RPC (the
+        # explicit schemes plus the auto-detected http(s) alias). The old
+        # "Esplora (mempool.space-style) http(s)" acceptance and its /api
+        # hint are GONE (mempool.space is public fee/price info, never a
+        # wallet backend); the value-free tail stays verbatim.
+        assert "Esplora" not in BACKEND_PROBE_FAIL
+        assert "mempool" not in BACKEND_PROBE_FAIL.lower()
+        assert "Electrum (ssl://)" in BACKEND_PROBE_FAIL
+        assert "bitcoind://" in BACKEND_PROBE_FAIL
         assert "nothing was saved and the current backend stays in service" in (
             BACKEND_PROBE_FAIL
         )
@@ -883,11 +888,13 @@ class _StubBackend:
     shadowed for the flags, an apply() that answers as scripted (and records
     the calls, so "never probed" is observable)."""
 
-    kind = "esplora"
+    # TCK-DESCOPE-M3B: the closed kind enum is {none, electrum, bitcoind};
+    # the stub speaks a live member (the seal point stamps it verbatim).
+    kind = "electrum"
     shadowed = False
-    # TCK-WEB-013: the seal point stamps this alongside ``kind`` — the stub
-    # carries a static display URL (the real one derives from live settings).
-    effective_base_url = "https://mempool.space/api"
+    # TCK-WEB-013: the seal point stamps this alongside ``kind`` — the real
+    # one derives from live settings (display URL, userinfo-stripped).
+    effective_base_url = "ssl://stub.test:50002"
 
     def __init__(self, error: str | None = None) -> None:
         self._error = error

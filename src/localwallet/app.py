@@ -146,7 +146,6 @@ from localwallet.chain import (
     PriceUnavailableError,
     PublicInfoClient,
     WatchedTx,
-    check_backend,
     classify_failure,
     estimate_eta,
     format_sat_vb,
@@ -598,7 +597,7 @@ WATCH_INTERVAL_MAX: Final[int] = 86400
 
 #: The shipped default — derived from the :class:`Settings` field default,
 #: never a second hardcoded literal (same single-source rule as
-#: ``_PUBLIC_DEFAULT_HOST``).
+#: ``_PUBLIC_ELECTRUM_HOST``).
 WATCH_INTERVAL_DEFAULT_S: Final[float] = float(
     Settings.__dataclass_fields__["watch_interval_s"].default
 )
@@ -807,9 +806,9 @@ def _effective_chain_url(settings: Settings) -> str:
     place by every hot-swap and by an explicit public consent). EMPTY means
     UNRESOLVED: there is no public fallback anymore (the old
     ``esplora_base_url`` default is gone — mempool.space serves public
-    fee/price info only). ``_backend_kind`` badges from it; the settings
+    fee/price info only). ``_backend_kind`` maps from it; the settings
     pane DISPLAYS it (TCK-WEB-013) through :func:`_url_without_credentials`
-    — one resolution expression, so the badge and the shown URL can never
+    — one resolution expression, so the kind and the shown URL can never
     disagree."""
     return settings.chain_base_url.strip()
 
@@ -3603,7 +3602,7 @@ def _make_broadcast_tx_handler(
     store: Store,
     wallet_id: int,
 ) -> Handler:
-    """Create the ``broadcast_tx`` handler: SIGNED record → Esplora → BROADCAST.
+    """Create the ``broadcast_tx`` handler: SIGNED record → chain backend → BROADCAST.
 
     Pipeline (TCK-P3-005 / ADR-0013 amendment — broadcast ONLY from
     ``SIGNED``, no skip path past the signing state):
@@ -3748,7 +3747,7 @@ def _make_broadcast_tx_handler(
 def _make_tx_status_handler(
     client: ChainClient, flow: TxFlow, scan_gate: StartupScan | None = None
 ) -> Handler:
-    """Create the ``tx_status`` handler: quoted txid → Esplora status.
+    """Create the ``tx_status`` handler: quoted txid → chain backend status.
 
     The ``txid`` param (layer 3 enforced it to EXACTLY 64 lowercase hex —
     the injection guard for the URL path) is looked up via
@@ -3763,8 +3762,8 @@ def _make_tx_status_handler(
     (or during the consented first scan) the lookup behaves unchanged.
 
     Eventual consistency (documented): a JUST-broadcast transaction is
-    often not indexed by the explorer yet — Esplora answers 404 until it
-    sees the transaction. When the queried txid IS the flow's recorded
+    often not indexed by the backend yet — the lookup answers not-found
+    until it sees the transaction. When the queried txid IS the flow's recorded
     broadcast txid and the lookup fails with the not-found status, the
     handler surfaces ``{"error": "unknown_tx", "detail": <value-free>}``
     instead of a generic chain failure, so the narration can say "not
@@ -6027,9 +6026,9 @@ def build_state_snapshot(
     state (a closed :class:`ModelDownloadFlow` state name), —
     TCK-LAUNCH-003 — the model PRELOAD state (a closed
     :class:`ModelPreloadFlow` state name; the two are mutually exclusive:
-    file present → preload, absent → card), — TCK-BACKEND-002 — the
-    live backend kind (a closed :data:`BACKEND_KINDS` enum NAME, badge
-    material: never a URL/host), and — TCK-UX-010 — the privacy mode (a
+    file present → preload, absent → card),     — TCK-BACKEND-002 — the
+    live backend kind (a closed :data:`BACKEND_KINDS` enum NAME: never a
+    URL/host), and — TCK-UX-010 — the privacy mode (a
     precomputed closed :data:`PRIVACY_MODES` enum NAME, computed by the
     pump at the call site; the builder sees no settings). No address,
     amount, txid, ``tx_ref``, key
@@ -6061,7 +6060,8 @@ def build_state_snapshot(
         snapshot["model_state"] = preload.state
     if backend_kind is not None:
         # Additive under state/1 (same rule): the CLOSED enum name of the
-        # live chain backend kind — a badge label, value-free by construction.
+        # live chain backend kind — value-free by construction (the settings
+        # pane stopped badging it in TCK-DESCOPE-M3B; the field stays).
         snapshot["backend_kind"] = backend_kind
     if privacy_mode is not None:
         # TCK-UX-010: additive under state/1 (same rule): the CLOSED
@@ -6133,59 +6133,29 @@ _BACKEND_AUTH_KEYS: Final[frozenset[str]] = frozenset(
 # --------------------------------- backend kind + hot-swap surfaces (TCK-BACKEND-002)
 
 #: The CLOSED enum of ``backend_kind`` values the settings/``/state``
-#: surfaces expose for the client's badges (TCK-BACKEND-002 user direction
-#: 10; ADR-0018 amendment). Value-free by construction — an enum NAME, never
-#: a URL/host. Mapping (scheme + config-derived; no probe rides the read):
+#: surfaces expose (TCK-BACKEND-002 user direction 10; ADR-0018 amendment;
+#: RE-SCOPED by TCK-DESCOPE-M3B to the two wallet families only — the
+#: public-consent choice installs the NAMED public Electrum server, an
+#: ``ssl://`` URL, so it reports kind ``electrum``; the trust dimension
+#: rides the separate ``privacy_mode`` enum, never the kind). Value-free by
+#: construction — an enum NAME, never a URL/host. Mapping (scheme only; no
+#: probe rides the read):
 #:
-#: * ``none``      — no backend is being consulted (no client, or the
-#:                   first-run choice is still unresolved/held);
-#: * ``electrum``  — the live URL's scheme is ``ssl://`` (M1 adapter);
-#: * ``bitcoind``  — the live URL's scheme is ``bitcoind://`` (M2 adapter,
-#:                   TCK-ONB-004; checked before the http-shape heuristics
-#:                   below — userinfo-carrying RPC URLs badge by scheme);
-#: * ``public``    — http(s) whose HOST is the shipped public mempool.space
-#:                   default host (mempool.space's own instance, public API,
-#:                   ADR-0003) — the trust badge, regardless of path;
-#: * ``mempool``   — any other http(s) URL whose API path starts with
-#:                   ``/api``: the mempool.space-app convention (self-hosted
-#:                   instances serve the Esplora API under ``/api``);
-#: * ``esplora``   — any other http(s) URL: an Esplora-shaped API served at
-#:                   the root (electrs/esplora-family servers);
-#: * ``bitcoind``  — emitted since docs/onb-004 plan M2 (the Core RPC
-#:                   adapter shipped; the value shipped reserved under
-#:                   TCK-BACKEND-002).
-#:
-#: The mempool-vs-esplora split is a documented URL-SHAPE heuristic: the
-#: two serve indistinguishable APIs, so the badge says which install the
-#: URL LOOKS like, never a probed software claim (ponytail: a real
-#: distinction would need a probe per page-load — not worth the traffic).
+#: * ``none``      — no backend is being consulted (no client, the
+#:                   first-run choice is still unresolved/held, or a legacy
+#:                   http(s) Esplora-shape rung that no longer builds a
+#:                   wallet client at all);
+#: * ``electrum``  — the live URL's scheme is ``ssl://`` (M1 adapter;
+#:                   includes the consented public Electrum server);
+#: * ``bitcoind``  — the live URL's scheme is ``bitcoind://`` or its
+#:                   ``bitcoind+tls://`` TLS sibling (M2/M3 adapters — the
+#:                   http(s) auto-detect STORES the rewrite, so the live
+#:                   URL is always one of the canonical schemes).
 BACKEND_KIND_NONE: Final[str] = "none"
 BACKEND_KIND_ELECTRUM: Final[str] = "electrum"
-BACKEND_KIND_PUBLIC: Final[str] = "public"
-BACKEND_KIND_MEMPOOL: Final[str] = "mempool"
-BACKEND_KIND_ESPLORA: Final[str] = "esplora"
 BACKEND_KIND_BITCOIND: Final[str] = "bitcoind"
 BACKEND_KINDS: Final[frozenset[str]] = frozenset(
-    {
-        BACKEND_KIND_NONE,
-        BACKEND_KIND_ELECTRUM,
-        BACKEND_KIND_PUBLIC,
-        BACKEND_KIND_MEMPOOL,
-        BACKEND_KIND_ESPLORA,
-        BACKEND_KIND_BITCOIND,
-    }
-)
-
-#: The shipped public default's HOST (``https://mempool.space/api`` →
-#: ``mempool.space``) — derived from the :class:`Settings` field default,
-#: never a second hardcoded literal, so the badge and the ADR-0003 default
-#: can never disagree. Plain-string split (urllib is lint-banned here).
-_PUBLIC_DEFAULT_HOST: Final[str] = (
-    Settings.__dataclass_fields__["esplora_base_url"]
-    .default.partition("://")[2]
-    .partition("/")[0]
-    .partition(":")[0]
-    .lower()
+    {BACKEND_KIND_NONE, BACKEND_KIND_ELECTRUM, BACKEND_KIND_BITCOIND}
 )
 
 #: The ONE honest refusal line for a failed validation probe (TCK-BACKEND-002
@@ -6205,16 +6175,15 @@ _PUBLIC_DEFAULT_HOST: Final[str] = (
 #: SKIPPED by design, documented).
 BACKEND_PROBE_FAIL: Final[str] = (
     "that backend did not check out: it is unreachable, or it does not "
-    "serve mainnet as an Esplora (mempool.space-style) http(s), Electrum "
-    "(ssl://) or Bitcoin Core RPC (bitcoind://) server — "
-    "nothing was saved and the current backend stays in service. hints: a "
-    "self-signed server certificate is refused unless TLS verification is "
-    "turned off (LOCALWALLET_TLS_VERIFY=0 / tls_verify=false — transport "
-    "authentication is then OFF, see the startup warning); a "
-    "mempool.space-style server serves its API under /api (auto-tried, so "
-    "the bare host works too); if the server answers but demands a login, "
-    "set the backend credentials and retry (a bare URL without them "
-    "cannot pass)"
+    "serve mainnet as an Electrum (ssl://) or Bitcoin Core RPC server "
+    "(bitcoind://, bitcoind+tls://, or the plain http(s) address of an RPC "
+    "port — auto-detected) — those are the only wallet backends this app "
+    "speaks, nothing was saved and the current backend stays in service. "
+    "hints: a self-signed server certificate is refused unless TLS "
+    "verification is turned off (LOCALWALLET_TLS_VERIFY=0 / "
+    "tls_verify=false — transport authentication is then OFF, see the "
+    "startup warning); if the server answers but demands a login, set the "
+    "backend credentials and retry (a bare URL without them cannot pass)"
 )
 
 #: The closed ``resync`` reply values on the settings/resync surfaces
@@ -6781,8 +6750,9 @@ def handle_settings_request(
     (a bare harness pump — no chain wiring to swap) both keys keep the
     plain store write and the entry flags carry the next-launch honesty.
     Every wired
-    reply (reads included) carries the additive ``backend_kind`` NAME for the
-    client's badges (deliverable 10 — an enum name, value-free).
+    reply (reads included) carries the additive ``backend_kind`` NAME
+    (deliverable 10, re-scoped by TCK-DESCOPE-M3B: an enum name, value-free;
+    the settings pane no longer badged it — the field still rides).
 
     ``creds`` (TCK-ONB-004 M3 security-review LOW 2): a credential overlay
     riding a ``chain_base_url`` write — one atomic Apply, ordered the honest
@@ -7639,8 +7609,9 @@ def _pump(
             # shipped client ignores unknown fields, so ``state/1`` is intact.
             # TCK-LAUNCH-002: an additive ``model_state`` NAME drives the
             # Yes/No card + quick-action buttons (enum name, never data).
-            # TCK-BACKEND-002: an additive ``backend_kind`` NAME is the
-            # client's badge material (closed enum, never a URL/host).
+            # TCK-BACKEND-002: an additive ``backend_kind`` NAME (closed
+            # enum, never a URL/host; TCK-DESCOPE-M3B trimmed it to
+            # none/electrum/bitcoind and dropped the client's kind badge).
             # TCK-UX-010: an additive ``privacy_mode`` NAME (closed
             # :data:`PRIVACY_MODES`, never a URL/host), computed HERE —
             # the ONB-006 hold overrides the mode while a first-run backend
@@ -8266,7 +8237,7 @@ def run(
             wiring.client.close()
         wiring.store.close()
         # The remote debug bridge also owns a client (httpx) — close it
-        # alongside the Esplora client when it exposes close().
+        # alongside the chain client when it exposes close().
         close = getattr(generate, "close", None)
         if callable(close):
             close()
@@ -8534,16 +8505,6 @@ def _failure_parts(exc: BaseException | None) -> tuple[str, str, str]:
     return fc, name, extra
 
 
-def _report_failure_parts(report: dict[str, str]) -> tuple[str, str, str]:
-    """Like :func:`_failure_parts`, but from ``check_backend``'s ``report``
-    dict (value-free by the chain contract)."""
-    return (
-        report.get("failure_class") or "network-error",
-        report.get("exc_name") or "unknown",
-        "",
-    )
-
-
 def _emit_probe_failure(
     output: _Output | None,
     *,
@@ -8597,41 +8558,31 @@ def _probe_chain_backend(
       credentials ride the dedicated ``backend_auth_*`` keys via ``auth``.
       Stored as-is (the transport bit is the scheme, so it survives the
       save and rebuilds the identical live client every later launch).
-    * ``http://`` → AMBIGUOUS — a real detection case. Probe order per this
-      ticket: Core JSON-RPC SHAPE FIRST (a :class:`BitcoindClient` against
-      the ``bitcoind://`` rewrite of the URL, POST ``getblockchaininfo``
-      with the resolved credentials — stored pair, else the documented
-      cookie ladder — over ``auth``), then the Esplora shape
-      (``check_backend``). First shape wins; a Core win STORES THE REWRITE
-      (``http://h:8332`` → ``bitcoind://h:8332``), so the detected kind
-      feeds ``backend_kind``, the client builder and every badge through the
-      ONE unchanged scheme-dispatch seam. Neither shape → ``None`` (the
-      caller's refusal names what was tried). URLs carrying userinfo skip
-      the Core branch (embedded credentials are refused on the stored rung
+    * ``http://`` / ``https://`` → AMBIGUOUS INPUT ALIASES FOR BITCOIN CORE
+      RPC ONLY (TCK-DESCOPE-M3B re-scope: an Esplora-shaped http(s) server
+      is NOT a wallet backend anymore — mempool.space serves public
+      fees/prices only, ADR-0003/0011 as amended). ONE attempt: the Core
+      JSON-RPC SHAPE against the canonical rewrite (a
+      :class:`BitcoindClient` over the ``bitcoind://``/``bitcoind+tls://``
+      form of the URL, POST ``getblockchaininfo`` with the resolved
+      credentials — stored pair, else the documented cookie ladder — over
+      ``auth``). A Core win STORES THE REWRITE (``http://h:8332`` →
+      ``bitcoind://h:8332``; https → the ``bitcoind+tls://`` TLS sibling,
+      TCK-BACKEND-003 D1: the https RPC URL is an INPUT alias, the canonical
+      STORED form carries the transport through the ONE scheme-dispatch
+      seam) so ``backend_kind``, the client builder and the settings pane
+      all ride one unchanged scheme read. NO Core win → ``None`` REFUSED —
+      there is deliberately no Esplora-shape fallback probe anymore, so a
+      mempool.space-style URL can never be persisted through this seam
+      (the M3A interim gap closed). URLs carrying userinfo are refused
+      WITHOUT a probe (embedded credentials are refused on the stored rung
       — logins ride the dedicated keys).
-    * ``https://`` → ALSO ambiguous since TCK-BACKEND-003 (D1): the SAME
-      Core-first probe runs against the ``bitcoind+tls://`` rewrite (an
-      https-capable transport; TLS trust rides the ladder inside the
-      client, so a self-signed RPC node is reachable only via the explicit
-      LOCALWALLET_TLS_VERIFY rung that also drives the live client), then
-      the Esplora shape (``check_backend`` — which itself auto-tries the
-      ``/api`` API-root segment, D2). A Core win STORES THE
-      ``bitcoind+tls://`` REWRITE; an Esplora win stores the input as-is.
-      This supersedes the M2 "https Core RPC is inexpressible" scope note
-      (ADR-0018 amendment): the https RPC URL is an INPUT alias, the
-      canonical STORED form is the ``bitcoind+tls://`` scheme (NOT plain
-      ``bitcoind://`` — a plain scheme would rebuild a plain-http client
-      that cannot reach the https node; storing the TLS sibling keeps the
-      ONE scheme-dispatch seam while carrying the transport).
-    * anything else → ``None`` WITHOUT probing (a foreign scheme is said
-      plainly by the caller, never probed).
 
     PORTS ARE NOT TRUSTED FOR CLASSIFICATION (M3 decision, plan §3's
     "never bypass the probe" hardened): no 8332/3006 heuristic steers the
     decision — scheme + shape probe is everything, because a port is a
     convention any real deployment (proxies, Docker mappings, Start9 app
-    ports) breaks. The probe's two bounded attempts cost at most two
-    timeouts.
+    ports) breaks. The ambiguous rungs cost at most ONE bounded attempt.
 
     Snappy budget (same rule as ever): ONE attempt past the initial, the
     shared per-request timeout; TLS trust rides the ladder inside the
@@ -8659,8 +8610,8 @@ def _probe_chain_backend(
     def _core_shape(core_url: str) -> tuple[bool, BaseException | None]:
         """One bounded Core-RPC handshake against the canonical rewrite; a
         malformed rewrite (e.g. a path riding through) fails the CONSTRUCTION
-        guard inside the probe and collapses to False — the Esplora branch
-        then judges the ORIGINAL URL."""
+        guard inside the probe and collapses to False — which since
+        TCK-DESCOPE-M3B is the whole answer for an http(s) candidate."""
         return _probe_tip(
             lambda: BitcoindClient(
                 base_url=core_url,
@@ -8690,70 +8641,51 @@ def _probe_chain_backend(
     for scheme, core_scheme in (("http://", BITCOIND_SCHEME), ("https://", BITCOIND_TLS_SCHEME)):
         if not text.startswith(scheme):
             continue
-        # The ambiguous rungs (http:// M3, https:// TCK-BACKEND-003): Core
-        # shape FIRST, then the Esplora shape. The rewrite feeds the one
-        # scheme-dispatch seam; an Esplora win (check_backend) stores the
-        # input UNCHANGED. A userinfo-carrying candidate skips the Core
-        # branch (embedded credentials are refused on the stored rung).
+        # The ambiguous rungs (http:// M3, https:// TCK-BACKEND-003): INPUT
+        # aliases for Bitcoin Core RPC ONLY — the ONE Core-shape attempt
+        # against the canonical rewrite feeds the single scheme-dispatch
+        # seam. No Core win means REFUSAL (TCK-DESCOPE-M3B: there is no
+        # Esplora-shape fallback anymore, so an Esplora/mempool.space-style
+        # URL can never be persisted through this seam). A userinfo-
+        # carrying candidate is refused without a probe (embedded
+        # credentials are refused on the stored rung — logins ride the
+        # dedicated keys).
         rest = text[len(scheme) :]
-        core_exc: BaseException | None = None
-        if "@" not in rest.partition("/")[0]:
-            ok, core_exc = _core_shape(core_scheme + rest)
-            if ok:
-                return core_scheme + rest
-        report: dict[str, str] = {}
-        try:
-            ok = check_backend(
-                text, timeout_s=timeout, max_retries=retries, report=report
-            )
-        except Exception as exc:  # noqa: BLE001 — belt-braces: check_backend already collapses
-            _refuse("esplora-shape", *_failure_parts(exc))
+        if "@" in rest.partition("/")[0]:
+            _refuse("bitcoind-core", NETWORK_ERROR, "ValueError")
             return None
+        ok, core_exc = _core_shape(core_scheme + rest)
         if ok:
-            return text
-        # Prefer the Esplora shape's own failure detail (its report is
-        # populated on every refusal path).
-        if report:
-            _refuse("esplora-shape", *_report_failure_parts(report))
-        else:
-            _refuse("bitcoind-core", *_failure_parts(core_exc))
+            return core_scheme + rest
+        _refuse("bitcoind-core", *_failure_parts(core_exc))
         return None
     _refuse("scheme-rejected", NETWORK_ERROR, "ValueError")
     return None
 
 def _backend_kind(settings: Settings, *, resolved: bool) -> str:
-    """The CLOSED ``backend_kind`` enum NAME for the live backend (badge
-    material for the web client, TCK-BACKEND-002 deliverable 10; the full
-    mapping table lives at :data:`BACKEND_KINDS`). Derived from the SAME
-    single selection point the client construction uses
-    (``Settings.chain_base_url`` over the legacy default) — scheme +
-    config-shape only, NEVER a network probe, and VALUE-FREE: a name, not a
-    URL. ``resolved=False`` (the first-run choice still unmade) answers
-    ``none``: nothing is being consulted and the badge must not claim a
-    server the user never picked."""
+    """The CLOSED ``backend_kind`` enum NAME for the live backend
+    (TCK-BACKEND-002 deliverable 10, RE-SCOPED by TCK-DESCOPE-M3B to the
+    two wallet families; the full mapping table lives at
+    :data:`BACKEND_KINDS`). Derived from the SAME single selection point the
+    client construction uses (``Settings.chain_base_url``) — scheme only,
+    NEVER a network probe, and VALUE-FREE: a name, not a URL.
+    ``resolved=False`` (the first-run choice still unmade) answers
+    ``none``: nothing is being consulted and the field must not claim a
+    server the user never picked. A legacy http(s) URL on a resolved rung
+    also answers ``none`` — since the de-scope it builds NO wallet client
+    (the construction seam refuses it), so nothing of that shape is ever
+    in service."""
     if not resolved:
         return BACKEND_KIND_NONE
     url = _effective_chain_url(settings)
     if url.startswith(ELECTRUM_SCHEME):
         return BACKEND_KIND_ELECTRUM
     if url.startswith((BITCOIND_SCHEME, BITCOIND_TLS_SCHEME)):
-        # The M2 Core-RPC adapter (TCK-ONB-004), including the https TLS
-        # sibling scheme (TCK-BACKEND-003): the reserved enum value,
-        # emitted the day the scheme became selectable — checked BEFORE the
-        # public-host/path heuristics, which are http(s)-shape reads and
-        # would mis-badge a userinfo-carrying RPC URL.
+        # The M2 Core-RPC adapter (TCK-ONB-004) including the https TLS
+        # sibling scheme (TCK-BACKEND-003); the http(s) auto-detect STORES
+        # the rewrite, so a live Core backend always reads one of these.
         return BACKEND_KIND_BITCOIND
-    rest = url.partition("://")[2]
-    netloc, slash, tail = rest.partition("/")
-    # Plain-string host split (urllib is lint-banned here). Ceiling: an
-    # IPv6-literal self-host counts its bracket as part of the host and
-    # never matches the public comparison — still classifies mempool/
-    # esplora by path, which is all the badge promises.
-    if netloc.partition(":")[0].lower() == _PUBLIC_DEFAULT_HOST:
-        return BACKEND_KIND_PUBLIC
-    if ("api" == tail.partition("/")[0]) if slash else False:
-        return BACKEND_KIND_MEMPOOL
-    return BACKEND_KIND_ESPLORA
+    return BACKEND_KIND_NONE
 
 
 class ChainBackendFlow:
@@ -8816,7 +8748,7 @@ class ChainBackendFlow:
     @property
     def kind(self) -> str:
         """The live backend's CLOSED enum NAME (:data:`BACKEND_KINDS`) for
-        the settings/``/state`` badge fields — computed from the same
+        the settings/``/state`` kind fields — computed from the same
         selection point the serving client was built from, value-free."""
         effective = self._w.settings.chain_base_url.strip()
         return _backend_kind(
@@ -8829,9 +8761,10 @@ class ChainBackendFlow:
         """The chain base URL ACTUALLY in service (TCK-WEB-013): the SAME
         single selection point ``kind``/``_backend_mode`` read — the boot
         fold (env > config file > stored) updated in place by every hot-
-        swap, or the shipped public default when no rung is set — rendered
-        through :func:`_url_without_credentials` (the pane may show the
-        user's own server; it may never show a login)."""
+        swap and by an explicit public consent; EMPTY when unresolved
+        (TCK-DESCOPE-M3A: no silent public default) — rendered through
+        :func:`_url_without_credentials` (the pane may show the user's own
+        server; it may never show a login)."""
         return _url_without_credentials(_effective_chain_url(self._w.settings))
 
     def _worker_occupied(self) -> bool:
@@ -10079,7 +10012,8 @@ _TRANSCRIPT_HELP: Final[str] = (
     "Commands: /details — reprint the pending transaction's full card; "
     "/label — list or set your own coin tags and notes; "
     "/setup — choose which server answers the app about your addresses "
-    "(public default or your own Esplora-compatible server); "
+    "(your own Electrum server or Bitcoin Core node, or the consented "
+    "public Electrum server); "
     "/export <path> — write a redacted session transcript; "
     "/scrub — clear the in-memory transcript; "
     "/balance, /receive, /address, /settings — model-free reads (work "

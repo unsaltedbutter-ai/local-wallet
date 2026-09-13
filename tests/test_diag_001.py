@@ -20,7 +20,6 @@ from localwallet.chain import classify_failure
 from localwallet.chain.esplora import (
     CONNECT_REFUSED,
     NETWORK_ERROR,
-    NOT_ESPLORA_SHAPE,
     NOT_MAINNET,
     TLS_VERIFY_FAILURE,
     check_backend,
@@ -121,20 +120,27 @@ def test_probe_url_class_clamps_scheme_less_input() -> None:
         assert "bc1q" not in line
 
 
-def test_probe_emits_esplora_shape_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_probe_refuses_http_without_esplora_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TCK-DESCOPE-M3B: an http(s) candidate gets the ONE Core-shape
+    attempt; when it does not answer in Core shape it is REFUSED with a
+    value-free debug line — there is no Esplora-shape fallback probe
+    anymore (the app module no longer even imports ``check_backend``),
+    so a mempool.space-style URL cannot be persisted through this seam."""
     out = _FakeOutput()
     settings = Settings.from_env()
+    assert not hasattr(app_module, "check_backend")  # seam closed, not idle
 
-    def fake_check(url: str, **kw: Any) -> bool:
-        kw["report"].update({"failure_class": NOT_ESPLORA_SHAPE, "exc_name": "not-a-list"})
-        return False
+    def dead_core(base_url: str = "", **_kw: Any) -> Any:
+        raise RuntimeError("not a Core RPC here")
 
-    monkeypatch.setattr(app_module, "check_backend", fake_check)
+    monkeypatch.setattr(app_module, "BitcoindClient", dead_core)
     assert _probe_chain_backend("http://h.example", settings, output=out) is None
     assert len(out.warnings) == 1
     line = out.warnings[0]
-    assert "stage=esplora-shape" in line
-    assert "class=not-esplora-shape" in line
+    assert "stage=bitcoind-core" in line
+    assert "class=network-error" in line
     assert "h.example" not in line  # value-free: no host
 
 

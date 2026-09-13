@@ -51,7 +51,8 @@ Add keys only when a log line or a feature asks for them; malformed/unknown keys
 
 - [ ] **First run is CHAT, not the settings window**: launch → the pane must NOT open; the chat shows "Loading local llm." → "Local llm fully loaded." → one bubble with the three greeting lines; the input is ENABLED with "Paste your xpub or zpub to get started…" — paste the zpub IN CHAT → "Great. I saved that." → the backend-ask bubble. The settings pane only opens when YOU click Settings.
 - [ ] Backend answer paths: type the server URL in chat (probe runs, refusals carry the DIAG class), or use the pane / the "Use public server" consent button (closing the pane or asking a balance must never imply consent).
-- [ ] Clicking an address/txid in a bubble COPIES it (no mempool navigation); QR button still opens the address QR.
+- [ ] Clicking an address/txid in a bubble COPIES it (no navigation to any
+      third-party site); QR button still opens the address QR.
 - [ ] While a turn runs, the 3-dot "working" indicator is a chat bubble at the transcript tail that gets replaced by the reply (not below the input).
 - [ ] Balance in other currencies ("in euros"); split/consolidate dry-run; "what's pending?" summary.
 - [ ] Startup: separate bubbles; watch line only when OFF; watch failure "retrying in ~Ns" + "watch: recovered.".

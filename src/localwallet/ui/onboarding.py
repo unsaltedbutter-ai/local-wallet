@@ -34,28 +34,29 @@ in the browser, only :data:`WEB_SETUP_HINT`):
   narration rides :meth:`opening_lines` / :meth:`emit_load_complete`
   (non-blocking variant, ADR-0022 / TCK-SCAN-003 landed; the deferred
   variant LOAD_WAIT replaces it while the scan is held).
-- :meth:`OnboardingFlow.begin_setup` — the ``/setup`` transcript command
-  (TCK-ONB-005, ADR-0023 step 5 run against an EXISTING wallet): the flow
-  exists DORMANT on every interactive CLI launch and /setup arms it. A
-  stored choice is shown first (mode framing, value-free) and an explicit
-  ``y`` is required before it can be overwritten; ``n`` exits with no
-  change. Accepted since then, in order: ``ssl://`` Electrum-protocol
-   addresses (TCK-BACKEND-002) and — TCK-ONB-004 M3 — plain ``bitcoind://``
-   Core RPC addresses and the AUTO-DETECT of an ambiguous ``http://`` one
-   (TCK-BACKEND-003 extended the Core-shape-first AUTO-DETECT to
-   ``https://``, added the ``bitcoind+tls://`` explicit scheme, and made
-   the Esplora probe tolerate a bare host whose API lives under /api; the
-   user never classifies; the entry probe answers in Core RPC shape
-   first, then Esplora shape, and a Core win STORES the
-   ``bitcoind://``/``bitcoind+tls://`` rewrite so kind/badge/dispatch all
-   ride the one scheme seam). Foreign
-  schemes are still refused plainly (never probed, never stored, the entry
-  re-prompts).
-- Validation is the ADR-0023 decision-5 gate: the ``chain/`` probe (Esplora
-  shape + mainnet genesis, the Electrum handshake + genesis for ``ssl://``,
-  or the Core handshake — ``chain == "main"`` + capability floor — for a
-  ``bitcoind://``/answering-http(s) address (TCK-BACKEND-003 extended the
-  Core-first probe to https and the TLS sibling scheme; ADR-0021) plus — loopback URLs
+ - :meth:`OnboardingFlow.begin_setup` — the ``/setup`` transcript command
+   (TCK-ONB-005, ADR-0023 step 5 run against an EXISTING wallet): the flow
+   exists DORMANT on every interactive CLI launch and /setup arms it. A
+   stored choice is shown first (mode framing, value-free) and an explicit
+   ``y`` is required before it can be overwritten; ``n`` exits with no
+   change. Accepted since then, in order: ``ssl://`` Electrum-protocol
+    addresses (TCK-BACKEND-002) and — TCK-ONB-004 M3 — plain ``bitcoind://``
+    Core RPC addresses and the AUTO-DETECT of an ambiguous ``http://`` one
+    (TCK-BACKEND-003 extended the Core-shape auto-detect to ``https://``,
+    added the ``bitcoind+tls://`` explicit scheme, and made the Core probe
+    tolerate a bare host; TCK-DESCOPE-M3B closed the Esplora-shape
+    fallback — an http(s) address is now ONLY a Core RPC input alias, and
+    a Core win STORES the ``bitcoind://``/``bitcoind+tls://`` rewrite so
+    kind/dispatch all ride the one scheme seam). Foreign
+   schemes are still refused plainly (never probed, never stored, the entry
+   re-prompts).
+- Validation is the ADR-0023 decision-5 gate: the ``chain/`` probe (the
+  Electrum handshake + genesis for ``ssl://``, or the Core handshake —
+  ``chain == "main"`` + capability floor — for a ``bitcoind://``/
+  ``bitcoind+tls://`` or answering-http(s) address (TCK-BACKEND-003
+  extended the Core-shape probe to https and the TLS sibling scheme;
+  TCK-DESCOPE-M3B removed the Esplora-shape acceptance entirely — ADR-0021)
+  plus — loopback URLs
   only, per the ADR-0016 contract — the node doctor's IBD facts; a syncing
   node is refused with its progress quoted from tool output. EVERY entry
   enforces mainnet AT ENTRY through the real adapter's own handshake — the
@@ -138,32 +139,32 @@ GREETING: Final[str] = (
 )
 
 #: Step 2 — the node ask, copy block (a) AS AMENDED by TCK-ONB-006 (ADR-0023
-#: amendment 2, user direction 2026-09-09): the server options are named
-#: plainly (Bitcoin Core / Electrum server / private mempool.space), the
+#: amendment 2, user direction 2026-09-09) and re-scoped by TCK-DESCOPE-M3B
+#: (USER REDIRECTION 2026-09-11: wallet backends are Bitcoin Core or an
+#: Electrum server ONLY — mempool.space is public fee/price info, never a
+#: chain choice; the public tier is the NAMED public Electrum server), the
 #: public option carries the leak in plain words, and on an unresolved
 #: launch this ask now precedes the scan (nothing is checked until it
 #: answers). Reused verbatim on re-offers and by /setup.
 NODE_ASK: Final[str] = (
     "A decision that's yours to make: which server should the app ask "
-    "about your wallet's addresses? Your own server — Bitcoin Core (with "
-    "the mempool.space app), an Electrum server, or a private "
-    "mempool.space server; Start9, Umbrel and MyNode run all of these — "
-    "means only your own machine ever sees which addresses you check. The "
-    "public mempool.space server needs no setup, but be clear about its "
-    "price: whoever runs it sees every address you check, can link those "
-    "addresses together and to your IP, and watches when your "
-    "transactions move.\n"
+    "about your wallet's addresses? Your own server — a Bitcoin Core node "
+    "or an Electrum server; Start9, Umbrel and MyNode run both — means "
+    "only your own machine ever sees which addresses you check. The public "
+    "Electrum server electrum.blockstream.info needs no setup, but be "
+    "clear about its price: whoever runs it sees every address you check, "
+    "can link those addresses together and to your IP, and watches when "
+    "your transactions move.\n"
     "\n"
     "One thing you do NOT have to know: which kind of server it is. Give "
-    "me an address — the mempool.space app's http(s) one, an Electrum "
-    "server's ssl:// one, or a plain Bitcoin Core RPC one (an http(s) "
-    "address on the RPC port, or written with a bitcoind:// prefix) — and "
-    "the app checks what answers and sets itself up to match; a Core "
-    "login, if it wants one, is asked for separately. Mainnet only, as "
-    "ever.\n"
+    "me an address — an Electrum server's ssl:// one, or a plain Bitcoin "
+    "Core RPC one (an http(s) address on the RPC port, or written with a "
+    "bitcoind:// prefix) — and the app checks what answers and sets "
+    "itself up to match; a Core login, if it wants one, is asked for "
+    "separately. Mainnet only, as ever.\n"
     "\n"
-    "1. Public mempool.space server — nothing to set up, with the leak "
-    "above.\n"
+    "1. Public Electrum server (electrum.blockstream.info) — nothing to "
+    "set up, with the leak above.\n"
     "2. Your own server — paste its address or take me through it.\n"
     "\n"
     "If you're not sure what any of this means, ask me \"what's a node?\" "
@@ -217,10 +218,10 @@ ASK_WAITS_ACK: Final[str] = (
 #: Explicit public pick with nothing stored: consent recorded WITH the leak
 #: named once more, then the held scan is released.
 PUBLIC_CHOSEN_ACK: Final[str] = (
-    "Understood — the public mempool.space server it is, chosen with "
-    "eyes open: whoever runs it sees the addresses we check and when "
-    "your transactions move. You can switch to your own server any "
-    "time with /setup."
+    "Understood — the public Electrum server electrum.blockstream.info "
+    "it is, chosen with eyes open: whoever runs it sees the addresses we "
+    "check and when your transactions move. You can switch to your own "
+    "server any time with /setup."
 )
 
 #: Appended to :data:`PUBLIC_CHOSEN_ACK` only when the release hook reports
@@ -249,29 +250,30 @@ LOAD_COMPLETE: Final[str] = (
 )
 
 #: Copy block (b) — URL entry after choosing 2. (TCK-ONB-004 M3: the user
-#: never classifies the kind — the entry probe answers in Core RPC shape,
-#: then Esplora shape, and the app sets itself up to match what answered.)
+#: never classifies the kind — an http(s) address is tried in Core RPC
+#: shape; TCK-DESCOPE-M3B: that is the ONLY http(s) shape, an Esplora-
+#: shaped server is no longer a wallet backend and the probe refuses one.)
 URL_PROMPT: Final[str] = (
-    "Type the web address of your node's mempool.space app — its API "
-    "address is usually the same, with /api at the end — or the address "
-    "of its Electrum (ssl://) or Bitcoin Core RPC endpoint. The app "
-    "figures out which kind answered. Nothing is saved, and no address "
-    "of your wallet goes to it, until the app has checked that it answers "
-    "correctly."
+    "Type your server's address — an Electrum server's ssl:// address, or "
+    "your Bitcoin Core node's RPC address (a plain http(s) one works too; "
+    "the app rewrites it to bitcoind:// when it recognizes the shape). "
+    "The app figures out which kind answered. Nothing is saved, and no "
+    "address of your wallet goes to it, until the app has checked that it "
+    "answers correctly."
 )
 
 #: Copy block (c) — validation failure: plain cause, next step, nothing
-#: saved, never a silent public fallback. The family wording widened to
-#: cover ``ssl://`` Electrum servers (TCK-BACKEND-002) and Bitcoin Core RPC
-#: (TCK-ONB-004 M3 — an http:// address that answers in Core shape is one
-#: of the shapes this entry tries, so the honest cause names all three).
+#: saved, never a silent public fallback. TCK-DESCOPE-M3B: the honest cause
+#: names the two families the entry can now speak — Electrum (ssl://) and
+#: Bitcoin Core RPC (``bitcoind[+tls]://`` or an http(s) address answering
+#: in Core shape).
 VALIDATION_FAIL: Final[str] = (
     "That address didn't check out: it wasn't reachable, it didn't answer "
-    "as a mainnet Esplora (mempool.space-style), Electrum or Bitcoin Core "
-    "server, or it refused the login on file. Nothing was saved, and no "
-    "address of your wallet was ever sent to it. Ask \"node status\" to "
-    "see what the app can detect on this machine — then say \"retry\" "
-    "with the same or a new address, or pick the public server instead."
+    "as a mainnet Electrum or Bitcoin Core server, or it refused the login "
+    "on file. Nothing was saved, and no address of your wallet was ever "
+    "sent to it. Ask \"node status\" to see what the app can detect on "
+    "this machine — then say \"retry\" with the same or a new address, or "
+    "pick the public server instead."
 )
 
 #: TCK-ONB-004 M3 — offered ONCE after a failed validation of an auth-
@@ -312,12 +314,16 @@ CONFIRMED: Final[str] = (
 )
 
 #: Copy block (e) — skip / "not now" / explicit public pick: never a dead
-#: end; the public default is retained (an explicit non-opt-in, decision 2).
+#: end. TCK-DESCOPE-M3B wording fix (M3A semantics): a skip with nothing
+#: stored keeps the backend UNRESOLVED — nothing is queried "for now", and
+#: the line says so (the old "keeps using the public server" claimed a
+#: silent default that no longer exists).
 SKIP_ACK: Final[str] = (
-    "No problem — the app keeps using the public server for now, and "
-    "that's not a verdict. Paste a mempool.space-style address, or ask to "
-    "\"switch to my node\", any time and we'll set it up. Ask \"what's a "
-    "node?\" whenever you want the long version."
+    "No problem — nothing is chosen and nothing is queried for now, and "
+    "that's not a verdict: your wallet stays unloaded until a server is "
+    "set up. Paste an Electrum (ssl://) or Bitcoin Core address, or ask "
+    "to \"switch to my node\", any time and we'll set it up. Ask \"what's "
+    "a node?\" whenever you want the long version."
 )
 
 #: Copy block (f) — the guide-path answer to "what's a node?".
@@ -329,8 +335,8 @@ GUIDE: Final[str] = (
     "no address is a secret — but which addresses are yours is, and a "
     "node you run keeps that piece to yourself. You don't need one to use "
     "the app; you'd want one to keep that link private. When you have "
-    "one, the app connects to its mempool.space-style address. Want to "
-    "try setting one up now, or continue without?"
+    "one, the app connects to its Electrum (ssl://) or Bitcoin Core RPC "
+    "address. Want to try setting one up now, or continue without?"
 )
 
 #: ADR-0018 (as amended by TCK-BACKEND-002): a stored own-server choice now
@@ -381,13 +387,12 @@ WEB_SETUP_HINT: Final[str] = (
     "No server choice has been made yet, so the app has NOT looked up "
     "your wallet — no address has gone to any server, and balances and "
     "history stay empty until a backend is chosen. Run the terminal app "
-    "once to decide: your own server (Bitcoin Core with the "
-    "mempool.space app, an Electrum server, or a private mempool.space "
-    "install) or the public mempool.space server, whose operator can see "
-    "the addresses you check and when your transactions move. Saving a "
-    "backend address in Settings works too — and since TCK-BACKEND-002 it "
-    "switches over right away, no restart needed: the wallet loads from "
-    "the server you save."
+    "once to decide: your own server (a Bitcoin Core node or an Electrum "
+    "server) or the public Electrum server electrum.blockstream.info, "
+    "whose operator can see the addresses you check and when your "
+    "transactions move. Saving a backend address in Settings works too — "
+    "and since TCK-BACKEND-002 it switches over right away, no restart "
+    "needed: the wallet loads from the server you save."
 )
 
 # --- /setup re-entry copy (TCK-ONB-005; implementation-time, value-free) ---
@@ -431,23 +436,25 @@ SETUP_KEEP_CURRENT: Final[str] = (
 #: TCK-BACKEND-002: the session follows the revert (hot-swap), no longer
 #: "keeps the backend it started with".
 SETUP_REVERTED: Final[str] = (
-    "Set — the app uses the public server again. Your saved address has "
-    "been removed."
+    "Set — the app uses the public Electrum server electrum.blockstream."
+    "info again. Your saved address has been removed."
 )
 
 #: A URL whose scheme NO entry point of this app can speak — foreign
-#: schemes like ftp:// stay refused (http(s), ssl:// and the bitcoind://
-#: family are the schemes the app speaks since TCK-ONB-004 M3, with
-#: TCK-BACKEND-003 adding the https Core-RPC rung and its
-#: ``bitcoind+tls://`` scheme): plain statement, no probe, nothing saved —
-#: and the entry re-prompts (never a dead end).
+#: schemes like ftp:// stay refused (the wallet families since
+#: TCK-DESCOPE-M3B: http(s) as a Bitcoin Core RPC alias (auto-rewritten to
+#: a bitcoind:// scheme when it answers in Core shape), ssl:// Electrum,
+#: and the explicit bitcoind:// / bitcoind+tls:// schemes — an http(s) URL
+#: that is NOT Core RPC is refused by :data:`VALIDATION_FAIL` after the
+#: probe, not by this line): plain statement, no probe, nothing saved —
+#: and the entry re-prompts (never a dead end). The constant name predates
+#: the de-scope (v1 spoke Esplora over http(s) only); the copy no longer
+#: offers that family.
 NON_ESPLORA_URL: Final[str] = (
-    "I can't use that address: this app speaks Esplora servers over "
-    "http(s) — the web address of a mempool.space app — Electrum servers "
-    "over ssl://, and Bitcoin Core over an http(s) RPC address (or one "
-    "written with a bitcoind:// / bitcoind+tls:// prefix). Nothing was "
-    "probed and nothing was saved. Type such an address, or 1 for the "
-    "public server."
+    "I can't use that address: this app speaks Electrum servers over "
+    "ssl://, and Bitcoin Core over an http(s) RPC address (or one written "
+    "with a bitcoind:// / bitcoind+tls:// prefix). Nothing was probed and "
+    "nothing was saved. Type such an address, or 1 for the public server."
 )
 
 #: /setup refuses DORMANT when the stored rung cannot be read (no gate can
@@ -601,8 +608,8 @@ def _scheme_can_auth(line: str) -> bool:
     runs against it) and the explicit Core schemes — ``bitcoind://`` and
     its https sibling ``bitcoind+tls://`` (TCK-BACKEND-003; the login rides
     the same never-echoed keys and the same auth overlay). ``https://``
-    keeps the M3 answer: the CLI conversation's Esplora-primary rungs get
-    no login offer (an https Core node that needs one is named EXPLICITLY
+    keeps the M3 answer: the ambiguous https rung gets no login offer
+    (an https Core node that needs one is named EXPLICITLY
     with the bitcoind+tls:// prefix, or enters through the web pane, whose
     credential fields are scheme-free). ``ssl://`` Electrum has no standard
     auth (plan OQ-5); credentials are inert there too."""
@@ -853,7 +860,8 @@ class OnboardingFlow:
                     output_fn(ASK_WAITS_ACK)
                 else:
                     output_fn(SKIP_ACK)  # nothing stored, nothing held:
-                    self._state = _AskState.DONE  # public IS current (e)
+                    self._state = _AskState.DONE  # UNRESOLVED stands (e);
+                    # nothing is queried, the ask re-arms next launch.
             elif key in _PUBLIC_WORDS:
                 self._revert_to_public(output_fn)  # an EXPLICIT public pick
                 self._state = _AskState.DONE
@@ -959,14 +967,15 @@ class OnboardingFlow:
         self._deferred = False
 
     def _validate(self, url: str, output_fn: Callable[[str], None]) -> bool:
-        """Decision-5 validation: chain probe (http(s) Esplora shape +
-        mainnet genesis, the ssl:// Electrum handshake + genesis since
-        TCK-BACKEND-002, or the Core RPC handshake — ``chain == "main"`` +
-        capability floor — for ``bitcoind://`` and, since TCK-ONB-004 M3,
-        as the FIRST shape tried on an ambiguous ``http://``; the injected
-        probe dispatches the families and returns the CANONICAL URL to
-        store — an http:// endpoint answering in Core shape is saved as
-        ``bitcoind://``, so the detected kind rides the one scheme seam
+        """Decision-5 validation: chain probe (the ssl:// Electrum handshake
+        + genesis since TCK-BACKEND-002, or the Core RPC handshake —
+        ``chain == "main"`` + capability floor — for ``bitcoind[+tls]://``
+        and, since TCK-ONB-004 M3, as the ONLY shape tried on an ambiguous
+        ``http(s)://`` (TCK-DESCOPE-M3B: no Esplora-shape fallback — an
+        http(s) address that does not answer in Core shape is REFUSED); the
+        injected probe dispatches the families and returns the CANONICAL
+        URL to store — an http:// endpoint answering in Core shape is saved
+        as ``bitcoind://``, so the detected kind rides the one scheme seam
         every other surface uses) + (loopback only) doctor's IBD facts.
         Success is the typed store write; failure is copy (c) or the
         syncing branch — and, for an auth-capable candidate that has not

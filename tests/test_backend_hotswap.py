@@ -27,9 +27,11 @@ The contract (USER DIRECTION 2026-09-09 items 5/6/8/9/10; ADR-0018 amendment
   applied WITHOUT an auto-rescan (``resync: "no_rescan"``) plus the
   value-free tradeoff line (a smaller window can only hide addresses); an
   unchanged apply says so (``resync: "unchanged"``) and starts no scan;
-* ``backend_kind`` (direction 10): the CLOSED enum name of the live backend
-  (public/mempool/esplora/electrum/none; bitcoind reserved for M2, never
-  emitted today) rides /settings and /state additively — value-free.
+* ``backend_kind`` (direction 10, re-scoped by TCK-DESCOPE-M3B): the CLOSED
+  enum name of the live backend ({none, electrum, bitcoind} — the
+  public/mempool/esplora URL-shape kinds are gone; the public consent
+  installs an ssl:// server and reports ``electrum``) rides /settings and
+  /state additively — value-free.
 
 All hermetic: fake duck-typed chain clients, tmp stores, injected probes.
 """
@@ -728,17 +730,19 @@ def test_settings_path_accepts_ssl_and_installs_the_electrum_client(
 def test_probe_dispatches_by_scheme_reusing_the_m1_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_probe_chain_backend`` (M3 contract): returns the CANONICAL URL to
-    store, or ``None`` to refuse. https:// rides ``check_backend`` (Esplora
-    shape + genesis) unchanged; ssl:// constructs the Electrum adapter and
-    forces ONE tip call — the M1 handshake's genesis gate IS the mainnet
-    proof; everything collapses to None value-free, and the probe client is
-    always closed."""
+    """``_probe_chain_backend`` (TCK-DESCOPE-M3B contract): returns the
+    CANONICAL URL to store, or ``None`` to refuse. ssl:// constructs the
+    Electrum adapter and forces ONE tip call — the M1 handshake's genesis
+    gate IS the mainnet proof. http(s) is a Core-RPC INPUT ALIAS ONLY: a
+    Core win returns the canonical rewrite (bitcoind:// /
+    bitcoind+tls://); a URL that does NOT answer in Core shape is REFUSED
+    — the Esplora-shape fallback is gone and with it the app module's
+    ``check_backend`` import (the M3A interim seam where an Esplora URL
+    could still be persisted is closed). Everything collapses to None
+    value-free, and the probe client is always closed."""
     settings = Settings(request_timeout_s=0.5, max_retries=3)
+    assert not hasattr(app, "check_backend")  # the seam is GONE, not idle
     calls: list[str] = []
-    monkeypatch.setattr(
-        app, "check_backend", lambda url, **kw: calls.append(f"esplora:{url}") or True
-    )
     built: list[_FakeElectrum] = []
 
     def fake_electrum(base_url: str = "", **kw: Any) -> _FakeElectrum:
@@ -748,8 +752,6 @@ def test_probe_dispatches_by_scheme_reusing_the_m1_gate(
         return client
 
     monkeypatch.setattr(app, "ElectrumClient", fake_electrum)
-    assert app._probe_chain_backend(GOOD_URL, settings) == GOOD_URL
-    assert calls == [f"esplora:{GOOD_URL}"]  # http+/api shape → Esplora branch
     assert app._probe_chain_backend(SSL_URL, settings) == SSL_URL
     assert calls[-1] == f"electrum:{SSL_URL}:1"  # the snappy budget, M1 gate
     assert built[0].tip_calls == 1 and built[0].closed is True
@@ -759,6 +761,30 @@ def test_probe_dispatches_by_scheme_reusing_the_m1_gate(
 
     monkeypatch.setattr(app, "ElectrumClient", explode)
     assert app._probe_chain_backend(SSL_URL, settings) is None
+
+    def fake_core(base_url: str = "", **_kw: Any) -> _FakeElectrum:
+        calls.append(f"core:{base_url}")
+        return _FakeElectrum(base_url)
+
+    monkeypatch.setattr(app, "BitcoindClient", fake_core)
+    # The ambiguous rungs answer ONLY in Core shape, and answer REWRITTEN:
+    # http:// → bitcoind://, https:// → the TLS sibling (one scheme seam).
+    assert app._probe_chain_backend(GOOD_URL, settings) == (
+        "bitcoind://" + GOOD_URL.partition("://")[2]
+    )
+    assert app._probe_chain_backend(NEW_URL, settings) == (
+        "bitcoind+tls://" + NEW_URL.partition("://")[2]
+    )
+
+    def dead_core(base_url: str = "", **_kw: Any) -> _FakeElectrum:
+        raise RuntimeError("not a Core RPC here")  # Esplora shape = this
+
+    monkeypatch.setattr(app, "BitcoindClient", dead_core)
+    assert app._probe_chain_backend(NEW_URL, settings) is None  # no fallback
+    # URL-embedded credentials never reach the Core branch: no client built.
+    before = len(calls)
+    assert app._probe_chain_backend("http://u:p@host:8332", settings) is None
+    assert len(calls) == before
 
 
 # ------------------------------------------------ kind detection (direction 10)
@@ -771,13 +797,19 @@ def test_probe_dispatches_by_scheme_reusing_the_m1_gate(
         ("https://mempool.space/api", False, "none"),  # … even with a client
         ("ssl://evil-star.local:50001", True, "electrum"),
         ("ssl://host", True, "electrum"),
-        ("https://mempool.space/api", True, "public"),
-        ("https://mempool.space", True, "public"),  # host match, path irrelevant
-        ("http://mempool.space:80/api", True, "public"),
-        ("https://mempool.mine.example:4000/api", True, "mempool"),
-        ("http://127.0.0.1:3006/api", True, "mempool"),
-        ("http://127.0.0.1:3006", True, "esplora"),  # root-served API shape
-        ("https://electrs.box/esplora", True, "esplora"),
+        # TCK-DESCOPE-M3B: the kind is a SCHEME read over the two wallet
+        # families only. The consented public Electrum server is an ssl://
+        # URL and answers ``electrum`` (trust rides privacy_mode, not the
+        # kind); the Core rewrite schemes answer ``bitcoind``; a legacy
+        # http(s) Esplora-shape rung can build no wallet client (the
+        # construction seam refuses it), so it answers ``none`` honestly.
+        ("ssl://electrum.blockstream.info:50002", True, "electrum"),
+        ("bitcoind://node.local:8332", True, "bitcoind"),
+        ("bitcoind+tls://node.local:8332", True, "bitcoind"),
+        ("https://mempool.space/api", True, "none"),
+        ("http://127.0.0.1:3006/api", True, "none"),
+        ("https://electrs.box/esplora", True, "none"),
+        ("ftp://nope", True, "none"),
     ],
 )
 def test_backend_kind_closed_mapping(url: str, resolved: bool, expected: str) -> None:
@@ -786,11 +818,12 @@ def test_backend_kind_closed_mapping(url: str, resolved: bool, expected: str) ->
     assert kind in BACKEND_KINDS
 
 
-def test_backend_kind_bitcoind_is_reserved_unreachable() -> None:
-    """Honest enum: the M2 Core adapter's name ships NOW (the client can
-    badge-color it the day one exists) but no configuration can produce it
-    today — the enum is closed and the mapping never lies."""
-    assert "bitcoind" in BACKEND_KINDS
+def test_backend_kinds_closed_set_after_the_descope() -> None:
+    """The M3B enum: exactly {none, electrum, bitcoind} — the mempool /
+    esplora / public URL-shape kinds are gone (mempool.space is public
+    fee/price info, never a wallet backend; ADR-0018/0023 as amended).
+    Nothing that is not Electrum or Core RPC answers ``none``."""
+    assert BACKEND_KINDS == frozenset({"none", "electrum", "bitcoind"})
     for url in ("", "ssl://h", "https://x/api", "http://y", "bitcoin://z"):
         assert _backend_kind(Settings(chain_base_url=url), resolved=True) != "bitcoind"
 
@@ -835,12 +868,16 @@ def test_kind_and_flags_ride_the_settings_and_state_surfaces(
 ) -> None:
     """Additive-field pin (settings/1 + state/1 unchanged): the settings READ
     and the /state snapshot carry ``backend_kind`` (an enum NAME) whenever a
-    backend is wired, and carry NOTHING when one is not."""
-    wiring, _commands = _mk_wiring(tmp_path, monkeypatch, stored_url=GOOD_URL)
-    wiring.settings.chain_base_url = GOOD_URL  # the boot fold the real wiring does
+    backend is wired, and carry NOTHING when one is not. TCK-DESCOPE-M3B:
+    the URL under test is a live family (loopback ssl:// → ``electrum`` +
+    ``own_node_local``) — the http(s) Esplora-shape GOOD_URL would now
+    honestly answer ``none`` (pinned in the closed-mapping pass above)."""
+    ssl_local = "ssl://127.0.0.1:50001"
+    wiring, _commands = _mk_wiring(tmp_path, monkeypatch, stored_url=ssl_local)
+    wiring.settings.chain_base_url = ssl_local  # the boot fold the real wiring does
     flow = ChainBackendFlow(wiring, _probe_true)
     reply = app.handle_settings_request(wiring.store, None, None, flow)
-    assert reply["backend_kind"] == "mempool"
+    assert reply["backend_kind"] == "electrum"
     snapshot = app.build_state_snapshot(
         wiring.flow,
         wiring.session,
@@ -850,7 +887,7 @@ def test_kind_and_flags_ride_the_settings_and_state_surfaces(
         flow.kind,
         privacy_mode=app._backend_mode(wiring.settings),  # the pump's source
     )
-    assert snapshot["backend_kind"] == "mempool"
+    assert snapshot["backend_kind"] == "electrum"
     # TCK-UX-010: the additive privacy_mode rides the SAME live settings
     # object the swap mutates — a closed enum NAME, never the URL/host.
     assert snapshot["privacy_mode"] == "own_node_local"
