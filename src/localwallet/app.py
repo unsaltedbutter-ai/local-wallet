@@ -177,6 +177,7 @@ from localwallet.node import LocalNodeReport, NodeStatus, detect_local_nodes
 from localwallet.node.doctor import NodeDoctor
 from localwallet.protocol import (
     BroadcastTxParams,
+    BumpFeeParams,
     ClarifyParams,
     ConfirmTxParams,
     CreateTxParams,
@@ -231,6 +232,13 @@ from localwallet.tx.psbt import (
     PsbtInputSource,
     build_unsigned_psbt,
     psbt_to_base64,
+)
+from localwallet.tx.replacement import (
+    OriginalTx,
+    RbfFloorError,
+    ReplacementError,
+    ReplacementPlan,
+    build_replacement_plan,
 )
 from localwallet.tx.revalidate import (
     IntendedTx,
@@ -1327,6 +1335,324 @@ _SELF_TOO_MANY_SMALL: Final[str] = (
     "merge a share of them."
 )
 
+#: TCK-RBF-004 (CPFP-001 rider): the ``cpfp`` MODE is grammar-live but its
+#: conversation lands with CPFP-002 — the self_transfer handler's step-0.5
+#: guard answers with this clean, value-free, code-owned line (never a
+#: crash on the consolidate-shape assert, never a fee-estimator call).
+_CPFP_NOT_READY: Final[str] = (
+    "Child-pays-for-parent fee bumping isn't available yet — nothing was "
+    "staged or sent."
+)
+
+# --- bump conversation copy (TCK-RBF-004) -----------------------------------
+#
+# Every line is dispatcher-owned text (the model never authors it; the
+# renderer prints it verbatim through the sanitizer). Value-bearing figures
+# reach the card ONLY as structured result keys rendered from the pure
+# builder's output / the store's rows (quote-verbatim rule), never as
+# hand-written constants here.
+
+#: The plan card's BIP-125 hedge row — the same honest substring the
+#: TCK-RBF-005 tx_status replaced-copy carries, in card shape.
+_BUMP_REPLACES_LINE: Final[str] = (
+    "Replaces: {old_txid} — the original may still confirm; only one of "
+    "these two ever will"
+)
+#: The plan card's fee-delta row: values verbatim from the builder's plan
+#: (old fee from the recorded original, new fee the plan's, delta their
+#: integer difference — ENGINE-computed, never a ladder rung alone).
+_BUMP_FEE_LINE: Final[str] = (
+    "Fee: {old_fee} sats → {new_fee} sats (paying {delta} sats extra)"
+)
+_BUMP_NOTHING_IN_FLIGHT: Final[str] = (
+    "Nothing of yours is in flight right now — there is no fee to bump."
+)
+_BUMP_ALREADY_CONFIRMED: Final[str] = (
+    "That transaction already confirmed — there is nothing left to bump."
+)
+_BUMP_ALREADY_SETTLED: Final[str] = (
+    "That transaction's race is already settled — check its status; there "
+    "is nothing further to bump."
+)
+_BUMP_UNRECORDED: Final[str] = (
+    "I can't rebuild that transaction's funding plan from my records — the "
+    "fee bump covers the transaction this app last broadcast."
+)
+_BUMP_MULTI_OUTPUT: Final[str] = (
+    "A fee bump doesn't cover a multi-output coin reshuffle yet — nothing "
+    "was staged or sent."
+)
+_BUMP_FLOW_BUSY: Final[str] = (
+    "Finish the transaction already in flight first (sign it or cancel "
+    "it), then bump the fee."
+)
+_BUMP_REQUOTE_GUIDANCE: Final[str] = (
+    "That pending transaction is a fee bump — to change its speed, cancel "
+    "it and ask for the bump again (say 'faster' or 'slower')."
+)
+_BUMP_PLAN_FAILED: Final[str] = (
+    "The recorded transaction does not add up — nothing was staged."
+)
+_BUMP_FUNDING_HEAD: Final[str] = (
+    "The change alone can't reach the replacement minimum — the bump needs "
+    "one of your CONFIRMED coins. Pick one:"
+)
+_BUMP_FUNDING_TAIL: Final[str] = (
+    "Say a number, or 'smallest', 'mid' or 'largest' — or name the coin's "
+    "label. Any other words set this aside."
+)
+_BUMP_TARGET_HEAD: Final[str] = (
+    "You have {count} transactions in flight — which one should I bump? "
+    "Say a number; any other words set this aside."
+)
+_BUMP_FLOOR_RATE: Final[str] = (
+    "That rate can't replace it — the new fee must be at least "
+    "{floor_sats} sats (BIP 125). Say 'faster' or name a higher rate."
+)
+_BUMP_FLOOR_FUNDING: Final[str] = (
+    "Even the best confirmed coin can't fund this bump — the replacement "
+    "fee must be at least {floor_sats} sats."
+)
+_BUMP_FLOOR_EXCEEDS: Final[str] = (
+    "That rate costs more than the funding can pay — at most "
+    "{max_payable_sats} sats can go to the fee, and the replacement needs "
+    "at least {floor_sats} sats."
+)
+_BUMP_ASK_REF_UNRESOLVED: Final[str] = (
+    "I couldn't match that coin reference — pick one of the confirmed "
+    "coins listed."
+)
+_BUMP_SUPERSEDE_LINE: Final[str] = (
+    "Replaces: {old_txid} — the original may still confirm; only one of "
+    "these two ever will"
+)
+
+#: 64-hex txid shape (lowercase — store txids are canonical lowercase).
+_BUMP_HEX64_RE: Final = re.compile(r"[0-9a-f]{64}")
+
+
+def _bump_framed_options(
+    coins: list[_BumpFundingOption],
+) -> list[_BumpFundingOption]:
+    """The funding ask's up-to-three numbered framing (TCK-RBF-004,
+    smallest/largest/mid per the user rule): 1 coin → just it; 2 → smallest
+    + largest; 3+ → smallest, median, largest. Deterministic over the
+    canonical ``(value_sats, txid, vout)`` ascending order the caller's
+    list already carries; the FULL confirmed set stays addressable by the
+    framing words themselves (a mid choice on 4 coins lands the true
+    median), only the presentation trims."""
+    n = len(coins)
+    if n == 1:
+        picks = [(0, "coin")]
+    elif n == 2:
+        picks = [(0, "smallest"), (1, "largest")]
+    else:
+        picks = [(0, "smallest"), (n // 2, "mid"), (n - 1, "largest")]
+    return [replace(coins[i], framing=word) for i, word in picks]
+
+
+#: Everyday synonyms for the funding ask's framing words (deterministic
+#: answer vocab only — the OFFERED card always says the canonical word;
+#: a single offered coin is answerable by its number or its label).
+_BUMP_FRAMING_SYNONYMS: Final[dict[str, tuple[str, ...]]] = {
+    "smallest": ("smallest", "small", "smaller", "lowest", "tiny"),
+    "mid": ("mid", "middle"),
+    "largest": ("largest", "large", "big", "biggest", "highest"),
+}
+
+#: Any deny token from the confirm gate's own vocabulary suppresses a
+#: deterministic ask answer ENTIRELY (TCK-HW-005 slice C review-MEDIUM
+#: precedent): "don't take the largest" must never fund a replacement.
+_BUMP_DENY_TOKENS: Final[frozenset[str]] = ConfirmGate.DENY_TOKENS | frozenset(
+    {"not", "nevermind", "never", "mind"}
+)
+
+
+def _bump_funding_answer(line: str, ask: _BumpAsk) -> int | None:
+    """Deterministic answer for an OPEN bump ask (TCK-RBF-004, the
+    UX-004/interrupt never-trap discipline): 1-based choice index, or
+    ``None`` (the caller CLEARS the ask and the utterance falls through to
+    the ordinary pipeline — the ask never traps the conversation).
+
+    The answer vocabulary is a number (``2``), a framing word
+    (``smallest``/``mid``/``largest``, plus the everyday synonyms), or a
+    coin-LABEL word — matched against the user's own stored tags/notes for
+    the offered coins, HERE in code, so the label words never reach the
+    model (the funding ask's whole deterministic-intercept point). A term
+    matching several offered coins is ambiguous → no answer. Any deny
+    token suppresses the match."""
+    words = [w for w in (t.strip(punctuation) for t in line.lower().split()) if w]
+    if not words or any(w in _BUMP_DENY_TOKENS for w in words):
+        return None
+    if ask.kind == "funding":
+        term_to_choice: dict[str, int] = {}
+        ambiguous: set[str] = set()
+        for i, option in enumerate(ask.options):
+            choice = i + 1
+            terms = set(_BUMP_FRAMING_SYNONYMS.get(option.framing, ())) | set(
+                option.match_terms
+            )
+            for term in terms:
+                if term_to_choice.get(term) not in (None, choice):
+                    ambiguous.add(term)
+                term_to_choice[term] = choice
+        first = words[0]
+        if first.isdigit() and 1 <= int(first) <= len(ask.options):
+            return int(first)
+        hits = {
+            term_to_choice[w]
+            for w in words
+            if w in term_to_choice and w not in ambiguous
+        }
+        if len(hits) == 1:
+            return hits.pop()
+        return None
+    if ask.kind == "target":
+        first = words[0]
+        if first.isdigit() and 1 <= int(first) <= len(ask.entries):
+            return int(first)
+    return None
+
+
+#: Bare speed-utterance phrases for the post-broadcast reroute (display
+#: vocab, TCK-RBF-004; whole-line exact match after punctuation strip —
+#: the ``_file_export_choice`` tightened-intercept precedent).
+_BUMP_FASTER_PHRASES: Final[frozenset[str]] = frozenset(
+    {"faster", "go faster", "make it faster", "make the fee faster"}
+)
+_BUMP_SLOWER_PHRASES: Final[frozenset[str]] = frozenset(
+    {"slower", "go slower", "make it slower", "make the fee slower"}
+)
+
+
+def _bump_speed_choice(line: str) -> str | None:
+    """``"faster"``/``"slower"`` for a bare speed utterance, else ``None``
+    (TCK-RBF-004 deliverable 7): after a BUMP broadcast these route to a
+    fresh bump of the NEW transaction (existing fee-target vocabulary) —
+    never to ``create_tx`` (which would silently start a duplicate
+    payment; its pending guard cannot see a BROADCAST flow)."""
+    words = [w.strip(punctuation) for w in line.lower().split()]
+    joined = " ".join(w for w in words if w)
+    if joined in _BUMP_FASTER_PHRASES:
+        return "faster"
+    if joined in _BUMP_SLOWER_PHRASES:
+        return "slower"
+    return None
+
+
+def _bump_next_rung(current: str | None, direction: str) -> str | None:
+    """One ladder step from ``current`` (TCK-RBF-004): the SAME
+    three-target order the re-quote map uses (:data:`_FEE_LADDER_ORDER`) —
+    at the extreme the rung holds (the bump then answers honestly: a
+    same-rung re-bump fails the BIP-125 floor with the sanctioned floor
+    number — the ceiling-ask shape). ``None`` when the staged record
+    carries no rung (an explicit-rate bump: no ladder to step — the
+    utterance falls through to the ordinary pipeline)."""
+    if current is None or current not in _FEE_LADDER_ORDER:
+        return None
+    pos = _FEE_LADDER_ORDER[current]
+    nxt = pos - 1 if direction == "faster" else pos + 1
+    nxt = min(max(nxt, 0), len(_FEE_LADDER_ORDER) - 1)
+    return {0: "fast", 1: "medium", 2: "slow"}[nxt]
+
+
+@dataclass(frozen=True, slots=True)
+class _BumpOriginal:
+    """Dispatcher-owned decomposition of the in-flight transaction a bump
+    replaces (TCK-RBF-004): the flow record's scalars PLUS the PSBT-derived
+    input sources (the :class:`~localwallet.tx.psbt.PsbtInputSource` coins
+    the pure :class:`~localwallet.tx.replacement.OriginalTx` consumes, in
+    that record's order). Carried on the session so a bump re-ask while its
+    replacement still pends rebuilds from the SAME decomposition — never a
+    re-read of user or model text."""
+
+    recipients: tuple[tuple[bytes, int], ...]
+    change_script: bytes | None
+    change_sats: int | None
+    inputs: tuple[PsbtInputSource, ...]
+    fee_sats: int
+    vsize: int
+
+    def as_original_tx(self) -> OriginalTx:
+        """The pure-builder view — the carried decomposition verbatim
+        (change script + value are both the ORIGINAL's, both-or-neither,
+        re-verified downstream)."""
+        return OriginalTx(
+            inputs=self.inputs,
+            recipients=self.recipients,
+            change_script=self.change_script,
+            change_sats=self.change_sats,
+            fee_sats=self.fee_sats,
+            vsize=self.vsize,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _BumpFundingOption:
+    """One funding-ask choice (TCK-RBF-004): the candidate coin plus its
+    DISPLAY label text. The label strings are user data — terminal material
+    only (the renderer prints them verbatim); they never enter the model
+    transcript (handler results are not injected into prompts) and
+    ``match_terms`` is what the deterministic intercept matches answers
+    against, so the label words never route through the model either."""
+
+    framing: str  # "smallest" | "mid" | "largest" | "coin"
+    value_sats: int
+    coin: PsbtInputSource
+    address: str | None
+    label_display: str | None
+    match_terms: tuple[str, ...]
+
+
+@dataclass
+class _BumpAsk:
+    """An OPEN bump-conversation ask (TCK-RBF-004). ``kind`` is
+    ``"target"`` (several in-flight transactions — index the choice) or
+    ``"funding"`` (change fell short — index a confirmed-coin choice).
+    ``old_txid`` is the verbatim txid the ask belongs to. The REPL's
+    deterministic intercept answers the ask by index; ANY other utterance
+    clears it (never-trap, the UX-004/interrupt discipline).
+
+    ``fee_target`` / ``fee_rate_sat_vb`` carry the fee knob the ask-opening
+    envelope resolved (at most one is set — ``BumpFeeParams`` makes them
+    mutually exclusive), so the answer intercept RE-QUOTES the user's
+    stated urgency rather than silently dropping it to the FAST default
+    (which could stage a bid the user never asked for, or spuriously
+    refuse a floor the explicit rate could fund). The handler re-validates
+    the whole plan on the answer turn, so re-quoting adds no trust surface."""
+
+    kind: str
+    old_txid: str
+    options: tuple[_BumpFundingOption, ...] = ()
+    entries: tuple[dict[str, object], ...] = ()
+    fee_target: str | None = None
+    fee_rate_sat_vb: int | None = None
+
+
+def _bump_ask_fee_kwargs(ask: _BumpAsk) -> dict[str, object]:
+    """The ``BumpFeeParams`` fee-knob kwargs an ask answer must re-quote
+    (TCK-RBF-004): whichever knob the ask opened with, or ``{}`` for a
+    knobless (FAST-default) ask — never an explicit ``None``, which the
+    envelope's present-when-not-omitted validators reject."""
+    if ask.fee_rate_sat_vb is not None:
+        return {"fee_rate_sat_vb": ask.fee_rate_sat_vb}
+    if ask.fee_target is not None:
+        return {"fee_target": ask.fee_target}
+    return {}
+
+
+@dataclass(frozen=True, slots=True)
+class _BumpPending:
+    """A staged replacement awaiting the user's lifecycle decisions
+    (TCK-RBF-004): the pending ``tx_ref`` it was staged under, the verbatim
+    ``old_txid`` it replaces (the broadcast handler's commit-only-on-success
+    lineage write keys on this), and the carried decomposition (re-bumps
+    while it pends rebuild from it)."""
+
+    tx_ref: str
+    old_txid: str
+    original: _BumpOriginal
+
 
 @dataclass
 class SendSession:
@@ -1360,12 +1686,22 @@ class SendSession:
     are the CODE-STAMPED sign-routing choices the user's own words set —
     the deterministic utterance intercepts write them, the ``sign_tx``
     handler reads and consumes them, and the MODEL can never set or clear
-    either (the same session-carried authority as ``gate_decision``,
-    ADR-0013). ``hw_sign_wanted`` latches "sign this flow on my device"
-    until a device sign succeeds, an explicit file export runs, or the
-    flow is cancelled — so a bare "retry" re-probes the device instead of
-    silently exporting. ``file_sign_export_once`` is the one-shot
-    explicit file fallback ("file"/"export" after the device ask).
+    either (gate_decision precedent, ADR-0013). ``hw_sign_wanted`` latches
+    "sign this flow on my device" until a device sign succeeds, an explicit
+    file export runs, or the flow is cancelled — so a bare "retry" re-probes
+    the device instead of silently exporting. ``file_sign_export_once`` is
+    the one-shot explicit file fallback ("file"/"export" after the device
+    ask).
+
+    ``bump_ask`` / ``bump_pending`` / ``bump_bcast_txid`` (TCK-RBF-004) are
+    the bump conversation's dispatcher-owned state: the OPEN
+    target/funding ask the deterministic intercept answers (any other
+    utterance clears it — never-trap), the staged replacement's lineage
+    record (the broadcast handler writes ``record_replacement`` ONLY on a
+    successful broadcast, keyed by the pending ``tx_ref``), and the last
+    successfully broadcast replacement's txid (what arms the post-broadcast
+    "faster"/"slower" rerouting). Code-owned end to end: the model can
+    neither set, read, nor clear any of them.
     """
 
     gate_decision: GateDecision = GateDecision.NOT_A_DECISION
@@ -1374,6 +1710,9 @@ class SendSession:
     label_hint_txid: str | None = None
     hw_sign_wanted: bool = False
     file_sign_export_once: bool = False
+    bump_ask: _BumpAsk | None = None
+    bump_pending: _BumpPending | None = None
+    bump_bcast_txid: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1670,6 +2009,7 @@ def build_dispatch_table(
             seconds_since_last_block_fn=seconds_since_last_block_fn,
             scan_gate=scan_gate,
             settings=app_settings,
+            session=send_session,
         ),
         IntentName.CONFIRM_TX: _make_confirm_tx_handler(tx_flow, send_session),
         IntentName.SIGN_TX: _make_sign_tx_handler(
@@ -1677,7 +2017,7 @@ def build_dispatch_table(
             session=send_session,
         ),
         IntentName.BROADCAST_TX: _make_broadcast_tx_handler(
-            tx_flow, client, store, wallet_id
+            tx_flow, client, store, wallet_id, session=send_session
         ),
         IntentName.TX_STATUS: _make_tx_status_handler(
             client, tx_flow, scan_gate, store=store, wallet_id=wallet_id
@@ -1696,18 +2036,18 @@ def build_dispatch_table(
             seconds_since_last_block_fn=seconds_since_last_block_fn,
             scan_gate=scan_gate,
         ),
-        IntentName.BUMP_FEE: _bump_fee_not_wired,
+        IntentName.BUMP_FEE: _make_bump_fee_handler(
+            store,
+            wallet_id,
+            parsed,
+            tx_flow,
+            fee_estimator if fee_estimator is not None else FeeEstimator(client),
+            scan_fn,
+            send_session,
+            seconds_since_last_block_fn=seconds_since_last_block_fn,
+            scan_gate=scan_gate,
+        ),
     }
-
-
-def _bump_fee_not_wired(envelope: Envelope) -> dict[str, object]:
-    """``bump_fee`` is protocol-registered (TCK-RBF-003) but not yet wired.
-
-    RBF-004 replaces this stub with the real replacement handler. Raising
-    here surfaces a structured ``dispatch_error`` (never a silent no-op) if
-    a ``bump_fee`` envelope ever reaches dispatch before the wiring lands.
-    """
-    raise RuntimeError("bump_fee handler not wired yet (RBF-004)")
 
 
 def _respond_handler(envelope: Envelope) -> dict[str, object]:
@@ -2476,6 +2816,7 @@ def _make_create_tx_handler(
     seconds_since_last_block_fn: Callable[[], int | None] | None = None,
     scan_gate: StartupScan | None = None,
     settings: Settings | None = None,
+    session: SendSession | None = None,
 ) -> Handler:
     """Create the ``create_tx`` handler: stage an unsigned pending transaction.
 
@@ -2608,6 +2949,25 @@ def _make_create_tx_handler(
             return _tx_pending_result(
                 flow, seconds_since_last_block_fn=seconds_since_last_block_fn
             )
+
+        # 1.5 TCK-RBF-004: a re-quote whose staged record is a fee-bump
+        #     replacement is refused — the create_tx pipeline RE-SELECTS
+        #     coins, which is not the BIP-125 shape (the replacement must
+        #     keep ALL the original's inputs + its own added funding).
+        #     Re-bumping the SAME transaction (faster/slower) is the
+        #     bump_fee handler's deterministic intercept; a create_tx
+        #     cannot stand in for it without losing the lineage.
+        if (
+            requote
+            and staged is not None
+            and session is not None
+            and session.bump_pending is not None
+            and session.bump_pending.tx_ref == staged.tx_ref
+        ):
+            return {
+                "error": "bump_requote",
+                "detail": _BUMP_REQUOTE_GUIDANCE,
+            }
 
         # 3 (resolved early — pure, no I/O): fee target for the
         # ceiling/floor guard below and the ladder estimate below. An
@@ -3084,6 +3444,18 @@ def _make_self_transfer_handler(
         if scan_gate is not None and scan_gate.first_scan_incomplete:
             return {"error": "wallet_loading", "detail": WALLET_LOADING_REFUSAL}
 
+        # 0.5 TCK-RBF-004 (CPFP-001 rider): the ``cpfp`` MODE is
+        # grammar-live (TCK-CPFP-001) but its conversation lands with
+        # CPFP-002 — refuse it HERE, step 0.5: BEFORE the
+        # split/consolidate branching (a cpfp envelope would trip the
+        # consolidate ``below_size_sats`` assert) and BEFORE any
+        # fee-estimator call (a cpfp refusal makes zero chain calls).
+        # The clean value-free line mirrors the RBF-003 ``bump_fee``
+        # not-wired precedent; the CPFP-002 ticket replaces this guard
+        # with the real child-pays flow.
+        if params.mode == "cpfp":
+            return {"error": "cpfp_unavailable", "detail": _CPFP_NOT_READY}
+
         # 1. Pending guard: a staged plan is never silently replaced by
         #    another destructive plan (no self-transfer re-quote; see the
         #    docstring). Past-the-gate states stay refused (flow.create's
@@ -3324,9 +3696,618 @@ def _make_self_transfer_handler(
     return handler
 
 
+def _make_bump_fee_handler(
+    store: Store,
+    wallet_id: int,
+    parsed: ParsedKey,
+    flow: TxFlow,
+    fee_estimator: FeeEstimator,
+    scan_fn: Callable[[], object],
+    session: SendSession,
+    *,
+    seconds_since_last_block_fn: Callable[[], int | None] | None = None,
+    scan_gate: StartupScan | None = None,
+) -> Handler:
+    """Create the ``bump_fee`` handler: the BIP-125 replacement conversation.
+
+    TCK-RBF-004 — consumes the landed pieces, rebuilds nothing:
+    :func:`_resolve_in_flight_outgoing` (the pinned RBF-005 resolver — the
+    ONLY target resolution), :func:`~localwallet.tx.replacement.
+    build_replacement_plan` (the pure RBF-002 builder — the ONLY money
+    math; ``estimate_tx_vsize`` semantics carried through the recorded
+    original, never re-measured), and the RBF-001 sanctioned
+    :meth:`~localwallet.store.Store.record_replacement` writer (called by
+    the BROADCAST handler, commit-only-on-success — this handler never
+    touches lineage). The staged replacement rides the SAME
+    create→confirm→sign→broadcast state machine: the dual-key gate and the
+    device handoff are untouched (the record is a plain
+    :class:`~localwallet.tx.flow.PendingTx`; ``session.bump_pending`` is
+    the code-side lineage marker the confirm/sign/broadcast handlers never
+    read).
+
+    Pipeline (every refusal BEFORE any staging; nothing is built unless
+    the whole plan succeeds):
+
+    0. First-scan gate, identical posture to ``create_tx`` (value
+       movement waits for the wallet load). Flow guards: ``CONFIRMED``/
+       ``SIGNED`` → honest busy refusal; ``CREATED`` → refused UNLESS this
+       is a re-bump of the currently staged replacement (the pending bump
+       is replaced through the same commit-only-on-success swap the
+       re-quote uses — never silently coexisting with a second plan).
+    1. Target resolution on a FRESH store read (this is ALSO the
+       mid-conversation recheck: if the original confirmed while an ask
+       stood open, it has left the in-flight set HERE and the honest
+       already-confirmed answer replaces the plan — a replacement of a
+       confirmed transaction is never staged):
+       - 64-hex txid → resolved directly when in flight;
+       - a non-txid reference with exactly ONE in-flight transaction →
+         assume-and-name-it (the resolver's single semantics, the txid
+         quoted verbatim);
+       - several in flight and nothing naming one → the INDEXED CHOICE ASK
+         (never guess);
+       - nothing in flight → the honest empty refusal.
+    2. Fee bid: the envelope's knobs exactly like ``create_tx`` — an
+       explicit ``fee_rate_sat_vb`` scales ×100 (the ONE edge that sees
+       centisat); a ``fee_target`` rung rides the shared estimator; NO
+       stated knob defaults to FAST (documented RBF-004 decision: a bump
+       IS a stated urgency — the MEDIUM default belongs to ordinary
+       sends). The estimator is called only after the target resolved,
+       so every early refusal makes ZERO chain calls.
+    3. Decomposition of the recorded original (the app-layer job RBF-002
+       documented): from the flow's retained record (terminal BROADCAST —
+       the transaction this app last broadcast) or, for a re-bump, from
+       the carried :class:`_BumpOriginal`. A txid the app cannot rebuild
+       is refused honestly — the store keeps no inputs/outputs and no raw
+       transaction is fetched (this module never touches the chain).
+       Multi-output plans (a self-transfer SPLIT) are refused (their
+       bump needs the plan-aware revalidation path — adjacent work,
+       ledgered); a single-output reshuffle rides the ordinary shape.
+    4. Funding (BIP-125 rule 2 — the replacement may only ADD CONFIRMED
+       coins): CHANGE FIRST — the plan builder is tried with no added
+       coin; its change paths (trim/fold) are the change paying. When the
+       change alone cannot reach the floor, a chooser over the wallet's
+       CONFIRMED coins ONLY opens (unconfirmed coins — including the
+       original's own pending change — are never offered and never
+       silently used; the original's inputs are excluded). Framing:
+       smallest / mid / largest, the user's coin labels printed verbatim
+       for the terminal — labels never reach the model (handler results
+       are not prompt context, and answers route through the
+       deterministic intercept). The ask is probed with the LARGEST
+       confirmed coin FIRST: when even it cannot reach the floor, the
+       honest refusal carries the sanctioned floor number instead of
+       asking a question nothing can answer. An explicit ``funding_ref``
+       (framing word, offered number, or coin address) skips the ask.
+       The floor refusal's sats figures ride STRUCTURED keys (the
+       ``insufficient_funds`` / ADR-0012 §7 precedent), never a log-bound
+       detail string.
+    5. Staging: a FRESH change index (derive → build → allocate → stage —
+       ``create_tx`` step 5's exact discipline, so the sign-time
+       independent re-derivation re-check holds for the replacement too),
+       the SAME pure PSBT builder, then the flow swap (a terminal BROADCAST
+       is reset to IDLE ONLY when the replacement is already fully built;
+       a CREATED re-bump replaces directly). ``session.bump_pending``
+       carries the lineage to the broadcast handler.
+
+    Narration contract: the result carries the plan card's verbatim fields
+    (``replaces``/``old_fee_sats``/``fee_delta_sats`` from the builder's
+    output); the renderer prints the fixed hedge + fee-delta rows.
+    """
+
+    def _floor_refusal(exc: RbfFloorError) -> dict[str, object]:
+        """The sanctioned floor-number refusal: the builder's own
+        ``floor_sats``/``max_payable_sats``, structured (never a detail
+        string carrying values)."""
+        return {
+            "error": "bump_floor_unreachable",
+            "reason": str(exc.reason.value),
+            "floor_sats": exc.floor_sats,
+            "max_payable_sats": exc.max_payable_sats,
+            "detail": "the replacement cannot be funded at this rate",
+        }
+
+    def _decompose(rec: PendingTx) -> _BumpOriginal | None:
+        """The app-layer decomposition RBF-002 documented: the flow's own
+        staged PSBT (dispatcher-owned bytes, built by this app at create
+        time) parsed into the pure builder's :class:`OriginalTx` inputs —
+        prevout coins with their wallet derivation coordinates, the
+        payment outputs verbatim in order, and the recorded change pair.
+        Any gap (no witness UTXO, no derivation, a change scalar that
+        disagrees with the PSBT) is a fail-closed ``None`` — a corrupt
+        record never feeds money math. The vsize is the RECORDED ESTIMATE
+        carried through (the RBF-002 contract trap: never treated as
+        measured, never re-measured). Output-script SHAPE is not inspected
+        here — the pure builder's conservation check plus its vsize
+        re-derivation (``tx.replacement``, ``estimate_tx_vsize``) is the
+        shape authority, so a non-P2WPKH reshuffle fails closed there,
+        not in this decomposition."""
+        try:
+            psbt = PSBT.parse(base64.b64decode(rec.psbt_base64))
+        except Exception:  # noqa: BLE001 — containment: embit parse errors vary; the record is ours, a failure here is value-free by construction
+            return None
+        if len(psbt.tx.vin) != len(psbt.inputs):
+            return None
+        coins: list[PsbtInputSource] = []
+        for vin, scope in zip(psbt.tx.vin, psbt.inputs):
+            if scope.witness_utxo is None or not scope.bip32_derivations:
+                return None
+            path = next(iter(scope.bip32_derivations.values())).derivation
+            if len(path) < 2:
+                return None
+            branch, index = int(path[-2]), int(path[-1])
+            if branch not in (0, 1) or index < 0:
+                return None
+            coins.append(
+                PsbtInputSource(
+                    txid=bytes(reversed(vin.txid)).hex(),
+                    vout=vin.vout,
+                    value_sats=scope.witness_utxo.value,
+                    script_pubkey=bytes(scope.witness_utxo.script_pubkey.data),
+                    branch=branch,
+                    index=index,
+                )
+            )
+        outs = [(bytes(o.script_pubkey.data), o.value) for o in psbt.tx.vout]
+        if rec.change_sats is not None:
+            if len(outs) < 2 or outs[-1][1] != rec.change_sats:
+                return None
+            change_script, change_sats = outs[-1]
+            recipients = tuple(outs[:-1])
+        else:
+            change_script, change_sats = None, None
+            recipients = tuple(outs)
+        if not coins or not recipients:
+            return None
+        return _BumpOriginal(
+            recipients=recipients,
+            change_script=change_script,
+            change_sats=change_sats,
+            inputs=tuple(coins),
+            fee_sats=rec.fee_sats,
+            vsize=rec.vsize,
+        )
+
+    def _confirmed_candidates(
+        original: _BumpOriginal,
+    ) -> tuple[list[_BumpFundingOption], dict[str, object] | None]:
+        """The funding pool: CONFIRMED coins only (BIP-125 rule 2 — an
+        added input must be confirmed; the original's own pending change
+        is unconfirmed and therefore never in this set), minus every
+        outpoint the original already spends. Unusable rows (no address,
+        no derivation record, foreign wallet) are DROPPED — a coin that
+        cannot be built into the replacement is never offered (the
+        chooser only offers what it can fund)."""
+        try:
+            if store.get_sync_state(wallet_id, wallet_scan.CURSOR_KEY) is None:
+                try:
+                    scan_fn()
+                except (ChainError, wallet_scan.ScanError, WatchKeyError) as exc:
+                    # detail is scrubbed by the chain/scan layers — safe verbatim.
+                    return [], {"error": "chain_unavailable", "detail": str(exc)}
+            utxo_rows = store.get_utxos_for_wallet(wallet_id)
+            label_rows = store.get_coin_labels(wallet_id)
+            by_address = {
+                r.address: r
+                for r in (
+                    store.get_by_address(u.address)
+                    for u in utxo_rows
+                    if u.address and u.confirmed == 1
+                )
+                if r is not None
+            }
+        except (StoreError, sqlite3.Error) as exc:
+            return [], _store_error(exc)
+        spent = {(c.txid.lower(), c.vout) for c in original.inputs}
+        labels = {
+            (row.txid.lower(), row.vout): row for row in label_rows
+        }
+        coins: list[_BumpFundingOption] = []
+        for u in utxo_rows:
+            if u.confirmed != 1 or not u.address:
+                continue
+            key = (u.txid.lower(), u.vout)
+            if key in spent:
+                continue
+            record = by_address.get(u.address)
+            if record is None or record.wallet_id != wallet_id or record.branch not in (0, 1):
+                continue
+            try:
+                script = bytes(address_to_scriptpubkey(u.address).data)
+            except Exception:  # noqa: BLE001,S112 — containment: a junk address row simply leaves the offerable set (value-free); the chooser only offers what it can fund, silently SKIPPING a broken row is the documented policy
+                continue
+            label = labels.get(key)
+            display: str | None = None
+            terms: tuple[str, ...] = ()
+            if label is not None:
+                bits = [*label.tags] + ([label.note] if label.note else [])
+                if bits:
+                    display = ", ".join(f"'{bit}'" for bit in bits)
+                    terms = tuple(
+                        word
+                        for bit in bits
+                        for word in bit.lower().split()
+                        if word
+                    )
+            coins.append(
+                _BumpFundingOption(
+                    framing="",
+                    value_sats=u.value_sats,
+                    coin=PsbtInputSource(
+                        txid=u.txid,
+                        vout=u.vout,
+                        value_sats=u.value_sats,
+                        script_pubkey=script,
+                        branch=record.branch,
+                        index=record.index,
+                    ),
+                    address=u.address,
+                    label_display=display,
+                    match_terms=terms,
+                )
+            )
+        coins.sort(key=lambda o: (o.value_sats, o.coin.txid.lower(), o.coin.vout))
+        return coins, None
+
+    def _resolve_funding_ref(
+        ref: str, coins: list[_BumpFundingOption], ask: _BumpAsk | None
+    ) -> _BumpFundingOption | None:
+        """Model-quoted ``funding_ref`` → a candidate: the offered number
+        from the ask that opened (the deterministic intercept quotes it),
+        a framing word (self-describing over the full confirmed set), or
+        an exact coin address. Anything else is ``None`` (the caller
+        re-asks — never a guessed coin)."""
+        text = ref.strip()
+        lowered = text.lower()
+        if ask is not None and ask.kind == "funding" and text.isdigit():
+            index = int(text)
+            if 1 <= index <= len(ask.options):
+                return ask.options[index - 1]
+            return None
+        # Framing word: THE shared vocab (:data:`_BUMP_FRAMING_SYNONYMS`,
+        # also consulted by the deterministic answer intercept), reduced to
+        # a position over the full confirmed set — the laziest single
+        # source of truth for the chooser's synonyms.
+        for framing, synonyms in _BUMP_FRAMING_SYNONYMS.items():
+            if lowered in synonyms:
+                if framing == "mid":
+                    return coins[len(coins) // 2]
+                if framing == "largest":
+                    return coins[-1]
+                return coins[0]  # "smallest"
+        for option in coins:
+            if option.address == text:
+                return option
+        return None
+
+    def _stage(
+        original: _BumpOriginal,
+        rec: PendingTx,
+        plan: ReplacementPlan,
+        old_txid: str,
+        rung: FeeTarget | None,
+    ) -> dict[str, object]:
+        """Build + stage the replacement (fail-closed; the flow record is
+        touched ONLY after the full PSBT build and address bookkeeping
+        succeeded — commit-only-on-success through and through). The
+        plan's coins are already :class:`PsbtInputSource` objects (the
+        decomposition's or a candidate's), so the builder consumes them
+        unchanged; the change rides a FRESH branch-1 index like every
+        ordinary send's (the sign-time independent re-derivation then
+        holds for the replacement exactly as for a create)."""
+        rate_c = plan.fee_rate_centisat_vb
+        change_address: str | None = None
+        change_index: int | None = None
+        try:
+            if plan.change_sats is not None:
+                change_index = store.get_derivation(wallet_id, BRANCH_CHANGE).next_index
+                change_address = BranchDeriver(parsed, BRANCH_CHANGE).address(change_index)
+            build_recipients: list[tuple[bytes, int]] = list(plan.outputs)
+            if plan.change_sats is not None:
+                build_recipients = build_recipients[:-1]
+            purpose = SCRIPT_PURPOSES[parsed.script_type]
+            psbt, meta = build_unsigned_psbt(
+                list(plan.inputs),
+                build_recipients,
+                change_address,
+                plan.change_sats,
+                account_key=parsed.hd_key,
+                account_fingerprint=parsed.hd_key.my_fingerprint,
+                account_path=(purpose + 2**31, MAINNET_COIN_TYPE + 2**31, 2**31),
+                change_index=change_index,
+            )
+            psbt_base64 = psbt_to_base64(psbt)
+        except PsbtError as exc:
+            return {"error": "psbt_failed", "detail": str(exc)}
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+        except Exception:  # noqa: BLE001 — containment: embit/derivation errors vary; re-raising could leak record material
+            return {"error": "internal", "detail": "replacement psbt could not be built"}
+
+        try:
+            if change_address is not None and change_index is not None:
+                store.upsert_batch(
+                    [
+                        AddressRecord(
+                            wallet_id=wallet_id,
+                            branch=BRANCH_CHANGE,
+                            index=change_index,
+                            address=change_address,
+                            script_type=parsed.script_type,
+                            status=ADDRESS_ALLOCATED,
+                        )
+                    ]
+                )
+                store.allocate(wallet_id, BRANCH_CHANGE, change_index)
+                store.bump_next_index(wallet_id, BRANCH_CHANGE)
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+
+        try:
+            if flow.state is TxFlowStatus.BROADCAST:
+                # The ORIGINAL's lifecycle is complete (terminal); the
+                # replacement starts its own full ride through the SAME
+                # state machine (ADR-0013 untouched — the reset only
+                # clears the finished flow's records, which this handler
+                # has already decomposed).
+                flow.reset()
+            pending = flow.create(
+                amount_sats=rec.amount_sats,
+                recipient=rec.recipient,
+                fee_rate_centisat_vb=rate_c,
+                fee_sats=plan.fee_sats,
+                psbt_base64=psbt_base64,
+                inputs_count=len(plan.inputs),
+                vsize=meta.vsize,
+                fee_target=rung.value if rung is not None else None,
+                change_sats=plan.change_sats,
+            )
+        except FlowError:
+            # Lost-the-race backstop (single-threaded unreachable after the
+            # guards): fail closed, the staged/recorded flow untouched.
+            return {"error": "bump_flow_busy", "detail": _BUMP_FLOW_BUSY}
+
+        session.bump_pending = _BumpPending(pending.tx_ref, old_txid, original)
+        session.bump_ask = None
+        eta = _eta_for(pending.fee_target, seconds_since_last_block_fn=seconds_since_last_block_fn)
+        return {
+            "bump": True,
+            "replaces": old_txid,
+            "bump_mode": plan.mode.value,
+            "tx_ref": pending.tx_ref,
+            "amount_sats": pending.amount_sats,
+            "recipient": pending.recipient,
+            "fee_sats": pending.fee_sats,
+            # Plan-card delta fields, verbatim builder output (the renderer
+            # prints them; the model never sees results at all).
+            "old_fee_sats": original.fee_sats,
+            "fee_delta_sats": plan.fee_sats - original.fee_sats,
+            "fee_rate_centisat_vb": pending.fee_rate_centisat_vb,
+            "fee_rate_display": format_sat_vb(pending.fee_rate_centisat_vb),
+            "vsize": pending.vsize,
+            "change_sats": pending.change_sats,
+            "inputs_count": pending.inputs_count,
+            "usd_cents": None,
+            "rate_stale": False,
+            "rate_age_s": None,
+            "rate_fetched_at": None,
+            "fee_target": pending.fee_target,
+            # A bump card never pitches the send speed-offer tail (the
+            # urgency was stated by asking for the bump); the re-bump
+            # route is the deterministic faster/slower intercept.
+            "fee_target_defaulted": False,
+            "fee_requote": False,
+            "expires_in_s": PENDING_TTL_S,
+            **({} if eta is None else eta),
+        }
+
+    def handler(envelope: Envelope) -> dict[str, object]:
+        params = envelope.params
+        if not isinstance(params, BumpFeeParams):
+            return {"error": "internal", "detail": "bump_fee params shape mismatch"}
+
+        # A fresh bump_fee envelope SUPERSEDES any open ask: the prior ask
+        # is captured for THIS call's number resolution and cleared here
+        # (every refusal path below then honestly leaves nothing open; a
+        # new ask is installed only by this call's own ask branch). The
+        # intercept dispatch always arrives with the ask open — digits
+        # resolve against ``prior_ask``.
+        prior_ask = session.bump_ask
+        session.bump_ask = None
+
+        # 0. First-scan gate (ADR-0022 decision 6) — same line, same
+        #    position as create_tx: refusal BEFORE any network/store work.
+        if scan_gate is not None and scan_gate.first_scan_incomplete:
+            return {"error": "wallet_loading", "detail": WALLET_LOADING_REFUSAL}
+        # 0.5 Flow posture: past-the-gate lifecycle states are busy (never
+        #     abandon a committed plan); a pending plan is refused UNLESS
+        #     this is a re-bump of the staged replacement itself (whose
+        #     pending this handler may replace, commit-only-on-success).
+        if flow.state in (TxFlowStatus.CONFIRMED, TxFlowStatus.SIGNED):
+            return {"error": "bump_flow_busy", "detail": _BUMP_FLOW_BUSY}
+        rebump = (
+            flow.state is TxFlowStatus.CREATED
+            and session.bump_pending is not None
+            and flow.pending is not None
+            and flow.pending.tx_ref == session.bump_pending.tx_ref
+        )
+        if flow.state is TxFlowStatus.CREATED and not rebump:
+            return _tx_pending_result(
+                flow, seconds_since_last_block_fn=seconds_since_last_block_fn
+            )
+
+        # 1. Target resolution — the pinned RBF-005 resolver on a FRESH
+        #    store read (the mid-conversation confirmation recheck IS this
+        #    step: a confirmed/retired original has left the in-flight set
+        #    and can never be staged against).
+        try:
+            rows = store.get_txs_for_wallet(wallet_id)
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+        entries = _resolve_in_flight_outgoing(rows)
+        by_txid = {str(entry["txid"]): entry for entry in entries}
+        target = params.target.strip()
+        old_txid: str | None = None
+        if _BUMP_HEX64_RE.fullmatch(target):
+            if target in by_txid:
+                old_txid = target
+            else:
+                row = next((r for r in rows if r.txid == target), None)
+                if row is not None and row.height is not None:
+                    return {"error": "bump_already_confirmed", "detail": _BUMP_ALREADY_CONFIRMED}
+                if row is not None and target in superseded_states(rows):
+                    # Lineage already settled (replaced: its bump confirmed
+                    # — or this targeted the bump and the original won).
+                    # Either way there is nothing further to bump; the
+                    # lineage-aware tx_status copy narrates the detail.
+                    return {"error": "bump_already_confirmed", "detail": _BUMP_ALREADY_SETTLED}
+                return {"error": "bump_nothing_in_flight", "detail": _BUMP_NOTHING_IN_FLIGHT}
+        elif len(entries) == 1:
+            # The resolver's assume-and-name-it semantics: the reference
+            # cannot be checked against a txid, but there is exactly one
+            # in-flight transaction — proceed with IT, quoted verbatim.
+            old_txid = str(entries[0]["txid"])
+        elif len(entries) >= 2:
+            # Never guess: the indexed choice ask (entries verbatim from
+            # the resolver — amounts may be honest NULLs, never invented).
+            session.bump_ask = _BumpAsk(
+                kind="target",
+                old_txid="",
+                entries=tuple(entries),
+                fee_target=params.fee_target,
+                fee_rate_sat_vb=params.fee_rate_sat_vb,
+            )
+            return {
+                "bump": True,
+                "ask": "target",
+                "options": [dict(entry) for entry in entries],
+            }
+        else:
+            return {"error": "bump_nothing_in_flight", "detail": _BUMP_NOTHING_IN_FLIGHT}
+        assert old_txid is not None  # every branch above resolves or returns
+
+        # 1.5 A pending plan is replaced by a bump ONLY when that bump is
+        #     the SAME lineage (the staged replacement re-bumping its own
+        #     original). Any other target while a plan pends is the busy
+        #     refusal — a different bump never silently replaces it.
+        if (
+            flow.state is TxFlowStatus.CREATED
+            and session.bump_pending is not None
+            and old_txid != session.bump_pending.old_txid
+        ):
+            return _tx_pending_result(
+                flow, seconds_since_last_block_fn=seconds_since_last_block_fn
+            )
+
+        # 2. Fee bid (only AFTER the target resolved — refusals above made
+        #    zero chain calls). An explicit user-quoted rate is taken
+        #    verbatim (×100 at this edge, the FEE-003 precedent, no rung
+        #    recorded); a stated rung rides the shared estimator; nothing
+        #    stated defaults to FAST (asking for a bump IS a stated
+        #    urgency — see the docstring).
+        if params.fee_rate_sat_vb is not None:
+            rate_c = params.fee_rate_sat_vb * 100
+            rung: FeeTarget | None = None
+        else:
+            rung = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.FAST
+            try:
+                rate_c = fee_estimator.estimate(rung).rate_centisat_vb
+            except ChainError as exc:
+                return {"error": "chain_unavailable", "detail": str(exc)}
+
+        # 3. Decomposition of the recorded original (from the carried
+        #    re-bump record, else the flow's retained broadcast record —
+        #    the ONLY source this app has: the store keeps no inputs and
+        #    no raw transaction is fetched).
+        rec = flow.pending if rebump and flow.pending is not None else flow.confirmed
+        if rec is None:
+            return {"error": "bump_unrecorded", "detail": _BUMP_UNRECORDED}
+        if rebump:
+            assert session.bump_pending is not None
+            original = session.bump_pending.original
+        else:
+            if flow.state is not TxFlowStatus.BROADCAST or flow.txid != old_txid:
+                return {"error": "bump_unrecorded", "detail": _BUMP_UNRECORDED}
+            decomposed = _decompose(rec)
+            if decomposed is None:
+                return {"error": "bump_unrecorded", "detail": _BUMP_UNRECORDED}
+            original = decomposed
+        if len(original.recipients) > 1:
+            return {"error": "bump_multi_output", "detail": _BUMP_MULTI_OUTPUT}
+
+        oo = original.as_original_tx()
+
+        # 4. Funding — CHANGE FIRST (the user rule): the change-only plan
+        #    (trim/fold shapes) is tried before any coin is considered.
+        try:
+            plan = build_replacement_plan(oo, rate_c)
+        except RbfFloorError as change_exc:
+            coins, err = _confirmed_candidates(original)
+            if err is not None:
+                return err
+            if not coins:
+                return _floor_refusal(change_exc)
+            # Probe the BEST candidate first: when even the largest
+            # confirmed coin cannot reach the floor, refuse with the
+            # sanctioned number instead of asking a question nothing can
+            # answer (never trap the user into a doomed chooser).
+            try:
+                build_replacement_plan(oo, rate_c, funding_coin=coins[-1].coin)
+            except RbfFloorError as best_exc:
+                return _floor_refusal(best_exc)
+            except ReplacementError:
+                return {"error": "bump_plan_failed", "detail": _BUMP_PLAN_FAILED}
+            chosen: _BumpFundingOption | None = None
+            if params.funding_ref is not None:
+                chosen = _resolve_funding_ref(params.funding_ref, coins, prior_ask)
+                if chosen is None:
+                    return {
+                        "error": "bump_funding_ref",
+                        "detail": _BUMP_ASK_REF_UNRESOLVED,
+                    }
+            if chosen is None:
+                options = tuple(_bump_framed_options(coins))
+                session.bump_ask = _BumpAsk(
+                    kind="funding",
+                    old_txid=old_txid,
+                    options=options,
+                    fee_target=params.fee_target,
+                    fee_rate_sat_vb=params.fee_rate_sat_vb,
+                )
+                return {
+                    "bump": True,
+                    "ask": "funding",
+                    "replaces": old_txid,
+                    "options": [
+                        {
+                            "index": i + 1,
+                            "framing": option.framing,
+                            "value_sats": option.value_sats,
+                            "label": option.label_display,
+                        }
+                        for i, option in enumerate(options)
+                    ],
+                }
+            try:
+                plan = build_replacement_plan(oo, rate_c, funding_coin=chosen.coin)
+            except RbfFloorError as coin_exc:
+                return _floor_refusal(coin_exc)
+            except ReplacementError:
+                return {"error": "bump_plan_failed", "detail": _BUMP_PLAN_FAILED}
+        except ReplacementError:
+            # The recorded original does not add up (fail-closed inside
+            # the pure builder); the value-free line says what it means —
+            # the builder's own messages never reach the UI (they could
+            # carry record scalars on paths the layer never expects).
+            return {"error": "bump_plan_failed", "detail": _BUMP_PLAN_FAILED}
+
+        # 5. Build + stage (the full TxFlow ride continues from CREATED —
+        #    confirm/sign/broadcast handlers unchanged, dual-key intact).
+        return _stage(original, rec, plan, old_txid, rung)
+
+    return handler
+
+
 def _make_confirm_tx_handler(flow: TxFlow, session: SendSession) -> Handler:
     """Create the ``confirm_tx`` handler: CREATED → CONFIRMED under the dual key.
-
     The flow transition requires BOTH keys (ADR-0013): the model's
     ``confirm_tx`` envelope with a ``tx_ref`` matching the pending
     transaction (this handler), AND the CONFIRM classification of the
@@ -3789,8 +4770,23 @@ def _make_broadcast_tx_handler(
     client: ChainClient,
     store: Store,
     wallet_id: int,
+    *,
+    session: SendSession | None = None,
 ) -> Handler:
     """Create the ``broadcast_tx`` handler: SIGNED record → chain backend → BROADCAST.
+
+    TCK-RBF-004 (commit-only-on-success lineage): when the broadcast that
+    just SUCCEEDED is the staged replacement a ``bump_fee`` conversation
+    carried (``session.bump_pending`` names it by ``tx_ref``), the handler
+    writes the lineage through the sanctioned
+    :meth:`~localwallet.store.Store.record_replacement` writer and marks
+    the broadcast as a bump (result ``replaces_txid`` + the session's
+    ``bump_bcast_txid`` that arms the faster/slower reroute). A FAILED
+    broadcast touches nothing (the signed record is kept for retry, the
+    pending is unchanged, no lineage is written); a lineage-WRITE failure
+    after a successful broadcast rides ``store_warning`` (bookkeeping never
+    undoes the money path) with the pending slot cleared (the link is
+    recoverable via ``/label``-style manual state, never a re-broadcast).
 
     Pipeline (TCK-P3-005 / ADR-0013 amendment — broadcast ONLY from
     ``SIGNED``, no skip path past the signing state):
@@ -3902,6 +4898,30 @@ def _make_broadcast_tx_handler(
         except (StoreError, sqlite3.Error) as exc:
             # Bookkeeping must not undo the broadcast: warn, stay BROADCAST.
             result["store_warning"] = f"could not record the transaction in history ({exc})"
+
+        # 4b. RBF lineage write (TCK-RBF-004, commit-only-on-success): this
+        #     broadcast SUCCEEDED and the record it carried is the staged
+        #     fee-bump replacement (one ``tx_ref`` threads pending→confirmed
+        #     →signed→broadcast). Link old→new through the sanctioned
+        #     writer ONLY. A failure is a ``store_warning`` (the money path
+        #     is done) and clears the pending slot (no re-broadcast to retry
+        #     the write; the live tx is tracked regardless).
+        if (
+            session is not None
+            and session.bump_pending is not None
+            and session.bump_pending.tx_ref == params.tx_ref
+        ):
+            bump = session.bump_pending
+            session.bump_pending = None
+            try:
+                store.record_replacement(wallet_id, bump.old_txid, txid)
+            except (StoreError, sqlite3.Error) as exc:
+                result["store_warning"] = (
+                    f"could not record the replacement lineage ({exc})"
+                )
+            else:
+                result["replaces_txid"] = bump.old_txid
+                session.bump_bcast_txid = txid
 
         # 5. Coin-label lineage (TCK-UTXO-001, design doc §1.3): our outputs
         #    inherit the UNION of the wallet's spent inputs' tag sets — a
@@ -4068,6 +5088,23 @@ def _make_tx_status_handler(
     chain failures surface as ``{"error": "chain_unavailable",
     "detail": <scrubbed>}``.
 
+    Backend-dependence note (TCK-RBF-004 review rider): the ``"status 404"``
+    hedge trigger is the Esplora/Bitcoind error dialect. Electrum reports a
+    not-found through a DIFFERENT dialect (:mod:`localwallet.chain.electrum`
+    raises ``request rejected by the server``, not ``status 404``), so on an
+    Electrum backend the 404→hedged-replaced and 404→eventual-consistency
+    branches do NOT fire — the lookup surfaces as an ordinary
+    ``chain_unavailable`` instead. Normalizing the trigger is deferred (the
+    honest smaller-diff is naming the dependence here); the terminal
+    lineage answers above are backend-independent (store-truth, no chain).
+
+    Store-read stand-down (TCK-RBF-004 review rider): when a store IS wired
+    and the lineage read itself fails, this handler returns ``store_error``
+    and stands the lookup down EVEN for a txid with no lineage row (which a
+    pure-chain wiring would have answered). This is the RBF-005 shape, kept
+    (lineage truth and the chain answer share the one read; failing the read
+    means the lineage answer cannot be trusted either — fail closed).
+
     The model obtains the txid to query from the FACTS block
     (``broadcast_txid``, :func:`_flow_facts`) — quoted verbatim, never
     invented.
@@ -4101,6 +5138,14 @@ def _make_tx_status_handler(
                 # hedged replaced copy — never an endless "try again" for a
                 # superseded original. (Live-race shape only: terminal ones
                 # were answered above, without a chain call.)
+                # ponytail: multi-bump chains (T1←T2←T3, each replaced_by
+                # pointing at its direct bump) — this hedged copy names ONE
+                # direct replacement per row, so a query on T1 says "replaced
+                # by T2" even after T2 itself was replaced by T3. The pair it
+                # names (T1, T2) can then both be dead (only T3 ever confirms)
+                # — a hedge-overstatement, never a false "confirmed".
+                # Transitive-closure resolution is future work (one store
+                # walk; unneeded for the single bump the conversation ships).
                 return lineage
             if (
                 flow.txid is not None
@@ -9360,9 +10405,10 @@ class ChainBackendFlow:
             seconds_since_last_block_fn=lambda: _safe_time_since_last_block(client),
             scan_gate=scan.gate if scan is not None else None,
             settings=w.settings,
+            session=w.session,
         )
         w.table[IntentName.BROADCAST_TX] = _make_broadcast_tx_handler(
-            w.flow, client, w.store, w.wallet.id
+            w.flow, client, w.store, w.wallet.id, session=w.session
         )
         w.table[IntentName.TX_STATUS] = _make_tx_status_handler(
             client,
@@ -9381,6 +10427,20 @@ class ChainBackendFlow:
             w.flow,
             fee_estimator,
             scan.scan_now if scan is not None else (lambda: None),
+            seconds_since_last_block_fn=lambda: _safe_time_since_last_block(client),
+            scan_gate=scan.gate if scan is not None else None,
+        )
+        # TCK-RBF-004: bump_fee rides the same shared fee_estimator + the
+        # lazy scan (for the funding candidate set) + the ONE session that
+        # carries the lineage/bump state; rebuilt exactly like self_transfer.
+        w.table[IntentName.BUMP_FEE] = _make_bump_fee_handler(
+            w.store,
+            w.wallet.id,
+            w.parsed,
+            w.flow,
+            fee_estimator,
+            scan.scan_now if scan is not None else (lambda: None),
+            w.session,
             seconds_since_last_block_fn=lambda: _safe_time_since_last_block(client),
             scan_gate=scan.gate if scan is not None else None,
         )
@@ -10984,6 +12044,45 @@ def _dispatch_code_sign_turn(
     return result
 
 
+def _dispatch_code_bump_turn(
+    session: SendSession,
+    line: str,
+    params: BumpFeeParams,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+) -> dict[str, object]:
+    """Shared body of the deterministic bump-conversation intercepts
+    (TCK-RBF-004, the ``_dispatch_code_sign_turn`` pattern): CODE builds
+    the ``bump_fee`` envelope from the dispatcher-owned ask/lineage state
+    (the verbatim txid and choice index as stamped when the ask opened —
+    never a model- or user-supplied reference) and dispatches straight to
+    the handler, whose own guards remain the authority.
+
+    UNLIKE the sign intercepts, the turn is NOT appended to the model
+    transcript: an ask answer may be a coin LABEL word (user data — the
+    §7.10 rule keeps labels out of model context through any channel, and
+    history re-injects user text verbatim on later turns), so the bump
+    conversation rides the transcript-free command/onboarding channel
+    instead. Conversation state flows onward through the dispatcher-owned
+    FACTS (the pending card follows a staged replacement like any other),
+    never through history."""
+    envelope = Envelope(v=0, intent=IntentName.BUMP_FEE, params=params)
+    result = table[IntentName.BUMP_FEE](envelope)
+    _print_turn(
+        AgentTurnResult(
+            status=AgentTurnStatus.OK,
+            envelope=envelope,
+            result=result,
+            user_message=None,
+            turns_used=0,
+        ),
+        output_fn,
+        session=session,
+    )
+    return result
+
+
 def _run_turn(
     loop: AgentLoop,
     flow: TxFlow,
@@ -11119,6 +12218,76 @@ def _run_turn(
         loop, flow, session, line, output_fn, table=table, hwi=hwi
     ):
         return
+    # TCK-RBF-004: the bump conversation's two deterministic intercepts,
+    # BOTH BEFORE the gate and the model (the never-trap / retry precedent).
+    #   (a) An OPEN funding/target ASK: the answer is a number, a framing
+    #       word, or a coin LABEL word (matched HERE against the stored
+    #       label — the label never reaches the model), stamped onto a
+    #       CODE-built ``bump_fee`` envelope and dispatched straight to the
+    #       handler. Any OTHER utterance closes the ask (never-trap) and
+    #       falls through to the ordinary pipeline unchanged.
+    #   (b) After a bump BROADCASTS, a bare "faster"/"slower" routes to a
+    #       NEW bump of the NEW transaction (the existing fee-target
+    #       vocabulary), never to ``create_tx``.
+    ask = session.bump_ask
+    if ask is not None and IntentName.BUMP_FEE in table:
+        choice = _bump_funding_answer(line, ask)
+        if choice is not None:
+            if ask.kind == "target":
+                target = str(ask.entries[choice - 1]["txid"])
+                params = BumpFeeParams(target=target, **_bump_ask_fee_kwargs(ask))
+            else:
+                params = BumpFeeParams(
+                    target=ask.old_txid,
+                    funding_ref=str(choice),
+                    **_bump_ask_fee_kwargs(ask),
+                )
+            _dispatch_code_bump_turn(session, line, params, output_fn, table=table)
+            return
+        # Any other utterance closes a live ask (never-trap) before the
+        # ordinary pipeline sees it.
+        session.bump_ask = None
+    speed = _bump_speed_choice(line)
+    if speed is not None and IntentName.BUMP_FEE in table:
+        if (
+            flow.state is TxFlowStatus.BROADCAST
+            and session.bump_bcast_txid is not None
+            and flow.txid == session.bump_bcast_txid
+        ):
+            # Deliverable 7: a bare speed word right after a bump
+            # broadcast → a NEW bump of the NEW tx (fee-target vocab),
+            # never a create_tx.
+            rung = _bump_next_rung(
+                flow.confirmed.fee_target if flow.confirmed else None, speed
+            )
+            if rung is not None:
+                _dispatch_code_bump_turn(
+                    session,
+                    line,
+                    BumpFeeParams(target=session.bump_bcast_txid, fee_target=rung),
+                    output_fn,
+                    table=table,
+                )
+                return
+        elif (
+            flow.state is TxFlowStatus.CREATED
+            and session.bump_pending is not None
+            and flow.pending is not None
+            and flow.pending.tx_ref == session.bump_pending.tx_ref
+        ):
+            # A speed word while a replacement still PENDING re-bumps the
+            # SAME original at the new rung (the handler's re-bump branch,
+            # commit-only-on-success swap of the staged replacement).
+            rung = _bump_next_rung(flow.pending.fee_target, speed)
+            if rung is not None:
+                _dispatch_code_bump_turn(
+                    session,
+                    line,
+                    BumpFeeParams(target=session.bump_pending.old_txid, fee_target=rung),
+                    output_fn,
+                    table=table,
+                )
+                return
     session.gate_decision = (
         ConfirmGate.classify(line)
         if flow.state is TxFlowStatus.CREATED
@@ -11131,6 +12300,12 @@ def _run_turn(
         # TCK-HW-005 slice C: the device wish belonged to THIS flow — a
         # cancelled flow retires the latch (never leaks onto the next one).
         session.hw_sign_wanted = False
+        # TCK-RBF-004: a cancelled flow also retires any bump conversation
+        # state that belonged to THIS staged replacement (never leaks onto
+        # the next flow). A carried re-bump decomposition is only valid
+        # while its pending lives.
+        session.bump_pending = None
+        session.bump_ask = None
     # Narration-only ETA fact (TCK-P5-002): the mempool hint is computed
     # lazily ONLY when the flow is CREATED (the ETA fact is needed); any
     # failure degrades to no congestion adjustment, never a crash.
@@ -11247,6 +12422,8 @@ def _print_turn(
         _print_create_tx(turn.result or {}, output_fn, session=session)
     elif envelope.intent is IntentName.SELF_TRANSFER:
         _print_self_transfer(turn.result or {}, output_fn, session=session)
+    elif envelope.intent is IntentName.BUMP_FEE:
+        _print_bump_fee(turn.result or {}, output_fn, session=session)
     elif envelope.intent is IntentName.CONFIRM_TX:
         _print_confirm_tx(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.SIGN_TX:
@@ -11570,6 +12747,176 @@ def _print_self_plan(
         output_fn(sanitize_tool_output(line))
 
 
+def _print_bump_fee(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    *,
+    session: SendSession | None = None,
+) -> None:
+    """Narrate a ``bump_fee`` outcome (TCK-RBF-004).
+
+    Success → the replacement PLAN CARD: the gate ask line (byte-identical
+    to the send card's — the dual-key wording is nobody's to change), the
+    two pinned rows (``Replaces: <old txid> — …only one of these two ever
+    will`` and ``Fee: <old> → <new> (paying <delta> extra)``, every figure
+    verbatim from the handler result — the builder's numbers, the FEE-003
+    rate text), To/Pay/From context, and the ``/details`` demotion tail
+    (the full render — Expires/Ref/ETA — cached on ``session`` exactly
+    like the send card's).
+
+    An open ASK (target disambiguation / funding chooser) prints its
+    numbered options with the resolver's/chooser's verbatim fields — the
+    funding card additionally prints each coin's stored LABEL for the
+    terminal (user data, print-only: handler results never enter model
+    context, and answers come back through the deterministic intercept,
+    so a label word never routes through the model).
+
+    Refusals print their dispatcher-owned friendly lines; the floor
+    refusal renders its sanctioned floor number from the STRUCTURED keys
+    (the ``insufficient_funds`` precedent — amounts are card material,
+    never detail-string material).
+    """
+    error = result.get("error")
+    ask = result.get("ask")
+    if error is None and ask == "target":
+        options = result.get("options")
+        count = len(options) if isinstance(options, list) else 0
+        output_fn(sanitize_tool_output(_BUMP_TARGET_HEAD.format(count=count)))
+        if isinstance(options, list):
+            for entry in options:
+                if not isinstance(entry, dict):  # pragma: no cover — handler-shaped
+                    continue
+                txid = str(entry.get("txid", ""))
+                short = f"{txid[:12]}…" if txid else "tx <unknown>"
+                amount = entry.get("amount_sats")
+                amount_part = (
+                    f"{amount:,} sats"
+                    if isinstance(amount, int) and not isinstance(amount, bool)
+                    else "amount not recorded"
+                )
+                rate_c = entry.get("fee_rate_centisat_vb")
+                rate_part = (
+                    f"{format_sat_vb(rate_c)} sat/vB"
+                    if isinstance(rate_c, int) and not isinstance(rate_c, bool)
+                    else "rate not recorded"
+                )
+                age = entry.get("age_s")
+                age_part = (
+                    f"~{max(1, int(age) // 60)} min old"
+                    if isinstance(age, int) and not isinstance(age, bool)
+                    else "age not recorded"
+                )
+                output_fn(
+                    sanitize_tool_output(
+                        f"  {entry.get('index')}. tx {short} · {amount_part} · "
+                        f"{rate_part} · {age_part}"
+                    )
+                )
+        return
+    if error is None and ask == "funding":
+        output_fn(sanitize_tool_output(_BUMP_FUNDING_HEAD))
+        options = result.get("options")
+        if isinstance(options, list):
+            for entry in options:
+                if not isinstance(entry, dict):  # pragma: no cover — handler-shaped
+                    continue
+                framing = str(entry.get("framing", "")) or "coin"
+                value = entry.get("value_sats")
+                value_part = (
+                    f"{value:,} sats"
+                    if isinstance(value, int) and not isinstance(value, bool)
+                    else "amount not recorded"
+                )
+                line = f"  {entry.get('index')}. {framing} — {value_part}"
+                label = entry.get("label")
+                if isinstance(label, str) and label:
+                    line += f" · labeled {label}"
+                output_fn(sanitize_tool_output(line))
+        output_fn(sanitize_tool_output(_BUMP_FUNDING_TAIL))
+        return
+    if error == "bump_floor_unreachable":
+        floor = result.get("floor_sats")
+        payable = result.get("max_payable_sats")
+        floor_part = f"{floor:,}" if isinstance(floor, int) and not isinstance(floor, bool) else ""
+        payable_part = (
+            f"{payable:,}" if isinstance(payable, int) and not isinstance(payable, bool) else ""
+        )
+        reason = result.get("reason")
+        if reason == "rate_below_floor":
+            output_fn(sanitize_tool_output(_BUMP_FLOOR_RATE.format(floor_sats=floor_part)))
+        elif reason == "rate_exceeds_funding":
+            output_fn(
+                sanitize_tool_output(
+                    _BUMP_FLOOR_EXCEEDS.format(
+                        max_payable_sats=payable_part, floor_sats=floor_part
+                    )
+                )
+            )
+        else:
+            output_fn(sanitize_tool_output(_BUMP_FLOOR_FUNDING.format(floor_sats=floor_part)))
+        return
+    if error == "wallet_loading":
+        output_fn(sanitize_tool_output(str(result.get("detail", "")) or WALLET_LOADING_REFUSAL))
+        return
+    if error is not None:
+        friendly = {
+            "bump_nothing_in_flight",
+            "bump_already_confirmed",
+            "bump_unrecorded",
+            "bump_multi_output",
+            "bump_flow_busy",
+            "bump_funding_ref",
+            "bump_plan_failed",
+        }
+        if error in friendly:
+            # The refusal IS the UX: the handler's code-owned friendly line.
+            output_fn(sanitize_tool_output(str(result.get("detail", "")).strip()))
+            return
+        output_fn(sanitize_tool_output(_error_line(result, "Could not prepare the fee bump")))
+        return
+    # Success: the replacement plan card.
+    old_txid = str(result.get("replaces", ""))
+    old_fee = _card_sats(result, "old_fee_sats")
+    new_fee = _card_sats(result, "fee_sats")
+    delta = _card_sats(result, "fee_delta_sats")
+    lines: list[str] = [_CARD_ASK_LINE]
+    if old_txid:
+        lines.append(_BUMP_REPLACES_LINE.format(old_txid=old_txid))
+    amount = _card_sats(result, "amount_sats")
+    lines.append(f"To: {result.get('recipient', '')}")
+    lines.append(f"Pay: {amount} sats" if amount is not None else "Pay: unavailable")
+    if old_fee is not None and new_fee is not None and delta is not None:
+        lines.append(
+            _BUMP_FEE_LINE.format(old_fee=old_fee, new_fee=new_fee, delta=delta)
+        )
+    rate = _card_fee_rate_text(result)
+    if rate is not None:
+        lines.append(f"Rate: {rate} sat/vB · {result.get('vsize', '')} vB")
+    eta_wording = result.get("eta_wording")
+    if isinstance(eta_wording, str) and eta_wording:
+        lines.append(f"ETA: {eta_wording}")
+    sources = result.get("inputs_count")
+    if isinstance(sources, int) and not isinstance(sources, bool):
+        lines.append(f"From: your wallet ({sources:,} source{'s' if sources != 1 else ''})")
+    else:
+        lines.append("From: your wallet (sources unavailable)")
+    lines.append(_CARD_DETAILS_TAIL)
+    for line in lines:
+        output_fn(sanitize_tool_output(line))
+    if session is not None:
+        full = lines[:-1]
+        expires = result.get("expires_in_s")
+        if isinstance(expires, int) and not isinstance(expires, bool):
+            full.append(f"Expires: ~{expires // 60} min")
+        ref = result.get("tx_ref")
+        if isinstance(ref, str) and ref:
+            full.append(
+                f"Ref: {ref} — names this pending transaction if you ask to "
+                "cancel or reprint it before it expires."
+            )
+        session.card_render = full
+
+
 def _print_self_transfer(
     result: Mapping[str, object],
     output_fn: Callable[[str], None],
@@ -11602,6 +12949,11 @@ def _print_self_transfer(
         return
     if error == "self_split_below_dust":
         output_fn(sanitize_tool_output(_SELF_SPLIT_BELOW_DUST))
+        return
+    if error == "cpfp_unavailable":
+        # TCK-RBF-004 (CPFP-001 rider): the step-0.5 guard's clean value-free
+        # line, printed verbatim (never an error dump).
+        output_fn(sanitize_tool_output(_CPFP_NOT_READY))
         return
     if error == "self_too_many_small":
         output_fn(sanitize_tool_output(_SELF_TOO_MANY_SMALL))
@@ -12123,6 +13475,14 @@ def _print_broadcast_tx(
     if result.get("status") == "broadcast":
         txid = str(result.get("txid", ""))
         output_fn(sanitize_tool_output(f"Sent! txid {txid} — tracking…"))
+        # TCK-RBF-004 supersede narration (ONLY on a broadcast that linked
+        # the lineage — commit-only-on-success): the same BIP-125 hedge
+        # wording the plan card and the status answer carry.
+        replaces = result.get("replaces_txid")
+        if isinstance(replaces, str) and replaces:
+            output_fn(
+                sanitize_tool_output(_BUMP_SUPERSEDE_LINE.format(old_txid=replaces))
+            )
         warning = result.get("store_warning")
         if isinstance(warning, str) and warning.strip():
             output_fn(sanitize_tool_output(f"warning: {warning}"))
