@@ -265,6 +265,7 @@ def test_scan_events_interleave_between_turns_and_persist_on_the_engine(
         (app.EVENT_PROGRESS, "."),
         (app.EVENT_PROGRESS, "."),
         (app.EVENT_PROGRESS, "\n"),
+        (app.EVENT_TURN_END, ""),  # TCK-WEB-024: scan summary closes its own turn
     ]
     # The completion narration is the engine's, after the persist:
     assert outputs == ["Startup scan complete: 0 UTXOs · tip height 0."]

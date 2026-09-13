@@ -643,6 +643,107 @@ def test_scan_dots_are_events_for_non_cli_transports(
     ]
 
 
+def test_scan_and_reply_close_their_own_turns(
+    monkeypatch: pytest.MonkeyPatch, echo_turns: list[str]
+) -> None:
+    """TCK-WEB-024: background narration must not STEAL a later reply's turn
+    anchor. The pump hands ScanFlow the turn-closing ``_narrate_line``
+    wrapper (not the raw output_fn), so the rescan's dots, summary and the
+    reply each close their own turn — the web client can never attach the
+    reply to the narration bubble. Pre-fix, the summary text opened a turn
+    that never closed, so the reply merged into it.
+    """
+
+    def fake_persist(_store: object, _records: object) -> ScanSummary:
+        return _summary()
+
+    monkeypatch.setattr(app.wallet_scan, "persist_scan", fake_persist)
+    events: list[EngineEvent] = []
+    emitter = EventEmitter(events.append)
+    commands: queue.Queue[Any] = queue.Queue()
+    store = Store(None)
+    wallet = store.create_wallet("default", "desc")
+    worker = app.ChainWorker(None)  # client unused: fetch never runs here
+    flow = app.ScanFlow(
+        store, wallet, worker, gap_limit=None, startup_plan=object(), rescan=True
+    )
+    try:
+        for _ in range(3):
+            commands.put(app._ScanTick())
+        commands.put(app._ScanDone(True, object()))
+        commands.put("show me my utxos")
+        commands.put(app.QUIT)
+        app._pump(
+            _make_loop(),
+            emitter.text,
+            commands,
+            flow=TxFlow(),
+            session=app.SendSession(),
+            table={},
+            emitter=emitter,
+            scan=flow,
+        )
+    finally:
+        worker.stop()
+    assert [(e.kind, e.payload) for e in events] == [
+        (EVENT_PROGRESS, "."),
+        (EVENT_PROGRESS, "."),
+        (EVENT_PROGRESS, "."),
+        (EVENT_PROGRESS, "\n"),
+        (EVENT_TEXT, app._rescan_summary_line(_summary())),
+        (EVENT_TURN_END, ""),
+        (app.EVENT_USER_TEXT, "show me my utxos"),
+        (EVENT_TEXT, "echo:show me my utxos"),
+        (EVENT_TURN_END, ""),
+    ]
+    assert echo_turns == ["show me my utxos"]
+
+
+def test_watchkey_replaced_note_closes_its_own_turn() -> None:
+    """TCK-WEB-024: the watchkey-replaced note is narration too — it rides
+    ``_narrate_line`` so it closes its own web turn (a text-opened turn is
+    never left open to swallow a later reply)."""
+    events: list[EngineEvent] = []
+    emitter = EventEmitter(events.append)
+    commands: queue.Queue[Any] = queue.Queue()
+
+    class _Wiring:
+        loop = None
+        flow = None
+        session = None
+        table = None
+        watcher = None
+        client = None
+        store = None
+        scan = None
+        swap = None
+        settings = None
+        hwi = None
+
+    class _Provision:
+        wiring = _Wiring()
+
+        def provision(self, key: str, allow_replace: bool = False) -> dict[str, object]:
+            return {"schema": app.WATCHKEY_SCHEMA, "status": "replaced"}
+
+    commands.put(app.WatchKeyRequest("replaced", "xpub", queue.Queue(), True))
+    commands.put(app.QUIT)
+    app._pump(
+        _make_loop(),
+        emitter.text,
+        commands,
+        flow=TxFlow(),
+        session=app.SendSession(),
+        table={},
+        emitter=emitter,
+        provision=_Provision(),
+    )
+    assert [(e.kind, e.payload) for e in events] == [
+        (EVENT_TEXT, app._WATCHKEY_REPLACED_NOTE),
+        (EVENT_TURN_END, ""),
+    ]
+
+
 def test_cli_sink_renders_events_like_the_pre_web_repl(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

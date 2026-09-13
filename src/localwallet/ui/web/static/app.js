@@ -740,7 +740,16 @@ function humanBytes(bytes) {
   return `${shown} ${units[unit]}`;
 }
 
+// TCK-WEB-024: ANY non-engine bubble closes an open engine turn, so a reply
+// can never amend an earlier bubble regardless of server ordering. Shared
+// with noteTurnEnd (turn_end closes the engine's own turn).
+function closeOpenTurn() {
+  state.openTurn = null;
+  state.progressLine = null;
+}
+
 function appendSystem(text) {
+  closeOpenTurn();
   const turn = el("li", "turn turn-system", text);
   addCopyButton(turn);
   transcriptEl.appendChild(turn);
@@ -750,6 +759,7 @@ function appendSystem(text) {
 }
 
 function appendUser(text, queued) {
+  closeOpenTurn();
   const turn = el("li", "turn turn-user" + (queued ? " turn-queued" : ""));
   turn.appendChild(el("span", "turn-role", "You"));
   if (queued) turn.appendChild(el("span", "turn-queued-tag", LABELS.queuedTag));
@@ -847,8 +857,7 @@ function renderUserText(text) {
 // event exists (kinds are text/progress/turn_end), so turn_end is the
 // reconcile point.
 function noteTurnEnd() {
-  state.openTurn = null;
-  state.progressLine = null;
+  closeOpenTurn();
   const next = state.queue.shift();
   if (next) {
     next.classList.remove("turn-queued");

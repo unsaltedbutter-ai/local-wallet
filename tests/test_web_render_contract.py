@@ -509,8 +509,8 @@ def test_pending_bubble_lifecycle_under_node() -> None:
     fns = [
         re.search(rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL).group(0)
         for name in (
-            "showPendingBubble", "clearPendingBubble", "tailPendingBubble",
-            "renderUserText", "noteTurnEnd",
+            "showPendingBubble", "clearPendingBubble",
+            "tailPendingBubble", "renderUserText", "noteTurnEnd", "closeOpenTurn",
         )
     ]
     script = """
@@ -565,6 +565,7 @@ def test_pending_bubble_lifecycle_under_node() -> None:
       __CLEAR__
       __TAIL__
       __RENDER__
+      __CLOSE__
       __END__
       // 1. remote echo (other tab/CLI): the bubble appears at the tail
       renderUserText("hello from the CLI");
@@ -613,8 +614,146 @@ def test_pending_bubble_lifecycle_under_node() -> None:
         .replace("__CLEAR__", fns[1])
         .replace("__TAIL__", fns[2])
         .replace("__RENDER__", fns[3])
+        .replace("__CLOSE__", fns[5])
         .replace("__END__", fns[4])
     )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# TCK-WEB-024 behavioral check (node if present): background narration can
+# never steal a later reply's turn anchor. The SHIPPED client functions
+# (ensureTurn/appendUser/appendSystem/appendText/appendProgress/renderUserText/
+# noteTurnEnd/closeOpenTurn) run against a moving-child DOM stub across the
+# four real server orderings — a non-engine bubble (user/system) closes any
+# open engine turn (FIX 2), so the reply always lands in its OWN engine turn
+# AFTER the user's bubble, never inside the narration bubble. Plus the
+# client-only pin: even an UNCLOSED background turn (the pre-fix engine
+# stream) cannot re-anchor the reply.
+def test_reply_never_lands_in_the_narration_bubble_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    fns = [
+        re.search(rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL).group(0)
+        for name in (
+            "closeOpenTurn", "ensureTurn", "appendText", "appendProgress",
+            "appendUser", "appendSystem", "noteTurnEnd", "renderUserText",
+            "showPendingBubble", "clearPendingBubble", "tailPendingBubble",
+            "handleEvent",
+        )
+    ]
+    script = """
+      const mkNode = (tag) => ({
+        tag, className: "", textContent: "", attrs: {}, children: [], parent: null,
+        setAttribute(k, v) { this.attrs[k] = v; },
+        appendChild(n) {
+          if (n.parent) {
+            const i = n.parent.children.indexOf(n);
+            if (i !== -1) n.parent.children.splice(i, 1);
+          }
+          n.parent = this; this.children.push(n); return n;
+        },
+        append(...ns) { for (const n of ns) this.appendChild(n); },
+        remove() {
+          if (!this.parent) return;
+          const i = this.parent.children.indexOf(this);
+          if (i !== -1) this.parent.children.splice(i, 1);
+          this.parent = null;
+        },
+        querySelector() { return null; },
+        querySelectorAll() { return []; },
+        get classList() {
+          const self = this;
+          const set = () => new Set(self.className.split(/\\s+/).filter(Boolean));
+          return {
+            add(c) { const s = set(); s.add(c); self.className = [...s].join(" "); },
+            remove(c) { const s = set(); s.delete(c); self.className = [...s].join(" "); },
+            contains(c) { return set().has(c); },
+          };
+        },
+      });
+      globalThis.document = {
+        createElement: (t) => mkNode(t),
+        createTextNode: (d) => {
+          const n = mkNode("#text");
+          n.textContent = d;
+          n.appendData = (s) => { n.textContent += s; };
+          return n;
+        },
+      };
+      const el = (tag, className, text) => {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      };
+      const LABELS = { turnWorking: "Working…" };
+      const hintEl = { hidden: true };
+      const scrollToEnd = () => {};
+      const refreshState = () => {};
+      const addCopyButton = () => {}; // leaf copy control: no ordering effect
+      const appendBubbleText = (line, text) => { line.textContent = text; };
+      const state = { busy: false, openTurn: null, progressLine: null,
+                      downloadLine: null, queue: [], pendingEchos: [],
+                      pendingBubble: null, lastEventId: 0 };
+      const setBusy = (b) => { state.busy = b; };
+      const transcriptEl = mkNode("ol");
+      __FNS__
+      let id = 0;
+      function drive(events) {
+        // fresh transcript + pristine state per interleaving
+        transcriptEl.children.length = 0;
+        state.openTurn = null; state.progressLine = null; state.downloadLine = null;
+        state.queue = []; state.pendingEchos = []; state.pendingBubble = null;
+        state.lastEventId = 0; state.busy = false;
+        for (const [kind, data] of events) handleEvent(++id, kind, data);
+      }
+      const userIdx = () => transcriptEl.children.findIndex(
+        (n) => n.className.includes("turn-user"));
+      const hasText = (n, s) => (n.textContent || "").includes(s) ||
+        n.children.some((c) => hasText(c, s));
+      const replyTurn = () => transcriptEl.children.find(
+        (n) => n.className.includes("turn-engine") && hasText(n, "REPLY"));
+      const narrationTurn = (t) => transcriptEl.children.find(
+        (n) => n.className.includes("turn-engine") && hasText(n, t));
+      function check(label) {
+        const u = userIdx(), r = replyTurn();
+        if (u === -1) throw new Error(label + ": no user bubble");
+        if (!r) throw new Error(label + ": no reply turn");
+        if (transcriptEl.children.indexOf(r) <= u)
+          throw new Error(label + ": reply before user bubble");
+        // the reply must NOT share the narration bubble's engine turn
+        const nTurn = narrationTurn("SCAN") || narrationTurn("WATCH");
+        if (nTurn && r === nTurn) throw new Error(label + ": reply inside narration");
+      }
+      // A: [scan text][turn_end][user][reply][turn_end]
+      drive([["text","SCAN"],["turn_end",""],["user_text","u"],
+             ["text","REPLY"],["turn_end",""]]);
+      check("A");
+      // B: [user][scan text][turn_end][reply][turn_end]
+      drive([["user_text","u"],["text","SCAN"],["turn_end",""],
+             ["text","REPLY"],["turn_end",""]]);
+      check("B");
+      // C: the REAL rescan stream — dots then summary then user then reply.
+      //    (FAILS pre-fix: the summary opened a turn the reply then joined.)
+      drive([["progress","."],["progress","."],["progress","."],
+             ["progress","\\n"],["text","SCAN"],["user_text","u"],
+             ["text","REPLY"],["turn_end",""]]);
+      check("C");
+      // D: [watch text][turn_end][user][reply][turn_end]
+      drive([["text","WATCH"],["turn_end",""],["user_text","u"],
+             ["text","REPLY"],["turn_end",""]]);
+      check("D");
+      // client-only pin: an UNCLOSED background turn (no turn_end marker)
+      // still renders the reply below the user bubble, not inside it.
+      drive([["text","SCAN"],["user_text","u"],["text","REPLY"]]);
+      check("unclosed");
+      console.log("ok");
+    """
+    script = script.replace("__FNS__", "\n".join(fns))
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 

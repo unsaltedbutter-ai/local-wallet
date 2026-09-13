@@ -7555,11 +7555,12 @@ def _pump(
         # wheel's build-time /dev/null dup2 window is process-wide).
         preload.attach(commands)
 
-    def _watch_line(line: str) -> None:
-        # TCK-WEB-011 fold (UX-012 review MINOR): watch narration lines
-        # (failure / recovered / incoming-tx) close their own turn in web
-        # mode, like the startup lines _Output already does — without the
-        # closer they merge into the NEXT reply bubble. Mid-turn narration
+    def _narrate_line(line: str) -> None:
+        # TCK-WEB-011 fold (UX-012 review MINOR): narration lines (watch
+        # failure / recovered / incoming-tx, scan progress/summary/hooks)
+        # close their own turn in web mode, like the startup lines _Output
+        # already does — without the closer they merge into the NEXT reply
+        # bubble and steal its turn anchor (TCK-WEB-024). Mid-turn narration
         # is untouched (it flows through the pump's text channel). The CLI
         # sink ignores the marker: byte-identical terminal output.
         output_fn(line)
@@ -7568,13 +7569,13 @@ def _pump(
 
     while True:
         if not (scan is not None and scan.in_progress):
-            watch_count = _drain_watch(watcher, _watch_line, client=client)
+            watch_count = _drain_watch(watcher, _narrate_line, client=client)
             if watch_count:
                 loop.record_event("watch_events", watch_count)
         if ready is not None:
             ready.set()
         command = commands.get()
-        if scan is not None and scan.handle_command(command, output_fn, emitter):
+        if scan is not None and scan.handle_command(command, _narrate_line, emitter):
             # A swap DEFERRED behind this scan installs now that the worker
             # has delivered (and the engine has persisted) its result — then
             # the swap's own resync occupies the worker again (the pump's
@@ -7625,7 +7626,7 @@ def _pump(
             if reply.get("status") in ("accepted", "replaced"):
                 _adopt_wiring()
                 if reply.get("status") == "replaced":
-                    output_fn(_WATCHKEY_REPLACED_NOTE)
+                    _narrate_line(_WATCHKEY_REPLACED_NOTE)
             continue
         if isinstance(command, StateSnapshotRequest):
             # Typed value-free /state read (TCK-WEB-003), answered ON the engine
@@ -7848,12 +7849,12 @@ def _pump(
         else:
             _run_turn(
                 loop, flow, session, line, output_fn, client=client, table=table,
-                scan_gate=scan.gate if scan is not None else None,
+                scan_gate=scan.gate if scan is not None else None, hwi=hwi,
             )
         if emitter is not None:
             emitter.emit(EVENT_TURN_END)
     if scan is not None:
-        scan.drain_until_complete(output_fn, emitter)
+        scan.drain_until_complete(_narrate_line, emitter)
     if model is not None:
         # Session end (QUIT / process exit): terminate a live download
         # child BOUNDED and join its reader — no orphaned downloader
