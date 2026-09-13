@@ -628,6 +628,9 @@ def test_pending_bubble_lifecycle_under_node() -> None:
         for name in (
             "showPendingBubble", "clearPendingBubble",
             "tailPendingBubble", "renderUserText", "noteTurnEnd", "closeOpenTurn",
+            # TCK-WEB-019: noteTurnEnd now calls announceTurn (the stubbed
+            # querySelector() finds no lines, so it stays inert here).
+            "announceTurn", "lineText",
         )
     ]
     script = """
@@ -649,6 +652,7 @@ def test_pending_bubble_lifecycle_under_node() -> None:
           this.parent = null;
         },
         querySelector() { return null; },
+        querySelectorAll() { return []; },
         get classList() {
           const self = this;
           const set = () => new Set(self.className.split(/\\s+/).filter(Boolean));
@@ -683,6 +687,8 @@ def test_pending_bubble_lifecycle_under_node() -> None:
       __TAIL__
       __RENDER__
       __CLOSE__
+      __ANN__
+      __LINETEXT__
       __END__
       // 1. remote echo (other tab/CLI): the bubble appears at the tail
       renderUserText("hello from the CLI");
@@ -732,6 +738,8 @@ def test_pending_bubble_lifecycle_under_node() -> None:
         .replace("__TAIL__", fns[2])
         .replace("__RENDER__", fns[3])
         .replace("__CLOSE__", fns[5])
+        .replace("__ANN__", fns[6])
+        .replace("__LINETEXT__", fns[7])
         .replace("__END__", fns[4])
     )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
@@ -759,7 +767,7 @@ def test_reply_never_lands_in_the_narration_bubble_under_node() -> None:
             "closeOpenTurn", "ensureTurn", "appendText", "appendProgress",
             "appendUser", "appendSystem", "noteTurnEnd", "renderUserText",
             "showPendingBubble", "clearPendingBubble", "tailPendingBubble",
-            "handleEvent",
+            "handleEvent", "announceTurn", "lineText",
         )
     ]
     script = """
@@ -953,6 +961,194 @@ def test_submit_401_and_stopped_tab_label_the_stale_session_under_node() -> None
       };
       main().catch((e) => { console.error(e); process.exit(1); });
     """.replace("__SUBMIT__", submit_fn).replace("__FORM__", form_listener)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# TCK-WEB-019 static pins: ONE visually-hidden polite live region in the
+# markup (distinct from WEB-026's #copy-status), written ONLY from the
+# turn_end handler — never from appendText/appendProgress/appendUser/
+# appendSystem — with bubbleText's line seam (.turn-text minus
+# .turn-progress/.turn-model), the "\n" join pinned, and textContent-only
+# (createTextNode + replaceChildren; the global sink scan covers innerHTML).
+def test_turn_status_live_region_markup_and_wiring() -> None:
+    html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    nodes = re.findall(r"<p[^>]*id=\"turn-status\"[^>]*>", html)
+    assert len(nodes) == 1, "exactly ONE #turn-status live region"
+    node = nodes[0]
+    assert 'class="visually-hidden"' in node
+    assert 'role="status"' in node and 'aria-live="polite"' in node
+    assert "copy-status" not in node  # distinct from the WEB-026 region
+    assert 'id="turn-status"' not in html.replace(node, "")
+
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    # the ONLY write site is noteTurnEnd, before the turn closes;
+    assert code.count("announceTurn(state.openTurn)") == 1
+    note = code[code.index("function noteTurnEnd"):]
+    note = note[: note.index("\n}")]
+    assert "announceTurn(state.openTurn)" in note
+    assert note.index("announceTurn") < note.index("closeOpenTurn()")
+    # never on user echoes, system lines, progress ticks, or settings paths:
+    for name in ("appendUser", "appendSystem", "appendProgress", "renderUserText"):
+        fn = code[code.index(f"function {name}"):]
+        assert "announceTurn" not in fn[: fn.index("\n}")], name
+    # the line seam: announceTurn selects EXACTLY bubbleText's lines. The two
+    # selector LITERALS are extracted from their own function bodies and
+    # compared for equality (a shared-substring `in` check would let a drift
+    # in either seam pass silently — code-review MINOR).
+    def body_of(name: str) -> str:
+        body = code[code.index(f"function {name}"):]
+        return body[: body.index("\n}")]
+
+    def selector_of(name: str) -> str:
+        found = re.search(r'querySelectorAll\("([^"]+)"\)', body_of(name))
+        assert found, f"{name} lost its querySelectorAll literal"
+        return found.group(1)
+
+    selector = '.turn-text:not(.turn-progress):not(.turn-model)'
+    assert selector_of("bubbleText") == selector_of("announceTurn") == selector
+    fn = body_of("announceTurn")
+    assert 'join("\\n")' in fn  # pinned join shape (same as the copy text)
+    assert "replaceChildren" in fn and "createTextNode" in fn
+
+
+# TCK-WEB-019 behavioral check (node if present): against a DOM stub with a
+# minimal :not() selector, the SHIPPED stream path (handleEvent → text /
+# progress / user_text / turn_end) announces a settled engine turn's text
+# ONCE — progress dots and the model line never reach the region, the user's
+# echo and the pending bubble are excluded by construction, a line-less or
+# already-closed turn stays silent, and a replayed turn_end (the id-guard) is
+# a no-op: exactly one write per turn.
+def test_turn_end_announces_the_settled_turn_once_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    fns = [
+        re.search(rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL).group(0)
+        for name in (
+            "lineText", "announceTurn", "closeOpenTurn", "ensureTurn",
+            "appendText", "appendProgress", "appendUser", "appendSystem",
+            "renderUserText", "showPendingBubble", "clearPendingBubble",
+            "tailPendingBubble", "noteTurnEnd", "handleEvent",
+        )
+    ]
+    script = """
+      const mkNode = (tag, nodeType) => ({
+        tag, nodeType: nodeType || 1, className: "", textContent: "",
+        attrs: {}, children: [], parent: null,
+        get childNodes() { return this.children; },
+        setAttribute(k, v) { this.attrs[k] = v; },
+        appendChild(n) {
+          if (n.parent) {
+            const i = n.parent.children.indexOf(n);
+            if (i !== -1) n.parent.children.splice(i, 1);
+          }
+          n.parent = this; this.children.push(n); return n;
+        },
+        append(...ns) { for (const n of ns) this.appendChild(n); },
+        replaceChildren(...ns) { this.children = []; this.append(...ns); },
+        remove() {
+          if (!this.parent) return;
+          const i = this.parent.children.indexOf(this);
+          if (this.parent) this.parent.children.splice(i, 1);
+          this.parent = null;
+        },
+        querySelector() { return null; },
+        // mini matcher for the ONE selector the shipped seam uses
+        querySelectorAll() {
+          const out = [];
+          const walk = (n) => {
+            for (const c of n.children) {
+              const cs = c.className.split(/\\s+/);
+              if (cs.includes("turn-text") && !cs.includes("turn-progress")
+                  && !cs.includes("turn-model")) out.push(c);
+              walk(c);
+            }
+          };
+          walk(this);
+          return out;
+        },
+        get classList() {
+          const self = this;
+          const set = () => new Set(self.className.split(/\\s+/).filter(Boolean));
+          return {
+            add(c) { const s = set(); s.add(c); self.className = [...s].join(" "); },
+            remove(c) { const s = set(); s.delete(c); self.className = [...s].join(" "); },
+            contains(c) { return set().has(c); },
+          };
+        },
+      });
+      globalThis.Node = { ELEMENT_NODE: 1 };
+      globalThis.document = {
+        createElement: (t) => mkNode(t),
+        createTextNode: (d) => {
+          const n = mkNode("#text", 3);
+          n.textContent = d;
+          n.appendData = (s) => { n.textContent += s; };
+          return n;
+        },
+      };
+      const el = (tag, className, text) => {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      };
+      const LABELS = { turnWorking: "Working…", queuedTag: "queued" };
+      const state = { busy: false, openTurn: null, progressLine: null,
+                      downloadLine: null, queue: [], pendingEchos: [],
+                      pendingBubble: null, lastEventId: 0 };
+      const transcriptEl = mkNode("ol");
+      const turnStatusEl = mkNode("p");
+      const hintEl = { hidden: true };
+      const scrollToEnd = () => {};
+      const refreshState = () => {};
+      const setBusy = (b) => { state.busy = b; };
+      const addCopyButton = () => {};
+      const renderModelProgress = () => {};
+      // the REAL token transform's inert shape: one text child per line
+      const appendBubbleText = (line, text) => {
+        line.appendChild(document.createTextNode(text));
+      };
+      __FNS__
+      let writes = 0;
+      const origReplace = turnStatusEl.replaceChildren.bind(turnStatusEl);
+      turnStatusEl.replaceChildren = (...ns) => { writes++; origReplace(...ns); };
+      const regionText = () => turnStatusEl.children.map((n) => n.textContent).join("");
+      // 1. a settled turn: text + progress dots + second line → announced once
+      handleEvent(1, "user_text", "show balance");
+      handleEvent(2, "text", "Balance: 0.05 BTC");
+      handleEvent(3, "progress", "..dot-telemetry..");
+      handleEvent(4, "text", "across 2 addresses");
+      handleEvent(5, "turn_end", "");
+      if (regionText() !== "Balance: 0.05 BTC\\nacross 2 addresses")
+        throw new Error("announce-content");  // \\n join pinned, dots excluded
+      if (writes !== 1) throw new Error("announce-once");
+      if (turnStatusEl.children.length !== 1) throw new Error("one-node");
+      // 2. mid-stream progress ticks never touch the region
+      handleEvent(6, "user_text", "rescan");
+      handleEvent(7, "progress", "....");
+      handleEvent(8, "progress", "\\n");
+      if (writes !== 1 || regionText() !== "Balance: 0.05 BTC\\nacross 2 addresses")
+        throw new Error("progress-silent");
+      // 3. replay: a duplicate turn_end inside the id guard's window is a
+      //    no-op (handleEvent drops it before noteTurnEnd runs) — once only
+      handleEvent(5, "turn_end", "");
+      handleEvent(9, "text", "Scan done");
+      handleEvent(10, "turn_end", "");
+      if (writes !== 2 || regionText() !== "Scan done") throw new Error("replay-dupe");
+      // 4. a line-less / already-closed turn announces nothing
+      handleEvent(11, "turn_end", "");
+      if (writes !== 2) throw new Error("empty-turn-quiet");
+      // 5. user echo and the pending bubble are never announced: the region
+      //    holds only the engine's settled line (appendUser ran first and
+      //    closed the turn — the "show balance" echo is absent above)
+      if (regionText().includes("show balance")) throw new Error("echo-leak");
+      console.log("ok");
+    """
+    script = script.replace("__FNS__", "\n".join(fns))
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 
