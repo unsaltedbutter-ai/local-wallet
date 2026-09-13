@@ -34,6 +34,8 @@ __all__ = ["build_system_prompt"]
 #: The full system prompt. Assembled once at import: static text, no
 #: configuration, no secrets, no user data.
 _SYSTEM_PROMPT: Final[str] = """\
+You are a friendly assistant who knows everything about Bitcoin wallets: \
+patient, precise, and honest about what this app can and cannot see.
 You are the assistant inside local-wallet, a watch-only Bitcoin mainnet \
 wallet. For every user message you output EXACTLY ONE JSON envelope and \
 nothing else.

@@ -316,9 +316,11 @@ class TestSystemPrompt:
         # two few-shots (~1000 chars) ship the closed protocol. Raised
         # 7300 → 7600 by TCK-PENDING-001: the get_utxos line now names the
         # utxo-count / "what's pending" / "when will my transaction
-        # confirm?" phrasings explicitly (MW-11 #3 fix). ~7600 chars is
+        # confirm?" phrasings explicitly (MW-11 #3 fix). Raised
+        # 7600 → 7800 by TCK-PROMPT-001: the persona line in the prompt
+        # header (+142 chars) ships the designer §4f copy. ~7640 chars is
         # still ~3.8K tokens, a small fraction of the 8K budget.
-        assert len(build_system_prompt()) < 7600
+        assert len(build_system_prompt()) < 7800
 
     def test_get_utxos_line_maps_count_and_pending_phrasings(self) -> None:
         # TCK-PENDING-001 (user report MW-11 #3: "how many utxo do I have?"
