@@ -1,6 +1,6 @@
 """Typed row records for the store layer (TCK-P1-001).
 
-Each frozen dataclass mirrors one table row in the SQLite schema (schema v2,
+Each frozen dataclass mirrors one table row in the SQLite schema (schema v3,
 see :mod:`localwallet.store.db`). The store layer is an internal persistence
 boundary; these records deliberately avoid pydantic to keep the store
 dependency-free (stdlib only: :mod:`dataclasses`, :mod:`collections.abc`).
@@ -215,7 +215,19 @@ class CoinLabelRecord:
 
 @dataclass(frozen=True)
 class TxRecord:
-    """A transaction observed for a wallet (history entry)."""
+    """A transaction observed for a wallet (history entry).
+
+    Schema v3 (TCK-RBF-001) adds four columns, all NULLABLE — a v2-era row
+    keeps NULLs and every reader must treat them as "not recorded", never
+    fabricate. The first three are the broadcast-time capture written by the
+    sign→broadcast handler off the flow's confirmed record (the flow already
+    carries them — this is the one store write that unblocks amount/fee
+    disambiguation lists and the BIP-125 fee delta); ``replaced_by_txid`` is
+    the RBF lineage link (original → replacement), written only by the typed
+    :meth:`~localwallet.store.db.Store.record_replacement` writer. Values in
+    these fields follow the same discipline as every other stored value:
+    verbatim in the database, never in log/exception text.
+    """
 
     wallet_id: int
     txid: str
@@ -224,6 +236,10 @@ class TxRecord:
     fee_sats: int | None
     direction: str
     raw_summary: str | None
+    amount_sats: int | None = None
+    fee_rate_centisat_vb: int | None = None
+    first_seen: int | None = None
+    replaced_by_txid: str | None = None
 
     _COLUMNS: ClassVar[tuple[str, ...]] = (
         "wallet_id",
@@ -233,13 +249,31 @@ class TxRecord:
         "fee_sats",
         "direction",
         "raw_summary",
+        "amount_sats",
+        "fee_rate_centisat_vb",
+        "first_seen",
+        "replaced_by_txid",
     )
 
     @classmethod
     def from_row(cls, row: Any) -> TxRecord:
         return cls(**{col: row[col] for col in cls._COLUMNS})
 
-    def to_row(self) -> tuple[int, str, int | None, int | None, int | None, str, str | None]:
+    def to_row(
+        self,
+    ) -> tuple[
+        int,
+        str,
+        int | None,
+        int | None,
+        int | None,
+        str,
+        str | None,
+        int | None,
+        int | None,
+        int | None,
+        str | None,
+    ]:
         return (
             self.wallet_id,
             self.txid,
@@ -248,7 +282,65 @@ class TxRecord:
             self.fee_sats,
             self.direction,
             self.raw_summary,
+            self.amount_sats,
+            self.fee_rate_centisat_vb,
+            self.first_seen,
+            self.replaced_by_txid,
         )
+
+
+# Superseded-retirement states (TCK-RBF-001): terminal outcomes for the LOSER
+# of a lineage pair (original ↔ replacement via ``replaced_by_txid``). BIP-125
+# rule: exactly one of the pair ever confirms — once one side has a height,
+# the sibling is retired and must exit every pending count (a count that can
+# never go down is a lie).
+SUPERSEDED_REPLACED = "replaced"  # pending original; its replacement confirmed
+SUPERSEDED_EVICTED = "evicted"  # pending replacement; the original confirmed
+
+
+def superseded_states(records: Iterable[TxRecord]) -> dict[str, str]:
+    """The retirement rule, derived — one shared source of truth (pure,
+    store-only, no clock, no network).
+
+    A row is superseded iff it is still pending (``height is None``) AND the
+    chain-truth the scan persists says it lost the race:
+
+    * ``replaced`` — its own ``replaced_by_txid`` points at a row of this
+      wallet that has CONFIRMED (the replacement went through; the original
+      never will).
+    * ``evicted`` — some other row lists THIS txid as its replacement, and
+      that original has CONFIRMED (the bump can no longer take effect).
+
+    Derived, not stored: the rule is a pure function of the (height,
+    ``replaced_by_txid``) data a scan persist already writes inside its
+    single atomic transaction, so retirement can never desync from the
+    confirmed heights — and a reorg that clears a height honestly un-retires
+    the sibling. A link pointing at a txid with no row in the cache retires
+    nothing (we do not know yet — stay pending, never fabricate).
+    ``records`` must be one wallet's rows (a caller-supplied set from
+    :meth:`~localwallet.store.db.Store.get_txs_for_wallet`); txids are
+    unique per wallet, cross-wallet mixing is caller-bug territory.
+    """
+    by_txid = {r.txid: r for r in records}
+    # replacement txid -> the (pending or confirmed) original that names it.
+    # Only the lineage link exists to identify a pair, so the link's SOURCE
+    # row is the original by definition.
+    original_of: dict[str, TxRecord] = {
+        r.replaced_by_txid: r for r in by_txid.values() if r.replaced_by_txid is not None
+    }
+    states: dict[str, str] = {}
+    for r in by_txid.values():
+        if r.height is not None:
+            continue  # confirmed rows are never retired — they WON
+        if r.replaced_by_txid is not None:
+            partner = by_txid.get(r.replaced_by_txid)
+            if partner is not None and partner.height is not None:
+                states[r.txid] = SUPERSEDED_REPLACED
+                continue
+        evictor = original_of.get(r.txid)
+        if evictor is not None and evictor.height is not None:
+            states[r.txid] = SUPERSEDED_EVICTED
+    return states
 
 
 @dataclass(frozen=True)

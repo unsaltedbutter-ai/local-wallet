@@ -209,6 +209,7 @@ from localwallet.store import (
     TxRecord,
     UtxoRecord,
     WalletRecord,
+    superseded_states,
 )
 from localwallet.tx.dust import dust_threshold
 from localwallet.tx.flow import (
@@ -1952,37 +1953,45 @@ def _pending_summary(
     - **Outgoing pending** = transaction rows with ``height is None`` and
       our spend directions (``out``/``self``) — broadcast-but-unconfirmed
       (the history row the broadcast handler writes, plus whatever a
-      scan has since confirmed about direction).
+      scan has since confirmed about direction) — MINUS the superseded
+      rows: once one side of a lineage pair (``replaced_by_txid``,
+      TCK-RBF-001) has confirmed, the sibling is terminal
+      (:func:`~localwallet.store.superseded_states`: ``replaced``/
+      ``evicted``) and exits the count. A pending count that can never
+      go down is a lie; BIP-125 says exactly one of the pair ever will
+      confirm, so the loser retires on the winner's height. The
+      join for incoming exclusion still covers superseded spends (a
+      replaced transaction's own change coin can never come to be — it
+      must not read as an incoming payment).
 
     Documented bounds (the store's fidelity, narrated honestly rather
-    than invented): it records **no amount** for an outgoing transaction
-    (only ``fee_sats``, nullable — not the sent value), **no first-seen
-    timestamp** for any row (so no age line), and **no fee target**, so
-    the eta.py ladder has no honest input here — the confirm-likelihood
-    line is the static :data:`PENDING_NO_ETA_NOTE` degrade, never a
-    fabricated probability or minute figure. Empty dict when nothing is
-    pending (a clean wallet's answer is byte-identical to before).
+    than invented): schema v3 records amount/fee-rate/first-seen only for
+    transactions broadcast by THIS build (legacy rows keep NULL), and the
+    pending block itself carries only counts and verbatim store sums —
+    the confirm-likelihood line is the static
+    :data:`PENDING_NO_ETA_NOTE` degrade, never a fabricated probability
+    or minute figure. Empty dict when nothing is pending (a clean
+    wallet's answer is byte-identical to before).
     """
+    retired = superseded_states(tx_records)
     outgoing = [
         t
         for t in tx_records
         if t.height is None and t.direction in (DIR_OUT, DIR_SELF)
     ]
-    if not outgoing:
-        incoming = [u for u in utxo_records if u.confirmed != 1]
-    else:
-        own_pending_txids = {t.txid for t in outgoing}
-        incoming = [
-            u
-            for u in utxo_records
-            if u.confirmed != 1 and u.txid not in own_pending_txids
-        ]
-    if not incoming and not outgoing:
+    pending_spend_txids = {t.txid for t in outgoing}
+    visible_outgoing = [t for t in outgoing if t.txid not in retired]
+    incoming = [
+        u
+        for u in utxo_records
+        if u.confirmed != 1 and u.txid not in pending_spend_txids
+    ]
+    if not incoming and not visible_outgoing:
         return {}
     return {
         "pending_incoming_count": len(incoming),
         "pending_incoming_sats": sum(u.value_sats for u in incoming),
-        "pending_outgoing_count": len(outgoing),
+        "pending_outgoing_count": len(visible_outgoing),
         # Tool-owned wording; the narration prints it verbatim (the model
         # never authors the estimate — there is none to author).
         "pending_eta_note": PENDING_NO_ETA_NOTE,
@@ -3723,11 +3732,13 @@ def _make_broadcast_tx_handler(
        layer>}`` and the flow STAYS ``SIGNED`` — the signed transaction is
        kept and the user retries; recovery is a cheap GET (``tx_status``),
        never a blind re-POST by us.
-    4. Recording: :meth:`TxFlow.broadcast` (SIGNED → BROADCAST, terminal)
-       with the chain-reported txid, then the outbound transaction is
-       upserted into the store's history (``height=None``,
-       ``direction="out"``, the approved record's fee) so ``get_history``
-       shows it immediately. A store failure becomes a value-free
+     4. Recording: :meth:`TxFlow.broadcast` (SIGNED → BROADCAST, terminal)
+        with the chain-reported txid, then the outbound transaction is
+        upserted into the store's history (``height=None``,
+        ``direction="out"``, the approved record's fee AND — TCK-RBF-001
+        schema v3 capture — the approved record's amount, fee rate, and the
+        broadcast first-seen stamp) so ``get_history`` shows it immediately.
+        A store failure becomes a value-free
        ``store_warning`` result key — the BROADCAST state is preserved
        (the money path succeeded; bookkeeping must not undo it).
 
@@ -3789,6 +3800,20 @@ def _make_broadcast_tx_handler(
                         fee_sats=confirmed.fee_sats if confirmed is not None else None,
                         direction=DIR_OUT,
                         raw_summary=None,
+                        # TCK-RBF-001 broadcast-time capture (schema v3): the
+                        # fields the flow's confirmed record already carries.
+                        # THE one store write that unblocks disambiguation
+                        # lists and the BIP-125 delta; the shared upsert's
+                        # COALESCE preserves them across every later scan.
+                        amount_sats=(
+                            confirmed.amount_sats if confirmed is not None else None
+                        ),
+                        fee_rate_centisat_vb=(
+                            confirmed.fee_rate_centisat_vb
+                            if confirmed is not None
+                            else None
+                        ),
+                        first_seen=int(time.time()),
                     )
                 ]
             )

@@ -43,6 +43,7 @@ from localwallet.store import (
     COIN_NOTE_MAX_CHARS,
     COIN_TAGS,
     DIR_OUT,
+    SCHEMA_VERSION,
     Store,
     StoreError,
     StoreIntegrityError,
@@ -90,8 +91,9 @@ def test_v1_db_upgrades_to_v2_on_reopen(tmp_path: Path) -> None:
     assert raw.execute("PRAGMA user_version").fetchone()[0] == 1
     raw.close()
 
-    with Store(db) as store:  # the migration runs here
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    with Store(db) as store:  # the migration runs here (the ladder now ends
+        # at the CURRENT schema version — v3, TCK-RBF-001 — via the v1→v2 rung)
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert store.get_wallet_by_name("main") is not None  # v1 data intact
         # coin_labels recreated EMPTY (a v1 DB never had label rows).
         assert store.get_coin_labels(wid) == []

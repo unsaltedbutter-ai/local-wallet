@@ -22,6 +22,8 @@ from localwallet.store.models import (
     DIR_IN,
     DIR_OUT,
     DIR_SELF,
+    SUPERSEDED_EVICTED,
+    SUPERSEDED_REPLACED,
     AddressRecord,
     CoinLabelRecord,
     DerivationRecord,
@@ -30,6 +32,7 @@ from localwallet.store.models import (
     UtxoRecord,
     WalletRecord,
     normalize_coin_tags,
+    superseded_states,
 )
 
 __all__ = [
@@ -44,6 +47,8 @@ __all__ = [
     "DIR_OUT",
     "DIR_SELF",
     "SCHEMA_VERSION",
+    "SUPERSEDED_EVICTED",
+    "SUPERSEDED_REPLACED",
     "AddressRecord",
     "CoinLabelRecord",
     "DerivationRecord",
@@ -55,4 +60,5 @@ __all__ = [
     "UtxoRecord",
     "WalletRecord",
     "normalize_coin_tags",
+    "superseded_states",
 ]

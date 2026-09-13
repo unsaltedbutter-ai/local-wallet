@@ -7,7 +7,10 @@ Phase 1: wallet profiles, per-branch derivation state, derived addresses,
 UTXO cache, transaction cache, sync cursor, and application settings — plus
 (schema v2, TCK-UTXO-001) outpoint-keyed coin labels: closed-set tags + one
 free-text note per coin, stored in their own table so they survive the scan
-snapshot's DELETE+re-INSERT. All SQL
+snapshot's DELETE+re-INSERT, and (schema v3, TCK-RBF-001) transaction
+lineage/capture columns (amount_sats, fee_rate_centisat_vb, first_seen,
+replaced_by_txid) — the broadcast-time record RBF/CPFP disambiguation is
+built on. All SQL
 lives inside this module; callers use the typed accessor methods and row
 records from :mod:`localwallet.store.models`. No raw SQL outside ``store/``.
 
@@ -62,7 +65,11 @@ from localwallet.store.models import (
 # v2 (TCK-UTXO-001): the ``coin_labels`` table (docs/ux-utxo-notes-design.md
 # §1.3) — outpoint-keyed, deliberately SEPARATE from the UTXO snapshot so
 # user labels survive every rescan.
-SCHEMA_VERSION = 2
+# v3 (TCK-RBF-001): the ``transactions`` lineage/capture columns — amount_sats,
+# fee_rate_centisat_vb, first_seen (broadcast-time capture off the flow's
+# confirmed record) and replaced_by_txid (RBF lineage link). All nullable;
+# purely additive; legacy rows keep NULLs and read as "not recorded".
+SCHEMA_VERSION = 3
 
 _BUSY_TIMEOUT_MS = 5000
 
@@ -147,19 +154,28 @@ def _wrap(exc: sqlite3.Error) -> StoreError:
 _TXID_HEX_CHARS = frozenset("0123456789abcdef")
 
 
-def _check_label_txid(txid: object) -> None:
-    """Fail-closed shape check for a coin-label txid (value-free error).
+def _check_txid_shape(txid: object, context: str) -> None:
+    """Fail-closed shape check for any store-layer txid (value-free error).
 
-    Mirrors the envelope layer's rule (exactly 64 lowercase hex): a label is
-    keyed by outpoint, so a malformed id is a caller bug, refused before disk.
-    The offending value is never echoed into the message.
+    Mirrors the envelope layer's rule (exactly 64 lowercase hex): the
+    offending value is never echoed into the message. ``context`` is
+    code-owned wording (table/operation), never user input.
     """
     if (
         not isinstance(txid, str)
         or len(txid) != 64
         or any(c not in _TXID_HEX_CHARS for c in txid)
     ):
-        raise StoreError("coin label txid must be 64 lowercase hex characters")
+        raise StoreError(f"{context} txid must be 64 lowercase hex characters")
+
+
+def _check_label_txid(txid: object) -> None:
+    """Fail-closed shape check for a coin-label txid.
+
+    A label is keyed by outpoint, so a malformed id is a caller bug, refused
+    before disk.
+    """
+    _check_txid_shape(txid, "coin label")
 
 
 def _check_label_vout(vout: object) -> None:
@@ -203,16 +219,29 @@ _UTXO_INSERT_SQL = (
     "VALUES (?, ?, ?, ?, ?, ?, ?)"
 )
 
+# Schema v3 (TCK-RBF-001): the four lineage/capture columns are written with
+# COALESCE-preserve semantics — a NON-NULL incoming value replaces, a NULL
+# never clobbers what broadcast capture already recorded. That is what lets
+# the scan (which knows chain truth — height/direction — but never our
+# amount/fee/first-seen/lineage) upsert through this ONE shared statement:
+# scan rows carry NULLs there and the captured facts survive every rescan.
 _TX_UPSERT_SQL = (
     "INSERT INTO transactions "
-    "(wallet_id, txid, height, block_time, fee_sats, direction, raw_summary) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+    "(wallet_id, txid, height, block_time, fee_sats, direction, raw_summary, "
+    "amount_sats, fee_rate_centisat_vb, first_seen, replaced_by_txid) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
     "ON CONFLICT(wallet_id, txid) DO UPDATE SET "
     "height = excluded.height, "
     "block_time = excluded.block_time, "
     "fee_sats = excluded.fee_sats, "
     "direction = excluded.direction, "
-    "raw_summary = excluded.raw_summary"
+    "raw_summary = excluded.raw_summary, "
+    "amount_sats = COALESCE(excluded.amount_sats, transactions.amount_sats), "
+    "fee_rate_centisat_vb = COALESCE(excluded.fee_rate_centisat_vb, "
+    "transactions.fee_rate_centisat_vb), "
+    "first_seen = COALESCE(excluded.first_seen, transactions.first_seen), "
+    "replaced_by_txid = COALESCE(excluded.replaced_by_txid, "
+    "transactions.replaced_by_txid)"
 )
 
 _SYNC_STATE_UPSERT_SQL = (
@@ -351,7 +380,20 @@ class Store(AbstractContextManager["Store"]):
                         f"database schema version {version} has no known "
                         "up-migration; refusing to migrate"
                     )
-                step(self, conn)
+                try:
+                    step(self, conn)
+                except _MigrateError:
+                    raise
+                except sqlite3.Error as exc:
+                    # Fail closed on a malformed on-disk shape (e.g. a table
+                    # the step cannot ALTER): the transaction rolls back, the
+                    # DB stays at its old version untouched, and the refusal
+                    # carries only the version number — the driver message
+                    # rides on as __cause__ only (never user values in it).
+                    raise _MigrateError(
+                        f"database schema migration from version {version} "
+                        "failed; refusing to open"
+                    ) from exc
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
@@ -367,10 +409,46 @@ class Store(AbstractContextManager["Store"]):
         """
         conn.executescript(_COIN_LABELS_DDL)
 
+    #: The four v3 ``transactions`` columns, DDL fragments in add order
+    #: (TCK-RBF-001). All nullable — a legacy row keeps NULLs and reads as
+    #: "not recorded"; nothing is fabricated from them, ever.
+    _V3_TX_COLUMNS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("amount_sats", "INTEGER"),
+        ("fee_rate_centisat_vb", "INTEGER"),
+        ("first_seen", "INTEGER"),
+        ("replaced_by_txid", "TEXT"),
+    )
+
+    def _migrate_v2_to_v3(self, conn: sqlite3.Connection) -> None:
+        """v2→v3 (TCK-RBF-001): add the lineage/capture columns to
+        ``transactions`` (amount_sats, fee_rate_centisat_vb, first_seen,
+        replaced_by_txid) — the broadcast-time record the RBF/CPFP
+        disambiguation lists and the BIP-125 delta read, and the one write
+        that lets the superseded-retirement rule leave the pending counts.
+
+        Purely additive and IDEMPOTENT (the migration contract): SQLite has
+        no ``ADD COLUMN IF NOT EXISTS``, so each column is added only when
+        ``PRAGMA table_info`` says it is missing — a crash between a step and
+        the version stamp re-runs cleanly. Fail-closed on a malformed table:
+        a stamped-v2 DB whose ``transactions`` table is absent cannot be
+        brought up safely, so the step refuses instead of silently rebuilding
+        history. ``coin_labels`` (the v2 user surface) is NOT touched here —
+        pinned by tests.
+        """
+        live = {row["name"] for row in conn.execute("PRAGMA table_info(transactions)")}
+        if not live:
+            raise _MigrateError(
+                "schema migration v2->v3 refused: transactions table is missing"
+            )
+        for name, decl in self._V3_TX_COLUMNS:
+            if name not in live:
+                conn.execute(f"ALTER TABLE transactions ADD COLUMN {name} {decl}")
+
     #: Up-migration ladder keyed by the version it migrates FROM. Extend (never
     #: reorder or delete) as schema version bumps; a missing rung fails closed.
     _MIGRATIONS: ClassVar[dict[int, Callable[[sqlite3.Connection], None]]] = {
         1: _migrate_v1_to_v2,
+        2: _migrate_v2_to_v3,
     }
 
     def _create_schema(self) -> None:
@@ -422,6 +500,10 @@ class Store(AbstractContextManager["Store"]):
                 fee_sats     INTEGER,
                 direction    TEXT CHECK(direction IN ('in','out','self')),
                 raw_summary  TEXT,
+                amount_sats  INTEGER,
+                fee_rate_centisat_vb INTEGER,
+                first_seen   INTEGER,
+                replaced_by_txid TEXT,
                 UNIQUE(wallet_id, txid)
             );
 
@@ -878,6 +960,41 @@ class Store(AbstractContextManager["Store"]):
         ).fetchall()
         return [TxRecord.from_row(r) for r in rows]
 
+    def record_replacement(
+        self, wallet_id: int, original_txid: str, replacement_txid: str
+    ) -> None:
+        """Write the RBF lineage link (schema v3): ``original_txid`` was
+        replaced by ``replacement_txid`` (TCK-RBF-001; the bump conversation,
+        TCK-RBF-004, is the caller). The ONLY sanctioned writer of
+        ``replaced_by_txid`` — the scan upserts carry NULL there and the
+        shared statement's COALESCE can never clobber or clear a link — so
+        the superseded-retirement rule has exactly one source for lineage.
+
+        The original must already have a recorded row (you can only link a
+        transaction this wallet actually broadcast). Validation is fail-closed
+        and value-free: malformed txids, a self-link, or a missing original
+        raise before anything touches disk, and no message echoes a txid.
+        """
+        _check_txid_shape(original_txid, "lineage original")
+        _check_txid_shape(replacement_txid, "lineage replacement")
+        if original_txid == replacement_txid:
+            raise StoreError("a transaction cannot replace itself")
+        try:
+            with self._transaction():
+                cur = self._conn.execute(
+                    "UPDATE transactions SET replaced_by_txid = ? "
+                    "WHERE wallet_id = ? AND txid = ?",
+                    (replacement_txid, wallet_id, original_txid),
+                )
+                if cur.rowcount == 0:
+                    raise StoreError(
+                        "lineage refused: the original transaction has no recorded row"
+                    )
+        except sqlite3.IntegrityError as exc:
+            raise _wrap_integrity(exc) from exc
+        except sqlite3.Error as exc:
+            raise _wrap(exc) from exc
+
     # ----------------------------------------------------------- sync_state
 
     def get_sync_state(self, wallet_id: int, key: str) -> str | None:
@@ -927,6 +1044,20 @@ class Store(AbstractContextManager["Store"]):
         the UTXO snapshot replace touches only the ``utxos`` table, so
         outpoint-keyed ``coin_labels`` rows survive every rescan unchanged
         (and remain after the coin is spent) — see :meth:`set_coin_label`.
+
+        Superseded retirement (schema v3, TCK-RBF-001) lands through this
+        SAME transaction: the scan's tx upsert is the one place that writes
+        confirmed heights, and the retirement rule
+        (:func:`localwallet.store.models.superseded_states`) is a pure
+        function of the (height, ``replaced_by_txid``) data this transaction
+        commits — exactly one side of a lineage pair ever gains a height
+        (BIP-125), and the sibling is then terminal and excluded from
+        pending counts. No extra statement is needed (and none is added):
+        state derived from the committed heights can never desync from them,
+        and the shared upsert's COALESCE-preserve keeps the broadcast-time
+        capture (amount/fee-rate/first-seen/lineage) intact across every
+        rescan. Engine-thread-safe by construction — one atomic transaction,
+        never a forked write.
         """
         snapshot = list(utxo_snapshot)
         with self._atomic():
