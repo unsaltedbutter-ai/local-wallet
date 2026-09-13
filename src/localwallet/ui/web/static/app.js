@@ -53,6 +53,9 @@ const settingsListEl = document.getElementById("settings-list");
 // aria-live=polite, visually hidden). flashCopyResult writes its value-free
 // state sentence here so both copy controls give SR + touch feedback.
 const copyStatusEl = document.getElementById("copy-status");
+// TCK-WEB-019: the ONE polite live region for SETTLED turn content
+// (announceTurn below; separate from the WEB-026 copy region above).
+const turnStatusEl = document.getElementById("turn-status");
 // TCK-QR-001: the receive-address QR viewer (see the QR section below).
 const qrViewerEl = document.getElementById("qr-viewer");
 const qrImgEl = document.getElementById("qr-img");
@@ -547,6 +550,28 @@ function bubbleText(turn) {
   return (turn.textContent || "").trim();
 }
 
+// TCK-WEB-019: ONE polite live region speaks each SETTLED engine turn's text
+// exactly once — noteTurnEnd (the turn_end handler) calls this before the
+// turn closes. The line seam is bubbleText's: .turn-text minus
+// .turn-progress/.turn-model, so the per-tick dot mutation can never reach
+// the region. The user's echo and the pending bubble are separate transcript
+// nodes, never children of the engine turn — excluded by construction.
+// PINNED: lines join with "\n" (same shape as the copy text; SRs read a
+// newline as a pause between paragraphs). An empty or line-less turn
+// announces nothing (a stray/replayed turn_end is silent). replaceChildren
+// with a FRESH text node per announcement keeps an identical repeat a
+// subtree change (same-text textContent writes can be skipped); the
+// once-per-turn guarantee is handleEvent's replay id-guard, which drops a
+// duplicate turn_end before noteTurnEnd ever runs.
+function announceTurn(turn) {
+  if (!turn) return;
+  const lines = turn.querySelectorAll(".turn-text:not(.turn-progress):not(.turn-model)");
+  if (lines.length === 0) return;
+  const text = Array.from(lines, lineText).join("\n").trim();
+  if (!text) return;
+  turnStatusEl.replaceChildren(document.createTextNode(text));
+}
+
 // The overlapping-squares icon, built with createElementNS (CSP-safe: no
 // markup strings, no external assets; the shapes carry no text nodes, so an
 // appended button never changes bubbleText).
@@ -875,6 +900,7 @@ function renderUserText(text) {
 // event exists (kinds are text/progress/turn_end), so turn_end is the
 // reconcile point.
 function noteTurnEnd() {
+  announceTurn(state.openTurn); // TCK-WEB-019: settle → speak, once
   closeOpenTurn();
   const next = state.queue.shift();
   if (next) {

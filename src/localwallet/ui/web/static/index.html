@@ -72,6 +72,14 @@
      via textContent — never the copied value). -->
 <p id="copy-status" class="visually-hidden" role="status" aria-live="polite"></p>
 
+<!-- TCK-WEB-019: the ONE visually-hidden polite live region that speaks each
+     SETTLED engine turn's text exactly once at turn_end (app.js announceTurn:
+     the turn's .turn-text lines — .turn-progress/.turn-model telemetry, the
+     user's own echo, and the pending bubble all excluded). Distinct from the
+     WEB-026 copy-status region: that one carries copy feedback, this one
+     carries turn content. -->
+<p id="turn-status" class="visually-hidden" role="status" aria-live="polite"></p>
+
 <footer class="bar bar-compose">
   <form id="turn-form" class="compose" autocomplete="off">
     <label class="visually-hidden" for="turn-text">Message</label>
