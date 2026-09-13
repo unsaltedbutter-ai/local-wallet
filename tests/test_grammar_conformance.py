@@ -460,6 +460,21 @@ ACCEPT = [
     '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":1}}',
     '{"v":0,"intent":"self_transfer","params":{"mode":"split","parts":99}}',
     '{"v":0,"intent":"self_transfer","params":{"mode":"consolidate","below_size_sats":0}}',
+    # ---- TCK-RBF-003: bump_fee drift pins (target + optional tail)
+    '{"v":0,"intent":"bump_fee","params":{"target":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}',
+    '{"v":0,"intent":"bump_fee","params":{"target":"pending-3f2a9c"}}',
+    '{"v":0,"intent":"bump_fee","params":{"target":"' + "a" * 64 + '","funding_ref":"3"}}',
+    '{"v":0,"intent":"bump_fee","params":{"target":"' + "a" * 64 + '","fee_target":"fast"}}',
+    '{"v":0,"intent":"bump_fee","params":{"target":"' + "a" * 64 + '","fee_target":"medium"}}',
+    '{"v":0,"intent":"bump_fee","params":{"target":"' + "a" * 64 + '","fee_target":"slow"}}',
+    '{"v":0,"intent":"bump_fee","params":{"target":"' + "a" * 64 + '","fee_rate_sat_vb":5}}',
+    '{"v":0,"intent":"bump_fee","params":{"target":"' + "a" * 64 + '","funding_ref":"3","fee_target":"fast"}}',
+    '{"v":0,"intent":"bump_fee","params":{"target":"' + "a" * 64 + '","funding_ref":"3","fee_rate_sat_vb":10000}}',
+    # whitespace around every token of the new branch
+    '{\n "v" : 0 ,\n "intent" : "bump_fee" ,\n "params" : { "target" : "abc" , "funding_ref" : "3" , "fee_target" : "slow" }\n}',
+    # grammar-legal rate the schema later bounds: 0 and 99999 (loose/tight split)
+    '{"v":0,"intent":"bump_fee","params":{"target":"' + "a" * 64 + '","fee_rate_sat_vb":0}}',
+    '{"v":0,"intent":"bump_fee","params":{"target":"' + "a" * 64 + '","fee_rate_sat_vb":99999}}',
 ]
 
 REJECT = [
@@ -650,6 +665,31 @@ REJECT = [
     '{"v":0,"intent":"self_transfer","params":{"mode":"consolidate","below_size_sats":1e3}}',
     "self_transfer below_size_sats string (must be an integer)",
     '{"v":0,"intent":"self_transfer","params":{"mode":"consolidate","below_size_sats":"1000"}}',
+    # ---- TCK-RBF-003: bump_fee drift pins (target + optional tail)
+    "bump_fee empty params (target is required)",
+    '{"v":0,"intent":"bump_fee","params":{}}',
+    "bump_fee target missing (target is the required first key)",
+    '{"v":0,"intent":"bump_fee","params":{"funding_ref":"3"}}',
+    "bump_fee wrong key order (funding_ref before target)",
+    '{"v":0,"intent":"bump_fee","params":{"funding_ref":"3","target":"abc"}}',
+    "bump_fee fee_target before target (strict key order)",
+    '{"v":0,"intent":"bump_fee","params":{"fee_target":"fast","target":"abc"}}',
+    "bump_fee BOTH fee knobs (exclusive tail alternation; schema re-checks)",
+    '{"v":0,"intent":"bump_fee","params":{"target":"abc","fee_target":"fast","fee_rate_sat_vb":5}}',
+    "bump_fee rate before funding_ref (strict key order)",
+    '{"v":0,"intent":"bump_fee","params":{"target":"abc","fee_rate_sat_vb":5,"funding_ref":"3"}}',
+    "bump_fee unknown fee_target literal",
+    '{"v":0,"intent":"bump_fee","params":{"target":"abc","fee_target":"urgent"}}',
+    "bump_fee fee_rate_sat_vb decimal (integer sat/vB only)",
+    '{"v":0,"intent":"bump_fee","params":{"target":"abc","fee_rate_sat_vb":1.5}}',
+    "bump_fee fee_rate_sat_vb 6 digits (5-digit syntactic cap)",
+    '{"v":0,"intent":"bump_fee","params":{"target":"abc","fee_rate_sat_vb":100000}}',
+    "bump_fee params extra key (closed world)",
+    '{"v":0,"intent":"bump_fee","params":{"target":"abc","memo":"x"}}',
+    "bump_fee with tx_ref key (intent->params coupling)",
+    '{"v":0,"intent":"bump_fee","params":{"tx_ref":"abc"}}',
+    "bump_fee target is a JSON integer (must be a string)",
+    '{"v":0,"intent":"bump_fee","params":{"target":64}}',
 ]
 
 
@@ -719,6 +759,12 @@ def test_grammar_parses_without_unsupported_constructs(matcher: GbnfMatcher):
         "parts-int",
         "below-size-kv",
         "self-transfer-tail",
+        "bump-fee",
+        "params-bump-fee",
+        "bump-fee-tail",
+        "bump-fee-tail-after-ref",
+        "funding-ref-kv",
+        "bump-fee-fee-kv",
         "string",
         "ws",
     }
@@ -741,6 +787,7 @@ def test_grammar_intent_branches_cover_the_closed_enum(matcher: GbnfMatcher):
         "tx_status",
         "node_status",
         "self_transfer",
+        "bump_fee",
     ):
         assert f'"{intent}"' in text
 

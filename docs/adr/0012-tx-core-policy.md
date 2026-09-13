@@ -173,12 +173,18 @@ headroom per transaction — never below the min-relay floor for rates
 opt-in RBF signaling). Rationale: Phase 5+ *may* add fee bumping without
 a flag-day migration, and uniform signaling makes all wallet
 transactions behave identically under replaceability-aware policies.
-v1 implements **no bumping** (N4): the fee UX must set the expectation
-that a low-fee transaction may sit unconfirmed for hours/days (R6).
-`0xfffffffe` (RBF-disabled) and `0xffffffff` (final) are **refused** by
-the builder — the policy is structural, not conventional, and
-`validate_psbt_shape` re-checks it on every input. This ADR is the N4
-documentation deliverable; no bumping code ships in Phase 2.
+ v1 implements **no bumping** (N4): the fee UX must set the expectation
+ that a low-fee transaction may sit unconfirmed for hours/days (R6).
+ `0xfffffffe` (RBF-disabled) and `0xffffffff` (final) are **refused** by
+ the builder — the policy is structural, not conventional, and
+ `validate_psbt_shape` re-checks it on every input. This ADR is the N4
+ documentation deliverable; no bumping code ships in Phase 2.
+
+> **Superseded in part (TCK-RBF-003, 2026-09):** bumping now exists via the
+> `bump_fee` intent (registry fourteen, ADR-0002). The replacement builder,
+> BIP-125 floor, and in-flight resolution land in the RBF-001/002/004/005
+> tickets; the closed intent and its confirm-gate discipline are the
+> protocol's side of that work.
 
 ### 6. PSBT content and structural validation
 

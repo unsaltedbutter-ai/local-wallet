@@ -17,6 +17,8 @@ the model's side of the closed intent protocol (PROJECT.md §7.1, §8):
    ``create_tx`` (Phase 2 v0 extension; ADR-0002/0013 lockstep), and
    ``self_transfer`` (split + consolidate; TCK-TX-SELF-001 — the money
    plan is engine-derived, so the examples carry no address/outpoint).
+   The ``bump_fee`` mapping lines (TCK-RBF-003) teach the phrasings that
+   route to ``bump_fee`` without ever computing the new fee.
 
 The prompt is kept compact on purpose: v0 runs with a ≤8K context budget
 (ADR-0006), and this text is paid for on every turn.
@@ -129,6 +131,19 @@ addresses, amounts and inputs itself: NEVER supply a recipient or address, \
 NEVER name a coin — if the part count (split) or size threshold \
 (consolidate) is missing, clarify; the flow still runs create → confirm_tx \
 → sign_tx → broadcast_tx.
+- bump_fee: raise the fee on an in-flight transaction (mainnet); params \
+{"target": "<the 64-hex txid or the app's pending-ref token quoted \
+VERBATIM from the FACTS/tool output>"}, optional "funding_ref": "<a coin \
+reference the user names>", and AT MOST ONE fee knob exactly like create_tx \
+(optional "fee_target": "fast"|"medium"|"slow", or "fee_rate_sat_vb": \
+<sat/vB integer quoted VERBATIM>, NEVER both) — when the user asks to \
+increase/bump the fee on a transaction or "make that transaction go \
+faster" (e.g. "increase the fee on <txid>", "bump the fee on <txid>"). \
+The model NEVER computes or invents the new fee: quote the target and any \
+knob the user stated VERBATIM; if a fee knob is not stated, OMIT it (the \
+app offers the choice). The app resolves the target and still requires the \
+user's explicit confirmation before broadcasting the replacement — bumping \
+the fee never skips the confirm gate.
 
 FACTS AND VERBATIM RULE
 - Addresses, amounts, and balances are provided in the FACTS block. Copy \
@@ -168,6 +183,10 @@ envelope: {"v": 0, "intent": "self_transfer", "params": {"mode": "split", \
 user: consolidate all my coins under 100000 sats, no hurry
 envelope: {"v": 0, "intent": "self_transfer", "params": {"mode": \
 "consolidate", "below_size_sats": 100000, "fee_target": "slow"}}
+
+user: bump the fee on abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+envelope: {"v": 0, "intent": "bump_fee", "params": {"target": \
+"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}}
 """
 
 
@@ -175,14 +194,14 @@ def build_system_prompt() -> str:
     """Return the system prompt encoding the output contract.
 
     The prompt fixes: exactly one envelope per turn with key order
-    ``v, intent, params``; the closed intent list (thirteen intents as of
-    the TCK-TX-SELF-001 v0 extension) with usage guidance; the
+    ``v, intent, params``; the closed intent list (fourteen intents as of
+    the TCK-RBF-003 v0 extension) with usage guidance; the
     quote-verbatim rule for FACTS values; the no-secrets (watch-only) rule;
-    and seven few-shot exchanges (respond / clarify / get_balance /
+    and eight few-shot exchanges (respond / clarify / get_balance /
     new_address / create_tx / self_transfer-split / self_transfer-
-    consolidate). The self_transfer examples carry NO address or outpoint —
-    the money plan is engine-derived, never model-authored.
-
+    consolidate / bump_fee). The self_transfer examples carry NO address or
+    outpoint — the money plan is engine-derived, never model-authored; the
+    bump_fee example quotes the target VERBATIM and never invents a fee.
     Intentionally parameter-free: intent membership and the wire format
     are owned by the protocol subsystem and the GBNF grammar — this text
     only instructs the model how to comply with them.

@@ -1,0 +1,5 @@
+{
+  "id": "golden-051",
+  "prompt": "bump the fee on abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+  "expectation": {"intent": "bump_fee", "params": {"target": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}}
+}

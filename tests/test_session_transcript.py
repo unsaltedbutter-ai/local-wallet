@@ -120,8 +120,10 @@ class TestSummarization:
         # whole assembled prompt; ~10.5K chars ≈ ~5.2K tokens, still well
         # inside the 8K budget and the bound's POINT (it is independent of
         # session length — the summary + recent window cap it, not the 300
-        # turns).
-        assert len(prompt) < 10500
+        # turns). 10500 → 12000 by TCK-RBF-003: the bump_fee intent line +
+        # mapping + one few-shot grew the fixed system prompt ~1K chars
+        # (~11.5K chars ≈ ~5.7K tokens, still inside the 8K budget).
+        assert len(prompt) < 12000
         assert "SESSION SUMMARY" in prompt
         assert "CONVERSATION SO FAR" in prompt
         # The recent window holds the last 20 turns verbatim.

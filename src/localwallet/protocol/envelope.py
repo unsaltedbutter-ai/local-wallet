@@ -5,8 +5,8 @@ Canonical envelope contract v0 — the model-emitted wire format::
     {"v": 0, "intent": <closed enum>, "params": {...}}
 
 - ``v``: integer, exactly ``0`` (booleans are not integers for this purpose).
-- ``intent``: closed enum — see :class:`IntentName` (thirteen members as of
-  the TCK-TX-SELF-001 v0 extension; see ``docs/adr/0002-envelope-spec.md``,
+- ``intent``: closed enum — see :class:`IntentName` (fourteen members as of
+  the TCK-RBF-003 v0 extension; see ``docs/adr/0002-envelope-spec.md``,
   ``docs/adr/0013-confirm-gate.md``).
 - ``params``: REQUIRED object, shape fixed per intent:
   ``respond`` → ``{"text": str, 1..4000 chars}``;
@@ -59,6 +59,15 @@ Canonical envelope contract v0 — the model-emitted wire format::
   (own fresh receive addresses, tag-pure selection pools). The params
   shape IS the guarantee that ``self_transfer`` cannot smuggle invented
   outputs past the confirm gate.
+  ``bump_fee`` (TCK-RBF-003) → ``{"target": str, 1..64 chars}`` plus
+  OPTIONAL ``{"funding_ref": str, 1..100 chars}`` and AT MOST ONE of
+  ``{"fee_target": "fast"|"medium"|"slow"}`` | ``{"fee_rate_sat_vb": int,
+  1..10_000}`` (mutually exclusive fee knobs, mirroring ``create_tx``).
+  ``target`` is the in-flight transaction reference — a 64-hex txid OR the
+  app's pending-ref token, carried as a shape-validated string; resolving
+  either against store lineage/flow state is the RBF-004/005 handler's job,
+  this schema only carries it. The model never computes the new fee (see
+  the ADR-0002 amendment for bump_fee).
 
 Adding enum members and optional params keys is a backward-compatible v0
 extension: previously-valid envelopes remain valid, so ``v`` stays ``0``
@@ -120,6 +129,7 @@ __all__ = [
     "MAX_AMOUNT_SATS",
     "MAX_AMOUNT_USD",
     "MAX_FEE_RATE_SAT_VB",
+    "MAX_FUNDING_REF_CHARS",
     "MAX_QUESTION_CHARS",
     "MAX_RECIPIENT_CHARS",
     "MAX_SELF_TRANSFER_PARTS",
@@ -131,6 +141,7 @@ __all__ = [
     "MIN_SELF_TRANSFER_PARTS",
     "BaseParams",
     "BroadcastTxParams",
+    "BumpFeeParams",
     "ClarifyParams",
     "ConfirmTxParams",
     "CreateTxParams",
@@ -207,6 +218,12 @@ MAX_SELF_TRANSFER_PARTS: Final[int] = 20
 #: params ``tx_ref`` (characters).
 MAX_TX_REF_CHARS: Final[int] = 64
 
+#: Maximum accepted length of ``bump_fee`` params ``funding_ref``
+#: (characters). A CHAT-001-style coin reference is a number (short) or an
+#: address string (up to 90 chars of bech32); 100 is generous transport
+#: headroom mirroring the recipient bound. Semantics are the handler's.
+MAX_FUNDING_REF_CHARS: Final[int] = 100
+
 #: The exact length of a Bitcoin transaction id (bytes rendered as hex).
 TXID_LENGTH_CHARS: Final[int] = 64
 
@@ -238,6 +255,8 @@ _KNOWN_LOC_FIELDS: Final[frozenset[str]] = frozenset(
         "tx_ref",
         "signer",
         "txid",
+        "target",
+        "funding_ref",
         "error",
         "detail",
         "code",
@@ -295,6 +314,17 @@ class IntentName(StrEnum):
     of the dispatcher-owned flow (``create → confirm_tx → sign_tx →
     broadcast_tx``, dual-key confirm gate unchanged — the handler stages
     the plan through :meth:`localwallet.tx.flow.TxFlow.create`).
+
+    TCK-RBF-003 v0 extension (backward-compatible — see
+    ``docs/adr/0002-envelope-spec.md``): ``bump_fee`` joins as the explicit
+    request to raise the fee on an IN-FLIGHT transaction (a 64-hex txid or
+    the app's pending-ref token — resolution against store lineage/flow
+    state is RBF-004/005's job). It is NOT a destructive step by itself:
+    the actual replacement rides the same dispatcher-owned flow and dual-key
+    confirm gate (the plan card still requires the user's confirmation), so
+    bump phrasings can never bypass the confirm gate. The model never
+    computes the new fee — it only names the target and (optionally) a fee
+    knob (rung or quoted whole-sat rate).
     """
 
     RESPOND = "respond"
@@ -310,6 +340,7 @@ class IntentName(StrEnum):
     TX_STATUS = "tx_status"
     NODE_STATUS = "node_status"
     SELF_TRANSFER = "self_transfer"
+    BUMP_FEE = "bump_fee"
 
 
 class BaseParams(BaseModel):
@@ -731,6 +762,85 @@ class SelfTransferParams(_OmitNoneDump):
         return self
 
 
+class BumpFeeParams(_OmitNoneDump):
+    """Params for ``bump_fee``: which in-flight transaction + optional fee knobs.
+
+    Contract (TCK-RBF-003 v0 extension, ADR-0002 bump policy; ADR-0013
+    confirm discipline unchanged — bumping a replacement STILL rides the
+    dispatcher-owned flow and the dual-key confirm gate, it never bypasses
+    it):
+
+    - ``target``: REQUIRED string, 1..64 characters — the in-flight
+      transaction reference. It accepts a 64-hex txid OR the app's
+      pending-ref token; both are carried as a shape-validated string, and
+      resolving either against store lineage / flow state is the
+      RBF-004/005 handler's job — this schema only carries it. Shape rule
+      (non-blank printable) mirrors the ``tx_ref`` convention.
+    - ``funding_ref``: OPTIONAL string, 1..100 characters — a CHAT-001-style
+      coin reference (a number or an address string), carried as a validated
+      string; semantics (which coin funds the replacement) are the
+      handler's.
+    - ``fee_target``: OPTIONAL enum literal ``"fast"|"medium"|"slow"``
+      (omitted ⇒ the handler applies its default). MUTUALLY EXCLUSIVE with
+      ``fee_rate_sat_vb`` (mirrors ``create_tx``). The model never computes
+      the new fee — it may only name a rung or quote a rate the user stated.
+    - ``fee_rate_sat_vb``: OPTIONAL TRUE JSON integer, ``1..MAX_FEE_RATE_SAT_VB``.
+      NOTE (TCK-FEE-003): internally fee rates are integer CENTISAT/vB, while
+      the envelope's ``fee_rate_sat_vb`` (and ``create_tx``'s) is WHOLE-SAT
+      ``1..10_000``. For v1 keep the same whole-sat envelope type (×100 at
+      the handler edge, the FEE-003 precedent) — documented here so the
+      handler's conversion is the only place that sees centisat.
+    """
+
+    target: str = Field(min_length=1, max_length=MAX_TX_REF_CHARS)
+    funding_ref: str | None = Field(
+        default=None, min_length=1, max_length=MAX_FUNDING_REF_CHARS
+    )
+    fee_target: Literal["fast", "medium", "slow"] | None = None
+    fee_rate_sat_vb: int | None = Field(default=None, ge=1, le=MAX_FEE_RATE_SAT_VB)
+
+    @field_validator("funding_ref", mode="before")
+    @classmethod
+    def _funding_ref_must_be_present_when_not_omitted(cls, value: object) -> object:
+        """Reject explicit ``null`` for ``funding_ref`` (see ``limit``)."""
+        if value is None:
+            raise ValueError("funding_ref must be a string when present")
+        return value
+
+    @field_validator("fee_target", mode="before")
+    @classmethod
+    def _fee_target_must_be_present_when_not_omitted(cls, value: object) -> object:
+        """Reject explicit ``null`` for ``fee_target`` (see ``limit``)."""
+        if value is None:
+            raise ValueError("fee_target must be 'fast', 'medium', or 'slow' when present")
+        return value
+
+    @field_validator("fee_rate_sat_vb", mode="before")
+    @classmethod
+    def _fee_rate_sat_vb_must_be_true_int(cls, value: object) -> object:
+        """Close pydantic's lax coercions for ``fee_rate_sat_vb`` (see ``limit``).
+
+        Also rejects explicit ``null``: omission is expressed by leaving the
+        key out, mirroring ``create_tx``'s ``fee_rate_sat_vb``.
+        """
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        raise ValueError("fee_rate_sat_vb must be an integer when present")
+
+    @model_validator(mode="after")
+    def _fee_knobs_are_exclusive(self) -> BumpFeeParams:
+        """``fee_target`` and ``fee_rate_sat_vb`` must not both be present.
+
+        Same ambiguity rule as ``create_tx``: a rung and a quoted rate are
+        two ways to say one fee; both at once is rejected rather than
+        guessed (the GBNF tail alternation already makes it syntactically
+        impossible; this covers every other producer).
+        """
+        if self.fee_target is not None and self.fee_rate_sat_vb is not None:
+            raise ValueError("fee_target and fee_rate_sat_vb are mutually exclusive")
+        return self
+
+
 #: Frozen mapping intent name → params model — THE closed world. Intents
 #: outside this registry do not exist: the schema layer rejects them and
 #: the dispatcher refuses them (defense in depth).
@@ -756,6 +866,7 @@ INTENT_REGISTRY: Mapping[IntentName, type[BaseParams]] = MappingProxyType(
         IntentName.TX_STATUS: TxStatusParams,
         IntentName.NODE_STATUS: NodeStatusParams,
         IntentName.SELF_TRANSFER: SelfTransferParams,
+        IntentName.BUMP_FEE: BumpFeeParams,
     }
 )
 
@@ -785,6 +896,7 @@ class Envelope(BaseModel):
         | TxStatusParams
         | NodeStatusParams
         | SelfTransferParams
+        | BumpFeeParams
     )
 
     @model_validator(mode="before")

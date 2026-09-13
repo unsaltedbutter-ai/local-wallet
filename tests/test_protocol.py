@@ -30,6 +30,7 @@ from localwallet.protocol import (
     MAX_TEXT_CHARS,
     MAX_VALIDATION_RETRIES,
     BroadcastTxParams,
+    BumpFeeParams,
     ClarifyParams,
     ConfirmTxParams,
     CreateTxParams,
@@ -58,6 +59,7 @@ from localwallet.protocol.envelope import (
     MAX_AMOUNT_SATS,
     MAX_AMOUNT_USD,
     MAX_FEE_RATE_SAT_VB,
+    MAX_FUNDING_REF_CHARS,
     MAX_TX_REF_CHARS,
     MIN_AMOUNT_SATS,
     MIN_AMOUNT_USD,
@@ -109,6 +111,36 @@ ACCEPT_CASES = {
         "intent": "self_transfer",
         "params": {"mode": "consolidate", "below_size_sats": 100000, "fee_target": "slow"},
     },
+    # TCK-RBF-003 v0 extension: bump_fee (target + optional funding_ref/fee knob).
+    "bump_fee": {
+        "v": 0,
+        "intent": "bump_fee",
+        "params": {"target": "pending-3f2a9c"},
+    },
+    "bump_fee_txid": {
+        "v": 0,
+        "intent": "bump_fee",
+        "params": {"target": "a" * 64},
+    },
+    "bump_fee_pending_ref": {
+        "v": 0,
+        "intent": "bump_fee",
+        "params": {"target": "pending-3f2a9c"},
+    },
+    "bump_fee_full": {
+        "v": 0,
+        "intent": "bump_fee",
+        "params": {
+            "target": "a" * 64,
+            "funding_ref": "3",
+            "fee_target": "fast",
+        },
+    },
+    "bump_fee_rate": {
+        "v": 0,
+        "intent": "bump_fee",
+        "params": {"target": "pending-3f2a9c", "fee_rate_sat_vb": 5},
+    },
 }
 
 PARAMS_TYPES = {
@@ -125,6 +157,7 @@ PARAMS_TYPES = {
     IntentName.TX_STATUS: TxStatusParams,
     IntentName.NODE_STATUS: NodeStatusParams,
     IntentName.SELF_TRANSFER: SelfTransferParams,
+    IntentName.BUMP_FEE: BumpFeeParams,
 }
 
 HANDLER_RESULTS = {
@@ -141,6 +174,7 @@ HANDLER_RESULTS = {
     IntentName.TX_STATUS: {"status": True},
     IntentName.NODE_STATUS: {"detected": True},
     IntentName.SELF_TRANSFER: {"staged": True},
+    IntentName.BUMP_FEE: {"staged": True},
 }
 
 
@@ -207,15 +241,16 @@ def test_intent_enum_is_the_closed_world():
         "tx_status",
         "node_status",
         "self_transfer",
+        "bump_fee",
     }
-    assert len(IntentName) == 13
+    assert len(IntentName) == 14
 
 
 def test_intent_registry_is_frozen_and_complete():
     assert set(INTENT_REGISTRY.keys()) == set(IntentName)
     # explicit count: registry completeness is pinned, not incidental
-    # (TCK-TX-SELF-001 v0 extension: 12 → 13)
-    assert len(INTENT_REGISTRY) == 13
+    # (TCK-RBF-003 v0 extension: 13 → 14)
+    assert len(INTENT_REGISTRY) == 14
     for intent, model in INTENT_REGISTRY.items():
         assert model is PARAMS_TYPES[intent]
     # frozen mapping: mutation is refused
@@ -228,7 +263,7 @@ def test_intent_registry_is_frozen_and_complete():
 def test_business_rules_cover_every_intent():
     assert set(BUSINESS_RULES.keys()) == set(IntentName)
     # explicit count: registry completeness is pinned, not incidental
-    assert len(BUSINESS_RULES) == 13
+    assert len(BUSINESS_RULES) == 14
     for intent in IntentName:
         assert callable(BUSINESS_RULES[intent])
     # frozen mapping: mutation is refused (symmetry with INTENT_REGISTRY)
@@ -898,7 +933,44 @@ def test_business_rule_sign_broadcast_tx_ref_shape(intent: IntentName, tx_ref: s
     assert all("tx_ref" in f for f in failures)
 
 
-def test_business_rule_sign_broadcast_bypass_shape():
+@pytest.mark.parametrize(
+    ("target", "expect_failures"),
+    [
+        ("a" * 64, False),  # 64-hex txid shape (carrier: resolution is RBF-004/005's)
+        ("pending-3f2a9c", False),  # the app's pending-ref token form
+        ("   ", True),
+        ("a\x00b", True),
+        ("line\nbreak", True),
+    ],
+    ids=["txid", "pending-ref", "blank", "nul", "newline"],
+)
+def test_business_rule_bump_fee_target_shape(target: str, expect_failures: bool):
+    """bump_fee rule checks target/funding_ref SHAPE only (TCK-RBF-003).
+
+    The schema carries the in-flight reference as a validated string — a
+    64-hex txid OR the app's pending-ref token; resolving either against
+    store lineage/flow state is the handler's job, never this rule.
+    """
+    env = validate_payload({"v": 0, "intent": "bump_fee", "params": {"target": target}})
+    assert isinstance(env.params, BumpFeeParams)
+    failures = BUSINESS_RULES[IntentName.BUMP_FEE](env.params)
+    assert bool(failures) is expect_failures
+    if expect_failures:
+        assert all("target" in f for f in failures)
+
+
+def test_business_rule_bump_fee_funding_ref_shape():
+    """funding_ref (when present) follows the same non-blank-printable shape."""
+    rule = BUSINESS_RULES[IntentName.BUMP_FEE]
+    good = validate_payload(
+        {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "funding_ref": "3"}}
+    )
+    assert rule(good.params) == []
+    bad = validate_payload(
+        {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "funding_ref": " \n "}}
+    )
+    assert bool(rule(bad.params))
+
     """Empty/control-char tx_refs are caught even by bypassed constructors."""
     for intent, params_model, name in (
         (IntentName.SIGN_TX, SignTxParams, "sign_tx"),
@@ -1083,6 +1155,23 @@ REJECT_MATRIX = [
     ("node_status_verbose_key", {"v": 0, "intent": "node_status", "params": {"refresh": 1}}),
     ("node_status_text_key", {"v": 0, "intent": "node_status", "params": {"text": "x"}}),
     ("node_status_null_params", {"v": 0, "intent": "node_status", "params": None}),
+    # TCK-RBF-003 v0 extension: bump_fee rejects (schema layer)
+    ("bump_fee_target_empty", {"v": 0, "intent": "bump_fee", "params": {"target": ""}}),
+    ("bump_fee_target_overlong", {"v": 0, "intent": "bump_fee", "params": {"target": "x" * (MAX_TX_REF_CHARS + 1)}}),
+    ("bump_fee_target_not_string", {"v": 0, "intent": "bump_fee", "params": {"target": 7}}),
+    ("bump_fee_target_null", {"v": 0, "intent": "bump_fee", "params": {"target": None}}),
+    ("bump_fee_target_missing", {"v": 0, "intent": "bump_fee", "params": {}}),
+    ("bump_fee_extra_key", {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "memo": "hi"}}),
+    ("bump_fee_funding_ref_null", {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "funding_ref": None}}),
+    ("bump_fee_funding_ref_overlong", {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "funding_ref": "x" * (MAX_FUNDING_REF_CHARS + 1)}}),
+    ("bump_fee_funding_ref_not_string", {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "funding_ref": 3}}),
+    ("bump_fee_both_fee_knobs", {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "fee_target": "fast", "fee_rate_sat_vb": 5}}),
+    ("bump_fee_fee_target_invalid", {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "fee_target": "urgent"}}),
+    ("bump_fee_fee_target_null", {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "fee_target": None}}),
+    ("bump_fee_rate_string", {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "fee_rate_sat_vb": "5"}}),
+    ("bump_fee_rate_zero", {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "fee_rate_sat_vb": 0}}),
+    ("bump_fee_rate_over_max", {"v": 0, "intent": "bump_fee", "params": {"target": "a" * 64, "fee_rate_sat_vb": MAX_FEE_RATE_SAT_VB + 1}}),
+    ("bump_fee_wrong_intent_key", {"v": 0, "intent": "bump_fee", "params": {"tx_ref": "abc"}}),
     # raw JSON documents that are not envelopes
     ("invalid_json", "{oops"),
     ("json_array", "[1, 2]"),
@@ -1241,6 +1330,7 @@ def test_invalid_json_yields_error_envelope_not_raw_exception():
         IntentName.BROADCAST_TX,
         IntentName.TX_STATUS,
         IntentName.NODE_STATUS,
+        IntentName.BUMP_FEE,
     ],
     ids=[
         "respond",
@@ -1255,6 +1345,7 @@ def test_invalid_json_yields_error_envelope_not_raw_exception():
         "broadcast_tx",
         "tx_status",
         "node_status",
+        "bump_fee",
     ],
 )
 def test_dispatch_routes_each_intent_to_its_handler(intent: IntentName):
@@ -1336,6 +1427,7 @@ def test_dispatch_handler_exception_surfaces_not_swallowed():
         IntentName.BROADCAST_TX,
         IntentName.TX_STATUS,
         IntentName.NODE_STATUS,
+        IntentName.BUMP_FEE,
     ],
     ids=[
         "respond",
@@ -1350,6 +1442,7 @@ def test_dispatch_handler_exception_surfaces_not_swallowed():
         "broadcast_tx",
         "tx_status",
         "node_status",
+        "bump_fee",
     ],
 )
 def test_handle_raw_ok_path_per_intent(intent: IntentName):

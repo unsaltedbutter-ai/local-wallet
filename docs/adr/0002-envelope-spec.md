@@ -270,3 +270,32 @@ required/optional-key params shapes only widens the accepted set, `v` stays
   registered"), which is the intended fail-closed behavior. Golden/redteam
   eval fixtures for the new intents land with TCK-P3-006 (the eval-ship
   obligation is recorded, not discharged, by this ticket).
+
+## v0 extensions (2026-09, Phase 4 / TCK-TX-SELF-001 / TCK-RBF-003)
+
+The ledger continued past Phase 3's eleven: Phase 4 added `node_status`
+(twelve), TCK-TX-SELF-001 added `self_transfer` (thirteen), and TCK-RBF-003
+added `bump_fee` — **registry of FOURTEEN**. Each is a **backward-compatible
+extension of v0, not a version bump** (same bump-policy reasoning as the
+Phase 1/2/3 extensions: adding enum members and optional-key params shapes
+only widens the accepted set, `v` stays `0`, no previously-valid envelope is
+invalidated).
+
+- `node_status` (Phase 4, TCK-P4-003) → `{"params": {}}` exactly — the
+  model emits nothing; the dispatcher owns all data (advise-only node
+  doctor).
+- `self_transfer` (TCK-TX-SELF-001) → `{"mode": "split"|"consolidate"}` plus
+  the mode's ONE required key (`parts` for split / `below_size_sats` for
+  consolidate) and an optional `fee_target` tail. No address/outpoint/amount
+  key is representable — the money plan is engine-derived.
+- `bump_fee` (TCK-RBF-003) → `{"target": str, 1..64}` (a 64-hex txid OR the
+  app's pending-ref token, carried as a shape-validated string; resolving it
+  against store lineage / flow state is the RBF-004/005 handler's job),
+  optional `{"funding_ref": str, 1..100}` (a coin reference; semantics are
+  the handler's), and AT MOST ONE of optional `fee_target` / `fee_rate_sat_vb`
+  (mutually exclusive, mirroring `create_tx`). The model never computes the
+  new fee — it only carries a rung or a user-quoted whole-sat rate. Grammar,
+  schema, system prompt, drift pins, and eval fixtures moved in lockstep per
+  the cross-reference rule; handler wiring lands in RBF-004 (until then a
+  `bump_fee` envelope surfaces `dispatch_error` via the not-wired stub).
+

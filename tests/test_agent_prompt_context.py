@@ -189,14 +189,15 @@ class TestSystemPrompt:
         for intent in IntentName:
             assert intent.value in prompt
 
-    def test_contains_all_thirteen_intent_names(self) -> None:
+    def test_contains_all_fourteen_intent_names(self) -> None:
         # Explicit pin (not just enum iteration): the Phase 1 v0 extension
         # added get_history / get_utxos / new_address, the Phase 2 v0
         # extension added create_tx / confirm_tx, the Phase 3 v0
         # extension added sign_tx / broadcast_tx / tx_status, the Phase 4
-        # v0 extension added node_status, and the TCK-TX-SELF-001 v0
-        # extension added self_transfer — grammar, schema and prompt must
-        # move together (ADR-0002/0013 lockstep).
+        # v0 extension added node_status, the TCK-TX-SELF-001 v0
+        # extension added self_transfer, and the TCK-RBF-003 v0 extension
+        # added bump_fee — grammar, schema and prompt must move together
+        # (ADR-0002/0013 lockstep).
         prompt = build_system_prompt()
         for name in (
             "respond",
@@ -212,6 +213,7 @@ class TestSystemPrompt:
             "tx_status",
             "node_status",
             "self_transfer",
+            "bump_fee",
         ):
             assert name in prompt
 
@@ -318,9 +320,11 @@ class TestSystemPrompt:
         # utxo-count / "what's pending" / "when will my transaction
         # confirm?" phrasings explicitly (MW-11 #3 fix). Raised
         # 7600 → 7800 by TCK-PROMPT-001: the persona line in the prompt
-        # header (+142 chars) ships the designer §4f copy. ~7640 chars is
-        # still ~3.8K tokens, a small fraction of the 8K budget.
-        assert len(build_system_prompt()) < 7800
+        # header (+142 chars) ships the designer §4f copy. Raised
+        # 7800 → 9000 by TCK-RBF-003: the bump_fee intent line + mapping +
+        # one few-shot ship the closed protocol (~960 chars). ~8.7K chars is
+        # still ~4.4K tokens, a small fraction of the 8K budget.
+        assert len(build_system_prompt()) < 9000
 
     def test_get_utxos_line_maps_count_and_pending_phrasings(self) -> None:
         # TCK-PENDING-001 (user report MW-11 #3: "how many utxo do I have?"

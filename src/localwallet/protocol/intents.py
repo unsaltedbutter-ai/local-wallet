@@ -16,9 +16,11 @@ address per ADR-0008 and the amount XOR; for ``confirm_tx``/``sign_tx``/
 EXACTLY 64 lowercase hex characters — the strict charset check that guards
 the URL path this user/model-supplied value is interpolated into; for
 ``self_transfer``: the mode↔key pairing — split↔parts / consolidate↔
-below_size_sats, exactly one — and the bound re-checks, TCK-TX-SELF-001)
-and return error strings for the dispatcher to surface. An empty list means
-valid.
+below_size_sats, exactly one — and the bound re-checks, TCK-TX-SELF-001;
+for ``bump_fee``: the ``target`` / ``funding_ref`` shape — non-blank
+printable strings, the txid-vs-pending-ref resolution is the handler's,
+TCK-RBF-003) and return error strings for the dispatcher to surface. An
+empty list means valid.
 
 Adding rules never widens the model's freedom: rules only reject, they
 never transform or execute.
@@ -52,6 +54,7 @@ from localwallet.protocol.envelope import (
     TXID_LENGTH_CHARS,
     BaseParams,
     BroadcastTxParams,
+    BumpFeeParams,
     ClarifyParams,
     ConfirmTxParams,
     CreateTxParams,
@@ -219,18 +222,23 @@ def _rule_create_tx(params: BaseParams) -> list[str]:
     return _recipient_rule_failure(params)
 
 
-def _tx_ref_shape_failures(field: str, value: str) -> list[str]:
-    """Shared ``tx_ref`` shape rule (confirm_tx / sign_tx / broadcast_tx).
+def _tx_ref_shape_failures(
+    field: str, value: str, *, noun: str = "transaction reference"
+) -> list[str]:
+    """Shared shape rule for a quoted reference (tx_ref / bump_fee target/funding_ref).
 
     The reference must be non-empty (after stripping whitespace) and
     printable (no control characters). Whether it names the actual
     pending/confirmed/signed transaction is decided by the dispatcher-owned
     flow (:mod:`localwallet.tx.flow`), not by rules — and for ``confirm_tx``
     even a matching reference only moves the flow when the same-turn user
-    utterance passed the deterministic confirm gate (ADR-0013).
+    utterance passed the deterministic confirm gate (ADR-0013). ``noun``
+    names what the field refers to in the failure string (default
+    "transaction reference"; ``bump_fee``'s ``funding_ref`` is a "coin
+    reference").
     """
     if not value.strip():
-        return [f"params.{field} must be a non-empty transaction reference"]
+        return [f"params.{field} must be a non-empty {noun}"]
     if not value.isprintable():
         return [f"params.{field} must contain only printable characters"]
     return []
@@ -362,6 +370,29 @@ def _rule_self_transfer(params: BaseParams) -> list[str]:
     return []
 
 
+def _rule_bump_fee(params: BaseParams) -> list[str]:
+    """``bump_fee``: ``target`` / ``funding_ref`` shape (TCK-RBF-003).
+
+    Both are carried as shape-validated strings, so the meaning-level check
+    is shape only, mirroring the ``tx_ref`` convention (non-blank after
+    stripping, printable — no control characters). Whether ``target`` names
+    a real in-flight transaction (64-hex txid) or the app's pending-ref
+    token, and whether the quoted ``funding_ref`` / fee knob resolve against
+    store lineage / flow state, is decided by the RBF-004/005 handler, NOT
+    here — this layer only guarantees a well-formed carrier. The model never
+    computes the new fee; it may only carry a rung or a quoted whole-sat
+    rate (both enum/bound-validated at layer 2).
+    """
+    if not isinstance(params, BumpFeeParams):
+        return ["internal: 'bump_fee' params failed the type check"]
+    failures = _tx_ref_shape_failures("target", params.target)
+    if params.funding_ref is not None:
+        failures += _tx_ref_shape_failures(
+            "funding_ref", params.funding_ref, noun="coin reference"
+        )
+    return failures
+
+
 #: Layer-3 business rules, per intent. Values are pure functions from the
 #: validated params model to a list of error strings (empty list == valid).
 #: Frozen (``MappingProxyType``) for symmetry with the frozen
@@ -381,5 +412,6 @@ BUSINESS_RULES: Mapping[IntentName, BusinessRule] = MappingProxyType(
         IntentName.TX_STATUS: _rule_tx_status,
         IntentName.NODE_STATUS: _rule_node_status,
         IntentName.SELF_TRANSFER: _rule_self_transfer,
+        IntentName.BUMP_FEE: _rule_bump_fee,
     }
 )

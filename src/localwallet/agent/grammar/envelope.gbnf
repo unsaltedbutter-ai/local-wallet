@@ -8,7 +8,7 @@
 #   {"v": 0, "intent": <closed enum>, "params": {...}}
 #
 #   v        : integer 0 exactly
-#   intent   : closed enum of the thirteen names
+#   intent   : closed enum of the fourteen names
 #   params   : required object, whose shape depends on intent:
 #                respond     -> {"text": string}
 #                clarify     -> {"question": string}
@@ -45,6 +45,15 @@
 #                               outpoint, NO amount key other than the two
 #                               stated numbers is representable (TCK-
 #                               TX-SELF-001: the money plan is engine-derived).
+#                bump_fee     -> {"target": string} then OPTIONAL
+#                               {"funding_ref": string} then AT MOST ONE of
+#                               {"fee_target": fast|medium|slow} |
+#                               {"fee_rate_sat_vb": <int>} (mutually
+#                               exclusive fee knobs; whole-sat envelope type,
+#                               TCK-FEE-003 — ×100 at the handler edge)
+#                               (TCK-RBF-003: the model names the in-flight
+#                               target and a fee knob; it never computes the
+#                               new fee)
 #
 # KEY ORDER: STRICT. The model must emit keys in order v, intent, params.
 # This is simpler for a small model and removes any ambiguity in the
@@ -110,7 +119,7 @@ envelope ::= "{" ws "\"v\"" ws ":" ws "0" ws "," ws intent-body
 
 # Each intent branch carries its exact params shape and closes the params
 # object and the envelope. This couples intent -> params at decode time.
-intent-body ::= respond | clarify | get-balance | get-history | get-utxos | new-address | create-tx | confirm-tx | sign-tx | broadcast-tx | tx-status | node-status | self-transfer
+intent-body ::= respond | clarify | get-balance | get-history | get-utxos | new-address | create-tx | confirm-tx | sign-tx | broadcast-tx | tx-status | node-status | self-transfer | bump-fee
 
 # intent "respond" -> params {"text": string}
 respond ::= "\"intent\"" ws ":" ws "\"respond\"" ws "," ws "\"params\"" ws ":" ws "{" ws "\"text\"" ws ":" ws string ws "}" ws "}" ws
@@ -270,6 +279,28 @@ below-size-kv ::= "\"below_size_sats\"" ws ":" ws sats-int
 # fee_rate_sat_vb is deliberately NOT offered here (an internal reshuffle
 # never rides the explicit-rate override — the estimator ladder alone bids).
 self-transfer-tail ::= "}" ws "}" ws | "," ws fee-target-kv ws "}" ws "}" ws
+
+# intent "bump_fee" -> params {"target": string[, "funding_ref": string][, fee knob]}
+# (TCK-RBF-003: raise the fee on an in-flight transaction). Keys in FIXED
+# order: target first, then an OPTIONAL funding_ref, then AT MOST ONE fee
+# knob (fee_target OR fee_rate_sat_vb, reusing the create_tx tail rules —
+# mutually exclusive by alternation). target is a shape-validated string (a
+# 64-hex txid OR the app's pending-ref token; resolution is the handler's).
+# The model names the target and a knob — it never computes the new fee.
+bump-fee ::= "\"intent\"" ws ":" ws "\"bump_fee\"" ws "," ws "\"params\"" ws ":" ws params-bump-fee
+
+params-bump-fee ::= "{" ws "\"target\"" ws ":" ws string ws bump-fee-tail
+
+# Optional tail chain: nothing | funding_ref [fee knob] | fee knob. Strict
+# order is preserved (funding_ref before the fee knob), and at most ONE fee
+# knob can appear (bump-fee-fee-kv is the fee_target|fee_rate alternation).
+bump-fee-tail ::= "}" ws "}" ws | "," ws funding-ref-kv ws bump-fee-tail-after-ref | "," ws bump-fee-fee-kv ws "}" ws "}" ws
+
+bump-fee-tail-after-ref ::= "}" ws "}" ws | "," ws bump-fee-fee-kv ws "}" ws "}" ws
+
+funding-ref-kv ::= "\"funding_ref\"" ws ":" ws string
+
+bump-fee-fee-kv ::= fee-target-kv | fee-rate-kv
 
 # Conservative JSON string: any char except quote, backslash, and control
 # chars (\x00-\x1f), OR a valid escape sequence. No raw control characters.

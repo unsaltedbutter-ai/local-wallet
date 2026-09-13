@@ -1690,7 +1690,18 @@ def build_dispatch_table(
             seconds_since_last_block_fn=seconds_since_last_block_fn,
             scan_gate=scan_gate,
         ),
+        IntentName.BUMP_FEE: _bump_fee_not_wired,
     }
+
+
+def _bump_fee_not_wired(envelope: Envelope) -> dict[str, object]:
+    """``bump_fee`` is protocol-registered (TCK-RBF-003) but not yet wired.
+
+    RBF-004 replaces this stub with the real replacement handler. Raising
+    here surfaces a structured ``dispatch_error`` (never a silent no-op) if
+    a ``bump_fee`` envelope ever reaches dispatch before the wiring lands.
+    """
+    raise RuntimeError("bump_fee handler not wired yet (RBF-004)")
 
 
 def _respond_handler(envelope: Envelope) -> dict[str, object]:
