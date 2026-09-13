@@ -16,20 +16,34 @@
 
 ---
 
-## MW-16 round 3 (2026-09-11) 🔥 — re-test on the newest code
+## MW-16 round 3 (updated 2026-09-12 for the de-scope) 🔥 — re-test on the newest code
 
-Round-2 root causes, all FIXED and committed (TCK-BACKEND-004/DIAG-002):
-- Your mempool returns `[]` for `/api/blocks/tip` and a list-wrapped genesis for `/api/blocks/0` — both shapes are now ACCEPTED (tip falls back to `/blocks`).
-- The bitcoind scan sent the wrong descriptor form (`desc(raw(...))` — Core-input wants bare `raw(hex)`) and a 10 s timeout made attempt 2 self-reject ("Scan already in progress"). Now: bare `raw()`, 30-min budget, one attempt.
-- `scantxoutset` permission was NEVER your problem (your status curl proved it) — Core 31 floor is fine too.
-- Probe latency: the 25 s `.local` stall is fixed (pooled client + DNS memo).
+State after the de-scope (TCK-DESCOPE-M3A, committed): **wallet backends = electrum or bitcoind ONLY.** Your Start9 private mempool app is NO LONGER a valid chain URL — mempool.space survives only as the public fees/prices source. If an old mempool URL is stored, startup refuses loudly naming the accepted families — just re-enter electrum or bitcoind.
 
-Verify, reporting any failure verbatim (the log lines now carry `[class=… exc=… code=…]` — paste them; that's the diagnosis):
-- [ ] 🔥 **Private mempool**: Settings → chain base `https://evil-star.local:56191` with `LOCALWALLET_TLS_VERIFY=false` (env or repo-root `config.json` → `"tls_verify": false`) → Apply → expect probe PASS + hot-swap + resync against your node. If it still fails, paste the log line (it now names the class — no more guessing).
-- [ ] 🔥 **bitcoind**: `https://192.168.0.25:65154` + user/pass → Apply → the startup/resync scan should now COMPLETE (minutes-class on first run). If rejected, paste the log line — expect `[class=rpc-error exc=RPCError code=<n>]`, which names the server's actual rejection.
-- [ ] Probe speed: `python3 tools/probe_backend_diag.py https://evil-star.local:56191 --insecure --json` should now take seconds, not 25 s.
-- [ ] **config.json location**: it now lives at the repo root next to the code (old `~/.localwallet/config.json` is ignored — TCK-CFG-003).
-- [ ] Still open from earlier rounds (re-test on new code): autodetect (plain `http://<core-host>:<port>` classifies as bitcoind; plain mempool URL classifies as mempool); creds UI ("no credentials needed" checkbox only for bitcoind; GET /settings shows "configured", never the values); **Resync now** keeps your coin tags/notes; **gap_limit apply** (increase → auto-rescan; DECREASE → stores without rescan + narrates the tradeoff — new behavior); first query speed (model preloads at launch); model-absent path (rename `models/bin/*.gguf` away → download card / No → quick actions).
+Fixed since your last run (TCK-BACKEND-004/DIAG-002 + SCAN-BITCOIND-001): the bitcoind scan sent the wrong descriptor form and a 10 s timeout self-rejected (now bare `raw(hex)`, 30-min budget, one attempt); the scan then crashed on Core 31's field naming (`height`, not legacy `blockheight`) and unconfirmed rows — all fixed; shape failures now report `not-core-shape`, RPC rejections report `rpc-error code=<n>`.
+
+Verify (log lines carry `[class=… exc=… code=…]` — paste them; that's the diagnosis):
+- [ ] 🔥 **electrum**: Settings → chain base `ssl://evil-star.local:50001` → Apply → probe PASS + hot-swap + resync.
+- [ ] 🔥 **bitcoind**: `https://192.168.0.25:65154` + user/pass → Apply → the scan should now COMPLETE end-to-end (minutes-class on first run; your round-3 `blockheight` failure is fixed).
+- [ ] 🔥 **TLS — try WITHOUT any tls_verify setting first.** Only if a log line says `[class=tls-verify-failure]` do you need `"tls_verify": false` in `config.json` (repo root) — see the TLS note below.
+- [ ] Probe speed: the diag should take seconds, not 25 s.
+- [ ] Still open from earlier rounds: autodetect (plain `http://<core-host>:<port>` classifies as bitcoind); creds UI ("no credentials needed" checkbox only for bitcoind; GET /settings shows "configured", never the values); **Resync now** keeps your coin tags/notes; **gap_limit apply** (increase → auto-rescan; DECREASE → stores without rescan + narrates the tradeoff); first query speed (model preloads); model-absent path (download card / No → quick actions).
+
+### TLS note (answers: is `LOCALWALLET_TLS_VERIFY=false` still required?)
+Probably NOT anymore — it was advice for the private mempool's HTTPS endpoint, which is no longer a chain URL. Your two backends:
+- **electrum `ssl://`**: if round 1-2 worked without the flag, keep working without it.
+- **bitcoind `https://`** (Start9 self-signed cert): run once WITHOUT the flag. If the log shows `[class=tls-verify-failure]`, then set it — in repo-root `config.json` as `"tls_verify": false` (persistent) or `LOCALWALLET_TLS_VERIFY=false` (env, same knob, per-launch). Either place works; the config file is the set-and-forget option. The flag carries the honest warning that an unverified backend can observe/tamper with queries.
+
+### config.json — what to enter
+Nothing is REQUIRED right now. The file (repo root, next to the code) is optional overrides only. Entries you might ever use:
+```json
+{
+  "tls_verify": false,
+  "display_currency": "eur"
+}
+```
+Add keys only when a log line or a feature asks for them; malformed/unknown keys refuse startup value-free.
+
 - Diagnostic command if anything fails (value-free, safe to paste):
   `python3 tools/probe_backend_diag.py <url> [--insecure] [--user <u> --password <p>] --json`
 
