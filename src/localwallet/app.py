@@ -28,7 +28,9 @@ implements no protocol, wallet, chain, or tx-engine logic itself:
   ``broadcast_tx`` extracts the raw hex from the re-validated signed
   PSBT, POSTs it once (the chain layer's single-attempt policy), and
   records the BROADCAST state plus a history row; ``tx_status`` quotes
-  the explorer's confirmation status for a verbatim txid.
+  the explorer's confirmation status for a verbatim txid, answered from
+  the store's lineage truth when a bumped transaction's fate is already
+  settled there (TCK-RBF-005).
 - :func:`run` / :func:`main` — CLI wiring: read the watch-only key from
   ``--zpub``, ``LOCALWALLET_ZPUB``, or the STORED wallet row (the wallets
   table's canonical descriptor carries the key — TCK-LAUNCH-001:
@@ -203,6 +205,8 @@ from localwallet.store import (
     DIR_IN,
     DIR_OUT,
     DIR_SELF,
+    SUPERSEDED_EVICTED,
+    SUPERSEDED_REPLACED,
     AddressRecord,
     Store,
     StoreError,
@@ -1675,7 +1679,9 @@ def build_dispatch_table(
         IntentName.BROADCAST_TX: _make_broadcast_tx_handler(
             tx_flow, client, store, wallet_id
         ),
-        IntentName.TX_STATUS: _make_tx_status_handler(client, tx_flow, scan_gate),
+        IntentName.TX_STATUS: _make_tx_status_handler(
+            client, tx_flow, scan_gate, store=store, wallet_id=wallet_id
+        ),
         IntentName.NODE_STATUS: _make_node_status_handler(
             app_settings,
             node_detect_fn=node_detect_fn,
@@ -2007,6 +2013,71 @@ def _pending_summary(
         # never authors the estimate — there is none to author).
         "pending_eta_note": PENDING_NO_ETA_NOTE,
     }
+
+
+def _resolve_in_flight_outgoing(
+    tx_records: Sequence[TxRecord],
+    *,
+    now: int | None = None,
+) -> list[dict[str, object]]:
+    """TCK-RBF-005 shared resolver: the wallet's in-FLIGHT outgoing spends.
+
+    PINNED CONTRACT (TCK-RBF-004 consumes exactly this API — no
+    re-derivation): name ``_resolve_in_flight_outgoing``, positional
+    ``tx_records``, keyword-only ``now``, returning ``list[dict]``.
+
+    Args:
+        tx_records: ONE wallet's verbatim transaction rows — pass
+            :meth:`localwallet.store.Store.get_txs_for_wallet` output
+            straight through (store order, txid ascending; entry
+            ``index`` follows that order, so it is deterministic).
+        now: unix seconds for the ``age_s`` computation; ``None`` reads
+            :func:`time.time` (tests inject a fixed clock).
+
+    Returns:
+        One entry per in-flight outgoing transaction — rows with
+        ``height is None`` and direction ``out``/``self``, MINUS the
+        lineage-retired losers (:func:`localwallet.store.superseded_states`:
+        a ``replaced`` original or an ``evicted`` bump is terminal, never
+        in flight):
+
+        - ``[]`` — nothing in flight. The honest empty answer; callers
+          must never fabricate a transaction from it.
+        - exactly one entry — THE in-flight transaction: assume-and-name-it
+          semantics (the caller narrates its ``txid`` verbatim).
+        - two or more — the disambiguation list; render it indexed.
+
+        Entry keys: ``index`` (1-based position in the returned list),
+        ``txid``, ``amount_sats``, ``fee_rate_centisat_vb``, ``age_s``
+        (seconds since ``first_seen``, floored at 0). The last three are
+        verbatim store values — a legacy (pre-v3) row or one broadcast
+        before the capture shipped carries ``None``, meaning "not
+        recorded", never invented.
+
+    Pure: no store handle, no network, no clock beyond ``now``. The
+    values are tool output (narratable verbatim); this function raises
+    nothing and errors carry nothing.
+    """
+    retired = superseded_states(tx_records)
+    clock = int(time.time()) if now is None else now
+    entries: list[dict[str, object]] = []
+    for row in tx_records:
+        if row.height is not None or row.direction not in (DIR_OUT, DIR_SELF):
+            continue
+        if row.txid in retired:
+            continue
+        entries.append(
+            {
+                "index": len(entries) + 1,
+                "txid": row.txid,
+                "amount_sats": row.amount_sats,
+                "fee_rate_centisat_vb": row.fee_rate_centisat_vb,
+                "age_s": (
+                    None if row.first_seen is None else max(0, clock - row.first_seen)
+                ),
+            }
+        )
+    return entries
 
 
 def _make_get_utxos_handler(
@@ -3877,8 +3948,80 @@ def _make_broadcast_tx_handler(
     return handler
 
 
+def _lineage_tx_status(
+    tx_records: Sequence[TxRecord], txid: str
+) -> dict[str, object] | None:
+    """TCK-RBF-005: the recorded-lineage answer for one queried txid.
+
+    Pure store read — returns the tool-result dict when the wallet's own
+    rows (``get_txs_for_wallet`` output, passed verbatim) already carry
+    the truth about ``txid``, else ``None`` (no lineage data: the caller
+    asks the chain):
+
+    - ``{"txid", "confirmed": False, "lineage": "replaced", "replaced_by",
+      "replacement_height"}`` — a pending original. Its replacement has
+      CONFIRMED (terminal: ``replacement_height`` set from the row) or the
+      recorded bump is unresolved (live race: ``replacement_height`` is
+      ``None`` — the caller may use that shape only to resolve a chain
+      not-found, never to pre-empt the chain, because the original may
+      still confirm).
+    - ``{"txid", "confirmed": False, "lineage": "evicted", "original_txid",
+      "original_height"}`` — a pending bump whose ORIGINAL confirmed: the
+      bump can never take effect (terminal).
+
+    Every terminal claim derives from :func:`localwallet.store.
+    superseded_states` (the one retirement rule — reorg-honest: a cleared
+    height un-retires the sibling, and a link to an unconfirmed or
+    unrecorded partner claims nothing). All quoted values come verbatim
+    from the rows; nothing is invented, nothing is fetched.
+    """
+    by_txid = {r.txid: r for r in tx_records}
+    row = by_txid.get(txid)
+    if row is None:
+        return None
+    state = superseded_states(tx_records).get(txid)
+    if state == SUPERSEDED_REPLACED:
+        partner = by_txid[row.replaced_by_txid or ""]
+        return {
+            "txid": txid,
+            "confirmed": False,
+            "lineage": "replaced",
+            "replaced_by": row.replaced_by_txid,
+            "replacement_height": partner.height,
+        }
+    if state == SUPERSEDED_EVICTED:
+        winner = next(
+            r
+            for r in tx_records
+            if r.replaced_by_txid == txid and r.height is not None
+        )
+        return {
+            "txid": txid,
+            "confirmed": False,
+            "lineage": "evicted",
+            "original_txid": winner.txid,
+            "original_height": winner.height,
+        }
+    if row.height is None and row.replaced_by_txid is not None:
+        # Live race: the bump is a recorded fact (we broadcast it), its
+        # outcome is not yet. Hedged shape — height None.
+        return {
+            "txid": txid,
+            "confirmed": False,
+            "lineage": "replaced",
+            "replaced_by": row.replaced_by_txid,
+            "replacement_height": None,
+        }
+    return None
+
+
 def _make_tx_status_handler(
-    client: ChainClient, flow: TxFlow, scan_gate: StartupScan | None = None
+    client: ChainClient,
+    flow: TxFlow,
+    scan_gate: StartupScan | None = None,
+    *,
+    store: Store | None = None,
+    wallet_id: int | None = None,
 ) -> Handler:
     """Create the ``tx_status`` handler: quoted txid → chain backend status.
 
@@ -3886,6 +4029,26 @@ def _make_tx_status_handler(
     the injection guard for the URL path) is looked up via
     ``client.get_tx_status``; the result quotes the response verbatim:
     ``{"txid", "confirmed", "block_height", "block_time"}``.
+
+    TCK-RBF-005 (lineage-aware answers from store truth) when a ``store``
+    is wired (every production table wires one; ``store=None`` keeps the
+    pure chain behavior the legacy headless call sites pin):
+
+    - a txid whose lineage pair has RESOLVED is answered BEFORE the chain
+      call — the scan already proved which side confirmed and the chain
+      can neither improve nor contradict that: terminal ``replaced`` →
+      the "replaced by <new txid>" copy (with the replacement's recorded
+      height), terminal ``evicted`` → the honest eviction copy.
+    - a txid the backend does not know (``status 404`` — the query that
+      for a superseded original used to mean an endless "try again") with
+      a recorded bump resolves to the hedged replaced copy instead
+      (:func:`_lineage_tx_status`). Never an endless retry loop.
+    - everything else is byte-identical: unlinked lookups, the
+      eventual-consistency line for the flow's own just-broadcast txid,
+      and the ``awaiting_backend`` refusal — which still runs FIRST, so
+      the no-consent hold stands down every lookup, lineage included (a
+      terminal claim without consent could never exist anyway: heights
+      arrive only via consented scans).
 
     TCK-PRIVACY-001 (the audit's one un-gated pre-consent chain call): while
     the first-run backend is UNRESOLVED (``awaiting_backend``), the handler
@@ -3916,10 +4079,29 @@ def _make_tx_status_handler(
             return {"error": "internal", "detail": "tx_status params shape mismatch"}
         if scan_gate is not None and scan_gate.state == "awaiting_backend":
             return {"error": "backend_unchosen", "detail": NO_BACKEND_REFUSAL}
+        lineage: dict[str, object] | None = None
+        if store is not None and wallet_id is not None:
+            try:
+                rows = store.get_txs_for_wallet(wallet_id)
+            except (StoreError, sqlite3.Error) as exc:
+                return _store_error(exc)
+            lineage = _lineage_tx_status(rows, params.txid)
+            if lineage is not None and (
+                lineage["lineage"] == "evicted"
+                or lineage.get("replacement_height") is not None
+            ):
+                return lineage  # terminal store truth — the chain adds nothing
         try:
             status = client.get_tx_status(params.txid)
         except ChainError as exc:
             detail = str(exc)  # scrubbed by the chain layer (no txids)
+            if "status 404" in detail and lineage is not None:
+                # The backend never saw (or no longer relays) this txid, but
+                # the wallet's own lineage rows know: the recorded bump's
+                # hedged replaced copy — never an endless "try again" for a
+                # superseded original. (Live-race shape only: terminal ones
+                # were answered above, without a chain call.)
+                return lineage
             if (
                 flow.txid is not None
                 and params.txid == flow.txid
@@ -9183,7 +9365,11 @@ class ChainBackendFlow:
             w.flow, client, w.store, w.wallet.id
         )
         w.table[IntentName.TX_STATUS] = _make_tx_status_handler(
-            client, w.flow, scan.gate if scan is not None else None
+            client,
+            w.flow,
+            scan.gate if scan is not None else None,
+            store=w.store,
+            wallet_id=w.wallet.id,
         )
         # TCK-TX-SELF-001: self_transfer rides the fee estimator (now the ONE
         # backend-independent shared instance); same scan_fn/gate threading
@@ -11957,6 +12143,12 @@ def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], No
     ``unknown_tx`` → the eventual-consistency note; ``backend_unchosen`` →
     :data:`NO_BACKEND_REFUSAL` verbatim (TCK-PRIVACY-001); other errors
     surface value-free via :func:`_error_line`.
+
+    TCK-RBF-005 lineage shapes (handler results, not errors) print the
+    store's recorded values verbatim: ``replaced`` → "replaced by <new
+    txid>" with the replacement's height when the scan has proven it, the
+    BIP-125 hedge otherwise; ``evicted`` → the honest bump-lost line with
+    the confirmed original's txid and height. The UI computes nothing.
     """
     error = result.get("error")
     if error == "unknown_tx":
@@ -11964,6 +12156,34 @@ def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], No
             sanitize_tool_output(
                 "Transaction not found on the chain yet — it may not be indexed; "
                 "try again in a moment."
+            )
+        )
+        return
+    lineage = result.get("lineage")
+    if lineage == "replaced":
+        replaced_by = result.get("replaced_by")
+        height = result.get("replacement_height")
+        if height is not None:
+            output_fn(
+                sanitize_tool_output(
+                    f"It was replaced by {replaced_by} — the replacement confirmed "
+                    f"at height {height}."
+                )
+            )
+        else:
+            output_fn(
+                sanitize_tool_output(
+                    f"It was replaced by {replaced_by} — the original may still "
+                    "confirm; only one of these two ever will."
+                )
+            )
+        return
+    if lineage == "evicted":
+        output_fn(
+            sanitize_tool_output(
+                f"It never confirmed — it was the fee bump, and the original it "
+                f"replaced went through instead ({result.get('original_txid')} "
+                f"at height {result.get('original_height')})."
             )
         )
         return
