@@ -222,6 +222,31 @@ def _normalize_fingerprint(value: Any) -> str | None:
     return text or None
 
 
+def _device_signable(device: DeviceInfo) -> bool:
+    """Enumerate facts say the device could serve a signature NOW.
+
+    Readability rules per class (the SAME shape ``_probe_lines`` narrates
+    and :meth:`HwiUsbSigner.sign_probe` gates the pre-sign check on — one
+    predicate, no drift): a Jade is signable once its fingerprint reads
+    (locked Jade never reports one); a BitBox02 additionally awaits its
+    on-device passphrase; every other class must report neither
+    ``needs_pin_sent`` nor ``needs_passphrase_sent``. This says nothing
+    about WHICH device is this wallet's — the account-key bind in
+    :meth:`HwiUsbSigner._open_matched_client` remains the only trust
+    decision (ADR-0015 amendment #2).
+    """
+    kind = device.type.lower()
+    if kind.startswith("jade"):
+        return device.fingerprint_hex is not None
+    if kind.startswith("bitbox"):
+        return device.fingerprint_hex is not None and not device.needs_passphrase_sent
+    return (
+        device.fingerprint_hex is not None
+        and not device.needs_pin_sent
+        and not device.needs_passphrase_sent
+    )
+
+
 class HwiUsbSigner(Signer):
     """USB hardware-wallet signer over HWI-as-a-library.
 
@@ -402,6 +427,41 @@ class HwiUsbSigner(Signer):
             lines.extend(self._probe_lines(commands, device, attempt_unlock))
         return tuple(lines)
 
+    def sign_probe(self) -> tuple[str, tuple[str, ...]]:
+        """The pre-sign device check (TCK-HW-005 slice C): ONE bounded
+        enumerate, NO unlock attempt, no client opened, never raises.
+
+        Returns ``(state, lines)`` — a decision, not narration:
+
+        - ``"ready"`` (lines empty): at least one device presents as
+          signable (:func:`_device_signable` — readability only, never
+          trust). The account-key bind inside :meth:`sign_unsigned` stays
+          the hard gate; a "ready" bus with the WRONG device still stops
+          there with the mismatch family.
+        - ``"absent"`` + the no-device guidance family (nothing enumerated,
+          or the enumeration failed, mapped). The CALLER owns the slice-C
+          file-offering ask — this layer never mentions exports.
+        - ``"locked"`` + the EXISTING locked-guidance family (the
+          slice-A report lines with ``attempt_unlock=False`` — the unlock
+          rides slice A's chat command, never a sign attempt).
+
+        Value-free by construction: no path, no fingerprint, no device
+        error text ever appears in ``lines``.
+        """
+        try:
+            devices = self.enumerate_devices()
+        except DeviceError as exc:
+            return "absent", (str(exc),)
+        if not devices:
+            return "absent", (_MSG_NO_DEVICES,)
+        if any(_device_signable(device) for device in devices):
+            return "ready", ()
+        commands = self._ensure_commands()
+        lines: list[str] = []
+        for device in devices:
+            lines.extend(self._probe_lines(commands, device, attempt_unlock=False))
+        return "locked", tuple(lines)
+
     def _probe_lines(
         self, commands: Any, device: DeviceInfo, attempt_unlock: bool
     ) -> list[str]:
@@ -409,15 +469,7 @@ class HwiUsbSigner(Signer):
         kind = device.type.lower()
         jade = kind.startswith("jade")
         bitbox = kind.startswith("bitbox")
-        if jade and device.fingerprint_hex is not None:
-            return [_MSG_HW_READY.format(model=device.model)]
-        if bitbox and device.fingerprint_hex is not None and (
-            not device.needs_passphrase_sent
-        ):
-            return [_MSG_HW_READY.format(model=device.model)]
-        if not jade and not bitbox and device.fingerprint_hex is not None and (
-            not device.needs_pin_sent and not device.needs_passphrase_sent
-        ):
+        if _device_signable(device):
             return [_MSG_HW_READY.format(model=device.model)]
         lines = [_MSG_HW_LOCKED_FOUND.format(model=device.model)]
         if (jade or bitbox) and attempt_unlock:

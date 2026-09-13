@@ -1350,12 +1350,25 @@ class SendSession:
     post-broadcast capture hint was already shown for (never repeated for
     the same tx within the session). Terminal-channel display data —
     labels themselves never enter model context.
+
+    ``hw_sign_wanted`` / ``file_sign_export_once`` (TCK-HW-005 slice C)
+    are the CODE-STAMPED sign-routing choices the user's own words set —
+    the deterministic utterance intercepts write them, the ``sign_tx``
+    handler reads and consumes them, and the MODEL can never set or clear
+    either (the same session-carried authority as ``gate_decision``,
+    ADR-0013). ``hw_sign_wanted`` latches "sign this flow on my device"
+    until a device sign succeeds, an explicit file export runs, or the
+    flow is cancelled — so a bare "retry" re-probes the device instead of
+    silently exporting. ``file_sign_export_once`` is the one-shot
+    explicit file fallback ("file"/"export" after the device ask).
     """
 
     gate_decision: GateDecision = GateDecision.NOT_A_DECISION
     card_render: list[str] | None = None
     last_broadcast_txid: str | None = None
     label_hint_txid: str | None = None
+    hw_sign_wanted: bool = False
+    file_sign_export_once: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1655,7 +1668,8 @@ def build_dispatch_table(
         ),
         IntentName.CONFIRM_TX: _make_confirm_tx_handler(tx_flow, send_session),
         IntentName.SIGN_TX: _make_sign_tx_handler(
-            tx_flow, signer_selection, signer, store, wallet_id, parsed
+            tx_flow, signer_selection, signer, store, wallet_id, parsed,
+            session=send_session,
         ),
         IntentName.BROADCAST_TX: _make_broadcast_tx_handler(
             tx_flow, client, store, wallet_id
@@ -3409,6 +3423,29 @@ def _descriptor_account_path(parsed: ParsedKey) -> str:
     return f"m/{purpose}'/{MAINNET_COIN_TYPE}'/0'"
 
 
+#: TCK-HW-005 SLICE C (user live finding 2026-09-12): the sign path found
+#: itself PSBT file when the user wanted their Jade. The pre-sign device
+#: check answers the absent case with a CHOICE, never a silent export. The
+#: line keeps the signer family's ``"No device found — plug in"`` prefix
+#: verbatim (the PHASE3-AC-3 pin, and the family's single source of
+#: wording) and adds the explicit file fallback: "file"/"export" then runs
+#: the export, "retry" re-probes. Value-free; code-owned; never model text.
+_HW_SIGN_ASK: Final[str] = (
+    "No device found — plug in and unlock your device, then say 'retry', "
+    "or say 'file' and I can export the transaction file for your SD card "
+    "instead."
+)
+
+#: The value-free note on a device sign the USER'S OWN WORDS routed ahead
+#: of a file-configured signer (TCK-HW-005 slice C; same conflict-guidance
+#: pattern as HW-004's "Using your configured signer (file)." — names what
+#: ran, value-free, never a refusal).
+_HW_DEVICE_PREFER_NOTE: Final[str] = (
+    "Signed on your connected device (your configured signer is the file "
+    "transfer — say 'file' while a transaction awaits signing to export instead)."
+)
+
+
 def _make_sign_tx_handler(
     flow: TxFlow,
     selection: SignerSelection,
@@ -3416,6 +3453,7 @@ def _make_sign_tx_handler(
     store: Store,
     wallet_id: int,
     parsed: ParsedKey,
+    session: SendSession | None = None,
 ) -> Handler:
     """Create the ``sign_tx`` handler: CONFIRMED record → signer → revalidate.
 
@@ -3452,9 +3490,18 @@ def _make_sign_tx_handler(
           fingerprint and the descriptor's account path, both from the
           parsed wallet key), and the candidate gate + post-open
           account-key bind run inside it. A :class:`DeviceError` maps to
-         ``{"error": "device_error", "guidance": <§10 guidance>}`` — the
-         guidance string is code-owned text from the error hierarchy and
-         is narrated verbatim.
+          ``{"error": "device_error", "guidance": <§10 guidance>}`` — the
+          guidance string is code-owned text from the error hierarchy and
+          is narrated verbatim.
+           PRE-SIGN DEVICE CHECK (TCK-HW-005 slice C, user finding
+           2026-09-12): every device-path attempt first runs ONE bounded
+           enumerate (:meth:`HwiUsbSigner.sign_probe`, no unlock attempt).
+           No device → the value-free file-offering ASK; locked → the
+           existing locked-guidance family; NOTHING exports silently and
+           the flow stays CONFIRMED. The user's own words may also route
+           the FILE kind onto this device path (probe-gated, session-
+           latched — the model cannot set it) or, via an explicit
+           "file"/"export" answer, run the export under the hwi config.
     4. REVALIDATION GATE (non-negotiable):
        :func:`~localwallet.tx.revalidate.revalidate_signed_psbt` checks
        the signed PSBT against the intent — outputs in exact order,
@@ -3528,7 +3575,23 @@ def _make_sign_tx_handler(
                 result["guidance"] = conflict_note
             return result
 
-        if kind == SIGNER_KIND_FILE:
+        # TCK-HW-005 SLICE C (user live finding 2026-09-12): the user's OWN
+        # WORDS can steer the handoff — deterministic utterance intercepts
+        # stamp these session flags; the model can never set or clear them
+        # (gate_decision precedent, ADR-0013). ``hw_sign_wanted`` latches
+        # "device for THIS flow" so every sign attempt (incl. a bare
+        # "retry") re-probes the device instead of silently exporting; an
+        # explicit "file"/"export" answer consumes
+        # ``file_sign_export_once`` and runs the airgap export even under
+        # the hwi config. Configured file signer + neither flag = the
+        # pre-slice file behavior, byte-identical (HW-004's matrix intact).
+        hw_wanted = session is not None and session.hw_sign_wanted
+        file_once = session is not None and session.file_sign_export_once
+        if session is not None:
+            session.file_sign_export_once = False
+        run_device = (kind != SIGNER_KIND_FILE or hw_wanted) and not file_once
+
+        if not run_device:
             file_signer = (
                 signer_override
                 if isinstance(signer_override, FilePsbtSigner)
@@ -3558,13 +3621,36 @@ def _make_sign_tx_handler(
                     "signer_name": file_signer.name,
                 })
         else:
+            # The device path. Under the FILE kind with the user's
+            # hardware-utterance latch, any override is the FILE signer's —
+            # build the device signer the way the hwi kind does (module
+            # attribute: the test seam the repl harness monkeypatches).
             device_signer = (
                 signer_override
-                if signer_override is not None
+                if signer_override is not None and kind != SIGNER_KIND_FILE
                 else HwiUsbSigner(
                     selection.fingerprint_hex, _descriptor_account_path(parsed)
                 )
             )
+            # PRE-SIGN DEVICE CHECK (slice C): ONE bounded enumerate, no
+            # unlock attempt, no client opened, no file written. Absent →
+            # the value-free file-offering ASK (never a silent export,
+            # never a silent dead end); locked → the EXISTING locked-guidance
+            # family (the unlock rides slice A's chat command). Either way
+            # the flow stays CONFIRMED. DUCK-TYPED on the probe surface (not
+            # isinstance): the real HwiUsbSigner is the only signer with
+            # ``sign_probe``; test-seam fakes without one sign directly (they
+            # own their error paths), and the class is monkeypatchable.
+            sign_probe = getattr(device_signer, "sign_probe", None)
+            if sign_probe is not None:
+                state, probe_lines = sign_probe()
+                if state == "absent":
+                    return _out({"error": "device_error", "guidance": _HW_SIGN_ASK})
+                if state == "locked":
+                    return _out({
+                        "error": "device_error",
+                        "guidance": "\n".join(probe_lines),
+                    })
             try:
                 signed_result = device_signer.sign_unsigned(confirmed.psbt_base64)
             except DeviceError as exc:
@@ -3585,13 +3671,24 @@ def _make_sign_tx_handler(
         except FlowError as exc:  # unreachable single-threaded after the gate
             return _out({"error": "sign_refused", "detail": str(exc)})
 
-        return _out({
+        if session is not None:
+            # The flow is signed — the user's device wish is fulfilled
+            # (slice C latch discipline: the preference never outlives it).
+            session.hw_sign_wanted = False
+        result: dict[str, object] = {
             "status": "signed",
             "tx_ref": signed.tx_ref,
             "txid": revalidated.txid,
             "signer_name": signed_result.signer_name,
             "checksum_verified": signed_result.checksum_verified,
-        })
+        }
+        if run_device and kind == SIGNER_KIND_FILE:
+            # The user's WORDS routed this sign onto the device ahead of the
+            # configured file transfer — name it, value-free (HW-004's
+            # conflict-guidance pattern: names what ran, never a refusal;
+            # the config still owns every turn the user did not speak for).
+            result["guidance"] = _HW_DEVICE_PREFER_NOTE
+        return _out(result)
 
     return handler
 
@@ -10391,15 +10488,29 @@ _HW_CONNECT_WORDS: Final[frozenset[str]] = frozenset(
 _HW_SEE_WORDS: Final[frozenset[str]] = frozenset(
     {"see", "sees", "seen", "detect", "detects", "detected"}
 )
+#: TCK-HW-005 SLICE C (user live finding 2026-09-12): "let's sign with my
+#: hardware wallet" must NEVER fall through to the LLM ("I cannot directly
+#: interact…" is a WRONG answer — the app CAN, via hwi). A device topic
+#: word (same set as above) plus a sign verb.
+_HW_SIGN_WORDS: Final[frozenset[str]] = frozenset({"sign", "signs", "signing"})
 
 
 def _hardware_chat_verb(line: str) -> str | None:
-    """``'unlock'`` | ``'connect'`` | ``'see'`` | ``None`` (priority order).
+    """``'unlock'`` | ``'connect'`` | ``'see'`` | ``'sign'`` | ``None``.
+
+    Priority order is UNLOCK > CONNECT > SEE > SIGN (slice-A families
+    keep their exact precedence; the slice-C ``'sign'`` verb is the new
+    bottom rung, so "can you see my hardware wallet" stays a probe/report
+    and "unlock my jade and sign" starts with the unlock).
 
     ``'see'`` answers with probe+report ONLY; ``'unlock'`` and
     ``'connect'`` (the "I connected my hardware wallet" report) also drive
-    the host-unlockable classes. Bare "unlock" (no topic), "unlock my
-    wallet" (no HARDWARE/device/class word), "can you see my balance",
+    the host-unlockable classes. ``'sign'`` ROUTES the pending send flow
+    onto the device sign path (slice C — probe-gated inside the handler)
+    and, with no flow pending, answers probe+report WITHOUT driving an
+    unlock (nothing to sign; the unlock stays slice A's chat command).
+    Bare "unlock" (no topic), "unlock my wallet" (no HARDWARE/device/class
+    word), "sign the transaction" (no topic), "can you see my balance",
     and "connect to my node" match nothing here and stay ordinary chat.
     """
     words = {
@@ -10414,26 +10525,241 @@ def _hardware_chat_verb(line: str) -> str | None:
         return "connect"
     if words & _HW_SEE_WORDS:
         return "see"
+    if words & _HW_SIGN_WORDS:
+        return "sign"
     return None
 
 
-def _run_hardware_probe(
-    hwi: HwiUsbSigner, line: str, output_fn: Callable[[str], None]
-) -> bool:
-    """Answer a matched hardware utterance straight from the device probe.
+#: TCK-HW-005 SLICE C: the pinned ANSWER to the device-absent ask ("…or say
+#: 'file' and I can export the transaction file for your SD card instead").
+#: Whole-utterance phrases only (the onboarding matcher shape) — consumed
+#: ONLY while a transaction sits CONFIRMED awaiting its handoff, so a stray
+#: "file" anywhere else stays ordinary chat.
+_FILE_EXPORT_PHRASES: Final[frozenset[str]] = frozenset(
+    {
+        "file",
+        "export",
+        "the file",
+        "export the file",
+        "file export",
+        "export it",
+        "export please",
+        "file please",
+        "export instead",
+        "file instead",
+        "use the file",
+        "sd card",
+        "export the psbt",
+    }
+)
 
-    Every narration line is code-owned, value-free signer text —
-    :meth:`HwiUsbSigner.probe_and_report` never raises and never leaks a
-    path/fingerprint, and failures ride the EXISTING guidance family
-    verbatim (never a generic manufacturer deflection). Printed verbatim
-    like all tool output; the model never composes a device answer, and
-    no sign path is touched (this slice cannot sign or select)."""
+
+def _file_export_choice(line: str) -> bool:
+    """The bare "file"/"export" fallback answer (slice C, pinned set)."""
+    words = [
+        w.strip(punctuation).replace("'", "").replace("\u2019", "")
+        for w in line.lower().split()
+    ]
+    return " ".join(w for w in words if w) in _FILE_EXPORT_PHRASES
+
+
+#: TCK-HW-005 slice C SECURITY FIX (review MEDIUM): the sign-verb match is
+#: DELIBERATELY BROADER than :class:`ConfirmGate` ("sign with my hardware
+#: wallet" classifies NOT_A_DECISION at the gate — "with"/"my"/"hardware"
+#: are not FILLER tokens), so the routing must never stamp a CONFIRM the
+#: gate itself would refuse. Guard: ANY deny token from the gate's own
+#: DENY vocabulary ("no", "cancel", "stop", "abort", "don't"/"dont",
+#: "deny", "reject", …) plus the standalone negation "not" (covering
+#: "do not sign …") suppresses the deterministic sign routing ENTIRELY —
+#: the utterance falls through to the ordinary gate/model pipeline, which
+#: handles cancel/NOT_A_DECISION honestly and keeps the CREATED-only chat
+#: cancel (the user's undo) intact.
+_HW_DENY_TOKENS: Final = ConfirmGate.DENY_TOKENS | frozenset({"not"})
+
+
+def _hardware_sign_denied(line: str) -> bool:
+    """True when the utterance carries deny/negation vocabulary."""
+    words = {
+        w.strip(punctuation).replace("'", "").replace("\u2019", "")
+        for w in line.lower().split()
+    }
+    return bool(words & _HW_DENY_TOKENS)
+
+
+def _route_hardware_sign(
+    loop: AgentLoop,
+    flow: TxFlow,
+    session: SendSession,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+) -> bool:
+    """Route "sign with my hardware wallet" (slice C) through the REAL
+    sign path — never the LLM, no skip, no reorder. Deny/negation
+    utterances are excluded by the caller's :func:`_hardware_sign_denied`
+    guard BEFORE this function runs.
+
+    CONFIRMED: one code-built ``sign_tx`` envelope (dispatcher-owned ref,
+    the retry-intercept precedent) with ``session.hw_sign_wanted`` latched;
+    the handler's pre-sign device check runs the ONE enumerate and decides
+    (device present → sign; absent → the file-offering ask, never a silent
+    export; locked → the existing guidance family).
+
+    CREATED — the CONFIRM stamp, stated honestly: this is a DELIBERATE,
+    NARROW EXTENSION of the gate's "sign" ask word, NOT classifier-
+    equivalent (ConfirmGate.classify on this phrasing is NOT_A_DECISION —
+    the extra words are not filler). It is justified by: (1) the user's OWN
+    literal utterance names the sign intent (device topic word ∧ sign verb,
+    whole words, code-matched) — no LLM is consulted anywhere on this path,
+    so an LLM "yes" can never produce the stamp; (2) same-turnness: the
+    decision describes the very utterance being dispatched (the ADR-0013
+    dual-key invariant); (3) the ref is dispatcher-owned (flow state, never
+    user text); (4) bounded consequences — nothing signs without on-device
+    approval, the revalidation hard stop is unchanged, and broadcast stays
+    a separately gated turn; (5) the deny/negation guard above refuses to
+    advance the flow against any cancel reading. The confirm handler runs
+    FIRST; the sign only chains if the flow actually reached CONFIRMED.
+    History records every dispatched turn like any model turn would.
+    """
+    if IntentName.SIGN_TX not in table:
+        return False
+    if flow.state is TxFlowStatus.CREATED:
+        if flow.pending is None or IntentName.CONFIRM_TX not in table:
+            return False
+        # Code-stamped same-turn CONFIRM — the deliberate narrow extension
+        # described in the docstring (user's own literal words, no LLM,
+        # deny-guarded upstream; NOT a ConfirmGate.classify match).
+        confirm_envelope = Envelope(
+            v=0,
+            intent=IntentName.CONFIRM_TX,
+            params=ConfirmTxParams(tx_ref=flow.pending.tx_ref),
+        )
+        session.gate_decision = GateDecision.CONFIRM
+        confirm_result = table[IntentName.CONFIRM_TX](confirm_envelope)
+        loop.add_turn(line, confirm_envelope.model_dump_json())
+        _print_turn(
+            AgentTurnResult(
+                status=AgentTurnStatus.OK,
+                envelope=confirm_envelope,
+                result=confirm_result,
+                user_message=None,
+                turns_used=0,
+            ),
+            output_fn,
+            session=session,
+        )
+    confirmed = flow.confirmed if flow.state is TxFlowStatus.CONFIRMED else None
+    if confirmed is None:
+        # The confirm above refused (value-free refusal already narrated) —
+        # the deterministic turn is complete; the ordinary pipeline must
+        # not re-ask the model about the same utterance.
+        return True
+    session.hw_sign_wanted = True
+    sign_envelope = Envelope(
+        v=0,
+        intent=IntentName.SIGN_TX,
+        params=SignTxParams(tx_ref=confirmed.tx_ref),
+    )
+    result = table[IntentName.SIGN_TX](sign_envelope)
+    loop.add_turn(line, sign_envelope.model_dump_json())
+    _print_turn(
+        AgentTurnResult(
+            status=AgentTurnStatus.OK,
+            envelope=sign_envelope,
+            result=result,
+            user_message=None,
+            turns_used=0,
+        ),
+        output_fn,
+        session=session,
+    )
+    return True
+
+
+def _run_hardware_chat(
+    loop: AgentLoop,
+    flow: TxFlow,
+    session: SendSession,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+    hwi: HwiUsbSigner | None,
+) -> bool:
+    """The deterministic hardware-utterance intercept (slices A + C).
+
+    ``'sign'`` with a flow PENDING (CREATED/CONFIRMED) routes through the
+    sign handler's device path (slice C — probe-gated, never the LLM)
+    UNLESS the utterance carries deny/negation vocabulary — a denied
+    sign match falls through to the ORDINARY gate/model path (no
+    CONFIRM stamp, no sign dispatch; the CREATED-only chat cancel and
+    the model's honest handling stay intact; review MEDIUM fix).
+    ``'sign'`` with NO pending flow gets slice A's probe+report (report
+    only — nothing to sign, so no unlock is driven). The unlock/connect/
+    see families answer straight from the probe signer; without one
+    (placeholder wiring) they stay ordinary chat, exactly as before."""
     verb = _hardware_chat_verb(line)
     if verb is None:
         return False
+    if verb == "sign" and flow.state in (
+        TxFlowStatus.CREATED,
+        TxFlowStatus.CONFIRMED,
+    ):
+        if _hardware_sign_denied(line):
+            return False
+        return _route_hardware_sign(
+            loop, flow, session, line, output_fn, table=table
+        )
+    if hwi is None:
+        return False
+    if verb == "sign":
+        # No flow pending: probe+report WITHOUT driving an unlock (the
+        # sign handoff itself never waits on one; slice A owns unlocks).
+        for text in hwi.probe_and_report(attempt_unlock=False):
+            output_fn(sanitize_tool_output(text))
+        return True
     for text in hwi.probe_and_report(attempt_unlock=verb != "see"):
         output_fn(sanitize_tool_output(text))
     return True
+
+
+def _dispatch_code_sign_turn(
+    loop: AgentLoop,
+    session: SendSession,
+    line: str,
+    tx_ref: str,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+) -> dict[str, object]:
+    """Shared body of the deterministic sign intercepts (TCK-HW-002 retry /
+    TCK-HW-005 slice C hardware-word + file-fallback): CODE builds the
+    ``sign_tx`` envelope from the dispatcher-owned confirmed ``tx_ref``
+    (never a model- or user-supplied reference) and dispatches straight to
+    the handler — whose flow gate, pre-sign device check, revalidation
+    hard stop, and latch consumption are the unchanged pipeline. History
+    records the turn like any dispatched turn would. Returns the handler
+    result (the file-fallback intercept inspects it for latch upkeep)."""
+    envelope = Envelope(
+        v=0,
+        intent=IntentName.SIGN_TX,
+        params=SignTxParams(tx_ref=tx_ref),
+    )
+    result = table[IntentName.SIGN_TX](envelope)
+    loop.add_turn(line, envelope.model_dump_json())
+    _print_turn(
+        AgentTurnResult(
+            status=AgentTurnStatus.OK,
+            envelope=envelope,
+            result=result,
+            user_message=None,
+            turns_used=0,
+        ),
+        output_fn,
+        session=session,
+    )
+    return result
 
 
 def _run_turn(
@@ -10480,14 +10806,24 @@ def _run_turn(
       envelope dispatches to; the model can never reach here without the
       user typing "retry", and an LLM "retry" is never consulted). Every
       other state and every other utterance takes the unchanged pipeline.
-    - Hardware probe/unlock utterances (TCK-HW-005 slice A): the
+    - Hardware probe/unlock utterances (TCK-HW-005 slices A + C): the
       deterministic :func:`_hardware_chat_verb` matcher intercepts the
       "can you see / I connected / unlock my hardware wallet" family
       BEFORE the gate and the model — the live signer answers with the
       value-free probe report (and drives the Jade/BitBox02 host unlock
       on the unlock/connect families). No intent, no envelope, no sign
       path; the model never deflects with "I cannot access your hardware
-      wallet" (a WRONG answer — the app CAN, via hwi).
+      wallet" (a WRONG answer — the app CAN, via hwi). Slice C extends
+      the matcher with the SIGN family: "sign with my hardware wallet"
+      while a flow pends routes through the real confirm/sign dispatch
+      (device-checked in the handler, model never consulted); any
+      deny/negation token in the utterance ("don't sign with my hardware
+      wallet", "cancel and sign…") SUPPRESSES the routing — the line
+      falls through to the ordinary gate/model path (no CONFIRM stamp,
+      chat cancel intact; review MEDIUM fix). With no flow pending it
+      degrades to the slice-A report; the bare "file"/"export" answer to
+      the device-absent ask (CONFIRMED only) runs the explicit export
+      (the device latch survives a FAILED export; review LOW fix).
     - GATE-MERGE (TCK-UX-002, ADR-0013 amendment): when the turn's
       ``confirm_tx`` succeeds, the device handoff (``sign_tx`` handler,
       code-built envelope from the dispatcher-owned confirmed ref) runs in
@@ -10513,32 +10849,53 @@ def _run_turn(
     # never a model- or user-supplied reference) and dispatched straight to
     # the sign_tx handler; the handler's own flow gate remains the
     # authority. History records the turn like any dispatched turn would.
+    # TCK-HW-005 slice C: while the user's words latched "device for this
+    # flow", this same dispatch RE-PROBES the device (the handler reads the
+    # latch) — "retry" after the file-offering ask means "device again".
     confirmed = flow.confirmed if flow.state is TxFlowStatus.CONFIRMED else None
     if confirmed is not None and line.strip().lower() == "retry":
-        envelope = Envelope(
-            v=0,
-            intent=IntentName.SIGN_TX,
-            params=SignTxParams(tx_ref=confirmed.tx_ref),
-        )
-        result = table[IntentName.SIGN_TX](envelope)
-        loop.add_turn(line, envelope.model_dump_json())
-        _print_turn(
-            AgentTurnResult(
-                status=AgentTurnStatus.OK,
-                envelope=envelope,
-                result=result,
-                user_message=None,
-                turns_used=0,
-            ),
-            output_fn,
-            session=session,
+        _dispatch_code_sign_turn(
+            loop, session, line, confirmed.tx_ref, output_fn, table=table
         )
         return
-    # TCK-HW-005 slice A: deterministic hardware probe/unlock intercept —
+    # TCK-HW-005 slice C: the explicit file fallback ANSWER to the
+    # device-absent ask — CONFIRMED-scoped (pin), so a stray "file"/
+    # "export" anywhere else stays ordinary chat. One-shot session stamp;
+    # the handler consumes it and runs the UNCHANGED airgap export (even
+    # under the hwi config — the user's own word, never the model's).
+    if (
+        confirmed is not None
+        and IntentName.SIGN_TX in table
+        and _file_export_choice(line)
+    ):
+        session.file_sign_export_once = True
+        try:
+            result = _dispatch_code_sign_turn(
+                loop, session, line, confirmed.tx_ref, output_fn, table=table
+            )
+        finally:
+            # The handler consumes this flag at its dispatch head; this
+            # finally also covers the refusal paths that return BEFORE it
+            # (a stale one-shot must never arm a later turn's sign).
+            session.file_sign_export_once = False
+        # LOW review fix: retire the device latch only when the file leg
+        # actually RAN (export handed off, or a placed file imported and
+        # signed). A failed export/import keeps the user's device
+        # preference, so the next "retry" still re-probes the device.
+        if (
+            result.get("status") == "signed"
+            or result.get("error") == "signed_file_missing"
+        ):
+            session.hw_sign_wanted = False
+        return
+    # TCK-HW-005 slices A + C: deterministic hardware utterance intercept —
     # BEFORE the gate and the model. The envelope-free narration comes
     # straight from the signer's value-free report or the EXISTING guidance
-    # family; nothing signs, selects, or reaches the model on a match.
-    if hwi is not None and _run_hardware_probe(hwi, line, output_fn):
+    # family; "sign with my hardware wallet" while a flow pends ROUTES the
+    # unchanged sign path (device-checked in the handler, never the LLM).
+    if _run_hardware_chat(
+        loop, flow, session, line, output_fn, table=table, hwi=hwi
+    ):
         return
     session.gate_decision = (
         ConfirmGate.classify(line)
@@ -10549,6 +10906,9 @@ def _run_turn(
     if session.gate_decision is GateDecision.DENY and flow.state is TxFlowStatus.CREATED:
         flow.cancel()
         cancelled = True
+        # TCK-HW-005 slice C: the device wish belonged to THIS flow — a
+        # cancelled flow retires the latch (never leaks onto the next one).
+        session.hw_sign_wanted = False
     # Narration-only ETA fact (TCK-P5-002): the mempool hint is computed
     # lazily ONLY when the flow is CREATED (the ETA fact is needed); any
     # failure degrades to no congestion adjustment, never a crash.
