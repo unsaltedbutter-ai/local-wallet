@@ -57,9 +57,12 @@ Add keys only when a log line or a feature asks for them; malformed/unknown keys
 - [ ] Balance in other currencies ("in euros"); split/consolidate dry-run; "what's pending?" summary.
 - [ ] Startup: separate bubbles; watch line only when OFF; watch failure "retrying in ~Ns" + "watch: recovered.".
 - [ ] Multi-tab echo + per-bubble copy icons still work.
+- [ ] Newest fixes to verify: after a rescan, a reply can no longer attach to an earlier bubble (order stays conversational); address/txid tokens show a DOTTED underline + "Copied ✓" feedback on click (+ screen-reader/touch announcement); hardware-wallet chat: "can you see my hardware wallet?" probes and reports, "unlock my hardware wallet" drives the unlock (Jade/Bitbox), "I connected my hardware wallet" reports + auto-unlocks; the assistant's persona line ("friendly assistant who knows everything about Bitcoin wallets…") shapes replies; settings pane shows NO kind badges (mempool/electrum/bitcoind chips gone — trust badge only).
 
-## MW-15 — live send/fee run
-- [ ] Fee line: FAST bids near the mempool floor; Pay line shows `@ $/BTC`; "faster" twice → asks for a sat/vB rate; explicit rate ("send 100000 sats to <addr> at 5 sat/vB") works. Startup never blocks (dots finish in background).
+## MW-15 — live send/fee run (fee policy v2, 2026-09-12)
+- [ ] Fee line per YOUR spec: MEDIUM = the next projected block's lowest fee × 1.15 (your example: 1.0557 → **1.21 sat/vB**, not the old 2); FASTER = double the target (2.42); SLOWER = the second block's lowest (~1.0). The Pay line shows `@ $/BTC`; "faster" twice → asks for a sat/vB rate; explicit rate ("send 100000 sats to <addr> at 5 sat/vB") works. Startup never blocks (dots finish in background).
+- [ ] Split/consolidate plan: `/details` now shows the DESTINATION addresses (one per line with amounts); the raw ref moved to `/details` with its purpose stated (cancel/reprint handle) — the main card stays clean.
+- [ ] Known issue (fix queued, don't re-file): chat-labeling an ADDRESS ("label bc1q… as Strike") narrates success but doesn't persist yet (TCK-LABEL-001).
 
 ## MW-9 — on-chain broadcast AC (from MW-4, whenever ready)
 - [ ] Sign with the Jade → broadcast → verify on an explorer (docs/phase3-ac.md final step).
