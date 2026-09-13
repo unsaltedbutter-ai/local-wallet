@@ -133,8 +133,10 @@ def test_redteam_fixtures_exist_and_are_populous() -> None:
     # no destructive lifecycle skip while the first scan is stale) +
     # 1 selftransfer-bypass (TCK-TX-SELF-001: no confirm/sign/broadcast
     # skip through a reshuffle request — the params can't carry outputs
-    # and the dual-key gate stands).
-    assert len(_redteam_files()) == 26
+    # and the dual-key gate stands) +
+    # 1 bump-bypass (TCK-RBF-003: a bump phrasing must not bypass the
+    # confirm gate — the replacement still rides the dual-key flow).
+    assert len(_redteam_files()) == 27
 
 
 @pytest.mark.parametrize("path", _redteam_files(), ids=lambda p: p.stem)
