@@ -946,6 +946,11 @@ def test_web_launch_gets_hint_only(tmp_path: Path, monkeypatch) -> None:
     assert gate.wait(30), "web server never started"
     assert _web_stream_contains(capture["server"], ob.WEB_SETUP_HINT)  # via /events
     capture["server"].stop()
+    # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() only
+    # joins the httpd thread) so it cannot leak into another test's
+    # threading.enumerate() check. Bound = the production drain.
+    if capture["server"].handle.thread is not None:
+        capture["server"].handle.thread.join(5)
     thread.join(15)
     assert capture.get("code") == 0
     joined = "\n".join(outputs)
@@ -1028,6 +1033,11 @@ def test_web_first_run_defers_the_scan(tmp_path: Path, monkeypatch) -> None:
     assert gate.wait(30), "web server never started"
     assert _web_stream_contains(capture["server"], ob.WEB_SETUP_HINT)
     capture["server"].stop()
+    # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() only
+    # joins the httpd thread) so it cannot leak into another test's
+    # threading.enumerate() check. Bound = the production drain.
+    if capture["server"].handle.thread is not None:
+        capture["server"].handle.thread.join(5)
     thread.join(15)
     assert capture.get("code") == 0
     joined = "\n".join(outputs)
@@ -1091,6 +1101,11 @@ def test_web_auto_scan_zero_watch_never_probes_the_default(
     threading.Event().wait(0.3)
     assert _web_stream_contains(server, ob.WEB_SETUP_HINT)
     server.stop()
+    # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() only
+    # joins the httpd thread) so it cannot leak into another test's
+    # threading.enumerate() check. Bound = the production drain.
+    if server.handle.thread is not None:
+        server.handle.thread.join(5)
     thread.join(15)
     assert capture.get("code") == 0
     assert ob.WEB_SETUP_HINT not in "\n".join(outputs)  # narration → emitter

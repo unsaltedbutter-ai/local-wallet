@@ -463,6 +463,8 @@ def test_first_run_beat_never_records_consent(
         # a choice either.
         stream.close()
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
         thread.join(15)
     assert capture.get("code") == 0
     store = Store(str(capture["store_path"]))

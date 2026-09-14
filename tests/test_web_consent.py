@@ -75,6 +75,8 @@ def test_consent_route_middleware_status_and_record(tmp_path: Path) -> None:
     assert body["schema"] == "consent/1"
     assert body["status"] == "recorded"
     server.stop()
+    if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+        server.handle.thread.join(5)
     assert _read_marker(tmp_path / "settings.db") == BACKEND_CHOICE_PUBLIC
 
 
@@ -96,6 +98,8 @@ def test_consent_maps_loading_only_from_the_seam(tmp_path: Path) -> None:
             assert json.loads(data)["status"] == closed
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
 
 
 def test_dead_engine_consent_is_a_value_free_503(tmp_path: Path) -> None:
@@ -108,6 +112,8 @@ def test_dead_engine_consent_is_a_value_free_503(tmp_path: Path) -> None:
         assert status == 503 and b"engine busy" in data
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
 
 
 def test_consent_runs_on_the_engine_thread(tmp_path: Path) -> None:
@@ -129,6 +135,8 @@ def test_consent_runs_on_the_engine_thread(tmp_path: Path) -> None:
     finally:
         app.set_public_backend_consent = real  # type: ignore[assignment]
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
 
 
 # ------------------------------------------------------ the real end-to-end
@@ -190,6 +198,8 @@ def test_consent_press_records_releases_and_nothing_else_consents(
     finally:
         stream.close()
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
         thread.join(15)
     assert capture.get("code") == 0
     store_path = capture["store_path"]

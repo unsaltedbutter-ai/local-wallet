@@ -221,6 +221,8 @@ def test_web_narration_is_in_the_emitter_not_the_terminal(
         assert b"event: text" in frame
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
         thread.join(15)
     assert capture.get("code") == 0
     # And the terminal carried NONE of the turn narration (only the launch

@@ -109,6 +109,12 @@ def serve(tmp_path: Path) -> Any:
     yield _serve
     for server in servers:
         server.stop()
+        # FLAKE-FIX (TCK-TEST-002): stop() only joins the httpd thread, never
+        # the daemon engine thread. Join it here so no engine thread leaks
+        # into the next test's `threading.enumerate()` (the CLI-default check
+        # races leaked engine-thread death). Bound = the production drain.
+        if server.handle.thread is not None:
+            server.handle.thread.join(5)
 
 
 def _conn(port: int) -> http.client.HTTPConnection:
@@ -1142,6 +1148,8 @@ def test_state_reports_awaiting_backend_for_a_held_scan(tmp_path: Path) -> None:
         assert ZPUB not in data.decode()  # value-free like every other state
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
         held["worker"].stop()
 
 
@@ -1338,6 +1346,8 @@ def test_settings_get_lists_the_allowlist_shape_only(
         assert server.token.encode() not in data
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
 
 
 def test_settings_post_writes_apply_and_refusals_are_value_free(
@@ -1427,6 +1437,8 @@ def test_settings_post_writes_apply_and_refusals_are_value_free(
         assert entries["chain_base_url"]["value"] == "http://127.0.0.1:3006/api"
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
 
 
 def test_settings_post_auth_overlay_rides_the_url_apply(
@@ -1488,6 +1500,8 @@ def test_settings_post_auth_overlay_rides_the_url_apply(
             assert status == 400, bad
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
 
 
 def test_settings_endpoints_answer_503_when_the_engine_is_dead(
@@ -1517,6 +1531,8 @@ def test_settings_endpoints_answer_503_when_the_engine_is_dead(
         assert entries["gap_limit"]["value"] is None
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
 
 
 # ---------------------------------------------- POST /resync (TCK-BACKEND-002)
@@ -1552,6 +1568,8 @@ def test_resync_endpoint_is_token_gated_and_status_mapped(tmp_path: Path) -> Non
             assert json.loads(data)["status"] == status_name
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
 
 
 # --------------------------- pre-first-scan refusal over the web turn (WEB-005)
@@ -1616,6 +1634,8 @@ def test_web_send_pre_first_scan_gets_the_loading_refusal_as_text(
         stream.close()
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
 
 
 # --------------------------------------------------------- run() wiring §5
@@ -1683,6 +1703,8 @@ def test_run_web_launch_lines_are_token_separate_and_turn_works(
     finally:
         server.stop()
     thread.join(15)
+    if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002: join engine
+        server.handle.thread.join(5)
     assert capture.get("code") == 0
     url_line = next(line for line in outputs if line.startswith("Web UI: http://127.0.0.1:"))
     assert f":{server.httpd.server_address[1]}" in url_line  # ephemeral port

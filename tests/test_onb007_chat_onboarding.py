@@ -893,6 +893,8 @@ def test_banner_precedes_beats_on_the_live_stream(
     finally:
         stream.close()
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
         thread.join(15)
 
 
@@ -950,4 +952,6 @@ def test_chat_zpub_provisions_through_the_real_web_transport(
     finally:
         stream.close()
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
         thread.join(15)

@@ -54,6 +54,11 @@ def serve(tmp_path: Path) -> Any:
     yield _serve
     for server in servers:
         server.stop()
+        # FLAKE-FIX TCK-TEST-002: stop() only joins the httpd thread, never
+        # the daemon engine thread. Join it so no engine thread leaks into a
+        # later test's threading.enumerate() check. Bound = production drain.
+        if server.handle.thread is not None:
+            server.handle.thread.join(5)
 
 
 def _get(server: Any, path: str, *, token: str | None = None, host: str | None = None):
@@ -149,6 +154,8 @@ def test_served_index_allows_the_same_blob_imgs(tmp_path: Any) -> None:
         status, headers, _body = _get(server, "/", token=server.token)
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
     assert status == 200
     assert "img-src 'self' blob:;" in headers["content-security-policy"]
 
