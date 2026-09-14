@@ -2978,12 +2978,14 @@ def _card_refs(outputs: list[str]) -> list[str]:
 #: The exact brief-card line sequence for the canonical fixture send
 #: (60,000 sats @ $20,000/BTC, medium default, 100,000-sat coin): every
 #: value verbatim from the handler result, thousands separators and the
-#: verbatim chain/eta.py hedge (TCK-UX-002 §1 variant A).
+#: verbatim chain/eta.py hedge (TCK-UX-002 §1 variant A). The Fee line's
+#: fiat parenthetical (TCK-FIAT-003): 282 sats @ $20,000/BTC floors to 5
+#: cents — the handler's ``fee_fiat_minor`` verbatim.
 BRIEF_CARD_LINES: Final[list[str]] = [
     'Pending — say "sign" to review it on your device, or "cancel" to discard.',
     f"To: {SEND_RECIPIENT}",
     "Pay: 60,000 sats ($12.00 · @ $20,000/BTC)",
-    "Fee: 282 sats · 2 sat/vB × 141 vB · medium — ETA ~60-70 min — estimate only, not a guarantee",
+    "Fee: 282 sats · 2 sat/vB × 141 vB (≈ $0.05) · medium — ETA ~60-70 min — estimate only, not a guarantee",
     "From: your wallet (1 source) · 39,718 sats come back as change",
     (
         'How important is this one? Say "faster" to confirm sooner (a slightly higher fee) '
@@ -3020,6 +3022,7 @@ def test_brief_card_full_line_sequence_variant_a() -> None:
             "eta_wording": "~60-70 min — estimate only, not a guarantee",
             "inputs_count": 1,
             "change_sats": 39_718,
+            "fee_fiat_minor": 5,  # TCK-FIAT-003: what the handler ships (282 sats @ 20k)
             "fee_target_defaulted": True,
         },
         lines.append,
@@ -3046,6 +3049,7 @@ def test_brief_card_variant_b_tail_no_preference_asked_twice() -> None:
             "eta_wording": "~60-70 min — estimate only, not a guarantee",
             "inputs_count": 1,
             "change_sats": 39_718,
+            "fee_fiat_minor": 5,  # TCK-FIAT-003 (see variant A twin)
             "fee_target_defaulted": False,
         },
         lines.append,
@@ -3278,6 +3282,7 @@ def test_send_flow_handler_result_card_fields(
         "change_sats",
         "inputs_count",
         "usd_cents",
+        "fee_fiat_minor",  # TCK-FIAT-003: the Fee-line fiat, same rate path
         "rate_stale",
         "rate_age_s",
         "rate_fetched_at",

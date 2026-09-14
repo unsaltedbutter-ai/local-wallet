@@ -958,7 +958,9 @@ def _stored_display_currency(store: Store) -> str | None:
         return None
 
 
-def _display_currency_reader(settings: Settings, store: Store) -> Callable[[], str]:
+def _display_currency_reader(
+    settings: Settings, store: Store, session: SendSession | None = None
+) -> Callable[[], str]:
     """The price oracle's LIVE display-currency reader (TCK-FIAT-002,
     ADR-0011 amendment). The ladder — env > config-file > stored > default
     — is re-resolved on EVERY oracle fetch decision, so a settings-panel
@@ -967,6 +969,16 @@ def _display_currency_reader(settings: Settings, store: Store) -> Callable[[], s
     in the create_tx handler). The env/config-file rung is the immutable
     boot snapshot (``Settings.from_env`` already merged them; only the
     startup-validated values ever ride it).
+
+    TCK-FIAT-003 (the MW-17 EUR bug): when ``session`` is wired, a per-ask
+    currency ONE-SHOT (``session.fiat_ask_currency``, stamped by
+    :func:`_detect_fiat_ask_currency` on the user's own utterance at the
+    head of the turn) takes precedence over the ladder for exactly that
+    turn's handler dispatch — the currency the user ASKED in answers that
+    reply; the ``display_currency`` SETTING is untouched (every later turn
+    rides the ladder again). The one-shot code is always a member of the
+    closed enum (the word table maps onto it), so it never needs
+    validation.
 
     The returned callable NEVER raises: :func:`_wire` refuses startup on an
     invalid rung and the settings surface validates every write fail-closed,
@@ -977,6 +989,8 @@ def _display_currency_reader(settings: Settings, store: Store) -> Callable[[], s
     boot = resolve_display_currency(settings.display_currency, None)
 
     def read() -> str:
+        if session is not None and session.fiat_ask_currency is not None:
+            return session.fiat_ask_currency
         try:
             return resolve_display_currency(
                 settings.display_currency, _stored_display_currency(store)
@@ -985,6 +999,49 @@ def _display_currency_reader(settings: Settings, store: Store) -> Callable[[], s
             return boot
 
     return read
+
+
+#: The CLOSED per-ask currency word table (TCK-FIAT-003): explicit currency
+#: words/names on the user's OWN utterance, mapped onto the closed display
+#: enum (``config.DISPLAY_CURRENCIES``). Whole whitespace-delimited tokens
+#: only (edge punctuation stripped, lowercased) — ``usd`` INSIDE an address
+#: or ``euro`` inside ``eurozone`` never matches. Ambiguous (two different
+#: currencies named) or absent = no override, the display ladder answers as
+#: before. This is CODE reading the user's words — the model never authors a
+#: currency code and the envelope schema never carries one.
+_FIAT_ASK_WORDS: Final[Mapping[str, str]] = {
+    "eur": "eur",
+    "euro": "eur",
+    "euros": "eur",
+    "usd": "usd",
+    "dollar": "usd",
+    "dollars": "usd",
+    "gbp": "gbp",
+    "pound": "gbp",
+    "pounds": "gbp",
+    "cad": "cad",
+    "chf": "chf",
+    "aud": "aud",
+    "jpy": "jpy",
+    "yen": "jpy",
+}
+
+
+def _detect_fiat_ask_currency(line: str) -> str | None:
+    """Deterministic per-ask currency intercept (TCK-FIAT-003, MW-17:
+    "what is my balance in Euros?" must answer in EUR even with the display
+    setting unset). Returns the single currency the utterance's tokens name,
+    or ``None`` (nothing named / more than one named = ambiguity, ride the
+    display ladder). Same whole-token matching as the other deterministic
+    utterance intercepts (the consolidation/cpfp word tables)."""
+    found = {
+        _FIAT_ASK_WORDS[token]
+        for token in (t.strip(punctuation) for t in line.lower().split())
+        if token in _FIAT_ASK_WORDS
+    }
+    if len(found) != 1:
+        return None
+    return found.pop()
 
 
 def _open_browser(url: str) -> bool:
@@ -2567,6 +2624,16 @@ class SendSession:
     "consolidated from N outputs" note to the plan's own outputs ON TOP of
     the existing §1.3 union inheritance, then retires). Code-owned end to
     end: the model can neither set, read, nor clear either.
+
+    ``fiat_ask_currency`` (TCK-FIAT-003, the MW-17 EUR bug) is the ONE-SHOT
+    per-ask currency the deterministic word-table intercept
+    (:func:`_detect_fiat_ask_currency`) stamps from the user's OWN words
+    before the turn's handlers run, and :func:`_run_turn` clears in a
+    ``finally`` when they are done: an explicit currency word ("in Euros?")
+    answers THAT reply in that currency while the ``display_currency``
+    SETTING stays untouched (the file_export one-shot precedent,
+    HW-005 slice C). The model can neither set, read, nor clear it — the
+    envelope carries no currency.
     """
 
     gate_decision: GateDecision = GateDecision.NOT_A_DECISION
@@ -2582,6 +2649,7 @@ class SendSession:
     cpfp_pending: _CpfpPending | None = None
     cons_ask: _ConsAsk | None = None
     cons_pending: _ConsPending | None = None
+    fiat_ask_currency: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -4457,6 +4525,14 @@ def _make_create_tx_handler(
             result["fiat_total_minor"] = fiat_minor
             result["fiat_currency"] = currency
             result["fiat_per_btc"] = rate.per_btc
+        if rate is not None:
+            # TCK-FIAT-003 (MW-17 user note): the card's Fee line gains a
+            # fiat conversion too — the SAME ADR-0011 rate as the Pay
+            # segment, in the turn's EFFECTIVE display currency (the
+            # oracle's reader already carries the per-ask one-shot). No
+            # rate = no key = the sats-only Fee line exactly as today;
+            # never a fabricated figure, never an error.
+            result["fee_fiat_minor"] = price_oracle.sats_to_usd(pending.fee_sats, rate)
         if requote and staged is not None:
             if params.fee_rate_sat_vb is not None:
                 # Explicit-rate re-quote: no rungs to compare — direction is
@@ -12294,7 +12370,7 @@ class ChainBackendFlow:
                 w.public_info
                 if w.public_info is not None
                 else PublicInfoClient(w.settings),
-                currency=_display_currency_reader(w.settings, w.store),
+                currency=_display_currency_reader(w.settings, w.store, w.session),
             )
             w.price_oracle = price_oracle
         fee_estimator = w.fee_estimator
@@ -12515,7 +12591,14 @@ def _wire(
     # fail-closed shapes (recommended fallback / stale → sats-only).
     public_info = _public_info_client(settings)
     fee_estimator = FeeEstimator(public_info)
-    price_oracle = PriceOracle(public_info, currency=_display_currency_reader(settings, store))
+    # TCK-FIAT-003: the session is built BEFORE the oracle so the injected
+    # ladder reader can consult the per-ask currency one-shot (a no-op for
+    # every other consumer — the REPL and the handlers share THIS object).
+    session = SendSession()
+    price_oracle = PriceOracle(
+        public_info,
+        currency=_display_currency_reader(settings, store, session),
+    )
     tx_flow = flow if flow is not None else TxFlow()
 
     # The dedicated chain worker (ADR-0022 decision 2): ALL scan/watch chain
@@ -12725,7 +12808,8 @@ def _wire(
             # — including a DEFERRED scan released by a public consent.
             scan.on_first_scan_done = onboarding.emit_load_complete
 
-    session = SendSession()
+    # TCK-FIAT-003: `session` was built with the price oracle above (the
+    # reader holds THIS object) — the REPL and the handlers below share it.
     # TCK-HW-005 slice A: the chat probe/unlock signer, built ONCE per
     # wiring from THIS wallet's account key (fingerprint + descriptor
     # account path — mirroring the lazy sign build in the sign_tx handler).
@@ -14116,6 +14200,13 @@ def _run_turn(
       CONFIRMED/SIGNED internally, and broadcast stays a separately gated
       turn. An LLM "yes" never counts: the chain only follows a dual-key
       confirm that already passed.
+    - Per-ask currency one-shot (TCK-FIAT-003, MW-17): before the model
+      runs, :func:`_detect_fiat_ask_currency` matches a closed currency
+      WORD table against the user's own utterance and stamps the one-shot
+      on ``session.fiat_ask_currency`` for exactly the turn's handlers
+      (the oracle's display-currency reader consults it); cleared when the
+      turn's dispatch ends — the ``display_currency`` setting is never
+      touched, and an ambiguous/absent ask rides the ladder as before.
     - FACTS (TCK-P2-004 SR fix, extended to the full lifecycle in
       TCK-P3-005): the flow's current state is injected as the turn's
       FACTS block (:func:`_flow_facts`) — the pending card while
@@ -14358,7 +14449,21 @@ def _run_turn(
         # narrower create_tx gate (decision 6): a skip unblocks sends.
         # The model narrates from it; it never authors a freshness claim.
         facts["freshness"] = FRESHNESS_STALE
-    turn = loop.run(line, facts)
+    # TCK-FIAT-003 (MW-17): the per-ask currency one-shot — CODE reads the
+    # user's OWN utterance (closed word table, whole tokens) BEFORE the
+    # model sees the turn; the price oracle's injected reader
+    # (:func:`_display_currency_reader`) consults it for exactly this
+    # turn's handler dispatch, so "in Euros?" answers in EUR while the
+    # display_currency SETTING stays untouched. The model still only routes
+    # the phrasing to get_balance/create_tx — it never authors a currency
+    # and the envelope never carries one. Cleared in a finally: a stale
+    # one-shot must never arm a later turn (the file_sign_export_once
+    # precedent).
+    session.fiat_ask_currency = _detect_fiat_ask_currency(line)
+    try:
+        turn = loop.run(line, facts)
+    finally:
+        session.fiat_ask_currency = None
     _print_turn(turn, output_fn, session=session)
     # GATE-MERGE (TCK-UX-002, ADR-0013 amendment): a successful confirm
     # chains straight into the device handoff IN THE SAME TURN — the
@@ -15511,6 +15616,22 @@ def _fiat_pair(result: Mapping[str, object]) -> tuple[int, str] | None:
     return None
 
 
+def _fee_fiat_pair(result: Mapping[str, object]) -> tuple[int, str] | None:
+    """The Fee-line fiat pair (TCK-FIAT-003): the handler-supplied
+    ``fee_fiat_minor`` in the card result's currency — the tagged
+    ``fiat_currency`` when the answer carries one (FIAT-002 shape), the
+    USD default otherwise (the same key design as :func:`_fiat_pair`).
+    ``None`` when the key is absent (no rate → the sats-only Fee line
+    exactly as today): fail-closed, never a fabricated conversion."""
+    minor = result.get("fee_fiat_minor")
+    if isinstance(minor, bool) or not isinstance(minor, int):
+        return None
+    currency = result.get("fiat_currency")
+    if isinstance(currency, str) and currency:
+        return minor, currency
+    return minor, DEFAULT_DISPLAY_CURRENCY
+
+
 def _fiat_text(minor: int, currency: str, *, grouped: bool) -> str:
     """Format a minor-unit fiat amount for display (the same display-only
     formatting class as ``_card_rate``'s thousands separation — the figure
@@ -15605,6 +15726,16 @@ def _print_brief_card(
         vsize = _card_sats(result, "vsize")
         if vsize is not None:
             fee += f" × {vsize} vB"
+        fee_fiat = _fee_fiat_pair(result)
+        if fee_fiat is not None:
+            # TCK-FIAT-003: the fiat parenthetical on the send card's Fee
+            # line (figures verbatim from the handler result, the same
+            # rate the Pay segment carries; the stale marker mirrors the
+            # Pay line's honesty). Absent key = sats-only as today.
+            approx = _fiat_text(fee_fiat[0], fee_fiat[1], grouped=False)
+            if result.get("rate_stale"):
+                approx += " · stale"
+            fee += f" (≈ {approx})"
         target_word = result.get("fee_target")
         if isinstance(target_word, str) and target_word:
             fee += f" · {target_word}"
