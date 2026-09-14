@@ -484,6 +484,16 @@ ACCEPT = [
     # grammar-legal rate the schema later bounds: 0 and 99999 (loose/tight split)
     '{"v":0,"intent":"bump_fee","params":{"target":"' + "a" * 64 + '","fee_rate_sat_vb":0}}',
     '{"v":0,"intent":"bump_fee","params":{"target":"' + "a" * 64 + '","fee_rate_sat_vb":99999}}',
+    # ---- TCK-CHAT-001: get_addresses + the additive address_number key
+    '{"v":0,"intent":"get_addresses","params":{}}',
+    '{"v":0,"intent":"get_addresses","params":{"address_number":3}}',
+    '{"v":0,"intent":"get_balance","params":{"address_number":1}}',
+    '{"v":0,"intent":"get_utxos","params":{"address_number":9999999}}',
+    # whitespace around every token of the new branches
+    '{\n "v" : 0 ,\n "intent" : "get_addresses" ,\n "params" : { "address_number" : 7 }\n}',
+    # grammar-legal values the schema/handler later bound: 10000000 (8-digit
+    # syntactic cap rejects — asserted in REJECT below); the registry
+    # bound-check is engine-side, the grammar only carries the shape
 ]
 
 REJECT = [
@@ -726,6 +736,35 @@ REJECT = [
     '{"v":0,"intent":"bump_fee","params":{"tx_ref":"abc"}}',
     "bump_fee target is a JSON integer (must be a string)",
     '{"v":0,"intent":"bump_fee","params":{"target":64}}',
+    # ---- TCK-CHAT-001: address_number drift pins (number-only carrier)
+    "get_balance address_number 0 (grammar [1-9] start; the schema floor rejects too)",
+    '{"v":0,"intent":"get_balance","params":{"address_number":0}}',
+    "get_balance address_number 8 digits (7-digit syntactic cap)",
+    '{"v":0,"intent":"get_balance","params":{"address_number":10000000}}',
+    "get_balance address_number negative (no sign in the number rules)",
+    '{"v":0,"intent":"get_balance","params":{"address_number":-3}}',
+    "get_balance address_number leading zero",
+    '{"v":0,"intent":"get_balance","params":{"address_number":03}}',
+    "get_balance address_number null (omission is leaving the key out)",
+    '{"v":0,"intent":"get_balance","params":{"address_number":null}}',
+    "get_balance address_number as a string",
+    '{"v":0,"intent":"get_balance","params":{"address_number":"3"}}',
+    "get_balance address_number as a bool",
+    '{"v":0,"intent":"get_balance","params":{"address_number":true}}',
+    "get_utxos BOTH limit and address_number (closed whole-object alternation)",
+    '{"v":0,"intent":"get_utxos","params":{"limit":5,"address_number":3}}',
+    "get_utxos address_number BEFORE nothing is fine but a second key is not",
+    '{"v":0,"intent":"get_utxos","params":{"address_number":3,"address":"bc1q"}}',
+    "get_addresses with an address key — the model cannot CARRY an address",
+    '{"v":0,"intent":"get_addresses","params":{"address":"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}}',
+    "get_addresses with a recipient key (intent->params coupling)",
+    '{"v":0,"intent":"get_addresses","params":{"recipient":"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}}',
+    "get_addresses params extra key (closed world)",
+    '{"v":0,"intent":"get_addresses","params":{"verbose":true}}',
+    "get_addresses address_number with a txid-looking value (int only)",
+    '{"v":0,"intent":"get_addresses","params":{"address_number":"' + "a" * 64 + '"}}',
+    "get_addresses with a bump_fee key (intent->params coupling)",
+    '{"v":0,"intent":"get_addresses","params":{"target":"abc"}}',
 ]
 
 
@@ -756,10 +795,16 @@ def test_grammar_parses_without_unsupported_constructs(matcher: GbnfMatcher):
         "respond",
         "clarify",
         "get-balance",
+        "params-balance",
+        "address-number-kv",
+        "address-number-int",
         "get-history",
         "params-history",
         "limit-int",
         "get-utxos",
+        "params-utxos",
+        "get-addresses",
+        "params-get-addresses",
         "new-address",
         "params-new-address",
         "branch-digit",
@@ -830,6 +875,7 @@ def test_grammar_intent_branches_cover_the_closed_enum(matcher: GbnfMatcher):
         "node_status",
         "self_transfer",
         "bump_fee",
+        "get_addresses",
     ):
         assert f'"{intent}"' in text
 

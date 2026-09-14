@@ -600,7 +600,11 @@ def test_ac4_store_view_narration_inputs_match_truth(store: Store) -> None:
         '{"v": 0, "intent": "get_utxos", "params": {}}'
     ))
     assert utxos["count"] == 3
-    assert utxos["utxos"] == [
+    # TCK-CHAT-001 adds a stable registry ``number`` per printed own
+    # address (assigned at this first showing, sorted-address order by the
+    # handler). The AC-4 store view is checked EX-NUMBER against fixture
+    # truth; the numbers themselves are pinned in tests/test_chat001_*.
+    assert [{k: v for k, v in row.items() if k != "number"} for row in utxos["utxos"]] == [
         {
             "txid": TX_SPEND_SELF,
             "vout": 0,
@@ -623,6 +627,13 @@ def test_ac4_store_view_narration_inputs_match_truth(store: Store) -> None:
             "confirmed": False,
         },
     ]
+    # TCK-CHAT-001: every printed own address carried a distinct positive
+    # stable registry number on this first showing (the numbers are
+    # assigned sorted-address order by the handler; the mapping itself is
+    # pinned in tests/test_chat001_referential_addresses.py).
+    printed_numbers = [row["number"] for row in utxos["utxos"]]
+    assert all(isinstance(n, int) and n > 0 for n in printed_numbers)
+    assert len(set(printed_numbers)) == len(printed_numbers) == 3
 
     # --- history rows: all 6 cached txs, newest first (unconfirmed first).
     history = table[IntentName.GET_HISTORY](validate_payload(

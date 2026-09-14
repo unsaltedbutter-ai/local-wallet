@@ -183,8 +183,10 @@ from localwallet.protocol import (
     CreateTxParams,
     DispatchTable,
     Envelope,
+    GetAddressesParams,
     GetBalanceParams,
     GetHistoryParams,
+    GetUtxosParams,
     Handler,
     IntentName,
     NewAddressParams,
@@ -199,6 +201,7 @@ from localwallet.signer.file import FilePsbtSigner
 from localwallet.signer.hwi import DeviceError, HwiUsbSigner
 from localwallet.store import (
     ADDRESS_ALLOCATED,
+    ADDRESS_USED,
     BRANCH_CHANGE,
     BRANCH_RECEIVE,
     COIN_NOTE_MAX_CHARS,
@@ -209,6 +212,7 @@ from localwallet.store import (
     SUPERSEDED_EVICTED,
     SUPERSEDED_REPLACED,
     AddressRecord,
+    AddressRegistryRecord,
     Store,
     StoreError,
     TxRecord,
@@ -1149,6 +1153,63 @@ SCAN_PENDING_NOTE: Final[str] = (
 PENDING_NO_ETA_NOTE: Final[str] = (
     "No confirmation estimate right now — pending transactions have no recorded fee target to estimate from"
 )
+
+# ---------------------------------------------------------------- TCK-CHAT-001
+#
+# The referential-address surface: every address shown to the user carries
+# a STABLE wallet-lifetime number from the store's registry (schema v4), and
+# a numbered referent ("show address 3", "balance of #3") resolves
+# engine-side against that registry with a bound-check. The copy below is
+# drafted in the docs/ux-web-copy-2.md voice (designer §2(a)/(b)/§5 strings
+# were never committed as a doc) — FLAGGED for designer review. Static,
+# value-free by construction (no address/amount digits in the framing; the
+# per-row values are verbatim TOOL output rendered separately).
+
+#: One-time teaching line, shown the FIRST time a numbered address list is
+#: printed to the user (persisted per wallet; never repeated).
+ADDRESS_REF_HINT: Final[str] = (
+    'Tip: you can refer to any of these by number — "show address 2", '
+    '"balance of #2".'
+)
+
+#: The FAQ-style line (council: the visible copy for the first-shown date
+#: is ONE line; the date itself is stored, never narrated per row).
+ADDRESS_TRACKING_FAQ_LINE: Final[str] = (
+    "I note the date I first show you each address, and every address "
+    "keeps its number for good."
+)
+
+#: The out-of-range/unknown-referent answer. Value-free: it names no
+#: address and echoes no fabricated state; it offers the one honest next
+#: step (list the numbers that DO exist). Deliberately NOT a guess.
+ADDRESS_REF_UNKNOWN: Final[str] = (
+    "I don't have an address with that number — I only answer for numbers "
+    "I've shown you. Say \"what addresses have I used\" for the list."
+)
+
+#: The empty-registry answer (wallet has shown no addresses yet).
+ADDRESSES_NONE_SHOWN: Final[str] = (
+    "I haven't shown you any addresses yet — ask me for a new one when "
+    "you're ready to receive."
+)
+
+#: Settings key marking the one-time numbered-referent hint as SHOWN
+#: (wallet-lifetime: survives sessions by design — the hint teaches the
+#: stable-registry contract, which is exactly what persists).
+_ADDRESS_REF_HINT_SETTING: Final[str] = "address_ref_hint_shown"
+
+#: Hard caps on the FACTS-injected registry (context budget, ADR-0006):
+#: at most this many entries serialize, and the joined value stays well
+#: under :data:`localwallet.agent.context.MAX_FACTS_VALUE_CHARS` (2000).
+#: A larger registry injects the FIRST ``_REGISTRY_FACTS_MAX`` entries and
+#: the count fact, and the prompt tells the model the list can be
+#: incomplete — the handler-side bound-check stays the only authority.
+_REGISTRY_FACTS_MAX: Final[int] = 20
+
+#: The per-entry registry FACTS budget (chars); entries that would push the
+#: joined line past it are dropped from the injection (never truncated
+#: mid-value: a cut-down address is worse than an omitted entry).
+_REGISTRY_FACTS_CHARS: Final[int] = 1600
 
 #: TCK-SCAN-003 (ADR-0022 decision 6): the friendly, value-free
 #: ``create_tx`` refusal while the FIRST scan has not completed —
@@ -2189,6 +2250,9 @@ def build_dispatch_table(
         ),
         IntentName.GET_HISTORY: _make_get_history_handler(store, wallet_id, scan_gate),
         IntentName.GET_UTXOS: _make_get_utxos_handler(store, wallet_id, scan_gate),
+        IntentName.GET_ADDRESSES: _make_get_addresses_handler(
+            store, wallet_id, scan_gate
+        ),
         IntentName.NEW_ADDRESS: _make_new_address_handler(store, wallet_id, parsed),
         IntentName.CREATE_TX: _make_create_tx_handler(
             store,
@@ -2314,11 +2378,38 @@ def _make_get_balance_handler(
     feed, capability-absent backend, disabled oracle, or an unexpected
     failure — leaves those keys ABSENT: a sats-only answer, never an
     error, never a fabricated number.
+
+    TCK-CHAT-001 (``address_number``): the additive param scopes the SAME
+    cached-snapshot sum to the UTXOs of ONE registry address — resolution
+    is engine-side against the store registry (the handler never widens:
+    no new lookup, no network, one filter over the rows it already
+    loaded), a miss answers the value-free ``address_ref_unknown`` clarify
+    (never a whole-wallet answer for a bad referent — silently dropping
+    the scope would retarget the user's mental model), and the answer
+    RESTATES the resolved ``address`` alongside ``address_number`` for the
+    full-address narration invariant.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
-        del envelope  # get_balance params are empty by schema
+        params = envelope.params
+        if not isinstance(params, GetBalanceParams):
+            return {"error": "internal", "detail": "get_balance params shape mismatch"}
         scan_pending = False
+        scoped_address: str | None = None
+        if params.address_number is not None:
+            # TCK-CHAT-001 referent: resolve the stable number against the
+            # registry FIRST — before any lazy scan (a bad referent must
+            # not pay for a minutes-class scan to discover it is unknown).
+            # Engine-verified bound-check; a miss is the value-free
+            # clarify, never a whole-wallet fallback.
+            try:
+                scoped_address = _resolve_address_ref(
+                    store, wallet_id, params.address_number
+                )
+            except (StoreError, sqlite3.Error) as exc:
+                return _store_error(exc)
+            if scoped_address is None:
+                return {"error": _ADDRESS_REF_UNKNOWN}
         try:
             in_flight = scan_gate is not None and scan_gate.in_progress
             if (
@@ -2354,6 +2445,8 @@ def _make_get_balance_handler(
             tip_raw = store.get_sync_state(wallet_id, wallet_scan.TIP_KEY)
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
+        if scoped_address is not None:
+            utxos = [u for u in utxos if u.address == scoped_address]
         confirmed = sum(u.value_sats for u in utxos if u.confirmed == 1)
         unconfirmed = sum(u.value_sats for u in utxos if u.confirmed != 1)
         result: dict[str, object] = {
@@ -2366,6 +2459,11 @@ def _make_get_balance_handler(
             # verbatim either way.
             "freshness": _freshness(store, wallet_id, scan_gate),
         }
+        if params.address_number is not None:
+            # Full-address restatement (CHAT-001 invariant: a scoped
+            # answer ALWAYS names the address; number-only is the bug).
+            result["address_number"] = params.address_number
+            result["address"] = scoped_address
         if scan_pending:
             # TCK-UX-011 (additive key, ADR-0022 amendment 2): the engine
             # stood the lazy scan down and kicked the background flow —
@@ -2636,14 +2734,40 @@ def _make_get_utxos_handler(
     pending figures ride the cache, so during the first scan they are
     partial-but-verbatim — the stale flag already says so. No network
     I/O.
+
+    TCK-CHAT-001: this listing is a SHOWING surface — every own address
+    it prints gets its stable registry number assigned (idempotent
+    first-showing write) and the row carries that ``number`` verbatim for
+    the narration. The additive ``address_number`` param scopes the
+    listing to one registry address (engine-resolved, bound-checked; a
+    miss is the value-free ``address_ref_unknown`` clarify and the answer
+    RESTATES the full address).
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
-        del envelope  # get_utxos params are empty by schema
+        params = envelope.params
+        if not isinstance(params, GetUtxosParams):
+            return {"error": "internal", "detail": "get_utxos params shape mismatch"}
         try:
             records = store.get_utxos_for_wallet(wallet_id)
             txs = store.get_txs_for_wallet(wallet_id)
             freshness = _freshness(store, wallet_id, scan_gate)
+            scoped_address: str | None = None
+            if params.address_number is not None:
+                scoped_address = _resolve_address_ref(
+                    store, wallet_id, params.address_number
+                )
+                if scoped_address is None:
+                    return {"error": _ADDRESS_REF_UNKNOWN}
+                records = [r for r in records if r.address == scoped_address]
+            # Number every address this answer will PRINT (showing = the
+            # registry's only writer; idempotent, so repeats never move a
+            # number or re-stamp the date).
+            numbers: dict[str, int] = {
+                r.address: r.number for r in store.list_address_registry(wallet_id)
+            }
+            for address in sorted({r.address for r in records if r.address}):
+                numbers[address] = store.note_address_shown(wallet_id, address).number
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
         utxos = [
@@ -2653,6 +2777,7 @@ def _make_get_utxos_handler(
                 "address": r.address,
                 "value_sats": r.value_sats,
                 "confirmed": bool(r.confirmed),
+                "number": numbers.get(r.address) if r.address else None,
             }
             for r in records
         ]
@@ -2661,6 +2786,9 @@ def _make_get_utxos_handler(
             "count": len(utxos),
             "freshness": freshness,
         }
+        if params.address_number is not None:
+            result["address_number"] = params.address_number
+            result["address"] = scoped_address
         result.update(_pending_summary(records, txs))
         return result
 
@@ -2692,6 +2820,16 @@ def _make_new_address_handler(
     and the bump can however re-issue the SAME address string on the next
     call — a same-string re-issue (no fund loss, the address is already
     this wallet's), never a skipped or duplicated derivation index.
+
+    TCK-CHAT-001 (numbering at FIRST SHOWING): the address this handler
+    returns is always printed to the user by ``_print_new_address``, so
+    the handler registers it (idempotent ``note_address_shown`` — an
+    address previewed earlier by ``/receive`` KEEPS its original number)
+    and the result carries the stable ``address_number`` for the narration
+    to print verbatim. Registry failure never un-allocates the address:
+    a store error here is surfaced by the (unchanged) value-free
+    ``store_error`` path, and the allocation itself already committed in
+    its own transactions — nothing half-happens.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -2716,11 +2854,183 @@ def _make_new_address_handler(
             )
             store.allocate(wallet_id, branch, index)
             store.bump_next_index(wallet_id, branch)
+            # First showing (this handler's answer is always narrated):
+            # assign/return the stable registry number BEFORE any error
+            # path can skip it — same atomicity discipline as the rest of
+            # the allocation bookkeeping (single writer).
+            registry = store.note_address_shown(wallet_id, address)
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
-        return {"address": address, "branch": branch, "index": index}
+        return {
+            "address": address,
+            "branch": branch,
+            "index": index,
+            "address_number": registry.number,
+        }
 
     return handler
+
+
+# ------------------------------------------------- referential addresses
+#
+# TCK-CHAT-001: the stable per-wallet NUMBER is the user's handle for an
+# address ("address 3", "#3"). THREE invariants shape everything below:
+# (a) resolution is ENGINE-side against the store registry — a miss is the
+# value-free :data:`ADDRESS_REF_UNKNOWN` clarify, never a guess and never a
+# nearest-match; (b) EVERY resolution restates the FULL address (a number-
+# only answer is the bug the council named: silent retargeting); (c) the
+# registry numbers/labels are never fabricated — numbers exist only because
+# a surface SHOWN the address, and the label slot renders honestly empty
+# until address-keyed labels exist (TCK-CHAT-003).
+
+#: Handler error CODE (not text) for a referent the registry does not
+#: hold — the narration maps it to :data:`ADDRESS_REF_UNKNOWN`, the
+#: value-free clarify. The code itself carries no number.
+_ADDRESS_REF_UNKNOWN: Final[str] = "address_ref_unknown"
+
+
+def _resolve_address_ref(store: Store, wallet_id: int, number: int) -> str | None:
+    """The full address behind ``number``, or ``None`` (out of range).
+
+    The engine-verified bound-check: ``None`` is not an error to raise but
+    the caller's cue for the value-free clarify — the store never guesses
+    a nearest number and this helper never echoes the number it could not
+    resolve.
+    """
+    record = store.get_address_by_number(wallet_id, number)
+    return record.address if record is not None else None
+
+
+def _used_state(store: Store, wallet_id: int) -> dict[str, dict[str, object]]:
+    """Per-address activity join (pure store read — the "used" truth).
+
+    Keyed by address; ``used`` is what the list header honestly defines
+    ("we've seen activity"), computed as: the scan marked the address
+    ``used``, OR the wallet currently holds a coin on it (a UTXO row IS
+    seen activity). ``sats_total`` sums the stored values verbatim; it is
+    ``None`` (never a fabricated 0) for an address with no UTXO row —
+    spent-through and never-funded addresses both print without a value,
+    and the freshness bound of the whole join belongs to the last scan,
+    which the caller carries separately (``freshness`` / header copy).
+    """
+    state: dict[str, dict[str, object]] = {}
+    for branch in (BRANCH_RECEIVE, BRANCH_CHANGE):
+        for row in store.get_addresses(wallet_id, branch):
+            state.setdefault(row.address, {})["used"] = row.status == ADDRESS_USED
+    for utxo in store.get_utxos_for_wallet(wallet_id):
+        if not utxo.address:
+            continue
+        entry = state.setdefault(utxo.address, {})
+        entry["used"] = True
+        entry["sats_total"] = int(entry.get("sats_total", 0)) + utxo.value_sats
+    for entry in state.values():
+        entry.setdefault("sats_total", None)
+    return state
+
+
+def _make_get_addresses_handler(
+    store: Store,
+    wallet_id: int,
+    scan_gate: StartupScan | None = None,
+) -> Handler:
+    """Create the ``get_addresses`` handler (TCK-CHAT-001 registry query).
+
+    ``params {}`` lists EVERY address the wallet has shown the user, in
+    stable-number order; ``{"address_number": N}`` resolves N engine-side
+    against the registry (a miss answers the value-free clarify) and
+    answers with that ONE entry — its FULL address restated.
+
+    Numbering at first showing, honestly: an address with activity the
+    scan has seen but the user has never been shown is FIRST SHOWN by this
+    very list, so the handler registers it (in receive-then-change, index
+    order — deterministic) before building the rows. A never-shown, never-
+    used address (the rest of the derivation window) is NOT here and gets
+    no number: the registry tracks what the user has seen, not what the
+    gap limit derived.
+
+    The label slot is every row's ``"label": None`` — address-keyed labels
+    do not exist yet (TCK-CHAT-003 lands them onto this exact field); the
+    narration renders the slot honestly ``unlabeled``, and NOTHING here
+    fabricates a label. The one-time referent hint (``hint_new``) is
+    stamped by the LIST answer only (a single restatement teaches nothing
+    new) and flips a persisted settings flag exactly once per wallet
+    lifetime. No network I/O.
+    """
+
+    def handler(envelope: Envelope) -> dict[str, object]:
+        params = envelope.params
+        if not isinstance(params, GetAddressesParams):
+            return {"error": "internal", "detail": "get_addresses params shape mismatch"}
+        try:
+            used = _used_state(store, wallet_id)
+            if params.address_number is not None:
+                # A single restatement SHOWS only that one address — it
+                # must not number the other activity rows (a number is
+                # minted at a showing, never as a side effect of lookup).
+                record = store.get_address_by_number(wallet_id, params.address_number)
+                if record is None:
+                    # Out-of-range: the value-free clarify, never a guess.
+                    return {"error": _ADDRESS_REF_UNKNOWN}
+                return {
+                    "addresses": [_registry_entry(record, used)],
+                    "requested_number": params.address_number,
+                    "count": 1,
+                    "freshness": _freshness(store, wallet_id, scan_gate),
+                    "last_scan_at": store.get_sync_state(wallet_id, wallet_scan.SCAN_AT_KEY),
+                }
+            # Register activity-seen-but-never-shown addresses NOW (the
+            # list is their first showing) — deterministic (branch, index)
+            # order so numbers follow the wallet's own address order.
+            numbered = {row.address for row in store.list_address_registry(wallet_id)}
+            to_show: list[tuple[int, int, str]] = []
+            for branch in (BRANCH_RECEIVE, BRANCH_CHANGE):
+                for row in store.get_addresses(wallet_id, branch):
+                    if row.address not in numbered and (
+                        row.status == ADDRESS_USED
+                        or (used.get(row.address) or {}).get("used") is True
+                    ):
+                        to_show.append((branch, row.index, row.address))
+            for _branch, _index, address in sorted(to_show):
+                store.note_address_shown(wallet_id, address)
+            rows = store.list_address_registry(wallet_id)
+            freshness = _freshness(store, wallet_id, scan_gate)
+            last_scan_at = store.get_sync_state(wallet_id, wallet_scan.SCAN_AT_KEY)
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+
+        # The hint teaches the NUMBERED LIST; an empty registry prints the
+        # honest empty line and consumes nothing (the flag only flips the
+        # first time rows actually print).
+        hint_new = bool(rows) and store.get_setting(_ADDRESS_REF_HINT_SETTING) != "1"
+        if hint_new:
+            store.set_setting(_ADDRESS_REF_HINT_SETTING, "1")
+        result: dict[str, object] = {
+            "addresses": [_registry_entry(r, used) for r in rows],
+            "count": len(rows),
+            "freshness": freshness,
+            "last_scan_at": last_scan_at,
+        }
+        if hint_new:
+            result["hint_new"] = True
+        return result
+
+    return handler
+
+
+def _registry_entry(record: AddressRegistryRecord, used: Mapping[str, dict[str, object]]) -> dict[str, object]:
+    """One list row: verbatim address, stable number, honest activity/
+    value join, and the label slot that is nothing until CHAT-003 fills it."""
+    truth = used.get(record.address, {})
+    return {
+        "number": record.number,
+        "address": record.address,
+        "used": truth.get("used") is True,
+        "sats_total": truth.get("sats_total"),
+        # Honest empty slot until TCK-CHAT-003's address-keyed labels
+        # exist (never fabricated; coin tags are OUTPOINT-scoped and do
+        # not generalize to an address).
+        "label": None,
+    }
 
 
 def _pending_remaining_s(flow: TxFlow) -> int:
@@ -2922,6 +3232,62 @@ def _flow_facts(
             facts["broadcast_tx_ref"] = signed.tx_ref
         return facts
     return {}
+
+
+def _address_registry_facts(store: Store) -> dict[str, object]:
+    """The TCK-CHAT-001 registry FACTS for one turn (routing help, never
+    authority).
+
+    Shape (only when the active wallet has shown addresses)::
+
+        address_registry: #1:bc1q…:used #2:bc1q…:not-used-yet …
+        address_registry_count: 27
+        address_registry_note: showing first 20 of 27 — quote the NUMBER \
+only; the app resolves and restates the address
+
+    Keys are code-controlled (the render_facts contract); values pass
+    through its sanitizer. Entry order is the stable number order. The
+    injection is BOUNDED (``_REGISTRY_FACTS_MAX`` entries within
+    ``_REGISTRY_FACTS_CHARS`` characters, never cut mid-entry) and the
+    note says honestly how many exist, so the model can never conclude a
+    number "does not exist" from an omitted row — every ``address_number``
+    param is re-resolved engine-side against the FULL registry regardless
+    of what this line showed. No wallet / empty registry → no facts at all
+    (a fresh wallet teaches the model nothing it can misuse). Used-state
+    comes from the same store join as the list narration — never a model
+    inference, never a fabrication.
+    """
+    wallet = store.get_active_wallet()
+    if wallet is None:
+        return {}
+    rows = store.list_address_registry(wallet.id)
+    if not rows:
+        return {}
+    # ponytail: the used-state join is O(window rows + UTXO rows) per turn
+    # (cheap at realistic sizes; upgrade path = a cached store count join).
+    used = _used_state(store, wallet.id)
+    parts: list[str] = []
+    budget = _REGISTRY_FACTS_CHARS
+    for row in rows:
+        truth = used.get(row.address, {})
+        item = (
+            f"#{row.number}:{row.address}:"
+            f"{'used' if truth.get('used') is True else 'not-used-yet'}"
+        )
+        if len(parts) >= _REGISTRY_FACTS_MAX or len(item) + 1 > budget:
+            break
+        budget -= len(item) + 1
+        parts.append(item)
+    facts: dict[str, object] = {
+        "address_registry": " ".join(parts),
+        "address_registry_count": len(rows),
+    }
+    if len(parts) < len(rows):
+        facts["address_registry_note"] = (
+            f"showing first {len(parts)} of {len(rows)} — quote the NUMBER "
+            "only; the app resolves and restates the address"
+        )
+    return facts
 
 
 def _tx_pending_result(
@@ -6123,7 +6489,7 @@ def _last_block_suffix(client: ChainClient) -> str | None:
 
 
 def _narrate_incoming_event(
-    event: IncomingEvent, suffix: str | None = None
+    event: IncomingEvent, suffix: str | None = None, number: int | None = None
 ) -> str:
     """Narrate one ``watch_incoming`` surfacing event (ADR-0019).
 
@@ -6137,19 +6503,26 @@ def _narrate_incoming_event(
 
     ``suffix`` — the value-free "last block ~N min ago" note computed ONCE
     per drain (:func:`_last_block_suffix`); appended verbatim when present.
+
+    ``number`` (TCK-CHAT-001): the event's own address is being PRINTED to
+    the user, so the drain registers it and passes its stable registry
+    number here — rendered ``at #N <address>``. ``None`` (no store seam /
+    registration failure / address-less event) renders the pre-CHAT-001
+    line UNCHANGED: the printer never fabricates a number.
     """
     short = f"{event.txid[:12]}…"
+    address_part = f"#{number} {event.address}" if number is not None else event.address
     if event.kind == "received":
         state = "confirmed" if event.confirmed else "in mempool"
         line = (
-            f"Incoming: received {event.amount_sats} sats at {event.address} "
+            f"Incoming: received {event.amount_sats} sats at {address_part} "
             f"({state}, tx {short})."
         )
     else:
         height = event.height
         height_part = f" (height {height})" if height is not None else ""
         line = (
-            f"Confirmed: {event.amount_sats} sats at {event.address} "
+            f"Confirmed: {event.amount_sats} sats at {address_part} "
             f"now confirmed{height_part} (tx {short})."
         )
     if suffix:
@@ -6229,6 +6602,7 @@ def _drain_watch(
     output_fn: Callable[[str], None],
     *,
     client: ChainClient | None = None,
+    store: Store | None = None,
 ) -> int:
     """Run one due watch cycle (if any) and narrate its events to the user.
 
@@ -6275,8 +6649,31 @@ def _drain_watch(
             if (client is not None and events)
             else None
         )
+        # TCK-CHAT-001: a watch event PRINTS an own address to the user,
+        # so each event address gets its stable registry number here
+        # (idempotent first-showing write). A registry failure degrades
+        # the NUMBER only — the surfacing itself never rides on it.
+        numbers: dict[str, int] = {}
+        if store is not None:
+            wallet = store.get_active_wallet()
+            if wallet is not None:
+                for event in events:
+                    if not event.address or event.address in numbers:
+                        continue
+                    try:
+                        numbers[event.address] = store.note_address_shown(
+                            wallet.id, event.address
+                        ).number
+                    except (StoreError, sqlite3.Error):
+                        continue
         for event in events:
-            output_fn(sanitize_tool_output(_narrate_incoming_event(event, suffix)))
+            output_fn(
+                sanitize_tool_output(
+                    _narrate_incoming_event(
+                        event, suffix, number=numbers.get(event.address or "")
+                    )
+                )
+            )
         return len(events)
     except (ChainError, wallet_scan.ScanError, StoreError, sqlite3.Error, WatchKeyError):
         # Fail open: a background-poll failure must never interrupt the chat.
@@ -9396,7 +9793,11 @@ def _print_next_receive_address(
     branch's live ``next_index``, NO allocation and NO network (an
     allocation-free preview; ``/address`` is the allocating command).
     Address display is verbatim tool output (terminal/transcript channel
-    only, never a log)."""
+    only, never a log). TCK-CHAT-001: printing an own address is a
+    showing, so it gets its stable registry number HERE (the registry
+    write is idempotent — the same string keeps the same number when
+    ``/address`` later allocates it); a registry failure degrades to the
+    number-free line, never a crash on a read path."""
     if store is None:
         output_fn(_LABEL_STORE_UNAVAILABLE)
         return
@@ -9411,9 +9812,14 @@ def _print_next_receive_address(
     except (StoreError, sqlite3.Error, WatchKeyError):
         output_fn(_LABEL_ERROR_STORE)
         return
+    try:
+        number = store.note_address_shown(wallet.id, address).number
+    except (StoreError, sqlite3.Error):
+        number = None
+    number_part = f" #{number}" if number is not None else ""
     output_fn(
         sanitize_tool_output(
-            f"Next receive address (index {index}, not yet issued — "
+            f"Next receive address{number_part} (index {index}, not yet issued — "
             f'"/address" reserves a fresh one): {address}'
         )
     )
@@ -9692,7 +10098,7 @@ def _pump(
 
     while True:
         if not (scan is not None and scan.in_progress):
-            watch_count = _drain_watch(watcher, _narrate_line, client=client)
+            watch_count = _drain_watch(watcher, _narrate_line, client=client, store=store)
             if watch_count:
                 loop.record_event("watch_events", watch_count)
         if ready is not None:
@@ -9974,6 +10380,7 @@ def _pump(
             _run_turn(
                 loop, flow, session, line, output_fn, client=client, table=table,
                 scan_gate=scan.gate if scan is not None else None, hwi=hwi,
+                store=store,
             )
         if emitter is not None:
             emitter.emit(EVENT_TURN_END)
@@ -12926,6 +13333,7 @@ def _run_turn(
     table: DispatchTable,
     scan_gate: StartupScan | None = None,
     hwi: HwiUsbSigner | None = None,
+    store: Store | None = None,
 ) -> None:
     """Run ONE REPL turn: gate classification → agent → flow narration.
 
@@ -13183,6 +13591,19 @@ def _run_turn(
     facts = _flow_facts(
         flow, seconds_since_last_block_fn=seconds_since_last_block_fn
     )
+    # TCK-CHAT-001: the stable address registry rides every turn's FACTS
+    # (numbers + addresses + used-state) so the model can MAP numbered
+    # phrasings to the right intent with the number as a param. It never
+    # authors numbers — the handler re-resolves every one against the
+    # store (the facts are routing help, not authority). A registry read
+    # failure injects nothing (an unnumbered turn is safe: referent asks
+    # then resolve to the handler's own store truth or the clarify) and
+    # never crashes the turn over sugar.
+    if store is not None:
+        try:
+            facts.update(_address_registry_facts(store))
+        except (StoreError, sqlite3.Error):
+            pass
     if scan_gate is not None and scan_gate.enabled and not scan_gate.complete:
         # ADR-0022 decision 5 (SR fix): the deterministic, tool-owned
         # freshness fact while the first scan has NOT completed — pending,
@@ -13284,6 +13705,8 @@ def _print_turn(
         _print_history(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.GET_UTXOS:
         _print_utxos(turn.result or {}, output_fn)
+    elif envelope.intent is IntentName.GET_ADDRESSES:
+        _print_addresses(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.NEW_ADDRESS:
         _print_new_address(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.CREATE_TX:
@@ -13339,8 +13762,21 @@ def _print_balance(result: Mapping[str, object], output_fn: Callable[[str], None
     figures the handler did not already print verbatim.
     """
     if result.get("error") is not None:
+        if result.get("error") == _ADDRESS_REF_UNKNOWN:
+            output_fn(sanitize_tool_output(ADDRESS_REF_UNKNOWN))
+            return
         output_fn(sanitize_tool_output(_error_line(result, "Balance lookup failed")))
         return
+    if result.get("address_number") is not None:
+        # TCK-CHAT-001 scoped answer: LEAD with the full-address
+        # restatement — a number-only balance is the retargeting bug the
+        # council named. Value verbatim from the handler's resolution.
+        output_fn(
+            sanitize_tool_output(
+                f"Balance for address #{result['address_number']} — "
+                f"{result.get('address', '')}:"
+            )
+        )
     confirmed = result.get("confirmed_sats", 0)
     unconfirmed = result.get("unconfirmed_sats", 0)
     total = result.get("total_sats", 0)
@@ -13436,10 +13872,21 @@ def _print_utxos(result: Mapping[str, object], output_fn: Callable[[str], None])
     path it is the honest no-estimate degrade, never a minute figure).
     """
     if result.get("error") is not None:
+        if result.get("error") == _ADDRESS_REF_UNKNOWN:
+            output_fn(sanitize_tool_output(ADDRESS_REF_UNKNOWN))
+            return
         output_fn(sanitize_tool_output(_error_line(result, "UTXO lookup failed")))
         return
     _print_freshness_note(result, output_fn)
     _print_pending_block(result, output_fn)
+    if result.get("address_number") is not None:
+        # TCK-CHAT-001 scoped listing: the full-address restatement leads.
+        output_fn(
+            sanitize_tool_output(
+                f"Coins on address #{result['address_number']} — "
+                f"{result.get('address', '')}:"
+            )
+        )
     utxos = result.get("utxos")
     if not isinstance(utxos, list) or not utxos:
         output_fn(sanitize_tool_output("No unspent outputs."))
@@ -13448,7 +13895,12 @@ def _print_utxos(result: Mapping[str, object], output_fn: Callable[[str], None])
         if not isinstance(utxo, dict):  # pragma: no cover — handler-shaped data
             continue
         address = utxo.get("address")
-        address_part = f"{address} · " if address else ""
+        number = utxo.get("number")
+        # Stable registry number prefix on every printed own address
+        # (TCK-CHAT-001); an address this answer did not register simply
+        # carries no prefix — never a fabricated one.
+        number_part = f"#{number} " if isinstance(number, int) else ""
+        address_part = f"{number_part}{address} · " if address else ""
         confirmed_label = "confirmed" if utxo.get("confirmed") else "unconfirmed"
         txid = str(utxo.get("txid", ""))
         short = f"{txid[:12]}…" if txid else "tx <unknown>"
@@ -13490,7 +13942,12 @@ def _print_pending_block(
 
 
 def _print_new_address(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
-    """Print the fresh address verbatim from the handler's result dict."""
+    """Print the fresh address verbatim from the handler's result dict.
+
+    TCK-CHAT-001: the fresh address is a FIRST SHOWING — the handler
+    registered it, so the line names its stable number too (a result
+    without the number key renders the pre-CHAT-001 line unchanged: the
+    printer never fabricates one)."""
     if result.get("error") is not None:
         output_fn(
             sanitize_tool_output(_error_line(result, "Could not allocate a new address"))
@@ -13498,12 +13955,89 @@ def _print_new_address(result: Mapping[str, object], output_fn: Callable[[str], 
         return
     branch = result.get("branch", 0)
     kind = "change" if branch == 1 else "receive"
+    number = result.get("address_number")
+    if isinstance(number, int) and not isinstance(number, bool):
+        output_fn(
+            sanitize_tool_output(
+                f"Fresh {kind} address (index {result.get('index', 0)}, "
+                f"address #{number}): {result.get('address', '')}"
+            )
+        )
+        return
     output_fn(
         sanitize_tool_output(
             f"Fresh {kind} address (index {result.get('index', 0)}): "
             f"{result.get('address', '')}"
         )
     )
+
+
+def _print_addresses(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+    """Narrate the TCK-CHAT-001 registry answer (list or one restatement).
+
+    Every row prints the FULL address verbatim from the handler result
+    (number-only answers are the bug); framing copy is static and
+    value-free. The header honestly defines "used" and states the
+    freshness bound of the last scan; the first-shown DATE itself is never
+    narrated (one FAQ-style line is its only visible copy); the
+    numbered-referent hint rides the ``hint_new`` flag exactly once per
+    wallet lifetime. The label slot renders ``unlabeled`` while
+    address-keyed labels do not exist — honest empty, never invented.
+    """
+    error = result.get("error")
+    if error is not None:
+        if error == _ADDRESS_REF_UNKNOWN:
+            output_fn(sanitize_tool_output(ADDRESS_REF_UNKNOWN))
+            return
+        output_fn(sanitize_tool_output(_error_line(result, "Address lookup failed")))
+        return
+    _print_freshness_note(result, output_fn)
+    entries = result.get("addresses")
+    if not isinstance(entries, list):  # pragma: no cover — handler-shaped
+        entries = []
+    if not entries:
+        output_fn(sanitize_tool_output(ADDRESSES_NONE_SHOWN))
+        return
+    scoped = result.get("requested_number") is not None
+    if not scoped:
+        output_fn(
+            sanitize_tool_output(
+                "Your addresses, with the number each one keeps for good:"
+            )
+        )
+        bound = _scan_bound_phrase(result.get("last_scan_at"), result.get("freshness"))
+        output_fn(sanitize_tool_output(f'"Used" means we\'ve seen activity — {bound}.'))
+        output_fn(sanitize_tool_output(ADDRESS_TRACKING_FAQ_LINE))
+    for entry in entries:
+        if not isinstance(entry, dict):  # pragma: no cover — handler-shaped
+            continue
+        parts = [
+            f"#{entry.get('number')}",
+            str(entry.get("address", "")),
+            "used" if entry.get("used") is True else "not used yet",
+            # Honest empty slot until TCK-CHAT-003's address labels exist.
+            str(entry.get("label")) if entry.get("label") else "unlabeled",
+        ]
+        sats = entry.get("sats_total")
+        if isinstance(sats, int) and not isinstance(sats, bool):
+            parts.append(f"{sats} sats")
+        output_fn(sanitize_tool_output(" · ".join(parts)))
+    if result.get("hint_new") is True:
+        output_fn(sanitize_tool_output(ADDRESS_REF_HINT))
+
+
+def _scan_bound_phrase(last_scan_at: object, freshness: object) -> str:
+    """The freshness BOUND of the 'used' definition (header honesty).
+
+    Renders only what the tool recorded: the last scan's date (a scan
+    stamp, display-only, never a narration of any per-address shown
+    date), or the honest no-scan state. Never a claim of currency the
+    data does not support (ADR-0022 freshness discipline)."""
+    if freshness == FRESHNESS_STALE:
+        return "as of the last completed scan — none yet, this wallet is still loading"
+    if isinstance(last_scan_at, str) and last_scan_at[:4].isdigit():
+        return f"as of your last scan ({last_scan_at[:10]})"
+    return "as of the last completed scan"
 
 
 def _print_self_plan(

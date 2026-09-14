@@ -8,15 +8,32 @@
 #   {"v": 0, "intent": <closed enum>, "params": {...}}
 #
 #   v        : integer 0 exactly
-#   intent   : closed enum of the fourteen names
+#   intent   : closed enum of the fifteen names
 #   params   : required object, whose shape depends on intent:
 #                respond     -> {"text": string}
 #                clarify     -> {"question": string}
-#                get_balance -> {}
+#                get_balance -> {} or {"address_number": <1-7 digit int>}
+#                               (TCK-CHAT-001 additive key: a registry
+#                                NUMBER quoted verbatim from FACTS; the
+#                                semantic bound 1..9_999_999 and the
+#                                registry bound-check are schema/handler
+#                                layers — this grammar only carries the
+#                                shape)
 #                get_history -> {} or {"limit": <1-3 digit int>}
 #                               (semantic bound 1..100 at the schema layer;
 #                                omitted -> handler default 20)
-#                get_utxos   -> {}
+#                get_utxos   -> {} or {"address_number": <1-7 digit int>}
+#                               (TCK-CHAT-001 additive key, same contract
+#                                as get_balance: scopes the listing to one
+#                                registry address)
+#                get_addresses -> {} or {"address_number": <1-7 digit int>}
+#                               (TCK-CHAT-001: {} is the numbered LIST of
+#                                shown addresses, the number restates that
+#                                ONE address; identical optional-key shape
+#                                as get_balance/get_utxos — the address_number
+#                                alternation idiom (params-<intent> ::=
+#                                empty | key form), so no other key can
+#                                slip in)
 #                new_address -> {} or {"branch": "0"|"1"}
 #                               (0 = receive chain default, 1 = change)
 #                create_tx   -> {"recipient": string} then EXACTLY ONE of
@@ -124,7 +141,7 @@ envelope ::= "{" ws "\"v\"" ws ":" ws "0" ws "," ws intent-body
 
 # Each intent branch carries its exact params shape and closes the params
 # object and the envelope. This couples intent -> params at decode time.
-intent-body ::= respond | clarify | get-balance | get-history | get-utxos | new-address | create-tx | confirm-tx | sign-tx | broadcast-tx | tx-status | node-status | self-transfer | bump-fee
+intent-body ::= respond | clarify | get-balance | get-history | get-utxos | new-address | create-tx | confirm-tx | sign-tx | broadcast-tx | tx-status | node-status | self-transfer | bump-fee | get-addresses
 
 # intent "respond" -> params {"text": string}
 respond ::= "\"intent\"" ws ":" ws "\"respond\"" ws "," ws "\"params\"" ws ":" ws "{" ws "\"text\"" ws ":" ws string ws "}" ws "}" ws
@@ -132,8 +149,24 @@ respond ::= "\"intent\"" ws ":" ws "\"respond\"" ws "," ws "\"params\"" ws ":" w
 # intent "clarify" -> params {"question": string}
 clarify ::= "\"intent\"" ws ":" ws "\"clarify\"" ws "," ws "\"params\"" ws ":" ws "{" ws "\"question\"" ws ":" ws string ws "}" ws "}" ws
 
-# intent "get_balance" -> params {} (empty object)
-get-balance ::= "\"intent\"" ws ":" ws "\"get_balance\"" ws "," ws "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
+# intent "get_balance" -> params {} OR {"address_number": <1-7 digit int>}
+# (TCK-CHAT-001 additive key — same whole-object-alternation idiom as
+# get_history: never an optional-token sequence, so key order stays strict
+# and no other key can slip in. The 1..9_999_999 semantic bound is the
+# schema layer's; registry resolution and the out-of-range clarify are the
+# HANDLER's — this grammar only carries a well-formed number.)
+get-balance ::= "\"intent\"" ws ":" ws "\"get_balance\"" ws "," ws "\"params\"" ws ":" ws params-balance
+
+params-balance ::= "{" ws "}" ws "}" ws | "{" ws address-number-kv ws "}" ws "}" ws
+
+# address_number: a stable wallet-lifetime REGISTRY number (never an
+# address, never an amount — the model quotes it verbatim from the
+# FACTS-injected registry). 1-7 digits, no leading zero ([1-9] [0-9]{0,6},
+# the same loose-grammar/tight-schema split as limit-int): syntactic cap
+# 9_999_999 == the schema bound MAX_ADDRESS_NUMBER.
+address-number-kv ::= "\"address_number\"" ws ":" ws address-number-int
+
+address-number-int ::= [1-9] [0-9]{0,6}
 
 # intent "get_history" -> params {} OR {"limit": <1-3 digit int>}
 # The optional key is expressed as a top-level alternation between the two
@@ -147,8 +180,12 @@ params-history ::= "{" ws "}" ws "}" ws | "{" ws "\"limit\"" ws ":" ws limit-int
 # 1..100 business bound is enforced at the schema layer (layer 2/3).
 limit-int ::= [1-9] [0-9]? [0-9]?
 
-# intent "get_utxos" -> params {} (empty object)
-get-utxos ::= "\"intent\"" ws ":" ws "\"get_utxos\"" ws "," ws "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
+# intent "get_utxos" -> params {} OR {"address_number": <1-7 digit int>}
+# (TCK-CHAT-001 additive key: with a number the listing is scoped to that
+# ONE registry address's UTXOs; same alternation as params-balance.)
+get-utxos ::= "\"intent\"" ws ":" ws "\"get_utxos\"" ws "," ws "\"params\"" ws ":" ws params-utxos
+
+params-utxos ::= "{" ws "}" ws "}" ws | "{" ws address-number-kv ws "}" ws "}" ws
 
 # intent "new_address" -> params {} OR {"branch": "0"|"1"}
 new-address ::= "\"intent\"" ws ":" ws "\"new_address\"" ws "," ws "\"params\"" ws ":" ws params-new-address
@@ -243,6 +280,16 @@ hex-txid ::= [0-9a-f]{64}
 # The model emits nothing else; the dispatcher owns all data (detect +
 # doctor guidance). Any key here is syntactically impossible.
 node-status ::= "\"intent\"" ws ":" ws "\"node_status\"" ws "," ws "\"params\"" ws ":" ws "{" ws "}" ws "}" ws
+
+# intent "get_addresses" -> params {} OR {"address_number": <1-7 digit int>}
+# (TCK-CHAT-001 referential addresses). {} is the numbered LIST of addresses
+# already SHOWN; a number restates that ONE address in full. The address
+# itself is NEVER a param — the store's registry is the only number->address
+# authority, so the model cannot invent, correct, or target an address by
+# writing one. Same alternation idiom as params-balance.
+get-addresses ::= "\"intent\"" ws ":" ws "\"get_addresses\"" ws "," ws "\"params\"" ws ":" ws params-get-addresses
+
+params-get-addresses ::= "{" ws "}" ws "}" ws | "{" ws address-number-kv ws "}" ws "}" ws
 
 # intent "self_transfer" -> params {"mode": <enum>, (parts | below_size_sats)[, fee_target]}
 # (TCK-TX-SELF-001: explicit on-demand reshuffle — SPLIT one coin into N

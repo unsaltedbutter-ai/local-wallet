@@ -45,6 +45,7 @@ from embit import bech32
 
 from localwallet.protocol.envelope import (
     INTENT_REGISTRY,
+    MAX_ADDRESS_NUMBER,
     MAX_AMOUNT_SATS,
     MAX_AMOUNT_USD,
     MAX_SELF_TRANSFER_PARTS,
@@ -58,6 +59,7 @@ from localwallet.protocol.envelope import (
     ClarifyParams,
     ConfirmTxParams,
     CreateTxParams,
+    GetAddressesParams,
     GetBalanceParams,
     GetHistoryParams,
     GetUtxosParams,
@@ -98,11 +100,39 @@ def _rule_clarify(params: BaseParams) -> list[str]:
     return []
 
 
+def _address_number_failures(
+    params: GetBalanceParams | GetUtxosParams | GetAddressesParams,
+) -> list[str]:
+    """Shared layer-3 re-check for the TCK-CHAT-001 ``address_number`` key.
+
+    When present it must be a TRUE int in ``1..MAX_ADDRESS_NUMBER`` (the
+    ``get_history.limit`` pattern: ``bool`` rejected explicitly because
+    ``True``/``False`` pass the range comparison as the ints 1/0). The
+    schema layer already bounds it identically — this is defense in depth,
+    reachable via a validation-skipping constructor. Crucially, this is
+    only a TRANSPORT bound: whether the number NAMES a registry entry at
+    all is decided engine-side against the store (the stable per-wallet
+    registry), where a miss answers the value-free clarify — this layer
+    never resolves and never guesses.
+    """
+    number = params.address_number
+    if isinstance(number, bool) or (
+        number is not None and not 1 <= number <= MAX_ADDRESS_NUMBER
+    ):
+        return [
+            (
+                "params.address_number must be an integer between 1 and "
+                f"{MAX_ADDRESS_NUMBER} when present"
+            )
+        ]
+    return []
+
+
 def _rule_get_balance(params: BaseParams) -> list[str]:
-    """``get_balance``: no meaning-level rules yet (reserved for future opts)."""
+    """``get_balance``: the additive ``address_number`` re-check (TCK-CHAT-001)."""
     if not isinstance(params, GetBalanceParams):
         return ["internal: 'get_balance' params failed the type check"]
-    return []
+    return _address_number_failures(params)
 
 
 def _rule_get_history(params: BaseParams) -> list[str]:
@@ -125,10 +155,24 @@ def _rule_get_history(params: BaseParams) -> list[str]:
 
 
 def _rule_get_utxos(params: BaseParams) -> list[str]:
-    """``get_utxos``: no meaning-level rules yet (registry completeness only)."""
+    """``get_utxos``: the additive ``address_number`` re-check (TCK-CHAT-001)."""
     if not isinstance(params, GetUtxosParams):
         return ["internal: 'get_utxos' params failed the type check"]
-    return []
+    return _address_number_failures(params)
+
+
+def _rule_get_addresses(params: BaseParams) -> list[str]:
+    """``get_addresses``: the additive ``address_number`` re-check (TCK-CHAT-001).
+
+    The rule is transport shape only. The store's registry decides whether
+    the number names a real shown address (handler-side bound-check →
+    value-free clarify on a miss); the LIST case (no key) has nothing to
+    check. The model never authors the number — it quotes it from the
+    FACTS-injected registry (ADR-0002 amendment).
+    """
+    if not isinstance(params, GetAddressesParams):
+        return ["internal: 'get_addresses' params failed the type check"]
+    return _address_number_failures(params)
 
 
 def _rule_new_address(params: BaseParams) -> list[str]:
@@ -428,5 +472,6 @@ BUSINESS_RULES: Mapping[IntentName, BusinessRule] = MappingProxyType(
         IntentName.NODE_STATUS: _rule_node_status,
         IntentName.SELF_TRANSFER: _rule_self_transfer,
         IntentName.BUMP_FEE: _rule_bump_fee,
+        IntentName.GET_ADDRESSES: _rule_get_addresses,
     }
 )

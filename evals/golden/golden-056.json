@@ -1,0 +1,5 @@
+{
+  "id": "golden-056",
+  "prompt": "what addresses have I used?",
+  "expectation": {"intent": "get_addresses", "params": {}}
+}

@@ -10,7 +10,8 @@ free-text note per coin, stored in their own table so they survive the scan
 snapshot's DELETE+re-INSERT, and (schema v3, TCK-RBF-001) transaction
 lineage/capture columns (amount_sats, fee_rate_centisat_vb, first_seen,
 replaced_by_txid) — the broadcast-time record RBF/CPFP disambiguation is
-built on. All SQL
+built on — plus (schema v4, TCK-CHAT-001) the ``address_registry`` table:
+stable wallet-lifetime address numbers and first-shown timestamps. All SQL
 lives inside this module; callers use the typed accessor methods and row
 records from :mod:`localwallet.store.models`. No raw SQL outside ``store/``.
 
@@ -52,6 +53,7 @@ from localwallet.store.models import (
     COIN_NOTE_MAX_CHARS,
     COIN_TAGS,
     AddressRecord,
+    AddressRegistryRecord,
     CoinLabelRecord,
     DerivationRecord,
     TxRecord,
@@ -69,7 +71,15 @@ from localwallet.store.models import (
 # fee_rate_centisat_vb, first_seen (broadcast-time capture off the flow's
 # confirmed record) and replaced_by_txid (RBF lineage link). All nullable;
 # purely additive; legacy rows keep NULLs and read as "not recorded".
-SCHEMA_VERSION = 3
+# v4 (TCK-CHAT-001): the ``address_registry`` table — stable wallet-lifetime
+# address numbers + first-shown timestamps. A SEPARATE table (not columns on
+# ``addresses``) on purpose: registry state is a DISPLAY fact (assigned when
+# the user is shown an address), orthogonal to derivation/scan state that the
+# scan upserts own; one more writer to the ``addresses`` row (via the shared
+# upsert or a second UPDATE inside the scan transaction) would couple two
+# unrelated lifecycles for zero gain. The address-keyed PRIMARY KEY mirrors
+# the ``addresses`` table's natural key (address is globally UNIQUE there).
+SCHEMA_VERSION = 4
 
 _BUSY_TIMEOUT_MS = 5000
 
@@ -274,6 +284,25 @@ _COIN_LABEL_UPSERT_SQL = (
     "note = excluded.note"
 )
 
+# address_registry (schema v4, TCK-CHAT-001) — the stable wallet-lifetime
+# NUMBER each shown address carries. Keyed by (wallet_id, address); the
+# number is assigned ONCE at the first showing (never re-derived, never
+# per-list positional — renumbering silently retargets spends) and is
+# UNIQUE per wallet, so the same address can never hold two numbers and
+# two addresses can never share one. ``first_shown`` (unix seconds) is
+# written with the number and never updated again (the date is store
+# truth for future allocated-but-never-used decisions, not narration).
+_ADDRESS_REGISTRY_DDL = """
+            CREATE TABLE IF NOT EXISTS address_registry (
+                wallet_id   INTEGER NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+                address     TEXT NOT NULL,
+                number      INTEGER NOT NULL,
+                first_shown INTEGER NOT NULL,
+                PRIMARY KEY (wallet_id, address),
+                UNIQUE (wallet_id, number)
+            );
+"""
+
 
 class Store(AbstractContextManager["Store"]):
     """Context-managed SQLite store.
@@ -444,11 +473,26 @@ class Store(AbstractContextManager["Store"]):
             if name not in live:
                 conn.execute(f"ALTER TABLE transactions ADD COLUMN {name} {decl}")
 
+    def _migrate_v3_to_v4(self, conn: sqlite3.Connection) -> None:
+        """v3→v4 (TCK-CHAT-001): add the ``address_registry`` table.
+
+        Purely additive and IDEMPOTENT (the migration contract — the same
+        ``CREATE TABLE IF NOT EXISTS`` pattern as v1→v2's ``coin_labels``):
+        a crash between this step and the version stamp re-runs cleanly.
+        Nothing is back-filled — legacy wallets simply have NO registry
+        rows, and numbers are assigned at the next showing (an address
+        that was printed before this build shipped gets its number the
+        next time a surface prints it; the registry never fabricates a
+        first-shown date it did not witness).
+        """
+        conn.executescript(_ADDRESS_REGISTRY_DDL)
+
     #: Up-migration ladder keyed by the version it migrates FROM. Extend (never
     #: reorder or delete) as schema version bumps; a missing rung fails closed.
     _MIGRATIONS: ClassVar[dict[int, Callable[[sqlite3.Connection], None]]] = {
         1: _migrate_v1_to_v2,
         2: _migrate_v2_to_v3,
+        3: _migrate_v3_to_v4,
     }
 
     def _create_schema(self) -> None:
@@ -521,6 +565,7 @@ class Store(AbstractContextManager["Store"]):
             """
         )
         conn.executescript(_COIN_LABELS_DDL)
+        conn.executescript(_ADDRESS_REGISTRY_DDL)
 
     def close(self) -> None:
         self._conn.close()
@@ -784,6 +829,123 @@ class Store(AbstractContextManager["Store"]):
         except sqlite3.Error as exc:
             raise _wrap(exc) from exc
 
+    # ---------------------------------------------------- address registry
+    #
+    # TCK-CHAT-001 (schema v4): the referential-address registry — a STABLE
+    # wallet-lifetime number + first-shown timestamp for every address the
+    # app SHOWS the user. The typed pair below is the only sanctioned writer
+    # (the chain_base_url / coin_labels precedent), so number assignment can
+    # never be skipped or forged: numbers come from MAX+1 over this table
+    # alone, ``first_shown`` is written exactly once and never updated, and
+    # an address that already has a number keeps it forever (idempotent
+    # re-showing returns the SAME record). Nothing here fabricates: an
+    # address never shown has no row, a lookup miss is ``None`` (the app's
+    # bound-check turns a miss into the value-free clarify), and errors
+    # carry only table/operation context — never the address.
+
+    def note_address_shown(
+        self, wallet_id: int, address: str, *, shown_at: int | None = None
+    ) -> AddressRegistryRecord:
+        """Register ``address`` as SHOWN to the user; return its registry row.
+
+        Idempotent and stable by construction: the FIRST call assigns the
+        next wallet-lifetime number (MAX+1, never reused) and stamps
+        ``shown_at`` (unix seconds; ``None`` reads the UTC clock — tests
+        inject one); EVERY later call returns the existing row untouched —
+        same address, same number, forever, and the first-shown date never
+        moves. The one-transaction read-then-assign makes a double-show
+        under a crash window impossible in this single-writer app (and the
+        UNIQUE(wallet_id, number) constraint fails closed, never silently
+        renumbers, if that assumption is ever violated).
+
+        Raises value-free :class:`StoreError` for a malformed address (a
+        registry key must be a non-empty printable string without
+        whitespace — anything else is a caller bug, refused before disk)
+        and :class:`StoreIntegrityError` for a FK violation (no such wallet).
+        """
+        if (
+            not isinstance(address, str)
+            or not address
+            or len(address) > 100
+            or not address.isprintable()
+            or any(c.isspace() for c in address)
+        ):
+            raise StoreError("address registry key must be a printable address string")
+        clock = int(datetime.now(UTC).timestamp()) if shown_at is None else shown_at
+        if not isinstance(clock, int) or isinstance(clock, bool) or clock < 0:
+            raise StoreError("address registry first-shown time must be a non-negative int")
+        try:
+            with self._atomic():
+                row = self._conn.execute(
+                    "SELECT * FROM address_registry WHERE wallet_id = ? AND address = ?",
+                    (wallet_id, address),
+                ).fetchone()
+                if row is not None:
+                    return AddressRegistryRecord.from_row(row)
+                number = int(
+                    self._conn.execute(
+                        "SELECT COALESCE(MAX(number), 0) + 1 FROM address_registry "
+                        "WHERE wallet_id = ?",
+                        (wallet_id,),
+                    ).fetchone()[0]
+                )
+                record = AddressRegistryRecord(wallet_id, address, number, clock)
+                self._conn.execute(
+                    "INSERT INTO address_registry "
+                    "(wallet_id, address, number, first_shown) VALUES (?, ?, ?, ?)",
+                    record.to_row(),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise _wrap_integrity(exc) from exc
+        except sqlite3.Error as exc:
+            raise _wrap(exc) from exc
+        return record
+
+    def get_address_by_number(
+        self, wallet_id: int, number: int
+    ) -> AddressRegistryRecord | None:
+        """The registry row bearing ``number``, or ``None``.
+
+        ``None`` means NO address has ever been shown under that number —
+        the caller (the app's referent resolver) treats it as the
+        out-of-range clarify; this layer never guesses and never invents a
+        nearest match. A non-int (or bool) number is a caller bug: refused
+        fail-closed, value-free.
+        """
+        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+            raise StoreError("address registry number must be a positive integer")
+        row = self._conn.execute(
+            "SELECT * FROM address_registry WHERE wallet_id = ? AND number = ?",
+            (wallet_id, number),
+        ).fetchone()
+        return AddressRegistryRecord.from_row(row) if row is not None else None
+
+    def list_address_registry(
+        self, wallet_id: int
+    ) -> list[AddressRegistryRecord]:
+        """Every registry row for a wallet, ordered by the STABLE number."""
+        rows = self._conn.execute(
+            "SELECT * FROM address_registry WHERE wallet_id = ? ORDER BY number",
+            (wallet_id,),
+        ).fetchall()
+        return [AddressRegistryRecord.from_row(r) for r in rows]
+
+    def registry_number_for(
+        self, wallet_id: int, address: str
+    ) -> AddressRegistryRecord | None:
+        """The registry row for ``address`` IF it has ever been shown.
+
+        A pure READ — it never assigns a number (assignment belongs to
+        :meth:`note_address_shown`, the first-showing write). ``None`` =
+        never shown, so a narration surface annotating an address it did
+        not show simply omits the number rather than back-dating one.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM address_registry WHERE wallet_id = ? AND address = ?",
+            (wallet_id, address),
+        ).fetchone()
+        return AddressRegistryRecord.from_row(row) if row is not None else None
+
     # ---------------------------------------------------------------- utxos
 
     def replace_utxos_for_wallet(
@@ -1044,6 +1206,9 @@ class Store(AbstractContextManager["Store"]):
         the UTXO snapshot replace touches only the ``utxos`` table, so
         outpoint-keyed ``coin_labels`` rows survive every rescan unchanged
         (and remain after the coin is spent) — see :meth:`set_coin_label`.
+        Address-registry rows (schema v4) are absent for the same reason:
+        a number is a FIRST-SHOWING fact the narration surfaces write,
+        never something a scan may assign, re-stamp, or clear.
 
         Superseded retirement (schema v3, TCK-RBF-001) lands through this
         SAME transaction: the scan's tx upsert is the one place that writes

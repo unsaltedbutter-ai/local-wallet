@@ -19,8 +19,12 @@ the model's side of the closed intent protocol (PROJECT.md §7.1, §8):
    plan is engine-derived, so the examples carry no address/outpoint;
    the third cpfp example, TCK-CPFP-001, teaches the stuck-INBOUND
    routing that keeps cpfp out of ``bump_fee``).
-   The ``bump_fee`` mapping lines (TCK-RBF-003) teach the phrasings that
-   route to ``bump_fee`` without ever computing the new fee.
+    The ``bump_fee`` mapping lines (TCK-RBF-003) teach the phrasings that
+    route to ``bump_fee`` without ever computing the new fee. The address
+    examples (TCK-CHAT-001) teach the list phrasings and the numbered-
+    referent routing (``get_addresses`` / ``address_number``) — a NUMBER
+    quoted from the FACTS-injected registry, never an address the model
+    wrote.
 
 The prompt is kept compact on purpose: v0 runs with a ≤8K context budget
 (ADR-0006), and this text is paid for on every turn.
@@ -65,7 +69,9 @@ confirms on their hardware wallet), then broadcast_tx.
 what they have. Fiat asks in any currency wording ("balance in USD / \
 dollars / euros / GBP / pounds") are ALSO get_balance: the app converts \
 in the currency of the user's display setting — never compute or invent \
-a fiat number, code or amount.
+a fiat number, code or amount. A balance asked about one of the user's \
+numbered addresses ("balance of #3") is get_balance with \
+{"address_number": N}, N quoted VERBATIM from the ADDRESS REGISTRY fact.
 - get_history: show recent wallet transactions; params {} or \
 {"limit": 1-100} — when the user asks what happened recently.
 - get_utxos: show the wallet's unspent outputs; params {} — when the user \
@@ -73,7 +79,17 @@ asks what is spendable, how many UTXOs/coins they have, or what is \
 pending/incoming/unconfirmed. "How many utxos do I have?", "what's \
 pending?" and "when will my transaction confirm?" (no txid given) are \
 ALL get_utxos — its answer carries the pending summary; tx_status is \
-only for a known 64-hex txid.
+only for a known 64-hex txid. Coins asked about ONE of the user's OWN \
+numbered addresses ("what's on address 3?", "UTXOs of #2") are get_utxos \
+with {"address_number": N}: quote the number VERBATIM from the ADDRESS \
+REGISTRY fact — never derive or guess a number.
+- get_addresses: the wallet's own numbered addresses; params {} to LIST \
+them ("what addresses have I used?", "show my addresses", "which \
+addresses are unused?") or {"address_number": N} to SHOW ONE ("show \
+address 3", "what is address #2?") — in every numbered case quote N \
+VERBATIM from the ADDRESS REGISTRY fact. You carry the NUMBER only; the \
+app restates the full address itself — never write, guess, or "correct" \
+an address or a number, and never renumber.
 - new_address: allocate a fresh receive address; params {} — when the user \
 asks for a new receiving address. Never invent an address: emit the intent \
 and quote the address from the tool result afterwards.
@@ -157,6 +173,14 @@ FACTS AND VERBATIM RULE
 them VERBATIM. Never invent, round, reformat, or "correct" them. If a \
 fact you need is missing, ask for it via clarify.
 - FACTS ``freshness: stale`` is tool-owned; never claim data is up to date.
+- The FACTS ``address_registry`` line (when present) lists the user's own \
+addresses the app has SHOWN, as ``#<number>:<address>:<used|not-used-yet>`` \
+entries — numbers are STABLE wallet-lifetime handles, never positional. \
+Map "address N" / "#N" to the entry with that number and quote ONLY the \
+NUMBER as address_number; the app resolves and restates the address. A \
+number not in the registry does not exist: emit clarify, never a guess. \
+"what addresses have I used" (any wording) is get_addresses {} even \
+while the registry is empty — the app owns the honest answer.
 
 SECRETS RULE
 - local-wallet is HARDWARE-WALLET-ONLY: it never handles seed phrases or \
@@ -198,6 +222,15 @@ envelope: {"v": 0, "intent": "self_transfer", "params": {"mode": "cpfp", \
 user: bump the fee on abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
 envelope: {"v": 0, "intent": "bump_fee", "params": {"target": \
 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}}
+
+user: what addresses have I used?
+envelope: {"v": 0, "intent": "get_addresses", "params": {}}
+
+user: balance of #3
+envelope: {"v": 0, "intent": "get_balance", "params": {"address_number": 3}}
+
+user: show address 2
+envelope: {"v": 0, "intent": "get_addresses", "params": {"address_number": 2}}
 """
 
 
@@ -205,15 +238,21 @@ def build_system_prompt() -> str:
     """Return the system prompt encoding the output contract.
 
     The prompt fixes: exactly one envelope per turn with key order
-    ``v, intent, params``; the closed intent list (fourteen intents as of
-    the TCK-RBF-003 v0 extension) with usage guidance; the
-    quote-verbatim rule for FACTS values; the no-secrets (watch-only) rule;
-    and eight few-shot exchanges (respond / clarify / get_balance /
+    ``v, intent, params``; the closed intent list (fifteen intents as of
+    the TCK-CHAT-001 v0 extension) with usage guidance; the
+    quote-verbatim rule for FACTS values (including the ``address_registry``
+    fact: the model maps an "address N" referent to the right read intent
+    with the NUMBER quoted verbatim from the registry, never an address it
+    wrote itself); the no-secrets (watch-only) rule; and twelve few-shot
+    exchanges (respond / clarify / get_balance /
     new_address / create_tx / self_transfer-split / self_transfer-
-    consolidate / self_transfer-cpfp / bump_fee). The self_transfer
+    consolidate / self_transfer-cpfp / bump_fee / get_addresses-list /
+    get_balance-by-number / get_addresses-by-number). The self_transfer
     examples carry NO address or
     outpoint — the money plan is engine-derived, never model-authored; the
-    bump_fee example quotes the target VERBATIM and never invents a fee.
+    bump_fee example quotes the target VERBATIM and never invents a fee; the
+    address examples carry a NUMBER only — full-address restatement is the
+    app's job.
     Intentionally parameter-free: intent membership and the wire format
     are owned by the protocol subsystem and the GBNF grammar — this text
     only instructs the model how to comply with them.

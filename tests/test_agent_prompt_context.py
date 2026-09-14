@@ -189,14 +189,15 @@ class TestSystemPrompt:
         for intent in IntentName:
             assert intent.value in prompt
 
-    def test_contains_all_fourteen_intent_names(self) -> None:
+    def test_contains_all_fifteen_intent_names(self) -> None:
         # Explicit pin (not just enum iteration): the Phase 1 v0 extension
         # added get_history / get_utxos / new_address, the Phase 2 v0
         # extension added create_tx / confirm_tx, the Phase 3 v0
         # extension added sign_tx / broadcast_tx / tx_status, the Phase 4
         # v0 extension added node_status, the TCK-TX-SELF-001 v0
-        # extension added self_transfer, and the TCK-RBF-003 v0 extension
-        # added bump_fee — grammar, schema and prompt must move together
+        # extension added self_transfer, the TCK-RBF-003 v0 extension
+        # added bump_fee, and the TCK-CHAT-001 v0 extension added
+        # get_addresses — grammar, schema and prompt must move together
         # (ADR-0002/0013 lockstep).
         prompt = build_system_prompt()
         for name in (
@@ -214,6 +215,7 @@ class TestSystemPrompt:
             "node_status",
             "self_transfer",
             "bump_fee",
+            "get_addresses",
         ):
             assert name in prompt
 
@@ -326,9 +328,13 @@ class TestSystemPrompt:
         # one few-shot ship the closed protocol (~960 chars). Raised
         # 9000 → 9500 by TCK-CPFP-001: the self_transfer line grows the
         # additive cpfp mode guidance (+ inbound-vs-outgoing routing vs
-        # bump_fee) and one cpfp few-shot (~575 chars). ~9.3K chars is
-        # still ~4.7K tokens, a small fraction of the 8K budget.
-        assert len(build_system_prompt()) < 9500
+        # bump_fee) and one cpfp few-shot (~575 chars). Raised
+        # 9500 → 11500 by TCK-CHAT-001: the get_addresses intent line, the
+        # address_number widenings on get_balance/get_utxos, the
+        # address-registry FACTS rule and three few-shots (~1750 chars)
+        # ship the referential-address protocol. ~11K chars is ~5.5K
+        # tokens, inside the 8K budget with the per-turn facts headroom.
+        assert len(build_system_prompt()) < 11500
 
     def test_self_transfer_line_routes_stuck_inbound_to_cpfp(self) -> None:
         # TCK-CPFP-001: the prompt must teach the INBOUND/OUTBOUND split —

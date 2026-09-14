@@ -1,6 +1,6 @@
 """Typed row records for the store layer (TCK-P1-001).
 
-Each frozen dataclass mirrors one table row in the SQLite schema (schema v3,
+Each frozen dataclass mirrors one table row in the SQLite schema (schema v4,
 see :mod:`localwallet.store.db`). The store layer is an internal persistence
 boundary; these records deliberately avoid pydantic to keep the store
 dependency-free (stdlib only: :mod:`dataclasses`, :mod:`collections.abc`).
@@ -211,6 +211,45 @@ class CoinLabelRecord:
             ",".join(self.tags),
             self.note,
         )
+
+
+@dataclass(frozen=True)
+class AddressRegistryRecord:
+    """One entry of the referential-address registry (TCK-CHAT-001, schema v4).
+
+    The registry is the wallet-lifetime identity layer for addresses the app
+    has SHOWN: ``number`` is a stable per-wallet identifier assigned at the
+    FIRST showing and never reused or renumbered (per-list positional numbering
+    silently retargets spends — the council invariant this table exists to
+    enforce), and ``first_shown`` (unix seconds) records WHEN the user first
+    saw it (the allocated-but-never-used signal the ledger will one day
+    spend; the timestamp is store truth, never narrated per row). Keyed by
+    address string (wallet-scoped UNIQUE) independently of the derivation
+    tables: an address keeps its number even if its ``addresses`` row's status
+    flips or the scan window moves. Values here follow the store's blanket
+    discipline: addresses stored verbatim, never echoed into exception/log
+    text; the NUMBER is not a secret value (users quote it back) but errors
+    stay value-free anyway.
+    """
+
+    wallet_id: int
+    address: str
+    number: int
+    first_shown: int
+
+    _COLUMNS: ClassVar[tuple[str, ...]] = (
+        "wallet_id",
+        "address",
+        "number",
+        "first_shown",
+    )
+
+    @classmethod
+    def from_row(cls, row: Any) -> AddressRegistryRecord:
+        return cls(**{col: row[col] for col in cls._COLUMNS})
+
+    def to_row(self) -> tuple[int, str, int, int]:
+        return (self.wallet_id, self.address, self.number, self.first_shown)
 
 
 @dataclass(frozen=True)

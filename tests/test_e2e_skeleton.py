@@ -871,12 +871,24 @@ def test_new_address_allocates_bumps_and_needs_no_network() -> None:
     first = loop.run("give me a new address", {})
     assert first.status is AgentTurnStatus.OK
     expected_receive = derive_addresses(_fixture_parsed(), 0, 0, 1)[0].address
-    assert first.result == {"address": expected_receive, "branch": 0, "index": 0}
+    # TCK-CHAT-001: the handler answers with the stable registry number of
+    # the address it just showed (numbering at FIRST showing).
+    assert first.result == {
+        "address": expected_receive,
+        "branch": 0,
+        "index": 0,
+        "address_number": 1,
+    }
 
     second = loop.run("and a change address", {})
     assert second.status is AgentTurnStatus.OK
     expected_change = derive_addresses(_fixture_parsed(), 1, 0, 1)[0].address
-    assert second.result == {"address": expected_change, "branch": 1, "index": 0}
+    assert second.result == {
+        "address": expected_change,
+        "branch": 1,
+        "index": 0,
+        "address_number": 2,
+    }
 
     # Allocation consumed exactly one index per branch in the store.
     assert store.get_derivation(wallet.id, 0).next_index == 1
@@ -904,6 +916,7 @@ def test_new_address_derivation_is_pure_same_index_same_address() -> None:
         "address": derive_addresses(parsed, 0, 0, 1)[0].address,
         "branch": 0,
         "index": 0,
+        "address_number": 1,  # TCK-CHAT-001: numbered at the first showing
     }
     # Direct re-derivation of the consumed index (no allocation): identical.
     assert derive_addresses(parsed, 0, 0, 1)[0].address == first["address"]
@@ -2263,7 +2276,7 @@ def test_repl_new_address_narration_and_persistence_across_runs(
         store_path=store_path,
     )
     assert code == 0
-    assert f"Fresh receive address (index 0): {expected0}" in "\n".join(outputs)
+    assert f"Fresh receive address (index 0, address #1): {expected0}" in "\n".join(outputs)
     assert recorded == []  # allocation is network-free
 
     code, outputs = _run_captured(
@@ -2274,7 +2287,10 @@ def test_repl_new_address_narration_and_persistence_across_runs(
         store_path=store_path,
     )
     assert code == 0
-    assert f"Fresh receive address (index 1): {expected1}" in "\n".join(outputs)
+    # TCK-CHAT-001: across a SESSION BOUNDARY the next address gets a FRESH
+    # number (#2) while the first one keeps #1 — stable wallet-lifetime
+    # numbering, verified below against the persisted registry.
+    assert f"Fresh receive address (index 1, address #2): {expected1}" in "\n".join(outputs)
 
     with Store(store_path) as store:
         wallet = store.get_wallet_by_name("default")
@@ -2282,6 +2298,9 @@ def test_repl_new_address_narration_and_persistence_across_runs(
         assert store.get_derivation(wallet.id, 0).next_index == 2
         statuses = {r.index: r.status for r in store.get_addresses(wallet.id, 0)}
         assert statuses == {0: "allocated", 1: "allocated"}
+        # The registry persists the stable numbers across sessions.
+        registry = {r.address: r.number for r in store.list_address_registry(wallet.id)}
+        assert registry == {expected0: 1, expected1: 2}
 
 
 def test_repl_history_narration_with_stub_phrase(

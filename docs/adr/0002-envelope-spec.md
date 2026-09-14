@@ -341,3 +341,68 @@ dispatcher's blanket `except Exception` containment surfaces a structured
 `dispatch_error`; nothing is ever built, staged, or broadcast — but the
 clean early refusal (before the fee-estimator call) is RBF-004's job.
 
+
+## v0 amendment (2026-09, TCK-CHAT-001): `get_addresses` + `address_number` (referential addresses)
+
+Every address the app SHOWS the user now carries a STABLE wallet-lifetime
+number (registry, store schema v4) and a first-shown timestamp, and the
+chat can refer to addresses BY NUMBER. This ships one NEW intent and two
+ADDITIVE optional params keys — **registry FIFTEEN**, `v` stays `0` (each
+is a backward-compatible widening: no previously-valid envelope changes
+shape or meaning).
+
+- `get_addresses` → `{}` (the numbered LIST of shown addresses — "what
+  addresses have I used?") or `{"address_number": int, 1..9_999_999}`
+  (SHOW that one address — "show address 3"). Decision recorded here: the
+  ticket's stated PREFERENCE was additive params on existing intents, and
+  the referents DO ride existing intents (below); a LIST needs a home of
+  its own — no existing intent means "enumerate my addresses", and
+  inventing one (e.g. `get_utxos {"list_addresses": true}`) would couple
+  two unrelated answers to one handler contract. One small intent is the
+  honest shape.
+- `get_balance` / `get_utxos` widened `{}` → `{}` OR
+  `{"address_number": N}` ("balance of #3", "which coins are on address
+  2?"). All THREE intents share one identical params shape
+  (`_AddressScopedParams`); the envelope's registry-binding validator keeps
+  each intent pinned to its own class. SCOPING DECISION (the ticket asked
+  for it documented): the existing handlers CAN answer one-address scope
+  honestly — `get_balance` already sums the cached UTXO snapshot and
+  `get_utxos` already returns it, so a filter on `address ==` the resolved
+  address IS store UTXO truth (no widened network path, no new lookup);
+  the handlers were scoped rather than bypassed.
+- The `address_number` VALUE is a NUMBER CARRIER ONLY. Grammar admits
+  `{"address_number": <1-7-digit int, no leading zero>}`; the schema
+  bounds it 1..9_999_999 (transport bound; the grammar's syntactic cap
+  MATCHES it here, unlike the limit/fee-rate looser/tighter split, since
+  there is no business meaning past "positive"); layer 3 re-checks it.
+  NO address is representable in any of the three params shapes — the
+  model cannot target, invent, correct, or renumber an address; it quotes
+  a FACTS-injected number and the ENGINE re-resolves every one against
+  the store registry (schema v4), which is the only number→address
+  authority. An out-of-range or unknown number is a value-free clarify
+  (`address_ref_unknown`), never a nearest-match and never a whole-wallet
+  fallback (a dropped scope silently retargets the user's mental model).
+- FACTS: every turn with a non-empty registry injects
+  `address_registry: #<n>:<address>:<used|not-used-yet> …` +
+  `address_registry_count` (+ an honest `address_registry_note` when the
+  bounded injection omits rows — the injection is ROUTING HELP, the
+  handler-side lookup is the authority). Registry numbers/labels are
+  never fabricated: a number exists only because a surface SHOWED the
+  address (new-address line, /receive preview, UTXO listing, watch
+  surfacing, or the list itself for activity-seen-but-never-shown rows),
+  and the first-shown DATE is store truth the narration never quotes per
+  row (one FAQ-style line is its only visible copy).
+
+Grammar (new `get-addresses` branch; `params-balance`/`params-utxos` whole-
+object alternations, llama.cpp 0.3.35 dialect), schema, system prompt
+(list/referent phrasings route, the number-verbatim rule, three few-shots),
+drift pins (grammar conformance ACCEPT/REJECT, registry-completeness 14→15,
+prompt intent-membership), and eval fixtures (golden-056..060: list, show-N,
+balance-of-N, utxos-of-N) moved IN LOCKSTEP. Prompt compaction ceilings
+re-pinned (prompt-context 9500→11500, session-transcript 12700→14500 —
+session-length-independent bounds, moved only by the fixed-prompt growth).
+The store-migration half (schema v4 `address_registry`) follows the
+RBF-001 versioned fail-closed pattern; no previously-valid DB is
+reinterpreted, and nothing is back-filled (pre-CHAT-001 addresses get
+their number at their NEXT showing — the registry never back-dates a
+first-shown event it did not witness).

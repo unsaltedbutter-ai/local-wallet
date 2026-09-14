@@ -39,6 +39,7 @@ from localwallet.protocol import (
     EnvelopeValidationError,
     ErrorCode,
     ErrorEnvelope,
+    GetAddressesParams,
     GetBalanceParams,
     GetHistoryParams,
     GetUtxosParams,
@@ -56,6 +57,7 @@ from localwallet.protocol import (
 )
 from localwallet.protocol.envelope import (
     _MAX_FAILURE_CHARS,
+    MAX_ADDRESS_NUMBER,
     MAX_AMOUNT_SATS,
     MAX_AMOUNT_USD,
     MAX_FEE_RATE_SAT_VB,
@@ -141,6 +143,24 @@ ACCEPT_CASES = {
         "intent": "bump_fee",
         "params": {"target": "pending-3f2a9c", "fee_rate_sat_vb": 5},
     },
+    # TCK-CHAT-001 v0 extension: the registry query (list / one-number) and
+    # the additive address_number key on the two read intents.
+    "get_addresses": {"v": 0, "intent": "get_addresses", "params": {}},
+    "get_addresses_number": {
+        "v": 0,
+        "intent": "get_addresses",
+        "params": {"address_number": 3},
+    },
+    "get_balance_number": {
+        "v": 0,
+        "intent": "get_balance",
+        "params": {"address_number": 1},
+    },
+    "get_utxos_number": {
+        "v": 0,
+        "intent": "get_utxos",
+        "params": {"address_number": 42},
+    },
 }
 
 PARAMS_TYPES = {
@@ -158,6 +178,7 @@ PARAMS_TYPES = {
     IntentName.NODE_STATUS: NodeStatusParams,
     IntentName.SELF_TRANSFER: SelfTransferParams,
     IntentName.BUMP_FEE: BumpFeeParams,
+    IntentName.GET_ADDRESSES: GetAddressesParams,
 }
 
 HANDLER_RESULTS = {
@@ -175,6 +196,7 @@ HANDLER_RESULTS = {
     IntentName.NODE_STATUS: {"detected": True},
     IntentName.SELF_TRANSFER: {"staged": True},
     IntentName.BUMP_FEE: {"staged": True},
+    IntentName.GET_ADDRESSES: {"entries": 0},
 }
 
 
@@ -242,15 +264,16 @@ def test_intent_enum_is_the_closed_world():
         "node_status",
         "self_transfer",
         "bump_fee",
+        "get_addresses",
     }
-    assert len(IntentName) == 14
+    assert len(IntentName) == 15
 
 
 def test_intent_registry_is_frozen_and_complete():
     assert set(INTENT_REGISTRY.keys()) == set(IntentName)
     # explicit count: registry completeness is pinned, not incidental
-    # (TCK-RBF-003 v0 extension: 13 → 14)
-    assert len(INTENT_REGISTRY) == 14
+    # (TCK-RBF-003 v0 extension: 13 → 14; TCK-CHAT-001 v0 extension: 14 → 15)
+    assert len(INTENT_REGISTRY) == 15
     for intent, model in INTENT_REGISTRY.items():
         assert model is PARAMS_TYPES[intent]
     # frozen mapping: mutation is refused
@@ -263,7 +286,7 @@ def test_intent_registry_is_frozen_and_complete():
 def test_business_rules_cover_every_intent():
     assert set(BUSINESS_RULES.keys()) == set(IntentName)
     # explicit count: registry completeness is pinned, not incidental
-    assert len(BUSINESS_RULES) == 14
+    assert len(BUSINESS_RULES) == 15
     for intent in IntentName:
         assert callable(BUSINESS_RULES[intent])
     # frozen mapping: mutation is refused (symmetry with INTENT_REGISTRY)
@@ -390,10 +413,58 @@ def test_new_address_branch_rejects_lax_coercions_and_out_of_range():
 
 
 def test_get_utxos_rejects_any_params_key():
-    """get_utxos is {} exactly — keys that belong to other intents
-    (limit/branch) or reserved-looking opts are all rejected."""
+    """get_utxos admits {} or address_number ONLY — keys that belong to
+    other intents (limit/branch) or reserved-looking opts are all
+    rejected (closed world; TCK-CHAT-001 widened it by exactly one key)."""
     for params in ({"limit": 5}, {"branch": 0}, {"verbose": True}, {"address": "x"}):
         expect_rejected({"v": 0, "intent": "get_utxos", "params": params})
+
+
+# ------------------------- TCK-CHAT-001 v0 extension: address_number shapes
+
+@pytest.mark.parametrize("intent", ["get_balance", "get_utxos", "get_addresses"])
+def test_address_number_rejects_lax_coercions_and_bounds(intent: str):
+    """The shared optional key: true JSON int 1..9_999_999 only. Strings/
+    bools/floats/explicit null/0/over-cap are all refused (schema layer;
+    layer 3 re-checks via the bypass matrix below)."""
+    for bad in ("3", True, False, 3.0, None, 0, -1, MAX_ADDRESS_NUMBER + 1, [3]):
+        expect_rejected({"v": 0, "intent": intent, "params": {"address_number": bad}})
+    assert validate_payload(
+        {"v": 0, "intent": intent, "params": {"address_number": 1}}
+    ).params.address_number == 1
+    assert validate_payload(
+        {"v": 0, "intent": intent, "params": {"address_number": MAX_ADDRESS_NUMBER}}
+    ).params.address_number == MAX_ADDRESS_NUMBER
+
+
+@pytest.mark.parametrize("intent", ["get_balance", "get_utxos", "get_addresses"])
+def test_address_number_wire_fidelity(intent: str):
+    """Omission round-trips to EXACTLY {} (the grammar's empty branch); the
+    present form round-trips to exactly the one-key branch (never null)."""
+    empty = validate_payload({"v": 0, "intent": intent, "params": {}})
+    assert empty.params.model_dump() == {}
+    scoped = validate_payload({"v": 0, "intent": intent, "params": {"address_number": 5}})
+    assert scoped.params.model_dump() == {"address_number": 5}
+
+
+@pytest.mark.parametrize("intent", ["get_balance", "get_utxos", "get_addresses"])
+def test_address_key_closed_world_per_intent(intent: str):
+    """No other new key sneaks in alongside address_number (closed world)."""
+    expect_rejected(
+        {"v": 0, "intent": intent, "params": {"address_number": 1, "address": "bc1x"}}
+    )
+
+
+def test_get_addresses_binds_own_params_model():
+    """The identically-shaped trio disambiguates by the registry binding:
+    get_addresses params must be GetAddressesParams, not a sibling."""
+    envelope = validate_payload(ACCEPT_CASES["get_addresses_number"])
+    assert isinstance(envelope.params, GetAddressesParams)
+    assert envelope.params.address_number == 3
+    balance = validate_payload(ACCEPT_CASES["get_balance_number"])
+    assert isinstance(balance.params, GetBalanceParams)
+    utxos = validate_payload(ACCEPT_CASES["get_utxos_number"])
+    assert isinstance(utxos.params, GetUtxosParams)
 
 
 # ------------------------------- Phase 4 v0 extension: node_status
@@ -1560,7 +1631,29 @@ def test_outcome_is_frozen():
         # already refuses them via the mode='before' validator)
         (IntentName.GET_HISTORY, GetHistoryParams.model_construct(limit=True), True),
         (IntentName.GET_HISTORY, GetHistoryParams.model_construct(limit=False), True),
+        # TCK-CHAT-001 address_number: the shared re-check on all three
+        # address-scoped read intents (schema bounds it; layer 3 re-checks
+        # against a validation-skipping bypass, bool included).
+        (IntentName.GET_BALANCE, GetBalanceParams(address_number=7), False),
+        (IntentName.GET_BALANCE, GetBalanceParams.model_construct(address_number=0), True),
+        (
+            IntentName.GET_BALANCE,
+            GetBalanceParams.model_construct(address_number=MAX_ADDRESS_NUMBER + 1),
+            True,
+        ),
+        (IntentName.GET_BALANCE, GetBalanceParams.model_construct(address_number=True), True),
         (IntentName.GET_UTXOS, GetUtxosParams(), False),
+        (IntentName.GET_UTXOS, GetUtxosParams(address_number=1), False),
+        (IntentName.GET_UTXOS, GetUtxosParams.model_construct(address_number=-2), True),
+        (IntentName.GET_ADDRESSES, GetAddressesParams(), False),
+        (IntentName.GET_ADDRESSES, GetAddressesParams(address_number=3), False),
+        (IntentName.GET_ADDRESSES, GetAddressesParams.model_construct(address_number=0), True),
+        (
+            IntentName.GET_ADDRESSES,
+            GetAddressesParams.model_construct(address_number=MAX_ADDRESS_NUMBER + 1),
+            True,
+        ),
+        (IntentName.GET_ADDRESSES, GetAddressesParams.model_construct(address_number=False), True),
         # new_address: optional branch re-checked against {0, 1} (layer 3)
         (IntentName.NEW_ADDRESS, NewAddressParams(), False),
         (IntentName.NEW_ADDRESS, NewAddressParams(branch=0), False),
@@ -1584,7 +1677,18 @@ def test_outcome_is_frozen():
         "get_history-limit-over",
         "get_history-limit-bool-true",
         "get_history-limit-bool-false",
+        "get_balance-number-ok",
+        "get_balance-number-zero",
+        "get_balance-number-over",
+        "get_balance-number-bool",
         "get_utxos-ok",
+        "get_utxos-number-ok",
+        "get_utxos-number-negative",
+        "get_addresses-omitted",
+        "get_addresses-number-ok",
+        "get_addresses-number-zero",
+        "get_addresses-number-over",
+        "get_addresses-number-bool",
         "new_address-omitted",
         "new_address-branch-receive",
         "new_address-branch-change",

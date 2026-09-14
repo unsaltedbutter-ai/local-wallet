@@ -22,6 +22,7 @@ from localwallet.protocol.dispatcher import (
 )
 from localwallet.protocol.envelope import (
     INTENT_REGISTRY,
+    MAX_ADDRESS_NUMBER,
     MAX_QUESTION_CHARS,
     MAX_TEXT_CHARS,
     BaseParams,
@@ -31,6 +32,7 @@ from localwallet.protocol.envelope import (
     ConfirmTxParams,
     CreateTxParams,
     Envelope,
+    GetAddressesParams,
     GetBalanceParams,
     GetHistoryParams,
     GetUtxosParams,
@@ -54,6 +56,7 @@ from localwallet.protocol.intents import BUSINESS_RULES
 __all__ = [
     "BUSINESS_RULES",
     "INTENT_REGISTRY",
+    "MAX_ADDRESS_NUMBER",
     "MAX_QUESTION_CHARS",
     "MAX_TEXT_CHARS",
     "MAX_VALIDATION_RETRIES",
@@ -69,6 +72,7 @@ __all__ = [
     "EnvelopeValidationError",
     "ErrorCode",
     "ErrorEnvelope",
+    "GetAddressesParams",
     "GetBalanceParams",
     "GetHistoryParams",
     "GetUtxosParams",

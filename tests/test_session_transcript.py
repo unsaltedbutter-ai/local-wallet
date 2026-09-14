@@ -126,8 +126,13 @@ class TestSummarization:
         # 12700 by TCK-CPFP-001: the cpfp-mode guidance (+ inbound-vs-
         # outgoing routing vs bump_fee) and one few-shot grew the fixed
         # system prompt ~575 chars (~12.0K chars ≈ ~6.0K tokens, still
-        # inside the 8K budget).
-        assert len(prompt) < 12700
+        # inside the 8K budget). 12700 → 14500 by TCK-CHAT-001: the
+        # get_addresses intent line, the address_number widenings, the
+        # address-registry FACTS rule and three few-shots grew the fixed
+        # system prompt ~1.8K chars (~13.8K chars ≈ ~6.9K tokens — still
+        # inside the 8K budget; this bound is session-length-independent,
+        # the summary + recent window cap it).
+        assert len(prompt) < 14500
         assert "SESSION SUMMARY" in prompt
         assert "CONVERSATION SO FAR" in prompt
         # The recent window holds the last 20 turns verbatim.

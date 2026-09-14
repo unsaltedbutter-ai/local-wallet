@@ -1,0 +1,5 @@
+{
+  "id": "golden-060",
+  "prompt": "which coins are on address 4?",
+  "expectation": {"intent": "get_utxos", "params": {"address_number": 4}}
+}

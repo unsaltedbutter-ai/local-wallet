@@ -751,8 +751,8 @@ def test_declined_shows_model_free_actions_and_quick_actions_run_without_llm(
     joined = "\n".join(outputs)
     for offer in app.MODEL_DECLINED_LINES:
         assert offer in joined
-    assert "Next receive address (index 0" in joined
-    assert "Fresh receive address (index 0)" in joined
+    assert "Next receive address #1 (index 0" in joined
+    assert "Fresh receive address (index 0, address #1)" in joined
     assert "watch_key: " in joined  # the settings readout, truncated form
     assert "…" in joined
     assert ZPUB not in joined  # the settings surface never reveals in full

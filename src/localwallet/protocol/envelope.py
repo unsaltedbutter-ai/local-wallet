@@ -5,16 +5,25 @@ Canonical envelope contract v0 — the model-emitted wire format::
     {"v": 0, "intent": <closed enum>, "params": {...}}
 
 - ``v``: integer, exactly ``0`` (booleans are not integers for this purpose).
-- ``intent``: closed enum — see :class:`IntentName` (fourteen members as of
-  the TCK-RBF-003 v0 extension; see ``docs/adr/0002-envelope-spec.md``,
+- ``intent``: closed enum — see :class:`IntentName` (fifteen members as of
+  the TCK-CHAT-001 v0 extension; see ``docs/adr/0002-envelope-spec.md``,
   ``docs/adr/0013-confirm-gate.md``).
 - ``params``: REQUIRED object, shape fixed per intent:
   ``respond`` → ``{"text": str, 1..4000 chars}``;
   ``clarify`` → ``{"question": str, 1..1000 chars}``;
-  ``get_balance`` → ``{}`` (reserved for future opts);
+  ``get_balance`` → ``{}`` or ``{"address_number": int, 1..9_999_999}``
+  (TCK-CHAT-001: the optional key scopes the answer to ONE registry
+  address; the number is carried, the RESOLUTION is the handler's);
   ``get_history`` → ``{}`` or ``{"limit": int, 1..100}`` (omitted ⇒ the
   handler applies its default of 20);
-  ``get_utxos`` → ``{}`` (reserved for future opts);
+  ``get_utxos`` → ``{}`` or ``{"address_number": int, 1..9_999_999}``
+  (TCK-CHAT-001: the optional key scopes the listing to ONE registry
+  address, answered from stored UTXO truth — never a widened handler);
+  ``get_addresses`` → ``{}`` or ``{"address_number": int, 1..9_999_999}``
+  (TCK-CHAT-001 referential addresses: empty asks for the numbered list of
+  addresses already SHOWN, the number asks to restate that ONE address in
+  full; the store's registry is the only authority for what a number means
+  and an unknown number is a value-free clarify, never a guess);
   ``new_address`` → ``{}`` or ``{"branch": 0|1}`` (0 = receive chain,
   the default; 1 = change chain, rarely user-requested but allowed);
   ``create_tx`` → ``{"recipient": str, 14..100 chars}`` plus EXACTLY ONE of
@@ -71,8 +80,15 @@ Canonical envelope contract v0 — the model-emitted wire format::
   ``target`` is the in-flight transaction reference — a 64-hex txid OR the
   app's pending-ref token, carried as a shape-validated string; resolving
   either against store lineage/flow state is the RBF-004/005 handler's job,
-  this schema only carries it. The model never computes the new fee (see
-  the ADR-0002 amendment for bump_fee).
+   this schema only carries it. The model never computes the new fee (see
+   the ADR-0002 amendment for bump_fee).
+   ``get_addresses`` (TCK-CHAT-001) → ``{}`` (the numbered list of addresses
+   already SHOWN to the user — "what addresses have I used") or
+   ``{"address_number": int, 1..9_999_999}`` (restate that ONE address in
+   full — "show address 3"). The number is a transport carrier only: the
+   store's registry decides what any number means, an unknown number is a
+   value-free clarify at the handler, and the model NEVER authors, computes,
+   or renumbers an address (the full-address restatement is engine work).
 
 Adding enum members and optional params keys is a backward-compatible v0
 extension: previously-valid envelopes remain valid, so ``v`` stays ``0``
@@ -131,6 +147,7 @@ from localwallet.protocol.errors import EnvelopeValidationError
 
 __all__ = [
     "INTENT_REGISTRY",
+    "MAX_ADDRESS_NUMBER",
     "MAX_AMOUNT_SATS",
     "MAX_AMOUNT_USD",
     "MAX_FEE_RATE_SAT_VB",
@@ -151,6 +168,7 @@ __all__ = [
     "ConfirmTxParams",
     "CreateTxParams",
     "Envelope",
+    "GetAddressesParams",
     "GetBalanceParams",
     "GetHistoryParams",
     "GetUtxosParams",
@@ -229,6 +247,15 @@ MAX_TX_REF_CHARS: Final[int] = 64
 #: headroom mirroring the recipient bound. Semantics are the handler's.
 MAX_FUNDING_REF_CHARS: Final[int] = 100
 
+#: Upper bound of the optional ``address_number`` param (TCK-CHAT-001,
+#: ADR-0002 amendment). Registry numbers are dense MAX+1 over shown
+#: addresses — a real wallet cannot approach this — so it is a transport
+#: bound (and matches the grammar's 7-digit syntactic cap), NOT a
+#: business rule: the store's registry lookup + the handler's bound-check
+#: are the authority (an out-of-range number answers the value-free
+#: clarify, never a guess).
+MAX_ADDRESS_NUMBER: Final[int] = 9_999_999
+
 #: The exact length of a Bitcoin transaction id (bytes rendered as hex).
 TXID_LENGTH_CHARS: Final[int] = 64
 
@@ -248,6 +275,7 @@ _KNOWN_LOC_FIELDS: Final[frozenset[str]] = frozenset(
         "text",
         "question",
         "limit",
+        "address_number",
         "branch",
         "recipient",
         "amount_sats",
@@ -336,6 +364,20 @@ class IntentName(StrEnum):
     bump phrasings can never bypass the confirm gate. The model never
     computes the new fee — it only names the target and (optionally) a fee
     knob (rung or quoted whole-sat rate).
+
+    TCK-CHAT-001 v0 extension (backward-compatible — see
+    ``docs/adr/0002-envelope-spec.md`` amendment): ``get_addresses`` joins
+    as the referential-address registry query (list every shown address
+    numbered / show ONE by its stable number), and the existing read
+    intents ``get_balance`` / ``get_utxos`` gain an ADDITIVE optional
+    ``address_number`` key (the preferred widen over more intents — the
+    ticket's param decision). The registry count is now FIFTEEN.
+    ``address_number`` carries only a NUMBER the model quotes verbatim from
+    the FACTS-injected registry; resolving it against the stable store
+    registry, the bound-check, and restating the FULL address are
+    dispatcher-owned engine work — the model never authors, computes, or
+    "corrects" a number, and a number that misses the registry answers the
+    value-free clarify.
     """
 
     RESPOND = "respond"
@@ -352,6 +394,7 @@ class IntentName(StrEnum):
     NODE_STATUS = "node_status"
     SELF_TRANSFER = "self_transfer"
     BUMP_FEE = "bump_fee"
+    GET_ADDRESSES = "get_addresses"
 
 
 class BaseParams(BaseModel):
@@ -376,14 +419,6 @@ class ClarifyParams(BaseParams):
     question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
 
 
-class GetBalanceParams(BaseParams):
-    """Params for ``get_balance``: empty object, reserved for future opts.
-
-    The model must emit ``"params": {}`` exactly; any key here is rejected
-    (closed world).
-    """
-
-
 class _OmitNoneDump(BaseParams):
     """Shared dump behavior for params models with optional keys.
 
@@ -399,6 +434,43 @@ class _OmitNoneDump(BaseParams):
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, object]:
         return {k: v for k, v in handler(self).items() if v is not None}
+
+
+class _AddressScopedParams(_OmitNoneDump):
+    """Shared params for the TCK-CHAT-001 address-numbered reads.
+
+    ``address_number``: OPTIONAL true JSON integer, ``1..MAX_ADDRESS_NUMBER``
+    (strict-int pattern from ``limit``: strings/bools/floats/explicit null
+    rejected — omission is expressed by leaving the key out). It carries a
+    STABLE wallet-lifetime registry number the model quotes VERBATIM from
+    the FACTS-injected address registry; this layer validates only the
+    transport shape. The meaning — which address, does it exist at all — is
+    resolved against the store's registry by the HANDLER (engine-verified
+    bound-check; a miss is the value-free clarify, never a guess), and the
+    answer always RESTATES the full address. The model never computes,
+    guesses, or renumbers (ADR-0002 amendment).
+    """
+
+    address_number: int | None = Field(
+        default=None, ge=1, le=MAX_ADDRESS_NUMBER
+    )
+
+    @field_validator("address_number", mode="before")
+    @classmethod
+    def _address_number_must_be_true_int(cls, value: object) -> object:
+        """Close pydantic's lax coercions for ``address_number`` (see ``limit``)."""
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        raise ValueError("address_number must be an integer when present")
+
+
+class GetBalanceParams(_AddressScopedParams):
+    """Params for ``get_balance``: ``{}`` (whole-wallet, the normal case)
+    or ``{"address_number": <int>}`` — the TCK-CHAT-001 additive scope key
+    (see :class:`_AddressScopedParams`; "balance of #3" rides the SAME
+    handler, scoped to that one registry address's coins). Any key other
+    than ``address_number`` is rejected (closed world).
+    """
 
 
 class GetHistoryParams(_OmitNoneDump):
@@ -432,11 +504,23 @@ class GetHistoryParams(_OmitNoneDump):
         raise ValueError("limit must be an integer when present")
 
 
-class GetUtxosParams(BaseParams):
-    """Params for ``get_utxos``: empty object, reserved for future opts.
+class GetUtxosParams(_AddressScopedParams):
+    """Params for ``get_utxos``: ``{}`` (whole-wallet, the normal case) or
+    ``{"address_number": <int>}`` — the TCK-CHAT-001 additive scope key
+    (see :class:`_AddressScopedParams`; "the coins on address 2" rides the
+    SAME handler, scoped to that one registry address's UTXOs). Any key
+    other than ``address_number`` is rejected (closed world).
+    """
 
-    Same shape as :class:`GetBalanceParams`: the model must emit
-    ``"params": {}`` exactly; any key here is rejected (closed world).
+
+class GetAddressesParams(_AddressScopedParams):
+    """Params for ``get_addresses`` (TCK-CHAT-001): ``{}`` (the numbered
+    LIST of every address the app has shown — "what addresses have I
+    used") or ``{"address_number": <int>}`` (SHOW that one registry
+    address — "show address 3"). Same scoped-params contract as
+    :class:`_AddressScopedParams`: the model carries only a number it
+    quoted from the FACTS-injected registry; resolution, bound-check, and
+    the full-address restatement are the handler's.
     """
 
 
@@ -920,6 +1004,7 @@ INTENT_REGISTRY: Mapping[IntentName, type[BaseParams]] = MappingProxyType(
         IntentName.NODE_STATUS: NodeStatusParams,
         IntentName.SELF_TRANSFER: SelfTransferParams,
         IntentName.BUMP_FEE: BumpFeeParams,
+        IntentName.GET_ADDRESSES: GetAddressesParams,
     }
 )
 
@@ -950,6 +1035,7 @@ class Envelope(BaseModel):
         | NodeStatusParams
         | SelfTransferParams
         | BumpFeeParams
+        | GetAddressesParams
     )
 
     @model_validator(mode="before")
@@ -960,7 +1046,9 @@ class Envelope(BaseModel):
         pydantic's smart union cannot disambiguate an empty ``params``
         object across the empty-params intents (``get_balance``,
         ``get_utxos``, ``get_history``, ``new_address``, ``node_status``
-        without keys): it
+        without keys) — nor the identically-SHAPED ``address_number``
+        trio ``get_balance``/``get_utxos``/``get_addresses`` (TCK-CHAT-001
+        shares one params shape across three intents): it
         would bind ``{}`` to whichever matching model comes first, and the
         pairing cross-check below would then reject a perfectly valid
         envelope. Instead, this validator looks up the registry entry for
