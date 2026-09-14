@@ -1207,12 +1207,16 @@ def test_reply_never_lands_in_the_narration_bubble_under_node() -> None:
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 
-# TCK-WEB-016 behavioral check (node if present): the SHIPPED submit() and
-# the form listener are extracted from app.js and run against a stubbed
-# fetch — a 401 (stale-tab token from a previous launch) renders the
-# session-stale/reload line, NOT "server unreachable"; other failures keep
-# the unreachable line; a stopped tab shows the stale line instead of
-# swallowing the press with the text still in the box.
+# TCK-WEB-016 + TCK-WEB-028(2) behavioral check (node if present): the SHIPPED
+# submit() and the form listener are extracted from app.js and run against a
+# stubbed fetch — a 401 (stale-tab token from a previous launch) renders the
+# session-stale/reload line, NOT "server unreachable"; a TRANSPORT failure
+# (fetch throws, status 0) keeps the unreachable sentence; any OTHER non-ok
+# code PROVES the server was reached and renders the refusal sentence — the
+# server's own value-free ``error`` when the body carries one, the plain
+# sentence otherwise. A stopped tab shows the stale line instead of swallowing
+# the press, and every failed POST re-reads snapshot truth (the WEB-028(5)
+# button-restore seam).
 def test_submit_401_and_stopped_tab_label_the_stale_session_under_node() -> None:
     import shutil
     import subprocess
@@ -1229,7 +1233,10 @@ def test_submit_401_and_stopped_tab_label_the_stale_session_under_node() -> None
         re.DOTALL,
     ).group(0)
     script = """
-      const LABELS = { unreachable: "UNREACHABLE-LINE", sessionStale: "STALE-LINE" };
+      const LABELS = {
+        unreachable: "UNREACHABLE-LINE", sessionStale: "STALE-LINE",
+        turnRejected: "REJECTED-LINE", turnRejectedPrefix: "REJECTED-WITH-REASON: ",
+      };
       const state = { busy: false, stopped: false, queue: [], pendingEchos: [] };
       let systemLines = [];
       const appendSystem = (s) => systemLines.push(s);
@@ -1238,6 +1245,9 @@ def test_submit_401_and_stopped_tab_label_the_stale_session_under_node() -> None
       let bubbles = 0;
       const showPendingBubble = () => { bubbles++; };
       const clearPendingBubble = () => { bubbles--; };
+      // TCK-WEB-028 (5): a failed POST re-reads snapshot truth (button restore).
+      let stateRefreshes = 0;
+      const refreshState = () => { stateRefreshes++; };
       const authHeaders = (h) => h;
       let lastEcho = null;
       const appendUser = (value) => {
@@ -1252,22 +1262,37 @@ def test_submit_401_and_stopped_tab_label_the_stale_session_under_node() -> None
       const inputEl = { value: "" };
       __FORM__
       const main = async () => {
-        // accepted: echo stays, no system line
+        // accepted: echo stays, no system line, no refresh
         fetchImpl = async () => ({ status: 202, ok: true });
         await submit("/turn", "text", "hello");
-        if (lastEcho.removed || systemLines.length) throw new Error("202-path");
+        if (lastEcho.removed || systemLines.length || stateRefreshes !== 0)
+          throw new Error("202-path");
         // 401: the stale-session line (never "unreachable"), echo un-rendered
-        fetchImpl = async () => ({ status: 401, ok: false });
+        fetchImpl = async () => ({
+          status: 401, ok: false, json: async () => ({ error: "no" }),
+        });
         systemLines = [];
         await submit("/turn", "text", "hello");
         if (!lastEcho.removed) throw new Error("401-kept-echo");
         if (systemLines.length !== 1 || systemLines[0] !== LABELS.sessionStale)
           throw new Error("401-label");
-        // 503 / transport failure: the unreachable line stands
-        fetchImpl = async () => ({ status: 503, ok: false });
+        if (stateRefreshes !== 1) throw new Error("401-no-refresh");
+        // TCK-WEB-028 (2) 503 WITH the server's value-free reason: reached ≠
+        // unreachable — the refusal sentence carries the reason.
+        fetchImpl = async () => ({
+          status: 503, ok: false, json: async () => ({ error: "engine busy" }),
+        });
         systemLines = [];
         await submit("/turn", "text", "hello");
-        if (systemLines[0] !== LABELS.unreachable) throw new Error("503-label");
+        if (systemLines[0] !== LABELS.turnRejectedPrefix + "engine busy")
+          throw new Error("503-reason-label");
+        // TCK-WEB-028 (2) 500 without a readable reason body: the plain line.
+        fetchImpl = async () => ({ status: 500, ok: false });
+        systemLines = [];
+        await submit("/action", "utterance", "confirm");
+        if (systemLines[0] !== LABELS.turnRejected) throw new Error("500-label");
+        if (!lastEcho.removed) throw new Error("500-kept-echo");
+        // transport failure (fetch throws, status stays 0): unreachable stands
         fetchImpl = async () => { throw new TypeError("network"); };
         systemLines = [];
         await submit("/turn", "text", "hello");
@@ -1286,6 +1311,296 @@ def test_submit_401_and_stopped_tab_label_the_stale_session_under_node() -> None
       };
       main().catch((e) => { console.error(e); process.exit(1); });
     """.replace("__SUBMIT__", submit_fn).replace("__FORM__", form_listener)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# ============================================================== TCK-WEB-028
+# Static robustness batch (council quick wins). Five rules, all browser-free
+# source pins unless a node behavioral check is named. textContent-only +
+# CSP-safe throughout (the global sink scan covers the new code; the QR focus
+# trap deliberately queries NO anchor/href selector — the WEB-014 pin bans
+# that literal in the client entirely).
+
+# (1) STUCK PENDING BUBBLE: applyState reconciles the transient "Working…"
+# bubble ONLY from a typed state/1 snapshot whose flow_state is "idle" with
+# the LOCAL queue empty (a typed reply is answered by the engine between
+# turns, so idle+drained means nothing is in flight). state/0, a non-idle
+# flow, or a queued-but-unpromoted line never clear it.
+# (2) FAILURE COPY: the submit() failure ternary splits transport-down
+# (status 0 → unreachable) from server-reached refusals (the ticket's
+# sentence, or the server's value-free reason through the data.error/
+# textContent pattern). 401 keeps the stale-session line (WEB-016).
+# (3) RECONNECT ANNOUNCEMENT: both live-region writes in listen() sit behind
+# the state.reconnecting transition guard; the "Connected" write doubles as
+# the out-of-state announcement.
+# (5) IN-FLIGHT DISABLE: both /action click listeners disable the clicked
+# utterance button synchronously; applyState's repaint restores disabled on
+# EVERY action-bar and quickbar button (model/quick ones included — the
+# restore lands before the model-only continue); a failed POST also
+# refreshes snapshot truth (no turn_end will ever come for a dead line).
+def test_web028_static_pins() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    # (1) the reconcile sits in applyState, gated on typed + idle + drained.
+    apply = code[code.index("function applyState") : code.index("function noteTrustFlip")]
+    assert 'if (typed && snap.flow_state === "idle" && state.queue.length === 0) {' in apply
+    assert apply.index("clearPendingBubble();") < apply.index("const visible =")
+    # (2) the two sentences exist verbatim (the ticket's line; the reason
+    # variant follows the established rejectedPrefix pattern).
+    assert 'turnRejected: "The wallet couldn\'t run that — try again.",' in code
+    assert 'turnRejectedPrefix: "The wallet couldn\'t run that: ",' in code
+    submit_fn = re.search(
+        r"async function submit\(path, field, value\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert "status === 0" in submit_fn and "LABELS.unreachable" in submit_fn
+    assert "LABELS.turnRejectedPrefix + reason" in submit_fn
+    assert "typeof data.error === \"string\"" in submit_fn  # the safe data.error path
+    # (3) transition-only announcements: the connecting write is guarded,
+    # and the reconnecting write happens once on entry into the state.
+    listen = code[
+        code.index("async function listen()") : code.index("async function submit(")
+    ]
+    assert 'if (!state.reconnecting) setStatus("connecting", "Connecting…");' in listen
+    assert "state.reconnecting = false;\n      setStatus(\"live\"" in listen  # out-transition
+    assert re.search(
+        r"if \(!state\.reconnecting\) \{\s*\n\s*state\.reconnecting = true;\s*\n"
+        r'\s*setStatus\("reconnecting"', listen
+    )
+    assert listen.count('setStatus(') == 4  # connecting/live/reconnecting/unauthorized only
+    # (5) disable-on-click in both listeners; restore on every repaint.
+    actions = code[
+        code.index("actionsEl.addEventListener(") :
+        code.index("quickbarEl.addEventListener(")
+    ]
+    quick = code[
+        code.index("quickbarEl.addEventListener(") : code.index("let inputSeq = 0;")
+    ]
+    assert "btn.disabled = true;\n    submit(" in actions
+    assert re.search(r"btn\.disabled = true;[^\n]*\n  submit\(", quick)
+    assert apply.count("btn.disabled = false;") == 2  # action bar + quickbar
+    # and the restore lands BEFORE the model-only continue (those buttons
+    # get it too — never a permanently disabled control):
+    assert apply.index("btn.disabled = false;") < apply.index('continue;')
+    # a failed POST re-reads snapshot truth (no turn_end will restore it):
+    assert "refreshState();" in submit_fn
+
+
+def test_stuck_pending_bubble_reconciles_from_typed_idle_state_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    apply = re.search(r"function applyState\(snap\) \{.*?\n\}", code, re.DOTALL).group(0)
+    script = """
+      const mkBtn = (action, extraClass) => ({
+        dataset: action ? { action } : {},
+        hidden: false, disabled: false,
+        classList: { contains: (c) => c === extraClass },
+      });
+      const flowBtn = mkBtn("confirm"); flowBtn.disabled = true;   // in flight
+      const modelBtn = mkBtn("model-download", "model-only"); modelBtn.disabled = true;
+      const quickBtn = mkBtn("quick-balance"); quickBtn.disabled = true;
+      const actionsEl = { querySelectorAll: () => [flowBtn, modelBtn] };
+      const quickbarEl = { querySelectorAll: () => [quickBtn] };
+      const state = {
+        queue: [], busy: true, backendName: "", privacyMode: "",
+        trustSig: null, watchKeyNeeded: false, pendingBubble: {},
+      };
+      let clears = 0;
+      const clearPendingBubble = () => { clears++; state.pendingBubble = null; };
+      const visibleActions = () => [];
+      const applyScanChip = () => {}; const applyPrivacyChip = () => {};
+      const applyWatchKeyGate = () => {}; const applyModelPrompt = () => {};
+      const paintSettingsDot = () => {}; const noteTrustFlip = () => {};
+      const settingsPanelEl = { hidden: true };
+      __APPLY__
+      // stuck: typed IDLE + empty local queue → the bubble is reconciled away
+      applyState({ schema: "state/1", flow_state: "idle" });
+      if (clears !== 1) throw new Error("idle-did-not-clear");
+      // a queued-but-unpromoted line keeps the bubble (its turn IS in flight)
+      state.pendingBubble = {}; clears = 0; state.queue = [{}];
+      applyState({ schema: "state/1", flow_state: "idle" });
+      if (clears !== 0) throw new Error("queue-cleared");
+      // a live flow (created) keeps it
+      state.pendingBubble = {}; state.queue = []; clears = 0;
+      applyState({ schema: "state/1", flow_state: "created", pending_present: true });
+      if (clears !== 0) throw new Error("flow-cleared");
+      // the UNTYPED transport-only shape never clears (busy/dead engine)
+      state.pendingBubble = {}; clears = 0;
+      applyState({ schema: "state/0", flow_state: "idle" });
+      if (clears !== 0) throw new Error("state0-cleared");
+      // TCK-WEB-028 (5): the same repaint restored EVERY in-flight-disabled
+      // button — flow, model-only (before its continue) and quickbar alike.
+      if (flowBtn.disabled || modelBtn.disabled || quickBtn.disabled)
+        throw new Error("disabled-stuck");
+      console.log("ok");
+    """.replace("__APPLY__", apply)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# TCK-WEB-028 (3) behavioral (node): the SHIPPED listen() runs against a
+# stubbed fetch that fails TWICE then connects — the reconnecting sentence is
+# written EXACTLY once (the polite live region announces the transition, not
+# every backoff attempt), "Connecting…" is written once on the first pass and
+# never re-flipped mid-ladder, and the recovery writes "Connected" once (the
+# out-transition).
+def test_reconnect_announces_only_the_transition_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    listen = re.search(r"async function listen\(\) \{.*?\n\}", code, re.DOTALL).group(0)
+    script = """
+      const state = { stopped: false, lastEventId: 0, backoffMs: 500,
+                      everConnected: false, reconnecting: false };
+      const writes = [];
+      const setStatus = (kind, label) => writes.push(kind + "|" + label);
+      const authHeaders = (h) => h;
+      const location = { origin: "http://127.0.0.1:8243" };
+      const refreshState = () => {};
+      const sleep = () => Promise.resolve(); // collapse the backoff ladder
+      let attempt = 0;
+      const fetch = async () => {
+        attempt += 1;
+        if (attempt < 3) throw new TypeError("network");
+        return { ok: true, status: 200, body: {} };
+      };
+      const consumeStream = async () => { state.stopped = true; }; // one stream, then stop
+      __LISTEN__
+      listen().then(() => {
+        const reconnecting = writes.filter((w) => w.startsWith("reconnecting|"));
+        const connecting = writes.filter((w) => w.startsWith("connecting|"));
+        const live = writes.filter((w) => w.startsWith("live|"));
+        if (attempt !== 3) throw new Error("attempts");
+        if (reconnecting.length !== 1) throw new Error("reconnecting-spam");
+        if (connecting.length !== 1) throw new Error("connecting-spam");
+        if (live.length !== 1) throw new Error("live-count");
+        // ORDER: connecting → (one) reconnecting → live (the out-transition).
+        if (writes[0] !== 'connecting|Connecting…') throw new Error("first");
+        if (!writes[1].startsWith("reconnecting|")) throw new Error("entry");
+        if (writes[2] !== "live|Connected") throw new Error("exit");
+        if (state.reconnecting !== false) throw new Error("flag-not-reset");
+        console.log("ok");
+      }).catch((e) => { console.error(e); process.exit(1); });
+    """.replace("__LISTEN__", listen)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# TCK-WEB-028 (4) behavioral (node): the SHIPPED Tab listener is extracted and
+# driven — while the dialog is OPEN, Tab at the last control wraps to the
+# first, Shift+Tab at the first wraps to the last, a strayed focus is pulled
+# back in, a mid-dialog Tab is left to the browser, and while the dialog is
+# HIDDEN the listener touches nothing (the settings Escape tiering and all
+# background tabbing are unaffected).
+def test_qr_dialog_tab_wraps_focus_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    prefix = 'document.addEventListener("keydown", '
+    start = code.index(prefix + '(event) => {\n  if (event.key !== "Tab"')
+    tab_listener = code[start : code.index("});", start) + 3]
+    assert tab_listener.count("addEventListener") == 1  # exactly the one listener
+    handler = tab_listener[len(prefix) : -2]  # the bare arrow function
+    assert handler.startswith("(event) =>") and handler.endswith("}")
+    script = """
+      const mkFocusable = (name) => ({ name, focused: 0, focus() { this.focused++; } });
+      const first = mkFocusable("first");
+      const last = mkFocusable("last");
+      const qrViewerEl = {
+        hidden: false,
+        querySelectorAll: () => [first, last],
+        contains: (n) => n === first || n === last,
+      };
+      globalThis.document = { addEventListener: () => {}, activeElement: null };
+      const tabHandler = __HANDLER__;
+      const press = (key, shiftKey) => {
+        const event = {
+          key, shiftKey: !!shiftKey, prevented: false,
+          preventDefault() { this.prevented = true; },
+        };
+        tabHandler(event);
+        return event;
+      };
+      // 1. Tab at the LAST control: wrapped to the first, browser move blocked
+      document.activeElement = last;
+      let e = press("Tab");
+      if (!e.prevented || first.focused !== 1) throw new Error("wrap-forward");
+      // 2. Shift+Tab at the FIRST control: wrapped to the last.
+      document.activeElement = first;
+      e = press("Tab", true);
+      if (!e.prevented || last.focused !== 1) throw new Error("wrap-back");
+      // 3. Focus strayed OUTSIDE the dialog: Tab pulls it back to the first.
+      document.activeElement = { name: "background" };
+      e = press("Tab");
+      if (!e.prevented || first.focused !== 2) throw new Error("stray-in");
+      // 4. A tab stop INSIDE (not at the boundary): left to the browser.
+      document.activeElement = first;
+      e = press("Tab");
+      if (e.prevented) throw new Error("clobbered-inner");
+      // 5. Dialog CLOSED: the listener is deaf (background tabbing intact).
+      qrViewerEl.hidden = true;
+      document.activeElement = last;
+      e = press("Tab");
+      if (e.prevented) throw new Error("trap-when-closed");
+      console.log("ok");
+    """
+    script = script.replace("__HANDLER__", handler)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# TCK-WEB-028 (5) behavioral (node): the SHIPPED actionsEl click listener
+# disables the clicked utterance button SYNCHRONOUSLY, before submit() ever
+# awaits — the browser (emulated here: a disabled button dispatches no click)
+# therefore queues "confirm" exactly once per double-click; the qa-settings
+# control (no utterance) is never disabled; and the WEB-028(1) harness above
+# pins the restore-on-repaint half.
+def test_action_click_disables_until_repaint_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    start = code.index('actionsEl.addEventListener("click", (event) => {')
+    listener = code[start : code.index("});", start) + 3]
+    handler = listener[len('actionsEl.addEventListener("click", ') : -2]
+    script = """
+      const mkBtn = (action, utterance) => ({
+        dataset: { action, ...(utterance ? { utterance } : {}) },
+        disabled: false,
+      });
+      const confirmBtn = mkBtn("confirm", "confirm");
+      const settingsBtn = mkBtn("qa-settings"); // client-only control
+      const state = { stopped: false };
+      const openSettings = () => {};
+      const queued = [];
+      const submit = (path, field, value) => { queued.push([path, field, value]); };
+      const handler = __HANDLER__;
+      // browser-emulated delegated dispatch: disabled buttons fire no click.
+      const click = (btn) => {
+        if (btn.disabled) return;
+        handler({ target: { closest: () => btn } });
+      };
+      click(confirmBtn);          // 1st: queues, disables synchronously
+      if (queued.length !== 1 || !confirmBtn.disabled) throw new Error("first-click");
+      click(confirmBtn);          // 2nd (the double-click): swallowed disabled
+      if (queued.length !== 1) throw new Error("double-queued");
+      // a DIFFERENT control still works while confirm is in flight
+      const cancelBtn = mkBtn("cancel", "cancel");
+      click(cancelBtn);
+      if (queued.length !== 2 || !cancelBtn.disabled) throw new Error("sibling");
+      // no-utterance settings opener: never disabled, nothing submitted
+      click(settingsBtn);
+      if (settingsBtn.disabled || queued.length !== 2) throw new Error("settings-btn");
+      console.log("ok");
+    """
+    script = script.replace("__HANDLER__", handler)
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 

@@ -23,6 +23,13 @@
 // transcript (shown by submit / remote user_text echoes, shared by queued
 // turns, removed at a queue-draining turn_end) — the old below-input
 // busy element is gone.
+// TCK-WEB-028 (static robustness batch): (1) a stuck pending bubble is
+// reconciled away by a typed idle state/1 snapshot with an empty local queue
+// (mid-turn server death replays no turn_end); (2) /turn + /action failures
+// split transport-down from server-rejection copy; (3) the reconnecting
+// status is announced on the TRANSITION only, not per backoff attempt;
+// (4) the QR dialog (aria-modal) Tab-wraps focus inside itself; (5) action
+// buttons disable on click until the next /state repaint restores them.
 
 const island = window.__LOCALWALLET__;
 const token = island && typeof island.token === "string" ? island.token : "";
@@ -85,6 +92,14 @@ const LABELS = {
   chatNeedsKeyPlaceholder: "Paste your xpub or zpub to get started…",
   unreachable:
     "Could not reach the wallet server — is it still running? Check the terminal where you started it.",
+  // TCK-WEB-028 (2): a non-ok /turn or /action reply that ISN'T a transport
+  // failure means the server was REACHED and refused — the unreachable
+  // sentence would send the user hunting a live server that is answering.
+  // The ticket's line; the server's own value-free ``error`` string (static
+  // strings only, same data.error/textContent contract as the settings and
+  // watchkey rejection paths) replaces the bare sentence when present.
+  turnRejected: "The wallet couldn't run that — try again.",
+  turnRejectedPrefix: "The wallet couldn't run that: ",
   // scan chip (TCK-WEB-005) — honest states straight from /state's scan_state
   scanLoading:
     "Wallet loading — balances may be incomplete until the first scan finishes.",
@@ -365,6 +380,10 @@ const state = {
   everConnected: false, // first /state comes from boot; later ones from reconnect
   stopped: false,       // true on 401/no-token: stop reconnecting
   backoffMs: 500,
+  // TCK-WEB-028 (3): the reconnecting TRANSITION tracker — the live-region
+  // text is written once on entry into (and once out of) reconnecting, never
+  // per backoff attempt (every textContent mutation re-announces to AT).
+  reconnecting: false,
   // TCK-WEB-008: /state freshness (a slow first snapshot must never re-show
   // an entry state the engine has already outgrown), the terminal dismiss on
   // accept, and the key the USER supplied in THIS page session (memory only
@@ -743,6 +762,31 @@ document.addEventListener("keydown", (event) => {
     closeQr();
   }
 });
+// TCK-WEB-028 (4): the QR dialog claims aria-modal="true" — while it is open,
+// Tab must cycle WITHIN it, not walk into the background transcript. Focus
+// starts on the Close button (openQr) and the dialog's only real control is
+// that button, but the wrap is written generically over the dialog's
+// focusables (first/last boundary + a strayed focus pulled back in). The
+// selector stays off anchors by construction (the WEB-014 no-navigation pin
+// bans the very literal here); Escape tiering from WEB-021 is untouched.
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Tab" || qrViewerEl.hidden) return;
+  const focusables = qrViewerEl.querySelectorAll(
+    'button, [tabindex]:not([tabindex="-1"])',
+  );
+  if (focusables.length === 0) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const at = document.activeElement;
+  const inside = qrViewerEl.contains(at);
+  if (event.shiftKey && (at === first || !inside)) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (at === last || !inside)) {
+    event.preventDefault();
+    first.focus();
+  }
+});
 
 function ensureTurn() {
   if (!state.openTurn) {
@@ -987,6 +1031,16 @@ function visibleActions(snap) {
 
 function applyState(snap) {
   const typed = !!snap && snap.schema === "state/1";
+  // TCK-WEB-028 (1): STUCK-PENDING-BUBBLE reconcile. A TYPED state/1 is
+  // answered by the engine thread only BETWEEN turns (busy/dead → state/0),
+  // so typed flow_state "idle" + an EMPTY local queue means nothing can
+  // still be in flight here: a mid-turn stream death whose server restarted
+  // without a replayed turn_end in reach would otherwise leave the
+  // transient "Working…" bubble up forever. If a turn really starts, the
+  // unmatched user_text echo re-shows the bubble (renderUserText).
+  if (typed && snap.flow_state === "idle" && state.queue.length === 0) {
+    clearPendingBubble();
+  }
   // TCK-WEB-021 (5): read the trust signature's OTHER half from typed truth
   // only (state/0 keeps the last known value — same discipline as
   // privacyMode). The NAME is never rendered (TCK-DESCOPE-M3B): it exists
@@ -996,11 +1050,19 @@ function applyState(snap) {
   }
   const visible = new Set(visibleActions(snap));
   for (const btn of actionsEl.querySelectorAll("button")) {
+    // TCK-WEB-028 (5): every repaint is snapshot truth — RESTORE the
+    // in-flight disable a click applied (and, with it, never leave a
+    // permanently disabled control: the server's own reply re-renders the
+    // row whether the POST landed, failed, or the engine moved on).
+    btn.disabled = false;
     // Skip the model/quick buttons — they are driven by model_state below.
     if (btn.classList.contains("model-only") || btn.classList.contains("quick-only")) {
       continue;
     }
     btn.hidden = !visible.has(btn.dataset.action);
+  }
+  for (const btn of quickbarEl.querySelectorAll("button")) {
+    btn.disabled = false; // TCK-WEB-028 (5): same restore for the header quicks
   }
   applyScanChip(snap);
   applyPrivacyChip(snap);
@@ -1299,7 +1361,11 @@ function sleep(ms) {
 async function listen() {
   while (!state.stopped) {
     try {
-      setStatus("connecting", "Connecting…");
+      // TCK-WEB-028 (3): a RETRY stays in the reconnecting state — the
+      // "Connecting…" word is written on the first pass only, so the polite
+      // live region never re-announces on the connecting↔reconnecting flip
+      // every backoff step used to make.
+      if (!state.reconnecting) setStatus("connecting", "Connecting…");
       const headers = authHeaders();
       if (state.lastEventId > 0) headers["Last-Event-ID"] = String(state.lastEventId);
       const response = await fetch("/events", { headers, cache: "no-store" });
@@ -1310,6 +1376,9 @@ async function listen() {
       }
       if (!response.ok || !response.body) throw new Error(String(response.status));
       state.backoffMs = 500; // a live stream resets the backoff ladder
+      // TCK-WEB-028 (3): the OUT-of-reconnecting transition is the one
+      // announcement — this text write is it.
+      state.reconnecting = false;
       setStatus("live", "Connected");
       if (state.everConnected) refreshState(); // reconnect: buttons may have moved
       state.everConnected = true;
@@ -1318,7 +1387,13 @@ async function listen() {
       // transport failure: treat like a closed stream and retry
     }
     if (state.stopped) return;
-    setStatus("reconnecting", `Reconnecting to ${location.origin} …`);
+    // TCK-WEB-028 (3): announce only the TRANSITION into reconnecting; the
+    // text is untouched while the state persists (no mutation = no
+    // announcement), and the data-state dot keeps its steady style.
+    if (!state.reconnecting) {
+      state.reconnecting = true;
+      setStatus("reconnecting", `Reconnecting to ${location.origin} …`);
+    }
     await sleep(state.backoffMs + Math.floor(Math.random() * 250));
     state.backoffMs = Math.min(state.backoffMs * 2, 15000);
   }
@@ -1342,6 +1417,7 @@ async function submit(path, field, value) {
   setBusy(true);
   showPendingBubble(); // TCK-WEB-015: the busy face, right below the echo
   let status = 0;
+  let reason = "";
   try {
     const response = await fetch(path, {
       method: "POST",
@@ -1349,7 +1425,15 @@ async function submit(path, field, value) {
       body: JSON.stringify({ [field]: value }),
     });
     status = response.status;
-    if (!response.ok) throw new Error(String(status));
+    if (!response.ok) {
+      // TCK-WEB-028 (2): a rejection body is value-free by the server's own
+      // contract (static strings only — "engine busy", "expected JSON
+      // object…"); we quote it, never echo the submitted line. Unreadable
+      // body → the plain sentence below.
+      const data = await response.json().catch(() => null);
+      if (data && typeof data.error === "string") reason = data.error;
+      throw new Error(String(status));
+    }
   } catch {
     echo.remove();
     const at = state.queue.indexOf(echo);
@@ -1362,7 +1446,22 @@ async function submit(path, field, value) {
     // (stale tab) — "unreachable" would send the user hunting a live server.
     // Same honest sentence as the stream/resync/consent paths; only a
     // reload/the new URL fixes it.
-    appendSystem(status === 401 ? LABELS.sessionStale : LABELS.unreachable);
+    // TCK-WEB-028 (2): status 0 = the fetch itself threw (nothing was
+    // reached) → the transport sentence. Any other non-ok code PROVES the
+    // server answered → the refusal sentence (its own reason when present).
+    appendSystem(
+      status === 401
+        ? LABELS.sessionStale
+        : status === 0
+          ? LABELS.unreachable
+          : reason
+            ? LABELS.turnRejectedPrefix + reason
+            : LABELS.turnRejected,
+    );
+    // TCK-WEB-028 (5): the POST is dead — no turn_end will ever come for
+    // this line, so re-read snapshot truth (restores a button disabled at
+    // click; harmless no-op for typed submits).
+    refreshState();
   }
 }
 
@@ -1398,6 +1497,11 @@ actionsEl.addEventListener("click", (event) => {
     return;
   }
   if (btn.dataset.utterance) {
+    // TCK-WEB-028 (5): disable the clicked control through the whole POST +
+    // turn; the next /state repaint (applyState) restores it from snapshot
+    // truth. A disabled button swallows the browser's own click, so a fast
+    // double-click on Confirm queues "confirm" exactly once.
+    btn.disabled = true;
     submit("/action", "utterance", btn.dataset.utterance);
   }
 });
@@ -1405,6 +1509,7 @@ actionsEl.addEventListener("click", (event) => {
 quickbarEl.addEventListener("click", (event) => {
   const btn = event.target.closest("button");
   if (!btn || state.stopped || !btn.dataset.utterance) return;
+  btn.disabled = true; // TCK-WEB-028 (5): same in-flight guard for the header quicks
   submit("/action", "utterance", btn.dataset.utterance);
 });
 
