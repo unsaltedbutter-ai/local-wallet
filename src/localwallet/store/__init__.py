@@ -13,6 +13,7 @@ from localwallet.store.db import (
 )
 from localwallet.store.models import (
     ADDRESS_ALLOCATED,
+    ADDRESS_LABEL_MAX_CHARS,
     ADDRESS_UNUSED,
     ADDRESS_USED,
     BRANCH_CHANGE,
@@ -24,6 +25,7 @@ from localwallet.store.models import (
     DIR_SELF,
     SUPERSEDED_EVICTED,
     SUPERSEDED_REPLACED,
+    AddressLabelRecord,
     AddressRecord,
     AddressRegistryRecord,
     CoinLabelRecord,
@@ -38,6 +40,7 @@ from localwallet.store.models import (
 
 __all__ = [
     "ADDRESS_ALLOCATED",
+    "ADDRESS_LABEL_MAX_CHARS",
     "ADDRESS_UNUSED",
     "ADDRESS_USED",
     "BRANCH_CHANGE",
@@ -50,6 +53,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "SUPERSEDED_EVICTED",
     "SUPERSEDED_REPLACED",
+    "AddressLabelRecord",
     "AddressRecord",
     "AddressRegistryRecord",
     "CoinLabelRecord",

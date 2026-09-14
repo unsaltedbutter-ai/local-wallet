@@ -11,9 +11,12 @@ snapshot's DELETE+re-INSERT, and (schema v3, TCK-RBF-001) transaction
 lineage/capture columns (amount_sats, fee_rate_centisat_vb, first_seen,
 replaced_by_txid) — the broadcast-time record RBF/CPFP disambiguation is
 built on — plus (schema v4, TCK-CHAT-001) the ``address_registry`` table:
-stable wallet-lifetime address numbers and first-shown timestamps. All SQL
-lives inside this module; callers use the typed accessor methods and row
-records from :mod:`localwallet.store.models`. No raw SQL outside ``store/``.
+stable wallet-lifetime address numbers and first-shown timestamps, and
+(schema v5, TCK-LABEL-001) the ``address_labels`` table: address-keyed
+free-text labels — the sibling of ``coin_labels`` for the question
+"what is this ADDRESS", the foundation TCK-CHAT-003 builds on. All
+SQL lives inside this module; callers use the typed accessor methods and
+row records from :mod:`localwallet.store.models`. No raw SQL outside ``store/``.
 
 WAL rationale
 -------------
@@ -50,8 +53,10 @@ from localwallet.config import (
     UTXO_TARGET_MIN_SETTING,
 )
 from localwallet.store.models import (
+    ADDRESS_LABEL_MAX_CHARS,
     COIN_NOTE_MAX_CHARS,
     COIN_TAGS,
+    AddressLabelRecord,
     AddressRecord,
     AddressRegistryRecord,
     CoinLabelRecord,
@@ -79,7 +84,15 @@ from localwallet.store.models import (
 # upsert or a second UPDATE inside the scan transaction) would couple two
 # unrelated lifecycles for zero gain. The address-keyed PRIMARY KEY mirrors
 # the ``addresses`` table's natural key (address is globally UNIQUE there).
-SCHEMA_VERSION = 4
+# v5 (TCK-LABEL-001): the ``address_labels`` table — free-text labels keyed by
+# ADDRESS (the sibling of the outpoint-keyed ``coin_labels``: "label this
+# address" had nowhere to land in v4, which is exactly the live bug this ships
+# for). Address-keyed with a plain TEXT PRIMARY KEY (same global-uniqueness
+# discipline as ``addresses.address``); the label is value-checked at the
+# typed write (non-empty, ≤500 chars) and the row rides OUTSIDE the scan
+# write-set like the registry, so a rescan can never clear or fabricate it.
+# The foundation TCK-CHAT-003's post-receive label capture builds on.
+SCHEMA_VERSION = 5
 
 _BUSY_TIMEOUT_MS = 5000
 
@@ -200,6 +213,25 @@ def _check_label_outpoint(txid: object, vout: object) -> None:
     _check_label_vout(vout)
 
 
+def _check_address_key_shape(address: object, context: str) -> None:
+    """Fail-closed shape gate for any address-keyed store table (value-free).
+
+    A key must be a non-empty printable string without whitespace, ≤ 100
+    characters (generous transport bound over the 90-char bech32 ceiling).
+    Semantic validation (mainnet bech32 etc.) belongs to the caller-facing
+    parser, not here — this gate only refuses things that cannot be keys.
+    ``context`` is code-owned wording, never user input.
+    """
+    if (
+        not isinstance(address, str)
+        or not address
+        or len(address) > 100
+        or not address.isprintable()
+        or any(c.isspace() for c in address)
+    ):
+        raise StoreError(f"{context} key must be a printable address string")
+
+
 # ----------------------------------------------------------------- shared SQL
 #
 # Single source of truth for the write paths shared by the public accessors
@@ -302,6 +334,38 @@ _ADDRESS_REGISTRY_DDL = """
                 UNIQUE (wallet_id, number)
             );
 """
+
+# address_labels (schema v5, TCK-LABEL-001) — free-text labels keyed by
+# ADDRESS. The sibling of ``coin_labels`` for a different question: a coin
+# label is about ONE output (txid:vout), an address label is about the
+# address itself (every coin that lands there, present and future). Keyed by
+# plain TEXT PRIMARY KEY — the same global-uniqueness discipline as
+# ``addresses.address`` — because the live bug ("label <address> as <text>")
+# is an address question coin_labels structurally cannot answer, and a
+# wallet column would add a second answer to it for zero gain. Like the
+# registry, the table lives OUTSIDE the scan write-set: a rescan can never
+# clear, re-assign, or fabricate a label. Label text is user data (verbatim
+# on disk, value-checked at the typed write, never in exception/log text,
+# never model context — §1.1/§7.10).
+_ADDRESS_LABELS_DDL = """
+            CREATE TABLE IF NOT EXISTS address_labels (
+                address    TEXT PRIMARY KEY,
+                label      TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+"""
+
+_ADDRESS_LABEL_UPSERT_SQL = (
+    "INSERT INTO address_labels (address, label, created_at, updated_at) "
+    "VALUES (?, ?, ?, ?) "
+    "ON CONFLICT(address) DO UPDATE SET "
+    "label = excluded.label, "
+    "updated_at = excluded.updated_at"
+    # created_at deliberately NOT touched on re-label: the first label's
+    # date is a fact that survives every later edit (same write-once
+    # discipline as the registry's first_shown).
+)
 
 
 class Store(AbstractContextManager["Store"]):
@@ -487,12 +551,27 @@ class Store(AbstractContextManager["Store"]):
         """
         conn.executescript(_ADDRESS_REGISTRY_DDL)
 
+    def _migrate_v4_to_v5(self, conn: sqlite3.Connection) -> None:
+        """v4→v5 (TCK-LABEL-001): add the ``address_labels`` table.
+
+        Purely additive and IDEMPOTENT (the migration contract — the same
+        ``CREATE TABLE IF NOT EXISTS`` pattern as v1→v2's ``coin_labels`` and
+        v3→v4's ``address_registry``): a crash between this step and the
+        version stamp re-runs cleanly. Nothing is back-filled — legacy
+        wallets simply have NO address labels, and a label exists only once
+        the user has actually written one through the typed accessor (the
+        store never fabricates label text, and the narrating app never
+        claims a label that has no row).
+        """
+        conn.executescript(_ADDRESS_LABELS_DDL)
+
     #: Up-migration ladder keyed by the version it migrates FROM. Extend (never
     #: reorder or delete) as schema version bumps; a missing rung fails closed.
     _MIGRATIONS: ClassVar[dict[int, Callable[[sqlite3.Connection], None]]] = {
         1: _migrate_v1_to_v2,
         2: _migrate_v2_to_v3,
         3: _migrate_v3_to_v4,
+        4: _migrate_v4_to_v5,
     }
 
     def _create_schema(self) -> None:
@@ -566,6 +645,7 @@ class Store(AbstractContextManager["Store"]):
         )
         conn.executescript(_COIN_LABELS_DDL)
         conn.executescript(_ADDRESS_REGISTRY_DDL)
+        conn.executescript(_ADDRESS_LABELS_DDL)
 
     def close(self) -> None:
         self._conn.close()
@@ -863,14 +943,7 @@ class Store(AbstractContextManager["Store"]):
         whitespace — anything else is a caller bug, refused before disk)
         and :class:`StoreIntegrityError` for a FK violation (no such wallet).
         """
-        if (
-            not isinstance(address, str)
-            or not address
-            or len(address) > 100
-            or not address.isprintable()
-            or any(c.isspace() for c in address)
-        ):
-            raise StoreError("address registry key must be a printable address string")
+        _check_address_key_shape(address, "address registry")
         clock = int(datetime.now(UTC).timestamp()) if shown_at is None else shown_at
         if not isinstance(clock, int) or isinstance(clock, bool) or clock < 0:
             raise StoreError("address registry first-shown time must be a non-negative int")
@@ -945,6 +1018,72 @@ class Store(AbstractContextManager["Store"]):
             (wallet_id, address),
         ).fetchone()
         return AddressRegistryRecord.from_row(row) if row is not None else None
+
+    # --------------------------------------------------------- address labels
+    #
+    # TCK-LABEL-001 (schema v5): the ADDRESS-keyed free-text label — the
+    # sibling of coin_labels for "what is this ADDRESS" questions (a coin
+    # label is about one txid:vout; an address label is about the address).
+    # Same typed-writer discipline as every other user surface: validation
+    # is fail-closed at write (non-empty, ≤ ADDRESS_LABEL_MAX_CHARS), errors
+    # are value-free (label text is user data, same class as an address —
+    # never echoed into exceptions/logs), and the labels themselves are
+    # user-authored facts consumed by DETERMINISTIC code only — they NEVER
+    # enter model context (§1.1/§7.10). The small trio below is the whole
+    # sanctioned surface; TCK-CHAT-003 builds its capture flow on it.
+
+    def set_address_label(self, address: str, label: str) -> AddressLabelRecord:
+        """Set (replace) the label for ``address``; return the STORED row.
+
+        The returned record is the committed row itself (read back after the
+        write, so callers can narrate store truth — a success line may only
+        ever quote what this returned, never what was typed). A re-label
+        replaces the text and moves ``updated_at``; ``created_at`` keeps the
+        first label's date (write-once, the registry's first_shown rule).
+
+        Raises value-free :class:`StoreError` for a malformed key or a
+        blank/over-long label (refused before disk; nothing is stored).
+        """
+        _check_address_key_shape(address, "address label")
+        if not isinstance(label, str) or not label:
+            raise StoreError("address label must be non-empty text")
+        if len(label) > ADDRESS_LABEL_MAX_CHARS:
+            raise StoreError("address label exceeds the maximum length")
+        now = _utcnow()
+        try:
+            with self._transaction():
+                self._conn.execute(_ADDRESS_LABEL_UPSERT_SQL, (address, label, now, now))
+            committed = self.get_address_label(address)
+        except sqlite3.IntegrityError as exc:
+            raise _wrap_integrity(exc) from exc
+        except sqlite3.Error as exc:
+            raise _wrap(exc) from exc
+        if committed is None:  # pragma: no cover — a committed write reads back
+            raise StoreError("address label write did not land")
+        return committed
+
+    def get_address_label(self, address: str) -> AddressLabelRecord | None:
+        """The label row for one address, or ``None`` (never labeled).
+
+        A pure READ: a miss is ``None``, never a nearest match and never a
+        fabricated label.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM address_labels WHERE address = ?", (address,)
+        ).fetchone()
+        return AddressLabelRecord.from_row(row) if row is not None else None
+
+    def get_address_labels(self) -> list[AddressLabelRecord]:
+        """Every address label on record, ordered by address (deterministic).
+
+        The listing surface for future narration (TCK-CHAT-003's
+        "labels you've used most" buttons count coins per label off this);
+        rows keyed by address survive rescans unchanged (§1.3's lesson).
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM address_labels ORDER BY address"
+        ).fetchall()
+        return [AddressLabelRecord.from_row(r) for r in rows]
 
     # ---------------------------------------------------------------- utxos
 
@@ -1208,7 +1347,10 @@ class Store(AbstractContextManager["Store"]):
         (and remain after the coin is spent) — see :meth:`set_coin_label`.
         Address-registry rows (schema v4) are absent for the same reason:
         a number is a FIRST-SHOWING fact the narration surfaces write,
-        never something a scan may assign, re-stamp, or clear.
+        never something a scan may assign, re-stamp, or clear. Address
+        labels (schema v5) likewise: a label is a USER fact, written only
+        through :meth:`set_address_label`; no scan can clear, re-assign,
+        or fabricate one.
 
         Superseded retirement (schema v3, TCK-RBF-001) lands through this
         SAME transaction: the scan's tx upsert is the one place that writes

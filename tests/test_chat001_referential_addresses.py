@@ -223,12 +223,12 @@ class TestSchemaV4Migration:
             store.upsert_txs([])  # touch the v3 surface
         self._as_v3_file(db)
         with Store(db) as store:
-            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
             assert store.list_address_registry(wallet.id) == []  # empty, never fabricated
             rec = store.note_address_shown(wallet.id, "bc1qa", shown_at=7)
             assert rec.number == 1
         with Store(db) as store:  # stable reopen, no re-run
-            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
             assert store.get_address_by_number(wallet.id, 1).address == "bc1qa"
 
     def test_migration_idempotent_half_applied(self, tmp_path: Path) -> None:
@@ -242,11 +242,11 @@ class TestSchemaV4Migration:
         raw.commit()
         raw.close()
         with Store(db) as store:
-            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
 
     def test_fresh_create_is_v4(self, tmp_path: Path) -> None:
         with Store(tmp_path / "fresh.db") as store:
-            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
 
     def test_scan_persist_never_touches_registry(self) -> None:
         """The registry is a DISPLAY fact: the scan's composite write (which

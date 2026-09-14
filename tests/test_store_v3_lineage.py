@@ -117,9 +117,10 @@ def test_v2_db_upgrades_to_v3_on_reopen(tmp_path: Path) -> None:
     with Store(db) as store:  # the migration runs here
         # Full upgrade lands on the CURRENT schema version: the v2→v3 rung
         # is followed by the v3→v4 add of ``address_registry`` (TCK-CHAT-001)
-        # riding the same ladder. The v3 COLUMN/data assertions below are
+        # and the v4→v5 add of ``address_labels`` (TCK-LABEL-001) riding the
+        # same ladder. The v3 COLUMN/data assertions below are
         # what this test is actually about.
-        assert _version(store._conn) == SCHEMA_VERSION == 4
+        assert _version(store._conn) == SCHEMA_VERSION == 5
         assert set(_V3_COLUMNS) <= _tx_columns(store._conn)
         # The v2 tx row survived untouched, new fields reading as not-recorded.
         rows = store.get_txs_for_wallet(wid)
@@ -129,7 +130,7 @@ def test_v2_db_upgrades_to_v3_on_reopen(tmp_path: Path) -> None:
         assert rows[0].first_seen is None
         assert rows[0].replaced_by_txid is None
     with Store(db) as store:  # stable reopen at the top version (no re-run)
-        assert _version(store._conn) == 4
+        assert _version(store._conn) == 5
 
 
 def test_v3_migration_is_idempotent_half_applied(tmp_path: Path) -> None:
@@ -143,13 +144,13 @@ def test_v3_migration_is_idempotent_half_applied(tmp_path: Path) -> None:
     _as_v2_file(db, drop_columns=("first_seen", "replaced_by_txid"))
 
     with Store(db) as store:
-        assert _version(store._conn) == 4
+        assert _version(store._conn) == 5
         assert set(_V3_COLUMNS) <= _tx_columns(store._conn)
 
 
 def test_fresh_create_is_v3(tmp_path: Path) -> None:
     with Store(tmp_path / "fresh.db") as store:
-        assert _version(store._conn) == 4
+        assert _version(store._conn) == 5
         assert set(_V3_COLUMNS) <= _tx_columns(store._conn)
 
 
@@ -205,7 +206,7 @@ def test_v2_to_v3_leaves_coin_labels_untouched(tmp_path: Path) -> None:
     _as_v2_file(db)
 
     with Store(db) as store:
-        assert _version(store._conn) == 4  # full ladder (v2→v3→v4) completes
+        assert _version(store._conn) == 5  # full ladder (v2→v3→v4→v5) completes
     raw = sqlite3.connect(db)
     assert (
         raw.execute("SELECT sql FROM sqlite_master WHERE name = 'coin_labels'").fetchone()[0]

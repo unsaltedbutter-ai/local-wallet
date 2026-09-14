@@ -201,6 +201,7 @@ from localwallet.signer.file import FilePsbtSigner
 from localwallet.signer.hwi import DeviceError, HwiUsbSigner
 from localwallet.store import (
     ADDRESS_ALLOCATED,
+    ADDRESS_LABEL_MAX_CHARS,
     ADDRESS_USED,
     BRANCH_CHANGE,
     BRANCH_RECEIVE,
@@ -14130,6 +14131,160 @@ def _dispatch_code_self_turn(
     return result
 
 
+# ---------------------------------------------------------------------------
+# TCK-LABEL-001: chat label-by-address intercept (deterministic, PRE-MODEL).
+# USER BUG (live, 2026-09-12): "label bc1q… as 'KYC'" → the narration claimed
+# the label was set but the store held NOTHING — the utterance had no route
+# at all: ``coin_labels`` is OUTPOINT-keyed (address ≠ txid:vout), so an
+# address label had nowhere to land, and the model's success-shaped ``respond``
+# was pure fabrication (an honest-response violation). The fix is the pair the
+# bug lacked: the schema v5 ``address_labels`` table (store) + THIS intercept,
+# which code-parses the address-literal phrasings BEFORE the model, writes
+# through the typed accessor, and narrates only committed store truth (a
+# success line exists iff the row exists). Precedents: the RBF-004 / CPFP-002
+# / CONS-001 code-self-turn dispatches and the FIAT-003 pre-model word-table
+# intercept. Labels are user-authored facts consumed by deterministic code —
+# a consumed turn never reaches the transcript or the model (§1.1/§7.10).
+# NON-address phrasings ("label my strike address as KYC") are deliberately
+# NOT this intercept's grammar — the address must be a literal mainnet bech32
+# token; everything else falls through to the unchanged model path (an honest
+# route there needs a prompt line, and prompt changes force the eval gate:
+# reported to the orchestrator, not touched here).
+# ---------------------------------------------------------------------------
+
+_ADDRESS_LABEL_VERB: Final[str] = "label"
+_ADDRESS_LABEL_CONNECTORS: Final[frozenset[str]] = frozenset({"as", "is"})
+#: Value-free refusals (plain cause + next step; the address/label are never
+#: quoted on a failure — nothing was stored, so there is no value to echo).
+_ADDRESS_LABEL_NO_VALUE: Final[str] = (
+    'No label to store — try: label <address> as "your label"'
+)
+_ADDRESS_LABEL_TOO_LONG: Final[str] = (
+    f"Labels are capped at {ADDRESS_LABEL_MAX_CHARS} characters — shorten "
+    "the label and try again; nothing was stored."
+)
+_ADDRESS_LABEL_GARBAGE: Final[str] = (
+    'I couldn\'t read that label — try: label <address> as "your label" '
+    "(quoted text must close, and nothing may follow the closing quote); "
+    "nothing was stored."
+)
+_ADDRESS_LABEL_STORE_ERROR: Final[str] = (
+    "I couldn't save that label — the store refused the write; nothing was "
+    "stored."
+)
+
+
+def _is_mainnet_bech32_address(token: str) -> bool:
+    """Strict SHAPE gate for the intercept's address token (mainnet-only,
+    ADR-0021): a ``bc1`` string that survives a real bech32/bech32m decode.
+
+    embit's varied decode errors are CONTAINED (the psbt.py precedent): a
+    bad token is a shape MISS, never a crash, and the token is never echoed.
+    base58/other shapes decode fine as scripts but fail the ``bc1`` gate —
+    this grammar speaks segwit address literals.
+    """
+    if not token.startswith("bc1"):
+        return False
+    try:
+        address_to_scriptpubkey(token)
+    except Exception:  # noqa: BLE001 — containment: embit raises varied errors
+        return False
+    return True
+
+
+def _address_label_request(line: str) -> tuple[str, str] | str | None:
+    """Code-parse a label-by-address utterance BEFORE the model.
+
+    Grammar (the ticket's two phrasings, nothing looser)::
+
+        label <address> as <label>
+        label <address> <label>
+
+    ``<address>`` must be a literal mainnet bech32 token (all-lower, or
+    all-upper normalized to lower on write — bech32 case rules, never a
+    mixed-case paste). ``<label>`` is a quoted string (``"…"``/``'…'``,
+    balanced, nothing outside the quotes) or bounded trailing text:
+    non-empty, ≤ :data:`ADDRESS_LABEL_MAX_CHARS`, printable. Returns:
+
+    * ``None`` — NOT this grammar (including every non-address-literal
+      phrasing: the line falls through to the unchanged pipeline);
+    * a code-owned refusal string — verb+address matched but the VALUE is
+      missing/overflowed/garbage. The turn is still CONSUMED with a
+      value-free "nothing was stored" line: a half-parsed label utterance
+      handed to the model is exactly the fabrication path this intercept
+      closes;
+    * ``(address, label)`` — validated, ready for the typed store write.
+    """
+    words = line.strip().split(maxsplit=2)
+    if not words or words[0].lower() != _ADDRESS_LABEL_VERB or len(words) < 2:
+        return None
+    token = words[1]
+    if not token.islower():
+        if not token.isupper():
+            return None  # mixed case is invalid bech32 — not an address literal
+        token = token.lower()
+    if not _is_mainnet_bech32_address(token):
+        return None
+    rest = words[2] if len(words) == 3 else ""
+    head, sep, tail = rest.partition(" ")
+    if sep and head.lower() in _ADDRESS_LABEL_CONNECTORS:
+        rest = tail  # drop the connector; EVERYTHING after it is the label
+    elif not sep and rest.lower() in _ADDRESS_LABEL_CONNECTORS:
+        rest = ""  # connector with no value ("label <addr> as")
+    rest = rest.strip()
+    if rest[:1] in ("\"", "'"):
+        if len(rest) < 2 or rest[-1] != rest[0]:
+            return _ADDRESS_LABEL_GARBAGE  # unbalanced / trailing after close
+        rest = rest[1:-1].strip()
+    if not rest:
+        return _ADDRESS_LABEL_NO_VALUE
+    if len(rest) > ADDRESS_LABEL_MAX_CHARS:
+        return _ADDRESS_LABEL_TOO_LONG
+    if not rest.isprintable():
+        return _ADDRESS_LABEL_GARBAGE
+    return token, rest
+
+
+def _run_address_label_turn(
+    store: Store, line: str, output_fn: Callable[[str], None]
+) -> bool:
+    """Consume a label-by-address chat turn; True when the turn was consumed.
+
+    STORE-TRUTH narration (the bug's other half): the success line prints
+    ONLY from the record the typed writer read back after its commit — a row
+    exists whenever this line is narrated, and a failed/absent write narrates
+    a refusal instead, never a claim. The ack echoes the stored label
+    verbatim and names the surface ADDRESS-LEVEL; when the address's coins
+    are known from scan data the line still says only that the label applies
+    to the ADDRESS and lists nothing else (no outpoints, no amounts). The
+    coin-level ``/label`` command ships unchanged — the two surfaces coexist,
+    distinctly named. The model is never consulted for a consumed turn, so
+    label text never enters a prompt, the transcript, or FACTS (§7.10).
+    """
+    request = _address_label_request(line)
+    if request is None:
+        return False
+    if isinstance(request, str):
+        output_fn(sanitize_tool_output(request))
+        return True
+    address, label = request
+    try:
+        record = store.set_address_label(address, label)
+    except (StoreError, sqlite3.Error):
+        # Fail closed, value-free: the write did not commit → no row exists →
+        # nothing may be claimed stored.
+        output_fn(sanitize_tool_output(_ADDRESS_LABEL_STORE_ERROR))
+        return True
+    output_fn(
+        sanitize_tool_output(
+            f'Address {record.address} is now labeled "{record.label}" — '
+            "an address-level label for the whole address; coin tags are a "
+            "separate surface (/label lists and sets those, per coin)."
+        )
+    )
+    return True
+
+
 def _run_turn(
     loop: AgentLoop,
     flow: TxFlow,
@@ -14350,6 +14505,16 @@ def _run_turn(
         and IntentName.SELF_TRANSFER in table
         and _run_consolidation_turn(session, store, flow, line, output_fn, table=table)
     ):
+        return
+    # TCK-LABEL-001: chat label-by-address ("label bc1… as 'KYC'") — the
+    # deterministic pre-model intercept for the bug that had NO route: the
+    # code-parsed value writes the schema v5 address_labels row and the ack
+    # narrates only committed store truth (row exists ⟺ success line). The
+    # consumed turn never reaches the transcript or the model (§7.10);
+    # value-free refusals consume too — a half-parsed label utterance must
+    # not reach the model either. Checked after the conversation intercepts
+    # (their open asks still close on a non-matching utterance — never-trap).
+    if store is not None and _run_address_label_turn(store, line, output_fn):
         return
     speed = _bump_speed_choice(line)
     if speed is not None and IntentName.BUMP_FEE in table:
