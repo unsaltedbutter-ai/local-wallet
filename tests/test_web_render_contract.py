@@ -287,6 +287,331 @@ def test_kind_badges_eliminated_and_trust_badge_survives() -> None:
     assert ".trust-badge" in css
 
 
+# ============================================================== TCK-WEB-021
+# Settings-pane "stars" rework (UX council 2026-09-11, arbitrated; de-scope
+# redirection: NO kind badges — the trust badge is the pane's only badge).
+# All textContent-only / CSP-safe (the global sink scan covers the new
+# builders); every rule below is a browser-free source pin unless a node
+# behavioral check is named.
+
+# (1) HUMAN LABELS: the closed key→word map with the four mandated words;
+# unknown keys fall back to the raw key (never a wrong guess); every row
+# label goes through settingLabel — the snake_case headings are gone from
+# the builders. Section titles are promoted in the stylesheet (bigger step,
+# primary ink — no longer a muted caption).
+def test_settings_rows_carry_human_labels_not_snake_case_keys() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    assert "const SETTING_LABELS = {" in code
+    for word in (
+        'watch_key: "Public account key",',
+        'chain_base_url: "Server address",',
+        'gap_limit: "Gap limit",',
+        'display_currency: "Display currency",',
+    ):
+        assert word in code, word
+    # raw-key fallback for unknown keys (the map discriminates by OWN
+    # property only — an inherited key can never fabricate a label):
+    assert "function settingLabel(key)" in code
+    assert "Object.prototype.hasOwnProperty.call(SETTING_LABELS, key)" in code
+    assert ": key;" in code  # fallback returns the RAW key
+    # every pane label paints through settingLabel; no snake_case literal
+    # row headings survive in the builders:
+    assert code.count("settingLabel(") >= 4  # def-excluding uses: rows + watch
+    assert 'el("label", "setting-key", entry.key)' not in code
+    assert 'el("p", "setting-key", "watch_key")' not in code
+    # section-title promotion: the pane's zone heading out-weights rows.
+    heading = css[css.index(".setting-heading {") :]
+    heading = heading [: heading.index("}")]
+    assert "var(--fs-lg)" in heading and "var(--c-text)" in heading
+
+
+# (2) WEIGHT: the configured wallet line and the "Now using: <url>" line —
+# the pane's two heaviest facts — carry real size/ink in the stylesheet,
+# and the builders place the URL line in the status zone (app.js side is
+# pinned by the zone test below).
+def test_wallet_and_now_using_lines_carry_real_weight() -> None:
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    for selector in (".chain-now {", ".watchkey-value {"):
+        block = css[css.index(selector):]
+        block = block[: block.index("}")]
+        assert "var(--fs-md)" in block, selector  # the body step, not --fs-xs
+        assert "var(--c-text)" in block, selector  # primary ink, not muted
+        assert "font-weight" in block, selector
+
+
+# (3) ZONES in the server card + the collapse discipline: status zone
+# (URL + trust badge; the slot WEB-023's kind pills join), act zone (field
+# + Apply/Cancel + the empty .chain-chips slot), rest zone (explanatory
+# prose behind a NATIVE <details>). Resync and the gap row stay VISIBLE —
+# built before/outside the rest zone. Entry form (7): ONE reassurance line
+# visible; the lecture collapses into its own <details>.
+def test_server_card_zones_and_collapse_discipline() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    chain = code[code.index("function chainBaseRow") : code.index("function backendCredFlags")]
+    # three zones + the WEB-022 chip slot:
+    for zone in ('"chain-status"', '"chain-act"', '"setting-details chain-rest"', '"chain-chips"'):
+        assert zone in chain, zone
+    # rest zone = native <details> + <summary> (no JS toggle, no aria fake):
+    assert 'el("details", "setting-details chain-rest")' in chain
+    assert 'el("summary", "setting-details-summary"' in chain
+    # the prose rides the collapsed zone, the recovery path does NOT:
+    assert 'restZone.appendChild(el("p", "setting-hint", LABELS.settingsEmptyIsDefault))' in chain
+    assert "LABELS.chainEnvOverride" in chain[chain.index("restZone"):]
+    assert "LABELS.settingsRestart" in chain[chain.index("restZone"):]
+    assert chain.index("li.appendChild(resyncLine)") < chain.index('el("details"')
+    assert 'li.appendChild(el("p", "setting-hint", LABELS.settingsEmptyIsDefault))' not in chain
+    # trust badge joins the STATUS zone (and WEB-023's pills would too):
+    assert "statusZone.appendChild(nowLine)" in chain
+    # gap_limit is its own GENERIC row outside the chain builder entirely:
+    render = code[code.index("function renderSettings") : code.index("function settingsCol")]
+    assert "settingRow(gap" in render and "chainBaseRow" in render
+    # (7) entry form: visible label + input + Connect + ONE reassurance
+    # line; the lede and the warning collapse behind a native <details>.
+    watch = code[code.index("function watchKeyRow") : code.index("function watchKeyInput")]
+    assert "label.htmlFor = inputId;" in watch  # (6): a VISIBLE label names the input
+    assert "el(\"p\", \"setting-hint\", LABELS.watchkeyReassure)" in watch
+    assert 'el("details", "setting-details")' in watch
+    assert 'el("summary", "setting-details-summary", LABELS.watchkeyFindSummary)' in watch
+    assert code.count('el("details"') == 2  # exactly the two collapse slots
+
+
+# (4) ONE COLOR VOCABULARY: the trust dimension owns the risk colors; the
+# stylesheet carries the CLASS CONTRACT for a future neutral .kind-pill —
+# as a comment only. No badge markup or .kind-pill rule exists today.
+def test_color_vocabulary_contract_and_no_kind_badge() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    assert "ONE COLOR VOCABULARY" in css  # the contract block is present
+    assert ".kind-pill" in css and "TCK-WEB-023" in css  # names the future slot
+    # contract comment only: no rule builds a pill, no client paints one.
+    assert ".kind-pill" not in code
+    assert not re.search(r"\.kind-pill\s*\{", css)
+    # risk tokens stay exclusively on the trust dimension (chip + badge):
+    priv_rules = re.findall(
+        r"^\.([a-z-]+)\[data-privacy", css, flags=re.MULTILINE
+    )
+    assert set(priv_rules) == {"privacy", "trust-badge"}
+
+
+# (5) STALE NOW-LINE: the reload trigger is PINNED — once per /state
+# snapshot flip of backend_kind or privacy_mode, typed snapshots only,
+# evaluated AFTER both halves carry this snapshot's truth, never while the
+# pane is closed (opening fetches fresh).
+def test_settings_reload_is_pinned_to_the_trust_flip() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    flip = code[code.index("function noteTrustFlip") : code.index("function paintSettingsDot")]
+    assert 'const sig = state.backendName + "|" + state.privacyMode;' in flip
+    # one reload per FLIP, open pane only, and the baseline never fires:
+    assert "state.trustSig !== null && sig !== state.trustSig && !settingsPanelEl.hidden" in flip
+    assert "loadSettings();" in flip
+    assert "state.trustSig = sig;" in flip  # re-baseline on EVERY typed pass
+    # called from applyState AFTER applyPrivacyChip (both halves updated),
+    # and gated on the TYPED flag (state/0 carries no new signature):
+    apply = code[code.index("function applyState") : code.index("function applyModelPrompt")]
+    assert "noteTrustFlip(typed);" in apply
+    assert apply.index("applyPrivacyChip(snap);") < apply.index("noteTrustFlip(typed);")
+    assert 'typeof snap.backend_kind === "string"' in apply  # consumed READ-ONLY
+
+
+def test_settings_reload_fires_once_per_flip_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    flip = re.search(
+        r"function noteTrustFlip\(typed\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    script = """
+      const state = { backendName: "", privacyMode: "", trustSig: null };
+      const settingsPanelEl = { hidden: false };
+      let loads = 0;
+      const loadSettings = () => { loads++; };
+      __FLIP__
+      // the FIRST typed snapshot only lays the baseline down (opening fetched):
+      noteTrustFlip(true);
+      noteTrustFlip(true);
+      if (loads !== 0) throw new Error("baseline-fired");
+      // an identical snapshot never reloads:
+      state.backendName = "electrum"; state.privacyMode = "public";
+      noteTrustFlip(true);
+      noteTrustFlip(true);
+      if (loads !== 1) throw new Error("not-once");
+      // a privacy_mode flip reloads exactly once:
+      state.privacyMode = "own_node_local";
+      noteTrustFlip(true);
+      if (loads !== 2) throw new Error("mode-flip");
+      // a backend_kind flip reloads exactly once too:
+      state.backendName = "bitcoind";
+      noteTrustFlip(true);
+      if (loads !== 3) throw new Error("kind-flip");
+      // untyped (state/0) replies never reload nor re-baseline:
+      noteTrustFlip(false);
+      if (loads !== 3) throw new Error("untyped-fired");
+      // a flip while the pane is CLOSED re-baselines silently (open fetches):
+      settingsPanelEl.hidden = true;
+      state.privacyMode = "public";
+      noteTrustFlip(true);
+      if (loads !== 3) throw new Error("closed-fired");
+      settingsPanelEl.hidden = false;
+      noteTrustFlip(true); // sig unchanged since baseline: stays quiet
+      if (loads !== 3) throw new Error("closed-rebaseline-missed");
+      console.log("ok");
+    """.replace("__FLIP__", flip)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# (6) A11Y: the visible zpub <label> is pinned above; here — the wait word
+# (the chain row names the seconds-class PROBE, generic rows keep the old
+# word), the refocus seam on every Cancel/Escape rebuild, and the QR/pane
+# Escape interplay (QR is topmost: it consumes the press, the settings
+# handler also returns early — double-guarded).
+def test_a11y_wait_word_refocus_and_escape_layering() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    # 'Checking the server…' rides ONLY the chain write (the probe):
+    assert 'isChain ? LABELS.settingsChecking : LABELS.settingsSaving' in code
+    # the entry input's NAME is the visible label now (no aria duplicate):
+    watch_input = code[code.index("function watchKeyInput") :]
+    watch_input = watch_input[: watch_input.index("\n}")]
+    assert "aria-label" not in watch_input
+    # refocus: the helper exists and rides BOTH cancel buttons and BOTH
+    # Escape-rebuild branches (4 call sites):
+    assert "function refocusRowControl(key)" in code
+    assert code.count("refocusRowControl(") == 5  # def + 4 rebuild seams
+    assert "(target || settingsHeadingEl).focus();" in code  # never <body>
+    # Escape layering: the QR listener consumes the press while open...
+    assert "event.stopImmediatePropagation();" in code
+    # ...and the settings handler returns early on the same condition:
+    esc = code[code.index('if (event.key !== "Escape"') :]
+    esc = esc[: esc.index("});")]
+    assert "if (!qrViewerEl.hidden) return;" in esc
+    # the dot rides a data-attribute styled in the stylesheet (no inline
+    # style anywhere — the global pin covers it; this names the pair):
+    assert 'settingsToggleEl.dataset.needsSetup = unfinished ? "1" : "";' in code
+    assert '#settings-toggle[data-needs-setup="1"]::after' in css
+
+
+def test_escape_layering_qr_consumes_before_the_pane_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    qr_handler = re.search(
+        r'document\.addEventListener\("keydown", \(event\) => \{\s*\n\s*if \(event\.key === "Escape"',
+        code,
+    )
+    assert qr_handler is not None
+    qr_listener = code[qr_handler.start() :]
+    qr_listener = qr_listener[: qr_listener.index("});") + 3]
+    pane_listener = code[code.index('document.addEventListener("keydown", (event) => {\n  if (event.key !== "Escape"') :]
+    pane_listener = pane_listener[: pane_listener.index("});") + 3]
+    script = """
+      // shipped registration ORDER (QR first) on one shared node:
+      const listeners = [];
+      globalThis.document = {
+        addEventListener: (_name, fn) => listeners.push(fn),
+      };
+      const qrViewerEl = { hidden: false }; // QR dialog OPEN (over the pane)
+      const settingsPanelEl = {
+        hidden: false,
+        querySelector: () => null, // nothing mid-edit in this scenario
+      };
+      const state = { watchKeyReplaceOpen: false };
+      let qrCloses = 0, paneCloses = 0, rebuilds = 0, refocuses = [];
+      const closeQr = () => { qrCloses++; qrViewerEl.hidden = true; };
+      const closeSettings = () => { paneCloses++; settingsPanelEl.hidden = true; };
+      const renderSettings = () => { rebuilds++; };
+      const refocusRowControl = (key) => { refocuses.push(key); };
+      __QR__
+      __PANE__
+      const press = () => {
+        const event = {
+          key: "Escape",
+          prevented: false,
+          preventDefault() { this.prevented = true; },
+          stopImmediatePropagation() { this._stopped = true; },
+        };
+        // same-node semantics: stopImmediatePropagation skips the REST.
+        for (const fn of listeners) {
+          fn(event);
+          if (event._stopped) break;
+        }
+        return event;
+      };
+      // 1. QR + pane both open: ONE press closes ONLY the QR.
+      press();
+      if (qrCloses !== 1 || paneCloses !== 0 || rebuilds !== 0)
+        throw new Error("qr-did-not-consume");
+      if (settingsPanelEl.hidden) throw new Error("pane-hidden");
+      // 2. pane open, QR closed, replace form open: Escape CANCELS the form
+      //    (rebuild + refocus) and does NOT close the pane.
+      state.watchKeyReplaceOpen = true;
+      press();
+      if (paneCloses !== 0 || rebuilds !== 1 || refocuses[0] !== "watch_key")
+        throw new Error("escape-cancel");
+      if (state.watchKeyReplaceOpen !== false) throw new Error("cancel-state");
+      // 3. pane open, nothing edited: the NEXT Escape closes the pane.
+      press();
+      if (paneCloses !== 1) throw new Error("escape-close");
+      // 4. pane closed: Escape is nobody's business (early return).
+      press();
+      if (qrCloses !== 1 || paneCloses !== 1 || rebuilds !== 1)
+        throw new Error("quiet-when-closed");
+      console.log("ok");
+    """
+    script = script.replace("__QR__", qr_listener).replace("__PANE__", pane_listener)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# (7) is pinned inside the zone test (the entry form). (8) SETTINGS-DOOR
+# DOT: lit from typed truth only — wallet key needed (tracked by
+# applyWatchKeyGate) or backend unresolved; never on an unknown mode.
+def test_settings_door_dot_rides_typed_truth_only() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    dot = re.search(
+        r"function paintSettingsDot\(\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert 'state.watchKeyNeeded === true || state.privacyMode === "awaiting_backend"' in dot
+    # no third condition, no guess: an empty privacyMode never lights it.
+    assert dot.count("||") == 1 and "&&" not in dot
+    apply = code[code.index("function applyState") : code.index("function applyModelPrompt")]
+    assert "paintSettingsDot();" in apply  # every snapshot repaints from state
+
+
+# (9) 320px: the row lines WRAP (no horizontal scroll, no clipped control);
+# the buttons keep their word-sized boxes.
+def test_phone_width_lines_wrap() -> None:
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    for selector in (".setting-line {", ".watchkey-line {", ".chain-now-line {"):
+        block = css[css.index(selector):]
+        block = block[: block.index("}")]
+        assert "flex-wrap: wrap;" in block, selector
+    assert ".setting-line > .btn { flex: none; }" in css
+    assert ".watchkey-line > .btn { flex: none; }" in css
+
+
+# (10) REJECTION LINES: every rejection rendering carries the SAME static
+# value-free next-step suffix (the dynamic part stays the server's own
+# reason; the suffix never varies and never echoes a value).
+def test_rejection_lines_end_in_a_static_next_step() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    assert 'settingsRejectNext: " — check the value and apply again.",' in code
+    assert 'watchkeyRejectNext: " — check the key and try again.",' in code
+    # settings rejections (delegated Apply ternary: 2 branches) + creds clear:
+    assert code.count("LABELS.settingsRejectNext") == 3
+    # watchkey rejections (entry/replace submit + replaceStage apply rung):
+    assert code.count("LABELS.watchkeyRejectNext") == 2
+    # the suffix joins ONLY the error branches — busy/stale/transport lines
+    # keep their own (already prescriptive) sentences:
+    assert 'LABELS.settingsBusy + LABELS.settingsRejectNext' not in code
+    assert 'LABELS.sessionStale + LABELS' not in code
+
+
 # TCK-LINK-001 (revised by TCK-WEB-014, critique D8) static pins: the
 # qualifying-token scan is unchanged, but the affordance is a COPY BUTTON —
 # the visible label is the verbatim token, no navigation machinery survives
@@ -1234,6 +1559,8 @@ def test_served_index_csp_allows_only_the_nonced_island() -> None:
         conn.close()
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
 
     assert csp is not None
     assert "unsafe-inline" not in csp and "unsafe-eval" not in csp
@@ -1262,5 +1589,7 @@ def test_static_asset_served_with_no_inline_nonce_csp() -> None:
         conn.close()
     finally:
         server.stop()
+        if server.handle.thread is not None:  # FLAKE-FIX TCK-TEST-002
+            server.handle.thread.join(5)
     assert ctype.startswith(("application/javascript", "text/javascript"))
     assert "script-src 'self';" in csp  # strict no-inline policy, no island nonce

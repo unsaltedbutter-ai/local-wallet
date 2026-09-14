@@ -104,9 +104,19 @@ const LABELS = {
   settingsApply: "Apply",
   settingsEdit: "Edit",
   settingsSaving: "Saving…",
+  // TCK-WEB-021 (6): the chain row's wait word names what is actually
+  // happening — the engine PROBE (seconds-class) runs inside the Apply.
+  settingsChecking: "Checking the server…",
   settingsApplied: "Applied.",
-  settingsRejected: "Rejected — no reason given.",
+  settingsRejected: "Rejected — no reason given",
   settingsRejectedPrefix: "Rejected:",
+  // TCK-WEB-021 (10): the static value-free next-step suffix on every
+  // rejection line (one shared sentence — the suffix itself never varies).
+  settingsRejectNext: " — check the value and apply again.",
+  watchkeyRejectNext: " — check the key and try again.",
+  // TCK-WEB-021 (3): the server card's collapsed rest zone (explanatory
+  // prose: legend-style hints, creds notes, env/restart flags).
+  chainRestNotes: "Server notes",
   settingsBusy: "The wallet is busy — try again.",
   settingsFailed: "Could not save — try again.",
   settingsRestart: "Takes effect after restart.",
@@ -138,6 +148,11 @@ const LABELS = {
     "This is not your seed words. This app is hardware-wallet-only. It " +
     "never accepts a seed phrase or a private key, and it could not use " +
     "one. Mainnet keys only — testnet keys are refused.",
+  // TCK-WEB-021 (7): the entry form is title + input + Connect + ONE
+  // reassurance line; the full lecture (lede + warning) collapses behind a
+  // native <details> whose summary asks the form's one real question.
+  watchkeyReassure: "A public key only — never your seed words or a private key.",
+  watchkeyFindSummary: "Where do I find this?",
   watchKeyInputLabel: "Public account key",
   watchKeyConnect: "Connect",
   watchkeySaving: "Connecting…",
@@ -307,6 +322,27 @@ const SPECIAL_SETTING_KEYS = new Set([
   "backend_auth_user", "backend_auth_pass", "backend_auth_none",
 ]);
 
+// TCK-WEB-021 (1): the CLOSED key→word map — snake_case engine keys never
+// headline a row again. Unknown/future allowlisted keys fall back to the
+// raw key (honest, never a wrong guess); the copy below is designer-
+// reviewable in one place.
+const SETTING_LABELS = {
+  watch_key: "Public account key",
+  chain_base_url: "Server address",
+  gap_limit: "Gap limit",
+  display_currency: "Display currency",
+  watch_interval_s: "Watch interval (seconds)",
+  utxo_target_min_sats: "Coin target minimum (sats)",
+  utxo_target_max_sats: "Coin target maximum (sats)",
+  consolidate_below_sat_vb: "Consolidation threshold (sat/vB)",
+};
+
+function settingLabel(key) {
+  return Object.prototype.hasOwnProperty.call(SETTING_LABELS, key)
+    ? SETTING_LABELS[key]
+    : key;
+}
+
 // The closed resync statuses the settings/resync replies carry (app.py
 // RESYNC_STATUSES) → honest inline note. An unknown value renders the plain
 // "Applied." line — never a guess.
@@ -346,6 +382,13 @@ const state = {
   // TCK-WEB-012 (f): the last KNOWN privacy_mode NAME from a typed
   // snapshot — state/0 (engine busy) must not blank the chip mid-turn.
   privacyMode: "",
+  // TCK-WEB-021 (5): the pinned reload trigger. The last TYPED snapshot's
+  // backend_kind NAME (never rendered — the badges are gone; read ONLY as
+  // half of the trust signature; state/0 keeps the last known value, the
+  // privacyMode discipline) and the signature it last produced. null =
+  // no typed snapshot yet = no reload baseline (opening fetches anyway).
+  backendName: "",
+  trustSig: null,
   stateSeq: 0,
   watchKeyDismissed: false,
   watchKeyPresent: null, // null = unknown | true | false (typed state/1 only)
@@ -689,8 +732,16 @@ qrCloseEl.addEventListener("click", closeQr);
 qrViewerEl.addEventListener("click", (event) => {
   if (event.target === qrViewerEl) closeQr(); // backdrop click
 });
+// TCK-WEB-021 (6): the QR dialog is the TOPMOST layer — while it is open its
+// Escape handler CONSUMES the key (stopImmediatePropagation) so the separate
+// settings-pane document keydown listener never runs on the same press (one
+// Escape closes the QR, not the QR AND the pane). The settings handler also
+// guards on !qrViewerEl.hidden, so the ordering is safe either way.
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !qrViewerEl.hidden) closeQr();
+  if (event.key === "Escape" && !qrViewerEl.hidden) {
+    event.stopImmediatePropagation();
+    closeQr();
+  }
 });
 
 function ensureTurn() {
@@ -935,6 +986,14 @@ function visibleActions(snap) {
 }
 
 function applyState(snap) {
+  const typed = !!snap && snap.schema === "state/1";
+  // TCK-WEB-021 (5): read the trust signature's OTHER half from typed truth
+  // only (state/0 keeps the last known value — same discipline as
+  // privacyMode). The NAME is never rendered (TCK-DESCOPE-M3B): it exists
+  // here solely so a backend flip can pin the settings reload below.
+  if (typed && typeof snap.backend_kind === "string") {
+    state.backendName = snap.backend_kind;
+  }
   const visible = new Set(visibleActions(snap));
   for (const btn of actionsEl.querySelectorAll("button")) {
     // Skip the model/quick buttons — they are driven by model_state below.
@@ -947,6 +1006,41 @@ function applyState(snap) {
   applyPrivacyChip(snap);
   applyWatchKeyGate(snap);
   applyModelPrompt(snap);
+  // TCK-WEB-021 (8): the settings-door dot (wallet/backend unset — drive
+  // the eye to setup). (5): the pinned reload trigger, LAST, so both
+  // signature halves (backendName above, privacyMode in applyPrivacyChip)
+  // carry THIS snapshot's truth before it is compared.
+  paintSettingsDot();
+  noteTrustFlip(typed);
+}
+
+// TCK-WEB-021 (5): the STALE-NOW-LINE fix, pinned: the pane reloads its
+// settings exactly once per /state SNAPSHOT FLIP of backend_kind or
+// privacy_mode (a chat-entered URL used to leave a confidently-wrong
+// "Now using" line + trust badge up). The signature is the pair of LAST
+// KNOWN typed NAMES; a flip while the pane is CLOSED only re-baselines
+// (opening always fetches fresh). state/0 replies carry no new signature.
+function noteTrustFlip(typed) {
+  if (!typed) return;
+  const sig = state.backendName + "|" + state.privacyMode;
+  if (state.trustSig !== null && sig !== state.trustSig && !settingsPanelEl.hidden) {
+    loadSettings();
+  }
+  state.trustSig = sig;
+}
+
+// TCK-WEB-021 (8): the state dot on the header Settings gear — lit while
+// the setup is unfinished on typed truth ONLY: the wallet still needs its
+// key (needs_watch_key, tracked by applyWatchKeyGate) or the backend choice
+// is unresolved (privacy_mode awaiting_backend). Unknown/absent mode (no
+// typed snapshot yet) never lights it — no guess, no nag. The dot itself
+// is styles.css on the data-attribute (never an inline style); the word
+// "dot" never reaches the AT (the pane is the affordance, the gear keeps
+// its label).
+function paintSettingsDot() {
+  const unfinished =
+    state.watchKeyNeeded === true || state.privacyMode === "awaiting_backend";
+  settingsToggleEl.dataset.needsSetup = unfinished ? "1" : "";
 }
 
 // TCK-LAUNCH-002: the Yes/No card buttons and the model-free quick-action
@@ -1325,13 +1419,16 @@ quickbarEl.addEventListener("click", (event) => {
 
 let inputSeq = 0; // unique label/id pairing inside the rebuilt panel
 
-// A generic editable row (gap_limit and any future allowlisted key the
-// client has no special row for): text/number input + Apply → POST /settings.
+// A generic editable row (gap_limit, display_currency, and any future
+// allowlisted key the client has no special row for): human label (closed
+// map + raw-key fallback, TCK-WEB-021 (1)) + text/number input + Apply →
+// POST /settings.
 function settingRow(entry, index) {
   const li = el("li", "setting");
+  li.dataset.key = entry.key; // refocusRowControl's stable row handle
   const keyId = "setting-input-" + index;
 
-  const label = el("label", "setting-key", entry.key);
+  const label = el("label", "setting-key", settingLabel(entry.key));
   label.htmlFor = keyId;
   li.appendChild(label);
 
@@ -1380,25 +1477,27 @@ function focusWatchInput() {
   if (watchForm && watchForm.input.isConnected) watchForm.input.focus();
 }
 
-// The watch-key entry input (shared by the ENTRY form and the §1 replace-mode
-// form — the same safe term in the aria-label, one builder, no fork).
-function watchKeyInput() {
-  const input = document.createElement("input");
-  input.type = "text";
-  input.spellcheck = false;
-  input.autocomplete = "off";
-  input.maxLength = 200;
-  input.placeholder = "zpub…";
-  input.setAttribute("aria-label", LABELS.watchKeyInputLabel);
-  return input;
+// TCK-WEB-021 (6): an Escape/Cancel row rebuild must not drop keyboard
+// focus to <body>. Rows carry a stable data-key handle; the rebuilt row's
+// primary control gets focus, and the pane heading (the WEB-012 open-focus
+// target) is the fallback whenever the row or control is gone.
+function refocusRowControl(key) {
+  const row = settingsListEl.querySelector('.setting[data-key="' + key + '"]');
+  const target =
+    row &&
+    row.querySelector(".setting-apply, .watchkey-line button, .watchkey-display-line button");
+  (target || settingsHeadingEl).focus();
 }
 
-// The settings pane's zpub section (TCK-WEB-009 a/b; copy pass 2 §1). States,
-// all rendered from typed /state truth plus the server's entry:
-//  * ENTRY (wallet needs a key): the moved card, compacted — lede, warning,
-//    one input + Connect. Submit is the ONE POST /watchkey channel (the same
-//    path the replaced card used, replace/confirm rung kept); ALL key
-//    validation is the engine's parse+gate, refusals relayed value-free.
+// The settings pane's zpub section (TCK-WEB-009 a/b; copy pass 2 §1; entry
+// form reworked by TCK-WEB-021 (6)/(7)). States, all rendered from typed
+// /state truth plus the server's entry:
+//  * ENTRY (wallet needs a key): title + input + Connect + ONE reassurance
+//    line; the full lecture (where to find the key, the seed/private-key
+//    warning) collapses behind a native <details>. Submit is the ONE
+//    POST /watchkey channel (the same path the replaced card used,
+//    replace/confirm rung kept); ALL key validation is the engine's
+//    parse+gate, refusals relayed value-free.
 //  * SET: a collapsed display (the engine's truncated descriptor,
 //    "wpkh([e7f511…" style) + an Edit button. No Show/Copy/Replace
 //    affordances (user direction): the full value is never needed here.
@@ -1407,12 +1506,13 @@ function watchKeyInput() {
 //    and the engine's 409 raises the existing confirm/apply rungs.
 function watchKeyRow(serverEntry) {
   const li = el("li", "setting setting-watchkey");
-  li.appendChild(el("p", "setting-key", "watch_key"));
+  li.dataset.key = "watch_key"; // refocusRowControl's stable row handle
   const status = el("p", "setting-status");
   status.setAttribute("role", "status");
   watchForm = null;
 
   if (state.watchKeyPresent === null && !serverEntry) {
+    li.appendChild(el("p", "setting-key", settingLabel("watch_key")));
     li.appendChild(el("p", "watchkey-value", LABELS.watchKeyRowUnknown));
     li.appendChild(status);
     return li;
@@ -1420,17 +1520,42 @@ function watchKeyRow(serverEntry) {
   const needsEntry =
     state.watchKeyNeeded ||
     (serverEntry ? serverEntry.configured !== true : state.watchKeyPresent !== true);
-  if (needsEntry) {
-    state.watchKeyReplaceOpen = false; // the ENTRY form owns the row
-    li.appendChild(el("p", "setting-hint", LABELS.watchkeyLede));
-    li.appendChild(el("p", "setting-flag", LABELS.watchkeyWarning));
+
+  if (needsEntry || state.watchKeyReplaceOpen) {
+    // ENTRY, or the §1 Edit rung of the replace cycle (flip to the form,
+    // replace-mode copy, no request — the submit is the SAME
+    // submitWatchKey path; the engine answers ``already`` (409) and raises
+    // the existing confirm rung below it; a silent overwrite is engine-
+    // impossible). TCK-WEB-021 (6): a VISIBLE <label> names the input
+    // (htmlFor/id pairing, no aria-label duplication).
+    const replacing = !needsEntry;
+    if (!replacing) state.watchKeyReplaceOpen = false; // the ENTRY form owns the row
+    inputSeq += 1;
+    const inputId = "watchkey-input-" + inputSeq;
+    const label = el("label", "setting-key", LABELS.watchKeyInputLabel);
+    label.htmlFor = inputId;
+    const more = el("details", "setting-details");
+    more.appendChild(el("summary", "setting-details-summary", LABELS.watchkeyFindSummary));
+    more.appendChild(
+      el("p", "setting-hint", replacing ? LABELS.watchkeyReplaceLede : LABELS.watchkeyLede),
+    );
+    more.appendChild(el("p", "setting-flag", LABELS.watchkeyWarning));
     const box = el("div", "watchkey-replace"); // confirm / apply rungs of a replace
     const line = el("div", "watchkey-line");
     const input = watchKeyInput();
-    const btn = el("button", "btn btn-primary btn-small", LABELS.watchKeyConnect);
+    input.id = inputId;
+    const btn = el(
+      "button",
+      "btn btn-primary btn-small",
+      replacing ? LABELS.watchKeyReplaceSubmit : LABELS.watchKeyConnect,
+    );
     btn.type = "button";
     line.append(input, btn);
-    li.append(line, box, status);
+    // ENTRY gets the ONE reassurance line (the lecture collapsed above it);
+    // the replace form keeps its own lede inside the details.
+    li.append(label, line);
+    if (!replacing) li.appendChild(el("p", "setting-hint", LABELS.watchkeyReassure));
+    li.append(more, box, status);
     btn.addEventListener("click", () => submitWatchKey(input, btn, status, box));
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
@@ -1438,49 +1563,32 @@ function watchKeyRow(serverEntry) {
         submitWatchKey(input, btn, status, box);
       }
     });
+    if (replacing) {
+      // Cancel collapses back to the display; nothing sent. (TCK-WEB-021
+      // (6): focus lands on the rebuilt row's Edit button, not <body>.)
+      const no = el("button", "btn btn-secondary btn-small", LABELS.watchKeyReplaceCancel);
+      no.type = "button";
+      no.addEventListener("click", () => {
+        state.watchKeyReplaceOpen = false;
+        renderSettings();
+        refocusRowControl("watch_key");
+      });
+      line.appendChild(no);
+    }
     watchForm = { input, submit: btn };
     return li;
   }
 
-  if (state.watchKeyReplaceOpen) {
-    // §1 Edit rung of the replace cycle: flip to the form, replace-mode
-    // copy, no request. The submit is the SAME submitWatchKey path — the
-    // engine answers ``already`` (409) and raises the existing confirm rung
-    // (below it); a silent overwrite is engine-impossible. Cancel collapses
-    // back to the display; nothing sent. Always available.
-    li.appendChild(el("p", "setting-hint", LABELS.watchkeyReplaceLede));
-    li.appendChild(el("p", "setting-flag", LABELS.watchkeyWarning));
-    const box = el("div", "watchkey-replace"); // confirm / apply rungs
-    const line = el("div", "watchkey-line");
-    const input = watchKeyInput();
-    const submitBtn = el("button", "btn btn-primary btn-small", LABELS.watchKeyReplaceSubmit);
-    submitBtn.type = "button";
-    const no = el("button", "btn btn-secondary btn-small", LABELS.watchKeyReplaceCancel);
-    no.type = "button";
-    no.addEventListener("click", () => {
-      state.watchKeyReplaceOpen = false;
-      renderSettings();
-    });
-    line.append(input, submitBtn, no);
-    li.append(line, box, status);
-    submitBtn.addEventListener("click", () => submitWatchKey(input, submitBtn, status, box));
-    input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        submitWatchKey(input, submitBtn, status, box);
-      }
-    });
-    watchForm = { input, submit: submitBtn };
-    return li;
-  }
-
-  // SET — collapsed display + the §1 Edit affordance.
+  // SET — collapsed display + the §1 Edit affordance. TCK-WEB-021 (2): the
+  // configured wallet is the pane's heaviest fact (.watchkey-value in
+  // styles.css); the label carries the human word, never "watch_key".
   const display =
     serverEntry && typeof serverEntry.value === "string"
       ? serverEntry.value
       : state.sessionWatchKey
         ? truncateKey(state.sessionWatchKey)
         : LABELS.watchKeyRowConnected;
+  li.appendChild(el("p", "setting-key", settingLabel("watch_key")));
   const line = el("div", "watchkey-line watchkey-display-line");
   line.appendChild(el("p", "watchkey-value", display));
   const editBtn = el("button", "btn btn-secondary btn-small", LABELS.settingsEdit);
@@ -1499,44 +1607,75 @@ function watchKeyRow(serverEntry) {
   return li;
 }
 
-// The chain-base row (TCK-WEB-009 d/e/f, reworked by TCK-WEB-013): the
-// effective backend is ALWAYS shown ("Now using: <url>" from the additive
-// /settings field, omitted when absent — never fabricated) with a trust
-// badge riding the /state privacy_mode enum ONLY. A stored value renders
-// read-only + Edit→Apply (the existing POST /settings write; the engine
-// probes before saving and hot-swaps server-side — ADR-0018 amendment); an
-// EMPTY field is directly typeable (Apply straight away), and the env rung
-// suppresses the field's whole write path for one honest note. Edit/typing
-// gain Cancel + Escape, which rebuild the row from engine truth with no
-// request. While a write (or the engine's probe inside it) is in flight the
-// button is disabled: no double-submit. Under the field: the three dimmed
-// backend badges and the Resync-now action.
+// The watch-key entry input (shared by the ENTRY form and the §1
+// replace-mode form). TCK-WEB-021 (6): the visible <label> (htmlFor/id at
+// the call sites) is the input's name now — no duplicate aria-label.
+function watchKeyInput() {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.spellcheck = false;
+  input.autocomplete = "off";
+  input.maxLength = 200;
+  input.placeholder = "zpub…";
+  return input;
+}
+
+// The chain-base row (TCK-WEB-009 d/e/f, TCK-WEB-013; zoned by TCK-WEB-021
+// (3)). THREE zones inside the server card:
+//  * STATUS (.chain-status): the effective backend — "Now using: <url>"
+//    with real visual weight ((2): the most privacy-relevant fact is no
+//    longer the smallest text) + the trust badge riding the /state
+//    privacy_mode closed enum ONLY. TCK-WEB-023 will later bring the
+//    electrum/bitcoind kind badges back into THIS zone as NEUTRAL pills
+//    (styles.css color-vocabulary contract) — the slot is here, no badge
+//    markup is built today (TCK-DESCOPE-M3B).
+//  * ACT (.chain-act): field + Apply/Edit/Cancel + the empty .chain-chips
+//    slot TCK-WEB-022 will fill with suggested-server chips.
+//  * REST (.chain-rest): the explanatory prose (empty-field legend, creds
+//    notes, env/restart flags) collapsed behind a native <details>.
+//    Resync-now and the gap_limit row stay VISIBLE outside it — the
+//    recovery path must not hide.
+// A stored value renders read-only + Edit→Apply (the existing POST
+// /settings write; the engine probes before saving and hot-swaps
+// server-side — ADR-0018 amendment); an EMPTY field is directly typeable
+// (Apply straight away), and the env rung suppresses the field's whole
+// write path for one honest note. Edit/typing gain Cancel + Escape, which
+// rebuild the row from engine truth with no request and REFOCUS the row's
+// control (TCK-WEB-021 (6)). While a write (or the engine's probe inside
+// it) is in flight the button is disabled: no double-submit, and the wait
+// word is "Checking the server…" (seconds-class probe, not a save).
 function chainBaseRow(entry) {
   inputSeq += 1;
   const li = el("li", "setting setting-chain");
+  li.dataset.key = entry.key; // refocusRowControl's stable row handle
   const keyId = "setting-input-" + inputSeq;
-  const label = el("label", "setting-key", entry.key);
+  const label = el("label", "setting-key", settingLabel(entry.key));
   label.htmlFor = keyId;
   li.appendChild(label);
 
-  // (5): an env-rung entry is not this field's to write — no Edit rung.
+  // TCK-WEB-013 (5): an env-rung entry is not this field's to write — no Edit rung.
   const envRung = entry.env_override === true;
+  const status = el("p", "setting-status");
+  status.setAttribute("role", "status");
 
-  // TCK-WEB-013 (1/2): the effective backend is ALWAYS shown when the
-  // server carries it (an empty stored field answers EMPTY since
-  // TCK-DESCOPE-M3A — unresolved, no silent public default; a recorded
-  // public consent lands the named public Electrum server on this line),
-  // with the trust badge riding the
-  // privacy_mode enum beside it. Field absent (bare pump) → line omitted.
+  // --- status zone -------------------------------------------------------
+  // TCK-WEB-013 (1): the effective backend is ALWAYS shown when the server
+  // carries it (an empty stored field answers EMPTY since TCK-DESCOPE-M3A —
+  // unresolved, no silent public default; a recorded public consent lands
+  // the named public Electrum server on this line), with the trust badge
+  // riding the privacy_mode enum beside it. Field absent (bare pump) → the
+  // zone stays empty (never fabricated).
+  const statusZone = el("div", "chain-status");
   if (state.effectiveChainUrl) {
     const nowLine = el("div", "chain-now-line");
     nowLine.appendChild(
       el("p", "chain-now", LABELS.settingsNowUsing + " " + state.effectiveChainUrl)
     );
     const badge = trustBadge();
-    if (badge) nowLine.appendChild(badge);
-    li.appendChild(nowLine);
+    if (badge) nowLine.appendChild(badge); // WEB-023's kind pills would join HERE.
+    statusZone.appendChild(nowLine);
   }
+  li.appendChild(statusZone);
 
   // TCK-PRIVACY-001B: the ONLY web trigger of public-backend consent. It
   // shows while the typed /state privacy_mode enum says the backend choice
@@ -1555,6 +1694,8 @@ function chainBaseRow(entry) {
   consent.hidden = state.privacyMode !== "awaiting_backend";
   li.appendChild(consent);
 
+  // --- act zone ----------------------------------------------------------
+  const actZone = el("div", "chain-act");
   const line = el("div", "setting-line");
   const input = document.createElement("input");
   input.className = "setting-input";
@@ -1563,9 +1704,9 @@ function chainBaseRow(entry) {
   input.spellcheck = false;
   input.autocomplete = "off";
   input.value = typeof entry.value === "string" ? entry.value : "";
-  // (3): an EMPTY stored field is directly typeable — Edit earns its keep
-  // only when a value exists (and never on the env rung, where a stored
-  // write is shadowed anyway).
+  // TCK-WEB-013 (3): an EMPTY stored field is directly typeable — Edit
+  // earns its keep only when a value exists (and never on the env rung,
+  // where a stored write is shadowed anyway).
   const directlyTypeable = !envRung && input.value.trim() === "";
   input.readOnly = !directlyTypeable;
   if (!envRung) input.placeholder = LABELS.settingsEmptyPlaceholder;
@@ -1583,22 +1724,33 @@ function chainBaseRow(entry) {
   );
   btn.type = "button";
   btn.dataset.settingKey = entry.key;
-  // (3): Cancel for the edit mode — restores read-only from ENGINE truth
-  // (renderSettings rebuilds from the entry, the replace-cancel shape),
-  // no request. Visible exactly while the field is editable.
+  // TCK-WEB-013 (3): Cancel for the edit mode — restores read-only from
+  // ENGINE truth (renderSettings rebuilds from the entry, the
+  // replace-cancel shape), no request. Visible exactly while the field is
+  // editable. TCK-WEB-021 (6): after the rebuild, focus returns to the
+  // row's Apply/Edit control — never <body>.
   const cancel = el("button", "btn btn-secondary btn-small setting-cancel", LABELS.settingsCancel);
   cancel.type = "button";
   cancel.hidden = !directlyTypeable;
-  cancel.addEventListener("click", () => renderSettings());
+  cancel.addEventListener("click", () => {
+    renderSettings();
+    refocusRowControl("chain_base_url");
+  });
   if (!envRung) line.append(input, btn, cancel);
   else line.appendChild(input);
-  li.appendChild(line);
+  actZone.appendChild(line);
+  // The TCK-WEB-022 slot: suggested-server chips (click-to-FILL) land in
+  // this group when that ticket ships. Nothing is fabricated here.
+  actZone.appendChild(el("div", "chain-chips"));
+  li.appendChild(actZone);
 
   // TCK-DESCOPE-M3B: the kind-badge strip (legend + mempool/electrum/
-  // bitcoind chips) is DELETED here — user direction: the kind of server
-  // is not a trust dimension and earns no pixels; the trust badge above
-  // and the leak disclosure carry the whole truth.
+  // bitcoind chips) stays DELETED here — user direction: the kind of
+  // server is not a trust dimension and earns no pixels; the trust badge
+  // in the status zone carries the whole truth.
 
+  // Resync-now (TCK-WEB-009 f): VISIBLE, OUTSIDE the rest zone — the
+  // recovery path must not hide behind a <details>.
   const resyncLine = el("div", "setting-line setting-resync-line");
   const resyncBtn = el("button", "btn btn-ghost btn-small", LABELS.resyncNow);
   resyncBtn.type = "button";
@@ -1606,42 +1758,49 @@ function chainBaseRow(entry) {
   resyncLine.appendChild(resyncBtn);
   li.appendChild(resyncLine);
 
-  // (5): the "Empty = no server chosen" hint lies under an env rung (the
-  // effective URL line above carries the truth instead) — suppressed there.
+  // --- rest zone ---------------------------------------------------------
+  // TCK-WEB-021 (3): the explanatory prose collapses behind a native
+  // <details> (no JS, no aria invention — the browser owns the toggle).
+  const restZone = el("details", "setting-details chain-rest");
+  restZone.appendChild(el("summary", "setting-details-summary", LABELS.chainRestNotes));
+  // TCK-WEB-013 (5): the "Empty = no server chosen" legend lies under an
+  // env rung (the effective URL line above carries the truth) — suppressed there.
   if (!envRung) {
-    li.appendChild(el("p", "setting-hint", LABELS.settingsEmptyIsDefault));
+    restZone.appendChild(el("p", "setting-hint", LABELS.settingsEmptyIsDefault));
   }
   if (entry.requires_restart === true) {
-    li.appendChild(el("p", "setting-flag", LABELS.settingsRestart));
+    restZone.appendChild(el("p", "setting-flag", LABELS.settingsRestart));
   }
   if (envRung) {
-    li.appendChild(el("p", "setting-flag", LABELS.chainEnvOverride));
+    restZone.appendChild(el("p", "setting-flag", LABELS.chainEnvOverride));
   }
-
-  // TCK-ONB-004 M3: the credentials block. The engine's secret entries
-  // report only SET/UNSET (never the value), so the fields start empty on
-  // every render; the checkbox mirrors the stored none-flag. Visibility:
-  // while EDITING an http:// (ambiguous — may be Core RPC) or bitcoind://
-  // address only; https is a Core-RPC input alias (creds ride the dedicated
-  // keys — fields never appear for it) and ssl:// Electrum has no standard
-  // auth — the fields never appear for those.
+  // TCK-ONB-004 M3: the credential NOTES (set/unset sentences) and their
+  // rare clear affordance ride inside the rest zone. The engine's secret
+  // entries report only SET/UNSET (never the value), so the fields start
+  // empty on every render; the checkbox mirrors the stored none-flag.
   const credFlags = backendCredFlags();
   if (credFlags.none) {
-    li.appendChild(el("p", "setting-flag creds-note", LABELS.credsNoneSaved));
+    restZone.appendChild(el("p", "setting-flag creds-note", LABELS.credsNoneSaved));
   } else if (credFlags.user || credFlags.pass) {
-    li.appendChild(el("p", "setting-flag creds-note", LABELS.credsSavedNote));
+    restZone.appendChild(el("p", "setting-flag creds-note", LABELS.credsSavedNote));
   }
   if (credFlags.none || credFlags.user || credFlags.pass) {
     const clearLine = el("div", "setting-line setting-creds-clear-line");
     const clearBtn = el("button", "btn btn-secondary btn-small", LABELS.credsClear);
     clearBtn.type = "button";
     clearBtn.addEventListener("click", () => {
-      const note = li.querySelector(".setting-status");
-      clearBackendCreds(clearBtn, note, li);
+      clearBackendCreds(clearBtn, status, li);
     });
     clearLine.appendChild(clearBtn);
-    li.appendChild(clearLine);
+    restZone.appendChild(clearLine);
   }
+  li.appendChild(restZone);
+
+  // The login FIELDS stay outside the collapsed zone: they surface only
+  // while EDITING an http:// (ambiguous — may be Core RPC) or bitcoind://
+  // address (https is a Core-RPC input alias — creds ride the dedicated
+  // keys, fields never appear for it — and ssl:// Electrum has no standard
+  // auth); a mid-edit user must never have to hunt a closed <details>.
   const creds = el("div", "setting-creds");
   creds.hidden = true;
   const noneLine = el("label", "setting-creds-none");
@@ -1671,8 +1830,6 @@ function chainBaseRow(entry) {
   li.appendChild(creds);
   li.dataset.credsNoneInitial = credFlags.none ? "1" : "0";
 
-  const status = el("p", "setting-status");
-  status.setAttribute("role", "status");
   li.appendChild(status);
   return li;
 }
@@ -1780,7 +1937,7 @@ async function clearBackendCreds(btn, status, row) {
         status.dataset.kind = "error";
         status.textContent =
           data && typeof data.error === "string"
-            ? LABELS.settingsRejectedPrefix + " " + data.error
+            ? LABELS.settingsRejectedPrefix + " " + data.error + LABELS.settingsRejectNext
             : LABELS.settingsFailed;
         return;
       }
@@ -2028,7 +2185,9 @@ settingsListEl.addEventListener("click", async (event) => {
     return;
   }
   btn.disabled = true; // in-flight (engine probe included): no double-submit
-  status.textContent = LABELS.settingsSaving;
+  // TCK-WEB-021 (6): the chain row's wait word names the seconds-class
+  // PROBE the engine runs inside the Apply — "Checking the server…".
+  status.textContent = isChain ? LABELS.settingsChecking : LABELS.settingsSaving;
   const submitted = input.value.trim(); // emptiness test only — never re-echoed
   try {
     // TCK-ONB-004 M3 (security-review LOW 2): the login no longer rides
@@ -2112,10 +2271,12 @@ settingsListEl.addEventListener("click", async (event) => {
           if (!box.checked && user.value && pass.value) {
             row.dataset.credsNoneInitial = "0";
             if (!row.querySelector(".creds-note")) {
-              row.insertBefore(
-                el("p", "setting-flag creds-note", LABELS.credsSavedNote),
-                creds,
-              );
+              // TCK-WEB-021 (3): the note is prose — it joins the collapsed
+              // rest zone (rendered notes live there too), not the row tail.
+              const rest = row.querySelector(".chain-rest");
+              const note = el("p", "setting-flag creds-note", LABELS.credsSavedNote);
+              if (rest) rest.appendChild(note);
+              else row.insertBefore(note, creds);
             }
           }
           if (box.checked) {
@@ -2135,10 +2296,13 @@ settingsListEl.addEventListener("click", async (event) => {
       }
     } else if (response.status === 400 && data && data.status === "rejected") {
       status.dataset.kind = "error";
+      // TCK-WEB-021 (10): every rejection line ends in the SAME static
+      // value-free next-step suffix (the suffix never varies, never
+      // echoes — the server's own reason is the only dynamic part).
       status.textContent =
         typeof data.error === "string"
-          ? LABELS.settingsRejectedPrefix + " " + data.error
-          : LABELS.settingsRejected;
+          ? LABELS.settingsRejectedPrefix + " " + data.error + LABELS.settingsRejectNext
+          : LABELS.settingsRejected + LABELS.settingsRejectNext;
       // a refused swap/probe: the field stays editable for a correction
     } else if (response.status === 401) {
       // TCK-WEB-013 (6): a stale per-launch token — retrying can never
@@ -2214,13 +2378,18 @@ settingsCloseEl.addEventListener("click", () => closeSettings());
 // FIRST (watch-key replace form → collapsed display; editing chain-base /
 // generic row → renderSettings() rebuilds from engine truth, discarding
 // the unsaved input); the NEXT Escape closes the pane. With nothing open,
-// one Escape closes.
+// one Escape closes. TCK-WEB-021 (6): the QR dialog is the TOPMOST layer —
+// while it is open its own listener consumes Escape and this handler
+// returns early (a single press must never close both). A cancel rebuilds
+// the row and REFOCUSES its control (focus never drops to <body>).
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape" || settingsPanelEl.hidden) return;
+  if (!qrViewerEl.hidden) return;
   if (state.watchKeyReplaceOpen) {
     event.preventDefault();
     state.watchKeyReplaceOpen = false;
     renderSettings();
+    refocusRowControl("watch_key");
     return;
   }
   // The URL field only — the login block's fields are never readonly and
@@ -2228,12 +2397,15 @@ document.addEventListener("keydown", (event) => {
   // TCK-WEB-013 (3): cancel the row only when an edit is actually OPEN —
   // a value present (Edit rung) or a touched directly-typeable field; an
   // untouched empty field is not an open edit, so Escape closes the pane.
+  // TCK-WEB-021 (3): the field lives in the act zone — a descendant match
+  // through .chain-act still excludes the login block by class.
   const editing = settingsPanelEl.querySelector(
     ".setting-chain .setting-line > input.setting-input:not(.creds-user):not(.creds-pass):not([readonly])",
   );
   if (editing && (editing.value.trim() !== "" || editing.dataset.dirty === "1")) {
     event.preventDefault();
     renderSettings(); // row back to read-only + Edit; nothing was sent
+    refocusRowControl("chain_base_url");
     return;
   }
   event.preventDefault();
@@ -2289,9 +2461,11 @@ async function submitWatchKey(input, btn, status, box) {
     typeof data.error === "string"
   ) {
     // Rejection reasons are value-free by the engine's contract — safe to
-    // quote; we add nothing, and nothing here can echo the submitted key.
+    // quote; we add nothing but the static next-step suffix (TCK-WEB-021
+    // (10)), and nothing here can echo the submitted key.
     status.dataset.kind = "error";
-    status.textContent = LABELS.watchkeyRejectedPrefix + " " + data.error;
+    status.textContent =
+      LABELS.watchkeyRejectedPrefix + " " + data.error + LABELS.watchkeyRejectNext;
   } else if (code === 0) {
     status.dataset.kind = "error";
     status.textContent = LABELS.unreachable;
@@ -2357,7 +2531,7 @@ function replaceStage(stage, input, btn, status, box, key) {
           : code === 401
             ? LABELS.sessionStale // TCK-WEB-013 (6)
             : data && typeof data.error === "string"
-              ? LABELS.watchkeyRejectedPrefix + " " + data.error
+              ? LABELS.watchkeyRejectedPrefix + " " + data.error + LABELS.watchkeyRejectNext
               : LABELS.watchkeyFailed;
       status.dataset.kind = "error";
       status.textContent = reason;

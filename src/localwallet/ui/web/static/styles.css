@@ -238,9 +238,11 @@ body {
 }
 
 /* TCK-WEB-013 (1): the chain row's effective-backend line — "Now using:
-   <url>" plus the trust badge beside it. The URL is the user's own config
-   (creds stripped server-side): muted mono, copyable, wrapped never cut
-   mid-value. */
+   <url>" plus the trust badge beside it. TCK-WEB-021 (2): this is the
+   pane's most privacy-relevant fact and now carries REAL weight (the
+   --fs-md step, primary ink, semibold) — never the smallest text again.
+   The URL is the user's own config (creds stripped server-side): mono,
+   copyable, wrapped never cut mid-value. */
 .chain-now-line {
   display: flex;
   flex-wrap: wrap;
@@ -253,14 +255,54 @@ body {
    block itself only needs separation from the beat above it. */
 .chain-consent { margin-block-start: var(--sp-2); }
 
+/* TCK-WEB-021 (3): the server card's three zones. Status = URL + trust
+   badge (TCK-WEB-023's NEUTRAL kind pills join here when they return —
+   see the color-vocabulary contract at .trust-badge below); act = field +
+   Apply/Cancel + .chain-chips (the empty TCK-WEB-022 suggested-server
+   slot, pre-styled as a wrapping chip row); rest = the prose collapsed
+   behind the native <details>. Resync + gap stay outside — recovery
+   paths never hide. */
+.chain-status,
+.chain-act { display: flex; flex-direction: column; gap: var(--sp-2); }
+.chain-chips { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+
+/* Native <details> for the collapsed prose (no JS, no ARIA invention).
+   The summary is a quiet, legible row-link; its text is app.js
+   textContent (LABELS), never markup. */
+.setting-details { display: flex; flex-direction: column; gap: var(--sp-1); }
+.setting-details > summary {
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--c-text-muted);
+  list-style-position: inside;
+}
+.setting-details > summary:hover { color: var(--c-text); }
+
 .chain-now {
   margin: 0;
   font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--c-text-muted);
+  font-size: var(--fs-md);
+  font-weight: 650;
+  color: var(--c-text);
   overflow-wrap: anywhere;
 }
 
+/* ---------------------------------------------------------------------------
+   TCK-WEB-021 (4): ONE COLOR VOCABULARY — the contract below is the class
+   law for every badge in this pane:
+
+   * The TRUST dimension owns the RISK colors. .privacy (header chip) and
+     .trust-badge (pane), recolored ONLY by [data-privacy] through the
+     --c-priv-* token pairs (green / yellow / red). Nothing else may wear
+     those tokens.
+   * Any backend-KIND badge (TCK-WEB-023 will bring electrum/bitcoind back)
+     MUST use the NEUTRAL PILL class .kind-pill: border + --c-text-muted
+     ink on --c-surface — never --c-priv-*, never --c-ok/--c-warn/--c-danger
+     — because "electrum is green" must never read as "electrum is safe".
+     No markup and no .kind-pill rule exists TODAY (TCK-DESCOPE-M3B): this
+     comment is the slot WEB-023 fills.
+   -------------------------------------------------------------------------- */
 .trust-badge {
   flex: none;
   font-size: var(--fs-xs);
@@ -281,6 +323,25 @@ body {
 }
 
 .btn-ghost:hover { color: var(--c-text); border-color: var(--c-border-strong); }
+
+/* TCK-WEB-021 (8): the settings-DOOR DOT — a warn-tone state dot on the
+   header Settings gear while setup is unfinished (wallet key unset or the
+   backend choice unresolved — app.js paintSettingsDot, typed /state truth
+   only). Pure CSS from the data-attribute (no inline style, no DOM node);
+   it decorates the existing labeled button, so the accessible name is
+   unchanged and screen readers keep hearing "Settings". */
+#settings-toggle { position: relative; }
+#settings-toggle[data-needs-setup="1"]::after {
+  content: "";
+  position: absolute;
+  inset-block-start: -3px;
+  inset-inline-end: -3px;
+  inline-size: 0.625rem;
+  block-size: 0.625rem;
+  border-radius: 50%;
+  background: var(--c-warn);
+  border: 1px solid var(--c-surface);
+}
 
 /* TCK-WEB-009 (c) + TCK-WEB-012 (a/b): compact rows, two columns when there
    is room — and a surface of its OWN: the pane reads as a different task
@@ -355,16 +416,24 @@ body {
   gap: var(--sp-1);
 }
 
+/* TCK-WEB-021 (1): row labels are HUMAN WORDS now (closed key→word map in
+   app.js), so they leave the code face (mono) for the text face — mono
+   stays where raw engine values are shown (.watchkey-value, .chain-now). */
 .setting-key {
-  font-family: var(--font-mono);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   font-weight: 600;
 }
 
+/* TCK-WEB-021 (9): the lines wrap cleanly at phone width — a long URL or
+   key value never forces horizontal scroll or clips a control: the input
+   (flex:1, min-width 0) shrinks first, the buttons size to their words. */
 .setting-line {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--sp-2);
 }
+
+.setting-line > .btn { flex: none; }
 
 .setting-input {
   flex: 1;
@@ -404,13 +473,17 @@ body {
 
 /* TCK-WEB-008/009: settings sections, the watch-key row and its controls.
    Tokens only, like every other rule in this file. */
+/* TCK-WEB-021 (1): the section titles (Wallet / Network & scanning) are
+   promoted — real size, primary ink, a leading rule — so they read as the
+   pane's zones, not a muted caption. */
 .setting-heading {
   margin: var(--sp-1) 0 0;
-  font-size: var(--fs-xs);
+  padding-block-start: var(--sp-2);
+  border-block-start: 2px solid var(--c-border-strong);
+  font-size: var(--fs-lg);
   font-weight: 650;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--c-text-muted);
+  letter-spacing: -0.01em;
+  color: var(--c-text);
 }
 
 .btn-small {
@@ -421,10 +494,15 @@ body {
 
 .setting-watchkey .setting-key { margin: 0; }
 
+/* TCK-WEB-021 (2): the configured wallet's descriptor is a headline fact
+   of the Wallet card — full-size mono in primary ink (was: small muted),
+   still the engine's own head…tail display truncation. */
 .watchkey-value {
   margin: 0;
   font-family: var(--font-mono);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--c-text);
   overflow-wrap: anywhere;
 }
 
@@ -820,7 +898,11 @@ body {
 
 /* --------------------------- watch key, now INSIDE the settings pane (009 a/b) */
 
-.watchkey-line { display: flex; gap: var(--sp-2); }
+/* TCK-WEB-021 (9): wraps with the same rule as .setting-line (above) — at
+   320px the Connect/Replace/Edit button drops to its own row instead of
+   squeezing the input or clipping. */
+.watchkey-line { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.watchkey-line > .btn { flex: none; }
 .watchkey-line input {
   flex: 1;
   min-inline-size: 0;
