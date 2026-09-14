@@ -23,11 +23,12 @@ State after the de-scope (TCK-DESCOPE-M3A, committed): **wallet backends = elect
 Fixed since your last run (TCK-BACKEND-004/DIAG-002 + SCAN-BITCOIND-001): the bitcoind scan sent the wrong descriptor form and a 10 s timeout self-rejected (now bare `raw(hex)`, 30-min budget, one attempt); the scan then crashed on Core 31's field naming (`height`, not legacy `blockheight`) and unconfirmed rows — all fixed; shape failures now report `not-core-shape`, RPC rejections report `rpc-error code=<n>`.
 
 Verify (log lines carry `[class=… exc=… code=…]` — paste them; that's the diagnosis):
-- [ ] 🔥 **electrum**: Settings → chain base `ssl://evil-star.local:50001` → Apply → probe PASS + hot-swap + resync.
-- [ ] 🔥 **bitcoind**: `https://192.168.0.25:65154` + user/pass → Apply → the scan should now COMPLETE end-to-end (minutes-class on first run; your round-3 `blockheight` failure is fixed).
-- [ ] 🔥 **TLS — try WITHOUT any tls_verify setting first.** Only if a log line says `[class=tls-verify-failure]` do you need `"tls_verify": false` in `config.json` (repo root) — see the TLS note below.
-- [ ] Probe speed: the diag should take seconds, not 25 s.
-- [ ] Still open from earlier rounds: autodetect (plain `http://<core-host>:<port>` classifies as bitcoind); creds UI ("no credentials needed" checkbox only for bitcoind; GET /settings shows "configured", never the values); **Resync now** keeps your coin tags/notes; **gap_limit apply** (increase → auto-rescan; DECREASE → stores without rescan + narrates the tradeoff); first query speed (model preloads); model-absent path (download card / No → quick actions).
+- [x] ✅ **electrum** — DONE 2026-09-13 (user).
+- [x] ✅ **bitcoind** — DONE 2026-09-13 (user).
+- [x] ✅ **TLS** — DONE 2026-09-13: works with no tls_verify setting; the flag is not needed (kept as an escape hatch only).
+- [x] ✅ Probe speed — DONE 2026-09-13 (fast).
+- [x] ✅ Autodetect — DONE 2026-09-13 (auto-detects).
+- [ ] Still open from earlier rounds: creds UI ("no credentials needed" checkbox only for bitcoind; GET /settings shows "configured", never the values); **Resync now** keeps your coin tags/notes; **gap_limit apply** (increase → auto-rescan; DECREASE → stores without rescan + narrates the tradeoff); first query speed (model preloads); model-absent path (download card / No → quick actions).
 
 ### TLS note (answers: is `LOCALWALLET_TLS_VERIFY=false` still required?)
 Probably NOT anymore — it was advice for the private mempool's HTTPS endpoint, which is no longer a chain URL. Your two backends:
@@ -47,17 +48,18 @@ Add keys only when a log line or a feature asks for them; malformed/unknown keys
 - Diagnostic command if anything fails (value-free, safe to paste):
   `python3 tools/probe_backend_diag.py <url> [--insecure] [--user <u> --password <p>] --json`
 
-## MW-17 — relaunch verification (chat onboarding + UX wave; refreshed 2026-09-11)
+## MW-17 — relaunch verification (chat onboarding + UX wave; refreshed 2026-09-11; ticked 2026-09-13)
 
-- [ ] **First run is CHAT, not the settings window**: launch → the pane must NOT open; the chat shows "Loading local llm." → "Local llm fully loaded." → one bubble with the three greeting lines; the input is ENABLED with "Paste your xpub or zpub to get started…" — paste the zpub IN CHAT → "Great. I saved that." → the backend-ask bubble. The settings pane only opens when YOU click Settings.
-- [ ] Backend answer paths: type the server URL in chat (probe runs, refusals carry the DIAG class), or use the pane / the "Use public server" consent button (closing the pane or asking a balance must never imply consent).
-- [ ] Clicking an address/txid in a bubble COPIES it (no navigation to any
-      third-party site); QR button still opens the address QR.
-- [ ] While a turn runs, the 3-dot "working" indicator is a chat bubble at the transcript tail that gets replaced by the reply (not below the input).
-- [ ] Balance in other currencies ("in euros"); split/consolidate dry-run; "what's pending?" summary.
-- [ ] Startup: separate bubbles; watch line only when OFF; watch failure "retrying in ~Ns" + "watch: recovered.".
-- [ ] Multi-tab echo + per-bubble copy icons still work.
-- [ ] Newest fixes to verify: after a rescan, a reply can no longer attach to an earlier bubble (order stays conversational); address/txid tokens show a DOTTED underline + "Copied ✓" feedback on click (+ screen-reader/touch announcement); hardware-wallet chat: "can you see my hardware wallet?" probes and reports, "unlock my hardware wallet" drives the unlock (Jade/Bitbox), "I connected my hardware wallet" reports + auto-unlocks; the assistant's persona line ("friendly assistant who knows everything about Bitcoin wallets…") shapes replies; settings pane shows NO kind badges (mempool/electrum/bitcoind chips gone — trust badge only).
+- [x] ✅ **First run is CHAT, not the settings window** — DONE (user, 2026-09-13).
+- [x] ✅ Backend answer paths — DONE (user, 2026-09-13).
+- [x] ✅ Clicking an address/txid in a bubble COPIES it — DONE (user, 2026-09-13).
+- [x] ✅ 3-dot "working" indicator is a chat bubble at the transcript tail — DONE (user, 2026-09-13).
+- [ ] Balance in other currencies: "what is my balance in Euros?" returned **USD values** ($241.53 · @ $77,291/BTC) — EUR does not display though USD does (→ TCK-FIAT-003).
+- [x] ✅ Multi-tab echo — DONE (user, 2026-09-13).
+- [x] ✅ After a rescan, a reply can no longer attach to an earlier bubble — DONE (user, 2026-09-13).
+- [x] ✅ "Copied ✓" feedback — DONE (user, 2026-09-13).
+- [x] ✅ Hardware-wallet chat: "can you see my hardware wallet?" probes and drives PIN mode — MOSTLY DONE; follow-up = verify the unlocked device is the key we're watching; if it's a different key say so (→ TCK-HW-006).
+- [ ] Settings badges: user LIKED kind badges (electrum & bitcoind) colored private-vs-public — green when the IP is 192.168.x.x or 10.x.x.x, yellow otherwise (→ TCK-WEB-023 amendment; partially reverses the DESCOPE-M3B badge removal — electrum/bitcoind badges come BACK, mempool stays gone).
 
 ## MW-15 — live send/fee run (fee policy v2, 2026-09-12)
 - [ ] Fee line per YOUR spec: MEDIUM = the next projected block's lowest fee × 1.15 (your example: 1.0557 → **1.21 sat/vB**, not the old 2); FASTER = double the target (2.42); SLOWER = the second block's lowest (~1.0). The Pay line shows `@ $/BTC`; "faster" twice → asks for a sat/vB rate; explicit rate ("send 100000 sats to <addr> at 5 sat/vB") works. Startup never blocks (dots finish in background).
