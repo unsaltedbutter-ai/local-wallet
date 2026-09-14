@@ -8,8 +8,10 @@ rate for fractional bids (sub-1 included).
 
 import pytest
 
+from localwallet.chain.fees import FeeEstimator, FeeTarget
 from localwallet.tx.psbt import PsbtError, build_unsigned_psbt
 from localwallet.tx.selection import (
+    InsufficientFundsError,
     SelectionError,
     fee_sats_for,
     select_coins,
@@ -25,6 +27,18 @@ from tests.test_tx_psbt import (  # shared fixture material (pattern: test_tx_re
 
 RECIPIENT = b"\x00\x14" + b"\x11" * 20
 CHANGE_COST = 31
+
+
+class _SubFloorNative:
+    """Backend-native estimator double (no get_json, no floor capability):
+    its ``estimate_fee`` answers whole sats/vB, so the floor clamp falls
+    back to the assumed 1 sat/vB — exactly Electrum's honest-absence case."""
+
+    def __init__(self, rates: dict) -> None:
+        self._rates = dict(rates)
+
+    def estimate_fee(self, target) -> int:
+        return self._rates[target]
 
 
 class Utxo:
@@ -105,12 +119,14 @@ def _build(result, amount_sats):
 
 
 def test_sub_one_bid_refuses_at_the_min_relay_gate_before_signing():
-    # Code-review MINOR pin: a sub-1 centisat bid is valid DATA through the
-    # selection engine (pure ceil fee math, above), but the PSBT builder's
-    # min-relay STANDARDNESS gate (Core default 1 sat/vB, computed from the
-    # built vsize — ADR-0012 §3, deliberately unchanged) refuses to build
-    # it: fail closed at QUOTE time, before any device signature, with the
-    # floor named in the message. The user re-quotes a rung up.
+    # TCK-FEE-003 pin, RE-SCOPED by TCK-FEE-004: the estimator can no longer
+    # deliver a sub-floor rung into this gate (MAX(rung, floor) fires first
+    # — see chain/fees.py and the e2e clamp test in test_e2e_skeleton.py),
+    # so the live "send 100000 sats -> psbt_failed" symptom is gone. The
+    # gate itself REMAINS as the last fail-closed defence for any caller
+    # that hands the ENGINE a sub-floor rate directly: valid data through
+    # selection (pure ceil fee math), refused at BUILD, value-free, before
+    # any device signature.
     inputs = [source("ab" * 32, 0, 200_000, index=3)]
     result = select_coins(inputs, 60_000, 55, CHANGE_COST, recipient_script())
     assert result.fee_sats == 78  # ceil(141 x 0.55) < the 141-sat relay floor
@@ -118,6 +134,35 @@ def test_sub_one_bid_refuses_at_the_min_relay_gate_before_signing():
         _build(result, 60_000)
     assert "min-relay" in str(exc.value)
     assert "78" not in str(exc.value)  # value-free, as everywhere in tx/
+
+
+def test_estimator_floor_clamp_fixes_the_live_psbt_failed_send():
+    # TCK-FEE-004 end to end at the engine edge (the user's corrected spec:
+    # MAX(calculated, floor) — MIN would still fail): a MEDIUM rung that
+    # policy-v2 computes under the min-relay floor arrives at the builder
+    # ALREADY lifted (55 -> 100 centisat/vB here), so the same 141-vB send
+    # that used to die psbt_failed now builds at the floor fee.
+    estimator = FeeEstimator(
+        _SubFloorNative({t: 1 for t in FeeTarget}),
+        ttl_s=30.0,
+    )
+    bid_c, raised = estimator.clamp_to_min_relay_floor(55)  # explicit sub-floor
+    assert (bid_c, raised) == (100, True)  # MAX, never MIN, never a refusal
+    inputs = [source("ab" * 32, 0, 200_000, index=3)]
+    result = select_coins(inputs, 60_000, bid_c, CHANGE_COST, recipient_script())
+    assert result.fee_sats == 141  # ceil(141 x 1.00) == the relay floor
+    _psbt, meta = _build(result, 60_000)  # builds clean — no psbt_failed
+    assert meta.expected_fee_sats == 141
+
+
+def test_floor_so_high_the_send_is_unfundable_still_refuses():
+    # The refusal that REMAINS (the ticket's carve-out): when the floored
+    # fee cannot be paid out of the selected coins at all, the money layer
+    # still fails closed with InsufficientFunds — clamping never conjures
+    # value from nothing.
+    inputs = [source("ab" * 32, 0, 60_000, index=3)]
+    with pytest.raises(InsufficientFundsError):
+        select_coins(inputs, 59_990, 100, CHANGE_COST, recipient_script())
 
 
 def test_fractional_bid_above_the_floor_builds_normally():

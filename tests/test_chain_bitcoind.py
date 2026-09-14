@@ -1170,6 +1170,82 @@ class TestFees:
         with _client(server) as client, pytest.raises(ChainError, match="not a usable rate"):
             client.estimate_fee(FeeTarget.FAST)
 
+    # -- TCK-FEE-004: the min-relay floor capability (getmempoolinfo) ------
+
+    def test_min_relay_centisat_vb_exact_conversion(self, bitcoind: Any) -> None:
+        # The DECIMAL_EXACT ladder (TCK-FEE-003 discipline): the default
+        # minrelaytxfee lands on 100 centisat/vB; whole and half-cent floors
+        # convert without float residue (BTC/kvB x 10 000 000 = centisat/vB).
+        cases = {
+            0.00001: 100,  # Core default = 1 sat/vB
+            0.00002: 200,  # 2 sat/vB
+            0.000015: 150,  # 1.5 sat/vB (exact half-cent)
+            0.001: 10_000,  # 10 sat/vB
+        }
+        for btc_kvb, cents in cases.items():
+            server = bitcoind(script={"getmempoolinfo": [{"minrelaytxfee": btc_kvb}]})
+            with _client(server) as client:
+                got = client.min_relay_centisat_vb()
+            assert got == cents, (btc_kvb, got)
+
+    def test_min_relay_centisat_vb_ceil_never_under_nodes_floor(self, bitcoind: Any) -> None:
+        # Sub-cent relay floors (0.1 sat/vB = 10 cents) are exact; a value
+        # with a fractional centisat CEILS so the clamped bid can never sit
+        # under what the node enforces.
+        server = bitcoind(script={"getmempoolinfo": [{"minrelaytxfee": 0.00000001}]})
+        with _client(server) as client:
+            assert client.min_relay_centisat_vb() == 1  # 0.01 sat/vB -> 1 cent
+        server = bitcoind(script={"getmempoolinfo": [{"minrelaytxfee": 0.00000015}]})
+        with _client(server) as client:
+            assert client.min_relay_centisat_vb() == 2  # 0.15 -> ceil 2 cents
+
+    @pytest.mark.parametrize(
+        "junk", [0, -1, "0.00001", True, None, {"relayfee": 1}, 100, float("nan")]
+    )
+    def test_min_relay_centisat_junk_fails_closed(self, bitcoind: Any, junk: Any) -> None:
+        server = bitcoind(script={"getmempoolinfo": [{"minrelaytxfee": junk}]})
+        with _client(server) as client, pytest.raises(ChainError):
+            client.min_relay_centisat_vb()
+
+    def test_min_relay_missing_field_fails_closed(self, bitcoind: Any) -> None:
+        server = bitcoind(script={"getmempoolinfo": [{"mempoolminfee": 0.00001}]})
+        with _client(server) as client, pytest.raises(ChainError, match="minrelaytxfee"):
+            client.min_relay_centisat_vb()
+
+    def test_min_relay_floor_clamps_native_ladder(self, bitcoind: Any) -> None:
+        # A node whose minrelaytxfee (5.5 sat/vB) sits ABOVE the MEDIUM/SLOW
+        # estimatesmartfee answers but below FAST: MEDIUM/SLOW are MAX'd to
+        # the floor and flagged; FAST (6) already clears it (unflagged). The
+        # floor is a node FIGURE, honoured over the assumed 1 sat/vB.
+        server = bitcoind(
+            script={
+                "estimatesmartfee": lambda p: {"feerate": 0.00001 * (7 - p[0]), "blocks": p[0]},
+                "getmempoolinfo": [{"minrelaytxfee": 0.000055}],
+            }
+        )
+        with _client(server) as client:
+            estimator = FeeEstimator(client, ttl_s=30.0)
+            fast = estimator.estimate(FeeTarget.FAST)
+            medium = estimator.estimate(FeeTarget.MEDIUM)
+            slow = estimator.estimate(FeeTarget.SLOW)
+        assert (fast.rate_centisat_vb, fast.clamped) == (600, False)
+        assert (medium.rate_centisat_vb, medium.clamped) == (550, True)
+        assert (slow.rate_centisat_vb, slow.clamped) == (550, True)
+
+    def test_min_relay_floor_unanswered_fails_closed(self, bitcoind: Any) -> None:
+        # getmempoolinfo erroring (unscripted in the fixture) never breaks
+        # the ladder: the assumed 1 sat/vB floor applies (SLOW 100 stays),
+        # the estimate just is not flagged as raised.
+        server = bitcoind(
+            script={
+                "estimatesmartfee": lambda p: {"feerate": 0.00001 * (7 - p[0]), "blocks": p[0]},
+            }
+        )
+        with _client(server) as client:
+            estimator = FeeEstimator(client, ttl_s=30.0)
+            assert estimator.estimate(FeeTarget.SLOW).rate_centisat_vb == 100
+            assert estimator.estimate(FeeTarget.SLOW).clamped is False
+
     @pytest.mark.parametrize(
         "junk", [0, -1, "0.0001", True, None, {"feerate": "x"}, 100, 5e-07, float("nan")]
     )

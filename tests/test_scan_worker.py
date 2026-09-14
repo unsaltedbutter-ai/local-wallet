@@ -340,7 +340,8 @@ def _table(store, wallet, wd, scan_gate, scan_fn, **kwargs):
         None,  # client: fee/price stubs below keep every path local
         scan_fn,
         fee_estimator=SimpleNamespace(
-            estimate=lambda target: SimpleNamespace(rate_centisat_vb=200)
+            estimate=lambda target: SimpleNamespace(rate_centisat_vb=200, clamped=False),
+            clamp_to_min_relay_floor=lambda rate: (rate, False),
         ),
         price_oracle=SimpleNamespace(
             fresh=lambda: (_ for _ in ()).throw(PriceUnavailableError("stub")),
@@ -471,7 +472,8 @@ def test_create_tx_refuses_pre_first_scan_then_works_after(wallet_store) -> None
         lambda: scans.append(1),
         flow=flow,
         fee_estimator=SimpleNamespace(
-            estimate=lambda target: SimpleNamespace(rate_centisat_vb=200)
+            estimate=lambda target: SimpleNamespace(rate_centisat_vb=200, clamped=False),
+            clamp_to_min_relay_floor=lambda rate: (rate, False),
         ),
         price_oracle=SimpleNamespace(
             fresh=lambda: (_ for _ in ()).throw(PriceUnavailableError("stub")),
@@ -612,7 +614,8 @@ def test_create_tx_gate_is_identity_stable_across_backend_release(wallet_store) 
             lambda: None,
             flow=app.TxFlow(),
             fee_estimator=SimpleNamespace(
-                estimate=lambda target: SimpleNamespace(rate_centisat_vb=200)
+                estimate=lambda target: SimpleNamespace(rate_centisat_vb=200, clamped=False),
+                clamp_to_min_relay_floor=lambda rate: (rate, False),
             ),
             price_oracle=SimpleNamespace(
                 fresh=lambda: (_ for _ in ()).throw(PriceUnavailableError("stub")),

@@ -505,6 +505,16 @@ class ElectrumClient:
             raise ChainError(f"{_KIND_FEE_ESTIMATE} response is below 1 sat/vB granularity")
         return sat_vb
 
+    # TCK-FEE-004 min-relay floor capability: DELIBERATELY ABSENT. Checked —
+    # the Electrum protocol exposes no clean min-relay figure: server.features
+    # carries only hosts/genesis_hash/hash_function/server_version/
+    # protocol bounds/pruning (no fee field), and the legacy
+    # ``blockchain.relayfee`` is deprecated since protocol 1.4.2 with
+    # unit-ambiguous answers that servers vary on. We invent no dialect: the
+    # absence IS the honest answer, so :class:`localwallet.chain.fees.
+    # FeeEstimator` fails this backend's floor clamp closed to its assumed
+    # 1 sat/vB (the tx engine's own build gate already refuses lower).
+
     # ------------------------------------------------------------- internals
 
     @staticmethod

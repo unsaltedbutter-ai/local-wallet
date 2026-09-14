@@ -482,6 +482,13 @@ class ChainClient(Protocol):
     is the backend-native fee source; ``supports_price`` declares whether a
     price feed exists at all). Presence of ``get_json`` identifies an Esplora
     backend; absence means the honest non-Esplora degrade paths apply.
+    Equally OPTIONAL (TCK-FEE-004, additive by design): ``min_relay_centisat_
+    vb() -> int`` — the backend's own min-relay floor in integer centisat/vB
+    (``getmempoolinfo.minrelaytxfee`` on bitcoind). Consumers gate on
+    presence (:mod:`localwallet.chain.fees`) and fall back to the assumed
+    1 sat/vB; electrum honestly ABSENTS it. Adding it to this Protocol would
+    make presence-of-capability indistinguishable from absence, so it is
+    duck-typed like ``get_json``, not declared.
     """
 
     #: Whether this backend serves a USD price feed (ADR-0011 ladder input;

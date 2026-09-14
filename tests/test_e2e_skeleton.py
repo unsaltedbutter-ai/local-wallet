@@ -70,7 +70,7 @@ from localwallet.app import (
     run,
     stub_generate,
 )
-from localwallet.chain import EsploraClient, PriceOracle
+from localwallet.chain import EsploraClient, FeeEstimator, PriceOracle
 from localwallet.config import PUBLIC_ELECTRUM_URL, Settings
 from localwallet.node import LocalNodeReport, NodeStatus
 from localwallet.node.detect import CoreHealth, CoreRpcProbe
@@ -2681,6 +2681,12 @@ def _send_chain_handler(
         if path.endswith("/v1/fees/recommended"):
             if state.get("fees_fail"):
                 return httpx.Response(500, json=None)
+            # TCK-FEE-004 seam: ``state["fees_payload"]`` overrides the
+            # recommended body (a higher minimumFee drives the min-relay
+            # floor clamp); absent = the historical payload, byte-identical.
+            fees_payload = state.get("fees_payload")
+            if fees_payload is not None:
+                return httpx.Response(200, json=fees_payload)
             return httpx.Response(200, json=SEND_FEES_PAYLOAD)
         if path.endswith("/v1/prices"):
             if state.get("prices_fail"):
@@ -2748,12 +2754,15 @@ def _build_send_table(
     gap_limit: int | None = TEST_GAP,
     signer: Any | None = None,
     signer_selection: Any | None = None,
+    fee_estimator: Any | None = None,
 ) -> tuple[dict[IntentName, Any], Store, Any, EsploraClient, list[httpx.Request], Any, SendSession]:
     """Send-flow dispatch table: like :func:`_build_table` but returning
     the shared ``TxFlow``/``SendSession`` pair the handlers own, and
     accepting a price-oracle factory for oracle-behavior tests plus the
     TCK-P3-005 signer seams (``signer`` object override /
-    ``signer_selection`` config override)."""
+    ``signer_selection`` config override) and the TCK-FEE-004 estimator
+    seam (a production-shaped ``FeeEstimator`` with an injected
+    ``relay_floor_client`` node double)."""
     recorded: list[httpx.Request] = []
     client = _mock_client(make_handler(recorded))
     store = Store.memory()
@@ -2775,6 +2784,7 @@ def _build_send_table(
         price_oracle=None if make_price_oracle is None else make_price_oracle(client),
         signer=signer,
         signer_selection=signer_selection,
+        fee_estimator=fee_estimator,
     )
     return table, store, wallet, client, recorded, tx_flow, session
 
@@ -3747,7 +3757,13 @@ def test_explicit_rate_fresh_create_bids_the_literal_rate(
     """TCK-FEE-002: a create_tx carrying fee_rate_sat_vb bids the USER-QUOTED
     rate, not the ladder — no estimator call at all — and stages with NO
     rung (fee_target None, no fabricated ETA, offer retired like any stated
-    preference). The fixture's medium rung is 2 sat/vB; 5 proves the override."""
+    preference). The fixture's medium rung is 2 sat/vB; 5 proves the override.
+
+    TCK-FEE-004 (code-review fix): the explicit seam consults ONLY the
+    RELAY floor (node capability -> assumed; this wiring has no floor-
+    capable node, so the assumed rail answers with ZERO chain calls) — the
+    restored "no fee-endpoint call" pin below is the FEE-002 property the
+    first cut of the clamp had broken."""
     addr0 = derive_fixture_addresses(1)[0]
     table, store, _wallet, client, recorded, flow, _session = _build_send_table(
         lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]})
@@ -3760,8 +3776,11 @@ def test_explicit_rate_fresh_create_bids_the_literal_rate(
     assert result["fee_target_defaulted"] is False  # stated preference → offer retired
     assert "eta_minutes" not in result  # rung-based ETA fails closed, never fabricated
     assert result["fee_requote"] is False
-    # The estimator was NEVER consulted (the price oracle still was, for display).
+    assert "fee_floor_note" not in result  # 5 sat/vB clears the assumed floor
+    # The estimator was NEVER consulted (the price oracle still was, for
+    # display): the floor seam answers from capability/assumed, no fetch.
     assert not any(r.url.path.endswith("/v1/fees/recommended") for r in recorded)
+    assert not any(r.url.path.endswith("/v1/fees/mempool-blocks") for r in recorded)
     pending = flow.pending
     assert pending is not None
     assert pending.fee_rate_centisat_vb == 500 and pending.fee_target is None
@@ -3772,6 +3791,122 @@ def test_explicit_rate_fresh_create_bids_the_literal_rate(
     assert any("5 sat/vB" in ln for ln in lines)
     client.close()
     store.close()
+
+
+def test_ladder_rung_under_the_floor_is_clamped_up_and_narrated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-FEE-004 done-when END TO END (the user's live failure: "send
+    100000 sats to bc1q… -> psbt_failed (fee is below the min-relay floor
+    for this transaction size)"): the projected blocks bottom UNDER the
+    min-relay floor (B0 0.3 / B1 0.28, minimumFee 1 sat/vB), so policy-v2
+    TARGET 0.34 sat/vB would bid a fee the node refuses. The MAX(rung,
+    floor) clamp lifts the used MEDIUM rung to exactly 1 sat/vB — the
+    141-sat fee on the 141-vB shape clears the engine gate — and the card
+    narrates the floor once. No psbt_failed, no sub-floor bid, ever."""
+    addr0 = derive_fixture_addresses(1)[0]
+    state = {
+        "mempool_blocks": [
+            {"blockSize": 1_000_000, "medianFee": 0.6,
+             "feeRange": [0.3, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]},
+            {"blockSize": 1_000_000, "medianFee": 0.56,
+             "feeRange": [0.28, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]},
+        ]
+    }
+    table = _build_send_table(
+        lambda rec: _send_chain_handler(
+            rec, utxos_by_addr={addr0: [SEND_UTXO]}, state=state
+        )
+    )[0]
+    result = table[IntentName.CREATE_TX](validate_payload(_create_tx_envelope_json()))
+    assert result.get("error") is None
+    assert result["fee_rate_centisat_vb"] == 100  # 0.34 lifted to the floor
+    assert result["fee_sats"] == SEND_VSIZE  # ceil(141 x 100/100) == floor fee
+    assert result["fee_floor_note"] is True
+    lines: list[str] = []
+    app_module._print_create_tx(result, lines.append)
+    assert any("min-relay floor" in ln and "1 sat/vB" in ln for ln in lines), lines
+
+
+class _NodeFloorDouble:
+    """Wallet-backend double with ONLY the optional min-relay capability —
+    the shape a bitcoind backend presents to the production estimator's
+    ``relay_floor_client`` seam (TCK-FEE-004 code-review fix)."""
+
+    def __init__(self, floor_centisat_vb: int) -> None:
+        self.floor = floor_centisat_vb
+        self.calls = 0
+
+    def min_relay_centisat_vb(self) -> int:
+        self.calls += 1
+        return self.floor
+
+
+def _production_shape_estimator(
+    addr0: str, node: _NodeFloorDouble
+) -> tuple[FeeEstimator, list[httpx.Request]]:
+    """A FeeEstimator in the EXACT production shape: bids over a public
+    fee source (a mock Esplora here — what PublicInfoClient is), RELAY
+    FLOOR over the injected wallet-node double."""
+    est_recorded: list[httpx.Request] = []
+    est_client = _mock_client(
+        _send_chain_handler(est_recorded, utxos_by_addr={addr0: [SEND_UTXO]})
+    )
+    return FeeEstimator(est_client, ttl_s=30.0, relay_floor_client=node), est_recorded
+
+
+def test_explicit_rate_below_the_node_floor_clamps_up_and_narrates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-FEE-004 (code-review fix): the user bids 1 sat/vB while OUR NODE's
+    relay floor is 3 — MAX, never MIN: the staged bid becomes 3 sat/vB (a
+    sub-floor bid would die later at the node), and because the user's
+    EXPLICIT number was altered the card MUST say so — never a silent
+    change of a stated rate. The floor comes from the NODE, not from the
+    fee source's congestion minimumFee (previous cut had it backwards)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    node = _NodeFloorDouble(300)
+    estimator, _est_recorded = _production_shape_estimator(addr0, node)
+    table = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]}),
+        fee_estimator=estimator,
+    )[0]
+    result = table[IntentName.CREATE_TX](_rate_envelope(1))
+    assert result.get("error") is None
+    assert result["fee_rate_centisat_vb"] == 300  # 100 lifted to the NODE's floor
+    assert result["fee_sats"] == -(-SEND_VSIZE * 300 // 100)  # ceil(141 x 3.00)
+    assert result["fee_floor_note"] is True
+    lines: list[str] = []
+    app_module._print_create_tx(result, lines.append)
+    assert any("min-relay floor" in ln and "3 sat/vB" in ln for ln in lines), lines
+    assert node.calls == 1  # ONE TTL-cached floor query, no ladder refresh
+
+
+def test_explicit_1_sat_vB_bids_1_through_congestion_when_the_node_allows_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-FEE-004 (code-review MAJOR pin): congestion says minimumFee 3
+    sat/vB, OUR NODE's relay floor is 1 — an EXPLICIT 1 sat/vB must bid 1
+    (the node would happily relay it): the congestion estimate never
+    out-vetoes the relay floor on an explicit bid, no floor note, and the
+    seam costs ZERO public fee-source calls."""
+    addr0 = derive_fixture_addresses(1)[0]
+    node = _NodeFloorDouble(100)
+    estimator, est_recorded = _production_shape_estimator(addr0, node)
+    state = {"fees_payload": {**SEND_FEES_PAYLOAD, "minimumFee": 3}}
+    table = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr={addr0: [SEND_UTXO]}, state=state),
+        fee_estimator=estimator,
+    )[0]
+    result = table[IntentName.CREATE_TX](_rate_envelope(1))
+    assert result.get("error") is None
+    assert result["fee_rate_centisat_vb"] == 100  # the user's literal 1 sat/vB
+    assert result["fee_sats"] == SEND_VSIZE  # ceil(141 x 1.00)
+    assert "fee_floor_note" not in result
+    assert not any(
+        r.url.path.endswith(("/v1/fees/recommended", "/v1/fees/mempool-blocks"))
+        for r in est_recorded
+    )
 
 
 def test_ceiling_answer_with_explicit_rate_rebuilds(

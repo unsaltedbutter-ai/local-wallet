@@ -132,7 +132,7 @@ import http.client
 import json
 import ssl
 import threading
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Final, Self
@@ -223,6 +223,11 @@ _ESTIMATESMARTFEE_TARGETS: Final[dict[FeeTarget, int]] = {
 _SAT_VB_PER_BTC_KB: Final[Decimal] = Decimal(100_000)
 _SATS_PER_BTC: Final[Decimal] = Decimal(100_000_000)
 
+#: BTC/kvB → CENTISAT/vB (TCK-FEE-004 floor conversion): ×1e8 sats/BTC,
+#: ÷1e3 vB/kvB, ×1e2 cents/sat = ×1e7 — exact Decimals, never float. The
+#: default minrelaytxfee 0.00001 BTC/kvB lands on exactly 100 (1 sat/vB).
+_CENTISAT_VB_PER_BTC_KVB: Final[Decimal] = Decimal(10_000_000)
+
 #: Sanity ceiling for a server's feerate answer (BTC/kB) — the electrum
 #: adapter's ``_MAX_FEE_BTC_KB`` twin: a broken/evil payload guard, not a
 #: fee policy (10 000 sat/vB is nonsense).
@@ -242,6 +247,7 @@ _KIND_TIP_BLOCK = "tip-block"
 _KIND_BROADCAST = "broadcast"
 _KIND_TX_STATUS = "tx-status"
 _KIND_FEE_ESTIMATE = "fee-estimate"
+_KIND_MEMPOOL = "mempool-info"
 
 #: HTTP statuses that mean "your credentials did not pass" (value-free
 #: refusal regardless of which source supplied the header).
@@ -820,6 +826,39 @@ class BitcoindClient:
         if sat_vb <= 0:
             raise ChainError(f"{_KIND_FEE_ESTIMATE} response is below 1 sat/vB granularity")
         return sat_vb
+
+    def min_relay_centisat_vb(self) -> int:
+        """Optional capability (TCK-FEE-004): the node's OWN min-relay floor.
+
+        ``getmempoolinfo.minrelaytxfee`` (BTC/kvB — "Current minimum relay
+        fee for transactions"; v22-v29 all carry this name) converted
+        EXACTLY with Decimal to integer centisat/vB
+        (``centisat/vB = BTC/kvB × 10 000 000`` — 1e8 sats/BTC, 1e3 vB/kvB,
+        1e2 cents/sat; the default 0.00001 lands on 100 = 1 sat/vB). A
+        sub-cent product (relay floors set below whole-cent granularity)
+        CEILS — this value is a FLOOR and must never sit under what the
+        node enforces. The answer is the node's RAW floor: the estimator
+        (:mod:`localwallet.chain.fees`) still clamps it up to the assumed
+        1 sat/vB its own build gate enforces and narrates raises honestly.
+
+        This is the min-RELAY floor (what may be relayed at all) —
+        DISTINCT from tx/replacement.py's BIP-125 INCREMENTAL relay rate
+        (how much MORE a replacement out-pays). Non-positive/absurd
+        (> the shared 0.1 BTC/kvB payload guard = 10 000 sat/vB, the
+        engine's own max bid) or malformed answers raise a value-free
+        :class:`ChainError` — the estimator's fail-closed assumed-floor
+        fallback then applies; a node's policy is never fabricated.
+        """
+        result = self._rpc("getmempoolinfo", [], _KIND_MEMPOOL)
+        if not isinstance(result, dict):
+            raise ChainError(f"{_KIND_MEMPOOL} response was not an object")
+        raw = result.get("minrelaytxfee")
+        if isinstance(raw, bool) or not isinstance(raw, (Decimal, int)):
+            raise ChainError(f"{_KIND_MEMPOOL} response has a missing or invalid 'minrelaytxfee'")
+        btc_per_kvb = Decimal(raw)
+        if btc_per_kvb <= 0 or btc_per_kvb > _MAX_FEE_BTC_KB:
+            raise ChainError(f"{_KIND_MEMPOOL} response is not a usable relay floor")
+        return int((btc_per_kvb * _CENTISAT_VB_PER_BTC_KVB).to_integral_value(rounding=ROUND_CEILING))
 
     # ------------------------------------------------------------- internals
 

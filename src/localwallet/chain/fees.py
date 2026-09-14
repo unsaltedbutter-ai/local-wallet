@@ -13,10 +13,10 @@ USER SPEC 2026-09-12, refining the TCK-FEE-001 floor-follower):
    =================  ==========================================================
    ``FeeTarget``      rate
    =================  ==========================================================
-   ``FAST`` (faster)  ``2 × MEDIUM`` (doubling of the ROUNDED target), floored
-                      by the recommended payload's ``minimumFee`` ("min fee to
-                      get into the next block" bounds the next-block rung —
-                      FEE-001's protection, kept)
+   ``FAST`` (faster)  ``2 × MEDIUM`` (doubling of the ROUNDED target); every
+                      rung is then MAX'd with the min-relay floor below
+                      (section 3) — the old FAST-only ``minimumFee`` floor
+                      (FEE-001) is generalized to all rungs
    ``MEDIUM`` (the   ``B₀ × 1.15`` rounded HALF-EVEN to 2 decimals, clamped up
     target)          so it is never below ``B₀`` itself (a floor never
                       undercuts its source)
@@ -54,10 +54,70 @@ USER SPEC 2026-09-12, refining the TCK-FEE-001 floor-follower):
    raises :class:`~localwallet.chain.esplora.ChainError` — there is no lower
    layer to fall back to).
 
+3. **Min-relay floor clamp (TCK-FEE-004, USER CORRECTED SPEC 2026-09-13,
+   code-review fix 2026-09-14).** A policy-v2 rung may legitimately compute
+   BELOW the min-relay floor that actually rejects transactions (the live
+   failure: ``send 100000 sats to bc1q…`` died with ``psbt_failed (fee is
+   below the min-relay floor for this transaction size)`` because
+   MEDIUM = B₀ × 1.15 sat under it). Every bid this estimator finalizes is
+   therefore ``MAX(rung, floor)``, with EACH rung clamped INDEPENDENTLY
+   (MEDIUM→max(medium,floor), FASTER→max(faster,floor), SLOWER→
+   max(slower,floor) — pinned semantics: simplest and honest; max is
+   monotone, so the ``FAST >= MEDIUM >= SLOW`` invariant survives).
+
+   The RELAY floor — the rate the network will actually accept — resolves
+   by precedence, never from a congestion estimate:
+
+   * **native node capability**: the wallet chain client's OPTIONAL
+     ``ChainClient`` method :meth:`~localwallet.chain.bitcoind.
+     BitcoindClient.min_relay_centisat_vb` (``getmempoolinfo``'s
+     ``minrelaytxfee``; BTC/kvB, exact Decimal → centisat/vB). The
+     estimator BIDS over the public fee source but takes its FLOOR from
+     the user's own node: the production wiring injects the wallet client
+     (and re-points it on a hot-swap) for exactly this.
+   * **electrum**: honestly ABSENT (checked — ``server.features`` carries
+     no relay fee and the legacy ``blockchain.relayfee`` is deprecated
+     with unit-ambiguous answers; we never invent a dialect).
+   * any query failure — ANY exception flavor: fail-closed, never a
+     failed send.
+   * **assumed floor** (the fallback and the irreducible rail): 1 sat/vB
+     (``_ASSUMED_MIN_RELAY_CENTISAT_VB``), the constant the tx engine's
+     own build gates enforce — a node answering lower cannot license a
+     bid our builder would refuse.
+
+   Two consumers, two deliberately DIFFERENT floors (the code-review
+   MAJOR: a congestion figure must never out-veto the node's relay floor
+   on an EXPLICIT bid):
+
+   * **policy rungs** (``estimate``): congestion-informed — every rung is
+     MAX'd with ``max(minimumFee×100, relay floor)`` on the
+     Esplora/publicinfo path (the next-block congestion bound is a
+     legitimate POLICY bid floor, FEE-003-sanctioned) and with the relay
+     floor alone on the backend-native path (no minimumFee exists there).
+   * **the EXPLICIT-rate seam** (``clamp_to_min_relay_floor``): the RELAY
+     floor ONLY — node capability, else the assumed constant; NEVER
+     ``minimumFee``. An explicit 1 sat/vB bids 1 THROUGH congestion
+     whenever the node's own floor is 1 sat/vB (pin). The seam answers
+     from ONE TTL-cached floor query — never a snapshot refresh, zero
+     chain calls when no floor-capable node is wired (the publicinfo
+     wiring keeps FEE-002's "explicit rate ⇒ no chain calls" property).
+
+   A clamped bid is flagged (``FeeEstimate.clamped``) so the card can
+   narrate it once, honestly, quoting the floor verbatim. This floor is
+   DISTINCT from ``tx/replacement.py``'s BIP-125 INCREMENTAL relay floor
+   (a replacement must out-pay the original it evicts — a different
+   question and a different constant): this clamp applies to a
+   transaction's INITIAL bid only and never touches replacement math.
+   An EXPLICIT user rate below the floor is likewise clamped UP and
+   narrated (never silently refused, never silently altered —
+   :meth:`FeeEstimator.clamp_to_min_relay_floor` is that seam).
+
 Motivating cases (user live runs): 2026-09-07 — ``fastestFee`` bid 2 sat/vB
 while blocks confirmed down to ~0.34 (FEE-001's floor-follower); 2026-09-12 —
 the integer ceil still bid 2 sat/vB where the next block's floor allows
-``1.0557 × 1.15 → 1.21`` (this policy; ADR-0011 amendments).
+``1.0557 × 1.15 → 1.21`` (this policy; ADR-0011 amendments); 2026-09-13 —
+MEDIUM computed under the node's min-relay floor and the send failed
+outright (TCK-FEE-004: MAX(bid, floor)).
 
 The full recommended payload also carries ``economyFee`` and ``minimumFee``
 (all in sats/vB). ``SLOW`` deliberately does NOT fall back to ``economyFee``
@@ -74,7 +134,11 @@ ElectrumClient`) gets its bids from the client's own ``estimate_fee(target)``
 the target-follower simply does not exist there and is NEVER faked. Its
 failure fails closed like a broken recommended payload — there is no lower
 layer. ``minimum_fee_sat_vb()`` raises :class:`ChainError` on this path (the
-backend exposes no such field and we never invent one).
+backend exposes no such payload field and we never invent one). The
+min-relay floor on this path rides a SEPARATE optional capability
+(``min_relay_centisat_vb()``; present on bitcoind, honestly absent on
+electrum) with the assumed 1 sat/vB as its fail-closed fallback — see the
+floor section above.
 
 Payloads are cheap but rate-limited (R11), so estimates are cached with a
 short, settings-driven TTL; one refresh (recommended + mempool-blocks)
@@ -91,7 +155,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -134,6 +198,70 @@ _CENT = Decimal("0.01")
 #: ``quantize`` out of the documented ChainError fallback as an
 #: InvalidOperation).
 _MAX_BOTTOM_SAT_VB = 10_000
+
+#: The ASSUMED min-relay floor in this module's unit (integer centisat/vB):
+#: Bitcoin Core's default ``minrelaytxfee`` of 1 sat/vB = 100 — the SAME
+#: assumption the tx engine's build/revalidate gates already enforce
+#: (``tx/dust.py`` ``min_relay_fee_vbytes`` default rate, applied to
+#: psbt.py/revalidate.py). TCK-FEE-004 uses it two ways: (a) the fail-closed
+#: floor when no backend/source can answer the floor query, and (b) the
+#: irreducible LOWER BOUND of a queried floor — a node answering below it
+#: cannot license a bid our own builder would still refuse. This is a rate
+#: floor, never a size-derived fee (the dust/min-relay-from-script-size
+#: invariant is untouched); it is DISTINCT from tx/replacement.py's BIP-125
+#: incremental-relay rate, which governs how much MORE a replacement must
+#: pay and is deliberately not touched here.
+_ASSUMED_MIN_RELAY_CENTISAT_VB = 100
+
+
+def _apply_floor(snapshot: _Snapshot, floor_c: int) -> _Snapshot:
+    """MAX every rung with the resolved min-relay floor, INDEPENDENTLY
+    (TCK-FEE-004's pinned semantics: simplest and honest — each of
+    MEDIUM/FASTER/SLOWER becomes ``max(rung, floor)``). ``max`` is monotone,
+    so the accepted-input invariant ``FAST >= MEDIUM >= SLOW`` survives. A
+    rung the floor actually raised carries ``clamped=True`` (narration says
+    so once, quoting the floor verbatim). The floor never drops the bid, so
+    an estimate that already met it is returned unchanged. The effective
+    floor is ``max(queried, assumed)`` — our own build gate enforces the
+    assumed 1 sat/vB regardless of what a node answers.
+    """
+    floor_c = max(floor_c, _ASSUMED_MIN_RELAY_CENTISAT_VB)
+    estimates = {
+        target: (
+            replace(est, rate_centisat_vb=floor_c, clamped=True)
+            if est.rate_centisat_vb < floor_c
+            else est
+        )
+        for target, est in snapshot.estimates.items()
+    }
+    return replace(snapshot, estimates=estimates)
+
+
+def _backend_min_relay_centisat_vb(client: Any) -> int:
+    """Resolve the min-relay floor over the backend's OPTIONAL capability.
+
+    TCK-FEE-004, riding the ONB-004 contract: a backend that can name its
+    own floor exposes ``min_relay_centisat_vb() -> int`` (centisat/vB;
+    today :class:`~localwallet.chain.bitcoind.BitcoindClient` via
+    ``getmempoolinfo.minrelaytxfee``). Absence, an unusable answer or ANY
+    exception from the query fail CLOSED to the assumed 1 sat/vB (the
+    code-review LOW: no exception flavor of a floor query may fail a send)
+    — never a fabricated node figure. Electrum honestly ABSENTS this
+    capability (:class:`~localwallet.chain.electrum.ElectrumClient` defines
+    no such method: ``server.features`` carries no relay fee and the legacy
+    ``blockchain.relayfee`` is deprecated/unit-ambiguous — no dialect is
+    invented), so its floor is the assumed constant.
+    """
+    getter = getattr(client, "min_relay_centisat_vb", None)
+    if getter is None:
+        return _ASSUMED_MIN_RELAY_CENTISAT_VB
+    try:
+        value = getter()
+    except Exception:  # noqa: BLE001 — fail-closed floor fallback, value-free
+        return _ASSUMED_MIN_RELAY_CENTISAT_VB
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return _ASSUMED_MIN_RELAY_CENTISAT_VB
+    return max(value, _ASSUMED_MIN_RELAY_CENTISAT_VB)
 
 
 def _now() -> float:
@@ -221,12 +349,18 @@ class FeeEstimate:
         source: The derivation path that produced the bid
             (:class:`FeeSource`): target-follower over mempool projections,
             or the recommended-fees fallback.
+        clamped: TCK-FEE-004 — True when this bid is the min-relay FLOOR
+            (the MAX(bid, floor) clamp raised it above the policy-derived
+            rung; the rate shown IS the floor then). False means the policy
+            rung already met or cleared the floor and is untouched.
+            Narration uses it to say so once, never silently.
     """
 
     target: FeeTarget
     rate_centisat_vb: int
     source_timestamp: float
     source: FeeSource
+    clamped: bool = False
 
 
 @dataclass(frozen=True)
@@ -268,6 +402,17 @@ class FeeEstimator:
             ``estimate_fee``). Network access stays in ``chain/``.
         ttl_s: Cache lifetime in seconds; defaults to
             ``Settings.fee_cache_ttl_s`` (30s).
+        relay_floor_client: TCK-FEE-004 (code-review fix): the WALLET chain
+            client whose node defines the min-relay floor the production
+            estimator must respect — duck-typed on the OPTIONAL
+            ``min_relay_centisat_vb()`` capability, like every other seam
+            here (bitcoind answers, electrum honestly doesn't, ``None`` or
+            any failure → the assumed 1 sat/vB). The bids keep riding
+            ``client`` (the public fee source); only the RELAY floor rides
+            the node. Absent (or any client without the capability) the
+            floor falls back to ``client`` itself — the backend-native
+            path, where estimator and node are the same object.
+            :meth:`set_relay_floor_client` re-points it on a hot-swap.
 
     Raises:
         ValueError: If ``ttl_s`` is not a positive, finite number. (A NaN or
@@ -276,7 +421,12 @@ class FeeEstimator:
             and an infinite TTL would never expire — hence fail closed.)
     """
 
-    def __init__(self, client: ChainClient, ttl_s: float | None = None) -> None:
+    def __init__(
+        self,
+        client: ChainClient,
+        ttl_s: float | None = None,
+        relay_floor_client: ChainClient | None = None,
+    ) -> None:
         if ttl_s is None:
             ttl_s = Settings.from_env().fee_cache_ttl_s
         if (
@@ -293,9 +443,47 @@ class FeeEstimator:
         self._client = client
         self._ttl_s = ttl_f
         self._cache: _Snapshot | None = None
+        self._relay_floor_client = relay_floor_client
+        #: TTL-bounded (min_relay_centisat_vB, fetched_at) pair — the light
+        #: floor-only answer the explicit-rate seam consumes (TCK-FEE-004).
+        self._floor_cache: tuple[int, float] | None = None
+
+    def set_relay_floor_client(self, client: ChainClient | None) -> None:
+        """Re-point the min-relay FLOOR source at the (hot-swapped) wallet
+        backend and drop the cached floor. The estimator instance itself
+        stays ONE shared object across a swap (one cache, one TTL, the bids
+        keep riding the public fee source) — only the node that DEFINES the
+        relay floor moves with the backend (TCK-FEE-004 code-review fix)."""
+        self._relay_floor_client = client
+        self._floor_cache = None
+
+    def _relay_floor_centisat_vb(self) -> int:
+        """The RELAY floor alone, TTL-cached: node capability → the assumed
+        1 sat/vB. NEVER the congestion ``minimumFee`` and NEVER a snapshot
+        refresh — answering an explicit-rate clamp costs at most ONE floor
+        query, zero chain calls when the floor source has no capability."""
+        now = _now()
+        if self._floor_cache is not None and now - self._floor_cache[1] < self._ttl_s:
+            return self._floor_cache[0]
+        client = self._relay_floor_client
+        if client is None:
+            client = self._client
+        floor_c = _backend_min_relay_centisat_vb(client)
+        self._floor_cache = (floor_c, now)
+        return floor_c
 
     def _get_snapshot(self) -> _Snapshot:
-        """Return the cache if fresh, otherwise fetch + parse + cache it."""
+        """Return the cache if fresh, otherwise fetch + parse + clamp + cache.
+
+        Every snapshot leaves here with each rung MAX'd against the
+        congestion-informed POLICY floor (TCK-FEE-004 + code-review fix):
+        the native path uses the relay floor (:meth:`_relay_floor_centisat_
+        vb`, no minimumFee exists there), the Esplora/publicinfo path
+        ``max(minimumFee×100, relay floor)`` — the next-block congestion
+        bound is a legitimate POLICY bid floor (FEE-003-sanctioned) and the
+        node's floor participates (MAX in) when one is wired. A degraded
+        target-follower attempt clamps the fallback snapshot the same way.
+        """
         now = _now()
         if self._cache is not None and now - self._cache.fetched_at < self._ttl_s:
             return self._cache
@@ -303,7 +491,7 @@ class FeeEstimator:
             # Backend-native path (Electrum/bitcoind adapters expose no
             # Esplora JSON): one estimate_fee per target, target-follower
             # skipped — never faked. Failures fail closed (ChainError).
-            snapshot = self._native_snapshot(now)
+            snapshot = _apply_floor(self._native_snapshot(now), self._relay_floor_centisat_vb())
             self._cache = snapshot
             return snapshot
         payload = self._client.get_json(_FEES_PATH, _FEES_KIND)
@@ -313,6 +501,10 @@ class FeeEstimator:
             snapshot = self._target_follower(recommended.minimum_fee_sat_vb, now)
         except ChainError:
             snapshot = recommended  # fail-closed degrade; value-free, never logged
+        snapshot = _apply_floor(
+            snapshot,
+            max(snapshot.minimum_fee_sat_vb * 100, self._relay_floor_centisat_vb()),
+        )
         self._cache = snapshot
         return snapshot
 
@@ -354,11 +546,16 @@ class FeeEstimator:
         - ``MEDIUM`` = ``B₀ × 1.15`` rounded half-even to 2 decimals, clamped
           up (ceil-2dp of ``B₀``) if that rounding ever lands below ``B₀``
           — a bid never undercuts its own floor;
-        - ``FAST`` = ``2 × MEDIUM`` (the doubling acts on the ROUNDED target)
-          and additionally ``>= minimumFee`` (FEE-001's next-block floor,
-          kept on the next-block rung only);
+        - ``FAST`` = ``2 × MEDIUM`` (the doubling acts on the ROUNDED target);
         - ``SLOW`` = ``B₁`` ceiled to 2 decimals (no markup; one projected
           block ⇒ ``B₀`` itself).
+
+        Then :func:`_apply_floor` (applied by the caller) MAXes EACH rung
+        independently with the source's min-relay floor — FEE-001's
+        old "minimumFee bounds the FAST rung only" rule is generalized to
+        every rung (TCK-FEE-004 pinned semantics: a sub-floor bid never
+        leaves this module; the ladder can collapse onto the floor and
+        that is honest, it cannot bid under it).
 
         With the parser's non-increasing-bottoms rule (``B₀ >= B₁``) this
         makes ``FAST >= MEDIUM >= SLOW`` a code invariant. All rounding is
@@ -372,7 +569,7 @@ class FeeEstimator:
         if Decimal(target_c).scaleb(-2) < bottoms[0]:  # rounding dipped under the floor
             target_c = _to_cents(bottoms[0], ROUND_CEILING)
         slow_c = _to_cents(bottoms[1] if len(bottoms) > 1 else bottoms[0], ROUND_CEILING)
-        fast_c = max(2 * target_c, minimum_fee_sat_vb * 100)
+        fast_c = 2 * target_c
         estimates = {
             target: FeeEstimate(
                 target=target,
@@ -395,10 +592,57 @@ class FeeEstimator:
     def estimate(self, target: FeeTarget) -> FeeEstimate:
         """Return the fee bid for ``target`` (integer centisat/vB, 1 sat/vB
         = 100), cached by TTL. Format with :func:`format_sat_vb` for display.
+
+        TCK-FEE-004: the returned bid is already floored — every rung leaves
+        the snapshot layer as ``MAX(policy rung, min-relay floor)``; check
+        :attr:`FeeEstimate.clamped` to narrate a floor-raised rung once,
+        honestly (the displayed rate IS the floor then).
         """
         if not isinstance(target, FeeTarget):
             raise TypeError("target must be a FeeTarget")
         return self._get_snapshot().estimates[target]
+
+    def clamp_to_min_relay_floor(self, rate_centisat_vb: int) -> tuple[int, bool]:
+        """MAX an EXPLICIT user bid with the min-relay floor (TCK-FEE-004).
+
+        The create_tx / bump_fee finalization seam for ``fee_rate_sat_vb``:
+        a user-quoted rate below the node's RELAY floor is RAISED to it and
+        the ``raised`` flag comes back True, so the card narrates the
+        change — never a silent alteration of an explicit rate, never a
+        silent sub-floor bid that the node would refuse (MAX, never MIN —
+        the user's corrected spec verbatim). The floor is the RELAY floor
+        ONLY (native node capability → the assumed 1 sat/vB): NEVER the
+        congestion ``minimumFee`` — an explicit 1 sat/vB bids 1 THROUGH
+        congestion whenever the node's own floor is 1 sat/vB (the
+        code-review MAJOR: a congestion estimate must not out-veto the
+        node). Answering costs at most ONE TTL-cached floor query — never
+        a snapshot refresh, zero chain calls when the floor source has no
+        capability (the publicinfo wiring keeps FEE-002's "explicit rate ⇒
+        no chain calls" property). This clamps the INITIAL bid only; the
+        BIP-125 INCREMENTAL floor a replacement must clear is
+        ``tx/replacement.py``'s distinct rule and is not consulted here.
+
+        Fail-closed like the floor itself: ANY failure of the floor query
+        (not just ChainError — the code-review LOW) degrades to the
+        assumed 1 sat/vB (the floor the tx engine's build gate already
+        enforces), so an explicit send never fails on a floor query and
+        the schema's 1 sat/vB explicit floor then passes through untouched.
+
+        Raises:
+            TypeError: non-int / bool input. ValueError: negative.
+                Messages are value-free.
+        """
+        if isinstance(rate_centisat_vb, bool) or not isinstance(rate_centisat_vb, int):
+            raise TypeError("rate_centisat_vb must be an integer")
+        if rate_centisat_vb < 0:
+            raise ValueError("rate_centisat_vb must be non-negative")
+        try:
+            floor_c = self._relay_floor_centisat_vb()
+        except Exception:  # noqa: BLE001 — no floor-query failure may fail a send
+            floor_c = _ASSUMED_MIN_RELAY_CENTISAT_VB
+        if rate_centisat_vb < floor_c:
+            return floor_c, True
+        return rate_centisat_vb, False
 
     def minimum_fee_sat_vb(self) -> int:
         """Return the ``minimumFee`` field (sats/vB), cached by TTL.
@@ -415,8 +659,10 @@ class FeeEstimator:
         return snapshot.minimum_fee_sat_vb
 
     def invalidate(self) -> None:
-        """Drop the cached payload; the next call refetches."""
+        """Drop the cached payload AND the cached relay floor; the next
+        call refetches."""
         self._cache = None
+        self._floor_cache = None
 
 
 def _to_cents(value: Decimal, rounding: str) -> int:

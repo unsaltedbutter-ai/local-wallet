@@ -1407,6 +1407,20 @@ _CARD_RATE_FLOOR: Final[str] = (
     "That's already the cheapest recommended rate — we never quote below "
     'the network minimum. Say "sign" to proceed or "cancel" to discard.'
 )
+#: TCK-FEE-004 min-relay clamp line: printed ONCE under the card's Fee line
+#: whenever the bid this card shows IS the min-relay floor (a policy rung
+#: the clamp raised, or an explicit user rate clamped UP toward it — never
+#: a silent alteration of an explicit rate). Deliberately source-neutral
+#: wording: the floor came from the node (bitcoind relayfee), from the fee
+#: source (recommended minimumFee) or from the ASSUMED 1 sat/vB every
+#: build gate here enforces — "the floor this wallet enforces" is honest
+#: for all three (no narration lie on the fail-closed rung); we never
+#: claim the node said something it didn't. The quoted rate is verbatim
+#: from the result's own fee_rate_display; no amounts.
+_CARD_FEE_FLOOR_NOTE: Final[str] = (
+    "Note: the min-relay floor is {rate} sat/vB — the lowest rate this "
+    "wallet builds at, so the fee uses it."
+)
 #: Mix warning (TCK-UTXO-004, docs/ux-utxo-notes-design.md §4.3): a dedicated
 #: conditional line printed ONLY when the FINAL selection spans the KYC /
 #: not-KYC partitions — which happens only when no pure pool funds the amount
@@ -4280,19 +4294,34 @@ def _make_create_tx_handler(
         rate_fetched_at = rate.fetched_at if rate is not None else None
 
         # 3 (cont.). Fee rate: the literal user-quoted sat/vB rate when
-        # present (no estimator call — the user's number is quoted verbatim
-        # and is the whole point of the ceiling-ask answer; it arrives in
-        # whole sats/vB and scales exactly to centisat/vB here), else the
-        # ladder (MEDIUM default when neither knob is given). From here on
-        # ``fee_rate`` is ALWAYS integer centisat/vB (1 sat/vB = 100) — the
-        # engine unit (docs/fee-fractional-plan.md, TCK-FEE-003 wave).
+        # present (the user's number is quoted verbatim and is the whole
+        # point of the ceiling-ask answer; it arrives in whole sats/vB and
+        # scales exactly to centisat/vB here), else the ladder (MEDIUM
+        # default when neither knob is given). From here on ``fee_rate`` is
+        # ALWAYS integer centisat/vB (1 sat/vB = 100) — the engine unit
+        # (docs/fee-fractional-plan.md, TCK-FEE-003 wave).
+        # TCK-FEE-004 min-relay clamp: the rung path is already floored
+        # INSIDE the estimator (every rung MAX'd with the source/node floor;
+        # ``estimate.clamped`` says whether the floor raised it); the
+        # EXPLICIT path consults ONLY the floor here — the user's number
+        # still wins whenever it clears the floor, and a floor raise is
+        # narrated (never a silent alteration of an explicit rate; never a
+        # silent sub-floor bid the node would refuse — MAX, never MIN).
+        # This floor is DISTINCT from tx/replacement.py's BIP-125
+        # INCREMENTAL relay floor (a bump must out-pay its original — a
+        # different constant, untouched here; the clamp is INITIAL-bid only).
+        floor_raised = False
         if params.fee_rate_sat_vb is not None:
-            fee_rate = params.fee_rate_sat_vb * 100
+            fee_rate, floor_raised = fee_estimator.clamp_to_min_relay_floor(
+                params.fee_rate_sat_vb * 100
+            )
         else:
             try:
-                fee_rate = fee_estimator.estimate(target).rate_centisat_vb
+                estimate = fee_estimator.estimate(target)
             except ChainError as exc:
                 return {"error": "chain_unavailable", "detail": str(exc)}
+            fee_rate = estimate.rate_centisat_vb
+            floor_raised = estimate.clamped
 
         # 4. UTXO snapshot with the lazy first scan.
         try:
@@ -4517,6 +4546,13 @@ def _make_create_tx_handler(
             "expires_in_s": PENDING_TTL_S,
             **({} if eta is None else eta),
         }
+        if floor_raised:
+            # TCK-FEE-004: the min-relay clamp raised THIS bid to the floor
+            # (a policy rung under it, or an explicit user rate under a
+            # higher source/node floor). Display-only narration marker —
+            # one honest line under the Fee data line; ABSENT unless the
+            # clamp fired (conditional-key pattern, TCK-FIAT-003).
+            result["fee_floor_note"] = True
         if rate is not None and currency != DEFAULT_DISPLAY_CURRENCY:
             # TCK-FIAT-002 currency-tagged card fields (same design as the
             # balance answer): ``fiat_total_minor`` = the send amount in the
@@ -5036,9 +5072,10 @@ def _make_self_transfer_handler(
         #    rate override).
         rung = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.FAST
         try:
-            fee_rate = fee_estimator.estimate(rung).rate_centisat_vb
+            estimate = fee_estimator.estimate(rung)
         except ChainError as exc:
             return {"error": "chain_unavailable", "detail": str(exc)}
+        fee_rate = estimate.rate_centisat_vb  # TCK-FEE-004: floored in the estimator
 
         # 7. The parent picture — honest both-or-neither (tx/cpfp.py).
         #    A stuck inbound is normally FOREIGN (watch-only sees its
@@ -5192,6 +5229,9 @@ def _make_self_transfer_handler(
             "fee_sats": pending.fee_sats,
             "fee_rate_centisat_vb": pending.fee_rate_centisat_vb,
             "fee_rate_display": format_sat_vb(pending.fee_rate_centisat_vb),
+            # TCK-FEE-004: display-only min-relay narration, only when the
+            # clamp actually raised the child's (initial) bid.
+            **({"fee_floor_note": True} if estimate.clamped else {}),
             "vsize": pending.vsize,
             "change_sats": None,
             "inputs_count": pending.inputs_count,
@@ -5279,12 +5319,14 @@ def _make_self_transfer_handler(
                 cons_picked = prior_cons.picked
 
         # 2. Fee bid: the estimator ladder (the ONLY chain call this flow
-        #    makes — exactly like create_tx; no new chain surface).
+        #    makes — exactly like create_tx; no new chain surface). The bid
+        #    is min-relay floored inside the estimator (TCK-FEE-004).
         target = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.MEDIUM
         try:
-            fee_rate = fee_estimator.estimate(target).rate_centisat_vb
+            estimate = fee_estimator.estimate(target)
         except ChainError as exc:
             return {"error": "chain_unavailable", "detail": str(exc)}
+        fee_rate = estimate.rate_centisat_vb
 
         # 3. UTXO snapshot with the lazy first scan (same path as
         #    create_tx step 4).
@@ -5493,6 +5535,9 @@ def _make_self_transfer_handler(
             "fee_sats": pending.fee_sats,
             "fee_rate_centisat_vb": pending.fee_rate_centisat_vb,
             "fee_rate_display": format_sat_vb(pending.fee_rate_centisat_vb),
+            # TCK-FEE-004: display-only min-relay narration (see create_tx);
+            # only when the clamp actually raised a plan rung.
+            **({"fee_floor_note": True} if estimate.clamped else {}),
             "vsize": pending.vsize,
             "change_sats": None,
             "inputs_count": pending.inputs_count,
@@ -5826,6 +5871,7 @@ def _make_bump_fee_handler(
         plan: ReplacementPlan,
         old_txid: str,
         rung: FeeTarget | None,
+        floor_raised: bool,
     ) -> dict[str, object]:
         """Build + stage the replacement (fail-closed; the flow record is
         touched ONLY after the full PSBT build and address bookkeeping
@@ -5924,6 +5970,11 @@ def _make_bump_fee_handler(
             "fee_delta_sats": plan.fee_sats - original.fee_sats,
             "fee_rate_centisat_vb": pending.fee_rate_centisat_vb,
             "fee_rate_display": format_sat_vb(pending.fee_rate_centisat_vb),
+            # TCK-FEE-004: display-only min-relay narration for the bump's
+            # INITIAL bid, only when the clamp raised it (the BIP-125
+            # incremental floor the builder applies below is a DISTINCT
+            # rule, never narrated as this one).
+            **({"fee_floor_note": True} if floor_raised else {}),
             "vsize": pending.vsize,
             "change_sats": pending.change_sats,
             "inputs_count": pending.inputs_count,
@@ -6042,18 +6093,28 @@ def _make_bump_fee_handler(
         # 2. Fee bid (only AFTER the target resolved — refusals above made
         #    zero chain calls). An explicit user-quoted rate is taken
         #    verbatim (×100 at this edge, the FEE-003 precedent, no rung
-        #    recorded); a stated rung rides the shared estimator; nothing
-        #    stated defaults to FAST (asking for a bump IS a stated
-        #    urgency — see the docstring).
+        #    recorded) but MIN-RELAY-FLOORED (TCK-FEE-004: MAX(rate, floor)
+        #    with honest narration on a raise); a stated rung rides the
+        #    shared estimator (already floored there); nothing stated
+        #    defaults to FAST (asking for a bump IS a stated urgency — see
+        #    the docstring). This is the bump's INITIAL bid only — the
+        #    DISTINCT BIP-125 incremental-relay floor (a replacement must
+        #    out-pay its original by an increment of its own size) remains
+        #    tx/replacement.py's alone, applied inside build_replacement_plan
+        #    below and untouched here.
         if params.fee_rate_sat_vb is not None:
-            rate_c = params.fee_rate_sat_vb * 100
+            rate_c, floor_raised = fee_estimator.clamp_to_min_relay_floor(
+                params.fee_rate_sat_vb * 100
+            )
             rung: FeeTarget | None = None
         else:
             rung = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.FAST
             try:
-                rate_c = fee_estimator.estimate(rung).rate_centisat_vb
+                estimate = fee_estimator.estimate(rung)
             except ChainError as exc:
                 return {"error": "chain_unavailable", "detail": str(exc)}
+            rate_c = estimate.rate_centisat_vb
+            floor_raised = estimate.clamped
 
         # 3. Decomposition of the recorded original (from the carried
         #    re-bump record, else the flow's retained broadcast record —
@@ -6143,7 +6204,7 @@ def _make_bump_fee_handler(
 
         # 5. Build + stage (the full TxFlow ride continues from CREATED —
         #    confirm/sign/broadcast handlers unchanged, dual-key intact).
-        return _stage(original, rec, plan, old_txid, rung)
+        return _stage(original, rec, plan, old_txid, rung, floor_raised)
 
     return handler
 
@@ -11671,9 +11732,11 @@ class _Wiring:
     #: REGARDLESS of the wallet backend — constructed once, never rebuilt
     #: on a hot-swap, never carries wallet data.
     public_info: PublicInfoClient | None = None
-    #: The one shared :class:`FeeEstimator` (over ``public_info``) — kept
-    #: on the wiring so a hot-swap rebind reuses it (one source, one
-    #: cache, one TTL; the swap no longer touches the fee path at all).
+    #: The one shared :class:`FeeEstimator` (bids over ``public_info``, min-
+    #: relay floor over the wallet client's optional capability) — kept on
+    #: the wiring so a hot-swap rebind reuses it (one source, one cache,
+    #: one TTL); the swap only re-points its FLOOR at the new backend
+    #: (TCK-FEE-004 code-review fix).
     fee_estimator: FeeEstimator | None = None
     #: The one shared :class:`PriceOracle` (over ``public_info`` and the
     #: live display-currency ladder), same single-instance rule as the
@@ -12357,7 +12420,10 @@ class ChainBackendFlow:
         backend-independent by construction, so the swap re-attaches the
         SAME shared instances (one source, one cache, one TTL — and no
         rebind even needs to touch them beyond passing the shared oracle
-        into the rebuilt handlers)."""
+        into the rebuilt handlers). ONE exception (TCK-FEE-004 code-review
+        fix): the shared estimator's min-relay FLOOR source IS backend-
+        owned — the swap re-points it at the new client (bids and cache
+        keep riding the public source unchanged)."""
         w = self._w
         scan = w.scan
         # TCK-FIAT-001 security-review LOW (folded into TCK-UX-009): ONE
@@ -12379,9 +12445,15 @@ class ChainBackendFlow:
             fee_estimator = FeeEstimator(
                 w.public_info
                 if w.public_info is not None
-                else PublicInfoClient(w.settings)
+                else PublicInfoClient(w.settings),
+                relay_floor_client=client,
             )
             w.fee_estimator = fee_estimator
+        else:
+            # TCK-FEE-004 (code-review fix): ONE shared estimator across
+            # the swap (same bids, same cache, same TTL) — but the
+            # min-relay FLOOR is the wallet backend's own: re-point it.
+            fee_estimator.set_relay_floor_client(client)
         w.table[IntentName.GET_BALANCE] = _make_get_balance_handler(
             w.store,
             w.wallet.id,
@@ -12591,7 +12663,13 @@ def _wire(
     # wallet backend; a public-source failure degrades per the existing
     # fail-closed shapes (recommended fallback / stale → sats-only).
     public_info = _public_info_client(settings)
-    fee_estimator = FeeEstimator(public_info)
+    # TCK-FEE-004 (code-review fix): the estimator BIDS over the public fee
+    # source but the min-relay FLOOR is what OUR NODE accepts — the wallet
+    # client's optional capability rides in (bitcoind answers; electrum
+    # honestly absents → the assumed 1 sat/vB). An UNRESOLVED boot posture
+    # (client None) starts on the assumed floor and the hot-swap re-points
+    # it via _rebind_handlers when the user picks a backend in-session.
+    fee_estimator = FeeEstimator(public_info, relay_floor_client=client)
     # TCK-FIAT-003: the session is built BEFORE the oracle so the injected
     # ladder reader can consult the per-ask currency one-shot (a no-op for
     # every other consumer — the REPL and the handlers share THIS object).
@@ -15143,6 +15221,9 @@ def _print_self_plan(
             # Verbatim chain/eta.py hedge appended — never re-punctuated.
             fee += f" — ETA {eta_wording}"
     lines: list[str] = [_CARD_ASK_LINE, plan, in_line, fee]
+    floor_note = _fee_floor_note_line(result)  # TCK-FEE-004 (see brief card)
+    if floor_note is not None:
+        lines.append(floor_note)
     other = _card_sats(result, "self_other_side_count")
     if other is not None:
         # Honest cross-pool note (the privacy pools are never mixed — this
@@ -15333,6 +15414,9 @@ def _print_bump_fee(
     rate = _card_fee_rate_text(result)
     if rate is not None:
         lines.append(f"Rate: {rate} sat/vB · {result.get('vsize', '')} vB")
+    floor_note = _fee_floor_note_line(result)  # TCK-FEE-004 (see brief card)
+    if floor_note is not None:
+        lines.append(floor_note)
     eta_wording = result.get("eta_wording")
     if isinstance(eta_wording, str) and eta_wording:
         lines.append(f"ETA: {eta_wording}")
@@ -15729,6 +15813,20 @@ def _card_fee_rate_text(result: Mapping[str, object]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _fee_floor_note_line(result: Mapping[str, object]) -> str | None:
+    """The TCK-FEE-004 min-relay-floor note line, or ``None``. Present only
+    when the handler marked THIS bid as raised to the floor
+    (``fee_floor_note=True``, display-only) AND the card can quote the rate
+    verbatim from its own ``fee_rate_display`` (the clamped bid IS the
+    floor). Fail-closed like every card segment: no figure, no line — the
+    floor is never narrated as a number the result does not carry.
+    """
+    if result.get("fee_floor_note") is not True:
+        return None
+    rate = _card_fee_rate_text(result)
+    return None if rate is None else _CARD_FEE_FLOOR_NOTE.format(rate=rate)
+
+
 def _card_rate(result: Mapping[str, object]) -> str | None:
     """Thousands-separated per-BTC rate, whole units when the source gave
     whole units (the price provider does — ADR-0011 §4), else 2 decimals.
@@ -15913,6 +16011,12 @@ def _print_brief_card(
             # Verbatim chain/eta.py hedge appended — never re-punctuated.
             fee += f" — ETA {eta_wording}"
     output_fn(sanitize_tool_output(fee))
+    floor_note = _fee_floor_note_line(result)
+    if floor_note is not None:
+        # TCK-FEE-004: one honest min-relay-floor line, under the Fee data
+        # line (the card that raised its bid says so once). Absent unless
+        # the handler marked this bid floor-raised.
+        output_fn(sanitize_tool_output(floor_note))
     sources = result.get("inputs_count")
     if isinstance(sources, int) and not isinstance(sources, bool):
         from_line = f"From: your wallet ({sources:,} {'source' if sources == 1 else 'sources'})"
@@ -15993,6 +16097,9 @@ def _print_confirmation_card(
     else:
         fee_line = "Fee: unavailable"
     output_fn(sanitize_tool_output(fee_line))
+    floor_note = _fee_floor_note_line(result)  # TCK-FEE-004 (see brief card)
+    if floor_note is not None:
+        output_fn(sanitize_tool_output(floor_note))
     if "vsize" in result:
         output_fn(sanitize_tool_output(f"Size: {result['vsize']} vB"))
     else:

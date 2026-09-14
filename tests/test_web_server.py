@@ -1594,7 +1594,8 @@ def test_web_send_pre_first_scan_gets_the_loading_refusal_as_text(
             None,  # client: the refusal fires before ANY chain/store work
             lambda: pytest.fail("refusal must precede any scan"),
             fee_estimator=SimpleNamespace(
-                estimate=lambda target: SimpleNamespace(rate_centisat_vb=200)
+                estimate=lambda target: SimpleNamespace(rate_centisat_vb=200, clamped=False),
+                clamp_to_min_relay_floor=lambda rate: (rate, False),
             ),
             price_oracle=SimpleNamespace(
                 fresh=lambda: (_ for _ in ()).throw(PriceUnavailableError("stub")),

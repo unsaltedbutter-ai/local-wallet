@@ -458,29 +458,36 @@ def test_user_case_source_is_target_follower():
 
 
 def test_target_never_undercuts_its_own_floor():
-    # Rounding dips under B₀ only for tiny bottoms (0.15 x B₀ < 0.005):
-    # B₀ = 0.021 -> 0.02415 -> half-even would say 0.02 < the floor -> the
-    # clamp lifts the bid to ceil-2dp of the floor (0.03). The bid is NEVER
-    # below feeRange[0] itself.
+    # Two nested protections, pinned since TCK-FEE-004:
+    #  * INTERNAL (policy v2): rounding dips under B₀ only for tiny bottoms
+    #    (0.15 x B₀ < 0.005): B₀ = 0.021 -> 0.02415 -> half-even would say
+    #    0.02 < the floor -> the target clamp lifts to ceil-2dp (0.03);
+    #  * MIN-RELAY FLOOR (TCK-FEE-004): every rung then MAXes with the
+    #    source floor (minimumFee 1 sat/vB here), so the sub-1 policy rungs
+    #    all surface AT the floor — a bid below what relays accept never
+    #    leaves this module (the live psbt_failed this ticket fixed).
     rates = _rates(
         RoutedServer(_floor_routes(projected=_projected_payload([0.021] * 8)))
     )
-    assert rates[FeeTarget.MEDIUM] == 3  # 0.03 >= 0.021 (the clamp fired)
-    assert rates[FeeTarget.SLOW] == 3  # ceil2(0.021)
+    assert rates[FeeTarget.MEDIUM] == 100  # 3 lifted to the min-relay floor
+    assert rates[FeeTarget.SLOW] == 100  # 3 lifted to the min-relay floor
     assert rates[FeeTarget.FAST] == 100  # max(2 x 3, minimumFee 1 sat/vB)
 
 
 def test_half_even_rounding_ties():
-    # Decimal ROUND_HALF_EVEN at 2dp, pinned on the exact tie B₀=0.3:
-    # 0.3 x 1.15 = 0.345 -> ties-to-even -> 0.34 (0.35 would be half-up).
+    # Decimal ROUND_HALF_EVEN at 2dp, pinned on the exact tie B₀=2.3:
+    # 2.3 x 1.15 = 2.645 -> ties-to-even -> 2.64 (2.65 would be half-up).
+    # (The tie stays above the 1 sat/vB min-relay floor so the clamp cannot
+    # mask it — the sub-1 tie case 0.3 -> 0.345 -> 0.34 now clamps to the
+    # floor and is pinned in test_min_relay_clamp_*.)
     rates = _rates(
         RoutedServer(
             _floor_routes(
-                projected=_projected_payload([0.3, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2])
+                projected=_projected_payload([2.3, 2.2, 2.2, 2.2, 2.2, 2.2, 2.2, 2.2])
             )
         )
     )
-    assert rates[FeeTarget.MEDIUM] == 34
+    assert rates[FeeTarget.MEDIUM] == 264
 
 
 def test_single_projected_block_slow_is_the_floor_itself():
@@ -492,11 +499,13 @@ def test_single_projected_block_slow_is_the_floor_itself():
     assert rates[FeeTarget.SLOW] == 450  # 4.5 exactly, no markup
 
 
-def test_minimum_fee_floors_fast_only():
-    # FEE-001's protection, kept: minimumFee is "min fee to get into the
-    # NEXT block", so it bounds the FAST rung and nothing else. B₀ = 0.4
-    # -> target 46, faster 92 -> lifted to minimumFee 5 sat/vB; MEDIUM and
-    # SLOW stay below it.
+def test_minimum_fee_floor_clamps_every_rung():
+    # TCK-FEE-004 SUPERSEDES FEE-001's "minimumFee bounds the FAST rung
+    # only" rule: the publicinfo payload's minimumFee is the floor FOR THAT
+    # SOURCE, and EACH rung is MAX'd with it independently (pinned
+    # semantics). B₀ = 0.4 -> policy 46/92/35, minimumFee 5 -> every rung
+    # lifts to 500 (the ladder collapses onto the floor and that is
+    # honest — sub-floor bids simply fail at the node).
     rates = _rates(
         RoutedServer(
             _floor_routes(
@@ -505,9 +514,9 @@ def test_minimum_fee_floors_fast_only():
             )
         )
     )
-    assert rates[FeeTarget.MEDIUM] == 46
-    assert rates[FeeTarget.FAST] == 500  # max(2 x 46, 5 x 100)
-    assert rates[FeeTarget.SLOW] == 35
+    assert rates[FeeTarget.MEDIUM] == 500
+    assert rates[FeeTarget.FAST] == 500
+    assert rates[FeeTarget.SLOW] == 500
 
 
 def test_congested_next_block_lifts_the_whole_ladder():
@@ -536,11 +545,12 @@ def test_ordering_invariant_faster_target_slower():
 
 
 def test_live_2026_09_07_case_still_bids_at_most_1_sat_vb():
-    # FEE-001's binding observed case, re-derived under v2: the next block
-    # bottomed at 0.3 with the last blocks confirming down to 0.34. The bid
-    # must not exceed 1 sat/vB: FAST = max(2 x 0.34, minimumFee 1) = 1.0;
-    # TARGET = 0.345 -> half-even -> 0.34 (>= 0.34, the observed block floor
-    # that R₅ used to guard — the markup role now); SLOW = 0.28.
+    # FEE-001's binding observed case, re-derived under v2 + the FEE-004
+    # floor: the next block bottomed at 0.3 with the last blocks confirming
+    # down to 0.34. The bid must not exceed 1 sat/vB, and TCK-FEE-004's
+    # min-relay clamp now pins every rung AT the 1 sat/vB floor (minimumFee
+    # 1): policy TARGET 0.34 / SLOW 0.28 both lift to 1.00 — never below
+    # what relays accept, never the 2 sat/vB overbid FEE-001 replaced.
     rates = _rates(
         RoutedServer(
             _floor_routes(
@@ -550,8 +560,8 @@ def test_live_2026_09_07_case_still_bids_at_most_1_sat_vb():
         )
     )
     assert rates[FeeTarget.FAST] == 100
-    assert rates[FeeTarget.MEDIUM] == 34
-    assert rates[FeeTarget.SLOW] == 28
+    assert rates[FeeTarget.MEDIUM] == 100
+    assert rates[FeeTarget.SLOW] == 100
 
 
 def _raw_json(text: str) -> httpx.Response:
@@ -714,3 +724,327 @@ def test_bottom_magnitude_boundary_is_the_engine_ceiling():
     ) == [Decimal(10_000), Decimal("1e-9")]
     with pytest.raises(ChainError):
         fees_module._parse_projected_bottoms([{"feeRange": [10_000.0001]}], "k")
+
+
+# -- min-relay floor clamp (TCK-FEE-004, USER CORRECTED SPEC 2026-09-13,
+#    code-review fix 2026-09-14) -------------------------------------------
+#
+# MAX(policy rung, floor), EACH rung independently — a sub-floor bid never
+# leaves this module (the live failure was MEDIUM computing under the
+# min-relay floor and the send dying psbt_failed). TWO distinct floors:
+# policy rungs take the congestion-informed floor (publicinfo:
+# max(minimumFee x 100, relay floor); native: the relay floor alone); the
+# EXPLICIT seam takes the RELAY FLOOR ONLY — node capability
+# (bitcoind min_relay_centisat_vb, injected as relay_floor_client like the
+# production wiring does) → the ASSUMED 1 sat/vB — NEVER minimumFee,
+# NEVER a snapshot refresh.
+
+
+class _Native:
+    """Backend-native client double (NO get_json): estimate_fee answers
+    whole sats/vB per target, exactly like ElectrumClient/BitcoindClient."""
+
+    def __init__(self, rates: dict[FeeTarget, int]) -> None:
+        self._rates = dict(rates)
+        self.estimate_calls = 0
+
+    def estimate_fee(self, target: FeeTarget) -> int:
+        self.estimate_calls += 1
+        return self._rates[target]
+
+
+class _FloorNative(_Native):
+    """Native double WITH the optional floor capability."""
+
+    def __init__(self, rates, floor=None, error: bool = False) -> None:
+        super().__init__(rates)
+        self._floor = floor
+        self._error = error
+        self.floor_calls = 0
+
+    def min_relay_centisat_vb(self) -> int:
+        self.floor_calls += 1
+        if self._error:
+            raise ChainError("fees-test floor query failed")
+        return self._floor
+
+
+def test_healthy_ladder_is_never_marked_clamped():
+    # The user's 2026-09-12 payload clears the 1 sat/vB floor on every rung
+    # (121 / 242 / 100 — SLOW equals the floor, it is not lifted to it):
+    # the clamp must not narrate where it did not fire.
+    server = RoutedServer(_floor_routes())
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0)
+        estimates = {target: est.estimate(target) for target in FeeTarget}
+    assert {t: e.rate_centisat_vb for t, e in estimates.items()} == {
+        FeeTarget.MEDIUM: 121,
+        FeeTarget.FAST: 242,
+        FeeTarget.SLOW: 100,
+    }
+    assert not any(e.clamped for e in estimates.values())
+
+
+def test_clamped_flag_marks_only_the_floor_raised_rungs():
+    # B₀ = 0.9 -> TARGET = 1.035 half-even -> 1.04 (clears the floor);
+    # FAST = 2.08 clears; SLOW = ceil2(0.8) = 0.80 UNDER the 1 sat/vB
+    # minimumFee floor -> lifted to exactly 1.00, flagged. Per-rung honesty:
+    # only the rung that moved says so.
+    server = RoutedServer(_floor_routes(projected=_projected_payload([0.9, 0.8, 0.8])))
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0)
+        medium = est.estimate(FeeTarget.MEDIUM)
+        fast = est.estimate(FeeTarget.FAST)
+        slow = est.estimate(FeeTarget.SLOW)
+    assert (medium.rate_centisat_vb, medium.clamped) == (104, False)
+    assert (fast.rate_centisat_vb, fast.clamped) == (208, False)
+    assert (slow.rate_centisat_vb, slow.clamped) == (100, True)
+
+
+def test_recommended_fallback_rungs_clamped_to_minimum_fee():
+    # The degraded path floors identically (same source rule): ScriptedServer
+    # answers mempool-blocks with a dict (malformed -> fallback), and
+    # hourFee 1 sat/vB sits under minimumFee 4 -> the SLOW rung is lifted
+    # to the floor, the others already clear it.
+    server = ScriptedServer(
+        httpx.Response(
+            200,
+            json={
+                "fastestFee": 8,
+                "halfHourFee": 5,
+                "hourFee": 1,
+                "economyFee": 1,
+                "minimumFee": 4,
+            },
+        )
+    )
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0)
+        fast = est.estimate(FeeTarget.FAST)
+        medium = est.estimate(FeeTarget.MEDIUM)
+        slow = est.estimate(FeeTarget.SLOW)
+    assert (fast.rate_centisat_vb, fast.clamped) == (800, False)
+    assert (medium.rate_centisat_vb, medium.clamped) == (500, False)
+    assert (slow.rate_centisat_vb, slow.clamped) == (400, True)
+    assert all(e.source is FeeSource.RECOMMENDED for e in (fast, medium, slow))
+
+
+# -- the explicit-rate finalization seam (create_tx / bump_fee) -----------
+
+
+def test_clamp_to_min_relay_floor_explicit_seam():
+    server = ScriptedServer(httpx.Response(200, json=RECOMMENDED))  # minimumFee 1
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0)
+        assert est.clamp_to_min_relay_floor(500) == (500, False)  # clears
+        assert est.clamp_to_min_relay_floor(100) == (100, False)  # at the floor
+        assert est.clamp_to_min_relay_floor(55) == (100, True)  # under -> MAX
+    # Code-review fix: the seam answers from the RELAY floor alone — the
+    # assumed 1 sat/vB here, NO snapshot refresh, zero chain calls.
+    assert server.requests == []
+
+
+class _FloorOnly:
+    """Wallet-backend double carrying ONLY the optional floor capability —
+    the shape the production estimator sees via ``relay_floor_client``
+    (bids ride the public source, the FLOOR rides this node)."""
+
+    def __init__(self, floor=None, error: Exception | None = None) -> None:
+        self._floor = floor
+        self._error = error
+        self.floor_calls = 0
+
+    def min_relay_centisat_vb(self) -> int:
+        self.floor_calls += 1
+        if self._error is not None:
+            raise self._error
+        return self._floor
+
+
+def test_explicit_seam_ignores_the_congestion_minimum_fee():
+    # CODE-REVIEW MAJOR pin: minimumFee (3 sat/vB next-block CONGESTION
+    # estimate) must NEVER lift an explicit 1 sat/vB — the node's own relay
+    # floor decides explicit bids, and answering costs ZERO fee-source
+    # calls (the old wiring refreshed the whole snapshot and MAXed against
+    # the congestion figure; both are gone).
+    server = ScriptedServer(httpx.Response(200, json={**RECOMMENDED, "minimumFee": 3}))
+    node = _FloorOnly(100)
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0, relay_floor_client=node)
+        assert est.clamp_to_min_relay_floor(100) == (100, False)  # bids 1 THROUGH congestion
+    assert server.requests == []
+
+
+def test_explicit_seam_floors_at_the_node_not_the_source():
+    # Node relay floor 2.5 sat/vB under a source minimumFee of 5: the
+    # explicit seam answers 250 — the relay floor ONLY (never 500, the
+    # congestion figure; never a full refresh).
+    server = ScriptedServer(httpx.Response(200, json={**RECOMMENDED, "minimumFee": 5}))
+    node = _FloorOnly(250)
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0, relay_floor_client=node)
+        assert est.clamp_to_min_relay_floor(100) == (250, True)  # MAX, narrated
+        assert est.clamp_to_min_relay_floor(250) == (250, False)  # clears
+        assert est.clamp_to_min_relay_floor(300) == (300, False)  # above stays
+    assert server.requests == []
+    assert node.floor_calls == 1  # ONE TTL-cached floor query, not per clamp
+
+
+def test_explicit_seam_without_a_capable_node_uses_the_assumed_floor():
+    # Electrum's honest absence on the production (publicinfo) wiring: the
+    # injected wallet client has NO floor capability -> assumed 1 sat/vB,
+    # and ZERO chain calls anywhere — this RESTORES FEE-002's "explicit
+    # rate => no chain calls" pin on that wiring.
+    server = ScriptedServer(httpx.Response(200, json={**RECOMMENDED, "minimumFee": 3}))
+    electrum_like = _Native({t: 1 for t in FeeTarget})  # no get_json, no capability
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0, relay_floor_client=electrum_like)
+        assert est.clamp_to_min_relay_floor(100) == (100, False)  # congestion 3 does NOT lift
+        assert est.clamp_to_min_relay_floor(99) == (100, True)  # the assumed rail does
+    assert server.requests == []
+
+
+def test_native_explicit_seam_is_one_floor_query_no_refresh(monkeypatch: pytest.MonkeyPatch):
+    # Code-review MINOR: the native explicit seam used to run the FULL
+    # refresh (3 estimate_fee RPCs + the floor query). It is now ONE
+    # getmempoolinfo-shaped floor query, TTL-cached and bounded.
+    set_time = _freeze_clock(monkeypatch)
+    client = _FloorNative(
+        {FeeTarget.FAST: 6, FeeTarget.MEDIUM: 2, FeeTarget.SLOW: 1}, floor=250
+    )
+    est = FeeEstimator(client, ttl_s=30.0)
+    assert est.clamp_to_min_relay_floor(100) == (250, True)
+    assert est.clamp_to_min_relay_floor(250) == (250, False)  # TTL-cached
+    assert client.floor_calls == 1
+    assert client.estimate_calls == 0  # the LADDER was never refreshed
+    set_time(1_000_000.0 + 31.0)  # past TTL -> one bounded re-query
+    assert est.clamp_to_min_relay_floor(100) == (250, True)
+    assert client.floor_calls == 2
+
+
+def test_node_floor_participates_in_the_congestion_informed_policy_rungs():
+    # POLICY rungs KEEP the FEE-003-sanctioned congestion-informed floor —
+    # max(minimumFee x 100, relay floor): a node floor ABOVE the source's
+    # minimumFee lifts every rung onto itself (MAX in). The explicit seam
+    # over the same wiring answers the RELAY floor alone (1000, not the
+    # minimum figure) — the two concepts stay separate.
+    payload = {
+        "fastestFee": 5,
+        "halfHourFee": 4,
+        "hourFee": 2,
+        "economyFee": 1,
+        "minimumFee": 1,
+    }
+    server = ScriptedServer(httpx.Response(200, json=payload))
+    node = _FloorOnly(1000)
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0, relay_floor_client=node)
+        for target in FeeTarget:
+            estimate = est.estimate(target)
+            assert (estimate.rate_centisat_vb, estimate.clamped) == (1000, True)
+        assert est.clamp_to_min_relay_floor(100) == (1000, True)
+    assert len(server.requests) == 2  # one combined refresh, untouched shape
+    assert node.floor_calls == 1  # the floor query rode the refresh, TTL-cached
+
+
+@pytest.mark.parametrize("boom", [RuntimeError("rpc exploded"), ChainError("no"), KeyError("k")])
+def test_explicit_seam_catches_every_floor_exception_flavor(boom):
+    # Security-review LOW: the floor query may fail with ANY exception
+    # flavor (transport, JSON-RPC shape, adapter bug) — none may fail an
+    # explicit send: fail closed to the assumed floor, value-free.
+    node = _FloorOnly(error=boom)
+    est = FeeEstimator(
+        _Native({t: 2 for t in FeeTarget}), ttl_s=30.0, relay_floor_client=node
+    )
+    assert est.clamp_to_min_relay_floor(99) == (100, True)
+    assert est.clamp_to_min_relay_floor(100) == (100, False)
+
+
+def test_clamp_fails_closed_to_assumed_floor_when_source_down():
+    # A floor query that cannot complete NEVER fails the send (the explicit
+    # path historically made zero chain calls — it must stay sendable):
+    # the assumed 1 sat/vB applies, silently (no raise, no narration lie —
+    # it is the floor our own build gate enforces regardless).
+    server = ScriptedServer(httpx.ConnectError("boom"))
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0)
+        assert est.clamp_to_min_relay_floor(100) == (100, False)
+        assert est.clamp_to_min_relay_floor(99) == (100, True)
+
+
+@pytest.mark.parametrize("bad", [1.0, "100", None, True, False, -1])
+def test_clamp_to_min_relay_floor_type_discipline(bad):
+    server = ScriptedServer(httpx.Response(200, json=RECOMMENDED))
+    est = FeeEstimator(server.client(), ttl_s=30.0)
+    with pytest.raises((TypeError, ValueError)):
+        est.clamp_to_min_relay_floor(bad)
+    assert server.requests == []  # validated before any network
+
+
+# -- the backend-native floor capability (bitcoind; electrum absent) ------
+
+
+def test_native_floor_capability_lifts_rungs_and_is_cached():
+    # Node relayfee 5 sat/vB > estimatesmartfee answers: MEDIUM 2 / SLOW 1
+    # lift to the floor, FAST 6 already clears. The floor query rides the
+    # refresh (one call), so repeated estimates and the explicit clamp see
+    # the SAME floor without hammering the node.
+    client = _FloorNative(
+        {FeeTarget.FAST: 6, FeeTarget.MEDIUM: 2, FeeTarget.SLOW: 1}, floor=500
+    )
+    est = FeeEstimator(client, ttl_s=30.0)
+    fast = est.estimate(FeeTarget.FAST)
+    medium = est.estimate(FeeTarget.MEDIUM)
+    slow = est.estimate(FeeTarget.SLOW)
+    assert (fast.rate_centisat_vb, fast.clamped) == (600, False)
+    assert (medium.rate_centisat_vb, medium.clamped) == (500, True)
+    assert (slow.rate_centisat_vb, slow.clamped) == (500, True)
+    assert est.clamp_to_min_relay_floor(250) == (500, True)
+    assert client.floor_calls == 1  # one query per refresh, TTL-cached
+    assert client.estimate_calls == 3
+
+
+def test_native_absent_capability_uses_the_assumed_floor():
+    # Electrum's honest absence (no capability method at all): bids serve
+    # unchanged and the floor is the assumed 1 sat/vB.
+    client = _Native({FeeTarget.FAST: 3, FeeTarget.MEDIUM: 2, FeeTarget.SLOW: 1})
+    est = FeeEstimator(client, ttl_s=30.0)
+    medium = est.estimate(FeeTarget.MEDIUM)
+    assert (medium.rate_centisat_vb, medium.clamped) == (200, False)
+    assert est.clamp_to_min_relay_floor(99) == (100, True)
+    assert est.clamp_to_min_relay_floor(100) == (100, False)
+
+
+def test_native_floor_query_failure_fails_closed_not_fatal():
+    # A broken floor answer NEVER breaks the refresh: the estimates still
+    # serve, clamped to the assumed constant (fail-closed, no fabricated
+    # node claim).
+    client = _FloorNative(
+        {FeeTarget.FAST: 2, FeeTarget.MEDIUM: 2, FeeTarget.SLOW: 1}, error=True
+    )
+    est = FeeEstimator(client, ttl_s=30.0)
+    assert est.estimate(FeeTarget.MEDIUM).rate_centisat_vb == 200
+    assert est.clamp_to_min_relay_floor(50) == (100, True)
+
+
+def test_native_floor_below_the_assumed_floor_cannot_lower_the_rail():
+    # A node answering 0.4 sat/vB cannot license a bid under the 1 sat/vB
+    # OUR build gate enforces (psbt.py/revalidate.py would refuse it): the
+    # effective floor is MAX(queried, assumed).
+    client = _FloorNative({FeeTarget.FAST: 1, FeeTarget.MEDIUM: 1, FeeTarget.SLOW: 1}, floor=40)
+    est = FeeEstimator(client, ttl_s=30.0)
+    assert est.clamp_to_min_relay_floor(60) == (100, True)  # 60 > 40, still < 100
+    assert est.estimate(FeeTarget.SLOW).rate_centisat_vb == 100
+
+
+@pytest.mark.parametrize("junk", [0, -5, True, "250", 2.5, None])
+def test_native_floor_junk_answer_falls_back(junk):
+    # Trust boundary: the capability's answer is re-validated here — only a
+    # positive plain int lifts the floor; everything else fails closed to
+    # the assumed 1 sat/vB, value-free.
+    client = _FloorNative(
+        {FeeTarget.FAST: 2, FeeTarget.MEDIUM: 2, FeeTarget.SLOW: 1}, floor=junk
+    )
+    est = FeeEstimator(client, ttl_s=30.0)
+    assert est.clamp_to_min_relay_floor(99) == (100, True)
+    assert est.clamp_to_min_relay_floor(100) == (100, False)
