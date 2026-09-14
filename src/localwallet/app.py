@@ -2842,6 +2842,7 @@ def build_dispatch_table(
     scan_gate: StartupScan | None = None,
     kick_scan_fn: Callable[[], bool] | None = None,
     defer_scans: bool = False,
+    output: _Output | None = None,
 ) -> DispatchTable:
     """Build the allowlist dispatch table for the running app.
 
@@ -2916,6 +2917,10 @@ def build_dispatch_table(
             detection pass (test seam). Defaults to
             :func:`detect_local_nodes` over ``settings`` — advise-only,
             honors ``node_detection_enabled``, bounded latency (P4-001).
+        output: The mode-aware :class:`_Output` router (TCK-DIAG-003): the
+            ``broadcast_tx`` handler emits its value-free send-failure debug
+            line through ``output.warning`` (console + launch log, NEVER the
+            transcript/SSE narration). ``None`` (test seam) emits nothing.
 
     Returns:
         A :class:`~localwallet.protocol.DispatchTable` covering the whole
@@ -2972,7 +2977,7 @@ def build_dispatch_table(
             session=send_session,
         ),
         IntentName.BROADCAST_TX: _make_broadcast_tx_handler(
-            tx_flow, client, store, wallet_id, session=send_session
+            tx_flow, client, store, wallet_id, session=send_session, output=output
         ),
         IntentName.TX_STATUS: _make_tx_status_handler(
             client, tx_flow, scan_gate, store=store, wallet_id=wallet_id
@@ -6722,6 +6727,7 @@ def _make_broadcast_tx_handler(
     wallet_id: int,
     *,
     session: SendSession | None = None,
+    output: _Output | None = None,
 ) -> Handler:
     """Create the ``broadcast_tx`` handler: SIGNED record → chain backend → BROADCAST.
 
@@ -6759,7 +6765,12 @@ def _make_broadcast_tx_handler(
        ``{"error": "broadcast_failed", "detail": <scrubbed by the chain
        layer>}`` and the flow STAYS ``SIGNED`` — the signed transaction is
        kept and the user retries; recovery is a cheap GET (``tx_status``),
-       never a blind re-POST by us.
+       never a blind re-POST by us. Every send failure ALSO emits the
+       TCK-DIAG-003 value-free debug line (failure class + exception name
+       via the DIAG-001 taxonomy) to console + launch log through
+       ``output.warning`` — never the transcript/SSE channel, never the
+       tx hex or txid. ``output=None`` (test seam, direct-call harnesses)
+       emits nothing, exactly like the probe/scan debug sites.
      4. Recording: :meth:`TxFlow.broadcast` (SIGNED → BROADCAST, terminal)
         with the chain-reported txid, then the outbound transaction is
         upserted into the store's history (``height=None``,
@@ -6802,6 +6813,21 @@ def _make_broadcast_tx_handler(
         try:
             txid = client.broadcast_tx(tx_hex)
         except ChainError as exc:
+            # TCK-DIAG-003: the console/log debug companion for the friendly
+            # line below — value-free by construction (the DIAG-001 failure
+            # CLASS + exception class name from the structured ChainError;
+            # the rpc-error rung also carries its numeric CODE, a protocol
+            # constant per DIAG-002). NEVER the tx hex, never the txid, no
+            # response text, no detail string: the chain layer's canned
+            # message already rides the transcript, and a raw server body is
+            # untrusted text that never echoes anywhere. Rides
+            # ``_Output.warning`` (console + launch log; web mode never
+            # touches SSE) — the exact DIAG-001 channel and shape.
+            if output is not None:
+                fc, name, extra = _failure_parts(exc)
+                output.warning(
+                    f"broadcast: send failed [class={fc} exc={name}{extra}]"
+                )
             # TCK-CPFP-002 (deliverable 5): a failed broadcast of a STAGED
             # CPFP CHILD distinguishes an input that can never spend (the
             # hurried parent is gone — recheck fresh store truth first, the
@@ -9235,6 +9261,9 @@ class WatchKeyProvision:
     node_detect_fn: Callable[[], LocalNodeReport] | None
     output_fn: Callable[[str], None]
     wiring: _Wiring | None = None
+    #: TCK-DIAG-003: the output router threaded to :func:`_wire` so a
+    #: provisioned/replaced wiring keeps the broadcast debug companion.
+    output: _Output | None = None
 
     def provision(self, key: str, *, allow_replace: bool = False) -> dict[str, object]:
         """Parse+gate ``key`` and wire the engine ON THE ENGINE THREAD.
@@ -9301,6 +9330,7 @@ class WatchKeyProvision:
                 output_fn=self.output_fn,
                 web_mode=True,
                 replace=was_configured,
+                output=self.output,
             )
         except _WiringError as exc:
             # Store-layer failure (the ONE line is the same value-free
@@ -11627,6 +11657,7 @@ def run(
             output_fn=output,
             cli_interactive=is_interactive,
             backend_check_fn=backend_check_fn,
+            output=output,
         )
     except _WiringError as exc:
         output.error(str(exc))
@@ -11748,6 +11779,10 @@ class _Wiring:
     #: account key — construction is cheap, hwilib imports lazily inside
     #: it, and the object signs nothing on this path).
     hwi: HwiUsbSigner | None = None
+    #: The mode-aware output router (TCK-DIAG-003): kept on the wiring so
+    #: the hot-swap rebind of the ``broadcast_tx`` handler re-attaches the
+    #: console/log debug companion too (None = test seam, emits nothing).
+    output: _Output | None = dataclass_field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -12480,7 +12515,7 @@ class ChainBackendFlow:
             session=w.session,
         )
         w.table[IntentName.BROADCAST_TX] = _make_broadcast_tx_handler(
-            w.flow, client, w.store, w.wallet.id, session=w.session
+            w.flow, client, w.store, w.wallet.id, session=w.session, output=w.output
         )
         w.table[IntentName.TX_STATUS] = _make_tx_status_handler(
             client,
@@ -12562,6 +12597,7 @@ def _wire(
     web_mode: bool = False,
     backend_check_fn: Callable[[str], str | None] | None = None,
     replace: bool = False,
+    output: _Output | None = None,
 ) -> _Wiring:
     """Build store → wallet profile → chain client → watch → startup-scan
     plan → dispatch table → agent loop (moved verbatim from the pre-web
@@ -12927,6 +12963,7 @@ def _wire(
         # inline lazy scan (defer_scans=False, the documented exception).
         kick_scan_fn=scan.kick_scan,
         defer_scans=web_mode,
+        output=output,
     )
     loop = AgentLoop(generate, table)
     wiring = _Wiring(
@@ -12949,6 +12986,7 @@ def _wire(
         fee_estimator=fee_estimator,
         price_oracle=price_oracle,
         hwi=hwi_probe,
+        output=output,
     )
     # Build last so the controller sees the finished wiring it mutates (the
     # late-bound ``swap`` name above now points here for the onboarding hook).
@@ -13047,6 +13085,7 @@ def _run_web(
                 generate=generate,
                 node_detect_fn=node_detect_fn,
                 output_fn=output,
+                output=output,
             )
             held["provision"] = provision
             booted.set()
@@ -13073,6 +13112,7 @@ def _run_web(
                 node_detect_fn=node_detect_fn,
                 output_fn=output,
                 web_mode=True,
+                output=output,
             )
         except BaseException as exc:
             startup["exc"] = exc
@@ -13094,6 +13134,7 @@ def _run_web(
             node_detect_fn=node_detect_fn,
             output_fn=output,
             wiring=wiring,
+            output=output,
         )
         held["provision"] = provision
         booted.set()
