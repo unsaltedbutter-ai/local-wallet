@@ -1016,32 +1016,46 @@ def test_multi_output_plan_refused(world) -> None:
     assert flow.state is TxFlowStatus.BROADCAST
 
 
-def test_cpfp_guard_clean_refusal_zero_fee_calls(world) -> None:
-    """CPFP-001 rider: mode ``cpfp`` (grammar-live since 7e2cf40) refuses
-    at step 0.5 — BEFORE the split/consolidate branching (no assert-crash
-    on the missing ``below_size_sats``) and BEFORE any fee-estimator call
-    — with the clean value-free line."""
-    calls = len(world["recorded"])
+def test_cpfp_guard_became_the_real_conversation(world) -> None:
+    """TCK-CPFP-002 REPLACED the RBF-004 step-0.5 guard: mode ``cpfp`` now
+    conversates — it still refuses cleanly BEFORE the split/consolidate
+    branching (no crash on the missing ``below_size_sats``), still makes
+    ZERO fee-estimator calls (the honest "nothing unconfirmed" answer is
+    store truth), and the value-free ``cpfp_unavailable`` line survives
+    ONLY for the session-less direct-wiring backstop (pinned in
+    tests/test_cpfp002_conversation.py)."""
+    def fees() -> list:
+        return [r for r in world["recorded"] if "/v1/fees" in r.url.path]
+    assert fees() == []
     result = world["table"][IntentName.SELF_TRANSFER](_env("self_transfer", {"mode": "cpfp"}))
-    assert result == {"error": "cpfp_unavailable", "detail": app._CPFP_NOT_READY}
-    assert len(world["recorded"]) == calls  # zero chain calls
+    assert result == {
+        "error": "cpfp_nothing_unconfirmed",
+        "detail": app._CPFP_NOTHING_UNCONFIRMED,
+    }
+    assert fees() == []  # zero fee-estimator calls to answer
     merged = world["table"][IntentName.SELF_TRANSFER](
         _env("self_transfer", {"mode": "cpfp", "merge_coin": True})
     )
-    assert merged["error"] == "cpfp_unavailable"
+    assert merged["error"] == "cpfp_nothing_unconfirmed"
     lines: list[str] = []
     app._print_self_transfer(result, lines.append)
-    assert lines == [app._CPFP_NOT_READY]
+    assert lines == [app._CPFP_NOTHING_UNCONFIRMED]
+    assert world["flow"].state is TxFlowStatus.IDLE  # nothing staged
 
 
-def test_cpfp_guard_beats_pending_card(world) -> None:
-    """The guard runs at step 0.5 — even while a send pends, a cpfp
-    envelope gets the clean cpfp line, not the pending card."""
+def test_cpfp_while_a_send_pends_reshows_the_card(world) -> None:
+    """TCK-CPFP-002: a cpfp envelope while an ORDINARY send pends re-shows
+    the pending card (the flow-posture guard — a pending plan is never
+    silently replaced; busy posture makes zero fee-estimator calls)."""
     world["table"][IntentName.CREATE_TX](
         _env("create_tx", {"recipient": SEND_RECIPIENT, "amount_sats": 60_000, "fee_target": "slow"})
     )
+    def fees() -> list:
+        return [r for r in world["recorded"] if "/v1/fees" in r.url.path]
+    before = len(fees())
     result = world["table"][IntentName.SELF_TRANSFER](_env("self_transfer", {"mode": "cpfp"}))
-    assert result["error"] == "cpfp_unavailable"
+    assert result["error"] == "tx_pending"
+    assert len(fees()) == before
     assert world["flow"].state is TxFlowStatus.CREATED  # pending untouched
 
 

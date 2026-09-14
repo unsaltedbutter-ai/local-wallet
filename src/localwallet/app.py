@@ -216,6 +216,11 @@ from localwallet.store import (
     WalletRecord,
     superseded_states,
 )
+from localwallet.tx.cpfp import (
+    CpfpError,
+    StuckParent,
+    build_cpfp_child_plan,
+)
 from localwallet.tx.dust import dust_threshold
 from localwallet.tx.flow import (
     PENDING_TTL_S,
@@ -1335,13 +1340,101 @@ _SELF_TOO_MANY_SMALL: Final[str] = (
     "merge a share of them."
 )
 
-#: TCK-RBF-004 (CPFP-001 rider): the ``cpfp`` MODE is grammar-live but its
-#: conversation lands with CPFP-002 — the self_transfer handler's step-0.5
-#: guard answers with this clean, value-free, code-owned line (never a
-#: crash on the consolidate-shape assert, never a fee-estimator call).
+#: TCK-CPFP-002: the RBF-004 step-0.5 guard became the real conversation.
+#: This line survives for the ONE genuinely unsupported shape left: a
+#: self_transfer handler wired WITHOUT a session (a legacy direct-call
+#: wiring that cannot carry the conversation's dispatcher-owned state).
+#: Production wirings always pass the session — the value-free refusal
+#: stands as the fail-closed backstop.
 _CPFP_NOT_READY: Final[str] = (
     "Child-pays-for-parent fee bumping isn't available yet — nothing was "
     "staged or sent."
+)
+
+# --- cpfp conversation copy (TCK-CPFP-002) ----------------------------------
+#
+# Same discipline as the bump block: every line is dispatcher-owned text;
+# value-bearing figures reach the card ONLY as structured result keys
+# rendered verbatim from the pure builder's plan / the store's rows.
+
+#: The stuck-INBOUND resolver's indexed ask (deliverable 1: multiple
+#: unconfirmed inbound coins — never a guess). Copy mirrors the bump
+#: target-ask (the never-trap tail included).
+_CPFP_TARGET_HEAD: Final[str] = (
+    "You have {count} unconfirmed payments coming in — which one should I "
+    "hurry? Say a number; any other words set this aside."
+)
+#: The THREE-option menu head (deliverable 2): the hurry options ride ONLY
+#: over CONFIRMED own coins eligible as merge inputs; with none eligible
+#: the plain single-input plan is staged directly (no fake menu).
+_CPFP_OPTIONS_HEAD: Final[str] = (
+    "Your stuck payment can carry a hurry fee of its own — or one of your "
+    "confirmed coins can pay it too. Pick one:"
+)
+_CPFP_OPTIONS_TAIL: Final[str] = (
+    "Say a number, or 'smallest' / 'largest' — or name the coin's label. "
+    "Any other words set this aside."
+)
+#: The card's framing row (deliverable 3): the child-pays-for-parent
+#: explanation, and the COUNCIL MUST hedge (glm#3) in its verbatim shape —
+#: the reorg/undo hedge IS that clause; the renderer prints both lines.
+_CPFP_CARD_HEAD: Final[str] = (
+    "Child pays for parent — this new transaction spends your stuck "
+    "incoming payment and pays the fee that hurries it"
+)
+_CPFP_HEDGE_LINE: Final[str] = (
+    "Heads up: this spends a payment that hasn't confirmed yet — if that "
+    "payment is undone, this won't send"
+)
+_CPFP_PARENT_LINE: Final[str] = "Hurries: {parent_txid} — this child pays its way too"
+#: Honest package rows: with the parent's recorded fee known, the plan's
+#: integer-DOWNED package-rate FLOOR (verbatim from the builder); with it
+#: unknown, NO rate figure is ever quoted (tx/cpfp.py's bound).
+_CPFP_PACKAGE_LINE: Final[str] = (
+    "Package: at least {package_rate} sat/vB counting the payment it hurries"
+)
+_CPFP_PACKAGE_UNKNOWN: Final[str] = (
+    "The stuck payment's own fee is unknown — no package rate can be "
+    "quoted; it may confirm slower than this child's rate"
+)
+_CPFP_NOTHING_UNCONFIRMED: Final[str] = (
+    "Nothing unconfirmed is coming in right now — there is no stuck "
+    "payment to hurry."
+)
+_CPFP_ALREADY_CONFIRMED: Final[str] = (
+    "That payment already confirmed — there is nothing left to hurry."
+)
+#: Mid-conversation recheck (the RBF-004 pattern): the chosen inbound left
+#: the unconfirmed set while an ask stood open — replaced/undone.
+_CPFP_INBOUND_GONE: Final[str] = (
+    "That payment is no longer coming in — it was undone or replaced; "
+    "nothing was staged or sent."
+)
+_CPFP_COIN_GONE: Final[str] = (
+    "That coin is no longer yours to spend — nothing was staged or sent."
+)
+#: The pure builder's fee-math refusals (CpfpRefusalReason) — value-free
+#: per ADR-0012's CPFP amendment (the builder never quotes sats, and CPFP
+#: card figures come from the PLAN, never an error path).
+_CPFP_CANNOT_FUND: Final[str] = (
+    "That payment can't fund a hurry at this rate — nothing was staged or "
+    "sent. Try again when fees are lower, or ask for a slower child."
+)
+_CPFP_PLAN_FAILED: Final[str] = (
+    "The stuck payment does not add up — nothing was staged."
+)
+_CPFP_FLOW_BUSY: Final[str] = (
+    "Finish the transaction already in flight first (sign it or cancel "
+    "it), then hurry a stuck payment."
+)
+#: Broadcast-failure copy for a DEAD parent (deliverable 5): input-
+#: unspendable, classified from fresh store/chain truth by the broadcast
+#: handler. Never pitches a retry (there is nothing left to hurry) — the
+#: value-free ``broadcast_failed`` line keeps that wording for transient
+#: failures only.
+_CPFP_PARENT_GONE: Final[str] = (
+    "Not broadcast — the payment this child spends is gone (it was undone "
+    "or replaced), so this child can never send; nothing to hurry anymore."
 )
 
 # --- bump conversation copy (TCK-RBF-004) -----------------------------------
@@ -1654,6 +1747,93 @@ class _BumpPending:
     original: _BumpOriginal
 
 
+# ------------------------------------------------------------- cpfp state
+# (TCK-CPFP-002: the dispatcher-owned conversation state. Structural twin
+# of the bump block above — the child is a NEW transaction spending the
+# unconfirmed INBOUND coin, so NOTHING here touches the RBF lineage: the
+# store's lineage link is RBF-only (schema v3 semantics) and the parent
+# transaction is never replaced, only hurried.)
+
+
+@dataclass(frozen=True, slots=True)
+class _CpfpOption:
+    """One numbered option of the cpfp menu (TCK-CPFP-002 deliverable 2).
+    ``framing`` is ``"smallest"``/``"largest"``/``"coin"`` for a merge
+    option (the eligible confirmed coin it would merge — display label and
+    intercept match terms ride verbatim from the store, print-only, never
+    model-routed) or ``"plain"`` for the no-merge child (the stuck payment
+    alone, consolidated into one fresh coin — answerable by number only).
+    ``coin`` is ``None`` for the plain option."""
+
+    framing: str
+    value_sats: int | None
+    coin: PsbtInputSource | None
+    label_display: str | None
+    match_terms: tuple[str, ...]
+
+
+@dataclass
+class _CpfpAsk:
+    """An OPEN cpfp-conversation ask (TCK-CPFP-002). ``kind`` is
+    ``"coin"`` (several unconfirmed inbound payments — index the choice)
+    or ``"options"`` (the merge menu over eligible confirmed coins).
+    ``inbound`` is the resolved stuck coin an ``"options"`` ask belongs to
+    (dispatcher-owned, revalidated against a FRESH store read on the
+    answer turn — the mid-conversation recheck). ``fee_target`` carries
+    the rung the ask-opening envelope resolved so the answer re-quotes the
+    user's stated urgency instead of silently defaulting to FAST (the
+    RBF-004 fee-knob-persistence lesson). ``choice`` is the ONE field the
+    ``_run_turn`` deterministic intercept stamps when it matches an
+    answer — the cpfp envelope structurally cannot carry a coin reference
+    (no outpoint or number key exists in its params), so the CHOICE is
+    session state, code-stamped, never model-settable. Any other
+    utterance clears the ask (never-trap)."""
+
+    kind: str
+    options: tuple[_CpfpOption, ...] = ()
+    entries: tuple[dict[str, object], ...] = ()
+    inbound: PsbtInputSource | None = None
+    fee_target: str | None = None
+    choice: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CpfpPending:
+    """A staged cpfp child awaiting its lifecycle (TCK-CPFP-002): the
+    pending ``tx_ref`` it rides under, the stuck payment's ``parent_txid``
+    and outpoint it spends (the broadcast-failure classification rechecks
+    THIS coin's liveness — deliverable 5), and the plan-card display facts
+    the flow record cannot carry (``/details``-style re-shows and the
+    cpfp ``tx_pending`` re-print render from this record, verbatim)."""
+
+    tx_ref: str
+    parent_txid: str
+    inbound_txid: str
+    inbound_vout: int
+    display: Mapping[str, object]
+
+
+def _cpfp_answer(line: str, ask: _CpfpAsk) -> int | None:
+    """Deterministic answer for an OPEN cpfp ask (TCK-CPFP-002): the
+    funding-branch matcher of :func:`_bump_funding_answer` is THE shared
+    vocabulary (number / framing word / coin LABEL word, deny tokens
+    suppressed, ambiguous terms no-answered) — normalized into a
+    throwaway ``_BumpAsk`` so one matcher implementation serves both
+    conversations. The cpfp ``"coin"`` ask (index the stuck payment)
+    matches by number only, like the bump target ask. ``None`` = no
+    answer (the caller CLEARS the ask and the utterance falls through to
+    the ordinary pipeline — never-trap)."""
+    return _bump_funding_answer(
+        line,
+        _BumpAsk(
+            kind="funding" if ask.kind == "options" else "target",
+            old_txid="",
+            options=ask.options,  # type: ignore[arg-type] — duck-typed: _CpfpOption carries .framing/.match_terms
+            entries=ask.entries,
+        ),
+    )
+
+
 @dataclass
 class SendSession:
     """Per-turn send-flow context shared by the REPL and the handlers.
@@ -1702,6 +1882,16 @@ class SendSession:
     successfully broadcast replacement's txid (what arms the post-broadcast
     "faster"/"slower" rerouting). Code-owned end to end: the model can
     neither set, read, nor clear any of them.
+
+    ``cpfp_ask`` / ``cpfp_pending`` (TCK-CPFP-002) are the SAME machinery
+    for the child-pays-for-parent conversation: the OPEN coin/options ask
+    (with the fee rung and — stamped by the intercept — the chosen option,
+    since a cpfp envelope cannot carry a coin reference), and the staged
+    child's record (its spent outpoint drives the broadcast-failure
+    parent-liveness classification; its display facts re-show the cpfp
+    card while the child pends). NO lineage: the hurried parent is a
+    different, untouched transaction — the store's lineage link stays
+    RBF-only. Code-owned end to end like the bump state.
     """
 
     gate_decision: GateDecision = GateDecision.NOT_A_DECISION
@@ -1713,6 +1903,8 @@ class SendSession:
     bump_ask: _BumpAsk | None = None
     bump_pending: _BumpPending | None = None
     bump_bcast_txid: str | None = None
+    cpfp_ask: _CpfpAsk | None = None
+    cpfp_pending: _CpfpPending | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2033,6 +2225,9 @@ def build_dispatch_table(
             tx_flow,
             fee_estimator if fee_estimator is not None else FeeEstimator(client),
             scan_fn,
+            # TCK-CPFP-002: the cpfp conversation state rides the ONE
+            # session (ask supersede / staging marker / re-show record).
+            session=send_session,
             seconds_since_last_block_fn=seconds_since_last_block_fn,
             scan_gate=scan_gate,
         ),
@@ -3326,6 +3521,7 @@ def _make_self_transfer_handler(
     fee_estimator: FeeEstimator,
     scan_fn: Callable[[], object],
     *,
+    session: SendSession | None = None,
     seconds_since_last_block_fn: Callable[[], int | None] | None = None,
     scan_gate: StartupScan | None = None,
 ) -> Handler:
@@ -3370,9 +3566,31 @@ def _make_self_transfer_handler(
       mergeable wallet, never silently mix). One output to ONE fresh
       receive address, value ``total − fee``; no change.
     - The fee bid rides the SAME estimator ladder as ``create_tx``
-      (``fee_target`` rung; MEDIUM default when neither knob is given —
-      no ``fee_rate_sat_vb`` exists on this intent; an internal reshuffle
+      (``fee_target`` rung; MEDIUM default when neither knob is given — no
+      ``fee_rate_sat_vb`` exists on this intent; an internal reshuffle
       never rides the explicit-rate override).
+    - **CPFP** (TCK-CPFP-002, the ``cpfp`` mode — a separate pipeline,
+      documented at :func:`_cpfp`): unstick a stuck INBOUND payment by
+      spending its unconfirmed coin in a fresh high-fee child paying ONE
+      own fresh receive address. Money math lives in
+      :func:`~localwallet.tx.cpfp.build_cpfp_child_plan` (the ONLY fee
+      computation; the child-pays-for-parent bound + the honest
+      parent-fee-unknown shape come from its plan verbatim). Which coin is
+      stuck is engine-resolved from a FRESH store read at every dispatch
+      (the RBF-004 mid-conversation-recheck pattern — a payment that
+      confirmed or vanished while an ask stood open is answered honestly,
+      never staged against); the merge menu offers ONLY CONFIRMED own
+      coins (BIP-125-eligible inputs), labels printed verbatim for the
+      terminal and never routed through the model. The default rung is
+      FAST (asking to hurry IS a stated urgency — the RBF-004 documented
+      decision; no explicit-rate knob exists on this intent, so the fee
+      knob that must persist across an ask is the rung). The child rides
+      the SAME create→confirm→sign→broadcast state machine (dual-key +
+      device handoff untouched; ``self_payment_indices`` marks the record,
+      so the sign-time re-derivation and the label-lineage capture behave
+      exactly as for any self-transfer plan). The hurried PARENT is never
+      modified and NO lineage is written (store lineage is RBF-only; a
+      child-parent link would be new schema — not this ticket).
 
     Bounds / fail-closed (every refusal BEFORE any allocation or staging;
     a staged plan only ever reflects a fully successful build):
@@ -3434,6 +3652,496 @@ def _make_self_transfer_handler(
             return [], _store_error(exc)
         return inputs, None
 
+    def _own_sources(
+        rows: list[UtxoRecord],
+    ) -> tuple[list[tuple[PsbtInputSource, UtxoRecord]], dict[str, object] | None]:
+        """Store rows → the wallet's OWN PSBT input sources paired with
+        their rows (TCK-CPFP-002): rows without an address, a usable
+        derivation record, or a mappable script are DROPPED — a coin that
+        cannot be built into the child is never offered (the RBF-004
+        funding chooser's documented skip policy; every figure a card
+        prints stays verbatim store truth)."""
+        out: list[tuple[PsbtInputSource, UtxoRecord]] = []
+        try:
+            for row in rows:
+                if not row.address:
+                    continue
+                record = store.get_by_address(row.address)
+                if (
+                    record is None
+                    or record.wallet_id != wallet_id
+                    or record.branch not in (0, 1)
+                ):
+                    continue
+                try:
+                    script = bytes(address_to_scriptpubkey(row.address).data)
+                except Exception:  # noqa: BLE001,S112 — containment: a junk address row simply leaves the offerable set (value-free)
+                    continue
+                out.append(
+                    (
+                        PsbtInputSource(
+                            txid=row.txid,
+                            vout=row.vout,
+                            value_sats=row.value_sats,
+                            script_pubkey=script,
+                            branch=record.branch,
+                            index=record.index,
+                        ),
+                        row,
+                    )
+                )
+        except (StoreError, sqlite3.Error) as exc:
+            return [], _store_error(exc)
+        return out, None
+
+    def _cpfp(params: SelfTransferParams) -> dict[str, object]:
+        """The child-pays-for-parent conversation (TCK-CPFP-002). The
+        handler docstring's CPFP bullet is the contract; the pipeline
+        mirrors the RBF-004 bump conversation (flow-posture guards first,
+        FRESH store truth at every dispatch = the mid-conversation
+        recheck, the fee estimator touched ONLY after resolution so every
+        early refusal makes zero chain calls, asks carry the fee rung for
+        re-quoting, staging is commit-only-on-success: the flow record is
+        touched only after the full build + allocation bookkeeping)."""
+        assert session is not None  # the caller refuses session-less wirings
+
+        def _coin_ask(kind: str, **state: object) -> dict[str, object]:
+            """Install an open ask carrying the resolved fee knob (the
+            RBF-004 MAJOR lesson: the user's stated urgency survives the
+            ask — the intercept re-quotes it onto the answer envelope)."""
+            session.cpfp_ask = _CpfpAsk(kind=kind, fee_target=params.fee_target, **state)
+            if kind == "coin":
+                payload: list[dict[str, object]] = [dict(e) for e in state["entries"]]  # type: ignore[union-attr]
+            else:
+                payload = [
+                    {
+                        "index": i + 1,
+                        "framing": option.framing,
+                        "value_sats": option.value_sats,
+                        "label": option.label_display,
+                    }
+                    for i, option in enumerate(state["options"])  # type: ignore[arg-type]
+                ]
+            return {"cpfp": True, "ask": kind, "options": payload}
+
+        def _classify_gone(
+            rows: list[UtxoRecord], txid: str, vout: int
+        ) -> dict[str, object]:
+            """The chosen payment left the unconfirmed set mid-conversation:
+            CONFIRMED (a row still there, confirmed) is the honest
+            already-confirmed answer; anything else is the undone/replaced
+            answer. Neither ever stages a child."""
+            row = next(
+                (r for r in rows if r.txid.lower() == txid and r.vout == vout), None
+            )
+            if row is not None and row.confirmed == 1:
+                return {"error": "cpfp_already_confirmed", "detail": _CPFP_ALREADY_CONFIRMED}
+            return {"error": "cpfp_inbound_gone", "detail": _CPFP_INBOUND_GONE}
+
+        # 1. Flow posture (value-free, zero chain calls): past-the-gate
+        #    lifecycle states are busy (never abandon a committed plan);
+        #    any other pending is the plan-card re-show; MY staged child
+        #    re-shows AS the cpfp plan (the RBF-004 pending-guard shape).
+        if flow.state in (TxFlowStatus.CONFIRMED, TxFlowStatus.SIGNED):
+            return {"error": "cpfp_flow_busy", "detail": _CPFP_FLOW_BUSY}
+        if flow.state is TxFlowStatus.CREATED:
+            result = _tx_pending_result(
+                flow, seconds_since_last_block_fn=seconds_since_last_block_fn
+            )
+            if (
+                session.cpfp_pending is not None
+                and flow.pending is not None
+                and flow.pending.tx_ref == session.cpfp_pending.tx_ref
+            ):
+                result.update(session.cpfp_pending.display)
+            return result
+
+        # 2. Answer consumption (the deterministic intercept stamps
+        #    ``choice`` on the open ask and re-quotes the fee knob onto
+        #    this envelope). A FRESH cpfp envelope SUPERSEDES an open
+        #    unanswered ask (every refusal below leaves nothing open; a
+        #    new ask is installed only by this call's own branches).
+        prior = session.cpfp_ask
+        session.cpfp_ask = None
+        answered = prior if prior is not None and prior.choice is not None else None
+
+        # 3. Store snapshot, FRESH at every dispatch (the lazy first scan
+        #    rides the same posture as split/consolidate step 3).
+        try:
+            if store.get_sync_state(wallet_id, wallet_scan.CURSOR_KEY) is None:
+                try:
+                    scan_fn()
+                except (ChainError, wallet_scan.ScanError, WatchKeyError) as exc:
+                    # detail is scrubbed by the chain/scan layers — safe verbatim.
+                    return {"error": "chain_unavailable", "detail": str(exc)}
+            utxo_rows = store.get_utxos_for_wallet(wallet_id)
+            tx_rows = store.get_txs_for_wallet(wallet_id)
+            label_rows = store.get_coin_labels(wallet_id)
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+        all_coins, err = _own_sources(utxo_rows)
+        if err is not None:
+            return err
+        clock = int(time.time())
+        labels = {
+            (row.txid.lower(), row.vout): row for row in label_rows
+        }
+        first_seen = {row.txid: row.first_seen for row in tx_rows}
+
+        def _display(key: tuple[str, int]) -> tuple[str | None, tuple[str, ...]]:
+            """The coin's stored label (display text + intercept match
+            terms) — user data, terminal material ONLY: handler results
+            are not prompt context, and ask answers route through the
+            deterministic intercept, so label words never reach the
+            model (the RBF-004 discipline, reused verbatim)."""
+            label = labels.get(key)
+            if label is None:
+                return None, ()
+            bits = [*label.tags] + ([label.note] if label.note else [])
+            if not bits:
+                return None, ()
+            return (
+                ", ".join(f"'{bit}'" for bit in bits),
+                tuple(
+                    word for bit in bits for word in bit.lower().split() if word
+                ),
+            )
+
+        # 4. Deliverable 1: the unconfirmed INBOUND set (mempool coins
+        #    credited to own addresses), canonical ascending order
+        #    (value_sats, txid, vout) — the same determinism every other
+        #    chooser here applies.
+        inbound = sorted(
+            (pair for pair in all_coins if pair[1].confirmed == 0),
+            key=lambda p: (p[0].value_sats, p[0].txid.lower(), p[0].vout),
+        )
+        chosen: PsbtInputSource | None = None
+        if answered is not None and prior is not None and prior.kind == "options":
+            # The MENU answered: the coin the menu was opened for rides the
+            # ask (dispatcher-owned) and is revalidated against THIS fresh
+            # read — if it confirmed or was undone while the menu stood
+            # open, the honest answer replaces the plan (mid-conversation
+            # recheck; a child is never staged against a dead parent).
+            assert prior.inbound is not None
+            want = (prior.inbound.txid.lower(), prior.inbound.vout)
+            match = next(
+                (src for src, _ in inbound if (src.txid.lower(), src.vout) == want),
+                None,
+            )
+            if match is None:
+                return _classify_gone(utxo_rows, want[0], want[1])
+            chosen = match
+        elif answered is not None and prior is not None and prior.kind == "coin":
+            # The coin ask answered: the CHOSEN outpoint (stamped by the
+            # intercept from the ask's own entries — never a re-guess of
+            # position, the set may have shifted while the ask stood open)
+            # must still be an unconfirmed candidate; the mid-conversation
+            # recheck is this fresh read.
+            entry = prior.entries[prior.choice - 1]
+            want = (str(entry["txid"]), int(str(entry["vout"])))
+            match = next(
+                (src for src, _ in inbound if (src.txid.lower(), src.vout) == want),
+                None,
+            )
+            if match is None:
+                return _classify_gone(utxo_rows, want[0], want[1])
+            chosen = match
+        elif not inbound:
+            # Honest empty (deliverable 1): nothing unconfirmed coming in.
+            return {
+                "error": "cpfp_nothing_unconfirmed",
+                "detail": _CPFP_NOTHING_UNCONFIRMED,
+            }
+        elif len(inbound) == 1:
+            # Exactly one → proceed, naming it (the resolver's
+            # assume-and-name semantics; the txid reaches the card only
+            # through the staged result, verbatim).
+            chosen = inbound[0][0]
+        else:
+            # Several and nothing chosen yet: the INDEXED choice ask —
+            # amount + age + destination label, verbatim from the store
+            # (an unrecorded age says "not recorded", never invented).
+            entries = [
+                {
+                    "index": i + 1,
+                    "txid": src.txid,
+                    "vout": src.vout,
+                    "value_sats": src.value_sats,
+                    "age_s": (
+                        None
+                        if first_seen.get(src.txid) is None
+                        else max(0, clock - int(first_seen[src.txid]))
+                    ),
+                    "label": _display((src.txid.lower(), src.vout))[0],
+                }
+                for i, (src, _) in enumerate(inbound)
+            ]
+            return _coin_ask("coin", entries=tuple(entries))
+        assert chosen is not None  # every branch above resolves or returns
+
+        # 5. Deliverable 2: the merge menu — offered ONLY over CONFIRMED
+        #    own coins eligible as merge inputs (BIP-125-eligible
+        #    inputs; the inbound coin itself is unconfirmed and never in
+        #    this set). None eligible → the plain single-input plan is
+        #    built directly (no fake menu). Framing words smallest/largest
+        #    over the canonical ascending order; ONE eligible coin collapses
+        #    the merge pair to a single "coin" option — the menu never
+        #    offers the same coin twice.
+        eligible = sorted(
+            (pair for pair in all_coins if pair[1].confirmed == 1),
+            key=lambda p: (p[0].value_sats, p[0].txid.lower(), p[0].vout),
+        )
+        plain_option = _CpfpOption(
+            framing="plain",
+            value_sats=None,
+            coin=None,
+            label_display=None,
+            match_terms=(),
+        )
+        option: _CpfpOption
+        if answered is not None and prior is not None and prior.kind == "options":
+            # The menu answered (the stuck payment was revalidated in step
+            # 4): the CHOSEN option rides the ask (code-stamped index); a
+            # merge option's coin must still be an eligible CONFIRMED
+            # input in this fresh read (a coin spent elsewhere mid-ask is
+            # the honest gone answer, never a silently swapped one).
+            option = prior.options[prior.choice - 1]
+            if option.framing != "plain":
+                assert option.coin is not None
+                still = next(
+                    (
+                        src
+                        for src, _ in eligible
+                        if (src.txid.lower(), src.vout)
+                        == (option.coin.txid.lower(), option.coin.vout)
+                    ),
+                    None,
+                )
+                if still is None:
+                    return {"error": "cpfp_coin_gone", "detail": _CPFP_COIN_GONE}
+                option = replace(option, coin=still)
+        elif not eligible:
+            option = plain_option
+        else:
+            options: list[_CpfpOption] = []
+            if len(eligible) == 1:
+                src, _row = eligible[0]
+                display, terms = _display((src.txid.lower(), src.vout))
+                options.append(
+                    _CpfpOption(
+                        framing="coin",
+                        value_sats=src.value_sats,
+                        coin=src,
+                        label_display=display,
+                        match_terms=terms,
+                    )
+                )
+            else:
+                for framing, (src, _) in (("smallest", eligible[0]), ("largest", eligible[-1])):
+                    display, terms = _display((src.txid.lower(), src.vout))
+                    options.append(
+                        _CpfpOption(
+                            framing=framing,
+                            value_sats=src.value_sats,
+                            coin=src,
+                            label_display=display,
+                            match_terms=terms,
+                        )
+                    )
+            options.append(plain_option)
+            return _coin_ask("options", options=tuple(options), inbound=chosen)
+
+        # 6. Fee bid — the ONLY chain call this flow makes, and only
+        #    AFTER resolution (every refusal and ask above made zero).
+        #    FAST default (a hurry request IS a stated urgency, the
+        #    documented RBF-004 decision inherited); a stated rung rides
+        #    the shared estimator ladder. No explicit-rate knob exists on
+        #    this intent (ADR-0002: an internal reshuffle never rides the
+        #    rate override).
+        rung = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.FAST
+        try:
+            fee_rate = fee_estimator.estimate(rung).rate_centisat_vb
+        except ChainError as exc:
+            return {"error": "chain_unavailable", "detail": str(exc)}
+
+        # 7. The parent picture — honest both-or-neither (tx/cpfp.py).
+        #    A stuck inbound is normally FOREIGN (watch-only sees its
+        #    output, never its inputs) and the store keeps no vsize for
+        #    ANY row, so the ONE honest "known" shape is the transaction
+        #    this app itself last broadcast whose id IS the funding tx
+        #    (its fee and recorded ESTIMATE-vsize ride the flow's retained
+        #    record — the RBF-002/RBF-004 estimate contract, never a
+        #    measured or back-solved number).
+        parent = StuckParent(chosen.txid.lower(), None, None)
+        if (
+            flow.state is TxFlowStatus.BROADCAST
+            and flow.txid == chosen.txid.lower()
+            and flow.confirmed is not None
+        ):
+            parent = StuckParent(
+                chosen.txid.lower(),
+                flow.confirmed.fee_sats,
+                flow.confirmed.vsize,
+            )
+
+        # 8. Destination: ONE FRESH receive address (branch-0
+        #    ``next_index``) — DERIVED here, the model cannot author it
+        #    (the envelope carries no address, no outpoint, no number);
+        #    allocated only AFTER the build (create_tx step 5's
+        #    discipline, ADR-0009 self-heal).
+        try:
+            start_index = store.get_derivation(wallet_id, BRANCH_RECEIVE).next_index
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+        try:
+            destination = derive_addresses(parsed, BRANCH_RECEIVE, start_index, 1)[0]
+            dest_script = bytes(address_to_scriptpubkey(destination.address).data)
+        except Exception:  # noqa: BLE001 — containment: deriver/embit errors vary; re-raising could leak key material, and every path is value-free
+            return {"error": "internal", "detail": "fresh receive derivation failed"}
+
+        # 9. The plan — the pure CPFP-001 builder is the ONLY money math.
+        merge_coin = option.coin
+        try:
+            plan = build_cpfp_child_plan(
+                parent,
+                chosen,
+                dest_script,
+                fee_rate,
+                merge_coin=merge_coin,
+            )
+        except CpfpError as exc:
+            if exc.reason is None:
+                return {"error": "cpfp_plan_failed", "detail": _CPFP_PLAN_FAILED}
+            # Fee-math refusals are VALUE-FREE per ADR-0012's CPFP
+            # amendment (the builder never quotes sats; the reason rides a
+            # machine key, never a detail string).
+            return {
+                "error": "cpfp_cannot_fund",
+                "reason": str(exc.reason.value),
+                "detail": _CPFP_CANNOT_FUND,
+            }
+
+        # 10. Build → allocate → stage (fail-closed; the flow record is
+        #     touched ONLY after the full PSBT build and bookkeeping
+        #     succeeded). ``payment_derivations`` labels the fresh output
+        #     internal (TCK-HW-003 discipline), and ``self_payment_indices``
+        #     on the record makes the sign-time independent re-derivation
+        #     and the broadcast label-lineage hold for the child exactly
+        #     as for any self-transfer plan.
+        purpose = SCRIPT_PURPOSES[parsed.script_type]
+        try:
+            psbt, meta = build_unsigned_psbt(
+                list(plan.inputs),
+                [(dest_script, plan.output_sats)],
+                None,
+                None,
+                account_key=parsed.hd_key,
+                account_fingerprint=parsed.hd_key.my_fingerprint,
+                account_path=(purpose + 2**31, MAINNET_COIN_TYPE + 2**31, 2**31),
+                payment_derivations=[(BRANCH_RECEIVE, destination.index)],
+            )
+            psbt_base64 = psbt_to_base64(psbt)
+        except PsbtError as exc:
+            return {"error": "psbt_failed", "detail": str(exc)}
+        try:
+            store.upsert_batch(
+                [
+                    AddressRecord(
+                        wallet_id=wallet_id,
+                        branch=BRANCH_RECEIVE,
+                        index=destination.index,
+                        address=destination.address,
+                        script_type=parsed.script_type,
+                        status=ADDRESS_ALLOCATED,
+                    )
+                ]
+            )
+            store.allocate(wallet_id, BRANCH_RECEIVE, destination.index)
+            store.bump_next_index(wallet_id, BRANCH_RECEIVE)
+        except (StoreError, sqlite3.Error) as exc:
+            return _store_error(exc)
+        try:
+            if flow.state is TxFlowStatus.BROADCAST:
+                # The last broadcast's lifecycle is terminal (the parent
+                # picture, if it was THAT transaction, is already baked
+                # into the plan); the child starts its own full ride
+                # through the SAME state machine (the RBF-004 _stage
+                # precedent — ADR-0013 untouched).
+                flow.reset()
+            pending = flow.create(
+                amount_sats=plan.output_sats,
+                recipient=destination.address,
+                fee_rate_centisat_vb=fee_rate,
+                fee_sats=plan.fee_sats,
+                psbt_base64=psbt_base64,
+                inputs_count=len(plan.inputs),
+                vsize=meta.vsize,
+                fee_target=rung.value,
+                change_sats=None,
+                self_payment_indices=(destination.index,),
+            )
+        except FlowError:
+            # Unreachable single-threaded after the posture guards; fail
+            # closed with the pending card rather than double-staging.
+            return _tx_pending_result(
+                flow, seconds_since_last_block_fn=seconds_since_last_block_fn
+            )
+
+        merge_value = merge_coin.value_sats if merge_coin is not None else None
+        display = {
+            "cpfp": True,
+            "self_mode": "cpfp",
+            "cpfp_parent_txid": parent.txid,
+            "cpfp_parent_fee_known": plan.parent_fee_known,
+            "cpfp_package_fee_rate_centisat_vb": plan.package_fee_rate_centisat_vb,
+            "cpfp_merged": plan.merged,
+            "cpfp_inbound_sats": chosen.value_sats,
+            "cpfp_merge_framing": None if merge_coin is None else option.framing,
+            "cpfp_merge_value_sats": merge_value,
+            # Destinations verbatim (renderer /details material — rides the
+            # cpfp ``tx_pending`` re-show too, so the re-printed card is
+            # the SAME card, never a bare send shape).
+            "self_destinations": [
+                {"address": destination.address, "amount_sats": plan.output_sats}
+            ],
+        }
+        session.cpfp_pending = _CpfpPending(
+            pending.tx_ref, parent.txid, chosen.txid.lower(), chosen.vout, display
+        )
+        eta = _eta_for(pending.fee_target, seconds_since_last_block_fn=seconds_since_last_block_fn)
+        return {
+            "tx_ref": pending.tx_ref,
+            "amount_sats": pending.amount_sats,
+            "recipient": pending.recipient,
+            "fee_sats": pending.fee_sats,
+            "fee_rate_centisat_vb": pending.fee_rate_centisat_vb,
+            "fee_rate_display": format_sat_vb(pending.fee_rate_centisat_vb),
+            "vsize": pending.vsize,
+            "change_sats": None,
+            "inputs_count": pending.inputs_count,
+            "fee_target": pending.fee_target,
+            "expires_in_s": PENDING_TTL_S,
+            "self_transfer": True,
+            **display,
+            # Display material ONLY (terminal/renderer — never a FACTS
+            # block, never model transcript): every figure verbatim from
+            # the builder's plan / the store's row.
+            "self_parts": 1,
+            "self_each_sats": plan.output_sats,
+            "self_inputs_total_sats": chosen.value_sats + (merge_value or 0),
+            "self_new_addresses": 1,
+            # The recorded parent fee when this app broadcast the hurried
+            # payment itself (the only honest-known shape, step 7); None
+            # (foreign parent) renders the unknown-package-rate line.
+            "cpfp_parent_fee_sats": parent.fee_sats,
+            # A cpfp card never pitches the send speed-offer tail (the
+            # urgency was stated by asking to hurry; re-bumping the child
+            # is the existing bump_fee conversation's job).
+            "fee_target_defaulted": False,
+            "fee_requote": False,
+            **({} if eta is None else eta),
+        }
+
     def handler(envelope: Envelope) -> dict[str, object]:
         params = envelope.params
         if not isinstance(params, SelfTransferParams):
@@ -3444,17 +4152,18 @@ def _make_self_transfer_handler(
         if scan_gate is not None and scan_gate.first_scan_incomplete:
             return {"error": "wallet_loading", "detail": WALLET_LOADING_REFUSAL}
 
-        # 0.5 TCK-RBF-004 (CPFP-001 rider): the ``cpfp`` MODE is
-        # grammar-live (TCK-CPFP-001) but its conversation lands with
-        # CPFP-002 — refuse it HERE, step 0.5: BEFORE the
-        # split/consolidate branching (a cpfp envelope would trip the
-        # consolidate ``below_size_sats`` assert) and BEFORE any
-        # fee-estimator call (a cpfp refusal makes zero chain calls).
-        # The clean value-free line mirrors the RBF-003 ``bump_fee``
-        # not-wired precedent; the CPFP-002 ticket replaces this guard
-        # with the real child-pays flow.
+        # 0.5 TCK-CPFP-002: the ``cpfp`` MODE branches to its own
+        # conversation HERE — step 0.5, exactly where the RBF-004 guard
+        # stood: BEFORE the split/consolidate branching (a cpfp envelope
+        # would trip the consolidate ``below_size_sats`` assert), and the
+        # conversation's own refusals make ZERO fee-estimator calls. The
+        # value-free refusal survives for ONE genuinely unsupported shape:
+        # a session-less direct wiring (legacy call sites) cannot carry
+        # the conversation's dispatcher-owned state.
         if params.mode == "cpfp":
-            return {"error": "cpfp_unavailable", "detail": _CPFP_NOT_READY}
+            if session is None:
+                return {"error": "cpfp_unavailable", "detail": _CPFP_NOT_READY}
+            return _cpfp(params)
 
         # 1. Pending guard: a staged plan is never silently replaced by
         #    another destructive plan (no self-transfer re-quote; see the
@@ -4765,6 +5474,53 @@ def _make_sign_tx_handler(
     return handler
 
 
+def _cpfp_parent_gone(
+    store: Store, wallet_id: int, client: ChainClient, pending: _CpfpPending
+) -> bool:
+    """Is the hurried parent of a failed-to-broadcast cpfp child PROVEN
+    gone? (TCK-CPFP-002 deliverable 5 — the input-unspendable classifier.)
+
+    Evidence order (RBF-005's doctrine: store truth first, the chain only
+    to confirm condemnation): the coin the child spends has left our
+    unspent set on a fresh read → the scan already saw the payment undone
+    or replaced — gone. The row is still there but CONFIRMED → the
+    payment landed, the child's input is spendable, the failure was
+    something else — not gone. Still unconfirmed in the cache → ask the
+    backend (the documented recovery GET; ONE call, only ever on an
+    already-failed cpfp-child broadcast): the parent no longer exists
+    anywhere it could ride → gone; known (mempool or chain) or any other
+    answer → NOT proven gone → honest transient. A failed store read or
+    any failed/unrecognized chain answer never condemns (absence of
+    evidence is never evidence of death — the user keeps the retryable
+    ``broadcast_failed`` answer)."""
+    try:
+        rows = store.get_utxos_for_wallet(wallet_id)
+    except (StoreError, sqlite3.Error):
+        return False
+    row = next(
+        (
+            r
+            for r in rows
+            if r.txid.lower() == pending.inbound_txid and r.vout == pending.inbound_vout
+        ),
+        None,
+    )
+    if row is None:
+        return True
+    if row.confirmed == 1:
+        return False
+    try:
+        client.get_tx_status(pending.parent_txid)
+    except ChainError as exc:
+        # The RBF-005 pinned dialect: the Esplora/Bitcoind not-found
+        # surfaces as ``status 404``; other chain errors (transport, 5xx,
+        # an Electrum-dialect rejection) condemn nothing.
+        return "status 404" in str(exc)
+    except Exception:  # noqa: BLE001 — containment: an adapter surprise never condemns a parent
+        return False
+    return False
+
+
 def _make_broadcast_tx_handler(
     flow: TxFlow,
     client: ChainClient,
@@ -4852,8 +5608,30 @@ def _make_broadcast_tx_handler(
         try:
             txid = client.broadcast_tx(tx_hex)
         except ChainError as exc:
-            # detail is scrubbed by the chain layer (no txids/tx hex).
-            return {"error": "broadcast_failed", "detail": str(exc)}
+            # TCK-CPFP-002 (deliverable 5): a failed broadcast of a STAGED
+            # CPFP CHILD distinguishes an input that can never spend (the
+            # hurried parent is gone — recheck fresh store truth first, the
+            # chain's own memory only as the confirming second read) from
+            # a transient failure. The gone answer NEVER pitches a retry
+            # (the signed child can never land); the ordinary
+            # ``broadcast_failed`` kept-for-retry wording is reserved for
+            # everything the recheck cannot condemn. The recheck itself is
+            # the documented recovery GET (chain's single-POST policy:
+            # callers recover via tx_status, never via a blind re-POST);
+            # it fires ONLY on an already-failed cpfp-child broadcast, so
+            # no other flow grows a network call, and its 404 trigger is
+            # the Esplora/Bitcoind error dialect — on a backend that
+            # speaks otherwise the answer degrades honestly to transient
+            # (never a "gone" claim without evidence).
+            detail = str(exc)  # scrubbed by the chain layer (no txids/tx hex)
+            if (
+                session is not None
+                and session.cpfp_pending is not None
+                and session.cpfp_pending.tx_ref == params.tx_ref
+                and _cpfp_parent_gone(store, wallet_id, client, session.cpfp_pending)
+            ):
+                return {"error": "cpfp_parent_gone", "detail": _CPFP_PARENT_GONE}
+            return {"error": "broadcast_failed", "detail": detail}
 
         # 4. Record the transition, then the history row.
         try:
@@ -4922,6 +5700,21 @@ def _make_broadcast_tx_handler(
             else:
                 result["replaces_txid"] = bump.old_txid
                 session.bump_bcast_txid = txid
+
+        # 4c. CPFP child marker retirement (TCK-CPFP-002): this broadcast
+        #     SUCCEEDED for the staged child, so its conversation record is
+        #     done. NO lineage is written — the store's lineage link is
+        #     RBF-only (schema v3 semantics): the hurried parent is a
+        #     DIFFERENT, untouched transaction, and a child→parent link
+        #     would be new schema (not this ticket). The child's own outputs
+        #     inherit the coin labels below (``self_payment_indices`` — the
+        #     TCK-TX-SELF-001 lineage path, unchanged).
+        if (
+            session is not None
+            and session.cpfp_pending is not None
+            and session.cpfp_pending.tx_ref == params.tx_ref
+        ):
+            session.cpfp_pending = None
 
         # 5. Coin-label lineage (TCK-UTXO-001, design doc §1.3): our outputs
         #    inherit the UNION of the wallet's spent inputs' tag sets — a
@@ -10427,6 +11220,9 @@ class ChainBackendFlow:
             w.flow,
             fee_estimator,
             scan.scan_now if scan is not None else (lambda: None),
+            # TCK-CPFP-002: the SAME session object across the swap — the
+            # cpfp conversation state survives a backend hot-swap.
+            session=w.session,
             seconds_since_last_block_fn=lambda: _safe_time_since_last_block(client),
             scan_gate=scan.gate if scan is not None else None,
         )
@@ -12083,6 +12879,42 @@ def _dispatch_code_bump_turn(
     return result
 
 
+def _dispatch_code_cpfp_turn(
+    session: SendSession,
+    line: str,
+    params: SelfTransferParams,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+) -> dict[str, object]:
+    """Shared body of the deterministic cpfp-conversation answer
+    intercepts (TCK-CPFP-002, the :func:`_dispatch_code_bump_turn`
+    pattern): CODE builds the ``self_transfer`` cpfp envelope from the
+    dispatcher-owned ask state (the fee rung re-quoted from the ask; the
+    CHOICE itself is stamped on the ask record, because the closed
+    cpfp params cannot carry a coin reference or index — the model
+    therefore can neither set, read, nor clear it) and dispatches
+    straight to the self_transfer handler, whose own guards remain the
+    authority. Transcript-free like the bump dispatch: an answer may be
+    a coin LABEL word (user data — the §7.10 rule keeps labels out of
+    model context through any channel)."""
+    del line  # recorded nowhere the model sees (see docstring)
+    envelope = Envelope(v=0, intent=IntentName.SELF_TRANSFER, params=params)
+    result = table[IntentName.SELF_TRANSFER](envelope)
+    _print_turn(
+        AgentTurnResult(
+            status=AgentTurnStatus.OK,
+            envelope=envelope,
+            result=result,
+            user_message=None,
+            turns_used=0,
+        ),
+        output_fn,
+        session=session,
+    )
+    return result
+
+
 def _run_turn(
     loop: AgentLoop,
     flow: TxFlow,
@@ -12229,6 +13061,10 @@ def _run_turn(
     #   (b) After a bump BROADCASTS, a bare "faster"/"slower" routes to a
     #       NEW bump of the NEW transaction (the existing fee-target
     #       vocabulary), never to ``create_tx``.
+    # TCK-CPFP-002 adds the cpfp conversation's identical intercept for an
+    # OPEN coin/options ask (checked right after the bump block — when
+    # both conversations have an open ask, an answer-shaped utterance
+    # resolves to the bump one; any other utterance closes both).
     ask = session.bump_ask
     if ask is not None and IntentName.BUMP_FEE in table:
         choice = _bump_funding_answer(line, ask)
@@ -12247,6 +13083,34 @@ def _run_turn(
         # Any other utterance closes a live ask (never-trap) before the
         # ordinary pipeline sees it.
         session.bump_ask = None
+    # TCK-CPFP-002: the cpfp conversation's deterministic intercept — the
+    # SAME machinery BEFORE the gate and the model (the bump block above
+    # it keeps priority: at most one conversation's answer is matchable
+    # per utterance, and any non-match closes BOTH asks). An OPEN coin/
+    # options ask is answered by a number / framing word / coin LABEL
+    # word (label matched in code — the label words never reach the
+    # model); the choice is stamped on the dispatcher-owned ask record
+    # (cpfp params cannot carry a reference), the fee rung is re-quoted
+    # onto the CODE-built envelope, and dispatch goes straight to the
+    # self_transfer handler. Any OTHER utterance closes the ask
+    # (never-trap) and falls through to the ordinary pipeline unchanged.
+    cpfp_ask = session.cpfp_ask
+    if cpfp_ask is not None and IntentName.SELF_TRANSFER in table:
+        choice = _cpfp_answer(line, cpfp_ask)
+        if choice is not None:
+            cpfp_ask.choice = choice
+            cpfp_params: dict[str, object] = {"mode": "cpfp"}
+            if cpfp_ask.kind == "options":
+                cpfp_params["merge_coin"] = (
+                    cpfp_ask.options[choice - 1].framing != "plain"
+                )
+            if cpfp_ask.fee_target is not None:
+                cpfp_params["fee_target"] = cpfp_ask.fee_target
+            _dispatch_code_cpfp_turn(
+                session, line, SelfTransferParams(**cpfp_params), output_fn, table=table
+            )
+            return
+        session.cpfp_ask = None
     speed = _bump_speed_choice(line)
     if speed is not None and IntentName.BUMP_FEE in table:
         if (
@@ -12306,6 +13170,10 @@ def _run_turn(
         # while its pending lives.
         session.bump_pending = None
         session.bump_ask = None
+        # TCK-CPFP-002: same retirement for the cpfp conversation — the
+        # staged child's marker and any open ask belonged to THIS flow.
+        session.cpfp_pending = None
+        session.cpfp_ask = None
     # Narration-only ETA fact (TCK-P5-002): the mempool hint is computed
     # lazily ONLY when the flow is CREATED (the ETA fact is needed); any
     # failure degrades to no congestion adjustment, never a crash.
@@ -12917,22 +13785,219 @@ def _print_bump_fee(
         session.card_render = full
 
 
+def _print_cpfp_coin_ask(
+    result: Mapping[str, object], output_fn: Callable[[str], None]
+) -> None:
+    """The indexed stuck-payment choice ask (TCK-CPFP-002 deliverable 1):
+    amount + age + destination label, every field verbatim from the
+    store's rows (an unrecorded age says so, never invented — the bump
+    target-ask's shape and honesty). The never-trap wording rides the
+    head line itself."""
+    options = result.get("options")
+    count = len(options) if isinstance(options, list) else 0
+    output_fn(sanitize_tool_output(_CPFP_TARGET_HEAD.format(count=count)))
+    if not isinstance(options, list):  # pragma: no cover — handler-shaped
+        return
+    for entry in options:
+        if not isinstance(entry, dict):  # pragma: no cover — handler-shaped
+            continue
+        txid = str(entry.get("txid", ""))
+        short = f"{txid[:12]}…" if txid else "tx <unknown>"
+        amount = entry.get("value_sats")
+        amount_part = (
+            f"{amount:,} sats"
+            if isinstance(amount, int) and not isinstance(amount, bool)
+            else "amount not recorded"
+        )
+        age = entry.get("age_s")
+        age_part = (
+            f"~{max(1, int(age) // 60)} min old"
+            if isinstance(age, int) and not isinstance(age, bool)
+            else "age not recorded"
+        )
+        line = (
+            f"  {entry.get('index')}. {amount_part} · {age_part} · "
+            f"tx {short} vout {entry.get('vout', 0)}"
+        )
+        label = entry.get("label")
+        if isinstance(label, str) and label:
+            line += f" · labeled {label}"
+        output_fn(sanitize_tool_output(line))
+
+
+def _print_cpfp_options(
+    result: Mapping[str, object], output_fn: Callable[[str], None]
+) -> None:
+    """The THREE-option merge menu (TCK-CPFP-002 deliverable 2): the
+    smallest/largest merge options carry their coin's value and stored
+    label VERBATIM (print-only user data — answers route through the
+    deterministic intercept, never the model), then the no-merge option
+    (the plain child, consolidated into one fresh coin). Any other
+    words set the menu aside (never-trap, the tail line)."""
+    output_fn(sanitize_tool_output(_CPFP_OPTIONS_HEAD))
+    options = result.get("options")
+    if isinstance(options, list):
+        for entry in options:
+            if not isinstance(entry, dict):  # pragma: no cover — handler-shaped
+                continue
+            if entry.get("framing") == "plain":
+                output_fn(
+                    sanitize_tool_output(
+                        f"  {entry.get('index')}. no merge — just the stuck "
+                        "payment, consolidated into one fresh coin"
+                    )
+                )
+                continue
+            framing = str(entry.get("framing", "")) or "coin"
+            value = entry.get("value_sats")
+            value_part = (
+                f"{value:,} sats"
+                if isinstance(value, int) and not isinstance(value, bool)
+                else "amount not recorded"
+            )
+            line = f"  {entry.get('index')}. merge your {framing} coin — {value_part}"
+            label = entry.get("label")
+            if isinstance(label, str) and label:
+                line += f" · labeled {label}"
+            output_fn(sanitize_tool_output(line))
+    output_fn(sanitize_tool_output(_CPFP_OPTIONS_TAIL))
+
+
+def _print_cpfp_plan(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    *,
+    session: SendSession | None = None,
+) -> None:
+    """Render a staged cpfp CHILD plan card (TCK-CPFP-002 deliverable 3).
+
+    Same brief-card discipline as the bump/self-plan: the gate ask line
+    byte-identical (the dual-key wording is nobody's to change), every
+    figure verbatim from the handler result (the pure builder's plan),
+    an absent/non-int numeric key rendering the fail-closed
+    ``unavailable`` marker (TCK-SEC-004 class, never a fabricated 0).
+    The framing row (``Child pays for parent``) and the COUNCIL MUST
+    hedge ("spends a payment that hasn't confirmed yet — if that payment
+    is undone, this won't send", the reorg/undo hedge) are pinned lines.
+    The package row is honest in BOTH shapes: with the parent's recorded
+    fee known, the builder's integer-DOWNED package-rate floor; with it
+    unknown, the stated bound — never a fabricated package rate. The
+    full ``/details`` render (To/Expires/Ref) caches on ``session`` like
+    every other card."""
+    lines: list[str] = [_CARD_ASK_LINE, _CPFP_CARD_HEAD, _CPFP_HEDGE_LINE]
+    parent_txid = result.get("cpfp_parent_txid")
+    if isinstance(parent_txid, str) and parent_txid:
+        lines.append(_CPFP_PARENT_LINE.format(parent_txid=parent_txid))
+    amount = _card_sats(result, "amount_sats")
+    lines.append(f"Pay: {amount} sats — into 1 fresh coin of yours")
+    fee_sats = _card_sats(result, "fee_sats")
+    fee = "Fee: unavailable" if fee_sats is None else f"Fee: {fee_sats} sats"
+    if fee_sats is not None:
+        rate = _card_fee_rate_text(result)
+        if rate is not None:
+            fee += f" · {rate} sat/vB"
+        vsize = _card_sats(result, "vsize")
+        if vsize is not None:
+            fee += f" × {vsize} vB"
+        target_word = result.get("fee_target")
+        if isinstance(target_word, str) and target_word:
+            fee += f" · {target_word}"
+        eta_wording = result.get("eta_wording")
+        if isinstance(eta_wording, str) and eta_wording:
+            # Verbatim chain/eta.py hedge appended — never re-punctuated.
+            fee += f" — ETA {eta_wording}"
+    lines.append(fee)
+    package_rate = result.get("cpfp_package_fee_rate_centisat_vb")
+    if result.get("cpfp_parent_fee_known") is True and isinstance(
+        package_rate, int
+    ) and not isinstance(package_rate, bool):
+        # The builder's integer-DOWNED FLOOR of the combined effective
+        # rate — "at least", verbatim from the plan (never a midpoint
+        # claim, never a number this renderer computes).
+        lines.append(
+            _CPFP_PACKAGE_LINE.format(package_rate=format_sat_vb(package_rate))
+        )
+    else:
+        lines.append(_CPFP_PACKAGE_UNKNOWN)
+    if result.get("cpfp_merged") is True:
+        framing = result.get("cpfp_merge_framing")
+        merge_value = _card_sats(result, "cpfp_merge_value_sats")
+        lines.append(
+            f"+ merged with your {framing if isinstance(framing, str) and framing else 'coin'}"
+            + (f" coin ({merge_value} sats)" if merge_value is not None else " coin")
+        )
+    sources = result.get("inputs_count")
+    if isinstance(sources, int) and not isinstance(sources, bool):
+        lines.append(f"From: your wallet ({sources:,} source{'s' if sources != 1 else ''})")
+    else:
+        lines.append("From: your wallet (sources unavailable)")
+    lines.append(_CARD_DETAILS_TAIL)
+    for line in lines:
+        output_fn(sanitize_tool_output(line))
+    if session is not None:
+        # The /details full render (the brief card demotes To/Expires/Ref
+        # — the destinations are the plan's fresh receive address,
+        # verbatim, printed only here; the model never sees any of it).
+        full = lines[:-1]
+        dests = result.get("self_destinations")
+        if isinstance(dests, list):
+            for entry in dests:
+                if not isinstance(entry, dict):
+                    continue
+                addr = entry.get("address")
+                amt = entry.get("amount_sats")
+                if not isinstance(addr, str) or not addr:
+                    continue
+                if isinstance(amt, int) and not isinstance(amt, bool):
+                    full.append(f"To: {addr} ({amt} sats)")
+                else:
+                    full.append(f"To: {addr}")
+        expires = result.get("expires_in_s")
+        if isinstance(expires, int) and not isinstance(expires, bool):
+            full.append(f"Expires: ~{expires // 60} min")
+        ref = result.get("tx_ref")
+        if isinstance(ref, str) and ref:
+            # Value-free app-generated handle with its purpose (TCK-UX-014).
+            full.append(
+                f"Ref: {ref} — names this pending transaction if you ask to "
+                "cancel or reprint it before it expires."
+            )
+        session.card_render = full
+
+
 def _print_self_transfer(
     result: Mapping[str, object],
     output_fn: Callable[[str], None],
     *,
     session: SendSession | None = None,
 ) -> None:
-    """Narrate a ``self_transfer`` outcome (TCK-TX-SELF-001).
+    """Narrate a ``self_transfer`` outcome (TCK-TX-SELF-001; the ``cpfp``
+    mode's conversation branch is TCK-CPFP-002).
 
-    Success → the plan card (:func:`_print_self_plan`). The honest
+    Success → the plan card (:func:`_print_self_plan`) — or, for a cpfp
+    child, the child-pays-for-parent card (:func:`_print_cpfp_plan`); an
+    open cpfp ASK (coin choice / merge menu) prints its numbered options
+    with the store's verbatim fields (labels print-only, never model-
+    routed — the bump ask's discipline). The honest
     value-free refusals print their dispatcher-owned lines;
     ``insufficient_funds`` reuses the friendly needed/have line (user-facing
     amounts, ADR-0012 — never a log-bound detail); ``tx_pending`` re-shows
     whatever plan/send currently pends (through the same shared renderers
-    as ``create_tx``). Everything else goes through :func:`_error_line`.
+    as ``create_tx`` — a staged cpfp child re-shows AS its cpfp card).
+    Everything else goes through :func:`_error_line`.
     """
     error = result.get("error")
+    if error is None and result.get("cpfp") is True:
+        # TCK-CPFP-002: ask (coin choice / merge menu) or the staged
+        # child's plan card — the cpfp conversation's own render family.
+        ask = result.get("ask")
+        if ask == "coin":
+            _print_cpfp_coin_ask(result, output_fn)
+        elif ask == "options":
+            _print_cpfp_options(result, output_fn)
+        else:
+            _print_cpfp_plan(result, output_fn, session=session)
+        return
     if error is None:
         _print_self_plan(result, output_fn, session)
         return
@@ -12951,14 +14016,37 @@ def _print_self_transfer(
         output_fn(sanitize_tool_output(_SELF_SPLIT_BELOW_DUST))
         return
     if error == "cpfp_unavailable":
-        # TCK-RBF-004 (CPFP-001 rider): the step-0.5 guard's clean value-free
-        # line, printed verbatim (never an error dump).
+        # TCK-CPFP-002: the session-less direct-wiring backstop's clean
+        # value-free line, printed verbatim (never an error dump).
         output_fn(sanitize_tool_output(_CPFP_NOT_READY))
+        return
+    if error in (
+        "cpfp_nothing_unconfirmed",
+        "cpfp_already_confirmed",
+        "cpfp_inbound_gone",
+        "cpfp_coin_gone",
+        "cpfp_cannot_fund",
+        "cpfp_plan_failed",
+        "cpfp_flow_busy",
+    ):
+        # The cpfp conversation's honest answers ARE the UX (the bump
+        # refusals' precedent): code-owned friendly lines, printed
+        # verbatim; fee-math refusals carry the machine-readable reason
+        # as a STRUCTURED key only (their detail strings never quote
+        # values — ADR-0012 §7).
+        output_fn(sanitize_tool_output(str(result.get("detail", "")).strip()))
         return
     if error == "self_too_many_small":
         output_fn(sanitize_tool_output(_SELF_TOO_MANY_SMALL))
         return
     if error == "tx_pending":
+        if result.get("cpfp") is True:
+            # A staged cpfp child re-shown (TCK-CPFP-002): AS its cpfp
+            # card (the carried display fields + the flow record's own
+            # numbers) — never the misleading generic reshape.
+            output_fn(sanitize_tool_output(_GUIDANCE_STILL_PENDING))
+            _print_cpfp_plan(result, output_fn, session=session)
+            return
         if result.get("self_transfer") is True:
             output_fn(sanitize_tool_output(_GUIDANCE_STILL_PENDING))
             _print_self_plan(result, output_fn, session)
@@ -13456,6 +14544,13 @@ def _print_broadcast_tx(
         detail = str(result.get("detail", "")).strip()
         message = f"Not broadcast — {detail}." if detail else "Not broadcast."
         output_fn(sanitize_tool_output(message))
+        return
+    if error == "cpfp_parent_gone":
+        # TCK-CPFP-002 deliverable 5: the hurried parent is PROVEN gone —
+        # the child can never spend. The honest line replaces the kept-
+        # for-retry wording ENTIRELY (no useless retry pitch against a
+        # dead parent); nothing left is sent.
+        output_fn(sanitize_tool_output(_CPFP_PARENT_GONE))
         return
     if error == "broadcast_failed":
         detail = str(result.get("detail", "")).strip()
