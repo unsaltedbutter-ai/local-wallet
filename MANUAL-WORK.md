@@ -16,6 +16,19 @@
 
 ---
 
+## AUTONOMOUS DECISIONS — REVIEW REQUESTED (orchestrator session 2026-09-13, user away)
+
+You asked for best-judgment decisions to be logged here. Each lists the options considered and the choice made. Please comment/override when you're back.
+
+1. **Fee-fiat on the tx card → folded into TCK-FIAT-003** (your 822d73f note 4). Options: (a) separate ticket for the card Fee line fiat conversion; (b) fold into FIAT-003 since both are "fiat display ignores currency setting" bugs in the same files. **Chose (b)** — same files (app.py narration + price oracle path), one review/eval pass. If you want it split, say so.
+2. **Chat creds question added to the UX council agenda** (your 4d2bba0 note 1). The council is also ruling on how creds should be entered in chat (follow-up ask vs `user:pass@host` syntax vs pointer to web /setup). Result becomes TCK-ONB-008's design.
+3. **MW-16 "still open" items may already be fixed — please re-verify instead of re-filing:** Resync-tags survive → landed in TCK-BACKEND-002 (pin: coin_labels separate table); first-query speed → TCK-LAUNCH-003 background preload; model-absent path → TCK-LAUNCH-002 Yes/No download card + quick actions; gap_limit apply/decrease → TCK-GAP-001 (decrease stores without rescan + narrates the tradeoff). If any still misbehaves on current code (4d2bba0+), tell me the MW-id and symptom.
+4. **FEE-004 uses MAX (your correction) — confirmed, no decision needed.** The ticket says MAX(our calculated fee, node's own min-relay floor), floor queried from the backend rather than assumed.
+5. **Your three header ideas went to the UX council; two were REJECTED by both critics (arbitrated by me — override freely):** (a) master fingerprint → BUILD (ticket TCK-WEB-027, pending); (b) persistent "Coldcard connected" chip → REJECTED — the engine only learns device state at probe/sign, so a persistent chip would be stale-by-design and could read as "ready to sign" when it isn't; the honest home is the during-sign waiting state (WEB-018) with "at your last check: …" wording; (c) "Connected to evil-star.local" in the header → REJECTED — redundant with the privacy chip, collides with the header's existing "Connected" (to the local server), and can over-claim during outages; instead the host joins the privacy chip's own-node-remote subline ("Your node at <host> — private only if you trust it", ticket WEB-023). If you want any of them anyway, say so and I'll build with the council's state-matrix guardrails.
+6. **Fee-fiat note (your 822d73f #4):** the card Fee line now converts to fiat (landed with FIAT-003) — `(≈ $0.55)` style, per display currency, sats-only when no rate.
+
+---
+
 ## MW-16 round 3 (updated 2026-09-12 for the de-scope) 🔥 — re-test on the newest code
 
 State after the de-scope (TCK-DESCOPE-M3A, committed): **wallet backends = electrum or bitcoind ONLY.** Your Start9 private mempool app is NO LONGER a valid chain URL — mempool.space survives only as the public fees/prices source. If an old mempool URL is stored, startup refuses loudly naming the accepted families — just re-enter electrum or bitcoind.
