@@ -4,6 +4,8 @@ mode: subagent
 model: aspark/glm-5.3-flash
 temperature: 0.7
 reasoningEffort: high
+steps: 30
+hidden: true
 permission:
   edit: deny
   read: allow

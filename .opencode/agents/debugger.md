@@ -4,11 +4,10 @@ description: >
   fails and someone needs to sit in the loop — read output, rerun,
   make a small change, try again. Not for planning or greenfield work.
 mode: subagent
-model: cspark/qwen3.8-flash-next
+model: lspark/deepseek-v4-flash-0731
 temperature: 0.2
-reasoningEffort: xhigh
 color: "#e67e22"
-steps: 100
+steps: 40
 permission:
   edit: allow
   bash:

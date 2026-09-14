@@ -1,9 +1,9 @@
 ---
 description: Read-only correctness and maintainability review of a ticket's diff. Run before the orchestrator commits. Security is a separate agent — do not duplicate it.
 mode: subagent
-model: aspark/glm-5.3-flash
+model: lspark/deepseek-v4-flash-0731
 temperature: 0
-reasoningEffort: high
+reasoningEffort: medium
 permission:
   edit: deny
   read: allow
@@ -42,6 +42,7 @@ Rules:
 - If the diff is clean, say so plainly — do not invent findings to justify the run.
 
 Return format:
+- Families: `reviewed-by=<your family> authored-by=<implementer family from the brief>` — the orchestrator's brief names the implementing agent; echo both. A mismatch with the routing rule (you must never share a family with the author) is itself a CRITICAL finding.
 - VERDICT: APPROVE or FIX-REQUIRED (FIX-REQUIRED if any CRITICAL or MAJOR).
 - Done-when table: one line per criterion — MET / NOT MET / UNCLEAR + evidence.
 - Findings: severity-ranked list, each `SEVERITY | issue | file:line | fix direction`.

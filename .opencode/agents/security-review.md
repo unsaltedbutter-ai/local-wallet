@@ -3,7 +3,7 @@ description: Read-only security review of a diff against the AGENTS.md invariant
 mode: subagent
 model: aspark/glm-5.3-flash
 temperature: 0
-reasoningEffort: xhigh
+reasoningEffort: high
 permission:
   edit: deny
   read: allow
