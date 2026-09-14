@@ -1498,6 +1498,170 @@ _CPFP_PARENT_GONE: Final[str] = (
     "or replaced), so this child can never send; nothing to hurry anymore."
 )
 
+# --- consolidation conversation copy (TCK-CONS-001) -------------------------
+#
+# The roll-up and the asks are CODE-RENDERED, deterministic views of the
+# store's rows (per-tag count + sats; ascending coin lists). Label/tag words
+# are matched HERE in code — the user's consolidation utterances are
+# intercepted BEFORE the model sees them, so a tag/label word never routes
+# through the model (the RBF-004 lesson generalized from ask ANSWERS to the
+# conversation's OPENING; §7.10). Amounts/labels print verbatim, store-side;
+# nothing here enters FACTS or the transcript.
+
+#: The label roll-up ask (deliverable 1): one row per non-empty tag group
+#: (canonical COIN_TAGS order, the unlabeled group last), count + sats
+#: computed by code from the store's rows.
+_CONS_ROLLUP_HEAD: Final[str] = (
+    "Here is how your coins are labeled — which group should I consolidate? "
+    "Say a label or its number; any other words set this aside."
+)
+_CONS_ROLLUP_ROW: Final[str] = "  {index}. {tag} — {coins} coin{s} · {sats:,} sats"
+_CONS_ROLLUP_UNLABELED: Final[str] = "(unlabeled)"
+
+#: The count ask (deliverable 2): "1 coin or N?" over the chosen label's
+#: coins. The tag's total is code-computed; both figures ride verbatim.
+_CONS_COUNT_HEAD: Final[str] = (
+    "You marked {coins} coin{s} {tag} — {sats:,} sats together. "
+)
+_CONS_COUNT_ASK: Final[str] = (
+    "Consolidate all {coins} into one new coin, or just 1 of them? Say "
+    "'all', '{coins}' or '1'; any other words set this aside."
+)
+
+#: The no-label path (deliverable 3): ascending UTXO list — amount, label,
+#: confirm-state — selected by the CHAT-001 registry number (stable, never
+#: positional; coins sharing an address share its number, and a number pick
+#: takes every coin listed under it).
+_CONS_LIST_HEAD: Final[str] = (
+    "Your coins, smallest first — say the NUMBER to pick (any other words "
+    "set this aside):"
+)
+_CONS_LIST_ROW: Final[str] = "  #{number}. {sats:,} sats · {label} · {state}"
+_CONS_LIST_NO_LABEL: Final[str] = "no label"
+
+#: The resolution restatement (the CHAT-001 glm#7 invariant): every number
+#: resolution prints the FULL address before anything is planned.
+_CONS_RESOLVED: Final[str] = "Coin #{number} at {address} — {sats:,} sats."
+_CONS_EMPTY: Final[str] = "You have no coins to consolidate yet."
+_CONS_COIN_GONE: Final[str] = (
+    "A coin you picked is no longer yours to spend — nothing was staged "
+    "or sent."
+)
+
+#: The consolidation plan echo (deliverable 4): the conversation's card line,
+#: built by the renderer from the staged result's OWN ``inputs_count`` /
+#: ``amount_sats`` (engine-computed totals, quote-verbatim) — never a
+#: promise of what the plan will be. ``Merge``/``UTXO(s)`` pluralities are
+#: the renderer's; the figures are the record's.
+_CONS_PLAN_LINE: Final[str] = (
+    "Merge {sources} UTXO{s} to create one new UTXO of {amount:,} sats"
+)
+
+#: Closed-set tag words the deterministic opener/intercept match (the
+#: §1.4 vocabulary + honest display synonyms; user data stays in code).
+_CONS_TAG_TERMS: Final[dict[str, tuple[str, ...]]] = {
+    "kyc": ("kyc",),
+    "exchange": ("exchange",),
+    "p2p": ("p2p", "peer"),
+    "purchase": ("purchase",),
+    "consolidation": ("consolidation",),
+}
+_CONS_UNLABELED_TERMS: Final[tuple[str, ...]] = ("unlabeled", "unlabelled")
+
+#: The opener's conservative phrase shape: a consolidation VERB plus a
+#: consolidation OBJECT word, and NO bare digit (an explicit
+#: "…under 100000 sats" threshold stays on the existing TX-SELF-001 model
+#: route — the golden phrasings are untouched).
+_CONS_VERBS: Final[frozenset[str]] = frozenset(
+    {
+        "consolidate",
+        "consolidates",
+        "consolidating",
+        "merge",
+        "merges",
+        "merging",
+        "sweep",
+        "sweeps",
+        "sweeping",
+    }
+)
+_CONS_OBJECT_TERMS: Final[frozenset[str]] = frozenset(
+    {
+        "coin",
+        "coins",
+        "utxo",
+        "utxos",
+        "dust",
+        "ones",
+        "wallet",
+        "funds",
+        "everything",
+        "all",
+        "small",
+        "labeled",
+        "unlabeled",
+        "unlabelled",
+    }
+)
+
+#: The count ask's answer vocabulary ("all 4"/"4" merge the group; "1"
+#: opens the list to pick a single coin). A hit on BOTH sets is ambiguous.
+_CONS_ALL_TERMS: Final[frozenset[str]] = frozenset(
+    {"all", "everything", "both", "them", "lot", "total", "entire", "yes", "merge", "merging"}
+)
+_CONS_ONE_TERMS: Final[frozenset[str]] = frozenset({"1", "one", "single", "lone"})
+
+#: Fee-rung phrases the opener parses IN CODE (the RBF-004 MAJOR lesson:
+#: the stated knob must survive every ask intercept — it rides the ask
+#: record and is re-quoted onto the code-built envelope). "no hurry"/
+#: "not urgent" carry deny-shaped words ("no"/"not") that must NOT
+#: suppress the opener — the phrase is checked first.
+_CONS_SLOW_PHRASES: Final[tuple[str, ...]] = ("no hurry", "not urgent", "slowly", "slow", "cheap")
+_CONS_FAST_PHRASES: Final[tuple[str, ...]] = ("asap", "urgent", "hurry", "faster", "fast", "quick")
+
+
+def _consolidation_intent(line: str) -> tuple[str | None, str | None] | None:
+    """Deterministic consolidation-opener match (TCK-CONS-001, BEFORE the
+    model sees the line): ``None`` = not a consolidation opener (ordinary
+    pipeline), else ``(tag, fee_target)`` where ``tag`` is a closed-set id,
+    ``""`` for the unlabeled path, or ``None`` for the label roll-up, and
+    ``fee_target`` is the rung the user's words named (``None`` = the
+    engine's MEDIUM default, unchanged). Any deny token suppresses the
+    intercept (the HW-005 slice-C review-MEDIUM rule) — except inside a
+    matched slow-rung phrase ("no hurry" is an urgency, not a refusal).
+    A line carrying a bare digit is NOT intercepted: an explicit size
+    threshold stays on the existing model route (golden phrasings
+    preserved). ponytail: word-set matching — "merge my notes about
+    coins" style collisions ride the never-trap; the card remains the
+    authority on what any plan actually spends."""
+    words = [w for w in (t.strip(punctuation) for t in line.lower().split()) if w]
+    if not words or not any(w in _CONS_VERBS for w in words):
+        return None
+    if not any(w in _CONS_OBJECT_TERMS for w in words):
+        return None
+    if any(w.isdigit() for w in words):
+        return None
+    joined = " ".join(words)
+    fee: str | None = None
+    # SLOW phrases are checked FIRST and win: "no hurry" contains the fast
+    # trigger "hurry" — the negated phrase is the urgency, not its word.
+    if any(p in joined for p in _CONS_SLOW_PHRASES):
+        fee = "slow"
+    elif any(p in joined for p in _CONS_FAST_PHRASES):
+        fee = "fast"
+    # A deny token suppresses the intercept (HW-005 slice-C rule) — except
+    # the deny-shaped word INSIDE a matched slow phrase ("no hurry"/"not
+    # urgent" are urgencies, not refusals).
+    if fee != "slow" and any(w in _BUMP_DENY_TOKENS for w in words):
+        return None
+    if any(w in _CONS_UNLABELED_TERMS for w in words):
+        return "", fee
+    for tag, terms in _CONS_TAG_TERMS.items():
+        if any(w in terms for w in words):
+            return tag, fee
+    return None, fee
+
+
 # --- bump conversation copy (TCK-RBF-004) -----------------------------------
 #
 # Every line is dispatcher-owned text (the model never authors it; the
@@ -1895,6 +2059,446 @@ def _cpfp_answer(line: str, ask: _CpfpAsk) -> int | None:
     )
 
 
+# ------------------------------------------------- consolidation state
+# (TCK-CONS-001: the dispatcher-owned consolidation conversation. The
+# structural twin of the cpfp block: the plan rides the EXISTING
+# ``self_transfer`` consolidate mode — no new intent, no envelope key ever
+# carries a coin reference; the picked coins live ONLY on this session
+# record, code-stamped, and the handler revalidates them against a fresh
+# store read at staging time.)
+
+
+@dataclass(frozen=True, slots=True)
+class _ConsRow:
+    """One label group of the roll-up ask: the closed-set ``tag`` (``""`` =
+    the unlabeled group), its display word + intercept match terms, and the
+    group's coin dicts (``value_sats``/``txid``/``vout``/``address``/
+    ``confirmed``/``label`` — all store-truth fields; label text is
+    print-only user data, the §7.10 discipline)."""
+
+    tag: str
+    display: str
+    match_terms: tuple[str, ...]
+    value_sats: int
+    coins: tuple[dict[str, object], ...]
+
+
+@dataclass
+class _ConsAsk:
+    """An OPEN consolidation-conversation ask. ``kind`` is ``"rollup"``
+    (pick a label group), ``"count"`` ("1 coin or N?" over the group), or
+    ``"list"`` (the ascending coin list, answered by CHAT-001 registry
+    NUMBER). ``fee_target`` carries the rung the opener's words resolved so
+    every later intercept re-quotes it instead of silently defaulting (the
+    RBF-004 MAJOR lesson, applied to this conversation's multi-step asks:
+    the knob AND the label group persist across every intercept). ``choice``
+    /``picked`` are the ONE fields the deterministic intercept stamps when
+    the final answer dispatches — consolidate params carry a
+    threshold-only number the ENGINE computed, never a coin reference."""
+
+    kind: str
+    rows: tuple[_ConsRow, ...] = ()
+    entries: tuple[dict[str, object], ...] = ()
+    label_display: str | None = None
+    fee_target: str | None = None
+    choice: int | None = None
+    picked: tuple[dict[str, object], ...] = ()
+    wallet_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ConsPending:
+    """A staged consolidation plan awaiting its lifecycle (TCK-CONS-001):
+    the pending ``tx_ref`` it rides under. On a SUCCESSFUL broadcast the
+    handler annotates the plan's own outputs (the §1.3 union inheritance
+    already runs for every self-transfer; this record adds the
+    ``consolidation`` tag + the "consolidated from N outputs" note on top —
+    N counted from the broadcast's own inputs, never from user text)."""
+
+    tx_ref: str
+
+
+def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
+    """Deterministic answer for an OPEN consolidation ask (the never-trap
+    discipline shared with :func:`_bump_funding_answer`: deny tokens
+    suppress, an ambiguous or absent match returns ``None`` and the caller
+    CLEARS the ask). Kind-shaped result:
+    ``"rollup"`` → the 1-based ROW (number or unique tag word);
+    ``"count"`` → ``1`` (pick a single coin) or ``2`` (merge them all —
+    "all"/the literal count digit);
+    ``"list"`` → the chosen CHAT-001 registry NUMBER itself (never a row
+    position — the council invariant), answering only when every digit in
+    the line names one known number."""
+    words = [w for w in (t.strip(punctuation) for t in line.lower().split()) if w]
+    if not words or any(w in _BUMP_DENY_TOKENS for w in words):
+        return None
+    if ask.kind == "rollup":
+        first = words[0]
+        if first.isdigit():
+            return int(first) if 1 <= int(first) <= len(ask.rows) else None
+        term_to_row: dict[str, int] = {}
+        ambiguous: set[str] = set()
+        for i, row in enumerate(ask.rows):
+            for term in row.match_terms:
+                if term_to_row.get(term) not in (None, i + 1):
+                    ambiguous.add(term)
+                term_to_row[term] = i + 1
+        hits = {
+            term_to_row[w] for w in words if w in term_to_row and w not in ambiguous
+        }
+        return hits.pop() if len(hits) == 1 else None
+    if ask.kind == "count":
+        ws = set(words)
+        one = bool(ws & _CONS_ONE_TERMS)
+        allt = bool(ws & _CONS_ALL_TERMS) or (
+            words[0].isdigit() and int(words[0]) == len(ask.entries)
+        )
+        if one and not allt:
+            return 1
+        if allt and not one:
+            return 2
+        return None
+    # kind == "list": the registry number is the referent (coins at one
+    # address share its number and are all picked with it).
+    digits = {int(w) for w in words if w.isdigit()}
+    known = {int(str(e["number"])) for e in ask.entries}
+    if len(digits) == 1 and digits <= known:
+        return digits.pop()
+    return None
+
+
+def _print_cons_ask(ask: _ConsAsk, output_fn: Callable[[str], None]) -> None:
+    """Render an open consolidation ask (code-rendered, deterministic;
+    every figure verbatim from the store rows the ask carries — label text
+    is print-only, handler-free, never model-bound)."""
+    if ask.kind == "rollup":
+        output_fn(sanitize_tool_output(_CONS_ROLLUP_HEAD))
+        for i, row in enumerate(ask.rows):
+            output_fn(
+                sanitize_tool_output(
+                    _CONS_ROLLUP_ROW.format(
+                        index=i + 1,
+                        tag=row.display,
+                        coins=len(row.coins),
+                        s="s" if len(row.coins) != 1 else "",
+                        sats=row.value_sats,
+                    )
+                )
+            )
+        return
+    if ask.kind == "count":
+        coins = len(ask.entries)
+        total = sum(int(str(e["value_sats"])) for e in ask.entries)
+        output_fn(
+            sanitize_tool_output(
+                _CONS_COUNT_HEAD.format(
+                    coins=coins,
+                    s="s" if coins != 1 else "",
+                    tag=f"'{ask.label_display or _CONS_ROLLUP_UNLABELED}'",
+                    sats=total,
+                )
+                + _CONS_COUNT_ASK.format(coins=coins)
+            )
+        )
+        return
+    output_fn(sanitize_tool_output(_CONS_LIST_HEAD))
+    for entry in ask.entries:
+        confirmed = entry.get("confirmed")
+        label = entry.get("label")
+        output_fn(
+            sanitize_tool_output(
+                _CONS_LIST_ROW.format(
+                    number=entry.get("number"),
+                    sats=int(str(entry["value_sats"])),
+                    label=(
+                        # the stored display text already quotes its bits
+                        # (the CPFP `_display` shape) — printed VERBATIM.
+                        label
+                        if isinstance(label, str) and label
+                        else _CONS_LIST_NO_LABEL
+                    ),
+                    state="confirmed" if confirmed == 1 else "unconfirmed",
+                )
+            )
+        )
+
+
+def _consolidation_coin_rows(
+    store: Store, wallet_id: int
+) -> tuple[dict[str, object], ...]:
+    """The wallet's coins as consolidation-list dicts, canonical ASCENDING
+    order ``(value_sats, txid, vout)`` — the one deterministic order every
+    chooser in this app uses. Label display text joins the stored tags +
+    note verbatim (print-only); ``tags`` rides the raw closed-set ids for
+    the roll-up grouping (code data, never a narration leak — nothing here
+    reaches a prompt: the ask renderer prints, the model never sees)."""
+    utxos = store.get_utxos_for_wallet(wallet_id)
+    labels = {
+        (row.txid.lower(), row.vout): row for row in store.get_coin_labels(wallet_id)
+    }
+    coins: list[dict[str, object]] = []
+    for row in sorted(utxos, key=lambda u: (u.value_sats, u.txid.lower(), u.vout)):
+        label = labels.get((row.txid.lower(), row.vout))
+        tags = tuple(label.tags) if label is not None else ()
+        bits = [*tags, *([label.note] if label is not None and label.note else [])]
+        coins.append(
+            {
+                "txid": row.txid,
+                "vout": row.vout,
+                "value_sats": row.value_sats,
+                "address": row.address,
+                "confirmed": row.confirmed,
+                "tags": tags,
+                "label": ", ".join(f"'{bit}'" for bit in bits) if bits else None,
+            }
+        )
+    return tuple(coins)
+
+
+def _cons_rollup_rows(
+    coins: tuple[dict[str, object], ...]
+) -> tuple[_ConsRow, ...]:
+    """The per-tag count + sats roll-up (deliverable 1, code-computed):
+    COIN_TAGS canonical order, a coin counts in EVERY tag group it carries
+    (union-tagged coins are honestly in both groups — display-only), and
+    the unlabeled group last (no row / no tags). Empty groups are omitted."""
+    rows: list[_ConsRow] = []
+    for tag in COIN_TAGS:
+        group = tuple(c for c in coins if tag in (c.get("tags") or ()))
+        if group:
+            rows.append(
+                _ConsRow(
+                    tag=tag,
+                    display=tag,
+                    match_terms=_CONS_TAG_TERMS[tag],
+                    value_sats=sum(int(str(c["value_sats"])) for c in group),
+                    coins=group,
+                )
+            )
+    unlabeled = tuple(c for c in coins if not (c.get("tags") or ()))
+    if unlabeled:
+        rows.append(
+            _ConsRow(
+                tag="",
+                display=_CONS_ROLLUP_UNLABELED,
+                match_terms=_CONS_UNLABELED_TERMS,
+                value_sats=sum(int(str(c["value_sats"])) for c in unlabeled),
+                coins=unlabeled,
+            )
+        )
+    return tuple(rows)
+
+
+def _run_consolidation_turn(
+    session: SendSession,
+    store: Store,
+    flow: TxFlow,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+) -> bool:
+    """One consolidation-conversation turn (TCK-CONS-001), run BEFORE the
+    gate and the model exactly like the hardware/bump/cpfp intercepts:
+    ``True`` = consumed (the turn ends here; the line is NEVER added to the
+    model transcript — tag/label words are intercepted before the model
+    sees them, the RBF-004 lesson applied to the conversation's opening).
+
+    State machine (dispatcher-owned, mirrors ``_CpfpAsk``):
+    ``rollup`` (pick a label) → ``count`` ("1 coin or N?") → optional
+    ``list`` (ascending UTXO list, CHAT-001 registry number pick) →
+    dispatch. The final answer stamps ``choice``/``picked`` on the ask and
+    CODE builds the ``self_transfer`` consolidate envelope (params carry
+    ONLY the engine-computed threshold + the persisted fee rung — never a
+    coin reference); the handler consumes the ask and revalidates every
+    picked coin against a FRESH store read (the mid-conversation recheck).
+    A group of exactly one coin answers the count ask by construction and
+    goes straight to the plan (no fake question — the CPFP-002 collapse
+    discipline). Any unmatched utterance CLEARS the ask (never-trap) and
+    the line falls through to the ordinary pipeline."""
+    ask = session.cons_ask
+    if ask is not None:
+        choice = _cons_answer(line, ask)
+        if choice is None:
+            session.cons_ask = None  # never-trap
+            return False
+        if ask.kind == "rollup":
+            row = ask.rows[choice - 1]
+            if row.tag == "":
+                return _cons_open_list(
+                    session, store, ask.wallet_id, row.coins, ask.fee_target, output_fn
+                )
+            if len(row.coins) == 1:
+                return _cons_finalize(
+                    session, row.coins, ask.fee_target, line, output_fn, table=table
+                )
+            session.cons_ask = _ConsAsk(
+                kind="count",
+                entries=row.coins,
+                label_display=row.display,
+                fee_target=ask.fee_target,
+                wallet_id=ask.wallet_id,
+            )
+            _print_cons_ask(session.cons_ask, output_fn)
+            return True
+        if ask.kind == "count":
+            if choice == 1:
+                return _cons_open_list(
+                    session, store, ask.wallet_id, ask.entries, ask.fee_target, output_fn
+                )
+            return _cons_finalize(
+                session, ask.entries, ask.fee_target, line, output_fn, table=table
+            )
+        picked = tuple(
+            e for e in ask.entries if int(str(e["number"])) == choice
+        )
+        # The CHAT-001 invariant: every resolution RESTATES the FULL
+        # address(es) before anything is planned (never number-only).
+        for entry in picked:
+            output_fn(
+                sanitize_tool_output(
+                    _CONS_RESOLVED.format(
+                        number=choice,
+                        address=entry.get("address"),
+                        sats=int(str(entry["value_sats"])),
+                    )
+                )
+            )
+        return _cons_finalize(session, picked, ask.fee_target, line, output_fn, table=table)
+
+    # --- the opener (BEFORE the model; conservative phrase match) ---
+    if flow.state in (
+        TxFlowStatus.CREATED,
+        TxFlowStatus.CONFIRMED,
+        TxFlowStatus.SIGNED,
+    ):
+        return False  # gate territory (the pending card owns this turn)
+    intent = _consolidation_intent(line)
+    if intent is None:
+        return False
+    tag, fee_target = intent
+    try:
+        wallet = store.get_active_wallet()
+        if wallet is None:
+            return False
+        if store.get_sync_state(wallet.id, wallet_scan.CURSOR_KEY) is None:
+            return False  # never scanned: the model route's lazy scan answers honestly
+        coins = _consolidation_coin_rows(store, wallet.id)
+    except (StoreError, sqlite3.Error):
+        return False  # sugar never crashes a turn; the ordinary pipeline continues
+    if not coins:
+        output_fn(sanitize_tool_output(_CONS_EMPTY))
+        return True
+    if tag == "":
+        unlabeled = tuple(c for c in coins if not (c.get("tags") or ()))
+        if not unlabeled:
+            output_fn(sanitize_tool_output(_CONS_EMPTY))
+            return True
+        return _cons_open_list(
+            session, store, wallet.id, unlabeled, fee_target, output_fn
+        )
+    if tag is not None:
+        group = tuple(c for c in coins if tag in (c.get("tags") or ()))
+        if not group:
+            output_fn(sanitize_tool_output(_CONS_EMPTY))
+            return True
+        if len(group) == 1:
+            return _cons_finalize(session, group, fee_target, line, output_fn, table=table)
+        session.cons_ask = _ConsAsk(
+            kind="count",
+            entries=group,
+            label_display=tag,
+            fee_target=fee_target,
+            wallet_id=wallet.id,
+        )
+        _print_cons_ask(session.cons_ask, output_fn)
+        return True
+    rows = _cons_rollup_rows(coins)
+    session.cons_ask = _ConsAsk(
+        kind="rollup", rows=rows, fee_target=fee_target, wallet_id=wallet.id
+    )
+    _print_cons_ask(session.cons_ask, output_fn)
+    return True
+
+
+def _cons_open_list(
+    session: SendSession,
+    store: Store,
+    wallet_id: int | None,
+    coins: tuple[dict[str, object], ...],
+    fee_target: str | None,
+    output_fn: Callable[[str], None],
+) -> bool:
+    """Install the ascending-list ask, numbering every shown address
+    through the sanctioned registry writer (TCK-CHAT-001: showing IS the
+    registration act — ``note_address_shown`` is idempotent MAX+1, so a
+    first-ever showing gets its stable wallet-lifetime number and every
+    later showing keeps it; no row is ever unnumbered, no dead end). A
+    registry write failure clears the ask and releases the line to the
+    ordinary pipeline (never-trap; the model never sees label data here —
+    a list ANSWER is a bare number, an opener line is closed-set words)."""
+    if wallet_id is None:
+        session.cons_ask = None
+        return False
+    try:
+        entries: list[dict[str, object]] = []
+        for coin in coins:
+            address = coin.get("address")
+            if not isinstance(address, str) or not address:
+                # A wallet coin without an address row is a store-shape
+                # surprise, not a list candidate: stand the conversation
+                # aside (fail closed, never a half-numbered ask).
+                session.cons_ask = None
+                return False
+            record = store.note_address_shown(wallet_id, address)
+            entries.append({**coin, "number": record.number})
+    except (StoreError, sqlite3.Error):
+        session.cons_ask = None
+        return False
+    session.cons_ask = _ConsAsk(
+        kind="list", entries=tuple(entries), fee_target=fee_target, wallet_id=wallet_id
+    )
+    _print_cons_ask(session.cons_ask, output_fn)
+    return True
+
+
+def _cons_finalize(
+    session: SendSession,
+    coins: tuple[dict[str, object], ...],
+    fee_target: str | None,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+) -> bool:
+    """The answer that plans: stamp the dispatcher-owned coins on the ask
+    (the envelope itself carries NO coin reference — only the engine's own
+    threshold ``max(values)+1`` and the persisted rung) and dispatch
+    straight to the ``self_transfer`` handler, whose fresh-store revalidation
+    and flow guards remain the authority. Transcript-free like every
+    consolidation turn."""
+    values = [int(str(c["value_sats"])) for c in coins]
+    params_kwargs: dict[str, object] = {
+        "mode": "consolidate",
+        "below_size_sats": max(values) + 1,
+    }
+    if fee_target is not None:
+        params_kwargs["fee_target"] = fee_target
+    session.cons_ask = _ConsAsk(
+        kind="final", entries=coins, picked=coins, choice=1, fee_target=fee_target
+    )
+    try:
+        _dispatch_code_self_turn(
+            session, line, SelfTransferParams(**params_kwargs), output_fn, table=table
+        )
+    finally:
+        # The handler consumes the answered ask; this covers every path
+        # that returned before consumption (the scan gate) — a stale
+        # answered ask must never re-dispatch on a later utterance.
+        session.cons_ask = None
+    return True
+
+
 @dataclass
 class SendSession:
     """Per-turn send-flow context shared by the REPL and the handlers.
@@ -1953,6 +2557,16 @@ class SendSession:
     card while the child pends). NO lineage: the hurried parent is a
     different, untouched transaction — the store's lineage link stays
     RBF-only. Code-owned end to end like the bump state.
+
+    ``cons_ask`` / ``cons_pending`` (TCK-CONS-001) are the consolidation
+    conversation's twin: the OPEN rollup/count/list ask (the label group,
+    the fee rung and — stamped by the intercept — the picked coins all
+    ride the dispatcher-owned record; consolidate params carry only the
+    engine-computed threshold), and the staged plan's ``tx_ref`` marker
+    (a successful broadcast adds the ``consolidation`` tag + the
+    "consolidated from N outputs" note to the plan's own outputs ON TOP of
+    the existing §1.3 union inheritance, then retires). Code-owned end to
+    end: the model can neither set, read, nor clear either.
     """
 
     gate_decision: GateDecision = GateDecision.NOT_A_DECISION
@@ -1966,6 +2580,8 @@ class SendSession:
     bump_bcast_txid: str | None = None
     cpfp_ask: _CpfpAsk | None = None
     cpfp_pending: _CpfpPending | None = None
+    cons_ask: _ConsAsk | None = None
+    cons_pending: _ConsPending | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3957,6 +4573,23 @@ def _make_self_transfer_handler(
       exactly as for any self-transfer plan). The hurried PARENT is never
       modified and NO lineage is written (store lineage is RBF-only; a
       child-parent link would be new schema — not this ticket).
+    - **CONSOLIDATION CONVERSATION** (TCK-CONS-001, the dispatcher-owned
+      twin of the cpfp asks — the conversation opens and advances in
+      :func:`_run_consolidation_turn`, BEFORE the gate and the model, so
+      label/tag words never route through the model). When a consolidate
+      envelope answers an OPEN ask (the intercept stamps ``choice`` +
+      ``picked`` on the session record — params carry only the engine's
+      own max+1 threshold, never a coin reference), step 1.5 consumes the
+      ask and the picked outpoints are revalidated against THIS fresh
+      store read: a coin that vanished while the ask stood open is the
+      honest ``cons_coin_gone`` answer, never a silently swapped set.
+      Without an answered ask the threshold/pool policy above is
+      byte-unchanged (the golden model-routed phrasings keep their
+      direct-plan behavior). A staged conversation plan carries
+      ``cons_merge`` (plan-echo card line) and arms the broadcast-time
+      annotation: the §1.3 union inheritance PLUS the closed-set
+      ``consolidation`` tag and the "consolidated from N outputs" note,
+      N counted from the broadcast's own inputs.
 
     Bounds / fail-closed (every refusal BEFORE any allocation or staging;
     a staged plan only ever reflects a fully successful build):
@@ -4534,11 +5167,39 @@ def _make_self_transfer_handler(
         # 1. Pending guard: a staged plan is never silently replaced by
         #    another destructive plan (no self-transfer re-quote; see the
         #    docstring). Past-the-gate states stay refused (flow.create's
-        #    own FlowError backstops, same shape as create_tx).
+        #    own FlowError backstops, same shape as create_tx). A staged
+        #    consolidation (TCK-CONS-001) re-shows WITH its plan-echo
+        #    marker (the same card it was confirmed on, never a bare
+        #    reshape the user did not read).
         if flow.state is TxFlowStatus.CREATED:
-            return _tx_pending_result(
+            result = _tx_pending_result(
                 flow, seconds_since_last_block_fn=seconds_since_last_block_fn
             )
+            if (
+                session is not None
+                and session.cons_pending is not None
+                and flow.pending is not None
+                and flow.pending.tx_ref == session.cons_pending.tx_ref
+            ):
+                result["cons_merge"] = True
+            return result
+
+        # 1.5 TCK-CONS-001: consume the consolidation conversation's ask
+        #     BEFORE any work (the CPFP-002 step-2 discipline — every
+        #     path after this point leaves nothing open). Only an ANSWERED
+        #     ask (choice + picked, both code-stamped by the deterministic
+        #     intercept — the model can neither set nor read them) steers
+        #     the inputs; a FRESH envelope supersedes an unanswered ask.
+        cons_picked: tuple[dict[str, object], ...] | None = None
+        if session is not None and session.cons_ask is not None:
+            prior_cons = session.cons_ask
+            session.cons_ask = None
+            if (
+                params.mode != "split"
+                and prior_cons.choice is not None
+                and prior_cons.picked
+            ):
+                cons_picked = prior_cons.picked
 
         # 2. Fee bid: the estimator ladder (the ONLY chain call this flow
         #    makes — exactly like create_tx; no new chain surface).
@@ -4608,36 +5269,54 @@ def _make_self_transfer_handler(
                 return {"error": "self_split_below_dust"}
             payment_values = [each] * parts
         else:
-            threshold = params.below_size_sats
-            assert threshold is not None  # layer 2+3 guarantee for consolidate
-            below = [
-                u for u in utxos if u.value_sats < threshold
-            ]
-            if not below:
-                return {"error": "self_nothing_below"}
-            # Privacy pools (TCK-UTXO-002): partition by stored coin tags,
-            # NEVER merge across sides. The larger-total pool wins; ties go
-            # other-side first (the fixed pool order).
-            try:
-                label_rows = store.get_coin_labels(wallet_id)
-            except (StoreError, sqlite3.Error) as exc:
-                return _store_error(exc)
-            kyc_outpoints = {
-                (row.txid, row.vout)
-                for row in label_rows
-                if coin_partition(row.tags)[0]
-            }
-            kyc_pool = [u for u in below if (u.txid, u.vout) in kyc_outpoints]
-            other_pool = [u for u in below if (u.txid, u.vout) not in kyc_outpoints]
-            other_total = sum(u.value_sats for u in other_pool)
-            kyc_total = sum(u.value_sats for u in kyc_pool)
-            if kyc_pool and other_pool:
-                chosen = other_pool if other_total >= kyc_total else kyc_pool
-                skipped = kyc_pool if other_total >= kyc_total else other_pool
-                other_side_count: int | None = len(skipped)
+            if cons_picked is not None:
+                # TCK-CONS-001: the conversation answered — EXACTLY the
+                # picked coins (code-stamped on the dispatcher-owned ask,
+                # never a model- or text-supplied reference), revalidated
+                # against THIS fresh store read (the RBF-004/CPFP-002
+                # mid-conversation recheck: a picked coin spent elsewhere
+                # while an ask stood open is the honest gone answer, never
+                # a silently swapped set). The envelope's threshold is the
+                # engine's own max+1 — authority for the plan stays here.
+                keys = {
+                    (str(c["txid"]).lower(), int(str(c["vout"]))) for c in cons_picked
+                }
+                chosen = [
+                    u for u in utxos if (u.txid.lower(), u.vout) in keys
+                ]
+                if len(chosen) != len(keys):
+                    return {"error": "cons_coin_gone", "detail": _CONS_COIN_GONE}
             else:
-                chosen = kyc_pool or other_pool
-                other_side_count = None
+                threshold = params.below_size_sats
+                assert threshold is not None  # layer 2+3 guarantee for consolidate
+                below = [
+                    u for u in utxos if u.value_sats < threshold
+                ]
+                if not below:
+                    return {"error": "self_nothing_below"}
+                # Privacy pools (TCK-UTXO-002): partition by stored coin tags,
+                # NEVER merge across sides. The larger-total pool wins; ties go
+                # other-side first (the fixed pool order).
+                try:
+                    label_rows = store.get_coin_labels(wallet_id)
+                except (StoreError, sqlite3.Error) as exc:
+                    return _store_error(exc)
+                kyc_outpoints = {
+                    (row.txid, row.vout)
+                    for row in label_rows
+                    if coin_partition(row.tags)[0]
+                }
+                kyc_pool = [u for u in below if (u.txid, u.vout) in kyc_outpoints]
+                other_pool = [u for u in below if (u.txid, u.vout) not in kyc_outpoints]
+                other_total = sum(u.value_sats for u in other_pool)
+                kyc_total = sum(u.value_sats for u in kyc_pool)
+                if kyc_pool and other_pool:
+                    chosen = other_pool if other_total >= kyc_total else kyc_pool
+                    skipped = kyc_pool if other_total >= kyc_total else other_pool
+                    other_side_count = len(skipped)
+                else:
+                    chosen = kyc_pool or other_pool
+                    other_side_count = None
             if len(chosen) > MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS:
                 return {"error": "self_too_many_small"}
             chosen.sort(key=lambda u: (u.value_sats, u.txid.lower(), u.vout))
@@ -4766,6 +5445,17 @@ def _make_self_transfer_handler(
         }
         if other_side_count:
             result["self_other_side_count"] = other_side_count
+        if cons_picked is not None:
+            # TCK-CONS-001: the plan-echo marker (the card renderer prints
+            # the pinned "Merge N UTXOs to create one new UTXO of X sats"
+            # line from this result's OWN inputs_count/amount_sats — engine
+            # totals, verbatim) and the broadcast annotation record (a
+            # successful broadcast tags the plan's outputs
+            # ``consolidation`` + notes "consolidated from N outputs";
+            # §1.3 union inheritance already ran for every self-transfer).
+            result["cons_merge"] = True
+            if session is not None:
+                session.cons_pending = _ConsPending(pending.tx_ref)
         return result
 
     return handler
@@ -6094,12 +6784,18 @@ def _make_broadcast_tx_handler(
         #    inherit, which is what keeps a consolidated/split coin on its
         #    pool side after the reshuffle. A send whose recipient is our own
         #    receive address inherits nothing there (ponytail: honest-bounds
-        #    edge — the coin appears unlabeled on the next rescan and /label
+        #    edge — the coin appears unlabeled on the next scan and /label
         #    covers it; full script-ownership matching is the provenance
         #    view's problem, not this capture path's). Purely local
         #    bookkeeping — labeling never causes network I/O — and it must
         #    never undo a completed broadcast, so EVERY failure is contained
-        #    value-free.
+        #    value-free. TCK-CONS-001: when this broadcast is a staged
+        #    consolidation plan (the conversation's marker matches the flow
+        #    record), the inherited union gets the closed-set
+        #    ``consolidation`` tag ADDED (a second tag describing what this
+        #    payment was, display-only per §1.4 — never a partition word)
+        #    and the free-note RECORD "consolidated from N outputs" — N
+        #    counted from the broadcast's own inputs, never from user text.
         owned_vouts: tuple[int, ...] = ()
         if confirmed is not None:
             try:
@@ -6117,11 +6813,38 @@ def _make_broadcast_tx_handler(
                     store.propagate_coin_lineage(
                         wallet_id, txid, owned_vouts, spent_inputs
                     )
+                    if (
+                        session is not None
+                        and session.cons_pending is not None
+                        and session.cons_pending.tx_ref == params.tx_ref
+                    ):
+                        n_from = len(spent_inputs)
+                        record = f"consolidated from {n_from} output{'s' if n_from != 1 else ''}"
+                        for out_vout in owned_vouts:
+                            existing = store.get_coin_label(wallet_id, txid, out_vout)
+                            merged = tuple(
+                                dict.fromkeys(
+                                    [*(existing.tags if existing else ()), "consolidation"]
+                                )
+                            )
+                            store.set_coin_label(
+                                wallet_id, txid, out_vout, merged, record
+                            )
             except Exception:  # noqa: BLE001 — containment: embit/store errors vary; missed tag-inheritance is annotation loss, never a money or broadcast failure
                 result.setdefault(
                     "store_warning",
                     "coin tag inheritance did not record — use /label after the next scan",
                 )
+        # Consolidation marker retirement (TCK-CONS-001, the CPFP-002 4c
+        # shape): this broadcast SUCCEEDED, the conversation record is done
+        # whether or not the annotation write made it (a failed write is
+        # the contained store_warning above, never a retry of the money).
+        if (
+            session is not None
+            and session.cons_pending is not None
+            and session.cons_pending.tx_ref == params.tx_ref
+        ):
+            session.cons_pending = None
         return result
 
     return handler
@@ -13286,7 +14009,7 @@ def _dispatch_code_bump_turn(
     return result
 
 
-def _dispatch_code_cpfp_turn(
+def _dispatch_code_self_turn(
     session: SendSession,
     line: str,
     params: SelfTransferParams,
@@ -13294,13 +14017,14 @@ def _dispatch_code_cpfp_turn(
     *,
     table: DispatchTable,
 ) -> dict[str, object]:
-    """Shared body of the deterministic cpfp-conversation answer
-    intercepts (TCK-CPFP-002, the :func:`_dispatch_code_bump_turn`
-    pattern): CODE builds the ``self_transfer`` cpfp envelope from the
-    dispatcher-owned ask state (the fee rung re-quoted from the ask; the
-    CHOICE itself is stamped on the ask record, because the closed
-    cpfp params cannot carry a coin reference or index — the model
-    therefore can neither set, read, nor clear it) and dispatches
+    """Shared body of the deterministic self_transfer-conversation answer
+    intercepts (TCK-CPFP-002's cpfp dispatch, reused verbatim by the
+    TCK-CONS-001 consolidation conversation; the
+    :func:`_dispatch_code_bump_turn` pattern): CODE builds the
+    ``self_transfer`` envelope from the dispatcher-owned ask state (the fee
+    rung re-quoted from the ask; the CHOICE itself is stamped on the ask
+    record, because the closed params cannot carry a coin reference — the
+    model therefore can neither set, read, nor clear it) and dispatches
     straight to the self_transfer handler, whose own guards remain the
     authority. Transcript-free like the bump dispatch: an answer may be
     a coin LABEL word (user data — the §7.10 rule keeps labels out of
@@ -13514,11 +14238,28 @@ def _run_turn(
                 )
             if cpfp_ask.fee_target is not None:
                 cpfp_params["fee_target"] = cpfp_ask.fee_target
-            _dispatch_code_cpfp_turn(
+            _dispatch_code_self_turn(
                 session, line, SelfTransferParams(**cpfp_params), output_fn, table=table
             )
             return
         session.cpfp_ask = None
+    # TCK-CONS-001: the consolidation conversation — the SAME machinery,
+    # checked right after the cpfp block (when several conversations hold an
+    # open ask, an answer-shaped utterance resolves to the earliest one —
+    # the documented double-open corner; any other utterance closes ALL).
+    # An OPEN rollup/count/list ask is answered by a number / label word /
+    # registry number (matched HERE in code — label words never reach the
+    # model), and a consolidation-shaped utterance OPENS the conversation
+    # before the model ever sees it (the RBF-004 lesson generalized to the
+    # opening). Consumed turns never touch the transcript
+    # (:func:`_dispatch_code_self_turn`); any unmatched utterance closes the
+    # ask (never-trap) and falls through to the ordinary pipeline.
+    if (
+        store is not None
+        and IntentName.SELF_TRANSFER in table
+        and _run_consolidation_turn(session, store, flow, line, output_fn, table=table)
+    ):
+        return
     speed = _bump_speed_choice(line)
     if speed is not None and IntentName.BUMP_FEE in table:
         if (
@@ -13582,6 +14323,11 @@ def _run_turn(
         # staged child's marker and any open ask belonged to THIS flow.
         session.cpfp_pending = None
         session.cpfp_ask = None
+        # TCK-CONS-001: and for the consolidation conversation (a DENY
+        # retires the ask AND the staged plan marker — neither leaks onto
+        # the next flow).
+        session.cons_ask = None
+        session.cons_pending = None
     # Narration-only ETA fact (TCK-P5-002): the mempool hint is computed
     # lazily ONLY when the flow is CREATED (the ETA fact is needed); any
     # failure degrades to no congestion adjustment, never a crash.
@@ -14073,15 +14819,34 @@ def _print_self_plan(
             else " → fresh addresses"
         )
     else:
-        merged = (
-            f"{sources} small coin{'s' if sources != '1' else ''}"
-            if sources is not None
-            else "small coins"
-        )
-        plan = (
-            f"Plan: merge {merged} into 1 × {each or 'unavailable'} sats "
-            "(1 fresh address)"
-        )
+        plan = ""
+        if result.get("cons_merge") is True:
+            # TCK-CONS-001 plan echo: the conversation's consolidation,
+            # stated as what the ENGINE planned — input count and the new
+            # UTXO's value quoted from this result's own record fields
+            # (the same fail-closed rule: an absent/non-int figure falls
+            # back to the generic plan line, never a fabricated number).
+            n_in = result.get("inputs_count")
+            amt = result.get("amount_sats")
+            if (
+                isinstance(n_in, int)
+                and not isinstance(n_in, bool)
+                and isinstance(amt, int)
+                and not isinstance(amt, bool)
+            ):
+                plan = _CONS_PLAN_LINE.format(
+                    sources=n_in, s="s" if n_in != 1 else "", amount=amt
+                )
+        if not plan:
+            merged = (
+                f"{sources} small coin{'s' if sources != '1' else ''}"
+                if sources is not None
+                else "small coins"
+            )
+            plan = (
+                f"Plan: merge {merged} into 1 × {each or 'unavailable'} sats "
+                "(1 fresh address)"
+            )
     in_line = (
         f"In: {in_total} sats" if in_total is not None else "In: unavailable"
     )
@@ -14562,12 +15327,14 @@ def _print_self_transfer(
         "cpfp_cannot_fund",
         "cpfp_plan_failed",
         "cpfp_flow_busy",
+        "cons_coin_gone",
     ):
         # The cpfp conversation's honest answers ARE the UX (the bump
-        # refusals' precedent): code-owned friendly lines, printed
-        # verbatim; fee-math refusals carry the machine-readable reason
-        # as a STRUCTURED key only (their detail strings never quote
-        # values — ADR-0012 §7).
+        # refusals' precedent), plus the consolidation conversation's
+        # mid-conversation recheck (TCK-CONS-001): code-owned friendly
+        # lines, printed verbatim; fee-math refusals carry the
+        # machine-readable reason as a STRUCTURED key only (their detail
+        # strings never quote values — ADR-0012 §7).
         output_fn(sanitize_tool_output(str(result.get("detail", "")).strip()))
         return
     if error == "self_too_many_small":
