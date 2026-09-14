@@ -14009,10 +14009,14 @@ def _run_hardware_chat(
     if verb == "sign":
         # No flow pending: probe+report WITHOUT driving an unlock (the
         # sign handoff itself never waits on one; slice A owns unlocks).
-        for text in hwi.probe_and_report(attempt_unlock=False):
+        # TCK-HW-006: the probe carries an additive wallet_match verdict;
+        # a proven mismatch already IS one of the lines (the honest MW-17
+        # copy, model-named by the signer) — the narration below is
+        # otherwise exactly the pre-ticket bytes.
+        for text in hwi.probe_and_report(attempt_unlock=False).lines:
             output_fn(sanitize_tool_output(text))
         return True
-    for text in hwi.probe_and_report(attempt_unlock=verb != "see"):
+    for text in hwi.probe_and_report(attempt_unlock=verb != "see").lines:
         output_fn(sanitize_tool_output(text))
     return True
 

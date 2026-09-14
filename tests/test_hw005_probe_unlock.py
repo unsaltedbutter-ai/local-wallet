@@ -37,15 +37,22 @@ from localwallet.app import (
     _hardware_chat_verb,
 )
 from localwallet.protocol import IntentName
+from localwallet.signer.hwi import ProbeReport
 from localwallet.tx.flow import TxFlow
 from tests.test_signer_hwi import (
+    _ACCOUNT_PUBKEY,
+    _OTHER_PUBKEY,
     DEVICE_WALLET,
+    FP_OTHER,
     FP_WALLET,
     JADE_LOCKED,
     JADE_UNLOCKED,
     MASTER_FP,
     TREZOR_LOCKED,
     DeviceConnectionError,
+    DeviceNotReadyError,
+    FakeAccountClient,
+    FakeClient,
     FakeCommands,
     JadeError,
     make_signer,
@@ -118,7 +125,7 @@ def test_matcher_reject_vectors(line: str) -> None:
 
 def _probe(devices: list[dict] | None = None, **kwargs: Any) -> tuple[str, ...]:
     commands = FakeCommands(devices=devices, **kwargs)
-    return make_signer(commands).probe_and_report()
+    return make_signer(commands).probe_and_report().lines
 
 
 def test_probe_no_devices_reuses_absent_family() -> None:
@@ -135,7 +142,7 @@ def test_probe_enumerate_error_maps_to_guidance_never_raises() -> None:
 
 def test_probe_unlocked_jade_reports_ready_without_opening() -> None:
     commands = FakeCommands(devices=[dict(JADE_UNLOCKED)])
-    lines = make_signer(commands).probe_and_report()
+    lines = make_signer(commands).probe_and_report().lines
     assert lines == ("Found your jade — it's unlocked and ready.",)
     # report never opens a client, and never signs
     assert [c for c in commands.calls if c[0] == "get_client"] == []
@@ -144,7 +151,7 @@ def test_probe_unlocked_jade_reports_ready_without_opening() -> None:
 
 def test_probe_locked_jade_report_only_reuses_jade_guidance() -> None:
     commands = FakeCommands(devices=[dict(JADE_LOCKED)])
-    lines = make_signer(commands).probe_and_report()
+    lines = make_signer(commands).probe_and_report().lines
     assert lines[0] == "Found your jade — it's locked."
     # EXISTING HW-001 guidance verbatim (on-device unlock, menu escapes)
     assert "Recovery Phrase Login" in lines[1]
@@ -155,7 +162,7 @@ def test_probe_locked_jade_report_only_reuses_jade_guidance() -> None:
 def test_unlock_locked_jade_drives_client_construction_and_reports_success() -> None:
     """Jade unlock = client construction (HW-001 pinserver relay)."""
     commands = FakeCommands(devices=[dict(JADE_LOCKED)])
-    lines = make_signer(commands).probe_and_report(attempt_unlock=True)
+    lines = make_signer(commands).probe_and_report(attempt_unlock=True).lines
     opened = [c for c in commands.calls if c[0] == "get_client"]
     assert len(opened) == 1 and opened[0][1:3] == ("jade", "/dev/tty.usbmodemJADE")
     assert lines[-1] == "Your jade is unlocked and ready."
@@ -171,7 +178,7 @@ def test_unlock_failure_surfaces_existing_guidance_value_free() -> None:
         devices=[dict(JADE_LOCKED)],
         get_client_error=JadeError(-32000, "User Canceled 12345 bc1qsecret", None),
     )
-    lines = make_signer(commands).probe_and_report(attempt_unlock=True)
+    lines = make_signer(commands).probe_and_report(attempt_unlock=True).lines
     assert lines[-1] == (
         "The request was canceled on your device — say 'retry' to try again."
     )
@@ -181,13 +188,13 @@ def test_unlock_failure_surfaces_existing_guidance_value_free() -> None:
 
 def test_unlock_client_none_reports_client_gone() -> None:
     commands = FakeCommands(devices=[dict(JADE_LOCKED)], client=None)
-    lines = make_signer(commands).probe_and_report(attempt_unlock=True)
+    lines = make_signer(commands).probe_and_report(attempt_unlock=True).lines
     assert "could not be opened" in lines[-1]
 
 
 def test_unlock_bitbox_drives_device_side_passphrase_flow() -> None:
     commands = FakeCommands(devices=[dict(BITBOX_LOCKED)])
-    lines = make_signer(commands).probe_and_report(attempt_unlock=True)
+    lines = make_signer(commands).probe_and_report(attempt_unlock=True).lines
     opened = [c for c in commands.calls if c[0] == "get_client"]
     assert len(opened) == 1 and opened[0][1] == "bitbox02"
     assert lines[-1] == "Your BitBox02 is unlocked and ready."
@@ -199,7 +206,7 @@ def test_bitbox_needing_passphrase_is_driven_even_when_readable() -> None:
         devices=[{**BITBOX_LOCKED, "fingerprint": MASTER_FP,
                   "needs_passphrase_sent": True}]
     )
-    lines = make_signer(commands).probe_and_report(attempt_unlock=True)
+    lines = make_signer(commands).probe_and_report(attempt_unlock=True).lines
     assert lines[0] == "Found your BitBox02 — it's locked."
     assert len([c for c in commands.calls if c[0] == "get_client"]) == 1
 
@@ -209,7 +216,7 @@ def test_host_pin_device_reported_never_driven() -> None:
     guidance and is NEVER auto-driven (promptpin/sendpin stay out of
     scope, ADR-0015 amendment) — even on the unlock family."""
     commands = FakeCommands(devices=[dict(TREZOR_LOCKED)])
-    lines = make_signer(commands).probe_and_report(attempt_unlock=True)
+    lines = make_signer(commands).probe_and_report(attempt_unlock=True).lines
     joined = "\n".join(lines)
     assert "companion" in joined.lower()
     assert [c for c in commands.calls if c[0] == "get_client"] == []
@@ -247,11 +254,128 @@ def test_probe_narration_is_value_free() -> None:
     ):
         for attempt in (False, True):
             commands = FakeCommands(devices=[dict(d) for d in devices])
-            lines = make_signer(commands).probe_and_report(attempt_unlock=attempt)
+            lines = make_signer(commands).probe_and_report(attempt_unlock=attempt).lines
             joined = "\n".join(lines).lower()
             assert "hid:" not in joined and "usb:" not in joined
             assert "tty" not in joined and "usbmodem" not in joined
             assert MASTER_FP not in joined and FP_WALLET not in joined
+
+
+# ---------------------------------------------------------------------------
+# (b2) TCK-HW-006 (MW-17): wallet-match verdict on the driven unlock
+# ---------------------------------------------------------------------------
+
+#: The user's exact MW-17 copy, with the {model} slot filled from the
+#: enumeration (the family's naming discipline — say "Jade" when the
+#: device reports "jade", never a hardcoded class).
+_MISMATCH_LINE = (
+    "Found your jade — it's unlocked but it is not the private key for "
+    "this wallet."
+)
+_UNLOCKING_LINE = (
+    "Unlocking now — follow the prompts on your jade's screen "
+    "(this app never sees your PIN or passphrase)."
+)
+
+
+def test_hw006_mismatch_verdict_and_exact_copy() -> None:
+    """The MW-17 repro: chat unlock drives a locked Jade, it unlocks, but
+    its key at the descriptor account path is NOT this wallet's →
+    verdict False, the success line is replaced by the exact honest copy,
+    the probe still SUCCEEDS, and the handle is released."""
+    rec: dict = {}
+    commands = FakeCommands(
+        devices=[dict(JADE_LOCKED)],
+        client=FakeAccountClient(rec, _OTHER_PUBKEY),
+    )
+    report = make_signer(commands).probe_and_report(attempt_unlock=True)
+    assert report.wallet_match is False
+    assert report.lines == (
+        "Found your jade — it's locked.",
+        _UNLOCKING_LINE,
+        _MISMATCH_LINE,
+    )
+    assert rec["closed"] is True
+    joined = "\n".join(report.lines)
+    assert FP_OTHER not in joined and FP_WALLET not in joined
+    assert MASTER_FP not in joined
+
+
+def test_hw006_match_verdict_true_and_unchanged_narration() -> None:
+    """Right device: verdict True, narration byte-identical to pre-ticket."""
+    commands = FakeCommands(
+        devices=[dict(JADE_LOCKED)],
+        client=FakeAccountClient({}, _ACCOUNT_PUBKEY),
+    )
+    report = make_signer(commands).probe_and_report(attempt_unlock=True)
+    assert report.wallet_match is True
+    assert report.lines[-1] == "Your jade is unlocked and ready."
+
+
+def test_hw006_check_unavailable_fails_open_to_none_never_fabricated() -> None:
+    """A client that CANNOT serve the account key is not proof of a wrong
+    key: verdict None, narration unchanged (the unlock succeeded), never a
+    fabricated match, never an error."""
+    # no get_pubkey_at_path on the client at all
+    rec: dict = {}
+    commands = FakeCommands(devices=[dict(JADE_LOCKED)], client=FakeClient(rec))
+    report = make_signer(commands).probe_and_report(attempt_unlock=True)
+    assert report.wallet_match is None
+    assert report.lines[-1] == "Your jade is unlocked and ready."
+    assert rec["closed"] is True
+    # device error mid-read
+    commands = FakeCommands(
+        devices=[dict(JADE_LOCKED)],
+        client=FakeAccountClient({}, DeviceNotReadyError("locked mid-flight")),
+    )
+    report = make_signer(commands).probe_and_report(attempt_unlock=True)
+    assert report.wallet_match is None
+    assert report.lines[-1] == "Your jade is unlocked and ready."
+    # unusable key shape
+    commands = FakeCommands(
+        devices=[dict(JADE_LOCKED)],
+        client=FakeAccountClient({}, b"\x02short"),
+    )
+    report = make_signer(commands).probe_and_report(attempt_unlock=True)
+    assert report.wallet_match is None
+    assert report.lines[-1] == "Your jade is unlocked and ready."
+
+
+def test_hw006_verdict_is_none_wherever_no_client_is_opened() -> None:
+    """Report-only paths and the no-device family keep their exact
+    narration AND a None verdict (the check can only run on an unlock-
+    opened client)."""
+    commands = FakeCommands(devices=[dict(JADE_UNLOCKED)])
+    report = make_signer(commands).probe_and_report(attempt_unlock=True)
+    assert report.wallet_match is None
+    assert report.lines == ("Found your jade — it's unlocked and ready.",)
+
+    commands = FakeCommands(devices=[])
+    report = make_signer(commands).probe_and_report(attempt_unlock=True)
+    assert report.wallet_match is None
+    assert report.lines == (
+        "No device found — plug in and unlock your device, then say 'retry'.",
+    )
+
+    commands = FakeCommands(devices=[dict(JADE_LOCKED)])
+    report = make_signer(commands).probe_and_report()
+    assert report.wallet_match is None
+    assert report.lines[0] == "Found your jade — it's locked."
+    assert [c for c in commands.calls if c[0] == "get_client"] == []
+
+
+def test_hw006_unlock_failure_verdict_none_existing_guidance() -> None:
+    """A failed/canceled unlock: no client, no check, no verdict — the
+    existing guidance line is byte-unchanged (regression pin)."""
+    commands = FakeCommands(
+        devices=[dict(JADE_LOCKED)],
+        get_client_error=JadeError(-32000, "User Canceled", None),
+    )
+    report = make_signer(commands).probe_and_report(attempt_unlock=True)
+    assert report.wallet_match is None
+    assert report.lines[-1] == (
+        "The request was canceled on your device — say 'retry' to try again."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -265,9 +389,9 @@ class _FakeProbe:
     def __init__(self) -> None:
         self.calls: list[bool] = []
 
-    def probe_and_report(self, *, attempt_unlock: bool) -> tuple[str, ...]:
+    def probe_and_report(self, *, attempt_unlock: bool) -> ProbeReport:
         self.calls.append(attempt_unlock)
-        return ("Found your jade — it's unlocked and ready.",)
+        return ProbeReport(("Found your jade — it's unlocked and ready.",), None)
 
 
 def _recording_loop() -> tuple[AgentLoop, list[str]]:
@@ -336,6 +460,26 @@ def test_turn_unlock_locked_jade_success_through_real_signer() -> None:
     assert "Unlocking now" in out[1]
     assert out[-1] == "Your jade is unlocked and ready."
     assert model_calls == []
+
+
+def test_turn_unlock_wrong_device_narrates_mismatch_through_real_signer() -> None:
+    """TCK-HW-006 e2e: the app narration branch renders the MW-17 line
+    verbatim on a wallet mismatch, still never touching the model, and
+    renders the pre-ticket bytes on a match (the test above pins match)."""
+    signer = make_signer(
+        FakeCommands(
+            devices=[dict(JADE_LOCKED)],
+            client=FakeAccountClient({}, _OTHER_PUBKEY),
+        )
+    )
+    out, model_calls = _turn("unlock my jade", signer)
+    assert out[-1] == _MISMATCH_LINE
+    assert model_calls == []
+    joined = "\n".join(out)
+    assert FP_OTHER not in joined and FP_WALLET not in joined
+    assert MASTER_FP not in joined
+    # still a successful probe: no refusal anywhere in the narration
+    assert "couldn't" not in joined.lower() and "error" not in joined.lower()
 
 
 def test_ordinary_line_still_reaches_the_model() -> None:

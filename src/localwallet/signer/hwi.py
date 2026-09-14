@@ -74,6 +74,7 @@ __all__ = [
     "DeviceMismatchError",
     "HwiUnavailableError",
     "HwiUsbSigner",
+    "ProbeReport",
 ]
 
 # --------------------------------------------------------------------------
@@ -169,6 +170,14 @@ _MSG_HW_UNLOCKING = (
     "(this app never sees your PIN or passphrase)."
 )
 _MSG_HW_UNLOCKED = "Your {model} is unlocked and ready."
+# TCK-HW-006 (MW-17): the wallet-match verdict line after a driven unlock
+# found the WRONG key. Value-free, never an error, never a refusal — the
+# probe still SUCCEEDS as a probe; the verdict IS the mismatch. Same
+# {model} naming as the family above (say Jade when enumerate says Jade).
+_MSG_HW_WRONG_WALLET = (
+    "Found your {model} — it's unlocked but it is not the private key for "
+    "this wallet."
+)
 
 # hwilib exception class names → (our subclass, guidance). Name-based
 # matching keeps the mapping stable across hwilib versions and works with
@@ -210,6 +219,27 @@ class DeviceInfo:
     needs_pin_sent: bool = False
     needs_passphrase_sent: bool = False
     locked: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeReport:
+    """Outcome of :meth:`HwiUsbSigner.probe_and_report` (TCK-HW-005/006).
+
+    ``lines`` is the value-free narration, rendered verbatim by the caller.
+    ``wallet_match`` (TCK-HW-006, MW-17) is the ADDITIVE verdict for
+    driven unlocks: ``True`` when the unlocked client served THIS wallet's
+    account key at the descriptor's account path (the same computation as
+    the HW-002 trust bind — but on the probe path it is INFORMATION ONLY,
+    never a gate; :meth:`HwiUsbSigner._open_matched_client` remains the
+    only trust decision), ``False`` when it served a different key (wrong
+    device — honest narration, the probe itself still succeeded), and
+    ``None`` whenever the check could not run (no unlock driven, no client
+    opened, or the account key unreadable — fail-open to None, NEVER a
+    fabricated match).
+    """
+
+    lines: tuple[str, ...]
+    wallet_match: bool | None = None
 
 
 def _normalize_fingerprint(value: Any) -> str | None:
@@ -378,7 +408,7 @@ class HwiUsbSigner(Signer):
 
     # -- probe & report (chat unlock, TCK-HW-005 slice A) -------------------
 
-    def probe_and_report(self, *, attempt_unlock: bool = False) -> tuple[str, ...]:
+    def probe_and_report(self, *, attempt_unlock: bool = False) -> ProbeReport:
         """Probe connected devices and narrate what is found; value-free.
 
         The honest chat answer to "can you see my hardware wallet?" /
@@ -414,18 +444,39 @@ class HwiUsbSigner(Signer):
         ponytail: a locked Jade's client construction blocks while the
         user enters the PIN (same HW-001 enumerate ceiling as above) —
         acceptable on the interactive engine thread, revisit if headless.
+
+        TCK-HW-006 (MW-17) adds the ADDITIVE ``wallet_match`` verdict on
+        :class:`ProbeReport`: every client this flow opens for an unlock is
+        asked for its account key at the descriptor's account path (the
+        HW-002 bind's own computation, reused verbatim) and compared to
+        the wallet's expected fingerprint. The check NEVER gates the probe
+        and never raises: mismatch → the honest mismatch line (in place of
+        the "unlocked and ready" claim), match/unavailable → the lines are
+        exactly what they were before this ticket.
         """
         try:
             devices = self.enumerate_devices()
         except DeviceError as exc:
-            return (str(exc),)
+            return ProbeReport((str(exc),))
         if not devices:
-            return (_MSG_NO_DEVICES,)
+            return ProbeReport((_MSG_NO_DEVICES,))
         commands = self._ensure_commands()
         lines: list[str] = []
+        verdicts: list[bool | None] = []
         for device in devices:
-            lines.extend(self._probe_lines(commands, device, attempt_unlock))
-        return tuple(lines)
+            device_lines, verdict = self._probe_lines(commands, device, attempt_unlock)
+            lines.extend(device_lines)
+            verdicts.append(verdict)
+        # A proven mismatch outranks a proven match (the honest reading of a
+        # bus where the unlocked device was the wrong key); no verdict at
+        # all stays None — never a fabricated match.
+        if False in verdicts:
+            wallet_match: bool | None = False
+        elif True in verdicts:
+            wallet_match = True
+        else:
+            wallet_match = None
+        return ProbeReport(tuple(lines), wallet_match)
 
     def sign_probe(self) -> tuple[str, tuple[str, ...]]:
         """The pre-sign device check (TCK-HW-005 slice C): ONE bounded
@@ -459,46 +510,82 @@ class HwiUsbSigner(Signer):
         commands = self._ensure_commands()
         lines: list[str] = []
         for device in devices:
-            lines.extend(self._probe_lines(commands, device, attempt_unlock=False))
+            # attempt_unlock=False → no client opened → verdict cannot run
+            # (None); the sign path's hard bind is unchanged (HW-006 is
+            # narration-only).
+            device_lines, _verdict = self._probe_lines(
+                commands, device, attempt_unlock=False
+            )
+            lines.extend(device_lines)
         return "locked", tuple(lines)
 
     def _probe_lines(
         self, commands: Any, device: DeviceInfo, attempt_unlock: bool
-    ) -> list[str]:
-        """Narration for ONE enumerated device (see probe_and_report)."""
+    ) -> tuple[list[str], bool | None]:
+        """Narration + wallet-match verdict for ONE enumerated device
+        (see :meth:`probe_and_report`). The verdict is non-``None`` only
+        when an unlock opened a client and the account-key check ran;
+        every no-client branch reports ``None`` (the check could not run —
+        never a fabricated match)."""
         kind = device.type.lower()
         jade = kind.startswith("jade")
         bitbox = kind.startswith("bitbox")
         if _device_signable(device):
-            return [_MSG_HW_READY.format(model=device.model)]
+            return [_MSG_HW_READY.format(model=device.model)], None
         lines = [_MSG_HW_LOCKED_FOUND.format(model=device.model)]
         if (jade or bitbox) and attempt_unlock:
             lines.append(_MSG_HW_UNLOCKING.format(model=device.model))
-            lines.append(self._drive_unlock(commands, device))
-        elif jade:
+            unlock_line, verdict = self._drive_unlock(commands, device)
+            lines.append(unlock_line)
+            return lines, verdict
+        if jade:
             lines.append(_MSG_JADE_LOCKED)
         elif device.needs_pin_sent or device.needs_passphrase_sent:
             lines.append(_MSG_HOST_PIN)
         else:
             lines.append(_MSG_LOCKED)
-        return lines
+        return lines, None
 
-    def _drive_unlock(self, commands: Any, device: DeviceInfo) -> str:
+    def _drive_unlock(self, commands: Any, device: DeviceInfo) -> tuple[str, bool | None]:
         """Jade/BitBox02 host-driven unlock: construct the client (that IS
-        the unlock trigger, TCK-HW-001) and release it. Success is
-        construction itself — a locked Jade raises long BEFORE any auth
-        completes, so a client in hand means the device unlocked."""
+        the unlock trigger, TCK-HW-001), run the TCK-HW-006 wallet-match
+        check on the OPEN client, and release it. Success is construction
+        itself — a locked Jade raises long BEFORE any auth completes, so a
+        client in hand means the device unlocked. The check can only
+        CHANGE the final line (mismatch → honest MW-17 copy) and the
+        verdict; it never fails the unlock and never raises."""
         try:
             client = commands.get_client(
                 device.type, device.path, chain=self._chain_enum(commands)
             )
         except Exception as exc:  # noqa: BLE001 — containment: the report
             # never raises; every failure returns its guidance line instead.
-            return str(self._map_hwi_error(exc))
+            return str(self._map_hwi_error(exc)), None
         if client is None:
-            return _MSG_CLIENT_GONE
+            return _MSG_CLIENT_GONE, None
+        wallet_match = self._probe_wallet_match(client)
         self._close_client(client)
-        return _MSG_HW_UNLOCKED.format(model=device.model)
+        if wallet_match is False:
+            return _MSG_HW_WRONG_WALLET.format(model=device.model), False
+        return _MSG_HW_UNLOCKED.format(model=device.model), wallet_match
+
+    def _probe_wallet_match(self, client: Any) -> bool | None:
+        """TCK-HW-006: does the OPEN client control THIS wallet's key?
+
+        The HW-002 account-fp bind's own computation (``get_pubkey_at_path``
+        at the descriptor account path, ``hash160(pubkey)[:4]`` vs the
+        descriptor origin fp), used here as an HONEST REPORT — the probe
+        still succeeded either way. Fail-open to ``None`` on any read
+        failure (a client that cannot serve the account key is NOT proof
+        of a foreign key); the sign path's hard gate in
+        :meth:`_open_matched_client` stays the only trust decision.
+        Value-free: no fingerprint ever leaves this function.
+        """
+        try:
+            return self._reverify_fingerprint(client)
+        except Exception:  # noqa: BLE001 — the verdict never travels
+            # with a value, and a failed check must not fail the probe.
+            return None
 
     # -- fingerprint trust gate (ADR-0015 + amendment #2) ------------------
 
