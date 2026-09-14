@@ -9091,6 +9091,25 @@ _CHAT_ONB_BACKEND_BEATS: Final[tuple[str, ...]] = (
     CHAT_ONB_BACKEND_PUBLIC,
 )
 
+# TCK-ONB-008 (chat backend creds UX, council-decided 2026-09-13): creds are
+# NEVER collected in chat — a password typed as a chat message is echoed to
+# every tab (user_text), announced by the a11y live region, and replayed from
+# the SSE ring forever. When the backend beat receives a URL of an AUTH-
+# CAPABLE scheme (the Bitcoin Core RPC family — the engine's own scheme
+# constants, no new classifier), it emits ONE deterministic hand-off bubble
+# naming the EXISTING settings-pane login block (masked fields, never-
+# echoed storage — TCK-ONB-004 M3 / TCK-WEB-012) and proceeds past the URL
+# as before; an embedded-login URL is refused value-free, the typed string
+# never echoed, parsed-for-storage, or logged.
+CHAT_ONB_BACKEND_CREDS: Final[str] = (
+    "That server asks for a username and password. I don't take those in "
+    "chat — open Settings (top right). Under the server address you'll "
+    "find the login fields; fill them in and press Apply."
+)
+CHAT_ONB_LOGIN_REMOVED: Final[str] = (
+    "Remove the login from the address — I'll ask for it in Settings."
+)
+
 #: The deterministic "ask me how" answer (NO model — the AI may not even be
 #: running yet). Implementation-time copy (designer mini-pass, critique Q6):
 #: generic device guidance only — Jade's export menu, Sparrow's wallet
@@ -9197,6 +9216,35 @@ def _chat_backend_url_candidate(line: str) -> str | None:
     if not text or any(ch.isspace() for ch in text):
         return None
     return text if text.lower().startswith(_KNOWN_PROBE_SCHEMES) else None
+
+
+#: The AUTH-CAPABLE schemes (TCK-ONB-008): the Bitcoin Core RPC family —
+#: the explicit ``bitcoind[+tls]://`` pair plus the bare http(s) aliases the
+#: probe auto-detects into them (every member is a component of
+#: :data:`_KNOWN_PROBE_SCHEMES`; the Electrum ``ssl://`` entry is NOT here —
+#: an Electrum server asks no login through this seam). A URL whose scheme
+#: is in this set gets the deterministic creds hand-off bubble.
+_CHAT_AUTH_CAPABLE_SCHEMES: Final[tuple[str, ...]] = (
+    BITCOIND_SCHEME,
+    BITCOIND_TLS_SCHEME,
+    "http://",
+    "https://",
+)
+
+
+def _chat_url_auth_capable(url: str) -> bool:
+    """Scheme-prefix test against the engine's own scheme constants (pure
+    string read, like :func:`_chat_backend_url_candidate` — no new
+    classifier, no parse, nothing that can echo a value)."""
+    return url.lower().startswith(_CHAT_AUTH_CAPABLE_SCHEMES)
+
+
+def _chat_url_has_login(url: str) -> bool:
+    """Whether the URL embeds userinfo (``user:pass@`` / ``user@``) —
+    reusing :func:`_url_without_credentials`: a URL whose credential-
+    stripped form differs from it carries a login. Never raises; the
+    answer is a bool, the value never escapes."""
+    return _url_without_credentials(url) != url
 
 
 @dataclass(frozen=True)
@@ -10849,7 +10897,10 @@ def _pump(
     ``apply`` — url_class clamp + DIAG-001 companion included) and a short
     public-answer routes through the 001B consent seam with the leak
     disclosure; a resolved launch swallows NOTHING (post-setup URLs are
-    ordinary chat). Zero model contact on all of it.
+    ordinary chat). TCK-ONB-008: an auth-capable (Core RPC family) URL
+    prepends the deterministic Settings-creds hand-off bubble before the
+    same probe→store→swap ride, and an embedded-login URL is refused value-
+    free without ever reaching the probe. Zero model contact on all of it.
     """
 
     def _onb_line(line: str) -> None:
@@ -10913,6 +10964,18 @@ def _pump(
             return False
         url = _chat_backend_url_candidate(line)
         if url is not None:
+            if _chat_url_has_login(url):
+                # TCK-ONB-008: an embedded login is refused BEFORE anything
+                # else — the typed string (it contains creds) is never
+                # echoed, probed, parsed-for-storage, or logged. Value-free
+                # constant line; the turn is consumed (no model contact).
+                _onb_line(CHAT_ONB_LOGIN_REMOVED)
+                return True
+            if _chat_url_auth_capable(url):
+                # TCK-ONB-008: ONE deterministic hand-off bubble naming the
+                # existing Settings login block, then the beat proceeds past
+                # the URL exactly as today (the URL is not a secret).
+                _onb_line(CHAT_ONB_BACKEND_CREDS)
             error, fields = backend.apply(url)
             client = backend.client  # rebind on an immediate swap (no-op else)
             if error is not None:
