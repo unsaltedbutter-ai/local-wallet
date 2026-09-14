@@ -93,9 +93,13 @@ height is honest chain-truth-so-far; sync-progress narration stays the
 app's watch surface, ADR-0023 decision 5); ``bestblockhash`` → verbose
 ``getblockheader`` → :class:`TipBlock` (``time``; absent/malformed →
 ``None`` clean-unavailable, never fabricated); verbose
-``getrawtransaction`` → :class:`TxStatus` (``confirmations > 0``;
-height (``height``, legacy ``blockheight``)/``blocktime`` only when
-confirmed — a mempool tx's
+``getrawtransaction`` → :class:`TxStatus` (``confirmations > 0``; the
+verbose tx carries NO height — Core's TxToJSON emits only
+``blockhash``/``confirmations``/``time``/``blocktime``, so
+``block_height`` is a tolerant read, typically ``None`` = honest
+unheighted confirmed (the Esplora parity; the only REAL height source
+is the ``scantxoutset`` rows, see :meth:`get_address_txs`) and
+``blocktime`` rides when confirmed — a mempool tx's
 first-seen ``time`` is deliberately NOT reported as a block time, the
 electrum parity rule); ``sendrawtransaction`` → :meth:`broadcast_tx` with
 the SAME single-attempt + embit txid-binding semantics as every other
@@ -279,15 +283,19 @@ def _require_plain_int(value: Any) -> int | None:
 
 
 def _tx_block_height(obj: dict[str, Any]) -> int | None:
-    """Lenient block-height read from a dict carrying one (fix 1).
+    """Lenient block-height read from a dict that might carry one.
 
-    Real Core names the field ``height`` (as everywhere in Core);
-    ``blockheight`` was the legacy ``getrawtransaction`` outlier (Core
-    21-28). Try ``blockheight`` then ``height`` and accept a plain int, a
-    digit-string, or a Decimal (bodies parse with ``parse_float=Decimal``,
-    so ``800000.0`` arrives as one). ``None`` when nothing readable is
-    present — the caller decides: confirmed verbose tx = shape refusal,
-    scan row = honest unconfirmed.
+    The only height Core REALLY reports is on the ``scantxoutset``
+    unspent rows (``height``). A verbose ``getrawtransaction`` reply
+    carries NEITHER ``height`` NOR ``blockheight`` — Core's TxToJSON
+    emits only ``blockhash``/``confirmations``/``time``/``blocktime`` for
+    a confirmed tx, under no name ever (TCK-SCAN-BITCOIND-002); on a
+    verbose tx this reader is a defensive fallback for non-mainline
+    nodes that add one. Accepts a plain int, a digit-string, or a
+    Decimal (bodies parse with ``parse_float=Decimal``, so ``800000.0``
+    arrives as one). ``None`` when nothing readable is present — the
+    caller decides: scan row = honest unconfirmed, verbose tx = honest
+    unheighted confirmed. NOTHING raises on ``None``.
     """
     for field in ("blockheight", "height"):
         value = obj.get(field)
@@ -611,15 +619,27 @@ class BitcoindClient:
         only in the mempool, which never enters the UTXO set — answers
         ``[]``, exactly the shape a fresh unused address gets, and the gap
         walk treats it as unused (nothing fabricated). Entries carry
-        ``txid``, ``status{confirmed[,block_height][,block_time]}``,
-        optional ``fee`` (only when the node reports it — Core omits it
-        when inputs are unknown, e.g. some pruned-node reads) and
-        ``vin``/``vout`` with ``scriptpubkey_address`` where mappable.
+        ``txid``, ``status{confirmed[,block_height][,block_time]}`` (the
+        ``block_height`` is the scan ROW's own proven height — the only
+        real height source on Core, whose verbose txs carry none — and is
+        simply absent when no row proved one), optional ``fee`` (only when
+        the node reports it — Core omits it when inputs are unknown, e.g.
+        some pruned-node reads) and ``vin``/``vout`` with
+        ``scriptpubkey_address`` where mappable.
         """
         script_hex = self._script_hex(address)
         with self._lock:
             self._scripts.add(script_hex)
             unspents = self._scan_snapshot(script_hex).get(script_hex, [])
+            # SCAN TRUTH (TCK-SCAN-BITCOIND-002): the confirmation height
+            # comes from the scantxoutset rows — Core's verbose txs carry
+            # no height field under any name. Rows that proved none are
+            # simply absent here; the entry then degrades honestly.
+            heights: dict[str, int] = {}
+            for row in unspents:
+                row_height = row["status"].get("block_height")
+                if row_height is not None:
+                    heights.setdefault(row["txid"], row_height)
             txids = list(dict.fromkeys(entry["txid"] for entry in unspents))
             entries: list[dict[str, Any]] = []
             for txid in txids:
@@ -629,7 +649,7 @@ class BitcoindClient:
                 # every input's sender. The Core-22 capability floor
                 # guarantees level 2 exists.
                 verbose = self._rpc("getrawtransaction", [txid, 2], _KIND_ADDRESS_TXS)
-                entries.append(self._tx_entry(verbose, txid))
+                entries.append(self._tx_entry(verbose, txid, heights.get(txid)))
             return entries
 
     def get_tip_height(self) -> int:
@@ -717,10 +737,14 @@ class BitcoindClient:
         """One transaction's confirmation status via verbose
         ``getrawtransaction``.
 
-        ``confirmed`` = ``confirmations > 0``; ``block_height``/``block_time``
-        come from the verbose tx's height field (``height`` on modern Core,
-        the legacy ``blockheight`` name still accepted — fix 1) and
-        ``blocktime`` when confirmed, and are
+        ``confirmed`` = ``confirmations > 0``. A confirmed verbose tx
+        carries NO block-height field (Core's TxToJSON emits only
+        ``blockhash``/``confirmations``/``time``/``blocktime``, ever —
+        TCK-SCAN-BITCOIND-002), so ``block_height`` is a tolerant read:
+        ``None`` on a real node = honest unheighted confirmed (the
+        Esplora parity; callers treat ``None`` as such, and deriving the
+        height would cost a per-poll ``getblockheader`` nobody needs).
+        ``block_time`` comes from ``blocktime`` when confirmed and is
         ``None`` otherwise (a mempool tx's first-seen ``time`` is
         deliberately NOT reported as a block time — the electrum parity
         rule; Core, unlike ElectrumX, ALWAYS sends ``confirmations`` — 0
@@ -745,18 +769,15 @@ class BitcoindClient:
         block_height: int | None = None
         block_time: int | None = None
         if confirmed:
-            # A confirmed tx WITHOUT a readable height is a broken
-            # payload — refused with the SHAPE class (never the
-            # network-error collapse). The field is named ``height`` on
-            # real Core (the legacy ``blockheight`` spelling is still
-            # read first for old nodes; the capability gate already
-            # refused pre-22).
+            # TCK-SCAN-BITCOIND-002 (the live watch-poll bug): a REAL
+            # confirmed verbose tx has no height field at all — the
+            # tolerant read stays (a node that does send one is honored)
+            # but its absence is honest ``block_height=None``, never the
+            # shape refusal that killed every watch poll. A readable
+            # negative is garbage and dropped like an unreadable value.
             block_height = _tx_block_height(verbose)
-            if block_height is None or block_height < 0:
-                raise ChainError(
-                    f"{_KIND_TX_STATUS} response has a missing or invalid block height",
-                    failure_class=NOT_CORE_SHAPE,
-                )
+            if block_height is not None and block_height < 0:
+                block_height = None
             stamp = _require_plain_int(verbose.get("blocktime"))
             block_time = stamp if stamp is not None and stamp >= 0 else None
         return TxStatus(
@@ -943,9 +964,18 @@ class BitcoindClient:
         self._snapshot_height = scan_height
         return snapshot
 
-    def _tx_entry(self, verbose: Any, requested_txid: str) -> dict[str, Any]:
+    def _tx_entry(
+        self, verbose: Any, requested_txid: str, scan_height: int | None
+    ) -> dict[str, Any]:
         """Translate one verbose ``getrawtransaction`` into the Esplora
-        ``/txs`` shape (the electrum adapter's twin mapping)."""
+        ``/txs`` shape (the electrum adapter's twin mapping).
+
+        ``scan_height`` is the confirmation height proven by the address's
+        ``scantxoutset`` row — the adapter's only REAL height source
+        (verbose txs carry none, TCK-SCAN-BITCOIND-002). ``None`` when no
+        row proved one: a confirmed entry then simply carries no
+        ``block_height`` — honest degradation, never a refusal.
+        """
         kind = _KIND_ADDRESS_TXS
         if not isinstance(verbose, dict):
             raise ChainError(
@@ -968,17 +998,17 @@ class BitcoindClient:
             )
         status: dict[str, Any] = {"confirmed": confirmations > 0}
         if confirmations > 0:
-            # THE live bug (debugger handoff): real Core names the field
-            # ``height``, not the legacy ``blockheight`` — the shared
-            # lenient reader takes either; an unreadable one on a
-            # confirmed tx is a SHAPE refusal (never network-error).
-            block_height = _tx_block_height(verbose)
-            if block_height is None or block_height < 0:
-                raise ChainError(
-                    f"{kind} transaction detail has a missing or invalid block height",
-                    failure_class=NOT_CORE_SHAPE,
-                )
-            status["block_height"] = block_height
+            # THE live bug (TCK-SCAN-BITCOIND-002): Core's verbose tx
+            # NEVER carries a height under any name — the confirmation
+            # height is the scan row's (``scan_height`` above). The
+            # lenient verbose read stays as a defensive fallback; a
+            # confirmed tx with no height anywhere carries none (the
+            # Esplora honest-unheighted shape), never a shape refusal.
+            block_height = (
+                scan_height if scan_height is not None else _tx_block_height(verbose)
+            )
+            if block_height is not None and block_height >= 0:
+                status["block_height"] = block_height
             stamp = _require_plain_int(verbose.get("blocktime"))
             if stamp is not None and stamp >= 0:
                 status["block_time"] = stamp
