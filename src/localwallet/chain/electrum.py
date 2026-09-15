@@ -89,6 +89,9 @@ from localwallet.chain.esplora import (
     _TXID_LENGTH_CHARS,
     MAINNET_GENESIS_HASH,
     NOT_MAINNET,
+    RPC_ERROR,
+    SERVER_REJECTED,
+    TXID_BIND_MISMATCH,
     ChainError,
     TipBlock,
     TxStatus,
@@ -425,10 +428,24 @@ class ElectrumClient:
         result = self._rpc(
             "blockchain.transaction.broadcast", [tx_hex], _KIND_BROADCAST, retries=0
         )
-        reported = _require_txid_hex(result, _KIND_BROADCAST)
+        # Site E (TCK-DIAG-005): this server dialect refuses a broadcast by
+        # answering with the refusal TEXT where the txid belongs. Label it
+        # HERE (the shared helper also serves history/utxo parsers, whose
+        # shape failures must stay unlabeled): same exception object, same
+        # message — only the value-free debug class is added.
+        try:
+            reported = _require_txid_hex(result, _KIND_BROADCAST)
+        except ChainError as exc:
+            exc.failure_class = SERVER_REJECTED
+            raise
         if reported != expected_txid:
+            # Site F: NOT a rejection — the server accepted the broadcast
+            # and answered with a well-formed foreign txid (the SEC-004
+            # bind tripping). Integrity event, distinct class, documented
+            # decision in the esplora taxonomy home.
             raise ChainError(
-                f"{_KIND_BROADCAST} response txid does not match the broadcast transaction"
+                f"{_KIND_BROADCAST} response txid does not match the broadcast transaction",
+                failure_class=TXID_BIND_MISMATCH,
             )
         return reported
 
@@ -749,8 +766,21 @@ class ElectrumClient:
                 error = message.get("error")
                 if error:
                     # Server text NEVER echoed (untrusted; can carry the
-                    # queried scripthash). Kind only.
-                    raise ChainError(f"{kind} request rejected by the server")
+                    # queried scripthash). Kind only. TCK-DIAG-005 site C:
+                    # a JSON-RPC error envelope is the rpc-error class (the
+                    # bitcoind adapter's answer for the same envelope; the
+                    # shared branch covers every electrum endpoint), with
+                    # the numeric code carried value-free — int-only,
+                    # bool-rejected, absent/malformed stays None
+                    # (bitcoind._rpc_error_code is the precedent).
+                    code = error.get("code") if isinstance(error, dict) else None
+                    if isinstance(code, bool) or not isinstance(code, int):
+                        code = None
+                    raise ChainError(
+                        f"{kind} request rejected by the server",
+                        failure_class=RPC_ERROR,
+                        rpc_code=code,
+                    )
                 return message.get("result")
             # id-less notifications (headers/scripthash updates) and stale
             # ids: skipped per plan (no batching, no push consumption v1).

@@ -16,7 +16,11 @@ if str(_SRC) not in sys.path:
 
 from localwallet.chain import ChainError, EsploraClient
 from localwallet.chain import esplora as esplora_module
-from localwallet.chain.esplora import NOT_ESPLORA_SHAPE
+from localwallet.chain.esplora import (
+    NOT_ESPLORA_SHAPE,
+    SERVER_REJECTED,
+    TXID_BIND_MISMATCH,
+)
 
 BASE_URL = "https://mempool.space/api"
 ADDRESS = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
@@ -399,6 +403,9 @@ def test_broadcast_tx_never_retries_any_failure(monkeypatch: pytest.MonkeyPatch,
     assert TX_HEX not in message  # log-scrubbing invariant
     assert len(server.requests) == 1  # exactly one attempt
     assert sleeps == []  # no backoff was ever scheduled
+    # TCK-DIAG-005 sibling: every non-2xx answer to the broadcast POST is a
+    # labeled server refusal, never the network-error fallthrough.
+    assert excinfo.value.failure_class == SERVER_REJECTED
 
 
 def test_broadcast_tx_connection_error_single_attempt(monkeypatch: pytest.MonkeyPatch):
@@ -470,6 +477,9 @@ def test_broadcast_tx_response_txid_is_revalidated():
         assert TX_HEX not in message
         for fragment in ("<html>", '{"txid"'):
             assert fragment not in message
+        # TCK-DIAG-005 sibling: the rejection-as-answer-body dialect is a
+        # labeled server refusal (electrum-site-E parity).
+        assert excinfo.value.failure_class == SERVER_REJECTED
 
 
 def test_broadcast_tx_refuses_well_formed_wrong_txid():
@@ -488,6 +498,9 @@ def test_broadcast_tx_refuses_well_formed_wrong_txid():
     assert BROADCAST_TXID not in message
     assert TX_HEX not in message
     assert len(server.requests) == 1  # the POST itself succeeded (2xx)
+    # TCK-DIAG-005: the bind trip is the dedicated integrity class, same as
+    # the electrum twin site (cross-adapter debug-line parity).
+    assert excinfo.value.failure_class == TXID_BIND_MISMATCH
 
 
 def test_broadcast_tx_binding_accepts_the_exact_computed_txid():

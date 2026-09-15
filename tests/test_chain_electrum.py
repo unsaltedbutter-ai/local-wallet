@@ -66,6 +66,13 @@ from localwallet.chain import (
     check_backend,
 )
 from localwallet.chain import electrum as electrum_module
+from localwallet.chain.esplora import (
+    CONNECT_REFUSED,
+    NETWORK_ERROR,
+    RPC_ERROR,
+    SERVER_REJECTED,
+    TXID_BIND_MISMATCH,
+)
 from localwallet.chain.watch import time_since_last_block
 from localwallet.config import Settings
 from localwallet.store import Store
@@ -550,6 +557,10 @@ class TestTranslation:
             client.get_address_txs(ADDRS[0][0])
         assert str(excinfo.value) == "address-txs request rejected by the server"
         assert secret not in str(excinfo.value)
+        # TCK-DIAG-005 site C is SHARED by every electrum endpoint (the
+        # enrichment is sanctioned for all of them — consistent with how
+        # bitcoind classifies the same JSON-RPC envelope).
+        assert excinfo.value.failure_class == RPC_ERROR
 
 
 # ------------------------------------------- scan-level indistinguishability
@@ -717,14 +728,55 @@ class TestBroadcast:
         assert server.requests[-1] == ("blockchain.transaction.broadcast", [TX_HEX])
 
     def test_wrong_txid_refused(self, electrum: Any) -> None:
+        """Site F (TCK-DIAG-005): a well-formed FOREIGN txid is the SEC-004
+        bind tripping — an integrity event, labeled, never the network-error
+        fallthrough (and NOT lumped under server-rejected: nothing was
+        refused; the server answered with the wrong transaction)."""
         server = electrum(script={"blockchain.transaction.broadcast": ["f" * 64]})
-        with _client(server) as client, pytest.raises(ChainError, match="does not match"):
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
             client.broadcast_tx(TX_HEX)
+        assert "does not match" in str(excinfo.value)
+        assert excinfo.value.failure_class == TXID_BIND_MISMATCH
 
     def test_junk_txid_response_refused(self, electrum: Any) -> None:
         server = electrum(script={"blockchain.transaction.broadcast": ["ok: 123"]})
         with _client(server) as client, pytest.raises(ChainError, match="malformed 'txid'"):
             client.broadcast_tx(TX_HEX)
+
+    def test_broadcast_rejection_as_result_string_is_server_rejected(self, electrum: Any) -> None:
+        """H1 (TCK-DIAG-005, the user's prime suspect): a server that
+        refuses a broadcast by answering with the refusal TEXT where the
+        txid belongs is labeled ``server-rejected`` — the message stays
+        byte-identical and value-free, the class is the ONLY addition, and
+        the DIAG-003 debug line reads class=server-rejected."""
+        refusal = "18: txn-mempool-conflict: rejected for reason dust"
+        server = electrum(script={"blockchain.transaction.broadcast": [refusal]})
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.broadcast_tx(TX_HEX)
+        exc = excinfo.value
+        assert exc.failure_class == SERVER_REJECTED
+        # value-free: the refusal text NEVER rides the message (server text
+        # is untrusted input; DIAG-001 surface discipline).
+        assert refusal not in str(exc)
+        assert "dust" not in str(exc) and "conflict" not in str(exc)
+        assert str(exc) == "broadcast response has a missing or malformed 'txid'"
+        # The DIAG-003 debug line shape: class rides verbatim, no code extra.
+        fc, name, extra = app_module._failure_parts(exc)
+        assert (fc, name, extra) == ("server-rejected", "ChainError", "")
+
+    def test_history_shape_failure_stays_unlabeled(self, electrum: Any) -> None:
+        """The site-E label is BROADCAST-ONLY: the shared txid helper also
+        serves the history/utxo parsers, whose shape failures must NOT be
+        mislabeled as broadcast rejections (they keep no explicit class —
+        the debug line falls through classify_failure exactly as before
+        TCK-DIAG-005)."""
+        server = electrum(script={"blockchain.scripthash.listunspent": [[{"tx_hash": "nope"}]]})
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.get_address_utxos(ADDRS[0][0])
+        assert "malformed 'txid'" in str(excinfo.value)
+        assert excinfo.value.failure_class is None
+        # classify_failure's fallthrough is unchanged for these siblings.
+        assert app_module._failure_parts(excinfo.value)[0] == NETWORK_ERROR
 
     def test_single_attempt_even_on_transport_loss(self, electrum: Any) -> None:
         """No-retry parity with Esplora: a POST-equivalent is never
@@ -734,15 +786,57 @@ class TestBroadcast:
             client.broadcast_tx(TX_HEX)
         assert server.counts["blockchain.transaction.broadcast"] == 1
         assert str(excinfo.value) == "broadcast failed: network error (ConnectionResetError)"
+        # TCK-DIAG-005 regression pin: real transport losses carry their
+        # TRUE class — a labeled network-error on broadcast now always means
+        # "server refused, unlabeled" is no longer a possible reading.
+        assert excinfo.value.failure_class == CONNECT_REFUSED
+        assert excinfo.value.failure_class != NETWORK_ERROR
 
     def test_error_response_single_attempt(self, electrum: Any) -> None:
+        # The scripted error entry must be LIST-wrapped — bare, the fixture
+        # indexes the tuple and answers with the result STRING "error"
+        # (a pre-DIAG-005 wiring quirk that made this "error response" test
+        # silently exercise the result-string dialect instead; the H2 pin
+        # below is what catches that class of drift now).
         server = electrum(
-            script={"blockchain.transaction.broadcast": ("error", "18: tx already known")}
+            script={"blockchain.transaction.broadcast": [("error", "18: tx already known")]}
         )
         with _client(server, max_retries=3) as client, pytest.raises(ChainError) as excinfo:
             client.broadcast_tx(TX_HEX)
         assert server.counts["blockchain.transaction.broadcast"] == 1
         assert "already known" not in str(excinfo.value)
+        # H2 (TCK-DIAG-005 site C): the JSON-RPC error-object dialect gains
+        # the rpc-error class (the bitcoind adapter's label for the same
+        # envelope) and the numeric code rides value-free.
+        exc = excinfo.value
+        assert exc.failure_class == RPC_ERROR
+        assert exc.rpc_code == 1  # the fixture's error object carries code 1
+        assert app_module._failure_parts(exc) == ("rpc-error", "ChainError", " code=1")
+
+    @pytest.mark.parametrize(
+        ("error_member", "expected_code"),
+        [
+            ({"message": "rejected"}, None),  # no code member
+            ({"code": "18", "message": "string code"}, None),  # not an int
+            ({"code": True, "message": "bool code"}, None),  # bool rejected
+            ({"code": -27, "message": "txn-mempool-conflict"}, -27),  # numeric rides
+            ("bare string error", None),  # non-object error member
+        ],
+    )
+    def test_rpc_error_code_extraction_is_value_free_int_only(
+        self, electrum: Any, error_member: Any, expected_code: int | None
+    ) -> None:
+        """Site C's code carry (bitcoind._rpc_error_code precedent):
+        int-only, bool-rejected, absent/malformed stays None — the error
+        TEXT never leaves the adapter."""
+        line = json.dumps({"id": 3, "result": None, "error": error_member})
+        server = electrum(script={"blockchain.transaction.broadcast": [("raw", line)]})
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.broadcast_tx(TX_HEX)
+        exc = excinfo.value
+        assert str(exc) == "broadcast request rejected by the server"
+        assert exc.failure_class == RPC_ERROR
+        assert exc.rpc_code == expected_code
 
     def test_unparseable_hex_never_sent(self, electrum: Any) -> None:
         server = electrum()

@@ -147,6 +147,23 @@ NETWORK_ERROR: Final[str] = "network-error"
 #: line on :class:`ChainError` (codes are protocol constants, not user
 #: data); the server's message text stays untrusted and never surfaces.
 RPC_ERROR: Final[str] = "rpc-error"
+#: The server understood the broadcast and REFUSED the transaction, but said
+#: so in the "rejection as answer" dialect instead of a JSON-RPC error
+#: object: an Electrum server returning the refusal text in place of the
+#: txid result, or an Esplora endpoint answering non-2xx on the POST
+#: (TCK-DIAG-005 — the label the network-error fallthrough was hiding;
+#: the server's TEXT is never extracted or echoed, only the fact of the
+#: refusal). Distinct from :data:`RPC_ERROR` (well-formed JSON-RPC error
+#: envelope) and from every transport class: the server spoke, and said no.
+SERVER_REJECTED: Final[str] = "server-rejected"
+#: A broadcast ANSWERED with a well-formed txid that is not the txid of the
+#: transaction we sent (TCK-SEC-004 txid bind tripped; TCK-DIAG-005 site F
+#: decision). Deliberately NOT :data:`SERVER_REJECTED`: the server did not
+#: refuse anything — it accepted the broadcast and lied about which
+#: transaction, an integrity event that demands a different operator
+#: response than a policy rejection (distinct-name precedent:
+#: :data:`NOT_CORE_SHAPE` above).
+TXID_BIND_MISMATCH: Final[str] = "txid-bind-mismatch"
 
 
 def classify_failure(exc: BaseException | None) -> str:
@@ -872,19 +889,34 @@ class EsploraClient:
             raise ChainError(f"{_KIND_BROADCAST} failed: network error ({type(exc).__name__})") from exc
         status = response.status_code
         if not 200 <= status < 300:
-            # Single attempt for EVERY non-2xx — including 429/5xx (no-retry decision above).
-            raise ChainError(f"{_KIND_BROADCAST} failed: status {status}")
+            # Single attempt for EVERY non-2xx — including 429/5xx (no-retry
+            # decision above). TCK-DIAG-005 sibling: the server answered the
+            # POST and it was not an acceptance — label the refusal
+            # (server-rejected), value-free, the same enrichment the electrum
+            # broadcast sites get; the status code already rides the message.
+            raise ChainError(
+                f"{_KIND_BROADCAST} failed: status {status}", failure_class=SERVER_REJECTED
+            )
         reported = response.text.strip()
         if len(reported) != _TXID_LENGTH_CHARS or not set(reported) <= _TXID_CHARSET:
-            raise ChainError(f"{_KIND_BROADCAST} response was not a valid transaction id")
+            # TCK-DIAG-005 sibling: the "rejection as answer-body" dialect
+            # (electrum-style refusal text where a txid belongs).
+            raise ChainError(
+                f"{_KIND_BROADCAST} response was not a valid transaction id",
+                failure_class=SERVER_REJECTED,
+            )
         # Bind the reported txid to the transaction we actually sent
         # (TCK-SEC-004 change 1). Both sides are lowercase hex here (the
         # charset contract above; ``txid().hex()`` by construction), so a
         # direct comparison is the case-insensitive-safe check. Value-free
-        # detail: neither txid is echoed.
+        # detail: neither txid is echoed. TCK-DIAG-005: same dedicated
+        # integrity class as the electrum twin site (cross-adapter parity —
+        # the class rides the app's debug line identically whichever
+        # backend refused).
         if reported != expected_txid:
             raise ChainError(
-                f"{_KIND_BROADCAST} response txid does not match the broadcast transaction"
+                f"{_KIND_BROADCAST} response txid does not match the broadcast transaction",
+                failure_class=TXID_BIND_MISMATCH,
             )
         return reported
 
