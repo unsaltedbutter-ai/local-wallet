@@ -197,7 +197,16 @@ def test_privacy_chip_is_enum_gated_and_never_paints_raw_enum() -> None:
     assert 'id="privacy-chip"' in index_html
     assert "Privacy notice" in index_html
     styles = (_STATIC / "styles.css").read_text(encoding="utf-8")
-    for name in ("public", "own_node_local", "own_node_remote", "awaiting_backend"):
+    # TCK-WEB-023: the FIVE-name closed enum — every /state privacy_mode
+    # NAME has a shipped color rule (an unmapped name would HIDE the chip:
+    # the client map + CSS must land together for a new enum member).
+    for name in (
+        "public",
+        "own_node_local",
+        "own_node_private",
+        "own_node_remote",
+        "awaiting_backend",
+    ):
         assert f'data-privacy="{name}"' in styles
 
 
@@ -251,17 +260,16 @@ def test_privacy_subline_visible_and_trust_badge_keys_off_privacy_mode() -> None
     assert "effectiveChainUrl" not in trust_block
 
 
-# TCK-DESCOPE-M3B static pins (user direction 2026-09-11): the settings
-# pane's backend-KIND badges are ELIMINATED — the whole client machinery
-# (family mapping, painters, state field, per-badge LABELS words) is gone
-# from app.js, the kind chips are gone from the stylesheet, and no
-# mempool/esplora/public kind string survives in the shipped client. The
-# TRUST badge (privacy_mode) is untouched — the pins above stay green; the
-# engine-side additive ``backend_kind`` field (closed enum
-# none/electrum/bitcoind) keeps its pins in tests/test_backend_hotswap.py.
-def test_kind_badges_eliminated_and_trust_badge_survives() -> None:
+# TCK-DESCOPE-M3B (user direction 2026-09-11) ELIMINATED the kind badges;
+# the TCK-WEB-023 AMENDMENT (user MW-17 direction 2026-09-13) re-admits
+# EXACTLY electrum & bitcoind as pills tinted by the shared privacy_mode
+# classification — MEMPOOL STAYS GONE, and the whole old machinery stays
+# dead: no legend, no dim/lit trust tiers, no family mapping, no old class
+# names. The TRUST badge (privacy_mode) is untouched.
+def test_kind_badges_return_amendment_shaped_mempool_stays_gone() -> None:
     raw = (_STATIC / "app.js").read_text(encoding="utf-8")
     code = _strip_js_comments(raw)
+    # the old shape is still fully gone (only the new minimal painter exists):
     for gone in (
         "BADGE_FAMILIES",
         "paintBackendBadges(",
@@ -275,12 +283,29 @@ def test_kind_badges_eliminated_and_trust_badge_survives() -> None:
         "settingsEmptyApplied",
         "backendKind",
         "backend-badge",
+        "mempool",
+        "esplora",
     ):
         assert gone not in code, gone
-    for stale_kind in ('"mempool"', '"esplora"', '"public"'):
-        assert stale_kind not in code, stale_kind
+    # the amendment painter: word map keyed by the CLOSED engine enum MINUS
+    # none (none = no pill), tint map keyed by the four RESOLVED modes
+    # (awaiting_backend absent = no pill), pure planner shipped.
+    words = code[code.index("const KIND_PILL_WORDS"):code.index("const KIND_PILL_TINTS")]
+    assert "electrum:" in words and "bitcoind:" in words and "none" not in words
+    tints = code[code.index("const KIND_PILL_TINTS"):code.index("function kindPillPaint")]
+    for mode in ("own_node_local", "own_node_private", "public", "own_node_remote"):
+        assert mode in tints
+    assert "awaiting_backend" not in tints
+    assert "kind-pill-private" in tints and "kind-pill-public" in tints
+    assert tints.count("kind-pill-private") == 2  # the two GREEN names only
+    assert tints.count("kind-pill-public") == 2
+    # the pill is consumed ONLY where the status zone builds it, beside the
+    # trust badge, and re-painted in the SAME trust pass (one truth/paint):
+    assert "const pill = kindPill();" in code
+    assert "kindPillPaint(state.backendName, state.privacyMode)" in code
     css = (_STATIC / "styles.css").read_text(encoding="utf-8")
     assert ".backend-badge" not in css
+    assert ".kind-pill" in css
     # no coverage loss on the trust badge: word map + painter still shipped.
     assert "const TRUST_BADGE_WORDS" in code
     assert "function paintTrustBadges" in code
@@ -376,22 +401,85 @@ def test_server_card_zones_and_collapse_discipline() -> None:
     assert code.count('el("details"') == 2  # exactly the two collapse slots
 
 
-# (4) ONE COLOR VOCABULARY: the trust dimension owns the risk colors; the
-# stylesheet carries the CLASS CONTRACT for a future neutral .kind-pill —
-# as a comment only. No badge markup or .kind-pill rule exists today.
-def test_color_vocabulary_contract_and_no_kind_badge() -> None:
+# (4) ONE COLOR VOCABULARY: the trust dimension owns the risk colors, and
+# the TCK-WEB-023 kind pill takes its tint ONLY as a DERIVED class from that
+# same closed classification (base neutral pill + tint class — no third
+# palette, and the risk tokens never reach any other selector).
+def test_color_vocabulary_contract_and_kind_pill_tint_derivation() -> None:
     code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
     css = (_STATIC / "styles.css").read_text(encoding="utf-8")
     assert "ONE COLOR VOCABULARY" in css  # the contract block is present
-    assert ".kind-pill" in css and "TCK-WEB-023" in css  # names the future slot
-    # contract comment only: no rule builds a pill, no client paints one.
-    assert ".kind-pill" not in code
-    assert not re.search(r"\.kind-pill\s*\{", css)
+    # the pill rule exists (amendment), built NEUTRAL first: the base class
+    # carries muted ink, the tint classes carry ONLY --c-priv-* pairs.
+    base = re.search(r"\.kind-pill \{[^}]*\}", css).group(0)
+    assert "--c-text-muted" in base and "--c-priv-" not in base
+    for tint, token in (
+        ("kind-pill-private", "--c-priv-local"),
+        ("kind-pill-public", "--c-priv-trust"),
+    ):
+        rule = re.search(rf"\.{tint} \{{[^}}]*\}}", css).group(0)
+        assert token in rule
+    # no client-side color logic: app.js picks a CLASS NAME from the closed
+    # tint map; --c-priv-* tokens never appear in the client, and NO trust
+    # or tint decision reads the effective chain URL / any URL content.
+    assert "--c-priv-" not in code
+    trust_block = code[code.index("const PRIVACY_SUBLINE"):code.index("function refreshState")]
+    assert "effectiveChainUrl" not in trust_block
+    assert "href" not in trust_block
     # risk tokens stay exclusively on the trust dimension (chip + badge):
     priv_rules = re.findall(
         r"^\.([a-z-]+)\[data-privacy", css, flags=re.MULTILINE
     )
     assert set(priv_rules) == {"privacy", "trust-badge"}
+
+
+# TCK-WEB-023 FIVE-ENUM MATRIX (static): every /state privacy_mode NAME maps
+# to a chip color and (where resolved) a subline + trust word; the TWO GREEN
+# names are exactly {own_node_local, own_node_private} and share the SAME
+# CSS rule (one classification, two names); YELLOW stays with remote/awaiting
+# and public keeps its existing danger-red chip. The two host-bearing
+# sublines carry the council copy verbatim; own_node_private's green copy
+# keeps the glm trust HEDGE ("run this server yourself") — the color claims
+# private-network, the words never do.
+def test_web023_five_mode_matrix_maps_and_copy() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    raw = (_STATIC / "app.js").read_text(encoding="utf-8")
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    sublines = code[code.index("const PRIVACY_SUBLINE"):code.index("const PRIVACY_HOST_TEMPLATES")]
+    for mode in ("public", "own_node_local", "own_node_private",
+                 "own_node_remote", "awaiting_backend"):
+        assert mode in sublines, mode
+    # unknown names still hide (the hasOwnProperty gate on the SHIPPED map):
+    assert 'hasOwnProperty.call(PRIVACY_SUBLINE, mode)' in code
+    words = code[code.index("const TRUST_BADGE_WORDS"):code.index("const KIND_PILL_WORDS")]
+    for mode in ("public", "own_node_local", "own_node_private",
+                 "own_node_remote", "awaiting_backend"):
+        assert mode in words, mode
+    # the council-folded copy, verbatim:
+    assert "Your node at {host} — private only if you trust it." in raw
+    assert "Your node at {host} — only private if you run this server yourself." in raw
+    assert "Your node — only private if you run this server yourself." in raw
+    # unchanged sublines keep their pre-WEB-023 sentences (public/local/
+    # awaiting — the ticket pins them):
+    assert "Public explorer — the operator can associate queried addresses with your IP." in raw
+    assert "Your node on this machine — lookups stay here." in raw
+    assert "No backend chosen yet." in raw
+    # the host arrives ONLY through the typed wire key (no sniffing source):
+    assert "snap.backend_host" in code
+    assert "BARE_HOST_RE" in code  # every host passes the bare-host gate
+    # CSS: the GREEN rule lists BOTH green names (and only them) and uses
+    # the green token pair; own_node_remote + awaiting share the yellow.
+    green = re.search(
+        r"\.privacy\[data-privacy=\"own_node_local\"\],[^{]*\{[^}]*\}", css
+    ).group(0)
+    assert green.count("data-privacy") == 4  # chip+badge × the two GREEN names
+    assert 'data-privacy="own_node_private"' in green and "--c-priv-local" in green
+    yellow = re.search(
+        r"\.privacy\[data-privacy=\"own_node_remote\"\],[^{]*\{[^}]*\}", css
+    ).group(0)
+    assert 'data-privacy="awaiting_backend"' in yellow and "--c-priv-trust" in yellow
+    red = re.search(r"\.privacy\[data-privacy=\"public\"\][^{]*\{[^}]*\}", css).group(0)
+    assert "--c-priv-public" in red  # public chip: existing danger-red, unchanged
 
 
 # (5) STALE NOW-LINE: the reload trigger is PINNED — once per /state
@@ -1988,4 +2076,189 @@ def test_scan_error_line_render_contract_under_node() -> None:
       if (!scanErrorEl.hidden) throw new Error("empty-shown");
       console.log("ok");
     """.replace("__FN__", fn)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# ============================================================== TCK-WEB-023
+# Private-IP GREEN + kind-pill return + the backend_host subline (AMENDMENT +
+# COUNCIL FOLD). The SHIPPED maps and functions are extracted from app.js and
+# executed under node (browser-free): five-enum chip/subline/pill matrices,
+# host present/absent/fallback, creds-refusal, unknown-name hide, and the
+# last-known-value lifecycle. Copy prose is the real shipped LABELS — the
+# matrices assert against it verbatim, so a reword fails the pin.
+
+def _web023_blocks() -> str:
+    """The shipped LABELS + both map/function blocks, verbatim (comments
+    stripped). One stub set (state, chip/subline/badge/pill elements, el)
+    satisfies both blocks; tests then drive only what they name."""
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    leak = re.search(r"const PUBLIC_LEAK_SENTENCE =.*?;\n", code, re.DOTALL).group(0)
+    labels = re.search(r"const LABELS = \{.*?\n\};", code, re.DOTALL).group(0)
+    privacy = code[code.index("const PRIVACY_SUBLINE"):code.index("const TRUST_BADGE_WORDS")]
+    badges = code[code.index("const TRUST_BADGE_WORDS"):code.index("async function refreshState")]
+    stubs = """
+      const state = { privacyMode: "", backendHost: "", backendName: "" };
+      const privacyChipEl = {
+        hidden: true, dataset: {}, removedAttrs: [],
+        removeAttribute(k) { this.removedAttrs.push(k); delete this.dataset[k]; },
+      };
+      let sublineWrites = 0;
+      const privacySublineEl = {
+        _t: "",
+        set textContent(v) { sublineWrites++; this._t = v; },
+        get textContent() { return this._t; },
+      };
+      const badgeStub = { hidden: true, dataset: {}, textContent: "" };
+      const pillStub = { hidden: true, className: "", textContent: "" };
+      const settingsListEl = {
+        querySelectorAll(sel) {
+          if (sel === ".trust-badge") return [badgeStub];
+          if (sel === ".kind-pill") return [pillStub];
+          return []; // .chain-consent: hidden-ness of the consent box is
+                     // WEB-022/001B territory, untouched here.
+        },
+      };
+      const el = (tag, cls, text) => ({ className: cls, textContent: text });
+    """
+    return stubs + leak + labels + privacy + badges
+
+
+def test_web023_subline_host_matrix_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    script = (
+        _web023_blocks()
+        + """
+      const GENERIC_PRIVATE = "Your node — only private if you run this server yourself.";
+      const GENERIC_REMOTE = "Your node on another machine — private only if you trust it.";
+      // five-enum matrix: every shipped mode has a host-less subline,
+      // none leaks the {host} placeholder, unknown names render "" (hide).
+      for (const m of ["public", "own_node_local", "own_node_private",
+                       "own_node_remote", "awaiting_backend"]) {
+        const s = privacySublineText(m, "");
+        if (!s || s.includes("{host}") || s.includes("1.2.3.4")) throw new Error(m);
+      }
+      if (privacySublineText("brand_new_mode", "1.2.3.4") !== "") throw new Error("unknown-shown");
+      // council fold: remote gains the host, private goes green-with-hedge.
+      if (privacySublineText("own_node_remote", "node.example.com")
+          !== "Your node at node.example.com — private only if you trust it.") throw new Error("remote-host");
+      if (privacySublineText("own_node_private", "192.168.1.50")
+          !== "Your node at 192.168.1.50 — only private if you run this server yourself.") throw new Error("private-host");
+      // fallbacks (host absent = nothing to name, never an empty hole):
+      if (privacySublineText("own_node_remote", "") !== GENERIC_REMOTE) throw new Error("remote-fb");
+      if (privacySublineText("own_node_private", "") !== GENERIC_PRIVATE) throw new Error("private-fb");
+      if (privacySublineText("own_node_private", undefined) !== GENERIC_PRIVATE) throw new Error("private-undef");
+      // the three UNCHANGED modes ignore the host key entirely:
+      for (const m of ["public", "own_node_local", "awaiting_backend"]) {
+        if (privacySublineText(m, "10.0.0.7").includes("10.0.0.7")) throw new Error(m + "-host-leak");
+      }
+      // NO-CREDS-ON-WIRE client defense: a regressed wire value carrying
+      // creds/scheme/path/whitespace/markup falls back to the generic
+      // hedge — the refused text NEVER renders, and no sink ever shows
+      // @, ://, or markup from a host-shaped value.
+      for (const bad of ["rpcuser:hunter2@10.0.0.7", "://10.0.0.7", "10.0.0.7/p",
+                         "10.0.0.7 ", "<img src=x onerror=alert(1)>", "@", "x".repeat(300)]) {
+        const s = privacySublineText("own_node_private", bad);
+        if (s !== GENERIC_PRIVATE) throw new Error("creds-refused:" + bad);
+        if (s.includes("@") || s.includes("://") || s.includes("<")) throw new Error("wire-leak");
+      }
+      // honest shapes that DO ride the subline (IPv6 bracket literal, FQDN):
+      if (!privacySublineText("own_node_private", "[::ffff:10.1.1.1]").includes("[::ffff:10.1.1.1]")) throw new Error("v6");
+      console.log("ok");
+    """
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+def test_web023_kind_pill_tint_matrix_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    script = (
+        _web023_blocks()
+        + """
+      const GREEN = new Set(["own_node_local", "own_node_private"]);
+      const RESOLVED = new Set(["public", "own_node_local", "own_node_private", "own_node_remote"]);
+      for (const kind of ["none", "electrum", "bitcoind", "mempool", "", "future"]) {
+        for (const mode of [...RESOLVED, "awaiting_backend", "", "brand_new"]) {
+          const p = kindPillPaint(kind, mode);
+          const should = (kind === "electrum" || kind === "bitcoind") && RESOLVED.has(mode);
+          if (p.visible !== should) throw new Error("visible:" + kind + "/" + mode);
+          if (!should) continue;
+          const wantTint = GREEN.has(mode) ? "kind-pill-private" : "kind-pill-public";
+          if (p.tint !== wantTint) throw new Error("tint:" + kind + "/" + mode);
+          if (p.text !== (kind === "electrum" ? "Electrum" : "Bitcoin Core")) throw new Error("word");
+        }
+      }
+      console.log("ok");
+    """
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+def test_web023_chip_lifecycle_pill_repaint_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    script = (
+        _web023_blocks()
+        + """
+      // (backendName is stamped upstream by applyState — pinned in
+      // test_settings_reload_is_pinned_to_the_trust_flip; this harness
+      // stamps it the same way before the chip pass repaints the badges.)
+      // private mode + host + kind: GREEN chip, host hedge, green pill —
+      // chip, trust badge and pill ALL painted from the one snapshot.
+      state.backendName = "electrum";
+      applyPrivacyChip({ schema: "state/1", privacy_mode: "own_node_private",
+                         backend_kind: "electrum", backend_host: "10.1.2.3" });
+      if (privacyChipEl.hidden) throw new Error("chip-hidden");
+      if (privacyChipEl.dataset.privacy !== "own_node_private") throw new Error("tint-attr");
+      if (!privacySublineEl.textContent.includes("10.1.2.3")
+          || !privacySublineEl.textContent.includes("run this server yourself")) throw new Error("subline");
+      if (badgeStub.hidden || badgeStub.dataset.privacy !== "own_node_private") throw new Error("badge");
+      if (pillStub.hidden || pillStub.className !== "kind-pill kind-pill-private"
+          || pillStub.textContent !== "Electrum") throw new Error("pill");
+      // typed flip to REMOTE with the host key OMITTED: the stale private
+      // host is gone (omit-never-empty), the pill re-tints YELLOW.
+      state.backendName = "bitcoind";
+      applyPrivacyChip({ schema: "state/1", privacy_mode: "own_node_remote",
+                         backend_kind: "bitcoind" });
+      if (privacySublineEl.textContent.includes("10.1.2.3")) throw new Error("stale-host");
+      if (privacySublineEl.textContent !== "Your node on another machine — private only if you trust it.") throw new Error("remote-fallback");
+      if (pillStub.className !== "kind-pill kind-pill-public"
+          || pillStub.textContent !== "Bitcoin Core") throw new Error("pill-retint");
+      // state/0 (busy) persists the last known truth untouched.
+      const before = sublineWrites;
+      applyPrivacyChip({ schema: "state/0" });
+      if (sublineWrites !== before) throw new Error("state0-repaint");
+      if (privacySublineEl.textContent.includes("10.1.2.3")) throw new Error("state0-revive");
+      // kind none / awaiting mode: NO pill (both branches).
+      state.backendName = "none";
+      applyPrivacyChip({ schema: "state/1", privacy_mode: "own_node_private",
+                         backend_kind: "none", backend_host: "10.1.2.3" });
+      if (!pillStub.hidden) throw new Error("none-pill");
+      state.backendName = "electrum";
+      applyPrivacyChip({ schema: "state/1", privacy_mode: "awaiting_backend",
+                         backend_kind: "electrum", backend_host: "surprise" });
+      if (!pillStub.hidden) throw new Error("awaiting-pill");
+      if (privacySublineEl.textContent !== "No backend chosen yet.") throw new Error("awaiting-subline");
+      // unknown mode NAME (newer engine): chip HIDES (existing discipline),
+      // and the host it carried is dropped, never rendered anywhere.
+      state.backendName = "electrum";
+      applyPrivacyChip({ schema: "state/1", privacy_mode: "brand_new_mode",
+                         backend_kind: "electrum", backend_host: "9.9.9.9" });
+      if (!privacyChipEl.hidden || state.privacyMode !== "" || state.backendHost !== "") throw new Error("unknown-mode");
+      if (privacySublineEl.textContent !== "") throw new Error("unknown-subline");
+      if (privacyChipEl.removedAttrs.length === 0) throw new Error("attr-residue");
+      if (!badgeStub.hidden || !pillStub.hidden) throw new Error("unknown-badges");
+      console.log("ok");
+    """
+    )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)

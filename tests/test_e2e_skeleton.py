@@ -1719,8 +1719,16 @@ def test_backend_mode_three_state_classification() -> None:
     TCK-DESCOPE-M3A): no configured URL ⇒ UNRESOLVED (awaiting_backend —
     the silent public default is gone); the consented PUBLIC ELECTRUM host
     ⇒ public; loopback host ⇒ own_node_local; anything else ⇒
+    own_node_remote. TCK-WEB-023 widens "anything else": a private-range
+    LITERAL IP now answers own_node_private (the full matrix + the
+    CGNAT/link-local/.local exclusions are pinned in
+    tests/test_web023_private_green.py); names and public literals stay
     own_node_remote."""
-    from localwallet.app import PRIVACY_MODE_AWAITING_BACKEND, _backend_mode
+    from localwallet.app import (
+        BACKEND_MODE_OWN_NODE_PRIVATE,
+        PRIVACY_MODE_AWAITING_BACKEND,
+        _backend_mode,
+    )
     from localwallet.config import PUBLIC_ELECTRUM_URL, Settings
 
     assert _backend_mode(Settings()) == PRIVACY_MODE_AWAITING_BACKEND
@@ -1745,7 +1753,7 @@ def test_backend_mode_three_state_classification() -> None:
     )
     assert (
         _backend_mode(Settings(chain_base_url="http://192.168.1.50:3006"))
-        == BACKEND_MODE_OWN_NODE_REMOTE
+        == BACKEND_MODE_OWN_NODE_PRIVATE  # TCK-WEB-023: LAN IP → private
     )
     assert (
         _backend_mode(

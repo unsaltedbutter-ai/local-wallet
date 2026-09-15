@@ -12,7 +12,12 @@
 // is an Edit→Apply read-only cycle with a Resync-now action, and the header
 // carries the model-free balance quick actions. TCK-DESCOPE-M3B (user
 // direction 2026-09-11): the backend KIND badges are eliminated — the trust
-// badge (privacy_mode) is the pane's only badge.
+// badge (privacy_mode) is the pane's only badge. TCK-WEB-023 AMENDMENT
+// (user MW-17 direction 2026-09-13): the electrum & bitcoind kind pills COME
+// BACK near the server field, tinted by the SAME engine-side closed
+// privacy_mode classification (GREEN iff own_node_local/own_node_private,
+// YELLOW iff public/own_node_remote; none/absent/awaiting → no pill). The
+// mempool badge stays gone. Tint NEVER comes from client URL sniffing.
 // TCK-WEB-013: the chain row always shows the effective backend URL with a
 // privacy_mode-driven trust badge, the empty field is directly typeable
 // (Edit/Cancel only once a value exists), the env rung gets one honest
@@ -113,6 +118,21 @@ const LABELS = {
   privacyOwnLocal: "Your node on this machine — lookups stay here.",
   privacyOwnRemote:
     "Your node on another machine — private only if you trust it.",
+  // TCK-WEB-023 (council fold 2026-09-13): the two host-named modes gain the
+  // engine-supplied bare backend_host (/state, creds already stripped
+  // server-side) — {host} is substituted ONLY through the isBareHost gate
+  // below, and a refused/absent host falls back to the generic sentence
+  // above / privacyOwnPrivate below (omit-never-empty discipline).
+  privacyOwnRemoteAt:
+    "Your node at {host} — private only if you trust it.",
+  // own_node_private (private-range literal IP, TCK-WEB-023): the badge goes
+  // GREEN but the binding glm council hedge stays TRUE — a private-IP server
+  // you do not run still sees every query, so only the COLOR claims private
+  // and the words keep the hedge ("run this server yourself").
+  privacyOwnPrivate:
+    "Your node — only private if you run this server yourself.",
+  privacyOwnPrivateAt:
+    "Your node at {host} — only private if you run this server yourself.",
   privacyAwaiting: "No backend chosen yet.",
   // settings panel (TCK-WEB-005)
   settingsLoading: "Loading…",
@@ -217,9 +237,12 @@ const LABELS = {
   qrTitle: "Receive address QR — scan with a wallet to send to this address",
   qrFailed: "Could not show the QR code.",
   // copy pass 2 #44 dim/lit badge words (TCK-WEB-009 e): RETIRED by
-  // TCK-DESCOPE-M3B — the settings pane no longer badges the backend kind
-  // at all (user direction 2026-09-11: mempool/electrum/bitcoind are not
-  // trust tiers; the trust badge is the pane's only badge).
+  // TCK-DESCOPE-M3B; the TCK-WEB-023 AMENDMENT brings the electrum/bitcoind
+  // kind pills BACK as neutral NAME pills (no dim/lit trust tier of their
+  // own — one color per kind, tinted by the shared privacy_mode
+  // classification). The mempool word stays gone (user direction).
+  kindElectrum: "Electrum",
+  kindBitcoind: "Bitcoin Core",
   // Backend credentials (TCK-ONB-004 M3): the chain-base row's login block,
   // shown while EDITING an http:// (ambiguous — could be Core RPC) or
   // bitcoind:// address. The password never comes back from the server (the
@@ -275,6 +298,10 @@ const LABELS = {
   // (2) the chain row's trust badge — rides the /state privacy_mode
   // closed enum ONLY (never derived from the URL string client-side).
   trustLocal: "on this computer",
+  // TCK-WEB-023: the private-range-IP mode reads as the user's own machine
+  // ON THEIR OWN NETWORK — the green tint claims "private network", the
+  // chip subline keeps the "run it yourself" hedge.
+  trustPrivate: "your own machine (private network)",
   trustRemote: "your own machine (remote)",
   trustPublic: "public server — see privacy notice",
   trustAwaiting: "not set up yet",
@@ -324,12 +351,14 @@ const FLOW_STATES = new Set([
   "idle", "created", "confirmed", "signed", "broadcast", "cancelled", "expired",
 ]);
 
-// TCK-DESCOPE-M3B (user direction 2026-09-11): the backend-KIND badges are
-// ELIMINATED from the settings pane — no BADGE_FAMILIES mapping, no client
-// BACKEND_KINDS set, no painter. The engine still serves the additive
-// ``backend_kind`` NAME (closed enum none/electrum/bitcoind) under the
-// unchanged state/1 + settings/1 tags; the shipped client simply does not
-// consume it. The trust badge (privacy_mode) is the pane's only badge.
+// TCK-DESCOPE-M3B (user direction 2026-09-11): the backend-KIND badges were
+// ELIMINATED from the settings pane. TCK-WEB-023 AMENDMENT (user MW-17
+// direction 2026-09-13): the electrum/bitcoind kind pills COME BACK near the
+// server field (mempool stays gone), riding the engine's additive
+// ``backend_kind`` NAME (closed enum none/electrum/bitcoind) for the WORD and
+// the SAME privacy_mode closed enum for the TINT — one classification, never
+// client URL sniffing. The old dim/lit machinery (BADGE_FAMILIES, per-kind
+// trust tiers) is NOT resurrected: kindPillPaint below is the whole painter.
 // Keys the pane renders specially (own rows / own block) — everything else
 // on the allowlist falls through to the generic text row. The credential
 // trio (TCK-ONB-004 M3) belongs to the chain-base row's login block.
@@ -410,12 +439,22 @@ const state = {
   // everything else here.
   scanError: "",
   // TCK-WEB-021 (5): the pinned reload trigger. The last TYPED snapshot's
-  // backend_kind NAME (never rendered — the badges are gone; read ONLY as
-  // half of the trust signature; state/0 keeps the last known value, the
-  // privacyMode discipline) and the signature it last produced. null =
-  // no typed snapshot yet = no reload baseline (opening fetches anyway).
+  // backend_kind NAME (state/0 keeps the last known value, the privacyMode
+  // discipline; half of the trust signature, and — since the TCK-WEB-023
+  // AMENDMENT — the WORD source of the kind pill) and the signature it last
+  // produced. null = no typed snapshot yet = no reload baseline (opening
+  // fetches anyway).
   backendName: "",
   trustSig: null,
+  // TCK-WEB-023 (council fold): the last TYPED snapshot's additive
+  // backend_host — the BARE hostname of the user's own configured server,
+  // engine-extracted (scheme/port/path/creds already stripped), present ONLY
+  // in the host-named modes (own_node_remote / own_node_private). Cleared by
+  // every typed snapshot that omits it (the engine omits = nothing to name;
+  // omit-never-empty, never a stale host across a typed flip); state/0 keeps
+  // the last known value like privacyMode. Rendered only through isBareHost.
+  // Memory only, never logged (it is a host — the value-free rule).
+  backendHost: "",
   stateSeq: 0,
   watchKeyDismissed: false,
   watchKeyPresent: null, // null = unknown | true | false (typed state/1 only)
@@ -1051,8 +1090,9 @@ function applyState(snap) {
   }
   // TCK-WEB-021 (5): read the trust signature's OTHER half from typed truth
   // only (state/0 keeps the last known value — same discipline as
-  // privacyMode). The NAME is never rendered (TCK-DESCOPE-M3B): it exists
-  // here solely so a backend flip can pin the settings reload below.
+  // privacyMode). Since the TCK-WEB-023 AMENDMENT the NAME also feeds the
+  // kind pill's word (KIND_PILL_WORDS); a backend flip still pins the
+  // settings reload below.
   if (typed && typeof snap.backend_kind === "string") {
     state.backendName = snap.backend_kind;
   }
@@ -1216,19 +1256,92 @@ function applyScanChip(snap) {
 const PRIVACY_SUBLINE = {
   public: LABELS.privacyPublic,
   own_node_local: LABELS.privacyOwnLocal,
+  // TCK-WEB-023: the FIFTH name — the private-range literal-IP mode. The
+  // value itself is the host-LESS hedge (the {host} template below rides
+  // privacySublineText); adding this key is what makes the shipped client
+  // show the chip GREEN for the mode instead of hiding it.
+  own_node_private: LABELS.privacyOwnPrivate,
   own_node_remote: LABELS.privacyOwnRemote,
   awaiting_backend: LABELS.privacyAwaiting,
 };
+
+// The two host-named modes (TCK-WEB-023 council fold): the {host} template
+// substitutes ONLY when a VALIDATED engine host is present; absent/refused
+// → the generic PRIVACY_SUBLINE sentence (omit-never-empty). public /
+// own_node_local / awaiting_backend keep their unchanged copy.
+const PRIVACY_HOST_TEMPLATES = {
+  own_node_remote: LABELS.privacyOwnRemoteAt,
+  own_node_private: LABELS.privacyOwnPrivateAt,
+};
+
+// Defensive host gate (ADR-0024 §7 spirit — the wire value is untrusted
+// model-free server data, still validated before display): a BARE hostname /
+// IP literal only. ANY refusal (@, ://, path/slash, whitespace, junk) falls
+// back to the generic subline — a credential-bearing "host" is never painted
+// even if the engine's parser ever regressed. Fails closed, value-free.
+const BARE_HOST_RE = /^[A-Za-z0-9._\-:[\]]{1,253}$/;
+function isBareHost(host) {
+  return typeof host === "string" && BARE_HOST_RE.test(host);
+}
+
+// PURE (node-pinned): mode NAME + last typed host → the chip's subline copy.
+// Never reads the effective chain URL — the host rides the typed /state
+// backend_host field ONLY.
+function privacySublineText(mode, host) {
+  const tpl = PRIVACY_HOST_TEMPLATES[mode];
+  if (tpl !== undefined && isBareHost(host)) {
+    const at = tpl.indexOf("{host}");
+    return tpl.slice(0, at) + host + tpl.slice(at + "{host}".length);
+  }
+  return PRIVACY_SUBLINE[mode] || "";
+}
 
 // TCK-WEB-013 (2): the chain row's trust badge — the SAME closed enum the
 // header chip rides (privacy_mode from /state; never derived from the URL
 // string client-side). Unknown/absent enum → no badge (existing discipline).
 const TRUST_BADGE_WORDS = {
   own_node_local: LABELS.trustLocal,
+  own_node_private: LABELS.trustPrivate,
   own_node_remote: LABELS.trustRemote,
   public: LABELS.trustPublic,
   awaiting_backend: LABELS.trustAwaiting,
 };
+
+// TCK-WEB-023 AMENDMENT: the kind pills (electrum/bitcoind; mempool stays
+// gone — no key here means an unpinnable word, and the engine closed set is
+// none/electrum/bitcoind). The WORD rides backend_kind, the TINT rides the
+// SAME single privacy_mode classification the trust badge uses — GREEN iff
+// the mode is one of the two own-node green names, YELLOW otherwise; no
+// pill at kind none/unknown or an absent/awaiting/unknown mode. The tint is
+// a CLASS name (styles.css owns the colors); nothing here sniffs a URL.
+const KIND_PILL_WORDS = {
+  electrum: LABELS.kindElectrum,
+  bitcoind: LABELS.kindBitcoind,
+};
+const KIND_PILL_TINTS = {
+  own_node_local: "kind-pill-private",
+  own_node_private: "kind-pill-private",
+  public: "kind-pill-public",
+  own_node_remote: "kind-pill-public",
+};
+
+// PURE (node-pinned): the pill's paint plan for (kind, mode) — visible only
+// when BOTH the word and the tint are known-closed values.
+function kindPillPaint(kind, mode) {
+  const words = KIND_PILL_WORDS[kind];
+  const tint = KIND_PILL_TINTS[mode];
+  if (words === undefined || tint === undefined) {
+    return { visible: false, text: "", tint: "" };
+  }
+  return { visible: true, text: words, tint };
+}
+
+// The pill element for the chain row's status zone, or null (no pill today).
+function kindPill() {
+  const paint = kindPillPaint(state.backendName, state.privacyMode);
+  if (!paint.visible) return null;
+  return el("span", "kind-pill " + paint.tint, paint.text);
+}
 
 // The badge element for the "Now using" line, or null (unknown mode).
 // Color rides data-privacy — the same attribute selector + token pair as
@@ -1250,6 +1363,17 @@ function paintTrustBadges() {
     if (words) {
       badge.dataset.privacy = state.privacyMode;
       badge.textContent = words;
+    }
+  }
+  // TCK-WEB-023: the kind pills re-tint in the SAME pass (one snapshot of
+  // truth paints the whole badge family — a mid-flip pane can never show a
+  // green word under a yellow badge or vice versa).
+  const pill = kindPillPaint(state.backendName, state.privacyMode);
+  for (const node of settingsListEl.querySelectorAll(".kind-pill")) {
+    node.hidden = !pill.visible;
+    if (pill.visible) {
+      node.className = "kind-pill " + pill.tint;
+      node.textContent = pill.text;
     }
   }
 }
@@ -1281,6 +1405,11 @@ function applyPrivacyChip(snap) {
       Object.prototype.hasOwnProperty.call(PRIVACY_SUBLINE, mode)
         ? mode
         : "";
+    // TCK-WEB-023: the additive typed backend_host NAME (a bare own-config
+    // host or an ABSENT field = nothing to name — cleared, never kept stale;
+    // state/0 keeps the last known value, the privacyMode discipline).
+    const host = state.privacyMode === "" ? undefined : snap.backend_host;
+    state.backendHost = typeof host === "string" ? host : "";
   }
   const mode = state.privacyMode;
   paintTrustBadges(); // TCK-WEB-013 (2): the pane badge rides the same truth
@@ -1288,19 +1417,24 @@ function applyPrivacyChip(snap) {
   if (!mode) {
     privacyChipEl.hidden = true;
     privacyChipEl.removeAttribute("data-privacy");
-    privacySublineEl.textContent = "";
+    if (privacySublineEl.textContent !== "") privacySublineEl.textContent = "";
     return;
   }
   privacyChipEl.dataset.privacy = mode;
-  privacySublineEl.textContent = PRIVACY_SUBLINE[mode];
+  // TCK-WEB-023: host-bearing for the two host-named modes when the engine
+  // sent one (validated in privacySublineText/isBareHost), generic otherwise.
+  // The chip is a live region: the subline is touched ONLY on a change
+  // (the WEB-020 transition gate — a state/0 or an identical snapshot must
+  // not re-write it and re-announce).
+  const subline = privacySublineText(mode, state.backendHost);
+  if (privacySublineEl.textContent !== subline) privacySublineEl.textContent = subline;
   privacyChipEl.hidden = false;
 }
 
-// TCK-DESCOPE-M3B: applyBackendKind/paintBackendBadges (the kind-badge
-// machinery) are deleted with the badges themselves — the additive
-// backend_kind NAME on /state and /settings replies is simply ignored now
-// (additive-field rule: clients may stop consuming fields without a tag
-// bump; the trust-badge pass below is untouched).
+// TCK-DESCOPE-M3B deleted the old kind-badge machinery (dim/lit family
+// pills). TCK-WEB-023 AMENDMENT: the additive backend_kind NAME rides
+// /state again (closed enum none/electrum/bitcoind) and is consumed by the
+// kindPill/kindPillPaint painter ONLY — never the resurrected dim/lit shape.
 
 async function refreshState() {
   // Newest-wins (TCK-WEB-008): a snapshot that started before a provisioning
@@ -1756,10 +1890,10 @@ function watchKeyInput() {
 //  * STATUS (.chain-status): the effective backend — "Now using: <url>"
 //    with real visual weight ((2): the most privacy-relevant fact is no
 //    longer the smallest text) + the trust badge riding the /state
-//    privacy_mode closed enum ONLY. TCK-WEB-023 will later bring the
-//    electrum/bitcoind kind badges back into THIS zone as NEUTRAL pills
-//    (styles.css color-vocabulary contract) — the slot is here, no badge
-//    markup is built today (TCK-DESCOPE-M3B).
+//    privacy_mode closed enum ONLY + (TCK-WEB-023 AMENDMENT) the
+//    electrum/bitcoind kind PILLs beside it, tinted by the SAME closed
+//    classification (styles.css color-vocabulary contract; none/absent/
+//    awaiting → no pill — kindPill returns null).
 //  * ACT (.chain-act): field + Apply/Edit/Cancel + the empty .chain-chips
 //    slot TCK-WEB-022 will fill with suggested-server chips.
 //  * REST (.chain-rest): the explanatory prose (empty-field legend, creds
@@ -1803,7 +1937,11 @@ function chainBaseRow(entry) {
       el("p", "chain-now", LABELS.settingsNowUsing + " " + state.effectiveChainUrl)
     );
     const badge = trustBadge();
-    if (badge) nowLine.appendChild(badge); // WEB-023's kind pills would join HERE.
+    if (badge) nowLine.appendChild(badge);
+    // TCK-WEB-023: the kind pill joins the trust badge HERE (same status
+    // zone, same wrap line); null = kind none/absent or mode not yet known.
+    const pill = kindPill();
+    if (pill) nowLine.appendChild(pill);
     statusZone.appendChild(nowLine);
   }
   li.appendChild(statusZone);
@@ -1875,10 +2013,11 @@ function chainBaseRow(entry) {
   actZone.appendChild(el("div", "chain-chips"));
   li.appendChild(actZone);
 
-  // TCK-DESCOPE-M3B: the kind-badge strip (legend + mempool/electrum/
-  // bitcoind chips) stays DELETED here — user direction: the kind of
-  // server is not a trust dimension and earns no pixels; the trust badge
-  // in the status zone carries the whole truth.
+  // TCK-DESCOPE-M3B: the old kind-badge STRIP (legend + mempool chips) stays
+  // deleted here — no legend, no mempool, no idle/dim state. The TCK-WEB-023
+  // AMENDMENT pill lives in the STATUS zone beside the trust badge, and the
+  // trust badge still carries the whole privacy truth (the pill only says
+  // WHICH software, tinted by the same classification).
 
   // Resync-now (TCK-WEB-009 f): VISIBLE, OUTSIDE the rest zone — the
   // recovery path must not hide behind a <details>.
@@ -2246,8 +2385,13 @@ async function loadSettings() {
       typeof data.effective_chain_base_url === "string"
         ? data.effective_chain_base_url
         : null;
-    // (the additive backend_kind NAME this used to read badges nothing
-    // anymore — TCK-DESCOPE-M3B; the field stays server-side, unconsumed).
+    // TCK-WEB-023 AMENDMENT: the additive backend_kind NAME is consumed
+    // again — the FRESHEST word for the kind pill (a chat-entered swap while
+    // the pane sat closed can outrun the last /state tick; the pill's TINT
+    // still rides privacy_mode only, never this string's content).
+    if (typeof data.backend_kind === "string") {
+      state.backendName = data.backend_kind;
+    }
     renderSettings();
   } catch {
     showSettingsUnavailable();

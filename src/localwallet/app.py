@@ -102,6 +102,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import queue
@@ -727,28 +728,55 @@ PRIVACY_INDICATOR_OWN_NODE_REMOTE_GENERIC: Final[str] = (
 )
 
 #: The 3-way chain-backend privacy mode (TCK-SEC-004 change 5), returned by
-#: :func:`_backend_mode` and carried verbatim in the ``node_status`` FACTS.
+#: :func:`_backend_mode` and carried verbatim in the ``node_status`` FACTS,
+#: widened to FOUR resolved answers by TCK-WEB-023's ``own_node_private``.
 BACKEND_MODE_PUBLIC: Final[str] = "public"
 BACKEND_MODE_OWN_NODE_LOCAL: Final[str] = "own_node_local"
 BACKEND_MODE_OWN_NODE_REMOTE: Final[str] = "own_node_remote"
 
+#: TCK-WEB-023 (user direction "green if the IP address is a private IP
+#: address"): a configured backend whose host is a LITERAL IP in a private
+#: range (10/8, 172.16/12, 192.168/16, plus the wider 127/8 loopback). The
+#: badge tint surface reads this as GREEN (like :data:`BACKEND_MODE_OWN_NODE_LOCAL`),
+#: but the mode keeps the REMOTE trust-hedged copy verbatim — a private-range
+#: server the user does NOT run (roommate/venue LAN — the binding glm
+#: council hedge) still sees every query, so only the COLOR says "private
+#: network", never the sentence. The existing names keep their exact meanings
+#: (own_node_local stays "this machine"): one new value was the smallest
+#: honest change, over remapping own_node_local to "private-ish" (which
+#: would have made the "lookups stay here" copy a lie for LAN nodes).
+BACKEND_MODE_OWN_NODE_PRIVATE: Final[str] = "own_node_private"
+
 #: TCK-UX-010: the FOURTH ``/state`` ``privacy_mode`` name — the ONB-006
 #: first-run hold (``scan.gate.state == "awaiting_backend"``, the same
-#: literal as the ``scan_state`` gate name). It OVERRIDES the 3-way mode
+#: literal as the ``scan_state`` gate name). It OVERRIDES the resolved mode
 #: while held: the backend is not chosen yet, so no mode claim is honest.
 PRIVACY_MODE_AWAITING_BACKEND: Final[str] = "awaiting_backend"
 
-#: The CLOSED enum of ``/state`` ``privacy_mode`` values (TCK-UX-010): the
-#: three :func:`_backend_mode` names plus the :data:`PRIVACY_MODE_AWAITING_BACKEND`
-#: hold. Names only — never a URL/host, never a bool (the same badge rule as
-#: :data:`BACKEND_KINDS`).
+#: The CLOSED enum of ``/state`` ``privacy_mode`` values (TCK-UX-010; the
+#: fifth member :data:`BACKEND_MODE_OWN_NODE_PRIVATE` added by TCK-WEB-023):
+#: the :func:`_backend_mode` names plus the :data:`PRIVACY_MODE_AWAITING_BACKEND`
+#: hold. Names only — never a URL, never a bool (the same badge rule as
+#: :data:`BACKEND_KINDS`); the one host-shaped /state field (``backend_host``,
+#: TCK-WEB-023 council fold) is a SEPARATE documented UX-009 exception.
 PRIVACY_MODES: Final[frozenset[str]] = frozenset(
     {
         BACKEND_MODE_PUBLIC,
         BACKEND_MODE_OWN_NODE_LOCAL,
+        BACKEND_MODE_OWN_NODE_PRIVATE,
         BACKEND_MODE_OWN_NODE_REMOTE,
         PRIVACY_MODE_AWAITING_BACKEND,
     }
+)
+
+#: The resolved modes whose banner/narration/``/state`` display NAME the
+#: configured host (TCK-UX-009 wording, host from
+#: :func:`_configured_url_host` — scheme/port/path/credentials stripped;
+#: the documented user-own-config display exception, creds NEVER riding).
+#: own_node_local keeps its host-less "this machine" copy, public names the
+#: consented server generically, awaiting_backend has no server to name.
+_BACKEND_HOST_MODES: Final[frozenset[str]] = frozenset(
+    {BACKEND_MODE_OWN_NODE_PRIVATE, BACKEND_MODE_OWN_NODE_REMOTE}
 )
 
 #: Hosts that count as "the user's own node on this machine" — mirrors the
@@ -757,13 +785,69 @@ PRIVACY_MODES: Final[frozenset[str]] = frozenset(
 #: so the set is mirrored here; keep the two in sync).
 _LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "localhost", "::1"})
 
+#: The IPv4 ranges that classify a LITERAL-IP backend host as PRIVATE
+#: (TCK-WEB-023 user direction: 10/8, 172.16/12, 192.168/16, plus the whole
+#: 127/8 loopback block — 127.0.0.2 IS this machine as much as 127.0.0.1;
+#: only the exact legacy strings in :data:`_LOOPBACK_HOSTS` keep the
+#: host-less own_node_local wording, the wider block arrives green-with-
+#: hedge through own_node_private). DELIBERATELY NOT ``ipaddress``'s
+#: ``is_private``: it also counts 169.254/16 link-local (and the IPv6
+#: link-local/ULA blocks) private — the council ruled link-local NEVER
+#: green (auto-assigned, any device on the segment may hold it), and
+#: CGNAT 100.64/10 is excluded the same way (a carrier-shared address is
+#: not a network you run). IPv6 gets no private branch beyond the exact
+#: ``::1`` in :data:`_LOOPBACK_HOSTS`: ULA fc00::/7 was not in the ticket's
+#: enumerated ranges and a literal-only rule stays honest and reviewable.
+_PRIVATE_GREEN_NETS_V4: Final[tuple[ipaddress.IPv4Network, ...]] = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+)
+
+
+def _host_is_private_range(host: str) -> bool:
+    """Whether ``host`` is a literal IP address in a :data:`_PRIVATE_GREEN_NETS_V4`
+    range — PURE TEXT PARSING, no DNS, no socket (the whole engine module
+    answers without network calls; ``getaddrinfo`` here would classify on a
+    name's *resolver*, i.e. on data the engine cannot verify).
+
+    The classification is honest-by-construction: only addresses whose range
+    is READABLE FROM THE TEXT count as private.
+
+    * ``10.x / 172.16-31.x / 192.168.x / 127.x`` literals (and the IPv4-
+      mapped IPv6 spelling ``::ffff:10.x``) → ``True``.
+    * ``100.64/10`` (CGNAT) and ``169.254/16`` (link-local) → ``False`` —
+      never green, per the council.
+    * EVERY hostname — including ``.local``/mDNS — → ``False``. DECISION
+      (documented, TCK-WEB-023): ``.local`` names typically resolve on-link,
+      but from here that is unverified — mDNS answers are unauthenticated
+      (any device on the segment may claim the name, the same threat shape
+      as the never-green 169.254 block) and resolvers/hosts files can route
+      a ``.local`` name anywhere. A name whose address cannot be read from
+      the text is classified on the honest non-green branch: the yellow
+      ``own_node_remote`` badge with its trust hedge stays TRUE for every
+      one of those worlds. VPN-overlay names ride the same rule.
+    * Anything :mod:`ipaddress` refuses to parse as an address (including
+      leading-zero octets) → ``False``. Never raises; value-free.
+    """
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return addr.version == 4 and any(addr in net for net in _PRIVATE_GREEN_NETS_V4)
+
 #: The ``node_status`` narration predicates (TCK-SEC-004 change 5, approved
 #: copy) — "You are " + one of these, mirroring the banner's split. The
 #: PUBLIC predicate names the consented public Electrum tier (its
 #: operator/leak shape is unchanged from the old public default,
 #: TCK-DESCOPE-M3A). The REMOTE predicate carries the SAME host insertion
 #: as the banner (TCK-UX-009 lockstep), falling back to the generic line
-#: when no host is parseable. The UNCHOSEN predicate (TCK-DESCOPE-M3A) is
+#: when no host is parseable; the private-IP mode reuses this REMOTE pair
+#: verbatim (TCK-WEB-023 — only the badge COLOR claims private, the words
+#: keep the trust hedge). The UNCHOSEN predicate (TCK-DESCOPE-M3A) is
 #: the honest UNRESOLVED answer — with no silent public default there is
 #: no server to point at, and the line says so.
 _NODE_STATUS_UNCHOSEN: Final[str] = (
@@ -1172,11 +1256,13 @@ def privacy_indicator(settings: Settings) -> str:
         return PRIVACY_INDICATOR_UNCHOSEN
     if mode == BACKEND_MODE_OWN_NODE_LOCAL:
         return PRIVACY_INDICATOR_OWN_NODE_LOCAL
-    if mode == BACKEND_MODE_OWN_NODE_REMOTE:
+    if mode in _BACKEND_HOST_MODES:
         # TCK-UX-009 user copy: name the host (scheme/port/creds stripped —
         # user-owned config display, not a leak surface); a URL with no
         # parseable host keeps the generic wording rather than printing
-        # something broken.
+        # something broken. TCK-WEB-023: the PRIVATE (private-range literal
+        # IP) mode renders the SAME hedged sentence — the tint surface
+        # distinguishes them, the honesty surface has one truth.
         host = _configured_url_host(settings.chain_base_url.strip())
         if host is not None:
             return PRIVACY_INDICATOR_OWN_NODE_REMOTE.format(host)
@@ -7401,7 +7487,7 @@ def _make_tx_status_handler(
 def _backend_mode(settings: Settings) -> str:
     """The chain-backend privacy mode (3-way classification, TCK-SEC-004
     change 5; the PUBLIC meaning re-targeted and the UNRESOLVED answer
-    added by TCK-DESCOPE-M3A).
+    added by TCK-DESCOPE-M3A; the PRIVATE-IP branch added by TCK-WEB-023).
 
     Derived from the SAME single selection point the chain client uses
     (:func:`_effective_chain_url`, ADR-0018 as amended):
@@ -7413,17 +7499,28 @@ def _backend_mode(settings: Settings) -> str:
       (:data:`PUBLIC_ELECTRUM_URL`'s host): a third-party operator sees
       every queried address plus the IP (the red leak warning).
     - :data:`BACKEND_MODE_OWN_NODE_LOCAL` — a configured URL whose host is
-      loopback: the user's own node on this machine.
+      a legacy loopback string (:data:`_LOOPBACK_HOSTS`): the user's own
+      node on THIS machine. Meaning unchanged (the ticket's smallest-
+      honest-change rule — the "lookups stay here" copy stays true).
+    - :data:`BACKEND_MODE_OWN_NODE_PRIVATE` — a configured URL whose host
+      is a LITERAL IP in a private range (:func:`_host_is_private_range`:
+      10/8, 172.16/12, 192.168/16, the wider 127/8). GREEN badge tint
+      (with own_node_local) on the trust surface, but the SAME host-named
+      trust-hedged wording as REMOTE — a private-IP server the user does
+      not run still sees the queries (the binding glm council hedge).
+      CGNAT 100.64/10 and link-local 169.254/16 are NEVER private here.
     - :data:`BACKEND_MODE_OWN_NODE_REMOTE` — any other configured host
-      (LAN/VPS instance): still the user's own server, but NOT on this
-      machine, so copy must not claim lookups "stay on this machine".
+      (VPS/public IP, or ANY hostname including ``.local``/mDNS — names
+      cannot be range-checked offline, see :func:`_host_is_private_range`):
+      still the user's own server, but not classifiably private, so copy
+      must not claim lookups "stay on this machine".
 
     The node_status narration mirrors this function (and the privacy banner
-    renders its REMOTE host through it), so neither can disagree with the
-    banner about which backend is actually in use. The ``/state``
-    ``privacy_mode`` field rides this classification too (TCK-UX-010); the
-    ONB-006 ``awaiting_backend`` gate override agrees with the empty-rung
-    answer by construction.
+    renders its host-named REMOTE wording for both _BACKEND_HOST_MODES), so
+    neither can disagree with the banner about which backend is actually in
+    use. The ``/state`` ``privacy_mode`` field rides this classification too
+    (TCK-UX-010); the ONB-006 ``awaiting_backend`` gate override agrees with
+    the empty-rung answer by construction.
     """
     configured = settings.chain_base_url.strip()
     if not configured:
@@ -7437,6 +7534,8 @@ def _backend_mode(settings: Settings) -> str:
         return BACKEND_MODE_PUBLIC
     if host is not None and host.lower() in _LOOPBACK_HOSTS:
         return BACKEND_MODE_OWN_NODE_LOCAL
+    if host is not None and _host_is_private_range(host):
+        return BACKEND_MODE_OWN_NODE_PRIVATE
     return BACKEND_MODE_OWN_NODE_REMOTE
 
 
@@ -7463,12 +7562,13 @@ def _make_node_status_handler(
     - **Detection unavailable** (defensive; detection is designed never to
       raise): ``detection_state="unavailable"``, no fabricated findings.
 
-    The result always carries ``backend_mode`` (the 3-way classification
+    The result always carries ``backend_mode`` (the classification
     from the chain-backend selection, :func:`_backend_mode`:
-    ``public``/``own_node_local``/``own_node_remote``) so the narration can
-    state "querying the public API" vs "your own node on this machine" vs
-    the REMOTE host-named line in lockstep with the privacy banner — in
-    REMOTE mode the result also carries ``backend_host`` (the configured
+    ``public``/``own_node_local``/``own_node_private``/``own_node_remote``)
+    so the narration can state "querying the public API" vs "your own node
+    on this machine" vs the host-named hedged line in lockstep with the
+    privacy banner — in BOTH host-named modes (:data:`_BACKEND_HOST_MODES`,
+    TCK-WEB-023) the result also carries ``backend_host`` (the configured
     URL's host, scheme/port/credentials stripped, TCK-UX-009: the user's
     OWN config echoed back to them, same as the banner), and the narration
     falls back to the generic wording when there is no host to name.
@@ -7484,7 +7584,9 @@ def _make_node_status_handler(
             "backend_mode": mode,
             "node_detection_enabled": bool(settings.node_detection_enabled),
         }
-        if mode == BACKEND_MODE_OWN_NODE_REMOTE:
+        if mode in _BACKEND_HOST_MODES:
+            # TCK-WEB-023: the PRIVATE mode names its host exactly like
+            # REMOTE does (same hedged wording, one host surface).
             host = _configured_url_host(settings.chain_base_url.strip())
             if host is not None:
                 facts["backend_host"] = host
@@ -9836,6 +9938,7 @@ def build_state_snapshot(
     backend_kind: str | None = None,
     preload: ModelPreloadFlow | None = None,
     privacy_mode: str | None = None,
+    backend_host: str | None = None,
 ) -> dict[str, object]:
     """The value-free ``/state`` snapshot, built ON the engine thread.
 
@@ -9853,13 +9956,24 @@ def build_state_snapshot(
     live backend kind (a closed :data:`BACKEND_KINDS` enum NAME: never a
     URL/host), — TCK-UX-010 — the privacy mode (a
     precomputed closed :data:`PRIVACY_MODES` enum NAME, computed by the
-    pump at the call site; the builder sees no settings), and —
+    pump at the call site; the builder sees no settings), —
     TCK-WEB-020 — the last scan/rescan failure (a value-free DIAG-001
-    class line, omitted when absent). No address,
+    class line, omitted when absent), and — TCK-WEB-023 council fold —
+    the configured backend's bare HOSTNAME (a precomputed string the pump
+    extracts with :func:`_configured_url_host`: scheme/port/path/
+    credentials already stripped, present only in the host-named modes,
+    omitted otherwise). That host is the DOCUMENTED UX-009 display
+    exception to the value-free rule — the user's OWN config shown back
+    to them for the privacy subline ("Your node at <host> …"), the same
+    text the CLI banner and the node_status FACTS already carry; no
+    credential can ride it (the parser drops userinfo) and no third-
+    party host is ever named (public/local/awaiting modes omit the
+    field). No address,
     amount, txid, ``tx_ref``, key
     material OR progress byte-count CAN appear — every value is an enum
-    NAME, a boolean, or a code-owned value-free failure line, never user
-    data. No progress percentage here (a wallet-size
+    NAME, a boolean, a code-owned value-free failure line, or that one
+    stripped own-config host, never user data. No progress percentage
+    here (a wallet-size
     oracle); download progress rides its own event kind.
     """
     snapshot: dict[str, object] = {
@@ -9895,6 +10009,14 @@ def build_state_snapshot(
         # an enum name, never a URL/host. Absent (None) = no settings
         # context; omitted, never guessed (the ``backend_kind`` pattern).
         snapshot["privacy_mode"] = privacy_mode
+    if backend_host is not None:
+        # TCK-WEB-023 council fold: additive under state/1 (same rule).
+        # The pump precomputed this bare HOSTNAME (never a URL: the parser
+        # strips scheme/port/path AND userinfo — creds never ride the
+        # wire) and passes it ONLY for the host-named modes (REMOTE and
+        # the new private-IP GREEN). Omitted = nothing to name, never a
+        # guess (the ``privacy_mode``/``backend_kind`` absent pattern).
+        snapshot["backend_host"] = backend_host
     if scan is not None and scan.scan_error:
         # TCK-WEB-020: additive under state/1 (same rule): the last
         # scan/rescan failure as a value-free DIAG-001 class line (chain/
@@ -11521,10 +11643,22 @@ def _pump(
             # the ONB-006 hold overrides the mode while a first-run backend
             # choice is outstanding; no settings context = field omitted,
             # never fabricated (the builder stays settings-free and value-free).
+            # TCK-WEB-023 (council fold): a second additive precomputed
+            # string ``backend_host`` — the configured host's BARE NAME
+            # (scheme/port/path/creds stripped by the parser, creds NEVER
+            # ride), supplied only for the host-named modes (own_node_remote
+            # and the private-IP own_node_private) so the privacy subline
+            # can say "Your node at <host> — …". The awaiting hold outranks
+            # it too (no server to name while unresolved).
             privacy_mode = (
                 PRIVACY_MODE_AWAITING_BACKEND
                 if scan is not None and scan.gate.state == PRIVACY_MODE_AWAITING_BACKEND
                 else (_backend_mode(settings) if settings is not None else None)
+            )
+            backend_host = (
+                _configured_url_host(settings.chain_base_url.strip())
+                if settings is not None and privacy_mode in _BACKEND_HOST_MODES
+                else None
             )
             snapshot = build_state_snapshot(
                 flow,
@@ -11535,6 +11669,7 @@ def _pump(
                 backend.kind if backend is not None else None,
                 preload,
                 privacy_mode,
+                backend_host,
             )
             if provision is not None and provision.wiring is None:
                 snapshot["needs_watch_key"] = True
@@ -17567,9 +17702,12 @@ def _print_node_status(result: Mapping[str, object], output_fn: Callable[[str], 
         output_fn(sanitize_tool_output(_NODE_STATUS_UNCHOSEN))
     elif backend == BACKEND_MODE_OWN_NODE_LOCAL:
         output_fn(sanitize_tool_output(_NODE_STATUS_OWN_NODE_LOCAL))
-    elif backend == BACKEND_MODE_OWN_NODE_REMOTE:
+    elif backend in _BACKEND_HOST_MODES:
         # Same host insertion as the banner (TCK-UX-009 lockstep); generic
-        # wording when the handler found no host to name.
+        # wording when the handler found no host to name. TCK-WEB-023: the
+        # PRIVATE (private-range IP) mode narrates the SAME hedged sentence
+        # as REMOTE — only the badge COLOR calls it private, the words keep
+        # the trust hedge either way.
         host = result.get("backend_host")
         if isinstance(host, str) and host:
             output_fn(sanitize_tool_output(_NODE_STATUS_OWN_NODE_REMOTE.format(host)))

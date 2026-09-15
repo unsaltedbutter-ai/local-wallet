@@ -357,10 +357,10 @@ def test_state_snapshot_request_is_answered_on_the_engine_thread(
     real_build = app.build_state_snapshot
 
     def spy_build(flow, session, watcher, scan=None, model=None, backend_kind=None,
-                  preload=None, privacy_mode=None):
+                  preload=None, privacy_mode=None, backend_host=None):
         build_threads.append(threading.get_ident())
         return real_build(flow, session, watcher, scan, model, backend_kind, preload,
-                          privacy_mode)
+                          privacy_mode, backend_host)
 
     monkeypatch.setattr(app, "build_state_snapshot", spy_build)
     events: list[EngineEvent] = []
@@ -477,27 +477,40 @@ def _bare_context(**kwargs: Any) -> Any:
 
 def test_state_snapshot_carries_each_privacy_mode_name() -> None:
     """Done-when: the additive ``privacy_mode`` carries every closed enum
-    NAME sourced from ``_backend_mode(settings)`` — and NEVER the URL or
-    host behind it (the pinned contract: names over the wire)."""
+    NAME sourced from ``_backend_mode(settings)`` — and NEVER the URL
+    behind it (the pinned contract: names over the wire). TCK-WEB-023
+    widened the enum with ``own_node_private`` (private-range literal IP)
+    and added the separate documented ``backend_host`` exception: the bare
+    HOSTNAME (no scheme/port/path, no credentials) rides ONLY the two
+    host-named modes, never the name-shaped enum."""
     from localwallet.config import Settings
 
     # TCK-DESCOPE-M3A: an empty selection is AWAITING (no silent public
     # default); the public name belongs to the consented public Electrum
     # server host only.
-    for url, expected in (
-        ("", "awaiting_backend"),
-        ("ssl://electrum.blockstream.info:50002", "public"),
-        ("ssl://127.0.0.1:50002", "own_node_local"),
-        ("http://node.example.invalid:3006", "own_node_remote"),
+    for url, expected, expected_host in (
+        ("", "awaiting_backend", None),
+        ("ssl://electrum.blockstream.info:50002", "public", None),
+        ("ssl://127.0.0.1:50002", "own_node_local", None),
+        ("ssl://10.1.2.3:50002", "own_node_private", "10.1.2.3"),
+        ("http://node.example.invalid:3006", "own_node_remote",
+         "node.example.invalid"),
     ):
         snap = _privacy_snapshot(
             _bare_context(settings=Settings(chain_base_url=url))
         )
         assert snap["privacy_mode"] == expected
         assert snap["privacy_mode"] in app.PRIVACY_MODES
+        assert snap.get("backend_host") == expected_host
         text = repr(snap)
-        for leak in (url, "://", "127.0.0.1", "example.invalid", "3006", "50002"):
+        # The URL SHAPE never rides: scheme, port and the full configured
+        # string are absent even where the bare host is displayed.
+        for leak in (url, "://", "127.0.0.1", "3006", "50002"):
             assert not leak or leak not in text
+        if expected_host is None:
+            assert "backend_host" not in snap
+        else:
+            assert url not in text  # only the stripped host, never the URL
 
 
 def test_state_snapshot_awaiting_backend_hold_overrides_the_mode(

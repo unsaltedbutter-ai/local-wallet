@@ -80,7 +80,8 @@
   --qr-scrim: rgba(27, 31, 39, 0.55);
 
   /* TCK-UX-010: privacy-label chip — one ink/surface pair per state family
-     (public = danger-red, local = green, trust-dependent = warn-yellow).
+     (public = danger-red, local = green — shared by TCK-WEB-023's
+     own_node_private, the second GREEN name —, trust-dependent = warn-yellow).
      Mapped to the palette tokens so both schemes retint automatically;
      --c-warn-soft is declared per palette below. */
   --c-priv-public: var(--c-danger);
@@ -241,8 +242,13 @@ body {
   background: var(--c-priv-public-bg);
   border-color: var(--c-priv-public);
 }
+/* TCK-WEB-023: own_node_private (private-range literal IP) is the SECOND
+   green name — it shares the local rule VERBATIM (one GREEN classification,
+   two names; the honesty hedge lives in the subline words, not the color). */
 .privacy[data-privacy="own_node_local"],
-.trust-badge[data-privacy="own_node_local"] {
+.privacy[data-privacy="own_node_private"],
+.trust-badge[data-privacy="own_node_local"],
+.trust-badge[data-privacy="own_node_private"] {
   color: var(--c-priv-local);
   background: var(--c-priv-local-bg);
   border-color: var(--c-priv-local);
@@ -275,8 +281,8 @@ body {
 .chain-consent { margin-block-start: var(--sp-2); }
 
 /* TCK-WEB-021 (3): the server card's three zones. Status = URL + trust
-   badge (TCK-WEB-023's NEUTRAL kind pills join here when they return —
-   see the color-vocabulary contract at .trust-badge below); act = field +
+   badge + (TCK-WEB-023 AMENDMENT) the kind pill beside it — see the
+   color-vocabulary contract at .trust-badge below; act = field +
    Apply/Cancel + .chain-chips (the empty TCK-WEB-022 suggested-server
    slot, pre-styled as a wrapping chip row); rest = the prose collapsed
    behind the native <details>. Resync + gap stay outside — recovery
@@ -315,12 +321,13 @@ body {
      .trust-badge (pane), recolored ONLY by [data-privacy] through the
      --c-priv-* token pairs (green / yellow / red). Nothing else may wear
      those tokens.
-   * Any backend-KIND badge (TCK-WEB-023 will bring electrum/bitcoind back)
-     MUST use the NEUTRAL PILL class .kind-pill: border + --c-text-muted
-     ink on --c-surface — never --c-priv-*, never --c-ok/--c-warn/--c-danger
-     — because "electrum is green" must never read as "electrum is safe".
-     No markup and no .kind-pill rule exists TODAY (TCK-DESCOPE-M3B): this
-     comment is the slot WEB-023 fills.
+   * Backend-KIND pills (TCK-WEB-023 AMENDMENT: electrum/bitcoind return,
+     mempool stays gone) are built on the NEUTRAL PILL base .kind-pill and
+     carry a TINT that is DERIVED — via the client's one closed map — from
+     the SAME engine-side privacy_mode classification the trust dimension
+     owns: .kind-pill-private takes the GREEN pair, .kind-pill-public the
+     YELLOW pair (own_node_remote/public). No independent palette, no dim/
+     lit trust tier of its own, and never a client-side URL sniff.
    -------------------------------------------------------------------------- */
 .trust-badge {
   flex: none;
@@ -329,6 +336,31 @@ body {
   border: 1px solid var(--c-border-strong);
   border-radius: 999px;
   padding: var(--sp-1) var(--sp-3);
+}
+
+/* TCK-WEB-023: the kind pill — the .trust-badge shape twin (same row, same
+   rhythm) with a NEUTRAL base (muted ink, no tint class shipped = plain
+   pill) plus the derived tint classes. Short words, flex:none inside the
+   already-wrapping .chain-now-line → wrap-safe at 320px. */
+.kind-pill {
+  flex: none;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border: 1px solid var(--c-border-strong);
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  color: var(--c-text-muted);
+  background: var(--c-surface);
+}
+.kind-pill-private {
+  color: var(--c-priv-local);
+  background: var(--c-priv-local-bg);
+  border-color: var(--c-priv-local);
+}
+.kind-pill-public {
+  color: var(--c-priv-trust);
+  background: var(--c-priv-trust-bg);
+  border-color: var(--c-priv-trust);
 }
 
 /* ---------------------------------------------------------------- settings */
@@ -939,11 +971,11 @@ body {
 .watchkey-display-line { align-items: baseline; }
 .watchkey-display-line .watchkey-value { flex: 1; min-inline-size: 0; }
 
-/* (e) TCK-DESCOPE-M3B: the backend KIND badge chips (the family pills the
-   pane used to paint next to the chain-base field) are DELETED per user
-   direction: the server family is not a trust dimension; the trust badge
-   (.trust-badge, above) is the settings pane's only badge. The
-   Resync-now line below keeps its own quiet spacing without them. */
+/* (e) TCK-DESCOPE-M3B deleted the old kind chips (mempool + legend + dim/lit
+   trust tiers). TCK-WEB-023 AMENDMENT re-admits ONLY the electrum/bitcoind
+   pill (.kind-pill above, tinted by the shared privacy_mode classification);
+   mempool and the legend stay deleted, and the trust badge (.trust-badge)
+   remains the privacy truth. The Resync-now line below is untouched. */
 
 /* (f): the Resync-now action sits on its own quiet line under the field. */
 .setting-resync-line { align-items: center; }
