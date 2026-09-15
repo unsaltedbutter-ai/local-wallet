@@ -1908,3 +1908,84 @@ def test_static_asset_served_with_no_inline_nonce_csp() -> None:
             server.handle.thread.join(5)
     assert ctype.startswith(("application/javascript", "text/javascript"))
     assert "script-src 'self';" in csp  # strict no-inline policy, no island nonce
+
+
+# ============================================================== TCK-WEB-020
+# Persistent scan/rescan-failure line (static half; the engine-side
+# /state scan_error field and its clear-on-start/complete semantics are
+# pinned in the engine tests). Discipline: typed-state-driven, verbatim
+# textContent, transition-gated DOM writes (the polite live region must
+# never re-announce per snapshot), absent key = zero residue.
+
+def test_scan_error_line_source_pins() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    index_html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    # the element sits next to the scan chip with status-live semantics
+    # and starts hidden (never prose-inferred into view).
+    assert (
+        '<p id="scan-error" class="chip scan-error" role="status" '
+        'aria-live="polite" hidden></p>'
+    ) in index_html
+    assert not re.search(r"\son[a-z]+=", index_html)  # global pin, restated
+    # rendered INSIDE the scan-chip snapshot-apply path, off a typed
+    # state/1 only, verbatim via textContent, transition-gated (the
+    # state.scanError guard). Exactly ONE reader of the wire key exists.
+    fn = code[code.index("function applyScanChip"):code.index("const PRIVACY_SUBLINE")]
+    assert "snap.scan_error" in fn
+    assert "scanErrorEl.textContent = scanError" in fn
+    assert "if (scanError !== state.scanError)" in fn
+    assert "scanErrorEl.hidden = scanError" in fn
+    assert code.count("scan_error") == 1
+    # no innerHTML sink anywhere is already pinned globally; the styling
+    # is token-warn (no inline style in markup or JS).
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    assert ".scan-error" in css and "--c-warn-soft" in css
+    assert ".style" not in fn and 'style="' not in index_html
+
+
+def test_scan_error_line_render_contract_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    fn = re.search(
+        r"function applyScanChip\(snap\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    script = """
+      const LABELS = { scanLoading: "Loading\\u2026", scanSkipped: "Skipped" };
+      let errWrites = 0;
+      const scanChipEl = { hidden: true, textContent: "" };
+      const scanErrorEl = {
+        hidden: true, _t: "",
+        set textContent(v) { errWrites++; this._t = v; },
+        get textContent() { return this._t; },
+      };
+      const state = { scanError: "" };
+      __FN__
+      const ERR = "<img src=x onerror=alert(1)> [class=http-status exc=HTTPStatus]";
+      // key present -> visible, VERBATIM, exactly one DOM write.
+      applyScanChip({ schema: "state/1", scan_state: "done", scan_error: ERR });
+      if (scanErrorEl.hidden || scanErrorEl.textContent !== ERR) throw new Error("show");
+      if (errWrites !== 1) throw new Error("write-count");
+      // identical snapshot re-applied -> NO re-write (no announce spam).
+      applyScanChip({ schema: "state/1", scan_state: "done", scan_error: ERR });
+      if (errWrites !== 1) throw new Error("spam");
+      // the engine clears the key when a scan starts -> line gone, no residue.
+      applyScanChip({ schema: "state/1", scan_state: "running" });
+      if (!scanErrorEl.hidden || scanErrorEl.textContent !== "") throw new Error("residue");
+      if (errWrites !== 2) throw new Error("clear-write-count");
+      // state/0 (busy engine) touches NOTHING (privacyMode discipline).
+      applyScanChip({ schema: "state/0" });
+      applyScanChip(null);
+      if (errWrites !== 2) throw new Error("state0-wrote");
+      // re-failure -> fresh line, visible, verbatim.
+      applyScanChip({ schema: "state/1", scan_error: ERR + " | 2" });
+      if (scanErrorEl.hidden || scanErrorEl.textContent !== ERR + " | 2") throw new Error("refail");
+      // empty-string key (contract says never sent) renders as absent.
+      applyScanChip({ schema: "state/1", scan_error: "" });
+      if (!scanErrorEl.hidden) throw new Error("empty-shown");
+      console.log("ok");
+    """.replace("__FN__", fn)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)

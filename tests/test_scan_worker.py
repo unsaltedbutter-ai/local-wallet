@@ -1040,3 +1040,223 @@ def test_print_balance_stale_without_pending_keeps_freshness_note() -> None:
         lines.append,
     )
     assert lines[-1] == app.FRESHNESS_NOTE
+
+
+# ------------------------------------------- TCK-WEB-020 scan-failure surface
+
+
+class _LogStub:
+    """Captures what would ride the per-launch log file (the DIAG-001
+    support channel), without touching the filesystem."""
+
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+
+    def warning(self, line: str) -> None:
+        self.warnings.append(line)
+
+    def error(self, line: str) -> None:  # pragma: no cover — never used here
+        raise AssertionError(line)
+
+
+_SCAN_FAIL_EXC = app.ChainError(
+    "utxo-scan request rejected by the server",
+    failure_class="http-status",
+    exc_name="HTTPStatus",
+)
+#: The value-free DIAG-001 class line the /state field carries verbatim
+#: (detail + suffix — the "warning:" framing and the cache note stay on the
+#: transcript/log line, never in the field).
+_SCAN_FAIL_FIELD = (
+    "utxo-scan request rejected by the server [class=http-status exc=HTTPStatus]"
+)
+_SCAN_FAIL_LINE = (
+    "warning: startup scan failed: utxo-scan request rejected by the server"
+    " — continuing with cached state. [class=http-status exc=HTTPStatus]"
+)
+
+
+def test_web_scan_failure_sets_state_field_and_emits_closed_transcript_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+) -> None:
+    """TCK-WEB-020 done-when (the user's live finding): a startup scan that
+    FAILS in web mode — the exact scantxoutset-style rejection — must reach
+    the browser twice over: the additive value-free ``/state`` ``scan_error``
+    field AND one transcript line, turn-closed (TCK-UX-012(a)/WEB-024: the
+    text event is followed IMMEDIATELY by its own turn_end — no bubble
+    merge, no turn steal). The DIAG-001 log + console channels stay (both
+    channels, not either/or)."""
+
+    def failing_fetch(plan: object, client: object, *, progress_fn=None) -> object:
+        raise _SCAN_FAIL_EXC
+
+    monkeypatch.setattr(wallet_scan, "fetch_scan", failing_fetch)
+    store = Store(tmp_path / "webfail.db")
+    wallet = store.create_wallet("default", "desc")
+    worker = app.ChainWorker(None)
+    log = _LogStub()
+    terminal: list[str] = []  # web mode must NOT print narration to terminal
+    router = app._Output(web=True, terminal=terminal.append, log=log)
+    flow = app.ScanFlow(
+        store, wallet, worker, gap_limit=None, startup_plan=object(), output=router
+    )
+    commands: queue.Queue[Any] = queue.Queue()
+    commands.put("exit")
+    events: list[app.EngineEvent] = []
+    emitter = app.EventEmitter(events.append)
+    try:
+        app._pump(
+            AgentLoop(app.stub_generate, {}),
+            emitter.text,
+            commands,
+            flow=app.TxFlow(),
+            session=app.SendSession(),
+            table={},
+            emitter=emitter,
+            scan=flow,
+        )
+    finally:
+        worker.stop()
+        store.close()
+    # The exit-drained failure: dot-line closer, then the ONE failure line
+    # with its OWN turn_end right behind it (the WEB-024 discipline).
+    assert [(e.kind, e.payload) for e in events] == [
+        (app.EVENT_USER_TEXT, "exit"),
+        (app.EVENT_PROGRESS, "\n"),
+        (app.EVENT_TEXT, _SCAN_FAIL_LINE),
+        (app.EVENT_TURN_END, ""),
+    ]
+    assert terminal == []  # the browser gets it; the terminal does not
+    assert _SCAN_FAIL_LINE in capsys.readouterr().err  # console stays (DIAG-001)
+    assert log.warnings == [_SCAN_FAIL_LINE]  # launch log stays (support story)
+    # /state carries the class line verbatim — value-free (no "://", no
+    # framing), and the gate stays the honest "skipped".
+    snap = app.build_state_snapshot(app.TxFlow(), app.SendSession(), None, flow)
+    assert snap["scan_error"] == _SCAN_FAIL_FIELD
+    assert snap["scan_state"] == "skipped"
+    assert "://" not in repr(snap) and "warning:" not in snap["scan_error"]
+
+
+def test_scan_error_clears_on_the_next_start_and_completion(wallet_store) -> None:
+    """TCK-WEB-020 clear semantics, PINNED: the field flips OFF the moment a
+    later scan STARTS (the real kick/resync tail — nothing stale lingers
+    while a fresh attempt runs), flips back ON honestly if that attempt
+    fails again, and a COMPLETED scan leaves it ABSENT (never
+    empty-string, never stale)."""
+    store, wallet, _wd = wallet_store
+    hold = threading.Event()
+    calls = {"n": 0}
+
+    def fetch(plan: object, client: object, *, progress_fn=None) -> object:
+        calls["n"] += 1
+        n = calls["n"]
+        if n == 1:
+            raise _SCAN_FAIL_EXC
+        if n == 2:
+            hold.wait(10.0)  # stay in flight while the clear-on-start is read
+            raise _SCAN_FAIL_EXC
+        return object()
+
+    def ok_persist(store_: object, records: object) -> wallet_scan.ScanSummary:
+        return wallet_scan.ScanSummary(
+            wallet_id=1, gap_limit=20, tip_height=0, scanned_at="x", utxo_count=0
+        )
+
+    def snap(flow: app.ScanFlow) -> dict[str, object]:
+        return app.build_state_snapshot(app.TxFlow(), app.SendSession(), None, flow)
+
+    worker = app.ChainWorker(None)
+    flow = app.ScanFlow(store, wallet, worker, gap_limit=None)
+    commands: queue.Queue[Any] = queue.Queue()
+    flow.attach(commands)
+    narrated: list[str] = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(wallet_scan, "fetch_scan", fetch)
+        mp.setattr(wallet_scan, "persist_scan", ok_persist)
+        try:
+            # Failure #1 lands (no router → the line falls back to narration).
+            flow.set_startup(object())
+            flow.begin()
+            flow.handle_command(commands.get(timeout=5.0), narrated.append, None)
+            assert flow.scan_error == _SCAN_FAIL_FIELD
+            assert snap(flow)["scan_error"] == _SCAN_FAIL_FIELD
+            # Attempt #2 STARTS via the real plan→arm→begin tail: the field
+            # clears while the fresh fetch is still in flight…
+            assert flow.kick_scan() is True
+            assert flow.scan_error is None
+            assert "scan_error" not in snap(flow)
+            # …fails → the flip back ON is honest (same value-free line).
+            hold.set()
+            flow.handle_command(commands.get(timeout=5.0), narrated.append, None)
+            assert snap(flow)["scan_error"] == _SCAN_FAIL_FIELD
+            # Attempt #3: starts (clears) and COMPLETES — stays cleared.
+            assert flow.kick_scan() is True
+            assert flow.scan_error is None  # clear-on-start
+            flow.handle_command(commands.get(timeout=5.0), narrated.append, None)
+            assert flow.scan_error is None
+            assert "scan_error" not in snap(flow)
+            assert snap(flow)["scan_state"] == "done"
+        finally:
+            hold.set()
+            worker.stop()
+    assert narrated.count(_SCAN_FAIL_LINE) == 2  # both failures narrated
+
+
+def test_cli_router_failure_stays_console_log_only_no_double_line(
+    tmp_path,
+) -> None:
+    """The CLI half of the both-channels contract: with a (non-web) router
+    the failure line rides console + log EXACTLY once — the transcript
+    channel is NOT also called (the pre-WEB-020 behavior stays byte-
+    identical; only web mode gains the second surface). The /state field
+    still records (harmless — the CLI serves no /state)."""
+    store = Store(tmp_path / "clipin.db")
+    wallet = store.create_wallet("default", "desc")
+    worker = app.ChainWorker(None)
+    log = _LogStub()
+    terminal: list[str] = []
+    router = app._Output(web=False, terminal=terminal.append, log=log)
+    flow = app.ScanFlow(store, wallet, worker, gap_limit=None, output=router)
+    narrated: list[str] = []
+    try:
+        flow.handle_command(
+            app._ScanDone(False, _SCAN_FAIL_EXC, flow._generation), narrated.append, None
+        )
+    finally:
+        worker.stop()
+        store.close()
+    assert terminal == [_SCAN_FAIL_LINE] and log.warnings == [_SCAN_FAIL_LINE]
+    assert narrated == []  # no second print on the narration channel
+    assert flow.scan_error == _SCAN_FAIL_FIELD
+
+
+def test_scan_now_success_clears_the_field(wallet_store) -> None:
+    """The blocking path counts as a completion: the lazy in-handler scan
+    and the watch poll ride :meth:`ScanFlow.scan_now`, and one that LANDS
+    clears any earlier flow-side failure (the data is fresh — the stale
+    class line must not linger)."""
+    store, wallet, _wd = wallet_store
+    worker = app.ChainWorker(None)
+    flow = app.ScanFlow(store, wallet, worker, gap_limit=None)
+    flow.attach(queue.Queue())
+    try:
+        flow.handle_command(
+            app._ScanDone(False, _SCAN_FAIL_EXC, flow._generation),
+            lambda _line: None,
+            None,
+        )
+        assert flow.scan_error == _SCAN_FAIL_FIELD
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(wallet_scan, "fetch_scan", lambda p, c, **k: object())
+            mp.setattr(
+                wallet_scan,
+                "persist_scan",
+                lambda s, r: wallet_scan.ScanSummary(
+                    wallet_id=1, gap_limit=20, tip_height=0, scanned_at="x",
+                    utxo_count=0,
+                ),
+            )
+            flow.scan_now()
+        assert flow.scan_error is None
+    finally:
+        worker.stop()

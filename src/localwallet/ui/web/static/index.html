@@ -15,6 +15,14 @@
   <!-- TCK-WEB-005: honest scan status, driven ONLY by the typed /state snapshot's
        scan_state field (never inferred from dots). Hidden until a snapshot says so. -->
   <p id="scan-chip" class="chip" role="status" aria-live="polite" hidden></p>
+  <!-- TCK-WEB-020: the persistent scan/rescan FAILURE line — the value-free
+       DIAG-001 class line from the typed /state snapshot's additive
+       scan_error key, rendered VERBATIM by app.js (engine-owned copy,
+       textContent-only; the transcript carries its own bubble for the same
+       failure — this is the status surface that survives it). Hidden when
+       the key is absent; app.js writes it only on transition, so the live
+       region never re-announces per snapshot (the scan chip's own pattern). -->
+  <p id="scan-error" class="chip scan-error" role="status" aria-live="polite" hidden></p>
   <!-- TCK-UX-010 + TCK-WEB-012 (f): persistent colored privacy label, driven
        ONLY by the typed /state snapshot's privacy_mode NAME (absent/unknown
        on a typed snapshot → hidden, never fabricated; a state/0 keeps the

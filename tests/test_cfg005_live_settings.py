@@ -328,6 +328,8 @@ class _StubScan:
 
     def __init__(self) -> None:
         self.wallet_id = 7
+        #: TCK-WEB-020: the /state builder reads it; this stub never scans.
+        self.scan_error: str | None = None
         self.gate = SimpleNamespace(
             state="disabled", enabled=False, in_progress=False
         )

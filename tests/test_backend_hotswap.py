@@ -1153,3 +1153,59 @@ def test_effective_url_follows_a_real_hot_swap_apply(
     assert reply[app.SETTINGS_EFFECTIVE_CHAIN_URL_KEY] == NEW_URL
     _drain(wiring, commands)
     wiring.store.close()
+
+
+# ------------------------------------------------ TCK-WEB-020 swap-failure
+
+
+def test_hotswap_resync_failure_surfaces_scan_error_field_and_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """TCK-WEB-020 req 3: the SWAP-001 apply path's resync FAILURE (the
+    user's exact live finding — "Saved — re-scanning…" that only the launch
+    log saw) rides the SAME surfaces as any other scan failure: the flow's
+    value-free ``scan_error`` field (→ the additive ``/state`` key) and one
+    transcript line via the narration channel, with the superseded-fetch
+    silence pin UNWEAKENED (the stale delivery still narrates nothing)."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    scan = wiring.scan
+    assert scan is not None
+    old = wiring.client
+    old.hold = threading.Event()
+    scan.set_startup(
+        wallet_scan.plan_scan(wiring.store, wiring.wallet, rebuild=False)
+    )
+    scan.begin()
+    assert old.entered.wait(5.0)
+    flow, _seen = _mk_flow(wiring, commands)
+    error, fields = flow.apply(NEW_URL)
+    assert error is None and fields == {"swapped": True, "resync": "started"}
+    # Mid-swap (the swap's resync queued, in flight): the field is CLEAN —
+    # begin()'s clear-on-start ran; /state reads running, not an error.
+    snap = app.build_state_snapshot(wiring.flow, wiring.session, None, scan)
+    assert "scan_error" not in snap and snap["scan_state"] == "running"
+    new = wiring.client
+    new.fail_with = app.ChainError(
+        "utxo-scan request rejected by the server",
+        failure_class="http-status",
+        exc_name="HTTPStatus",
+    )
+    old.hold.set()  # the superseded fetch runs out OK (silently discarded)
+    narration = _drain(wiring, commands)
+    # One honest transcript line, labelled as the RESCAN it was — and no
+    # success line to contradict it.
+    assert any(
+        line.startswith("warning: rescan failed: utxo-scan request rejected")
+        for line in narration
+    )
+    assert not any("Rescan complete" in line for line in narration)
+    assert scan.scan_error == (
+        "utxo-scan request rejected by the server [class=http-status exc=HTTPStatus]"
+    )
+    snap = app.build_state_snapshot(wiring.flow, wiring.session, None, scan)
+    assert snap["scan_error"] == scan.scan_error
+    # Value-free: the just-swapped server's URL/host never rides anywhere,
+    # even though the swap itself moved it into the live wiring.
+    dumped = repr(snap) + repr(narration)
+    assert "://" not in dumped and "mempool.mine" not in dumped
+    wiring.store.close()

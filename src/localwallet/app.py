@@ -8005,6 +8005,13 @@ class _Output:
         self._emitter: EventEmitter | None = None
         self._buffered: list[str] = []
 
+    @property
+    def web(self) -> bool:
+        """The mode accessor (TCK-WEB-020): callers that must dual-route a
+        line (scan failure → console/log AND the web transcript) branch on
+        it; fixed at construction, so it is a fact, not a mutable flag."""
+        return self._web
+
     def bind_emitter(self, emitter: EventEmitter) -> None:
         """Attach the engine emitter (once available) and flush any buffered
         startup narration to it — each line as its own closed turn (see the
@@ -8461,6 +8468,19 @@ class ScanFlow:
         #: scan persists successfully (never on failure — the load did not
         #: complete). ``_wire`` arms it only for an onboarding session.
         self.on_first_scan_done: Callable[[Callable[[str], None]], None] | None = None
+        #: TCK-WEB-020: the last scan/rescan FAILURE as the value-free
+        #: DIAG-001 class line (detail + ``[class=… exc=…]`` suffix), the
+        #: additive ``/state`` ``scan_error`` field's source. Set by
+        #: :meth:`_warn` (EVERY current-generation scan/rescan failure —
+        #: startup, repair resync, and the hot-swap's superseding resync
+        #: alike); cleared by :meth:`begin` (a subsequent scan STARTS),
+        #: :meth:`_finish`'s success branch (a subsequent scan COMPLETES)
+        #: and :meth:`scan_now` success (the lazy/watch scan lands).
+        #: A superseded (stale-generation) failure never sets it — that
+        #: server is retired and its superseding fetch has already cleared
+        #: the field via ``begin``. Engine-thread-only, like every other
+        #: mutation here.
+        self._scan_error: str | None = None
 
     @property
     def wallet_id(self) -> int:
@@ -8468,6 +8488,15 @@ class ScanFlow:
         watcher rebind builds the watch probe from here without reaching
         into the flow's privates)."""
         return self._wallet_id
+
+    @property
+    def scan_error(self) -> str | None:
+        """TCK-WEB-020: the value-free DIAG-001 class line of the last
+        scan/rescan failure, or ``None`` once a later scan has started or
+        completed (see :attr:`_scan_error`). Read by
+        :func:`build_state_snapshot` on the engine thread; the web client
+        renders it near the scan chip."""
+        return self._scan_error
 
     @property
     def _live_gap_limit(self) -> int | None:
@@ -8552,6 +8581,12 @@ class ScanFlow:
         if self._started or self._startup_plan is None or self._commands is None:
             return
         self._started = True
+        # TCK-WEB-020 clear-on-start: a fresh scan starting supersedes the
+        # last failure — /state's scan_error disappears while scan_state
+        # reads pending/running, and reappears (with the NEW class line) if
+        # this attempt fails too. The failing-then-recovering flip is the
+        # point: stale errors never linger past a fresh attempt.
+        self._scan_error = None
         self.gate.mark_running()
         commands = self._commands
         generation = self._generation  # the delivery's staleness stamp (TCK-SWAP-001)
@@ -8742,6 +8777,10 @@ class ScanFlow:
             self._out_of_window(output_fn)
             return
         self.gate.mark_done()
+        # TCK-WEB-020 clear-on-completion (belt to begin()'s clear-on-start:
+        # every engine-driven success already passed through begin(), but
+        # the pin says a completed scan clears, and it costs one line).
+        self._scan_error = None
         output_fn(
             _rescan_summary_line(summary) if self._rescan else _scan_summary_line(summary)
         )
@@ -8772,16 +8811,27 @@ class ScanFlow:
         value-free by their layers' contracts). The REPL still runs; handlers
         surface store-empty/chain-down states per turn. With a ``_Output``
         router present (web/CLI launch), the line is a TCK-DIAG-001 warning
-        (log + console, never the SSE stream); otherwise it falls back to the
-        caller's narration channel (test harnesses)."""
+        (log + console — the support story, unchanged); TCK-WEB-020: in WEB
+        mode it ALSO rides the narration channel (the pump hands this method
+        ``_narrate_line``, so the browser gets one honest transcript line,
+        turn-closed per TCK-UX-012(a)/WEB-024) — the user's MW-16 round-2
+        finding was that a rescan failure visible only in the launch log
+        gave the browser NO signal. In CLI mode the console channel already
+        prints it (no double line); with no router (test harnesses) the
+        narration channel is the only surface. The value-free class core
+        (``detail`` + suffix, never the "warning:" framing) additionally
+        lands on ``/state`` as ``scan_error`` (:attr:`_scan_error`)."""
         label = "rescan" if self._rescan else "startup scan"
-        line = f"warning: {label} failed: {detail} — continuing with cached state."
-        if exc is not None:
-            line += _scan_failure_suffix(exc)
+        suffix = _scan_failure_suffix(exc) if exc is not None else ""
+        line = f"warning: {label} failed: {detail} — continuing with cached state.{suffix}"
+        # TCK-WEB-020: the additive /state field's source — the exact
+        # value-free class taxonomy line the log line carries, minus the
+        # framing (the web renders it next to the scan chip).
+        self._scan_error = f"{detail}{suffix}"
         out = self._output
         if out is not None:
             out.warning(line)
-        else:
+        if out is None or out.web:
             output_fn(line)
 
     # ------------------------------------------------------------- blocking scan
@@ -8801,7 +8851,13 @@ class ScanFlow:
         plan = wallet_scan.plan_scan(
             self._store, self._wallet, gap_limit=self._gap_limit, rebuild=False
         )
-        return wallet_scan.persist_scan(self._store, self._worker.scan(plan))
+        summary = wallet_scan.persist_scan(self._store, self._worker.scan(plan))
+        # TCK-WEB-020 clear-on-completion for the blocking path too (the
+        # lazy in-handler scan and the watch poll ride here): a landed
+        # scan makes any earlier flow-side failure stale. A failure raises
+        # past this line — the field keeps the last honest class line.
+        self._scan_error = None
+        return summary
 
     @property
     def in_progress(self) -> bool:
@@ -9795,12 +9851,15 @@ def build_state_snapshot(
     :class:`ModelPreloadFlow` state name; the two are mutually exclusive:
     file present → preload, absent → card),     — TCK-BACKEND-002 — the
     live backend kind (a closed :data:`BACKEND_KINDS` enum NAME: never a
-    URL/host), and — TCK-UX-010 — the privacy mode (a
+    URL/host), — TCK-UX-010 — the privacy mode (a
     precomputed closed :data:`PRIVACY_MODES` enum NAME, computed by the
-    pump at the call site; the builder sees no settings). No address,
+    pump at the call site; the builder sees no settings), and —
+    TCK-WEB-020 — the last scan/rescan failure (a value-free DIAG-001
+    class line, omitted when absent). No address,
     amount, txid, ``tx_ref``, key
-    material OR progress byte-count CAN appear — every value is an enum NAME
-    or a boolean, never data. No progress percentage here (a wallet-size
+    material OR progress byte-count CAN appear — every value is an enum
+    NAME, a boolean, or a code-owned value-free failure line, never user
+    data. No progress percentage here (a wallet-size
     oracle); download progress rides its own event kind.
     """
     snapshot: dict[str, object] = {
@@ -9836,6 +9895,15 @@ def build_state_snapshot(
         # an enum name, never a URL/host. Absent (None) = no settings
         # context; omitted, never guessed (the ``backend_kind`` pattern).
         snapshot["privacy_mode"] = privacy_mode
+    if scan is not None and scan.scan_error:
+        # TCK-WEB-020: additive under state/1 (same rule): the last
+        # scan/rescan failure as a value-free DIAG-001 class line (chain/
+        # layer scrubbed detail + ``[class=… exc=…]`` suffix — class names
+        # and codes only, never a host, credential, address, or amount).
+        # OMITTED when there is no current failure — absent = no error
+        # (the flow clears the source on the next scan start/completion;
+        # the builder adds no logic of its own).
+        snapshot["scan_error"] = scan.scan_error
     return snapshot
 
 

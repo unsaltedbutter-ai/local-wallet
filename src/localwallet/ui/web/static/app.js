@@ -47,6 +47,7 @@ const scrollerEl = document.getElementById("scroller");
 const actionsEl = document.getElementById("actions");
 const quickbarEl = document.getElementById("quickbar");
 const scanChipEl = document.getElementById("scan-chip");
+const scanErrorEl = document.getElementById("scan-error");
 const privacyChipEl = document.getElementById("privacy-chip");
 const privacySublineEl = document.getElementById("privacy-subline");
 const settingsToggleEl = document.getElementById("settings-toggle");
@@ -401,6 +402,13 @@ const state = {
   // TCK-WEB-012 (f): the last KNOWN privacy_mode NAME from a typed
   // snapshot — state/0 (engine busy) must not blank the chip mid-turn.
   privacyMode: "",
+  // TCK-WEB-020: the LAST RENDERED scan_error line (typed state/1 only).
+  // The tracker doubles as the transition gate: the live region is touched
+  // only when the line appears, changes, or disappears — never per
+  // snapshot (every textContent mutation re-announces, the WEB-028
+  // reconnecting-tracker discipline). "" = clean. Memory only, like
+  // everything else here.
+  scanError: "",
   // TCK-WEB-021 (5): the pinned reload trigger. The last TYPED snapshot's
   // backend_kind NAME (never rendered — the badges are gone; read ONLY as
   // half of the trust signature; state/0 keeps the last known value, the
@@ -1171,9 +1179,27 @@ function dismissWatchKeyForm(key) {
 // The scan chip reflects ONLY the typed snapshot's scan_state (additive under
 // state/1). Unknown/absent values (state/0 fallback, future states) clear it —
 // never a guess, never a hard-fail.
+//
+// TCK-WEB-020: the persistent failure line rides the SAME apply path. The
+// typed snapshot's additive scan_error key (the value-free DIAG-001 class
+// line, engine-owned copy) is rendered VERBATIM via textContent — present
+// key shows it, absent key clears it (the engine drops it the moment a
+// subsequent scan starts or lands, so staleness is server-authoritative;
+// never empty-string framing, never client inference). state/0 keeps the
+// last render untouched (the privacyMode discipline — a busy engine must
+// not flicker the line off and re-announce it on the next typed snapshot).
+// DOM writes happen ONLY on transition, one textContent assignment per
+// change — the polite live region never spams per-snapshot.
 function applyScanChip(snap) {
   scanChipEl.hidden = true;
   if (!snap || snap.schema !== "state/1") return;
+  const rawError = snap.scan_error; // read ONCE; absent/non-string = clean
+  const scanError = typeof rawError === "string" ? rawError : "";
+  if (scanError !== state.scanError) {
+    state.scanError = scanError;
+    scanErrorEl.textContent = scanError; // verbatim — never parsed, never reworded
+    scanErrorEl.hidden = scanError === "";
+  }
   if (snap.scan_state === "pending" || snap.scan_state === "running") {
     scanChipEl.textContent = LABELS.scanLoading;
     scanChipEl.hidden = false;

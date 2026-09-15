@@ -196,6 +196,25 @@ body {
   padding: var(--sp-1) var(--sp-3);
 }
 
+/* TCK-WEB-020: the persistent scan/rescan failure line (the /state
+   scan_error class line, verbatim). A stronger warn tint than the plain
+   chip — ink + soft background from the SAME token pair the trust family
+   uses, so the header's color vocabulary stays one system. A class line
+   is long-ish prose: at phone width it wraps inside the flex row
+   (max-width + overflow-wrap guard the flex-item min-content blowout),
+   and — like the two-line privacy chip — it is a rounded block, not a
+   single-row pill. hidden = zero footprint (UA [hidden], like every chip
+   here); showing it grows only the wrap-able header row, never the
+   scrolling pane. */
+.scan-error {
+  color: var(--c-warn);
+  background: var(--c-warn-soft);
+  border-color: var(--c-warn);
+  border-radius: var(--r-lg);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 /* TCK-UX-010: the privacy chip recolors by the typed privacy_mode NAME via
    data-privacy (the same attribute-selector pattern as the conn dot above);
    awaiting_backend shares the trust-yellow family. Unknown/absent → the

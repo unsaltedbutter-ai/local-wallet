@@ -562,6 +562,44 @@ def test_state_snapshot_omits_privacy_mode_without_settings() -> None:
     )
 
 
+def test_state_scan_error_rides_verbatim_and_is_omitted_when_clean(
+    tmp_path: Path,
+) -> None:
+    """TCK-WEB-020 state-pin: the builder adds NO framing to the flow's
+    value-free DIAG-001 class line (the client renders it verbatim — the
+    exact taxonomy string, never the "warning:" transcript framing), and
+    OMITS the key entirely when there is no current failure (the
+    ``backend_kind``/``privacy_mode`` absent rule; absent = no error). The
+    fail→start/completion flip itself is pinned at the flow level in
+    test_scan_worker."""
+    store = Store(tmp_path / "pin.db")
+    wallet = store.create_wallet("default", "desc")
+    worker = app.ChainWorker(None)
+    try:
+        flow = app.ScanFlow(store, wallet, worker, gap_limit=None)
+        clean = app.build_state_snapshot(TxFlow(), app.SendSession(), None, flow)
+        assert "scan_error" not in clean
+        exc = app.ChainError(
+            "utxo-scan request rejected by the server",
+            failure_class="rpc-error",
+            exc_name="RPCError",
+        )
+        flow.handle_command(
+            app._ScanDone(False, exc, flow._generation), lambda _line: None, None
+        )
+        snap = app.build_state_snapshot(TxFlow(), app.SendSession(), None, flow)
+        # verbatim class line (rpc-error + the sanctioned scantxoutset
+        # suspect guidance; the ticket's exact example shape):
+        assert snap["scan_error"].startswith(
+            "utxo-scan request rejected by the server [class=rpc-error exc=RPCError"
+        )
+        assert not snap["scan_error"].startswith("warning:")
+        assert "://" not in repr(snap)  # value-free by construction
+    finally:
+        worker.stop()
+        store.close()
+
+
 def test_store_built_off_the_engine_thread_is_refused(tmp_path: Path) -> None:
     """The ``check_same_thread`` guard is real: state constructed on the
     WRONG thread fails closed inside the bootstrap (surfaced on
