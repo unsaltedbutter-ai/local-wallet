@@ -1,0 +1,5 @@
+{
+  "id": "golden-075",
+  "prompt": "open mempool for abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

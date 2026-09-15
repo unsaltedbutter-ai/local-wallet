@@ -1,0 +1,5 @@
+{
+  "id": "golden-074",
+  "prompt": "what is the current block height?",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

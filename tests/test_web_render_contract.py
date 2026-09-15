@@ -269,6 +269,13 @@ def test_privacy_subline_visible_and_trust_badge_keys_off_privacy_mode() -> None
 def test_kind_badges_return_amendment_shaped_mempool_stays_gone() -> None:
     raw = (_STATIC / "app.js").read_text(encoding="utf-8")
     code = _strip_js_comments(raw)
+    # TCK-CHAT-006 carve-out: the link-line regex names mempool.space as the
+    # explorer LINK origin (an outbound URL the user clicks) — not backend-
+    # kind machinery. Remove that one literal before the dead-word ban; the
+    # pin's intent (esplora/mempool never returns as a backend badge) holds.
+    code = code.replace(
+        re.search(r"const EXPLORER_LINK_LINE_RE =\s*\n?\s*[^;]+;", code).group(0), ""
+    )
     # the old shape is still fully gone (only the new minimal painter exists):
     for gone in (
         "BADGE_FAMILIES",
@@ -703,9 +710,10 @@ def test_rejection_lines_end_in_a_static_next_step() -> None:
 # TCK-LINK-001 (revised by TCK-WEB-014, critique D8) static pins: the
 # qualifying-token scan is unchanged, but the affordance is a COPY BUTTON —
 # the visible label is the verbatim token, no navigation machinery survives
-# (no EXPLORER_ORIGIN, no explorerHref, no href/target/rel, no mempool
-# disclosure string), and the feedback reuses the shared WEB-010 ok/fail
-# pattern. Classes/attributes only (no inline style on the generated control).
+# on the token path (no EXPLORER_ORIGIN, no explorerHref, no mempool
+# disclosure string; href/target/rel live ONLY in the TCK-CHAT-006
+# explorerAnchor carve-out, pinned below), and the feedback reuses the shared
+# WEB-010 ok/fail pattern. Classes/attributes only (no inline style).
 def test_linkify_client_shape_pins() -> None:
     raw = (_STATIC / "app.js").read_text(encoding="utf-8")
     code = _strip_js_comments(raw)
@@ -718,10 +726,18 @@ def test_linkify_client_shape_pins() -> None:
     assert "explorerHref" not in raw
     assert "explorerLink" not in raw
     assert "Opens mempool.space" not in raw
-    # no navigation of any kind: an <a> is never built, href/target/rel absent
-    assert 'createElement("a")' not in code
-    assert "href" not in code
-    assert "_blank" not in code and "noopener" not in code
+    # no navigation of any kind OUTSIDE the TCK-CHAT-006 anchor builder:
+    # explorerAnchor is the ONE <a>/href/target/rel site (its full-line gate
+    # is pinned below); with that function removed, the WEB-014 ban holds.
+    anchor_fn = re.search(
+        r"function explorerAnchor\(url\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    no_anchor = code.replace(anchor_fn, "")
+    assert 'createElement("a")' not in no_anchor
+    assert "href" not in no_anchor
+    assert "_blank" not in no_anchor and "noopener" not in no_anchor
+    # the copy token button itself stays navigation-free (built, not linked)
+    assert 'btn.setAttribute("href"' not in code
     # copy affordance: button with the verbatim token as its only content
     assert 'btn.className = "explorer-link"' in code
     assert "btn.textContent = token;" in code
@@ -921,6 +937,190 @@ def test_linkify_regexes_and_click_to_copy_under_node() -> None:
         .replace("__COPY_FN__", copy_fn)
         .replace("__CLIP_FN__", clip_fn)
         .replace("__FLASH_FN__", flash_fn)
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# TCK-CHAT-006 static pins: engine explorer LINK lines ("Explorer links
+# (mempool.space) — click to open:" head + "<Label>: <url>" lines, URL last,
+# no trailing punctuation — engine-validated before emission) render as
+# click-to-open anchors, and ONLY those lines. The full-line regex is anchored
+# at BOTH ends with a closed label enum and the single https://mempool.space
+# origin plus shape-validated paths; the anchor machinery (href/target/rel/
+# <a>) exists ONLY inside explorerAnchor, which carries no listener (a click
+# on a real <a> IS the gesture); no window.open anywhere; and appendBubbleText
+# routes a link line through the regex match BEFORE the token-copy scan, so
+# plain narration — even narration carrying a URL-shaped string — never
+# reaches the anchor path and keeps the WEB-014 token behavior untouched.
+def test_chat006_explorer_link_anchor_static_pins() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    lit = re.search(
+        r"const EXPLORER_LINK_LINE_RE =\s*\n?\s*([^;]+);", code
+    ).group(1)
+    assert lit.startswith("/^") and lit.endswith("$/")  # whole-line only
+    assert "(Transaction|Address|Mempool)" in lit  # the engine's closed enum
+    assert r"https:\/\/mempool\.space" in lit  # the ONE origin, as a literal
+    assert r"\/tx\/[0-9a-f]{64}" in lit  # lowercase 64-hex txid path
+    assert r"\/address\/bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}" in lit
+    # the ONE anchor builder: attributes only, textContent for the URL,
+    # no listener (the click is native), no inline style.
+    anchor_fn = re.search(
+        r"function explorerAnchor\(url\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert 'document.createElement("a")' in anchor_fn
+    assert "a.href = url;" in anchor_fn
+    assert 'a.target = "_blank";' in anchor_fn
+    assert 'a.rel = "noopener noreferrer";' in anchor_fn
+    assert "a.textContent = url;" in anchor_fn
+    assert "addEventListener" not in anchor_fn
+    assert "innerHTML" not in anchor_fn
+    assert "window.open" not in code
+    # the gate: appendBubbleText matches the WHOLE line against the regex
+    # first; the token scan below is the unchanged WEB-014 path.
+    painter = code[
+        code.index("function appendBubbleText") : code.index("function explorerAnchor")
+    ]
+    assert "EXPLORER_LINK_LINE_RE.exec(text)" in painter
+    assert "explorerAnchor(link[2])" in painter
+    assert "LINK_SCAN_RE" in painter  # token path intact on non-link lines
+
+
+# TCK-CHAT-006 behavioral pin (runs under node if present): the SHIPPED
+# appendBubbleText/explorerAnchor/regexes render engine link lines as real
+# anchors — href, target=_blank, rel=noopener noreferrer, URL textContent
+# verbatim, label kept as a separate text node (lineText/bubbleText stay
+# verbatim) — while every near-miss (URL-shaped narration sentence, wrong
+# charset, wrong length, uppercase hex, trailing punctuation, foreign or
+# lookalike origin, path extras, unknown label, bare URL, the head line)
+# produces NO anchor at all: malformed URL-looking strings never reach an
+# href. The narration vector doubles as the token-copy regression check: a
+# bare token inside a sentence still becomes the <button> copy affordance,
+# never an <a>.
+def test_chat006_explorer_link_anchor_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    link_re = re.search(
+        r"const EXPLORER_LINK_LINE_RE =\s*\n?\s*([^;]+);", code
+    ).group(1)
+    addr_re = re.search(r"const ADDRESS_RE = (/[^;]+);", code).group(1)
+    scan_re = re.search(r"const LINK_SCAN_RE =\s*\n?\s*([^;]+);", code).group(1)
+    append_fn = re.search(
+        r"function appendBubbleText\(line, text\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    anchor_fn = re.search(
+        r"function explorerAnchor\(url\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    copy_fn = re.search(
+        r"function copyTokenButton\(token\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    script = """
+      const EXPLORER_LINK_LINE_RE = __LINK_RE__;
+      const ADDRESS_RE = __ADDR_RE__;
+      const LINK_SCAN_RE = __SCAN_RE__;
+      const LABELS = { clickToCopy: "Click to copy", copyAddress: "Copy address",
+                       copyTxid: "Copy transaction id" };
+      function makeEl(tag) {
+        return {
+          tag, nodeType: 1, children: [], listeners: 0, className: "",
+          textContent: "", title: "", href: "", target: "", rel: "", attrs: {},
+          appendChild(c) { this.children.push(c); return c; },
+          setAttribute(k, v) { this.attrs[k] = v; },
+          addEventListener() { this.listeners += 1; },
+          classList: { add() {}, remove() {}, contains: () => false },
+        };
+      }
+      globalThis.document = {
+        createElement: makeEl,
+        createTextNode: (t) => ({ nodeType: 3, textContent: t }),
+      };
+      // the QR control is TCK-QR-001 machinery, out of scope here — a stub
+      // proves only that the untouched token path still fires it.
+      let qrCalls = 0;
+      function qrButton() { qrCalls += 1; return makeEl("span"); }
+      function clipboardWrite() { return Promise.resolve(true); }
+      function flashCopyResult() {}
+      __APPEND_FN__
+      __ANCHOR_FN__
+      __COPY_FN__
+      const tx = "f".repeat(64);
+      const addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+      const render = (text) => {
+        const line = makeEl("p");
+        appendBubbleText(line, text);
+        return line;
+      };
+      const anchors = (line) => line.children.filter((c) => c.tag === "a");
+      const url = (u) => "Transaction: " + u;
+      // --- the three engine link lines: label text node + real anchor ---
+      for (const [label, line1] of [
+        ["Transaction", render("Transaction: https://mempool.space/tx/" + tx)],
+        ["Address", render("Address: https://mempool.space/address/" + addr)],
+        ["Mempool", render("Mempool: https://mempool.space")],
+      ]) {
+        const a = anchors(line1);
+        if (line1.children.length !== 2 || a.length !== 1)
+          throw new Error(label + ": not exactly label+anchor");
+        if (line1.children[0].nodeType !== 3 ||
+            line1.children[0].textContent !== label + ": ")
+          throw new Error(label + ": label node");
+        if (a[0].target !== "_blank") throw new Error(label + ": target");
+        if (a[0].rel !== "noopener noreferrer") throw new Error(label + ": rel");
+        if (!a[0].href.startsWith("https://mempool.space"))
+          throw new Error(label + ": href origin");
+        if (a[0].textContent !== a[0].href) throw new Error(label + ": verbatim");
+        if (a[0].listeners !== 0) throw new Error(label + ": handler on anchor");
+      }
+      const addrLine = render("Address: https://mempool.space/address/" + addr);
+      if (addrLine.children[1].href !== "https://mempool.space/address/" + addr)
+        throw new Error("address href not the full verbatim URL");
+      // --- discrimination: a URL-shaped string in a NARRATION SENTENCE is
+      // not a link line: no anchor anywhere, and the bare token inside it
+      // keeps the untouched WEB-014 copy-button behavior ---
+      const narration = render("check https://mempool.space/tx/" + tx + " right now");
+      if (anchors(narration).length !== 0) throw new Error("narration became a link");
+      const btn = narration.children.find((c) => c.tag === "button");
+      if (!btn || btn.textContent !== tx) throw new Error("token-copy changed");
+      const addrNarr = render("paid to " + addr + " already");
+      if (anchors(addrNarr).length !== 0) throw new Error("narration link");
+      if (qrCalls === 0) throw new Error("QR affordance changed");
+      // --- href validation: malformed URL-looking strings are NEVER anchors
+      // (and never reach any href) ---
+      const head = render("Explorer links (mempool.space) — click to open:");
+      const nearMisses = [
+        head, // the head line stays plain text
+        render(url("https://mempool.space/tx/" + "z".repeat(64))), // bad charset
+        render(url("https://mempool.space/tx/" + "f".repeat(63))), // too short
+        render(url("https://mempool.space/tx/" + "F".repeat(64))), // uppercase
+        render(url("https://mempool.space/tx/" + tx + ".")), // trailing dot
+        render(url("https://mempool.space/tx/" + tx + "/extra")), // path extra
+        render(url("https://mempool.space/address/" + addr + "!")), // trailing !
+        render(url("https://mempool.space/address/bc1q0invalid")), // bad bech32
+        render(url("https://mempool.space/../evil")), // path traversal
+        render(url("http://mempool.space/tx/" + tx)), // not https
+        render("Transaction: https://mempool.space.evil.example/tx/" + tx),
+        render("Transaction: https://evil.example/tx/" + tx),
+        render("Wallet: https://mempool.space"), // unknown label
+        render("https://mempool.space/tx/" + tx), // label-less bare URL
+      ];
+      for (const line of [head, ...nearMisses]) {
+        for (const c of line.children) {
+          if (c.tag === "a") throw new Error("anchor for a near-miss: " + c.href);
+          if (c.href) throw new Error("href on a non-anchor");
+        }
+      }
+      console.log("ok");
+    """
+    script = (
+        script.replace("__LINK_RE__", link_re)
+        .replace("__ADDR_RE__", addr_re)
+        .replace("__SCAN_RE__", scan_re)
+        .replace("__APPEND_FN__", append_fn)
+        .replace("__ANCHOR_FN__", anchor_fn)
+        .replace("__COPY_FN__", copy_fn)
     )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
@@ -1417,7 +1617,7 @@ def test_submit_401_and_stopped_tab_label_the_stale_session_under_node() -> None
 # source pins unless a node behavioral check is named. textContent-only +
 # CSP-safe throughout (the global sink scan covers the new code; the QR focus
 # trap deliberately queries NO anchor/href selector — the WEB-014 pin bans
-# that literal in the client entirely).
+# that literal outside the TCK-CHAT-006 explorerAnchor carve-out).
 
 # (1) STUCK PENDING BUBBLE: applyState reconciles the transient "Working…"
 # bubble ONLY from a typed state/1 snapshot whose flow_state is "idle" with

@@ -825,6 +825,19 @@ body {
 .copy-ok::after { content: "Copied ✓"; }
 .copy-fail::after { content: "Copy failed"; }
 
+/* TCK-CHAT-006: engine explorer LINK lines render as REAL anchors —
+   deliberately distinct from the dotted-underline copy affordance (solid
+   accent link at rest), and wrap anywhere like a token so the full URL
+   stays copyable at phone width. The global :focus-visible ring (top of
+   file) already covers keyboard focus. Tokens only. */
+.explorer-open-link {
+  color: var(--c-accent);
+  text-decoration: underline;
+  text-decoration-color: var(--c-accent);
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+}
+
 .turn-progress {
   color: var(--c-text-muted);
   letter-spacing: 0.2em;

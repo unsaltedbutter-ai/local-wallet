@@ -16443,6 +16443,458 @@ def _run_chat_settings_turn(
     return False
 
 
+# ------------------------------------- network status + explorer links (TCK-CHAT-006)
+#
+# User direction 2026-09-12: natural-language network-status answers and
+# explorer links, on the established code-owned-intercept pattern
+# (TCK-FIAT-003 currency ask, TCK-CONS-002 timing answer, TCK-CFG-004
+# settings): the deterministic matcher answers BEFORE the model, every
+# figure is engine truth, and the model never authors a number or a URL.
+#
+# FETCH DISCIPLINE (pinned): fees-now and block-height cost ZERO chain
+# requests beyond the SHARED FeeEstimator's one TTL-cached snapshot (the
+# same single refresh every card and the CONS-002 timing answer already
+# pays; a second answer inside the TTL costs nothing). The block height is
+# the store's own ``last_tip_height`` (written by every completed scan —
+# the SAME cache-backed figure the balance line narrates as ``tip
+# height N``), so no live tip RPC rides a chat turn; a missing tip is
+# narrated as absent, never fabricated (SR-006 minor 2 rule). The reply
+# timestamp is the engine clock, UTC (the CHAT-005 tool-owned-``now``
+# convention). The explorer links are pure code: no fetch at all.
+#
+# The "next-block feeRange data" the ticket names is consumed through the
+# estimator's OWN derivation (TCK-FEE-003 policy v2: MEDIUM = the next
+# block's feeRange lowest ×1.15, FASTER = 2×, SLOWER = the second block's
+# lowest, all from the one mempool-blocks snapshot): the raw per-block
+# quantile lists are not retained on the snapshot, and widening the chain
+# surface is out of this ticket's scope — the RUNG BIDS are the engine's
+# verbatim answer to "what are fees like", derived from exactly that data.
+
+#: The ONE code-owned explorer root the links are built under (public web
+#: UI — deliberately NOT the settings' ``esplora_base_url`` API base: the
+#: ticket pins mempool.space as the constant, and a chat link must never
+#: drift with a backend URL the user may have repointed at a private
+#: server). Every emitted URL is ``EXPLORER_ROOT_URL`` plus a closed path
+#: over a VALIDATED token — raw user text never enters a URL.
+EXPLORER_ROOT_URL: Final[str] = "https://mempool.space"
+
+#: Words that name the explorer family (whole tokens; "mempool.space" is
+#: matched as a substring of the lowercased line, punctuation survives
+#: the word strip).
+_EXPLORER_WORDS: Final[frozenset[str]] = frozenset({"mempool", "explorer"})
+#: Verbs that make a TOKENLESS explorer line an explicit link request
+#: ("show me the mempool", "open the explorer"). Anything else falls
+#: through to the model (knowledge asks like "what is a mempool?" stay
+#: the model's honest chat).
+_EXPLORER_LINK_VERBS: Final[frozenset[str]] = frozenset(
+    {"open", "show", "see", "give", "link", "load"}
+)
+#: Referent words that keep a tokenless line OUT of the root-link
+#: intercept: they point at wallet data the ordinary routes answer better
+#: ("is my transaction in the mempool?" → tx_status territory via the
+#: model; "show my addresses" → get_addresses; the pending card and the
+#: registry keep their surfaces).
+_EXPLORER_REFERENT_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "transaction",
+        "transactions",
+        "tx",
+        "txs",
+        "utxo",
+        "utxos",
+        "coin",
+        "coins",
+        "address",
+        "addresses",
+        "balance",
+        "payment",
+        "incoming",
+        "pending",
+        "my",
+        "mine",
+    }
+)
+#: A 64-hex token is a txid candidate (either case — normalized to
+#: lowercase, canonical form). 40+ hex that is NOT exactly 64 is a
+#: MALFORMED candidate (refused, never echoed).
+_EXPLORER_TXID_RE: Final = re.compile(r"[0-9a-fA-F]{64}")
+_EXPLORER_HEX40_RE: Final = re.compile(r"[0-9a-fA-F]{40,}")
+#: The bech32 candidate gate mirrors the client scanner's own shape
+#: ("bc1" + 11..87 chars, total 14..90) BEFORE the real
+#: :func:`_is_mainnet_bech32_address` decode (mainnet-only, ADR-0021).
+_EXPLORER_ADDR_RE: Final = re.compile(r"bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}")
+
+_EXPLORER_LABEL_TX: Final[str] = "Transaction"
+_EXPLORER_LABEL_ADDRESS: Final[str] = "Address"
+_EXPLORER_LABEL_HOME: Final[str] = "Mempool"
+_EXPLORER_HEAD: Final[str] = "Explorer links (mempool.space) — click to open:"
+#: The malformed-token refusal: value-free by construction — it names the
+#: SHAPE rules, never the token that failed them (LABEL-001 rule: a
+#: half-parsed explorer utterance must not reach the model either, where
+#: it could echo or "correct" it).
+_EXPLORER_BAD_TOKEN: Final[str] = (
+    "That is not a valid transaction id (64 hex characters) or a mainnet "
+    "address, so there is nothing to open."
+)
+
+#: Shared question-shape starters for the status matchers (a line that
+#: neither opens with one of these nor ends with ``?`` is a statement,
+#: not a status ask — it keeps its ordinary route).
+_STATUS_ASK_STARTERS: Final[frozenset[str]] = frozenset(
+    {"what", "whats", "how", "are", "is", "check", "see", "tell", "current", "currently"}
+)
+#: Words whose presence means the line is NOT a fee-LEVEL question: fee
+#: COMMANDS (the bump_fee / create_tx / settings routes), ownership
+#: ("my fees" is a history question), and the CFG-004 ceiling/floor
+#: settings wording.
+_FEES_ASK_EXCLUDE: Final[frozenset[str]] = frozenset(
+    {
+        "increase",
+        "bump",
+        "raise",
+        "lower",
+        "reduce",
+        "change",
+        "set",
+        "send",
+        "spend",
+        "pay",
+        "ceiling",
+        "floor",
+        "my",
+        "mine",
+        "received",
+        "sent",
+        "label",
+        "labeled",
+        "unlabeled",
+    }
+)
+#: Height-question vocabularies: a height/tip WORD, or the "how many
+#: blocks" shape. Exclusions: block-manipulation commands and any line
+#: carrying a token or a digit (those belong to tx_status / bump / the
+#: settings ladder routes, never to the public-height answer).
+_HEIGHT_WORDS: Final[frozenset[str]] = frozenset({"height", "tip"})
+_HEIGHT_BLOCK_WORDS: Final[frozenset[str]] = frozenset({"block", "blocks", "chain"})
+_HEIGHT_EXCLUDE: Final[frozenset[str]] = frozenset(
+    {
+        "increase",
+        "bump",
+        "raise",
+        "lower",
+        "set",
+        "change",
+        "orphan",
+        "reorg",
+        "confirm",
+        "confirms",
+        "confirmed",
+        "until",
+        "tx",
+        "my",
+        "mine",
+    }
+)
+
+_FEES_NOW_TIP: Final[str] = (
+    "Network status · {stamp} · chain tip (last scan): block {tip}."
+)
+_FEES_NOW_NO_TIP: Final[str] = (
+    "Network status · {stamp} · no chain tip is recorded yet — ask for a "
+    "rescan and I can name one."
+)
+_FEES_NOW_RATES: Final[str] = (
+    "Estimated bids · next block: {medium} sat/vB · faster: {fast} sat/vB "
+    "· a block back: {slow} sat/vB."
+)
+_FEES_NOW_AVG: Final[str] = (
+    "Six-hour average of the per-block lowest fees: {avg} sat/vB."
+)
+_FEES_NOW_NO_DATA: Final[str] = (
+    "Fee data isn't available right now — I won't guess a rate."
+)
+_FEES_NOW_HEDGE: Final[str] = "Estimates from the public fee feed, never a promise."
+_BLOCK_HEIGHT_TIP: Final[str] = "Chain tip (last scan): block {tip} · answered {stamp}."
+_BLOCK_HEIGHT_NO_TIP: Final[str] = (
+    "No chain tip is recorded yet — ask for a rescan and I can name one."
+)
+
+
+def _explorer_request(line: str) -> list[dict[str, str]] | str | None:
+    """Deterministic explorer-ask parse (TCK-CHAT-006, BEFORE the model).
+
+    Returns ``None`` (not an explorer ask — ordinary pipeline), a
+    code-owned REFUSAL string (an explorer ask carrying a token-shaped
+    word that fails validation — consumed, value-free, the bad token is
+    never echoed), or the closed link list ``[{"label", "url"}, …]`` with
+    at most one entry per validated token, in word order. URLs are
+    CONSTRUCTED by this function from the code-owned root plus a closed
+    path over the normalized, validated token — raw user text never
+    enters a URL, and the model never authors links at all.
+
+    A deny token suppresses the whole family ("don't open the explorer"
+    is ordinary chat — the HW-005 slice-C rule). A tokenless ask needs an
+    explicit link verb AND must carry no wallet-referent word, so
+    tx_status/get_addresses/model-knowledge phrasings keep their routes.
+    ponytail: word-set matching — collisions with the ordinary routes ride
+    the interception ORDER (every conversation/label/settings intercept
+    runs before this one in :func:`_run_turn`)."""
+    lower = line.lower()
+    if (
+        not (_EXPLORER_WORDS & set(_chat_words(line)))
+        and "mempool.space" not in lower
+    ):
+        return None
+    words = [w for w in (t.strip(punctuation) for t in line.split()) if w]
+    stripped = [w.replace("'", "").replace("\u2019", "").lower() for w in words]
+    if not words or any(w in _BUMP_DENY_TOKENS for w in stripped):
+        return None
+    links: list[dict[str, str]] = []
+    seen: set[str] = set()
+    malformed = False
+    for word in words:
+        lowered = word.lower()
+        if _EXPLORER_TXID_RE.fullmatch(word):
+            if lowered not in seen:
+                seen.add(lowered)
+                links.append(
+                    {
+                        "label": _EXPLORER_LABEL_TX,
+                        "url": f"{EXPLORER_ROOT_URL}/tx/{lowered}",
+                    }
+                )
+            continue
+        if _EXPLORER_HEX40_RE.fullmatch(word):
+            malformed = True  # hex-shaped but not a 64-hex txid
+            continue
+        if lowered.startswith("bc1") and len(lowered) >= 14:
+            if not (word.islower() or word.isupper()):
+                malformed = True  # mixed case is not a valid bech32 literal
+                continue
+            if _EXPLORER_ADDR_RE.fullmatch(lowered) and _is_mainnet_bech32_address(lowered):
+                if lowered not in seen:
+                    seen.add(lowered)
+                    links.append(
+                        {
+                            "label": _EXPLORER_LABEL_ADDRESS,
+                            "url": f"{EXPLORER_ROOT_URL}/address/{lowered}",
+                        }
+                    )
+            else:
+                malformed = True
+            continue
+    if malformed:
+        return _EXPLORER_BAD_TOKEN
+    if links:
+        return links
+    word_set = set(stripped)
+    if word_set & _EXPLORER_LINK_VERBS and not word_set & _EXPLORER_REFERENT_WORDS:
+        return [{"label": _EXPLORER_LABEL_HOME, "url": EXPLORER_ROOT_URL}]
+    return None
+
+
+def _fees_now_ask(line: str) -> bool:
+    """True when the line asks what fees are like NOW (public fee LEVEL —
+    TCK-CHAT-006). Requires a fee word, a question shape, and none of the
+    exclude words / digits / token shapes / deny tokens that keep the
+    bump_fee, create_tx, settings and history routes theirs."""
+    words = _chat_words(line)
+    if not words or not (set(words) & {"fee", "fees"}):
+        return False
+    if any(w in _BUMP_DENY_TOKENS for w in words):
+        return False
+    if set(words) & _FEES_ASK_EXCLUDE or any(w.isdigit() for w in words):
+        return False
+    if _explorer_token_shaped(line) or _EXPLORER_HEX40_RE.search(line):
+        return False
+    if line.strip().endswith("?"):
+        return True
+    return words[0] in _STATUS_ASK_STARTERS or len(words) <= 2
+
+
+def _block_height_ask(line: str) -> bool:
+    """True when the line asks the current chain HEIGHT (TCK-CHAT-006):
+    a height/tip word or the "how many blocks" shape, question-shaped,
+    with no token, no digit, no block-manipulation command word, and no
+    deny token (a specific-block or tx-scoped question keeps its route)."""
+    words = _chat_words(line)
+    if not words:
+        return False
+    has_height = bool(set(words) & _HEIGHT_WORDS) or bool(
+        set(words) & _HEIGHT_BLOCK_WORDS and "many" in words
+    )
+    if not has_height:
+        return False
+    if any(w in _BUMP_DENY_TOKENS for w in words):
+        return False
+    if set(words) & _HEIGHT_EXCLUDE or any(w.isdigit() for w in words):
+        return False
+    if _explorer_token_shaped(line) or _EXPLORER_HEX40_RE.search(line):
+        return False
+    if line.strip().endswith("?"):
+        return True
+    return words[0] in _STATUS_ASK_STARTERS or len(words) <= 3
+
+
+def _explorer_token_shaped(line: str) -> bool:
+    """True when any whitespace token is address-SHAPED (``bc1`` + length
+    gate). Shared exclusion probe for the status matchers: a line naming
+    a concrete token is never a general fee/height question."""
+    return any(
+        w.startswith("bc1") and len(w) >= 14
+        for w in (t.strip(punctuation).lower() for t in line.split())
+    )
+
+
+def _stored_tip_height(store: Store, wallet_id: int) -> int | None:
+    """The scan-owned cached tip (:data:`wallet_scan.TIP_KEY`, written by
+    every completed scan — zero chain call). Absent or malformed is
+    ``None``: the answer says so, never fabricates a number (the
+    balance line's SR-006 minor 2 rule, mirrored)."""
+    try:
+        raw = store.get_sync_state(wallet_id, wallet_scan.TIP_KEY)
+    except (StoreError, sqlite3.Error):
+        return None
+    if raw is None:
+        return None
+    try:
+        tip = int(raw)
+    except ValueError:
+        return None
+    return tip if tip >= 0 else None
+
+
+def _status_stamp(now: float | None) -> str:
+    """The tool-owned reply time, UTC (the CHAT-005 clock convention;
+    tests inject a fixed ``now`` for byte-exact pins)."""
+    clock = time.time() if now is None else now
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(clock))
+
+
+def _fees_now_facts(
+    store: Store,
+    wallet_id: int,
+    fee_estimator: FeeEstimator,
+    *,
+    now: float | None = None,
+) -> dict[str, object]:
+    """The closed FACTS block behind the fees-now answer: the estimator's
+    ONE cached snapshot re-quoted through :func:`_consolidation_timing_facts`
+    (the four integer-centisat figures, CONS-002 shape unchanged — reuse,
+    not a second snapshot) plus the cached ``tip_height`` and the
+    tool-owned ``reply_time_utc``. Absence is ``None``, never a guess."""
+    facts: dict[str, object] = dict(_consolidation_timing_facts(fee_estimator))
+    facts["tip_height"] = _stored_tip_height(store, wallet_id)
+    facts["reply_time_utc"] = _status_stamp(now)
+    return facts
+
+
+def _fees_now_answer(
+    store: Store,
+    wallet_id: int,
+    fee_estimator: FeeEstimator,
+    output_fn: Callable[[str], None],
+    *,
+    now: float | None = None,
+) -> None:
+    """The code-owned fees-now narration: every figure verbatim from
+    :func:`_fees_now_facts` (integer centisat/vB rendered through the
+    chain's own :func:`format_sat_vb` — the card's formatter, no second
+    one). No bids → the honest no-data line (never a rate); no average →
+    that sentence is omitted (never padded); no tip → the head says so."""
+    facts = _fees_now_facts(store, wallet_id, fee_estimator, now=now)
+    tip = facts["tip_height"]
+    stamp = facts["reply_time_utc"]
+    assert isinstance(stamp, str)
+    if tip is None:
+        output_fn(sanitize_tool_output(_FEES_NOW_NO_TIP.format(stamp=stamp)))
+    else:
+        assert isinstance(tip, int)
+        output_fn(sanitize_tool_output(_FEES_NOW_TIP.format(stamp=stamp, tip=tip)))
+    medium = facts["medium_bid_centisat_vb"]
+    fast = facts["fast_bid_centisat_vb"]
+    slow = facts["slow_bid_centisat_vb"]
+    if medium is None or fast is None or slow is None:
+        output_fn(sanitize_tool_output(_FEES_NOW_NO_DATA))
+        return
+    avg = facts["six_hour_low_average_centisat_vb"]
+    output_fn(
+        sanitize_tool_output(
+            _FEES_NOW_RATES.format(
+                medium=format_sat_vb(int(str(medium))),
+                fast=format_sat_vb(int(str(fast))),
+                slow=format_sat_vb(int(str(slow))),
+            )
+        )
+    )
+    if avg is not None:
+        output_fn(sanitize_tool_output(_FEES_NOW_AVG.format(avg=format_sat_vb(int(str(avg))))))
+    output_fn(sanitize_tool_output(_FEES_NOW_HEDGE))
+
+
+def _block_height_answer(
+    store: Store,
+    wallet_id: int,
+    output_fn: Callable[[str], None],
+    *,
+    now: float | None = None,
+) -> None:
+    """Height + reply time, both tool-owned, quoted verbatim — or the
+    honest "no tip recorded" line (the cached store read makes the ask
+    free either way; a live tip is NEVER fetched for a chat line)."""
+    tip = _stored_tip_height(store, wallet_id)
+    stamp = _status_stamp(now)
+    if tip is None:
+        output_fn(sanitize_tool_output(_BLOCK_HEIGHT_NO_TIP))
+        return
+    output_fn(sanitize_tool_output(_BLOCK_HEIGHT_TIP.format(tip=tip, stamp=stamp)))
+
+
+def _run_network_status_turn(
+    store: Store | None,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    fee_estimator: FeeEstimator | None = None,
+    now: float | None = None,
+) -> bool:
+    """Consume a network-status or explorer turn (TCK-CHAT-006); True when
+    consumed — the turn ends here, transcript- and model-free like every
+    code-owned intercept. Explorer links need no wiring at all; fees-now
+    stands DOWN without an estimator (the CONS-002 discipline: the line
+    keeps the model route, where the prompt's ownership rule keeps it
+    honest); block height needs only the store cache. A store surprise
+    returns False (sugar never crashes a turn — the ordinary pipeline
+    continues). ``now`` is the fixed-clock test seam."""
+    links = _explorer_request(line)
+    if links is not None:
+        if isinstance(links, str):
+            output_fn(sanitize_tool_output(links))
+            return True
+        output_fn(sanitize_tool_output(_EXPLORER_HEAD))
+        for link in links:
+            output_fn(sanitize_tool_output(f"{link['label']}: {link['url']}"))
+        return True
+    if store is None:
+        return False
+    fees = fee_estimator is not None and _fees_now_ask(line)
+    height = not fees and _block_height_ask(line)
+    if not (fees or height):
+        return False
+    try:
+        wallet = store.get_active_wallet()
+        if wallet is None:
+            return False
+        if fees:
+            assert fee_estimator is not None  # the guard above
+            _fees_now_answer(store, wallet.id, fee_estimator, output_fn, now=now)
+        else:
+            _block_height_answer(store, wallet.id, output_fn, now=now)
+    except (StoreError, sqlite3.Error):
+        return False
+    return True
+
+
 def _run_turn(
     loop: AgentLoop,
     flow: TxFlow,
@@ -16691,6 +17143,18 @@ def _run_turn(
     if store is not None and _run_chat_settings_turn(
         store, line, output_fn, live_apply=live_apply_setting
     ):
+        return
+    # TCK-CHAT-006: network-status + explorer-link intercepts — the SAME
+    # code-owned pattern: fees-now and block height answer from cached
+    # engine truth (the shared estimator's ONE snapshot + the stored tip,
+    # zero extra fetches, tool-owned time quoted verbatim), and an explorer
+    # ask emits CODE-CONSTRUCTED mempool.space links built from
+    # shape-validated tokens only (never raw user text, never a model
+    # authorship — the prompt ownership line covers near-misses that still
+    # reach the model). Checked after the settings intercept (its keys keep
+    # priority) and before the bump speed-word route; consumed turns never
+    # touch the transcript or the model.
+    if _run_network_status_turn(store, line, output_fn, fee_estimator=fee_estimator):
         return
     speed = _bump_speed_choice(line)
     if speed is not None and IntentName.BUMP_FEE in table:

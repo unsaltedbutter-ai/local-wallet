@@ -779,10 +779,12 @@ class TestLockstepPins:
 
     def test_golden_fixtures_cover_every_filter_family(self) -> None:
         evals_dir = Path(__file__).resolve().parent.parent / "evals" / "golden"
+        # TCK-CHAT-006 note: the family is pinned by EXPLICIT ids — the
+        # old "golden-07*" glob would also catch the CHAT-006 status/
+        # explorer fixtures (073+) and mis-pin them as filter fixtures.
         blobs = [
-            json.loads(p.read_text())
-            for p in sorted(evals_dir.glob("golden-0[67][7-9].json"))
-            + sorted(evals_dir.glob("golden-07*.json"))
+            json.loads((evals_dir / f"golden-0{n}.json").read_text())
+            for n in range(67, 73)
         ]
         assert blobs, "TCK-CHAT-005 eval fixtures must exist"
         ids = {b["id"] for b in blobs}

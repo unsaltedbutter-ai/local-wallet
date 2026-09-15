@@ -572,8 +572,9 @@ function authHeaders(extra) {
 // bubbles (progress lines, the model-download bar, and every settings-pane
 // display keep plain text nodes — they never route through appendBubbleText).
 // WEB-014 (user direction, reverses LINK-001's navigation): a qualifying
-// token renders as a COPY BUTTON, not a link — there is no href, no external
-// origin, no navigation (mempool.space is never opened from a bubble). The
+// token renders as a COPY BUTTON, not a link — no href, no external origin
+// (the ONE bubble navigation is the TCK-CHAT-006 engine link line below,
+// whose URL is full-line-validated before it becomes an <a>). The
 // visible label is the token VERBATIM (addresses/txids are quoted from tool
 // output; the affordance never alters displayed characters), and the string
 // handed to the clipboard is that same verbatim token. A <button> (not a
@@ -589,12 +590,36 @@ const TXID_RE = /^[0-9a-f]{64}$/;
 const LINK_SCAN_RE =
   /\b(bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}|[0-9a-f]{64})\b/g;
 
+// TCK-CHAT-006: engine explorer LINK lines. The engine emits plain text —
+// a head line "Explorer links (mempool.space) — click to open:" then one
+// line per link, "<Label>: <url>", URL last, no trailing punctuation, and
+// EVERY url was built engine-side as the literal https://mempool.space root
+// plus a closed path shape. ONLY a line that matches this anchored regex IN
+// FULL renders its URL as a click-to-open anchor; the href is the captured,
+// shape-validated token — arbitrary bubble text never reaches an href
+// (LINK-001 precedent). The label set is the closed engine enum; paths are
+// /tx/<64-hex> | /address/<mainnet-bech32-shape> | bare root. Anything else
+// — a URL-shaped string inside a narration sentence, malformed path,
+// trailing punctuation, uppercase hex, foreign origin — fails the match and
+// keeps the existing token copy-affordance treatment (WEB-014 unchanged).
+const EXPLORER_LINK_LINE_RE =
+  /^(Transaction|Address|Mempool): (https:\/\/mempool\.space(?:\/tx\/[0-9a-f]{64}|\/address\/bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87})?)$/;
+
 // Append `text` to a bubble line as text nodes with qualifying tokens turned
 // into copy buttons. Render-once idempotence: every .turn-text line is built
 // ONCE at its event — the handleEvent event-id duplicate guard drops replayed
 // SSE events before appendText/appendUser ever run — and this transform never
 // re-reads an existing line, so a replay cannot double-wrap or nest controls.
 function appendBubbleText(line, text) {
+  // TCK-CHAT-006: the ONLY navigation in a bubble — an engine link LINE
+  // (full-line strict match) paints its validated URL as a real <a>; the
+  // user's click is the gesture (no window.open, no auto-navigation).
+  const link = EXPLORER_LINK_LINE_RE.exec(text);
+  if (link) {
+    line.appendChild(document.createTextNode(link[1] + ": "));
+    line.appendChild(explorerAnchor(link[2]));
+    return;
+  }
   let last = 0;
   let m;
   LINK_SCAN_RE.lastIndex = 0;
@@ -679,6 +704,22 @@ function copyTokenButton(token) {
     flashCopyResult(btn, await clipboardWrite(token), LABELS.clickToCopy, name);
   });
   return btn;
+}
+
+// TCK-CHAT-006: the ONE anchor builder in the client. Its href argument is
+// ONLY ever a capture of EXPLORER_LINK_LINE_RE — https://mempool.space plus
+// a shape-validated path, never arbitrary text. The visible text is the URL
+// verbatim via textContent (XSS contract). target=_blank + rel=noopener
+// noreferrer; the click IS the user gesture — no event listener, no
+// scripting, no window.open.
+function explorerAnchor(url) {
+  const a = document.createElement("a");
+  a.className = "explorer-open-link";
+  a.href = url;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  a.textContent = url;
+  return a;
 }
 
 // TCK-WEB-010: per-bubble copy control. The copyable text of a turn is its

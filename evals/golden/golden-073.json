@@ -1,0 +1,5 @@
+{
+  "id": "golden-073",
+  "prompt": "what are fees like right now",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

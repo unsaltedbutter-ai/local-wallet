@@ -345,8 +345,16 @@ class TestSystemPrompt:
         # label words the ENGINE resolves) plus five filter few-shots
         # (~1800 chars) ship the money-query filters. ~13.9K chars ≈
         # ~6.9K tokens, inside the 8K budget with the per-turn facts
-        # headroom.
-        assert len(build_system_prompt()) < 14000
+        # headroom. Raised 14000 → 15000 by TCK-CHAT-006: the NETWORK
+        # STATUS & EXPLORER LINKS ownership block (+484 chars — one
+        # compact line block, no few-shots; the engine's deterministic
+        # intercept owns the surface and the model only clarifies
+        # near-misses) lands the prompt at 14,357 chars. CHAT-005
+        # MINOR honored: measured with the REAL pinned tokenizer
+        # (llama_cpp + the models/bin GGUF) — 3,881 tokens at the true
+        # 3.7 chars/token ratio, NOT the ~8.7K the 2.0-ratio worry
+        # guessed; comfortably inside the 8K budget with facts headroom.
+        assert len(build_system_prompt()) < 15000
 
     def test_self_transfer_line_routes_stuck_inbound_to_cpfp(self) -> None:
         # TCK-CPFP-001: the prompt must teach the INBOUND/OUTBOUND split —

@@ -1,0 +1,5 @@
+{
+  "id": "golden-077",
+  "prompt": "show me the mempool",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

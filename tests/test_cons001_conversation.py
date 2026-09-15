@@ -485,11 +485,15 @@ def test_broadcast_record_unlabeled_single_output_note(world) -> None:
 )
 def test_any_utterance_closes_the_ask(world, open_line: str) -> None:
     """No dead ends from ANY ask state: one unmatched utterance closes the
-    ask and the line rides the ordinary pipeline to the model."""
+    ask and the line rides the ordinary pipeline to the model. (The
+    closer re-picked by TCK-CHAT-006: "what is the block height" now
+    matches that ticket's network-status intercept and is answered
+    there — the ask still closes, but the line never reaches the model,
+    so the vector is a genuinely unmatched line.)"""
     _labeled(world)
     _turn(world, open_line)
     assert world["session"].cons_ask is not None  # an ask stands open
-    _, fake, _ = _turn(world, "what is the block height")
+    _, fake, _ = _turn(world, "what is the meaning of life")
     assert world["session"].cons_ask is None  # cleared, never traps
     assert len(fake.prompts) == 1  # and the conversation let the line go
 
