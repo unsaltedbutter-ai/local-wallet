@@ -934,6 +934,32 @@ _PUBLIC_ELECTRUM_HOST: Final[str] = (
     _configured_url_host(PUBLIC_ELECTRUM_URL) or ""
 )
 
+#: TCK-WEB-022 (engine half): the CODE-OWNED vetted list the settings pane
+#: renders as click-to-FILL public Electrum chips (click fills the field and
+#: focuses Apply — applying stays behind the ONE consent+probe path). An entry
+#: joins this tuple ONLY after a reachability + mainnet probe; the URL is
+#: :data:`~localwallet.config.PUBLIC_ELECTRUM_URL` (single source, never a
+#: second literal) and the label is value-free display text naming the
+#: operator, never an amount/address/credential. Probe round 2026-09-11
+#: adjudication of the candidates the orchestrator probed:
+#: * ``electrum.bitaroo.net:50002`` — OMITTED: reachable but its TLS
+#:   certificate does not verify. A chip is a recommendation; a "cert note"
+#:   cannot make an unverifiable channel safe for address queries, so it is
+#:   not a vetted server (re-probe; add only on a valid chain).
+#: * ``electrum1.bluewallet.io:50001`` — OMITTED: PLAINTEXT TCP. The Electrum
+#:   adapter is ``ssl://``-only, and a plaintext backend would put every
+#:   queried address on the wire (ADR-0003/0021) — that needs adapter work,
+#:   not a list entry.
+#: * ``electrum5-8.getlynx.io:50002`` — OMITTED: reachable but OUR mainnet
+#:   (genesis) check FAILED. Whether the bug is theirs or ours is the open
+#:   TCK-DESCOPE-M3B question; listing servers our own code rejects would
+#:   inherit that bug. Verify first, then add.
+#: Empty/absent (defensively) → :func:`build_state_snapshot` OMITS the field,
+#: never ships ``[]``.
+SUGGESTED_ELECTRUM_SERVERS: Final[tuple[Mapping[str, str], ...]] = (
+    {"url": PUBLIC_ELECTRUM_URL, "label": "Blockstream public electrum"},
+)
+
 #: TCK-DESCOPE-M3A (ADR-0023 amendment 2 / its own amendment): the honest,
 #: value-free startup line for a HEADLESS (non-interactive, non-web) launch
 #: whose backend is UNRESOLVED. The old carve-out let such a launch scan the
@@ -9980,6 +10006,7 @@ def build_state_snapshot(
     privacy_mode: str | None = None,
     backend_host: str | None = None,
     wallet_fingerprint: str | None = None,
+    suggested_servers: Sequence[Mapping[str, str]] | None = None,
 ) -> dict[str, object]:
     """The value-free ``/state`` snapshot, built ON the engine thread.
 
@@ -10017,11 +10044,18 @@ def build_state_snapshot(
     user-owned-identifier disclosure class as the token-gated watch_key
     settings entry and rides ONLY the token-gated /state; the field name
     is deliberately NOT "master" — the device's master fingerprint is
-    unknowable watch-only (HW-002). No address,
+    unknowable watch-only (HW-002). — TCK-WEB-022 — the CODE-OWNED vetted
+    public-Electrum chip list ``suggested_servers``: an array of
+    ``{"url", "label"}`` objects the pump supplies verbatim from
+    :data:`SUGGESTED_ELECTRUM_SERVERS` (probed-and-verified server literals
+    this module owns — never a user-configured URL, never a client echo; the
+    same documented display exception class as ``backend_host``). An empty or
+    absent list OMITS the field — never an empty array. No address,
     amount, txid, ``tx_ref``, key
     material OR progress byte-count CAN appear — every value is an enum
-    NAME, a boolean, a code-owned value-free failure line, or that one
-    stripped own-config host, never user data. No progress percentage
+    NAME, a boolean, a code-owned value-free failure line, that one
+    stripped own-config host, or one of the code-owned vetted server
+    literals, never user data. No progress percentage
     here (a wallet-size
     oracle); download progress rides its own event kind.
     """
@@ -10075,6 +10109,15 @@ def build_state_snapshot(
         # show", never an empty string and never a guess (the
         # ``backend_host``/``privacy_mode`` absent pattern).
         snapshot["wallet_fingerprint"] = wallet_fingerprint
+    if suggested_servers:
+        # TCK-WEB-022: additive under state/1 (same rule). The pump supplies
+        # the CODE-OWNED vetted public-Electrum chips verbatim — the builder
+        # adds no entry, no framing, no filtering (the vetting happened at
+        # probe time, in :data:`SUGGESTED_ELECTRUM_SERVERS`). Entries are
+        # shallow-copied so a consumer cannot poison the module constant.
+        # An empty/absent list OMITS the key (never ``[]`` — the client reads
+        # "absent" as "no chips to offer", the ``wallet_fingerprint`` rule).
+        snapshot["suggested_servers"] = [dict(entry) for entry in suggested_servers]
     if scan is not None and scan.scan_error:
         # TCK-WEB-020: additive under state/1 (same rule): the last
         # scan/rescan failure as a value-free DIAG-001 class line (chain/
@@ -11716,6 +11759,8 @@ def _pump(
             # fabricated. A watch-key replace rebinds ``store`` onto the
             # new wiring before any later snapshot is served, so the field
             # follows the new descriptor with no extra plumbing.
+            # TCK-WEB-022: plus the CODE-OWNED vetted chip list, supplied
+            # verbatim from the module constant (no settings, no user input).
             privacy_mode = (
                 PRIVACY_MODE_AWAITING_BACKEND
                 if scan is not None and scan.gate.state == PRIVACY_MODE_AWAITING_BACKEND
@@ -11738,6 +11783,7 @@ def _pump(
                 privacy_mode,
                 backend_host,
                 wallet_fingerprint,
+                SUGGESTED_ELECTRUM_SERVERS,
             )
             if provision is not None and provision.wiring is None:
                 snapshot["needs_watch_key"] = True

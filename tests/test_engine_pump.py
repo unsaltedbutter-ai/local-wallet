@@ -359,10 +359,11 @@ def test_state_snapshot_request_is_answered_on_the_engine_thread(
 
     def spy_build(flow, session, watcher, scan=None, model=None, backend_kind=None,
                   preload=None, privacy_mode=None, backend_host=None,
-                  wallet_fingerprint=None):
+                  wallet_fingerprint=None, suggested_servers=None):
         build_threads.append(threading.get_ident())
         return real_build(flow, session, watcher, scan, model, backend_kind, preload,
-                          privacy_mode, backend_host, wallet_fingerprint)
+                          privacy_mode, backend_host, wallet_fingerprint,
+                          suggested_servers)
 
     monkeypatch.setattr(app, "build_state_snapshot", spy_build)
     events: list[EngineEvent] = []
@@ -389,6 +390,15 @@ def test_state_snapshot_request_is_answered_on_the_engine_thread(
         # state/1 tag (the pinned client ignores unknown keys).
         "scan_state": "disabled",
         "first_scan_complete": False,
+        # TCK-WEB-022: the CODE-OWNED vetted chip list rides every typed
+        # snapshot, verbatim from the module constant (literal pinned here —
+        # growing the vetted list must be a deliberate edit to this pin too).
+        "suggested_servers": [
+            {
+                "url": "ssl://electrum.blockstream.info:50002",
+                "label": "Blockstream public electrum",
+            }
+        ],
     }
     # Answered by the ENGINE thread, not the caller (main):
     assert build_threads == [handle.thread.ident]
@@ -504,7 +514,17 @@ def test_state_snapshot_carries_each_privacy_mode_name() -> None:
         assert snap["privacy_mode"] == expected
         assert snap["privacy_mode"] in app.PRIVACY_MODES
         assert snap.get("backend_host") == expected_host
-        text = repr(snap)
+        # TCK-WEB-022: the vetted chip list is the ONE url-shaped thing on
+        # /state; it is EXCLUDED from this configured-URL leak scan because
+        # the blockstream row of this table is literally that same URL. The
+        # exclusion is safe — the line below proves the field can only ever
+        # be the module constant (never a settings echo), and its contents
+        # are pinned literally in tests/test_web022_suggested_servers.py.
+        assert snap["suggested_servers"] == list(app.SUGGESTED_ELECTRUM_SERVERS)
+        text = repr({
+            key: value for key, value in snap.items()
+            if key != "suggested_servers"
+        })
         # The URL SHAPE never rides: scheme, port and the full configured
         # string are absent even where the bare host is displayed.
         for leak in (url, "://", "127.0.0.1", "3006", "50002"):

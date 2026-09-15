@@ -218,7 +218,15 @@ def test_backend_host_strips_scheme_port_path_and_never_credentials() -> None:
         snap = _state_snap(Settings(chain_base_url=url))
         assert snap["privacy_mode"] == mode
         assert snap["backend_host"] == host
-        text = repr(snap)
+        # TCK-WEB-022: the code-owned vetted chip list carries a scheme and is
+        # the only url-shaped field on /state; it is excluded because it is a
+        # module CONSTANT (the next line — never a settings echo, so no
+        # credential, port or path of the configured URL can hide in it).
+        assert snap["suggested_servers"] == list(app.SUGGESTED_ELECTRUM_SERVERS)
+        text = repr({
+            key: value for key, value in snap.items()
+            if key != "suggested_servers"
+        })
         for secret in ("rpcuser", "hunter2", "u2", "p2", "://", "8332", "/w"):
             assert secret not in text, (url, secret)
 

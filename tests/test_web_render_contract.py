@@ -1504,6 +1504,7 @@ def test_stuck_pending_bubble_reconciles_from_typed_idle_state_under_node() -> N
       const visibleActions = () => [];
       const applyScanChip = () => {}; const applyPrivacyChip = () => {};
       const applyWalletFpChip = () => {}; // TCK-WEB-027 chip painter (own harness)
+      const applySuggestedServers = () => {}; // TCK-WEB-022 chips (own harness)
       const applyWatchKeyGate = () => {}; const applyModelPrompt = () => {};
       const paintSettingsDot = () => {}; const noteTrustFlip = () => {};
       const settingsPanelEl = { hidden: true };
@@ -2427,3 +2428,175 @@ def test_web027_chip_lifecycle_copy_and_label_copy_under_node() -> None:
         ["node", "--input-type=module", "-e", script],
         check=True, capture_output=True, text=True,
     )
+
+
+# --------------------------------------------------------------------------
+# TCK-WEB-022: suggested public-Electrum chips (click-to-FILL) in the server
+# card's act zone. COUNCIL BINDING (glm#2/#3/#10, qwen#5) pinned below: the
+# chips NEVER apply (the one Apply+probe path keeps the leak disclosure even
+# for a public→public switch), the warn sentence precedes the chips in DOM
+# order (the SR order), the group is a real role="group" of real <button>s,
+# warn styling is token-only with a pinned ≥4.5:1 pair, and the tracker is
+# typed-only + change-gated (state/0 keeps the last known group; a typed
+# missing key renders NO group, never an empty one).
+
+
+def test_suggested_chips_are_click_to_fill_source_pins() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    # (glm#3) group semantics + REAL buttons + warn BEFORE chips (DOM = SR).
+    group = re.search(
+        r"function chainChipsGroup\(servers, fill\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert 'group.setAttribute("role", "group");' in group
+    assert 'group.setAttribute("aria-label", LABELS.chainChipsGroup);' in group
+    assert 'el("p", "chain-chips-warn"' in group
+    assert group.index("chain-chips-warn") < group.index('el("button", "chain-chip"')
+    assert 'chip.type = "button";' in group
+    # (glm#2) the chips do NOT ride the delegated Apply handler or any POST:
+    assert "settingKey" not in group and "fetch" not in group
+    fill = re.search(
+        r"function fillChainServer\(input, applyBtn, url\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert "input.value = url;" in fill  # verbatim — no trim, no rewrite
+    assert "input.focus();" in fill  # (qwen#5) focus the URL field after fill
+    assert "settingKey" not in fill and "fetch(" not in fill and "/settings" not in fill
+    # one disclosure voice: the group's warn line REUSES the pane's sentence.
+    assert 'chainChipsWarn: "A public server — " + PUBLIC_LEAK_SENTENCE' in code
+    # (glm#3 / WEB-021) the group rides the act zone, below the URL line.
+    chain = code[code.index("function chainBaseRow") : code.index("function backendCredFlags")]
+    assert "renderChainChips(li);" in chain
+    assert chain.index('actZone.appendChild(el("div", "chain-chips"));') < chain.index(
+        "li.appendChild(actZone)"
+    )
+    # typed-only + change-gated re-render (render-once today — static list).
+    apply = re.search(
+        r"function applySuggestedServers\(snap\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert 'if (!snap || snap.schema !== "state/1") return;' in apply  # state/0 keeps it
+    assert "if (sig === state.suggestedServersSig) return;" in apply
+    # (glm#10) chip styling: TOKENS ONLY (no raw hex), the dedicated pinned
+    # warn pair, wrapping chip row (flex-wrap survives 320px).
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    chip = css[css.index(".chain-chip {") :]
+    chip = chip[: chip.index("}")]
+    assert "#" not in chip
+    assert "var(--c-chip-warn-ink)" in chip and "var(--c-chip-warn-bg)" in chip
+    assert "overflow-wrap: anywhere;" in chip  # long label wraps, never clips
+    assert ".chain-chips { display: flex; flex-wrap: wrap;" in css
+    warn = css[css.index(".chain-chips-warn {") :]
+    warn = warn[: warn.index("}")]
+    assert "color: var(--c-chip-warn-ink);" in warn
+
+
+def test_suggested_chips_fill_focus_and_never_apply_under_node() -> None:
+    """Node-executed behavioral pin: against DOM stubs, the SHIPPED builder +
+    fill run — a chip click fills the field with the verbatim vetted URL and
+    focuses it (opening the Edit rung when the field was read-only), fires NO
+    apply/POST; malformed wire entries die at the gate; no list = no group."""
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    funcs = "\n".join(
+        re.search(rf"function {name}\(.*?\n\}}", code, re.DOTALL).group(0)
+        for name in ("el", "readSuggestedServers", "chainChipsGroup", "fillChainServer")
+    )
+    script = """
+      const LABELS = {
+        chainChipsGroup: "Suggested public Electrum servers",
+        chainChipsWarn: "A public server — whoever runs it sees every address.",
+      };
+      const document = { createElement: (tag) => ({
+        tag, className: "", textContent: "", type: "", dataset: {},
+        attrs: {}, children: [], handlers: {},
+        setAttribute(k, v) { this.attrs[k] = String(v); },
+        appendChild(n) { this.children.push(n); return n; },
+        addEventListener(t, fn) { this.handlers[t] = fn; },
+      }) };
+      let posts = 0;
+      globalThis.fetch = () => { posts++; throw new Error("chip-posted"); };
+      __FUNCS__
+      const URL = "ssl://electrum.blockstream.info:50002";
+      const LABEL = "Blockstream public electrum";
+      // the wire gate: missing key / non-array / junk entries die, valid ride verbatim.
+      if (readSuggestedServers(undefined).length !== 0) throw new Error("missing-key");
+      if (readSuggestedServers("junk").length !== 0) throw new Error("non-array");
+      const servers = readSuggestedServers([null, "x", { url: URL }, { label: LABEL },
+                                           { url: 42, label: LABEL }, { url: URL, label: LABEL }]);
+      if (servers.length !== 1 || servers[0].url !== URL) throw new Error("gate");
+      // no chips = NO group rendered at all (never an empty one).
+      if (chainChipsGroup([], () => {}) !== null) throw new Error("empty-group");
+      // n = 1: warn sentence FIRST, then exactly one real button (DOM = SR).
+      let focusCalls = 0, applyClicks = 0;
+      const input = { readOnly: true, value: "", dataset: {}, focus() { focusCalls++; } };
+      const applyBtn = { click() { applyClicks++; input.readOnly = false; } };
+      const group = chainChipsGroup(servers, (url) => fillChainServer(input, applyBtn, url));
+      if (group.attrs.role !== "group" || !group.attrs["aria-label"]) throw new Error("semantics");
+      if (group.children.length !== 2) throw new Error("arity:" + group.children.length);
+      if (group.children[0].className !== "chain-chips-warn") throw new Error("warn-order");
+      if (group.children[0].textContent !== LABELS.chainChipsWarn) throw new Error("warn-copy");
+      const chip = group.children[1];
+      if (chip.tag !== "button" || chip.type !== "button") throw new Error("not-a-button");
+      if (chip.textContent !== LABEL) throw new Error("label-not-textContent");
+      if ("settingKey" in chip.dataset) throw new Error("rides-apply-delegate");
+      // CLICK on a stored (read-only) row: Edit rung opens, URL fills verbatim,
+      // focus moves to the FIELD (qwen#5) — and NOTHING is ever POSTed.
+      chip.handlers.click();
+      if (applyClicks !== 1) throw new Error("rung-not-opened");
+      if (input.value !== URL) throw new Error("not-verbatim:" + input.value);
+      if (focusCalls !== 1) throw new Error("focus");
+      if (input.dataset.dirty !== "1") throw new Error("not-dirty");
+      if (posts !== 0) throw new Error("applied");
+      // CLICK on an already-editable field: no rung click, fill + focus only.
+      chip.handlers.click();
+      if (applyClicks !== 1 || input.value !== URL || focusCalls !== 2 || posts !== 0) {
+        throw new Error("second-click");
+      }
+      console.log("ok");
+    """.replace("__FUNCS__", funcs)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+def test_suggested_chips_tracker_is_typed_only_and_change_gated_under_node() -> None:
+    """Node-executed lifecycle pin (the WEB-020/023/027 discipline): state/0
+    never touches the group (keeps the last known), a typed snapshot without
+    the key clears it (no group, not an empty one), and the DOM repaints ONLY
+    when the gated array actually changes."""
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    funcs = "\n".join(
+        re.search(rf"function {name}\(.*?\n\}}", code, re.DOTALL).group(0)
+        for name in ("readSuggestedServers", "applySuggestedServers")
+    )
+    script = """
+      const state = { suggestedServers: [], suggestedServersSig: null };
+      let paints = 0;
+      const paintChainChips = () => { paints++; };
+      __FUNCS__
+      const ONE = [{ url: "ssl://electrum.blockstream.info:50002", label: "Blockstream public electrum" }];
+      // state/0 BEFORE any typed truth: nothing happens (no flash, no paint).
+      applySuggestedServers({ schema: "state/0" });
+      if (paints || state.suggestedServers.length) throw new Error("state0-first");
+      // the first typed snapshot lands the group once.
+      applySuggestedServers({ schema: "state/1", suggested_servers: ONE });
+      if (paints !== 1 || state.suggestedServers.length !== 1) throw new Error("first");
+      // an identical typed list NEVER re-paints (change-gated DOM writes).
+      applySuggestedServers({ schema: "state/1", suggested_servers: ONE });
+      if (paints !== 1) throw new Error("re-paint-spam");
+      // state/0 mid-turn keeps the last known group.
+      applySuggestedServers({ schema: "state/0" });
+      if (paints !== 1 || state.suggestedServers.length !== 1) throw new Error("state0-blanked");
+      // a typed snapshot that OMITS the key clears it — no group, once.
+      applySuggestedServers({ schema: "state/1" });
+      if (paints !== 2 || state.suggestedServers.length !== 0) throw new Error("clear");
+      applySuggestedServers({ schema: "state/1" });
+      if (paints !== 2) throw new Error("clear-spam");
+      console.log("ok");
+    """.replace("__FUNCS__", funcs)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)

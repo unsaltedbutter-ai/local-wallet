@@ -354,6 +354,12 @@ const LABELS = {
   consentLoading: "Consent recorded — the wallet is loading now.",
   consentRecorded: "Consent recorded.",
   consentFailed: "Could not record consent — try again.",
+  // TCK-WEB-022: the suggested-public-server chip group. The group name is
+  // the aria-label ONLY (never painted text); the warn line REUSES the pane's
+  // one disclosure sentence (PUBLIC_LEAK_SENTENCE, the same dash pattern as
+  // consentSubline above — one voice, value-free).
+  chainChipsGroup: "Suggested public Electrum servers",
+  chainChipsWarn: "A public server — " + PUBLIC_LEAK_SENTENCE,
 };
 
 // Which buttons the typed /state snapshot shows, per flow position. The
@@ -483,6 +489,15 @@ const state = {
   // state/0 (busy engine) keeps the last value. Never fabricated, never
   // logged, never derived client-side from the zpub.
   walletFingerprint: "",
+  // TCK-WEB-022: the last TYPED snapshot's vetted public-Electrum chip list
+  // (engine-validated {url, label} entries; gated again here — see
+  // readSuggestedServers). [] = no group (missing key on a typed snapshot
+  // clears it; state/0 keeps the last known group — the backend_host /
+  // walletFingerprint discipline). The sig is the change gate: the DOM is
+  // touched ONLY when the array actually differs (render-once today — the
+  // engine list is a code-owned constant). Memory only, never logged.
+  suggestedServers: [],
+  suggestedServersSig: null,
   stateSeq: 0,
   watchKeyDismissed: false,
   watchKeyPresent: null, // null = unknown | true | false (typed state/1 only)
@@ -1143,6 +1158,7 @@ function applyState(snap) {
   applyScanChip(snap);
   applyPrivacyChip(snap);
   applyWalletFpChip(snap); // TCK-WEB-027: the header fingerprint chip
+  applySuggestedServers(snap); // TCK-WEB-022: the click-to-FILL chip group
   applyWatchKeyGate(snap);
   applyModelPrompt(snap);
   // TCK-WEB-021 (8): the settings-door dot (wallet/backend unset — drive
@@ -1994,8 +2010,10 @@ function watchKeyInput() {
 //    electrum/bitcoind kind PILLs beside it, tinted by the SAME closed
 //    classification (styles.css color-vocabulary contract; none/absent/
 //    awaiting → no pill — kindPill returns null).
-//  * ACT (.chain-act): field + Apply/Edit/Cancel + the empty .chain-chips
-//    slot TCK-WEB-022 will fill with suggested-server chips.
+//  * ACT (.chain-act): field + Apply/Edit/Cancel + (TCK-WEB-022) the
+//    .chain-chips slot holding the click-to-FILL suggested-server chip
+//    group (warn sentence first, then one <button> per vetted server — see
+//    chainChipsGroup; absent engine list = no group at all).
 //  * REST (.chain-rest): the explanatory prose (empty-field legend, creds
 //    notes, env/restart flags) collapsed behind a native <details>.
 //    Resync-now and the gap_limit row stay VISIBLE outside it — the
@@ -2108,10 +2126,11 @@ function chainBaseRow(entry) {
   if (!envRung) line.append(input, btn, cancel);
   else line.appendChild(input);
   actZone.appendChild(line);
-  // The TCK-WEB-022 slot: suggested-server chips (click-to-FILL) land in
-  // this group when that ticket ships. Nothing is fabricated here.
+  // TCK-WEB-022: the suggested-server chip slot rides the act zone, below
+  // the URL field / beside the Apply path it feeds. No chip list, no group.
   actZone.appendChild(el("div", "chain-chips"));
   li.appendChild(actZone);
+  renderChainChips(li);
 
   // TCK-DESCOPE-M3B: the old kind-badge STRIP (legend + mempool chips) stays
   // deleted here — no legend, no mempool, no idle/dim state. The TCK-WEB-023
@@ -2202,6 +2221,108 @@ function chainBaseRow(entry) {
 
   li.appendChild(status);
   return li;
+}
+
+// ------------------------------------------------ suggested public servers (TCK-WEB-022)
+// The vetted public-Electrum chip list is ENGINE truth: the additive typed
+// /state ``suggested_servers`` array of {url, label} objects (code-owned,
+// probe-verified literals — never user data, never a client echo). Chips are
+// click-to-FILL, NEVER click-to-apply: a click lands the URL verbatim in the
+// row's field and moves focus there (qwen#5), so a public→public switch still
+// passes through the row's ONE Apply path — the delegated [data-setting-key]
+// handler, where the leak disclosure and the engine probe live. The group
+// (role="group", real <button>s, warn sentence BEFORE the chips — DOM order =
+// SR order) renders only when the array is non-empty; typed missing = no
+// group, state/0 keeps the last known group (the backend_host/walletFingerprint
+// discipline), and a re-render fires ONLY when the array actually changes
+// (static today — render-once + presence-gated).
+//
+// Wire gate (ADR-0024 §7 spirit — every wire value is untrusted, re-validated
+// before display): an entry survives only as a {url, label} of two non-empty
+// strings; anything else is dropped, never painted, never guessed. The values
+// reach the DOM through el()/textContent ONLY (label as button text; the url
+// as the field's value — inert text, never markup, never a link href).
+function readSuggestedServers(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== "object") continue;
+    const url = entry.url;
+    const label = entry.label;
+    if (typeof url !== "string" || url === "") continue;
+    if (typeof label !== "string" || label === "") continue;
+    out.push({ url: url, label: label });
+  }
+  return out;
+}
+
+// PURE (node-pinned): the chip group for one row, or null = render nothing
+// (never an empty group). `fill` is the click behavior, injected so the
+// builder itself touches no fetch and no flow object.
+function chainChipsGroup(servers, fill) {
+  if (!Array.isArray(servers) || servers.length === 0) return null;
+  const group = el("div", "chain-chip-group");
+  group.setAttribute("role", "group");
+  group.setAttribute("aria-label", LABELS.chainChipsGroup);
+  group.appendChild(el("p", "chain-chips-warn", LABELS.chainChipsWarn));
+  for (const server of servers) {
+    const chip = el("button", "chain-chip", server.label);
+    chip.type = "button";
+    chip.addEventListener("click", () => fill(server.url));
+    group.appendChild(chip);
+  }
+  return group;
+}
+
+// PURE (node-pinned): the ONE thing a chip click does — fill the row's field
+// with the vetted URL verbatim and focus it. If the field is read-only (a
+// stored value), the row's own Edit rung opens first: the delegated Apply
+// handler's isChain && input.readOnly branch does exactly that with NO
+// request, and reusing the real button (never a duplicated unlock) keeps the
+// one write path honest. No POST, no data-setting-key, no trim, no rewrite.
+function fillChainServer(input, applyBtn, url) {
+  if (input.readOnly) applyBtn.click();
+  input.value = url;
+  input.dataset.dirty = "1";
+  input.focus();
+}
+
+// Populate (or clear) one chain card's chip slot. A row WITHOUT a live
+// Apply/Edit control — the env rung, whose field has no write path — gets no
+// chips: filling a field nothing can apply is a dead affordance.
+function renderChainChips(li) {
+  const slot = li.querySelector(".chain-chips");
+  if (!slot) return;
+  const input = li.querySelector(".setting-input");
+  const applyBtn = li.querySelector(".setting-apply");
+  const group =
+    input && applyBtn
+      ? chainChipsGroup(state.suggestedServers, (url) =>
+          fillChainServer(input, applyBtn, url),
+        )
+      : null;
+  slot.textContent = "";
+  if (group) slot.appendChild(group);
+}
+
+function paintChainChips() {
+  for (const li of settingsListEl.querySelectorAll(".setting-chain")) {
+    renderChainChips(li);
+  }
+}
+
+// Typed-state-only lifecycle (the WEB-020/023/027 doctrine): state/0 touches
+// nothing (a busy engine never flickers the group away); a typed snapshot
+// without the key clears it (absent = nothing to offer); the DOM is written
+// ONLY when the gated array actually differs.
+function applySuggestedServers(snap) {
+  if (!snap || snap.schema !== "state/1") return;
+  const servers = readSuggestedServers(snap.suggested_servers);
+  const sig = JSON.stringify(servers);
+  if (sig === state.suggestedServersSig) return;
+  state.suggestedServers = servers;
+  state.suggestedServersSig = sig;
+  paintChainChips();
 }
 
 // What the engine's secret entries said at the last full read (the ONLY

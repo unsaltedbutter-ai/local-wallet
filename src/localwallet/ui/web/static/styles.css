@@ -90,6 +90,13 @@
   --c-priv-local-bg: var(--c-accent-soft);
   --c-priv-trust: var(--c-warn);
   --c-priv-trust-bg: var(--c-warn-soft);
+
+  /* TCK-WEB-022: the suggested-public-server chip pair (leak DISCLOSURE,
+     not a trust badge — see the pinned-contrast contract at .chain-chip).
+     Aliased to the danger family so both palettes retint from their own
+     --c-danger/--c-danger-soft values (the --c-priv-* aliasing pattern). */
+  --c-chip-warn-ink: var(--c-danger);
+  --c-chip-warn-bg: var(--c-danger-soft);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -315,13 +322,65 @@ body {
 /* TCK-WEB-021 (3): the server card's three zones. Status = URL + trust
    badge + (TCK-WEB-023 AMENDMENT) the kind pill beside it — see the
    color-vocabulary contract at .trust-badge below; act = field +
-   Apply/Cancel + .chain-chips (the empty TCK-WEB-022 suggested-server
-   slot, pre-styled as a wrapping chip row); rest = the prose collapsed
+   Apply/Cancel + .chain-chips (TCK-WEB-022: the wrapping slot of the
+   suggested-server chip group); rest = the prose collapsed
    behind the native <details>. Resync + gap stay outside — recovery
    paths never hide. */
 .chain-status,
 .chain-act { display: flex; flex-direction: column; gap: var(--sp-2); }
 .chain-chips { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+
+/* TCK-WEB-022: the suggested-public-server chip group (click-to-FILL).
+   The slot renders NOTHING unless the typed engine list is non-empty — no
+   group is ever left empty. The warn sentence sits above the chip row
+   (DOM order = SR order, app.js owns both); the whole group takes the RED
+   leak tint — every public server is a leak by disclosure, not by hint.
+   Contrast pinned (WCAG relative-luminance math, verified at build time):
+   the ink/bg pair is the danger family, aliasing the palette tokens so it
+   retints per scheme on its own:
+   * light: #a12626 on chip bg #f7e4e4 = 6.09:1, on pane surface #eef0f4 =
+     6.53:1 — warn text and chips both ≥ 4.5:1;
+   * dark:  #e07a7a on chip bg #402325 = 4.87:1, on pane surface #262a31 =
+     4.96:1 — both ≥ 4.5:1.
+   A dedicated pair (--c-chip-warn-ink / --c-chip-warn-bg) instead of
+   wearing the --c-priv-* trust-badge tokens directly: those belong to the
+   trust dimension alone (the color-vocabulary contract below), and these
+   chips are static leak DISCLOSURE, not a live-mode badge. */
+.chain-chip-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.chain-chips-warn {
+  margin: 0;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--c-chip-warn-ink);
+  overflow-wrap: anywhere;
+}
+/* Real <button>s (app.js), reset like the wallet-fp chip: the UA font/cursor
+   is not the pane's voice. flex:none + overflow-wrap keeps a long label a
+   WRAPPING whole chip at 320px, never a clipped or split one. The hover
+   swaps the SAME pinned pair (inverted) — contrast is identical by
+   construction; focus rides the global ring. */
+.chain-chip {
+  flex: none;
+  max-width: 100%;
+  font: var(--fs-xs)/var(--lh) var(--font-sans);
+  font-weight: 600;
+  text-align: start;
+  cursor: pointer;
+  color: var(--c-chip-warn-ink);
+  background: var(--c-chip-warn-bg);
+  border: 1px solid var(--c-chip-warn-ink);
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  overflow-wrap: anywhere;
+}
+.chain-chip:hover {
+  color: var(--c-chip-warn-bg);
+  background: var(--c-chip-warn-ink);
+}
 
 /* Native <details> for the collapsed prose (no JS, no ARIA invention).
    The summary is a quiet, legible row-link; its text is app.js

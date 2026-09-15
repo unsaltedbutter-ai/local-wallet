@@ -1168,6 +1168,9 @@ def test_state_falls_back_to_transport_shape_when_engine_busy(
     assert snapshot["schema"] == "state/0"
     assert {"last_event_id", "buffered_events", "subscribers"} <= set(snapshot)
     assert "flow_state" not in snapshot  # minimal shape carries no engine facts
+    # TCK-WEB-022: the vetted chip list rides the TYPED door only — a busy
+    # engine's state/0 fallback carries no engine fields at all.
+    assert "suggested_servers" not in snapshot
     assert server.token.encode() not in data
 
 
