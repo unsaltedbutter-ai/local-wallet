@@ -3,7 +3,8 @@
 Covers the ticket's unit-test list:
 * v3 migration: a real v2 file upgrades on reopen, fresh creates are v3,
   the step is idempotent, malformed shapes fail closed, and the v2
-  ``coin_labels`` surface stays untouched (pinned);
+  ``coin_labels`` surface stays untouched by the v3 rung (pinned — the v6
+  fold later RETAINS the table write-frozen but never rewrites its rows);
 * broadcast-time capture + lineage upsert semantics (COALESCE-preserve —
   a scan can never clobber what the broadcast handler recorded);
 * the typed ``record_replacement`` writer (fail-closed, value-free);
@@ -86,11 +87,16 @@ def _wallet(store: Store) -> int:
 
 
 def _as_v2_file(db: Path, *, drop_columns: tuple[str, ...] = _V3_COLUMNS) -> None:
-    """Simulate a REAL pre-v3 file: remove (some of) the v3 columns and stamp
-    user_version=2 — the exact on-disk shape the v2→v3 rung must recover."""
+    """Simulate a REAL pre-v3 file: remove (some of) the v3 columns, make
+    sure the v2 tables exist (a real v2-era DB always had ``coin_labels``;
+    a fresh v6 DB no longer creates it), and stamp user_version=2 — the
+    exact on-disk shape the v2→v3 rung must recover."""
+    from localwallet.store.db import _COIN_LABELS_DDL
+
     raw = sqlite3.connect(db)
     for col in drop_columns:
         raw.execute(f"ALTER TABLE transactions DROP COLUMN {col}")
+    raw.executescript(_COIN_LABELS_DDL)
     raw.execute("PRAGMA user_version=2")
     raw.commit()
     raw.close()
@@ -116,11 +122,12 @@ def test_v2_db_upgrades_to_v3_on_reopen(tmp_path: Path) -> None:
 
     with Store(db) as store:  # the migration runs here
         # Full upgrade lands on the CURRENT schema version: the v2→v3 rung
-        # is followed by the v3→v4 add of ``address_registry`` (TCK-CHAT-001)
-        # and the v4→v5 add of ``address_labels`` (TCK-LABEL-001) riding the
-        # same ladder. The v3 COLUMN/data assertions below are
-        # what this test is actually about.
-        assert _version(store._conn) == SCHEMA_VERSION == 5
+        # is followed by the v3→v4 add of ``address_registry`` (TCK-CHAT-001),
+        # the v4→v5 add of ``address_labels`` (TCK-LABEL-001), and the v5→v6
+        # fold to ``address_label_set`` (TCK-LABELS-UNIFY) riding the same
+        # ladder. The v3 COLUMN/data assertions below are what this test is
+        # actually about.
+        assert _version(store._conn) == SCHEMA_VERSION == 6
         assert set(_V3_COLUMNS) <= _tx_columns(store._conn)
         # The v2 tx row survived untouched, new fields reading as not-recorded.
         rows = store.get_txs_for_wallet(wid)
@@ -130,7 +137,7 @@ def test_v2_db_upgrades_to_v3_on_reopen(tmp_path: Path) -> None:
         assert rows[0].first_seen is None
         assert rows[0].replaced_by_txid is None
     with Store(db) as store:  # stable reopen at the top version (no re-run)
-        assert _version(store._conn) == 5
+        assert _version(store._conn) == 6
 
 
 def test_v3_migration_is_idempotent_half_applied(tmp_path: Path) -> None:
@@ -144,13 +151,13 @@ def test_v3_migration_is_idempotent_half_applied(tmp_path: Path) -> None:
     _as_v2_file(db, drop_columns=("first_seen", "replaced_by_txid"))
 
     with Store(db) as store:
-        assert _version(store._conn) == 5
+        assert _version(store._conn) == 6
         assert set(_V3_COLUMNS) <= _tx_columns(store._conn)
 
 
 def test_fresh_create_is_v3(tmp_path: Path) -> None:
     with Store(tmp_path / "fresh.db") as store:
-        assert _version(store._conn) == 5
+        assert _version(store._conn) == 6
         assert set(_V3_COLUMNS) <= _tx_columns(store._conn)
 
 
@@ -194,20 +201,32 @@ def test_v2_to_v3_leaves_coin_labels_untouched(tmp_path: Path) -> None:
     db = tmp_path / "store.db"
     with Store(db) as store:
         wid = _wallet(store)
-        store.set_coin_label(wid, ORIG, 0, ["kyc", "p2p"], "keep me exactly")
     raw = sqlite3.connect(db)
+    # A real v2 file HAS the table (a fresh v6 file never creates it): write
+    # the v2 shape raw — the migration is the table's only reader now.
+    from localwallet.store.db import _COIN_LABELS_DDL
+
+    raw.executescript(_COIN_LABELS_DDL)
+    raw.execute(
+        "INSERT INTO coin_labels (wallet_id, txid, vout, tags, note) VALUES (?,?,?,?,?)",
+        (wid, ORIG, 0, "kyc,p2p", "keep me exactly"),
+    )
     ddl_before = raw.execute(
         "SELECT sql FROM sqlite_master WHERE name = 'coin_labels'"
     ).fetchone()[0]
     rows_before = raw.execute(
         "SELECT wallet_id, txid, vout, tags, note FROM coin_labels"
     ).fetchall()
+    raw.commit()
     raw.close()
     _as_v2_file(db)
 
     with Store(db) as store:
-        assert _version(store._conn) == 5  # full ladder (v2→v3→v4→v5) completes
+        assert _version(store._conn) == 6  # full ladder v2→…→v6 completes
     raw = sqlite3.connect(db)
+    # The v3 RUNG touched nothing here — and the v6 fold, which RETAINS the
+    # table write-frozen, never rewrites or deletes a row either (the rows
+    # have no utxo match in this file, so they stay exactly as written).
     assert (
         raw.execute("SELECT sql FROM sqlite_master WHERE name = 'coin_labels'").fetchone()[0]
         == ddl_before

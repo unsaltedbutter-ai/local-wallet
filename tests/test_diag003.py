@@ -58,8 +58,16 @@ def world(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(app, "_extract_signed_tx_hex", lambda _b64: TX_HEX)
     flow, _ticks = make_flow()
     signed = drive_to_signed(flow)
+    from tests.test_e2e_skeleton import _fixture_parsed
+
     store = app.Store(None)
     wallet = store.create_wallet("default", "desc")
+    # Post-LABELS-UNIFY the broadcast handler re-derives the change ADDRESS
+    # (next_index-1, the sign-time recovery) to write label inheritance onto
+    # — seed the derivation the staging shape implies (this fixture's point
+    # is the FAILURE CLASS, not the inheritance; see test_coin_labels for
+    # the full e2e inheritance ride).
+    store.update_derivation(wallet.id, 1, next_index=1)
     state: dict[str, Any] = {}
 
     def _broadcast(_hex: str) -> str:
@@ -76,6 +84,7 @@ def world(monkeypatch: pytest.MonkeyPatch):
             SimpleNamespace(broadcast_tx=_broadcast),
             store,
             wallet.id,
+            _fixture_parsed(),
             output=output,
         )
         return handler(_env({"tx_ref": signed.tx_ref}))

@@ -57,12 +57,15 @@ POLICY LAYERS (TCK-UTXO-002, ADR-0012 amendment; docs/ux-utxo-notes-design.md
 §2) — layered AROUND steps 1–4, which stay unchanged within any pool
 -------------------------------------------------------------------------------
 Tags arrive pre-joined by the CALLER as plain data on the UTXO objects —
-this module reads NO store, NO env, NO free text (the note field never
-reaches it). Each duck-typed UTXO may carry ``kyc_side: bool`` (absent =
-False = other-side, §1.4 "unlabeled = other-side by default", which makes an
-untagged wallet behave exactly like pre-amendment selection). The pure
-:func:`coin_partition` is the canonical tag-set -> (kyc_side, mixed) mapping
-for that caller-side join (mixed-by-lineage coins are kyc-side — fail-safe).
+this module reads NO store, NO env, NO free text (label text never reaches
+it). Each duck-typed UTXO may carry ``kyc_side: bool`` (absent = False =
+other-side, §1.4 "unlabeled = other-side by default", which makes an
+untagged wallet behave exactly like pre-amendment selection). Since schema
+v6 (TCK-LABELS-UNIFY) the caller joins the address's INHERITED label set
+(``store.get_address_label_sets`` — one address = one provenance; the
+outpoint-keyed ``coin_labels`` are no longer a selection input); the join
+rule is the pure :func:`coin_partition` over the set's members (free-text
+members touch neither side; mixed-by-lineage sets are kyc-side — fail-safe).
 
 A. **Partition preference.** Steps 1–4 (+5) run over the other-side pool and
    the kyc-side pool; any pure pool that finalizes wins — between two
@@ -251,11 +254,12 @@ class InsufficientFundsError(SelectionError):
 
 
 def coin_partition(tags: Iterable[str]) -> tuple[bool, bool]:
-    """Map a coin's tag set to its selection partition (doc §1.4 + §1.3).
+    """Map a coin's label set (its address's inherited members, doc §1.4 +
+    §1.3 + TCK-LABELS-UNIFY) to its selection partition.
 
     Returns ``(kyc_side, mixed)`` — the two booleans the caller joins onto
-    each UTXO before :func:`select_coins` (tags themselves never reach the
-    engine; the free-text note never reaches this module at all). The
+    each UTXO before :func:`select_coins` (the members themselves never
+    reach the engine; free-text members touch neither side). The
     decision table:
 
     ==============================  ==========  ======  ==================

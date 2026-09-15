@@ -86,10 +86,13 @@ def _coin(
     world, txid: str, value: int, *, index: int, tag: str | None = None, confirmed: int = 1
 ) -> None:
     """Plant one coin (the RBF-004 way a rescan leaves it) + its stored
-    label row when tagged."""
+    label when tagged — and since TCK-LABELS-UNIFY the label lives on the
+    coin's ADDRESS (the coin inherits it; every coin at this index/address
+    shares the set)."""
     _add_coin(world["store"], world["wallet"].id, index, txid, value, confirmed=confirmed)
     if tag is not None:
-        world["store"].set_coin_label(world["wallet"].id, txid, 0, [tag])
+        address = derive_fixture_addresses(8)[index]
+        world["store"].add_address_labels(address, [tag])
 
 
 def _labeled(world) -> None:
@@ -394,41 +397,44 @@ def test_direct_threshold_plan_keeps_the_generic_card(world) -> None:
 
 
 def test_broadcast_inherits_common_tag_plus_consolidation(world) -> None:
-    """§1.3 union inheritance runs as always, and the conversation's
-    staged plan adds the closed-set ``consolidation`` tag + the
-    'consolidated from N outputs' record — written ONLY at broadcast."""
+    """§1.3 union inheritance runs as always — now onto the NEW coin's
+    ADDRESS set — and the conversation's staged plan adds the closed-set
+    ``consolidation`` tag + the "consolidated from N outputs" member,
+    written ONLY at broadcast (the session carries the broadcast's own
+    addresses: that is what makes the fresh set labelable pre-rescan)."""
     _labeled(world)
     _turn(world, "consolidate my kyc coins")
     _turn(world, "all")
-    txid = _ride(world)
-    row = world["store"].get_coin_label(world["wallet"].id, txid, 0)
-    assert row is not None
-    assert row.tags == ("kyc", "consolidation")  # canonical order
-    assert row.note == "consolidated from 2 outputs"
+    _ride(world)
+    assert len(world["session"].last_broadcast_addresses) == 1
+    new_addr = world["session"].last_broadcast_addresses[0]
+    members = world["store"].get_address_label_set(new_addr)
+    assert members == ("kyc", "consolidation", "consolidated from 2 outputs")
     assert world["session"].cons_pending is None  # retired at broadcast
-    # the consumed inputs keep their own rows (outpoint-keyed, spent-safe)
-    assert world["store"].get_coin_label(world["wallet"].id, KYC_BIG_TXID, 0).tags == ("kyc",)
+    # the consumed inputs keep their own address sets (address-keyed, spent-safe)
+    addrs = derive_fixture_addresses(8)
+    assert world["store"].get_address_label_set(addrs[3]) == ("kyc",)
 
 
 def test_broadcast_inherits_union_and_adds_record(world) -> None:
-    """Mixed groups inherit the UNION of every input tag (a kyc+p2p coin
+    """Mixed groups inherit the UNION of every input tag (a kyc+p2p address
     lands on both sides — the fail-safe §1.3 rule) + the record."""
     _coin(world, KYC_SMALL_TXID, 12_000, index=2)
-    world["store"].set_coin_label(world["wallet"].id, KYC_SMALL_TXID, 0, ["kyc", "p2p"])
     _coin(world, KYC_BIG_TXID, 30_000, index=3)
-    world["store"].set_coin_label(world["wallet"].id, KYC_BIG_TXID, 0, ["p2p"])
+    world["store"].add_address_labels(derive_fixture_addresses(8)[2], ["kyc", "p2p"])
+    world["store"].add_address_labels(derive_fixture_addresses(8)[3], ["p2p"])
     _turn(world, "consolidate my p2p coins")
     _turn(world, "all")
-    txid = _ride(world)
-    row = world["store"].get_coin_label(world["wallet"].id, txid, 0)
-    assert row is not None
-    assert row.tags == ("kyc", "p2p", "consolidation")
-    assert row.note == "consolidated from 2 outputs"
+    _ride(world)
+    new_addr = world["session"].last_broadcast_addresses[0]
+    members = world["store"].get_address_label_set(new_addr)
+    assert members == ("kyc", "p2p", "consolidation", "consolidated from 2 outputs")
 
 
 def test_broadcast_record_unlabeled_single_output_note(world) -> None:
-    """Unlabeled inputs inherit NOTHING (no union rows — the §1.3 rule),
-    yet the consolidation record is still written; N=1 reads 'output'."""
+    """Unlabeled inputs inherit NOTHING (no closed-tag union — the §1.3
+    rule), yet the consolidation record is still written; N=1 reads
+    'output'."""
     _labeled(world)
     _turn(world, "sweep my unlabeled coins")  # list ask (2+ coins)
     # pick the 7k coin by its registry number
@@ -438,11 +444,10 @@ def test_broadcast_record_unlabeled_single_output_note(world) -> None:
         if r.address == derive_fixture_addresses(8)[7]
     )
     _turn(world, str(number))
-    txid = _ride(world)
-    row = world["store"].get_coin_label(world["wallet"].id, txid, 0)
-    assert row is not None
-    assert row.tags == ("consolidation",)
-    assert row.note == "consolidated from 1 output"
+    _ride(world)
+    new_addr = world["session"].last_broadcast_addresses[0]
+    members = world["store"].get_address_label_set(new_addr)
+    assert members == ("consolidation", "consolidated from 1 output")
 
 
 # =========================================================================
@@ -577,7 +582,9 @@ def test_label_words_never_reach_the_model(world) -> None:
     IN CODE, and no prompt or transcript entry ever carries them — even
     the derailment turn's prompt is clean (§7.10, both directions)."""
     _labeled(world)
-    world["store"].set_coin_label(world["wallet"].id, P2P_TXID, 0, ("p2p",), "fridge magnet")
+    # The p2p address gains its tag (via _labeled) PLUS a free-text member —
+    # the list ask prints both verbatim, the model sees neither.
+    world["store"].add_address_labels(derive_fixture_addresses(8)[4], ["fridge magnet"])
     fake = _FakeGen()
     loop = AgentLoop(fake, world["table"])
     for line in (

@@ -5,16 +5,20 @@ What the store is
 A thin, typed persistence layer over a single SQLite database (WAL). It backs
 Phase 1: wallet profiles, per-branch derivation state, derived addresses,
 UTXO cache, transaction cache, sync cursor, and application settings — plus
-(schema v2, TCK-UTXO-001) outpoint-keyed coin labels: closed-set tags + one
-free-text note per coin, stored in their own table so they survive the scan
-snapshot's DELETE+re-INSERT, and (schema v3, TCK-RBF-001) transaction
-lineage/capture columns (amount_sats, fee_rate_centisat_vb, first_seen,
-replaced_by_txid) — the broadcast-time record RBF/CPFP disambiguation is
-built on — plus (schema v4, TCK-CHAT-001) the ``address_registry`` table:
-stable wallet-lifetime address numbers and first-shown timestamps, and
-(schema v5, TCK-LABEL-001) the ``address_labels`` table: address-keyed
-free-text labels — the sibling of ``coin_labels`` for the question
-"what is this ADDRESS", the foundation TCK-CHAT-003 builds on. All
+(schema v3, TCK-RBF-001) transaction lineage/capture columns (amount_sats,
+fee_rate_centisat_vb, first_seen, replaced_by_txid) — the broadcast-time
+record RBF/CPFP disambiguation is built on — (schema v4, TCK-CHAT-001) the
+``address_registry`` table: stable wallet-lifetime address numbers and
+first-shown timestamps, and (schema v6, TCK-LABELS-UNIFY) the
+``address_label_set`` table: the ADDRESS-keyed label SET — the labeling
+source of truth (one address = one private key = one provenance; coins
+INHERIT their address's set for the selection engine; the v5 ``address_labels``
+single label and the v2 outpoint-keyed ``coin_labels`` fold into it by
+per-address union on migration). The legacy ``coin_labels`` table is retained
+WRITE-FROZEN on upgraded databases as preserved history — ALL of its rows stay
+(resolvable and spent alike); the migration merely COPIES what resolves to an
+address into the set, leaving the frozen table as-is; from v6 on NOTHING in
+code writes or reads it — no live surface consumes it. All
 SQL lives inside this module; callers use the typed accessor methods and
 row records from :mod:`localwallet.store.models`. No raw SQL outside ``store/``.
 
@@ -29,8 +33,8 @@ No-secrets / no-value-logging policy
 ------------------------------------
 Watch-only: the store holds **no secrets** (no xprvs, no seed phrases) — only
 public watch data. Addresses, txids and amounts are legitimately *stored in
-the database*, but they are **never placed into log/exception text**. Coin
-label text is the same class of user data (design doc §1.1): stored verbatim,
+the database*, but they are **never placed into log/exception text**. Label
+text is the same class of user data (design doc §1.1): stored verbatim,
 never echoed into a message. Every :class:`StoreError` message carries only
 table/operation context — never a value. This module deliberately performs no
 ``logging``; errors are raised for the caller to handle, with scrubbed
@@ -54,24 +58,22 @@ from localwallet.config import (
 )
 from localwallet.store.models import (
     ADDRESS_LABEL_MAX_CHARS,
-    COIN_NOTE_MAX_CHARS,
     COIN_TAGS,
-    AddressLabelRecord,
     AddressRecord,
     AddressRegistryRecord,
-    CoinLabelRecord,
     DerivationRecord,
     TxRecord,
     UtxoRecord,
     WalletRecord,
-    normalize_coin_tags,
 )
 
 # Current schema version, tracked via ``PRAGMA user_version``. Bump this and
 # add an up-migration whenever the schema changes; never down-migrate.
-# v2 (TCK-UTXO-001): the ``coin_labels`` table (docs/ux-utxo-notes-design.md
-# §1.3) — outpoint-keyed, deliberately SEPARATE from the UTXO snapshot so
-# user labels survive every rescan.
+# v2 (TCK-UTXO-001, superseded as an INPUT by v6): the ``coin_labels`` table —
+# outpoint-keyed tags + note; v6 folds its content per-address union into
+# ``address_label_set`` and retains the table (write-frozen, history only) on
+# upgraded DBs because spent coins' label rows cannot be attributed to an
+# address from this DB, and dropping user data silently is forbidden.
 # v3 (TCK-RBF-001): the ``transactions`` lineage/capture columns — amount_sats,
 # fee_rate_centisat_vb, first_seen (broadcast-time capture off the flow's
 # confirmed record) and replaced_by_txid (RBF lineage link). All nullable;
@@ -84,15 +86,27 @@ from localwallet.store.models import (
 # upsert or a second UPDATE inside the scan transaction) would couple two
 # unrelated lifecycles for zero gain. The address-keyed PRIMARY KEY mirrors
 # the ``addresses`` table's natural key (address is globally UNIQUE there).
-# v5 (TCK-LABEL-001): the ``address_labels`` table — free-text labels keyed by
-# ADDRESS (the sibling of the outpoint-keyed ``coin_labels``: "label this
-# address" had nowhere to land in v4, which is exactly the live bug this ships
-# for). Address-keyed with a plain TEXT PRIMARY KEY (same global-uniqueness
-# discipline as ``addresses.address``); the label is value-checked at the
-# typed write (non-empty, ≤500 chars) and the row rides OUTSIDE the scan
-# write-set like the registry, so a rescan can never clear or fabricate it.
-# The foundation TCK-CHAT-003's post-receive label capture builds on.
-SCHEMA_VERSION = 5
+# v5 (TCK-LABEL-001, folded by v6): the ``address_labels`` table — one
+# free-text label keyed by ADDRESS. Its whole content maps cleanly into the
+# v6 set (the key already IS the address), so the v5→v6 rung copies and drops
+# it: the two-address-label-sources split v5 left behind (address free text
+# here, engine tags on coin_labels, neither feeding the other) is exactly the
+# inconsistency this unification ends.
+# v6 (TCK-LABELS-UNIFY, USER MODEL ratified 2026-09-13): the
+# ``address_label_set`` table — the ADDRESS-keyed label SET as the labeling
+# source of truth. One address = one private key = one provenance ("you can't
+# have KYC coins and KYC-free coins at the same address"), so labeling the
+# ADDRESS is the honest unit: members are the closed tag vocabulary
+# (``store.models.COIN_TAGS`` — engine vocabulary, canonicalized at write)
+# plus free-text labels (display-only), coins INHERIT the set for the
+# selection engine, and a per-UTXO label is just another addition to that
+# address's set (union). Keyed (address, label) PRIMARY KEY — the same
+# global-uniqueness discipline as ``addresses.address`` and v5's
+# ``address_labels``; OUTSIDE the scan write-set like the registry, so a
+# rescan can never clear, re-assign, or fabricate a label. The foundation
+# TCK-CHAT-003's address-level label ask and TCK-CHAT-007's receive+label
+# dual action build on.
+SCHEMA_VERSION = 6
 
 _BUSY_TIMEOUT_MS = 5000
 
@@ -192,27 +206,6 @@ def _check_txid_shape(txid: object, context: str) -> None:
         raise StoreError(f"{context} txid must be 64 lowercase hex characters")
 
 
-def _check_label_txid(txid: object) -> None:
-    """Fail-closed shape check for a coin-label txid.
-
-    A label is keyed by outpoint, so a malformed id is a caller bug, refused
-    before disk.
-    """
-    _check_txid_shape(txid, "coin label")
-
-
-def _check_label_vout(vout: object) -> None:
-    """Fail-closed shape check for a coin-label vout (non-negative int)."""
-    if not isinstance(vout, int) or isinstance(vout, bool) or vout < 0:
-        raise StoreError("coin label vout must be a non-negative integer")
-
-
-def _check_label_outpoint(txid: object, vout: object) -> None:
-    """Validate a full (txid, vout) outpoint used as a coin_labels key."""
-    _check_label_txid(txid)
-    _check_label_vout(vout)
-
-
 def _check_address_key_shape(address: object, context: str) -> None:
     """Fail-closed shape gate for any address-keyed store table (value-free).
 
@@ -230,6 +223,64 @@ def _check_address_key_shape(address: object, context: str) -> None:
         or any(c.isspace() for c in address)
     ):
         raise StoreError(f"{context} key must be a printable address string")
+
+
+def _normalize_label_member(label: object) -> str:
+    """Fail-closed, value-free gate + canonicalization for ONE address-label-
+    set member (TCK-LABELS-UNIFY, schema v6).
+
+    A member must be a non-blank printable string of at most
+    :data:`ADDRESS_LABEL_MAX_CHARS` characters — anything else is refused
+    before disk and the offending text is never echoed (label text is user
+    data, same class as an address). The ONE canonicalization: a word that
+    matches a closed-set tag id case-insensitively stores as the tag id
+    ("KYC" → ``kyc``), because the tag ids are the ENGINE VOCABULARY the
+    deterministic partition reads; free text stays verbatim (display-only).
+    """
+    if not isinstance(label, str) or not label.strip():
+        raise StoreError("address labels must be non-empty text")
+    if len(label) > ADDRESS_LABEL_MAX_CHARS:
+        raise StoreError("address label exceeds the maximum length")
+    if not label.isprintable():
+        raise StoreError("address labels must be printable text")
+    candidate = label.strip().lower()
+    for tag in COIN_TAGS:
+        if candidate == tag:
+            return tag
+    return label
+
+
+def _migrate_label_member(label: object) -> str | None:
+    """Migration-lenient member gate for v5→v6: ``None`` means "skip this
+    member" (the row still migrates, contributing nothing to the union).
+
+    v5's writers only rejected empty (``not label``) and over-cap, so
+    whitespace-only and non-printable members are LEGITIMATE v5 data — they
+    COALESCE to skip here instead of refusing (a hard refusal would brick the
+    whole upgrade on rows v5 never forbade). Over-cap stays a refusal: no v5
+    writer ever produced it, so it is genuine corruption, and it is the one
+    failure this helper shares with :func:`_normalize_label_member`.
+    """
+    if not isinstance(label, str) or not label.strip():
+        return None
+    if len(label) > ADDRESS_LABEL_MAX_CHARS:
+        raise StoreError("address label exceeds the maximum length")
+    if not label.isprintable():
+        return None
+    candidate = label.strip().lower()
+    for tag in COIN_TAGS:
+        if candidate == tag:
+            return tag
+    return label
+
+
+def _canonical_label_members(members: Iterable[str]) -> tuple[str, ...]:
+    """Deterministic canonical order of one label set: closed-set tags first
+    (COIN_TAGS order), free-text members sorted. Dedupes exact strings."""
+    seen = set(members)
+    tags = tuple(tag for tag in COIN_TAGS if tag in seen)
+    free = tuple(sorted(m for m in seen if m not in COIN_TAGS))
+    return tags + free
 
 
 # ----------------------------------------------------------------- shared SQL
@@ -291,12 +342,14 @@ _SYNC_STATE_UPSERT_SQL = (
     "ON CONFLICT(wallet_id, key) DO UPDATE SET value = excluded.value"
 )
 
-# coin_labels (schema v2, TCK-UTXO-001) — outpoint-keyed per-coin tags + note.
-# ``tags`` is a canonical-comma-joined closed-set string (NOT NULL — an
-# unlabeled coin has NO row, per §1.3, never an empty-string row); ``note`` is
-# verbatim free text, nullable. The (wallet_id, txid, vout) primary key lives
-# on the OUTPOINT, independent of the ephemeral utxos snapshot. FK cascade ties
-# it to the wallet (delete the wallet → its labels go too).
+# coin_labels (schema v2, TCK-UTXO-001 — LEGACY since v6): the outpoint-
+# keyed per-coin tags + note. The v5→v6 rung reads it once, unions every
+# resolvable row into ``address_label_set``, and RETAINS the table (write-
+# frozen) as preserved history for labels v5 attached to coins this store can
+# no longer attribute an address to (spent coins — ``utxos`` is the only
+# outpoint→address record, and it is the unspent snapshot). From v6 on no
+# accessor writes or reads it; it survives only on upgraded DBs (a fresh v6
+# database never creates it). The DDL remains for the v1→v2 ladder rung.
 _COIN_LABELS_DDL = """
             CREATE TABLE IF NOT EXISTS coin_labels (
                 wallet_id  INTEGER NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
@@ -307,14 +360,6 @@ _COIN_LABELS_DDL = """
                 PRIMARY KEY (wallet_id, txid, vout)
             );
 """
-
-_COIN_LABEL_UPSERT_SQL = (
-    "INSERT INTO coin_labels (wallet_id, txid, vout, tags, note) "
-    "VALUES (?, ?, ?, ?, ?) "
-    "ON CONFLICT(wallet_id, txid, vout) DO UPDATE SET "
-    "tags = excluded.tags, "
-    "note = excluded.note"
-)
 
 # address_registry (schema v4, TCK-CHAT-001) — the stable wallet-lifetime
 # NUMBER each shown address carries. Keyed by (wallet_id, address); the
@@ -335,18 +380,12 @@ _ADDRESS_REGISTRY_DDL = """
             );
 """
 
-# address_labels (schema v5, TCK-LABEL-001) — free-text labels keyed by
-# ADDRESS. The sibling of ``coin_labels`` for a different question: a coin
-# label is about ONE output (txid:vout), an address label is about the
-# address itself (every coin that lands there, present and future). Keyed by
-# plain TEXT PRIMARY KEY — the same global-uniqueness discipline as
-# ``addresses.address`` — because the live bug ("label <address> as <text>")
-# is an address question coin_labels structurally cannot answer, and a
-# wallet column would add a second answer to it for zero gain. Like the
-# registry, the table lives OUTSIDE the scan write-set: a rescan can never
-# clear, re-assign, or fabricate a label. Label text is user data (verbatim
-# on disk, value-checked at the typed write, never in exception/log text,
-# never model context — §1.1/§7.10).
+# address_labels (schema v5, TCK-LABEL-001 — FOLDED by v6): the single
+# free-text label keyed by ADDRESS. Every row maps cleanly into the v6 set
+# (the key already IS the address), so the v5→v6 rung copies and DROPS the
+# table — no data can be lost in a total fold, and leaving a second address-
+# label surface alive is precisely the split the unification ends. The DDL
+# remains for the v4→v5 ladder rung.
 _ADDRESS_LABELS_DDL = """
             CREATE TABLE IF NOT EXISTS address_labels (
                 address    TEXT PRIMARY KEY,
@@ -356,15 +395,32 @@ _ADDRESS_LABELS_DDL = """
             );
 """
 
-_ADDRESS_LABEL_UPSERT_SQL = (
-    "INSERT INTO address_labels (address, label, created_at, updated_at) "
-    "VALUES (?, ?, ?, ?) "
-    "ON CONFLICT(address) DO UPDATE SET "
-    "label = excluded.label, "
-    "updated_at = excluded.updated_at"
-    # created_at deliberately NOT touched on re-label: the first label's
-    # date is a fact that survives every later edit (same write-once
-    # discipline as the registry's first_shown).
+# address_label_set (schema v6, TCK-LABELS-UNIFY) — THE labeling source of
+# truth: one row per (address, label) MEMBER. ``label`` is a closed-set tag
+# id (engine vocabulary — canonicalized at write, §1.4) or verbatim free text
+# (display-only); the address's coins INHERIT the whole set for the
+# deterministic partition (the caller joins it onto the snapshot; ``tx/``
+# reads no store). ``created_at`` (ISO-8601 UTC) is written once per member
+# and never moves (the registry's first_shown / v5's created_at discipline).
+# Keyed on the address string with the same global-uniqueness assumption as
+# ``addresses.address`` / v5 ``address_labels``; FK-less on purpose (an
+# address keeps its labels across wallets and scans — a label is a USER fact
+# about a script, not derivation state). Lives OUTSIDE the scan write-set: a
+# rescan can never clear, re-assign, or fabricate a label.
+_ADDRESS_LABEL_SET_DDL = (
+    """
+            CREATE TABLE IF NOT EXISTS address_label_set (
+                address    TEXT NOT NULL,
+                label      TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (address, label)
+            )
+"""
+)
+
+_ADDRESS_LABEL_SET_INSERT_SQL = (
+    "INSERT OR IGNORE INTO address_label_set (address, label, created_at) "
+    "VALUES (?, ?, ?)"
 )
 
 
@@ -442,7 +498,11 @@ class Store(AbstractContextManager["Store"]):
         written LAST. A crash between a step and the stamp leaves the DB at
         the old version with the additive step applied — the next open simply
         re-runs the idempotent step and re-stamps. No step ever destructively
-        rewrites data, so per-statement atomicity is sufficient.
+        rewrites data, so per-statement atomicity is sufficient — with ONE
+        named exception: the v5→v6 fold MOVES data, so that rung runs as its
+        OWN explicit transaction (all-or-nothing; see
+        :meth:`_migrate_v5_to_v6`) and re-runs cleanly from an untouched v5
+        after any crash.
         """
         conn = self._conn
         current = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -565,6 +625,156 @@ class Store(AbstractContextManager["Store"]):
         """
         conn.executescript(_ADDRESS_LABELS_DDL)
 
+    def _migrate_v5_to_v6(self, conn: sqlite3.Connection) -> None:
+        """v5→v6 (TCK-LABELS-UNIFY): the ADDRESS label SET becomes the
+        labeling source of truth (USER MODEL ratified 2026-09-13: one address
+        = one private key = one provenance; coins inherit the address's set;
+        a per-UTXO label is an addition to it).
+
+        This is the ONE rung in the ladder that MOVES data, so it honors the
+        migration contract through ATOMICITY rather than append-only DDL: the
+        whole rung runs inside a single explicit ``BEGIN IMMEDIATE``
+        transaction (plain ``execute`` statements — never
+        ``executescript``, which commits beforehand), and the rung's own
+        version stamp (``PRAGMA user_version=6``) is written INSIDE that
+        transaction, LAST. The ladder's post-rung stamp then no-ops. Because
+        the fold AND its stamp are one atomic COMMIT, the FIRST non-idempotent
+        rung re-runs cleanly after any crash by construction: a crash ANYWHERE
+        mid-rung rolls every statement back — the DB stays a pristine v5 and
+        the next open re-runs the whole rung — and once the fold COMMIT lands
+        the v6 stamp is already durable (there is no post-COMMIT/pre-stamp
+        window left to wedge a healthy wallet). For a v5 file already in that
+        legacy half-applied shape (a fully-migrated DB a pre-fix build left
+        stamped v5 — ``address_labels`` dropped, ``address_label_set``
+        present), the rung detects fold-already-applied and COMPLETES by
+        stamping v6 instead of refusing. No partial fold ever lands.
+
+        Content: (1) every ``address_labels`` (v5) row folds into the set —
+        a total map (its key already IS the address), after which the fully-
+        represented table is dropped; (2) every ``coin_labels`` (v2) row's
+        tags AND note union into the label set of the address that holds the
+        coin (joined through ``utxos`` — the store's only outpoint→address
+        record); rows whose coin has been SPENT resolve to no address and
+        contribute nothing. The ``coin_labels`` table itself is RETAINED
+        write-frozen WHOLE — resolvable and spent rows alike stay (dropping
+        user data silently is forbidden); the union merely copies what
+        resolves. (3) Lenient on what v5 legitimately
+        allowed: blank/whitespace-only and non-printable label/note members
+        (v5 writers rejected only empty and over-cap) COALESCE to "skip this
+        member" — the row still migrates, contributing nothing to the union.
+        (4) Fail-closed on genuine corruption: an unknown tag id, an over-cap
+        member, an un-keyable address, or a missing legacy table refuses the
+        ENTIRE upgrade value-free; the DB stays v5 untouched — never a silent
+        drop, never a partial fold.
+        """
+        live = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "coin_labels" not in live:
+            # A stamped-v5 DB without the coin-label table is not this
+            # schema — refuse (fail closed; a v5 file always has it).
+            raise _MigrateError(
+                "schema migration v5->v6 refused: a legacy label table is missing"
+            )
+        if "address_labels" not in live:
+            # Either the fold already applied but a PRE-FIX crash dropped the
+            # stamp (address_label_set present, address_labels gone — a
+            # fully-migrated, healthy wallet), or a genuinely malformed v5.
+            # Distinguish by whether the v6 set table is present: fold-already-
+            # applied COMPLETES by stamping v6; anything else is not this
+            # schema and refuses.
+            if "address_label_set" in live:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute("PRAGMA user_version=6")
+                    conn.execute("COMMIT")
+                except sqlite3.Error:
+                    self._rollback_quietly()
+                    raise  # the ladder's own value-free migration wrapper owns it
+                return
+            raise _MigrateError(
+                "schema migration v5->v6 refused: a legacy label table is missing"
+            )
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(_ADDRESS_LABEL_SET_DDL)
+            for row in conn.execute("SELECT address, label FROM address_labels"):
+                member = _migrate_label_member(row["label"])
+                _check_address_key_shape(row["address"], "address label set")
+                if member is None:
+                    continue  # whitespace-only / non-printable v5 label: skipped
+                conn.execute(
+                    _ADDRESS_LABEL_SET_INSERT_SQL, (row["address"], member, _utcnow())
+                )
+            conn.execute("DROP TABLE address_labels")
+            lookup = conn.cursor()
+            for tags, note, wallet_id, txid, vout in conn.execute(
+                "SELECT tags, note, wallet_id, txid, vout FROM coin_labels "
+                "ORDER BY txid, vout"
+            ):
+                # Validate EVERY row (malformed spent-coin rows refuse too)
+                # before deciding whether this one can be relocated.
+                # FINDING 4: the non-str guard runs BEFORE the split — a
+                # BLOB-stored tags cell must refuse as a value-free
+                # _MigrateError (rollback + pristine v5), never escape as a
+                # bare TypeError from ``.split``.
+                if not isinstance(tags, str):
+                    raise _MigrateError(
+                        "schema migration v5->v6 refused: a legacy coin label "
+                        "carries an unknown tag"
+                    )
+                parts = [p for p in tags.split(",") if p]
+                if any(p not in COIN_TAGS for p in parts):
+                    raise _MigrateError(
+                        "schema migration v5->v6 refused: a legacy coin label "
+                        "carries an unknown tag"
+                    )
+                members = list(parts)
+                if note is not None:
+                    member = _migrate_label_member(note)
+                    if member is not None:
+                        members.append(member)
+                if not members:
+                    continue  # a tagless, note-less row (v5 never wrote one):
+                    # nothing to relocate; the row stays with the frozen table.
+                addr_row = lookup.execute(
+                    "SELECT address FROM utxos "
+                    "WHERE wallet_id = ? AND LOWER(txid) = ? AND vout = ?",
+                    (wallet_id, str(txid).lower(), vout),
+                ).fetchone()
+                address = addr_row[0] if addr_row is not None else None
+                if not address:
+                    continue  # coin spent pre-upgrade: RETAINED in coin_labels
+                for member in members:
+                    conn.execute(
+                        _ADDRESS_LABEL_SET_INSERT_SQL, (address, member, _utcnow())
+                    )
+            # FINDING 1: stamp v6 INSIDE the rung's own transaction, atomically
+            # with the fold — the ladder's post-rung stamp then no-ops. A crash
+            # after this COMMIT cannot leave a folded-but-stamped-v5 DB.
+            conn.execute("PRAGMA user_version=6")
+            conn.execute("COMMIT")
+        except _MigrateError:
+            self._rollback_quietly()
+            raise
+        except StoreError as exc:
+            # The only members that still REFUSE are the ones no v5 writer
+            # could ever have produced (over-cap; the address key gate);
+            # seeing them means the on-disk rows were edited or corrupted.
+            # (Whitespace-only / non-printable members were legitimately
+            # writable in v5 and are COALESCED, never raised.) Fail closed,
+            # value-free: nothing echoes, nothing drops.
+            self._rollback_quietly()
+            raise _MigrateError(
+                "schema migration v5->v6 refused: a legacy label row is malformed"
+            ) from exc
+        except sqlite3.Error:
+            self._rollback_quietly()
+            raise  # the ladder's own value-free migration wrapper owns it
+
     #: Up-migration ladder keyed by the version it migrates FROM. Extend (never
     #: reorder or delete) as schema version bumps; a missing rung fails closed.
     _MIGRATIONS: ClassVar[dict[int, Callable[[sqlite3.Connection], None]]] = {
@@ -572,6 +782,7 @@ class Store(AbstractContextManager["Store"]):
         2: _migrate_v2_to_v3,
         3: _migrate_v3_to_v4,
         4: _migrate_v4_to_v5,
+        5: _migrate_v5_to_v6,
     }
 
     def _create_schema(self) -> None:
@@ -643,9 +854,15 @@ class Store(AbstractContextManager["Store"]):
             );
             """
         )
-        conn.executescript(_COIN_LABELS_DDL)
+        # v6 shape, stated honestly: a FRESH database carries the address
+        # label set only — the legacy ``address_labels`` (v5) is gone entirely
+        # (folded), and ``coin_labels`` (v2) is simply never created (its
+        # writer is dead; upgraded databases keep the table with its
+        # historical rows, fresh ones have no history to preserve). The
+        # ladder rungs that create them exist only to bring versioned files
+        # UP through v5, where the v5→v6 fold then relocates the content.
+        conn.execute(_ADDRESS_LABEL_SET_DDL)
         conn.executescript(_ADDRESS_REGISTRY_DDL)
-        conn.executescript(_ADDRESS_LABELS_DDL)
 
     def close(self) -> None:
         self._conn.close()
@@ -1019,71 +1236,92 @@ class Store(AbstractContextManager["Store"]):
         ).fetchone()
         return AddressRegistryRecord.from_row(row) if row is not None else None
 
-    # --------------------------------------------------------- address labels
+    # --------------------------------------------------------- address label sets
     #
-    # TCK-LABEL-001 (schema v5): the ADDRESS-keyed free-text label — the
-    # sibling of coin_labels for "what is this ADDRESS" questions (a coin
-    # label is about one txid:vout; an address label is about the address).
-    # Same typed-writer discipline as every other user surface: validation
-    # is fail-closed at write (non-empty, ≤ ADDRESS_LABEL_MAX_CHARS), errors
-    # are value-free (label text is user data, same class as an address —
-    # never echoed into exceptions/logs), and the labels themselves are
-    # user-authored facts consumed by DETERMINISTIC code only — they NEVER
-    # enter model context (§1.1/§7.10). The small trio below is the whole
-    # sanctioned surface; TCK-CHAT-003 builds its capture flow on it.
+    # TCK-LABELS-UNIFY (schema v6): the ADDRESS-keyed label SET — the labeling
+    # source of truth (one address = one private key = one provenance; coins
+    # INHERIT the set for the selection engine; a per-UTXO label is just
+    # another union-addition to it; engine-internal change addresses stay
+    # unlabeled until a write or an inheritance lands a member). Members are
+    # closed-set tag ids (ENGINE vocabulary; "KYC" canonicalizes to ``kyc``
+    # at write) and verbatim free text (display-only unless it matches a tag).
+    # The typed accessors below are the ONLY sanctioned writers (the
+    # chain_base_url / gap_limit precedent): fail-closed validation at write,
+    # value-free errors (label text is user data — never echoed into
+    # exceptions/logs), and reads that return COMMITTED truth in a
+    # deterministic canonical order. Labels NEVER enter model context
+    # (§1.1/§7.10). TCK-CHAT-003 (address-level label ask) and TCK-CHAT-007
+    # (receive + label) build their capture flows on this trio.
 
-    def set_address_label(self, address: str, label: str) -> AddressLabelRecord:
-        """Set (replace) the label for ``address``; return the STORED row.
+    def add_address_labels(
+        self, address: str, labels: Iterable[str]
+    ) -> tuple[str, ...]:
+        """Union-ADD members to one address's label set; return the COMMITTED set.
 
-        The returned record is the committed row itself (read back after the
-        write, so callers can narrate store truth — a success line may only
-        ever quote what this returned, never what was typed). A re-label
-        replaces the text and moves ``updated_at``; ``created_at`` keeps the
-        first label's date (write-once, the registry's first_shown rule).
+        The returned tuple is the whole set as stored, read back after the
+        commit — a success line may only ever quote what this returned, never
+        what was typed (the LABEL-001 store-truth discipline, generalized to
+        set membership). Union is IDEMPOTENT: re-adding a member the address
+        already carries changes nothing (INSERT OR IGNORE; the first member's
+        ``created_at`` survives — write-once, the registry's ``first_shown``
+        rule). An empty ``labels`` addition is a no-op that still answers with
+        the current committed set (never an error, never a clear).
 
-        Raises value-free :class:`StoreError` for a malformed key or a
-        blank/over-long label (refused before disk; nothing is stored).
+        Raises value-free :class:`StoreError` for a malformed key or a member
+        that is empty/blank, over :data:`ADDRESS_LABEL_MAX_CHARS`, or not
+        printable — the WHOLE add is one transaction, so a refusal stores
+        nothing, not even the call's valid members.
         """
-        _check_address_key_shape(address, "address label")
-        if not isinstance(label, str) or not label:
-            raise StoreError("address label must be non-empty text")
-        if len(label) > ADDRESS_LABEL_MAX_CHARS:
-            raise StoreError("address label exceeds the maximum length")
-        now = _utcnow()
+        _check_address_key_shape(address, "address label set")
+        members = [_normalize_label_member(label) for label in labels]
+        if not members:
+            return self.get_address_label_set(address)
+        created = _utcnow()
         try:
-            with self._transaction():
-                self._conn.execute(_ADDRESS_LABEL_UPSERT_SQL, (address, label, now, now))
-            committed = self.get_address_label(address)
+            with self._atomic():
+                self._conn.executemany(
+                    _ADDRESS_LABEL_SET_INSERT_SQL,
+                    [(address, member, created) for member in members],
+                )
+            committed = self.get_address_label_set(address)
         except sqlite3.IntegrityError as exc:
             raise _wrap_integrity(exc) from exc
         except sqlite3.Error as exc:
             raise _wrap(exc) from exc
-        if committed is None:  # pragma: no cover — a committed write reads back
+        if not committed:  # pragma: no cover — a committed write reads back
             raise StoreError("address label write did not land")
         return committed
 
-    def get_address_label(self, address: str) -> AddressLabelRecord | None:
-        """The label row for one address, or ``None`` (never labeled).
+    def get_address_label_set(self, address: str) -> tuple[str, ...]:
+        """The committed label set of one address, canonically ordered
+        (tags in COIN_TAGS order, then free text sorted); ``()`` = unlabeled.
 
-        A pure READ: a miss is ``None``, never a nearest match and never a
+        A pure READ: a miss is ``()``, never a nearest match and never a
         fabricated label.
         """
-        row = self._conn.execute(
-            "SELECT * FROM address_labels WHERE address = ?", (address,)
-        ).fetchone()
-        return AddressLabelRecord.from_row(row) if row is not None else None
+        rows = self._conn.execute(
+            "SELECT label FROM address_label_set WHERE address = ?", (address,)
+        ).fetchall()
+        return _canonical_label_members(row["label"] for row in rows)
 
-    def get_address_labels(self) -> list[AddressLabelRecord]:
-        """Every address label on record, ordered by address (deterministic).
+    def get_address_label_sets(self) -> dict[str, tuple[str, ...]]:
+        """Every labeled address → its canonically ordered set (address order).
 
-        The listing surface for future narration (TCK-CHAT-003's
-        "labels you've used most" buttons count coins per label off this);
-        rows keyed by address survive rescans unchanged (§1.3's lesson).
+        The one read the selection join and the listing surfaces ride: an
+        address with no members is ABSENT (unlabeled = no rows, never an
+        empty-string row — the v2 lesson), and rows keyed by address survive
+        rescans unchanged (§1.3's crux, kept by v6). Small table, global read
+        — addresses are globally unique keys (``addresses.address``
+        discipline), so a wallet-scoped variant would answer the same
+        question for zero extra honesty.
         """
         rows = self._conn.execute(
-            "SELECT * FROM address_labels ORDER BY address"
+            "SELECT address, label FROM address_label_set ORDER BY address, label"
         ).fetchall()
-        return [AddressLabelRecord.from_row(r) for r in rows]
+        grouped: dict[str, list[str]] = {}
+        for row in rows:
+            grouped.setdefault(row["address"], []).append(row["label"])
+        return {address: _canonical_label_members(m) for address, m in grouped.items()}
 
     # ---------------------------------------------------------------- utxos
 
@@ -1107,143 +1345,15 @@ class Store(AbstractContextManager["Store"]):
         ).fetchall()
         return [UtxoRecord.from_row(r) for r in rows]
 
-    # ---------------------------------------------------------- coin labels
+    # ------------------------------------------------ coin labels (LEGACY v2)
     #
-    # TCK-UTXO-001 (docs/ux-utxo-notes-design.md §1.3/§1.4): per-OUTPOINT
-    # closed-set tags + one free-text note. These typed accessors are the ONLY
-    # sanctioned writers (the chain_base_url / gap_limit precedent): tag-set
-    # and note-length validation live here, fail-closed, before anything
-    # reaches disk; error messages are value-free (label text is user data,
-    # same class as an address — never echoed into exceptions/logs). Labels
-    # are consumed by DETERMINISTIC code only and NEVER enter model context.
-
-    def set_coin_label(
-        self,
-        wallet_id: int,
-        txid: str,
-        vout: int,
-        tags: Iterable[str] = (),
-        note: str | None = None,
-    ) -> CoinLabelRecord | None:
-        """Set (replace) one coin's tags + note; returns the stored row.
-
-        Multi-tag is allowed (the §1.4 partition classes combine; lineage
-        unions input tag sets). An empty tag list stores "no tags"; a blank
-        (``""``) note clears the note field while keeping the tags. With
-        NEITHER tags nor a note the whole row is DELETED — a bare re-label
-        clears (§1.3: "no /label with no tags and no note clears"), and an
-        unlabeled coin is *no row*, never an empty row.
-
-        Raises value-free :class:`StoreError` for an unknown tag, an
-        over-long/blank-but-present note, or a malformed outpoint;
-        :class:`StoreIntegrityError` for a FK violation (no such wallet).
-        """
-        _check_label_outpoint(txid, vout)
-        try:
-            canonical = normalize_coin_tags(tags)
-        except ValueError as exc:
-            raise StoreError("coin tags must come from the closed tag set") from exc
-        if note is not None:
-            if not isinstance(note, str):
-                raise StoreError("coin note must be text")
-            if len(note) > COIN_NOTE_MAX_CHARS:
-                raise StoreError("coin note exceeds the maximum length")
-            note = note or None
-        if not canonical and note is None:
-            self.clear_coin_label(wallet_id, txid, vout)
-            return None
-        record = CoinLabelRecord(wallet_id, txid, vout, canonical, note)
-        try:
-            with self._transaction():
-                self._conn.execute(_COIN_LABEL_UPSERT_SQL, record.to_row())
-        except sqlite3.IntegrityError as exc:
-            raise _wrap_integrity(exc) from exc
-        except sqlite3.Error as exc:
-            raise _wrap(exc) from exc
-        return record
-
-    def get_coin_label(self, wallet_id: int, txid: str, vout: int) -> CoinLabelRecord | None:
-        """The label row for one outpoint, or ``None`` (unlabeled)."""
-        row = self._conn.execute(
-            "SELECT * FROM coin_labels WHERE wallet_id = ? AND txid = ? AND vout = ?",
-            (wallet_id, txid, vout),
-        ).fetchone()
-        return CoinLabelRecord.from_row(row) if row is not None else None
-
-    def get_coin_labels(self, wallet_id: int) -> list[CoinLabelRecord]:
-        """Every label row for a wallet (unspent AND spent coins — rows keyed
-        by outpoint survive rescans and stay after a coin is spent, §1.2)."""
-        rows = self._conn.execute(
-            "SELECT * FROM coin_labels WHERE wallet_id = ? ORDER BY txid, vout",
-            (wallet_id,),
-        ).fetchall()
-        return [CoinLabelRecord.from_row(r) for r in rows]
-
-    def clear_coin_label(self, wallet_id: int, txid: str, vout: int) -> None:
-        """Delete one coin's label row (idempotent: no row = already clear)."""
-        _check_label_outpoint(txid, vout)
-        try:
-            with self._transaction():
-                self._conn.execute(
-                    "DELETE FROM coin_labels WHERE wallet_id = ? AND txid = ? AND vout = ?",
-                    (wallet_id, txid, vout),
-                )
-        except sqlite3.Error as exc:
-            raise _wrap(exc) from exc
-
-    def propagate_coin_lineage(
-        self,
-        wallet_id: int,
-        txid: str,
-        output_vouts: Sequence[int],
-        spent_inputs: Sequence[tuple[str, int]],
-    ) -> None:
-        """Lineage-on-broadcast (design doc §1.3): our transaction's outputs
-        inherit the UNION of its wallet inputs' tag sets.
-
-        Conservative taint: a coin made by mixing carries both classes and
-        thereafter counts on both sides of the selection partition (kyc-side
-        is the fail-safe direction). Notes are display-only history and are
-        NEVER inherited; only tags are. Inputs without rows contribute
-        nothing — a union with no tags writes no row at all (unlabeled stays
-        unlabeled). Idempotent: an existing output row's tags merge into the
-        same union and its note is preserved.
-
-        Validation is fail-closed and value-free; the whole write is one
-        transaction (never a partially-inherited coin).
-        """
-        _check_label_txid(txid)
-        for in_txid, in_vout in spent_inputs:
-            _check_label_outpoint(in_txid, in_vout)
-        for vout in output_vouts:
-            _check_label_vout(vout)
-        input_tags: set[str] = set()
-        try:
-            for in_txid, in_vout in spent_inputs:
-                row = self.get_coin_label(wallet_id, in_txid, in_vout)
-                if row is not None:
-                    input_tags.update(row.tags)
-        except sqlite3.Error as exc:
-            raise _wrap(exc) from exc
-        if not input_tags:
-            return  # unlabeled inputs → unlabeled outputs (no rows written)
-        with self._atomic():
-            for vout in output_vouts:
-                tag_set = set(input_tags)
-                existing = self.get_coin_label(wallet_id, txid, vout)
-                if existing is not None:
-                    tag_set.update(existing.tags)
-                tags = tuple(tag for tag in COIN_TAGS if tag in tag_set)
-                self._conn.execute(
-                    _COIN_LABEL_UPSERT_SQL,
-                    (
-                        wallet_id,
-                        txid,
-                        vout,
-                        ",".join(tags),
-                        existing.note if existing is not None else None,
-                    ),
-                )
+    # TCK-UTXO-001's outpoint-keyed accessors (set/get/list/clear plus
+    # propagate_coin_lineage) are DELETED, not deprecated: under the ratified
+    # labeling model (TCK-LABELS-UNIFY, schema v6) the ADDRESS label SET is
+    # the single source of truth, and a coin-level writer that selection
+    # ignores would be a lie-machine. The migrated-but-retained coin_labels
+    # rows (unresolvable spent-coin history) have no reader in code — by
+    # design, stated where the table itself is documented above.
 
     # --------------------------------------------------------- transactions
 
@@ -1341,16 +1451,15 @@ class Store(AbstractContextManager["Store"]):
         sync state — no order dependencies exist (every row references only
         the pre-existing wallet row).
 
-        Coin labels (schema v2) are DELIBERATELY absent from this write-set:
-        the UTXO snapshot replace touches only the ``utxos`` table, so
-        outpoint-keyed ``coin_labels`` rows survive every rescan unchanged
-        (and remain after the coin is spent) — see :meth:`set_coin_label`.
-        Address-registry rows (schema v4) are absent for the same reason:
-        a number is a FIRST-SHOWING fact the narration surfaces write,
-        never something a scan may assign, re-stamp, or clear. Address
-        labels (schema v5) likewise: a label is a USER fact, written only
-        through :meth:`set_address_label`; no scan can clear, re-assign,
-        or fabricate one.
+        Label surfaces are DELIBERATELY absent from this write-set: the UTXO
+        snapshot replace touches only the ``utxos`` table, so the (schema v6)
+        ``address_label_set`` — the labeling source of truth, like the
+        (schema v4) registry rows — survives every rescan unchanged. A label
+        is a USER fact, written only through :meth:`add_address_labels`
+        (and the broadcast-time inheritance that runs through it); no scan
+        can clear, re-assign, or fabricate one. The write-frozen legacy
+        ``coin_labels`` history rides outside the write-set for the same
+        reason.
 
         Superseded retirement (schema v3, TCK-RBF-001) lands through this
         SAME transaction: the scan's tx upsert is the one place that writes

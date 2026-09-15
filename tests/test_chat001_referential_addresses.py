@@ -210,8 +210,13 @@ class TestSchemaV4Migration:
     """The RBF-001 pattern: versioned, additive, idempotent, fail-closed."""
 
     def _as_v3_file(self, db: Path) -> None:
+        from localwallet.store.db import _COIN_LABELS_DDL
+
         raw = sqlite3.connect(db)
         raw.execute("DROP TABLE address_registry")
+        # A REAL v3 file carries coin_labels (a fresh v6 DB no longer
+        # creates it; the v5→v6 fold requires the v5-contract tables).
+        raw.executescript(_COIN_LABELS_DDL)
         raw.execute("PRAGMA user_version=3")
         raw.commit()
         raw.close()
@@ -223,12 +228,12 @@ class TestSchemaV4Migration:
             store.upsert_txs([])  # touch the v3 surface
         self._as_v3_file(db)
         with Store(db) as store:
-            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
+            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
             assert store.list_address_registry(wallet.id) == []  # empty, never fabricated
             rec = store.note_address_shown(wallet.id, "bc1qa", shown_at=7)
             assert rec.number == 1
         with Store(db) as store:  # stable reopen, no re-run
-            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 6
             assert store.get_address_by_number(wallet.id, 1).address == "bc1qa"
 
     def test_migration_idempotent_half_applied(self, tmp_path: Path) -> None:
@@ -237,16 +242,19 @@ class TestSchemaV4Migration:
         db = tmp_path / "store.db"
         with Store(db):
             pass
+        from localwallet.store.db import _COIN_LABELS_DDL
+
         raw = sqlite3.connect(db)
+        raw.executescript(_COIN_LABELS_DDL)  # a real v3 file has it
         raw.execute("PRAGMA user_version=3")
         raw.commit()
         raw.close()
         with Store(db) as store:
-            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 6
 
     def test_fresh_create_is_v4(self, tmp_path: Path) -> None:
         with Store(tmp_path / "fresh.db") as store:
-            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 6
 
     def test_scan_persist_never_touches_registry(self) -> None:
         """The registry is a DISPLAY fact: the scan's composite write (which

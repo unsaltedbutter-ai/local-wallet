@@ -26,8 +26,8 @@ The contract (USER DIRECTION 2026-09-09 items 5/6/8/9/10; ADR-0018 amendment
   test_setup_command.py); the Electrum probe reuses M1's handshake genesis
   gate via ``_probe_chain_backend``;
 * ``resync_now`` (direction 6) re-runs the full SCAN-003 rebuild scan and
-  TAGS SURVIVE — ``coin_labels`` is a separate table, never in the scan
-  write-set (pinned below, pre- and post-hot-swap);
+  TAGS SURVIVE — ``address_label_set`` (schema v6) is a separate table,
+  never in the scan write-set (pinned below, pre- and post-hot-swap);
 * a ``gap_limit`` apply whose value ACTUALLY CHANGED fires the same resync
   (direction 8) — UNLESS it NARROWED the window (TCK-GAP-001), which is
   applied WITHOUT an auto-rescan (``resync: "no_rescan"``) plus the
@@ -629,32 +629,32 @@ def test_resync_now_reruns_full_scan_and_tags_survive(
 ) -> None:
     """Deliverable 5 (direction 6): ``resync_now`` re-runs the FULL rebuild
     scan (the --rescan semantics, "as though the zpub had been entered for
-    the first time") — and COIN TAGS SURVIVE: ``coin_labels`` is a separate
-    table, never in the scan write-set (store/db.py's contract, pinned here
-    for both a plain resync AND the hot-swap resync)."""
+    the first time") — and COIN TAGS SURVIVE: the address label set
+    (``address_label_set``, schema v6) is a separate table, never in the
+    scan write-set (store/db.py's contract, pinned here for both a plain
+    resync AND the hot-swap resync — labels key the ADDRESS, so a rescan
+    rewriting the utxo snapshot cannot touch them)."""
     wiring, commands = _mk_wiring(tmp_path, monkeypatch)
     scan = wiring.scan
     assert scan is not None
     scan.gate = StartupScan(enabled=True)  # a startup scan completed already
     scan.gate.mark_done()
-    label = wiring.store.set_coin_label(
-        wiring.wallet.id, "ab" * 32, 0, tags=("kyc",), note="mine"
-    )
-    assert label is not None
+    stored = wiring.store.add_address_labels("bc1qmine-example", ["kyc", "mine"])
+    assert stored == ("kyc", "mine")
     assert scan.resync_now() is True
     assert scan.gate.state == "running"
     narration = _drain(wiring, commands)
     assert scan.gate.state == "done"
     assert any("Rescan complete" in line for line in narration)
     # Tags survived the rescan…
-    assert wiring.store.get_coin_label(wiring.wallet.id, "ab" * 32, 0) is not None
+    assert wiring.store.get_address_label_set("bc1qmine-example") == ("kyc", "mine")
     # …and survive the HOT-SWAP-TRIGGERED resync too:
     flow, _seen = _mk_flow(wiring, commands)
     error, fields = flow.apply(NEW_URL)
     assert error is None and fields["resync"] == "started"
     _drain(wiring, commands)
-    kept = wiring.store.get_coin_label(wiring.wallet.id, "ab" * 32, 0)
-    assert kept is not None and kept.tags == ("kyc",) and kept.note == "mine"
+    kept = wiring.store.get_address_label_set("bc1qmine-example")
+    assert kept == ("kyc", "mine")
     wiring.store.close()
 
 

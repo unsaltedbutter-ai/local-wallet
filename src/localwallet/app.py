@@ -205,7 +205,6 @@ from localwallet.store import (
     ADDRESS_USED,
     BRANCH_CHANGE,
     BRANCH_RECEIVE,
-    COIN_NOTE_MAX_CHARS,
     COIN_TAGS,
     DIR_IN,
     DIR_OUT,
@@ -2354,19 +2353,18 @@ def _consolidation_coin_rows(
 ) -> tuple[dict[str, object], ...]:
     """The wallet's coins as consolidation-list dicts, canonical ASCENDING
     order ``(value_sats, txid, vout)`` — the one deterministic order every
-    chooser in this app uses. Label display text joins the stored tags +
-    note verbatim (print-only); ``tags`` rides the raw closed-set ids for
-    the roll-up grouping (code data, never a narration leak — nothing here
-    reaches a prompt: the ask renderer prints, the model never sees)."""
+    chooser in this app uses. Since TCK-LABELS-UNIFY (schema v6) a coin's
+    labels are its ADDRESS's inherited set: the display text joins the
+    stored members verbatim (print-only) and ``tags`` rides the set's
+    closed-tag members for the roll-up grouping (code data, never a
+    narration leak — nothing here reaches a prompt: the ask renderer
+    prints, the model never sees)."""
     utxos = store.get_utxos_for_wallet(wallet_id)
-    labels = {
-        (row.txid.lower(), row.vout): row for row in store.get_coin_labels(wallet_id)
-    }
+    label_sets = store.get_address_label_sets()
     coins: list[dict[str, object]] = []
     for row in sorted(utxos, key=lambda u: (u.value_sats, u.txid.lower(), u.vout)):
-        label = labels.get((row.txid.lower(), row.vout))
-        tags = tuple(label.tags) if label is not None else ()
-        bits = [*tags, *([label.note] if label is not None and label.note else [])]
+        members = label_sets.get(row.address or "", ())
+        tags = tuple(member for member in members if member in COIN_TAGS)
         coins.append(
             {
                 "txid": row.txid,
@@ -2375,7 +2373,9 @@ def _consolidation_coin_rows(
                 "address": row.address,
                 "confirmed": row.confirmed,
                 "tags": tags,
-                "label": ", ".join(f"'{bit}'" for bit in bits) if bits else None,
+                "label": ", ".join(f"'{member}'" for member in members)
+                if members
+                else None,
             }
         )
     return tuple(coins)
@@ -2650,8 +2650,14 @@ class SendSession:
     §1.2/§1.3) are the ``/label`` session state: the most recent tx THIS
     wallet broadcast (what ``last`` resolves to) and the tx the one-line
     post-broadcast capture hint was already shown for (never repeated for
-    the same tx within the session). Terminal-channel display data —
-    labels themselves never enter model context.
+    the same tx within the session). ``last_broadcast_addresses``
+    (TCK-LABELS-UNIFY) carries that broadcast's OWN output addresses
+    (change/receive, derived at the inheritance write) — since the labeling
+    unit is the ADDRESS, this is what makes ``/label last`` reach a just-
+    broadcast coin's address before any rescan (the v5 trick of resolving
+    the target through the lineage's own outpoint rows dies with
+    ``coin_labels``). Terminal-channel display data — labels themselves
+    never enter model context.
 
     ``hw_sign_wanted`` / ``file_sign_export_once`` (TCK-HW-005 slice C)
     are the CODE-STAMPED sign-routing choices the user's own words set —
@@ -2709,6 +2715,7 @@ class SendSession:
     card_render: list[str] | None = None
     last_broadcast_txid: str | None = None
     label_hint_txid: str | None = None
+    last_broadcast_addresses: tuple[str, ...] = ()
     hw_sign_wanted: bool = False
     file_sign_export_once: bool = False
     bump_ask: _BumpAsk | None = None
@@ -3031,7 +3038,8 @@ def build_dispatch_table(
             session=send_session,
         ),
         IntentName.BROADCAST_TX: _make_broadcast_tx_handler(
-            tx_flow, client, store, wallet_id, session=send_session, output=output
+            tx_flow, client, store, wallet_id, parsed,
+            session=send_session, output=output,
         ),
         IntentName.TX_STATUS: _make_tx_status_handler(
             client, tx_flow, scan_gate, store=store, wallet_id=wallet_id
@@ -3065,6 +3073,28 @@ def build_dispatch_table(
             scan_gate=scan_gate,
         ),
     }
+
+
+def _kyc_side_addresses(store: Store) -> frozenset[str]:
+    """The addresses whose label set puts their coins on the KYC side
+    (TCK-LABELS-UNIFY: since schema v6 the ADDRESS's inherited set is the
+    selection input — one address = one private key = one provenance; the
+    outpoint-keyed ``coin_labels`` are gone as an input, and unlabeled
+    addresses default other-side exactly as unlabeled coins once did).
+
+    The partition read is the engine's own :func:`coin_partition` over the
+    set's members (closed-tag members decide; free-text members touch
+    neither side), so this module and ``tx/`` never grow a second tag rule.
+    Label TEXT stops here — the only thing that leaves is an address set of
+    booleans: never model context, never logs, never the tx/ engine
+    (ADR-0012 amendment; docs/ux-utxo-notes-design.md §4.1 — the dispatcher
+    joins plain data onto the snapshot, the engine reads no store).
+    """
+    return frozenset(
+        address
+        for address, members in store.get_address_label_sets().items()
+        if coin_partition(members)[0]
+    )
 
 
 def _respond_handler(envelope: Envelope) -> dict[str, object]:
@@ -4416,30 +4446,29 @@ def _make_create_tx_handler(
 
         # 6. Selection + PSBT via the pure tx engine.
         #
-        # 6a. Tag-aware join (TCK-UTXO-004, docs/ux-utxo-notes-design.md
-        # §4.1 — dispatcher-owned, model-free): coin_labels rows become the
-        # ONE plain boolean the selection layer reads (``kyc_side``; a
-        # mixed-lineage coin is kyc-side — the §1.3 fail-safe). Tag and note
-        # TEXT stops here: never model context, never logs, never tx/ (labels
-        # arrive as plain data, the same discipline as rate and settings —
-        # ADR-0012 amendment). Unlabeled coins stay untagged (other side), so
-        # a wallet without labels selects exactly as before the amendment.
+        # 6a. Label-aware join (TCK-UTXO-004 → TCK-LABELS-UNIFY, design doc
+        # §4.1 — dispatcher-owned, model-free): each coin INHERITS its
+        # ADDRESS's label set (schema v6: the address is the labeling unit;
+        # the outpoint-keyed coin rows are no longer a selection input), and
+        # the join produces the ONE plain boolean the selection layer reads
+        # (``kyc_side``; a kyc+other set is the §1.3 fail-safe mixed-side).
+        # Label TEXT stops here: never model context, never logs, never tx/
+        # (labels arrive as plain data, the same discipline as rate and
+        # settings — ADR-0012 amendment). Unlabeled addresses stay untagged
+        # (other side), so a wallet without labels selects exactly as before
+        # the amendment — and exactly as the same data did pre-migration.
         try:
-            label_rows = store.get_coin_labels(wallet_id)
+            kyc_addresses = _kyc_side_addresses(store)
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
         selection_inputs: Sequence[Any] = utxos
-        kyc_outpoints = {
-            (row.txid, row.vout)
-            for row in label_rows
-            if coin_partition(row.tags)[0]
-        }
-        if kyc_outpoints:
+        if kyc_addresses:
             # Only the kyc-side coins are re-wrapped: attribute-absent means
-            # other-side under the engine's duck-type contract.
+            # other-side under the engine's duck-type contract. A coin with
+            # no address (a snapshot surprise) is other-side, as unlabeled.
             selection_inputs = [
                 SimpleNamespace(**vars(utxo), kyc_side=True)
-                if (utxo.txid, utxo.vout) in kyc_outpoints
+                if utxo.address in kyc_addresses
                 else utxo
                 for utxo in utxos
             ]
@@ -4946,28 +4975,23 @@ def _make_self_transfer_handler(
                     return {"error": "chain_unavailable", "detail": str(exc)}
             utxo_rows = store.get_utxos_for_wallet(wallet_id)
             tx_rows = store.get_txs_for_wallet(wallet_id)
-            label_rows = store.get_coin_labels(wallet_id)
+            label_sets = store.get_address_label_sets()
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
         all_coins, err = _own_sources(utxo_rows)
         if err is not None:
             return err
         clock = int(time.time())
-        labels = {
-            (row.txid.lower(), row.vout): row for row in label_rows
-        }
         first_seen = {row.txid: row.first_seen for row in tx_rows}
 
-        def _display(key: tuple[str, int]) -> tuple[str | None, tuple[str, ...]]:
-            """The coin's stored label (display text + intercept match
-            terms) — user data, terminal material ONLY: handler results
-            are not prompt context, and ask answers route through the
-            deterministic intercept, so label words never reach the
-            model (the RBF-004 discipline, reused verbatim)."""
-            label = labels.get(key)
-            if label is None:
-                return None, ()
-            bits = [*label.tags] + ([label.note] if label.note else [])
+        def _display(address: str | None) -> tuple[str | None, tuple[str, ...]]:
+            """The coin's inherited label set (display text + intercept
+            match terms) — user data, terminal material ONLY: handler
+            results are not prompt context, and ask answers route through
+            the deterministic intercept, so label words never reach the
+            model (the RBF-004 discipline, reused verbatim; the set is the
+            address's, TCK-LABELS-UNIFY)."""
+            bits = label_sets.get(address or "", ())
             if not bits:
                 return None, ()
             return (
@@ -5042,9 +5066,9 @@ def _make_self_transfer_handler(
                         if first_seen.get(src.txid) is None
                         else max(0, clock - int(first_seen[src.txid]))
                     ),
-                    "label": _display((src.txid.lower(), src.vout))[0],
+                    "label": _display(row.address)[0],
                 }
-                for i, (src, _) in enumerate(inbound)
+                for i, (src, row) in enumerate(inbound)
             ]
             return _coin_ask("coin", entries=tuple(entries))
         assert chosen is not None  # every branch above resolves or returns
@@ -5095,8 +5119,8 @@ def _make_self_transfer_handler(
         else:
             options: list[_CpfpOption] = []
             if len(eligible) == 1:
-                src, _row = eligible[0]
-                display, terms = _display((src.txid.lower(), src.vout))
+                src, row = eligible[0]
+                display, terms = _display(row.address)
                 options.append(
                     _CpfpOption(
                         framing="coin",
@@ -5107,8 +5131,11 @@ def _make_self_transfer_handler(
                     )
                 )
             else:
-                for framing, (src, _) in (("smallest", eligible[0]), ("largest", eligible[-1])):
-                    display, terms = _display((src.txid.lower(), src.vout))
+                for framing, (src, row) in (
+                    ("smallest", eligible[0]),
+                    ("largest", eligible[-1]),
+                ):
+                    display, terms = _display(row.address)
                     options.append(
                         _CpfpOption(
                             framing=framing,
@@ -5477,20 +5504,16 @@ def _make_self_transfer_handler(
                 ]
                 if not below:
                     return {"error": "self_nothing_below"}
-                # Privacy pools (TCK-UTXO-002): partition by stored coin tags,
-                # NEVER merge across sides. The larger-total pool wins; ties go
-                # other-side first (the fixed pool order).
+                # Privacy pools (TCK-UTXO-002, address-inherited since
+                # TCK-LABELS-UNIFY): partition by each coin's ADDRESS label
+                # set, NEVER merge across sides. The larger-total pool wins;
+                # ties go other-side first (the fixed pool order).
                 try:
-                    label_rows = store.get_coin_labels(wallet_id)
+                    kyc_addresses = _kyc_side_addresses(store)
                 except (StoreError, sqlite3.Error) as exc:
                     return _store_error(exc)
-                kyc_outpoints = {
-                    (row.txid, row.vout)
-                    for row in label_rows
-                    if coin_partition(row.tags)[0]
-                }
-                kyc_pool = [u for u in below if (u.txid, u.vout) in kyc_outpoints]
-                other_pool = [u for u in below if (u.txid, u.vout) not in kyc_outpoints]
+                kyc_pool = [u for u in below if u.address in kyc_addresses]
+                other_pool = [u for u in below if u.address not in kyc_addresses]
                 other_total = sum(u.value_sats for u in other_pool)
                 kyc_total = sum(u.value_sats for u in kyc_pool)
                 if kyc_pool and other_pool:
@@ -5835,7 +5858,7 @@ def _make_bump_fee_handler(
                     # detail is scrubbed by the chain/scan layers — safe verbatim.
                     return [], {"error": "chain_unavailable", "detail": str(exc)}
             utxo_rows = store.get_utxos_for_wallet(wallet_id)
-            label_rows = store.get_coin_labels(wallet_id)
+            label_sets = store.get_address_label_sets()
             by_address = {
                 r.address: r
                 for r in (
@@ -5848,9 +5871,6 @@ def _make_bump_fee_handler(
         except (StoreError, sqlite3.Error) as exc:
             return [], _store_error(exc)
         spent = {(c.txid.lower(), c.vout) for c in original.inputs}
-        labels = {
-            (row.txid.lower(), row.vout): row for row in label_rows
-        }
         coins: list[_BumpFundingOption] = []
         for u in utxo_rows:
             if u.confirmed != 1 or not u.address:
@@ -5865,19 +5885,14 @@ def _make_bump_fee_handler(
                 script = bytes(address_to_scriptpubkey(u.address).data)
             except Exception:  # noqa: BLE001,S112 — containment: a junk address row simply leaves the offerable set (value-free); the chooser only offers what it can fund, silently SKIPPING a broken row is the documented policy
                 continue
-            label = labels.get(key)
+            bits = label_sets.get(u.address, ())
             display: str | None = None
             terms: tuple[str, ...] = ()
-            if label is not None:
-                bits = [*label.tags] + ([label.note] if label.note else [])
-                if bits:
-                    display = ", ".join(f"'{bit}'" for bit in bits)
-                    terms = tuple(
-                        word
-                        for bit in bits
-                        for word in bit.lower().split()
-                        if word
-                    )
+            if bits:
+                display = ", ".join(f"'{bit}'" for bit in bits)
+                terms = tuple(
+                    word for bit in bits for word in bit.lower().split() if word
+                )
             coins.append(
                 _BumpFundingOption(
                     framing="",
@@ -6790,6 +6805,7 @@ def _make_broadcast_tx_handler(
     client: ChainClient,
     store: Store,
     wallet_id: int,
+    parsed: ParsedKey,
     *,
     session: SendSession | None = None,
     output: _Output | None = None,
@@ -7001,47 +7017,93 @@ def _make_broadcast_tx_handler(
         ):
             session.cpfp_pending = None
 
-        # 5. Coin-label lineage (TCK-UTXO-001, design doc §1.3): our outputs
-        #    inherit the UNION of the wallet's spent inputs' tag sets — a
-        #    mixed-lineage coin carries both classes (the fail-safe side for
-        #    the deterministic partition check). Which outputs are ours is the
-        #    revalidated positional contract: change rides LAST when present
-        #    (tx/psbt.py + the sign-time revalidation), and this SIGNED record
-        #    is byte-frozen, so vout = count-1 is ours exactly when
-        #    change_sats is set. A self-transfer (TCK-TX-SELF-001) owns EVERY
-        #    output (fresh receive plan, no external destination) — ALL vouts
-        #    inherit, which is what keeps a consolidated/split coin on its
-        #    pool side after the reshuffle. A send whose recipient is our own
-        #    receive address inherits nothing there (ponytail: honest-bounds
-        #    edge — the coin appears unlabeled on the next scan and /label
-        #    covers it; full script-ownership matching is the provenance
-        #    view's problem, not this capture path's). Purely local
-        #    bookkeeping — labeling never causes network I/O — and it must
-        #    never undo a completed broadcast, so EVERY failure is contained
-        #    value-free. TCK-CONS-001: when this broadcast is a staged
-        #    consolidation plan (the conversation's marker matches the flow
-        #    record), the inherited union gets the closed-set
-        #    ``consolidation`` tag ADDED (a second tag describing what this
-        #    payment was, display-only per §1.4 — never a partition word)
-        #    and the free-note RECORD "consolidated from N outputs" — N
-        #    counted from the broadcast's own inputs, never from user text.
-        owned_vouts: tuple[int, ...] = ()
+        # 5. Label inheritance (TCK-UTXO-001 §1.3 → TCK-LABELS-UNIFY: the
+        #    ADDRESS label set is the truth, so our outputs' ADDRESSES
+        #    inherit the UNION of the closed-tag members of the spent
+        #    inputs' address sets — a mixed-lineage address carries both
+        #    classes, the fail-safe side for the deterministic partition;
+        #    free-text members are display-only history and are NEVER
+        #    inherited). Which outputs are ours is the revalidated
+        #    positional contract: change rides LAST when present (tx/psbt.py
+        #    + the sign-time revalidation), and this SIGNED record is
+        #    byte-frozen, so vout = count-1 is ours exactly when
+        #    change_sats is set — its address is the branch-1 address at
+        #    next_index-1 (the allocation advanced at staging; the SAME
+        #    recovery the sign-time intent re-derivation uses, single-
+        #    pending-tx invariant). A self-transfer (TCK-TX-SELF-001) owns
+        #    EVERY output (fresh receive plan, no external destination) —
+        #    all destination addresses inherit, which is what keeps a
+        #    consolidated/split coin on its pool side after the reshuffle.
+        #    A send whose recipient is our own receive address inherits
+        #    nothing there (ponytail: honest-bounds edge — label that
+        #    address directly and its coins inherit; full script-ownership
+        #    matching is the provenance view's problem, not this capture
+        #    path's). Purely local bookkeeping — labeling never causes
+        #    network I/O — and it must never undo a completed broadcast, so
+        #    EVERY failure is contained value-free. TCK-CONS-001: when this
+        #    broadcast is a staged consolidation plan (the conversation's
+        #    marker matches the flow record), the inherited union gets the
+        #    closed-set ``consolidation`` tag ADDED (a second tag describing
+        #    what this payment was, display-only per §1.4 — never a
+        #    partition word) and the member "consolidated from N outputs" —
+        #    N counted from the broadcast's own inputs, never from user
+        #    text — joins each owned address's set. Inputs the snapshot no
+        #    longer resolves contribute nothing (a union with no tags writes
+        #    nothing; unlabeled stays unlabeled — engine-internal change
+        #    addresses never gain a label the engine did not witness).
+        owned_addresses: tuple[str, ...] = ()
         if confirmed is not None:
             try:
                 signed_psbt = PSBT.parse(base64.b64decode(signed.psbt_base64))
-                n_vouts = len(signed_psbt.tx.vout)
                 if confirmed.self_payment_indices is not None:
-                    owned_vouts = tuple(range(n_vouts))
+                    receive_deriver = BranchDeriver(parsed, BRANCH_RECEIVE)
+                    owned_addresses = tuple(
+                        receive_deriver.address(i)
+                        for i in confirmed.self_payment_indices
+                    )
                 elif confirmed.change_sats is not None:
-                    owned_vouts = (n_vouts - 1,)
-                if owned_vouts:
+                    change_index = (
+                        store.get_derivation(wallet_id, BRANCH_CHANGE).next_index - 1
+                    )
+                    owned_addresses = (
+                        BranchDeriver(parsed, BRANCH_CHANGE).address(change_index),
+                    )
+                # ``/label last`` resolution BEFORE the next scan
+                # (TCK-LABELS-UNIFY: the target of ``last`` is now the
+                # broadcast's OWN addresses, session-carried — the store
+                # resolves outpoint→address only while the snapshot still
+                # holds the coins). Stamped here, the moment ``owned_addresses``
+                # is FINAL — BEFORE any store read/write in the inheritance
+                # block below — so it is set on EVERY path: a store call in
+                # that block raising (sqlite-busy etc., contained by the
+                # except below) can no longer leave ``last`` pointing at the
+                # PRIOR broadcast's addresses while ``last_broadcast_txid``
+                # advances. A plain send with no own outputs (no change, no
+                # self-payment) CLEARS any previous broadcast's addresses so
+                # ``/label last`` never labels the stale prior tx.
+                if session is not None:
+                    session.last_broadcast_addresses = owned_addresses
+                if owned_addresses:
                     spent_inputs = tuple(
                         (bytes(reversed(vin.txid)).hex(), vin.vout)
                         for vin in signed_psbt.tx.vin
                     )
-                    store.propagate_coin_lineage(
-                        wallet_id, txid, owned_vouts, spent_inputs
-                    )
+                    # Input addresses: the unspent snapshot still carries
+                    # the coins THIS tx spends (the next scan is what
+                    # removes them) — the store's only outpoint→address
+                    # record, read fresh.
+                    input_addresses = {
+                        (u.txid.lower(), u.vout): u.address
+                        for u in store.get_utxos_for_wallet(wallet_id)
+                    }
+                    label_sets = store.get_address_label_sets()
+                    inherited: set[str] = set()
+                    for key in spent_inputs:
+                        members = label_sets.get(input_addresses.get(key) or "", ())
+                        inherited.update(t for t in members if t in COIN_TAGS)
+                    if inherited:
+                        for address in owned_addresses:
+                            store.add_address_labels(address, inherited)
                     if (
                         session is not None
                         and session.cons_pending is not None
@@ -7049,15 +7111,9 @@ def _make_broadcast_tx_handler(
                     ):
                         n_from = len(spent_inputs)
                         record = f"consolidated from {n_from} output{'s' if n_from != 1 else ''}"
-                        for out_vout in owned_vouts:
-                            existing = store.get_coin_label(wallet_id, txid, out_vout)
-                            merged = tuple(
-                                dict.fromkeys(
-                                    [*(existing.tags if existing else ()), "consolidation"]
-                                )
-                            )
-                            store.set_coin_label(
-                                wallet_id, txid, out_vout, merged, record
+                        for address in owned_addresses:
+                            store.add_address_labels(
+                                address, ("consolidation", record)
                             )
             except Exception:  # noqa: BLE001 — containment: embit/store errors vary; missed tag-inheritance is annotation loss, never a money or broadcast failure
                 result.setdefault(
@@ -8470,8 +8526,8 @@ class ScanFlow:
         rescan flag flips here).
 
         Tags survive by construction: ``persist_scan``'s write-set is the
-        utxo/address/tx/sync-state tables only — ``coin_labels`` is a
-        separate table the scan never touches (pinned in
+        utxo/address/tx/sync-state tables only — the ``address_label_set``
+        (schema v6) is a separate table the scan never touches (pinned in
         tests/test_backend_hotswap.py; store/db.py's own contract note).
 
         Concurrency guard (single-threaded truth, engine thread): ``False``
@@ -9910,8 +9966,8 @@ class ResyncRequest:
     (TCK-BACKEND-002 deliverable 5). The browser's button carries NO data;
     the ENGINE thread runs the existing SCAN-003 rebuild path (the ``--rescan``
     semantics: full rescan as-if the key was entered for the first time) —
-    tags survive by construction (``coin_labels`` is a separate table, never
-    in the scan write-set; pinned by tests/test_backend_hotswap.py). The
+    tags survive by construction (``address_label_set`` is a separate table,
+    never in the scan write-set; pinned by tests/test_backend_hotswap.py). The
     concurrency guard is single-threaded truth: one answer, one scan at a
     time (:meth:`ScanFlow.resync_now` refuses while a scan owns the worker).
     """
@@ -11307,8 +11363,8 @@ def _pump(
         if isinstance(command, ResyncRequest):
             # Typed resync_now trigger (TCK-BACKEND-002 deliverable 5): the
             # ENGINE thread runs the existing SCAN-003 rebuild path (tags
-            # survive — coin_labels is outside the scan write-set by
-            # construction); the closed value-free status answers the button
+            # survive — address_label_set is outside the scan write-set
+            # by construction); the closed value-free status answers the button
             # and the scan's own progress/completion narration rides the
             # regular scan events. Emit turn_end so the web client re-reads
             # /state (scan_state flipped).
@@ -12374,7 +12430,7 @@ class ChainBackendFlow:
     that fetch's :class:`_ScanDone` is DISCARDED unpersisted by the
     :class:`ScanFlow` generation check (engine-thread-only persistence is
     preserved, no new threads). Tags survive the resync by construction
-    (``coin_labels`` is not in the scan write-set).
+    (``address_label_set`` is not in the scan write-set).
     """
 
     def __init__(
@@ -12689,7 +12745,8 @@ class ChainBackendFlow:
             session=w.session,
         )
         w.table[IntentName.BROADCAST_TX] = _make_broadcast_tx_handler(
-            w.flow, client, w.store, w.wallet.id, session=w.session, output=w.output
+            w.flow, client, w.store, w.wallet.id, w.parsed,
+            session=w.session, output=w.output,
         )
         w.table[IntentName.TX_STATUS] = _make_tx_status_handler(
             client,
@@ -13695,7 +13752,7 @@ def _repl(
 #: all deterministic transcript/channel intercepts, never model intents.
 _TRANSCRIPT_HELP: Final[str] = (
     "Commands: /details — reprint the pending transaction's full card; "
-    "/label — list or set your own coin tags and notes; "
+    "/label — list or add address labels (your coins inherit them); "
     "/setup — choose which server answers the app about your addresses "
     "(your own Electrum server or Bitcoin Core node, or the consented "
     "public Electrum server); "
@@ -13718,29 +13775,28 @@ _SETUP_CLI_ONLY: Final[str] = (
     "the same choice.)"
 )
 
-# ------------------------------------------------------------- /label (UTXO-001)
+# ------------------------------------------------------------- /label (UTXO-001 → LABELS-UNIFY)
 #
-# Coin tags and notes are USER-AUTHORED facts about the user's own coins, on
-# the deterministic transcript channel (ADR-0020, like /details): they never
-# reach the model, the gate, or the dispatcher (design doc §1.1/§4.4). The
-# copy below is code-owned and static except for the values echoed verbatim
-# from the store's typed writer (txid, stored tags, stored note — terminal
-# display, same class as /details printing addresses). Display always frames
-# them as the user's claim ("your note" / "you marked") — we verify nothing (§9).
+# Labels are USER-AUTHORED facts, on the deterministic transcript channel
+# (ADR-0020, like /details): they never reach the model, the gate, or the
+# dispatcher (design doc §1.1/§4.4). Since TCK-LABELS-UNIFY (schema v6) the
+# labeling unit is the ADDRESS (one address = one private key = one
+# provenance): ``/label [last | <txid>] …`` resolves the transaction's
+# wallet-owned outputs to their ADDRESSES and UNION-ADDS members to each
+# address's label set — a per-coin label is an addition to that address's
+# set, never a separate per-coin fact, and there is no per-coin clear
+# (labels for a whole address are the user's, and one coin's command must
+# never rewrite them). The copy below is code-owned and static except for
+# the values echoed verbatim from the store's read-back (address, the
+# committed set — terminal display, same class as /details printing
+# addresses). Display always frames them as the user's claim ("you marked"
+# / "your own words") — we verify nothing (§9).
 
-#: §1.4 closed tag set → the strings the user sees (display-only mapping;
-#: ids are what the deterministic selection layer consumes, TCK-UTXO-002).
-_LABEL_TAG_DISPLAY: Final[dict[str, str]] = {
-    "kyc": "KYC",
-    "exchange": "exchange",
-    "p2p": "peer to peer",
-    "purchase": "purchase",
-    "consolidation": "consolidation",
-}
 #: §1.2 command shape (terminal UI; never a model-facing string).
 _LABEL_USAGE: Final[str] = (
     'Usage: /label [last | <txid>] [tag words] ["your own words" after a |]'
-    " — bare /label lists your coins."
+    " — labels attach to the ADDRESS and its coins inherit; bare /label"
+    " lists your coins."
 )
 #: §4.3 label.unknown_tag — cause + the closed set + the free-note way out.
 _LABEL_UNKNOWN_TAG: Final[str] = (
@@ -13756,8 +13812,6 @@ _LABEL_NOTHING_LAST: Final[str] = (
 _LABEL_ERROR_STORE: Final[str] = (
     'I couldn\'t save that note — the database is busy; say "retry".'
 )
-#: §4.3 label.cleared.
-_LABEL_CLEARED: Final[str] = "Cleared your note for that transaction's coins."
 #: Fail-closed target shapes (value-free; the command is terminal-only so a
 #: malformed txid is named plainly, never quoted back).
 _LABEL_BAD_TXID: Final[str] = (
@@ -13768,14 +13822,15 @@ _LABEL_NO_TARGET: Final[str] = (
 )
 _LABEL_NO_WALLET: Final[str] = "No wallet is open yet — nothing to label."
 _LABEL_NOTE_TOO_LONG: Final[str] = (
-    f"That note is too long — {COIN_NOTE_MAX_CHARS} characters maximum. "
+    f"That note is too long — {ADDRESS_LABEL_MAX_CHARS} characters maximum. "
     'Shorten the text after the "|".'
 )
 _LABEL_STORE_UNAVAILABLE: Final[str] = "Labels are unavailable — no wallet store is open."
 _LABEL_NO_COINS: Final[str] = "No coins to show yet — the wallet has no unspent outputs."
 #: §4.3 label.list_head — the honesty frame (§9) on every listing.
 _LABEL_LIST_HEAD: Final[str] = (
-    "Your unspent coins — tags are what YOU marked (we never verify anything):"
+    "Your unspent coins — labels are what YOU marked (we never verify "
+    "anything; each coin carries its address's labels):"
 )
 #: §4.3 card.broadcast_hint — the ONE post-broadcast capture hint (§1.2):
 #: printed when no gate is armed (flow is terminal BROADCAST), static
@@ -13783,6 +13838,26 @@ _LABEL_LIST_HEAD: Final[str] = (
 _LABEL_BROADCAST_HINT: Final[str] = (
     'Want to remember what this was? Type /label last [tag] ["note"]'
 )
+#: Store-truth acks (TCK-LABELS-UNIFY): a success line exists iff the set
+#: carries the member — the text echoes ONLY the committed read-back from
+#: :meth:`Store.add_address_labels`, and it names what was stored: set
+#: membership at ADDRESS level, coins inheriting.
+_LABEL_SET_ACK: Final[str] = (
+    'Noted on address {address} — your labels: {labels}. Every coin at this '
+    "address, this one and any that land there later, carries them."
+)
+_LABEL_SET_KEPT: Final[str] = (
+    "Address {address} already carries those labels — nothing changed. "
+    "Your labels: {labels}."
+)
+#: Bare ``/label <target>`` now READS (there is no per-coin clear — the set
+#: belongs to the address, and one coin's command never rewrites it).
+_LABEL_SHOW_TARGET: Final[str] = (
+    "That transaction's coins carry these ADDRESS labels (adding more: "
+    "/label {target} kyc | your own words):"
+)
+_LABEL_SHOW_ROW: Final[str] = "  {address} — {labels}"
+_LABEL_UNLABELED: Final[str] = "(unlabeled)"
 
 
 def _handle_transcript_command(
@@ -13807,10 +13882,11 @@ def _handle_transcript_command(
     command, never a spoken decision: the word "details" is deliberately
     NOT in the gate's whitelists, so it can never confirm anything.
 
-    ``/label`` (TCK-UTXO-001) lists/sets/clears the user's OWN coin tags
-    and notes on the same channel — never model context, never a gate
-    answer, never an envelope; the store's typed accessors are the only
-    writers and own the fail-closed validation.
+    ``/label`` (TCK-UTXO-001, unified by TCK-LABELS-UNIFY) lists the wallet's
+    coins and UNION-ADDS labels to the ADDRESS sets the coins inherit —
+    same channel: never model context, never a gate answer, never an
+    envelope; the store's typed accessors are the only writers and own the
+    fail-closed validation.
 
     ``/setup`` (TCK-ONB-005, ADR-0023 step 5 against an EXISTING wallet)
     arms the onboarding flow's backend branch for the command loop: the
@@ -13881,33 +13957,27 @@ def _active_wallet_id(store: Store | None, output_fn: Callable[[str], None]) -> 
     return wallet.id
 
 
-def _label_tag_line(tags: Sequence[str]) -> str:
-    """Render a stored tag id list as the user-facing display strings (§1.4)."""
-    return ", ".join(_LABEL_TAG_DISPLAY.get(tag, tag) for tag in tags)
+def _label_members_line(members: Sequence[str]) -> str:
+    """One address's committed set as display text — members verbatim,
+    canonical order straight from the store read-back (store truth; the
+    closed tags sort first because the STORE orders them, not because the
+    renderer re-decides anything)."""
+    return ", ".join(members) if members else _LABEL_UNLABELED
 
 
-def _label_echo(txid: str, tags: Sequence[str], note: str | None) -> str:
-    """One §4.3 label.set line — txid verbatim, tags/note echoed AS STORED
-    (canonical order from the typed writer). Terminal display only."""
-    shown = f"Noted on transaction {txid}"
-    if tags:
-        shown += f" — your coin tags: {_label_tag_line(tags)}"
-    if note:
-        shown = f'{shown}{" ·" if tags else " —"} your note: "{note}"'
-    return shown
-
-
-def _list_coin_labels(store: Store, wallet_id: int, output_fn: Callable[[str], None]) -> None:
-    """Bare ``/label``: list tags/notes for the wallet's UNSPENT coins (§1.3).
+def _list_address_labels(store: Store, wallet_id: int, output_fn: Callable[[str], None]) -> None:
+    """Bare ``/label``: list the wallet's UNSPENT coins with the label set
+    each coin's ADDRESS carries (TCK-LABELS-UNIFY — coins inherit; two coins
+    at one address honestly show the same labels).
 
     Terminal-only, value-VERBATIM display is fine here (same class as the
     /details card — addresses/amounts go to the human, never the model).
-    Unlabeled coins fall back to ``(unlabeled)`` — no row, matching the
+    Unlabeled addresses fall back to ``(unlabeled)`` — no rows, matching the
     §5 provenance view's existing fallback shape.
     """
     try:
         utxos = store.get_utxos_for_wallet(wallet_id)
-        labels = {(r.txid, r.vout): r for r in store.get_coin_labels(wallet_id)}
+        label_sets = store.get_address_label_sets()
     except (StoreError, sqlite3.Error):
         output_fn(_LABEL_ERROR_STORE)
         return
@@ -13916,11 +13986,42 @@ def _list_coin_labels(store: Store, wallet_id: int, output_fn: Callable[[str], N
         return
     output_fn(_LABEL_LIST_HEAD)
     for u in utxos:
-        rec = labels.get((u.txid, u.vout))
-        tags = rec.tags if rec is not None else ()
-        note = rec.note if rec is not None else None
-        tail = "(unlabeled)" if not tags and not note else _label_echo(u.txid, tags, note)
-        output_fn(sanitize_tool_output(f"{u.txid}:{u.vout}  {u.value_sats} sats — {tail}"))
+        members = label_sets.get(u.address or "", ())
+        output_fn(
+            sanitize_tool_output(
+                f"{u.txid}:{u.vout}  {u.value_sats} sats — {u.address or 'no address'} — "
+                + _label_members_line(members)
+            )
+        )
+
+
+def _resolve_label_target_addresses(
+    store: Store,
+    wallet_id: int,
+    txid: str,
+    session: SendSession | None,
+) -> tuple[str, ...]:
+    """The ADDRESSes a ``/label`` target names: the wallet-owned outputs of
+    ``txid`` as the store knows them (the utxo snapshot is the outpoint→
+    address record) — plus, when the target IS this session's just-broadcast
+    txid (``last`` or an explicit txid equal to ``last_broadcast_txid``), the
+    addresses the broadcast's own inheritance write stamped on the session (a
+    just-broadcast change coin is labelable before any rescan through its
+    ADDRESS, never through a per-coin row — v5's lineage-row trick dies with
+    ``coin_labels``). Deterministic order (sorted); empty = not labelable
+    yet."""
+    addresses = {u.address for u in store.get_utxos_for_wallet(wallet_id) if u.txid == txid}
+    # Also resolve the broadcast's OWN stamped addresses when the target IS
+    # this session's just-broadcast txid — pre-rescan, the snapshot no longer
+    # attributes the coins to an address, and an explicit ``/label <txid>`` on
+    # that fresh coin must work exactly like ``last`` (v5's lineage-row
+    # resolution). An explicit txid equal to ``last_broadcast_txid`` covers the
+    # ``last`` keyword too, so one condition serves both.
+    if session is not None and txid == session.last_broadcast_txid:
+        addresses.update(session.last_broadcast_addresses)
+    addresses.discard(None)
+    addresses.discard("")
+    return tuple(sorted(addresses))
 
 
 def _handle_label_command(
@@ -13929,30 +14030,28 @@ def _handle_label_command(
     session: SendSession | None,
     output_fn: Callable[[str], None],
 ) -> None:
-    """Implement ``/label`` (design doc §1.2, TCK-UTXO-001) — deterministic,
-    transcript-channel, NEVER model-facing.
+    """Implement ``/label`` (design doc §1.2 + TCK-LABELS-UNIFY) —
+    deterministic, transcript-channel, NEVER model-facing.
 
     Grammar::
 
-        /label                                → list tags/notes for unspent coins
-        /label [last | <txid>] [tag words] [| free note]
+        /label                                → list unspent coins + their addresses' label sets
+        /label [last | <txid>]                → SHOW the target addresses' committed sets
+        /label [last | <txid>] [tag words] [| free words]
+                                              → UNION-ADD to each target address's set
 
-    ``last`` resolves to the most recent tx this wallet BROADCAST this session
-    (``session.last_broadcast_txid``); ``<txid>`` is a full 64-hex id. Both
-    label the wallet-owned outputs the store knows about for that txid (its
-    unspent coins from that tx under ``utxos`` PLUS any recorded
-    ``coin_labels`` outpoints). A bare ``/label <target>`` with no tags and
-    no note clears (§1.3). All validation is fail-closed: unknown tag → the
-    §1.4 refusal listing the closed set; over-long note → a length-cap
-    refusal; malformed txid → refused. The typed store accessor is the sole
+    ``last`` resolves to the most recent tx this wallet BROADCAST (session
+    state) and its stamped own addresses. A label is stored at ADDRESS level
+    (one address = one provenance): the ack states set membership verbatim
+    from the store's read-back, and adding words the address already carries
+    changes nothing (union idempotence — the ack says so, honestly, instead
+    of pretending to re-store). There is no per-coin clear: one coin's
+    command never rewrites the address's whole set. All validation is
+    fail-closed: unknown tag word → the §1.4 refusal listing the closed set;
+    over-long free words → the cap refusal; malformed txid → refused. The
+    typed store accessor (:meth:`Store.add_address_labels`) is the sole
     writer; the model is not consulted and label text never enters a
     prompt/envelope/FACTS (§1.1/§7.10).
-
-    The store is the sole source of truth for which outpoints are ours: a
-    target txid resolves to the wallet's unspent outputs from that tx PLUS any
-    coin_labels rows for it (so a just-broadcast change coin is labelable
-    before the next rescan, and a retained spent-coin label can be edited).
-    A txid with no known coin says so value-free (§1.2).
     """
     tokens = rest.split("|", 1)
     head = tokens[0].strip()
@@ -13967,7 +14066,7 @@ def _handle_label_command(
             return
         wallet_id = _active_wallet_id(store, output_fn)
         if wallet_id is not None:
-            _list_coin_labels(store, wallet_id, output_fn)
+            _list_address_labels(store, wallet_id, output_fn)
         return
 
     words = head.split()
@@ -13996,7 +14095,10 @@ def _handle_label_command(
         return
 
     # Fail-closed tag validation against the closed set (case-insensitive in;
-    # the canonical ids out). Unknown word → the §1.4 refusal, nothing stored.
+    # the canonical ids out). Free words after "|" join the set as display
+    # members (they feed the engine only if they happen to match a tag —
+    # the store canonicalizes that). Unknown word → §1.4 refusal, nothing
+    # stored.
     tag_ids: list[str] = []
     for word in tag_words:
         cid = word.lower()
@@ -14005,42 +14107,58 @@ def _handle_label_command(
             return
         tag_ids.append(cid)
 
-    if note is not None and len(note) > COIN_NOTE_MAX_CHARS:
+    if note is not None and len(note) > ADDRESS_LABEL_MAX_CHARS:
         output_fn(_LABEL_NOTE_TOO_LONG)
         return
 
-    # Which of THIS transaction's outputs are ours? Both wallet-owned unspent
-    # rows (coins this tx CREATED for us — the utxos snapshot holds only our
-    # own coins) and recorded label rows (the change coin of a just-broadcast
-    # send, written by the lineage helper before any rescan). A txid with no
-    # recorded coin is not labelable yet — §1.2 "says so".
     try:
-        utxos = store.get_utxos_for_wallet(wallet_id)
-        label_rows = store.get_coin_labels(wallet_id)
+        addresses = _resolve_label_target_addresses(store, wallet_id, txid, session)
     except (StoreError, sqlite3.Error):
         output_fn(_LABEL_ERROR_STORE)
         return
-    our_vouts = sorted(
-        {u.vout for u in utxos if u.txid == txid}
-        | {r.vout for r in label_rows if r.txid == txid}
-    )
-    if not our_vouts:
+    if not addresses:
+        # A txid with no coin the store can attribute to an address is not
+        # labelable yet — §1.2 "says so", value-free.
         output_fn(_LABEL_NO_TARGET)
         return
 
-    cleared = not tag_ids and note is None
     try:
-        for vout in our_vouts:
-            # A bare re-label replaces; no tags + no note clears (§1.3).
-            rec = store.set_coin_label(wallet_id, txid, vout, tag_ids, note)
-        if cleared:
-            output_fn(_LABEL_CLEARED)
-        elif rec is not None:
-            output_fn(sanitize_tool_output(_label_echo(txid, rec.tags, rec.note)))
-    except StoreError:
+        if not tag_ids and note is None:
+            # Bare target: SHOW the committed sets (there is no per-coin
+            # clear to offer at address level — see the docstring).
+            output_fn(
+                sanitize_tool_output(_LABEL_SHOW_TARGET.format(target=target))
+            )
+            for address in addresses:
+                output_fn(
+                    sanitize_tool_output(
+                        _LABEL_SHOW_ROW.format(
+                            address=address,
+                            labels=_label_members_line(
+                                store.get_address_label_set(address)
+                            ),
+                        )
+                    )
+                )
+            return
+        members = [*tag_ids] + ([note] if note is not None else [])
+        for address in addresses:
+            before = store.get_address_label_set(address)
+            committed = store.add_address_labels(address, members)
+            template = _LABEL_SET_KEPT if committed == before else _LABEL_SET_ACK
+            output_fn(
+                sanitize_tool_output(
+                    template.format(
+                        address=address, labels=_label_members_line(committed)
+                    )
+                )
+            )
+    except (StoreError, sqlite3.Error):
         # The store's own fail-closed validation (should be pre-caught above);
-        # a residual StoreError is surfaced value-free, nothing is asserted
-        # saved. sqlite is guarded by Store's transaction handling.
+        # a residual store/sqlite error is surfaced value-free, nothing is
+        # asserted saved. Each address's add is its own transaction, so an
+        # earlier address in this loop may already have committed — the error
+        # line claims nothing about it and the next list shows the truth.
         output_fn(_LABEL_ERROR_STORE)
         return
 
@@ -14434,21 +14552,24 @@ def _dispatch_code_self_turn(
 # TCK-LABEL-001: chat label-by-address intercept (deterministic, PRE-MODEL).
 # USER BUG (live, 2026-09-12): "label bc1q… as 'KYC'" → the narration claimed
 # the label was set but the store held NOTHING — the utterance had no route
-# at all: ``coin_labels`` is OUTPOINT-keyed (address ≠ txid:vout), so an
+# at all: ``coin_labels`` was OUTPOINT-keyed (address ≠ txid:vout), so an
 # address label had nowhere to land, and the model's success-shaped ``respond``
 # was pure fabrication (an honest-response violation). The fix is the pair the
-# bug lacked: the schema v5 ``address_labels`` table (store) + THIS intercept,
-# which code-parses the address-literal phrasings BEFORE the model, writes
-# through the typed accessor, and narrates only committed store truth (a
-# success line exists iff the row exists). Precedents: the RBF-004 / CPFP-002
-# / CONS-001 code-self-turn dispatches and the FIAT-003 pre-model word-table
-# intercept. Labels are user-authored facts consumed by deterministic code —
-# a consumed turn never reaches the transcript or the model (§1.1/§7.10).
-# NON-address phrasings ("label my strike address as KYC") are deliberately
-# NOT this intercept's grammar — the address must be a literal mainnet bech32
-# token; everything else falls through to the unchanged model path (an honest
-# route there needs a prompt line, and prompt changes force the eval gate:
-# reported to the orchestrator, not touched here).
+# bug lacked: the address-keyed label store (v5 ``address_labels``, folded by
+# TCK-LABELS-UNIFY into the schema v6 ``address_label_set`` — the ONE labeling
+# surface, so this intercept now rides the same set the selection engine
+# reads) + THIS intercept, which code-parses the address-literal phrasings
+# BEFORE the model, writes through the typed accessor, and narrates only
+# committed store truth (a success line exists iff the member exists).
+# Precedents: the RBF-004 / CPFP-002 / CONS-001 code-self-turn dispatches and
+# the FIAT-003 pre-model word-table intercept. Labels are user-authored facts
+# consumed by deterministic code — a consumed turn never reaches the
+# transcript or the model (§1.1/§7.10). NON-address phrasings ("label my
+# strike address as KYC") are deliberately NOT this intercept's grammar — the
+# address must be a literal mainnet bech32 token; everything else falls
+# through to the unchanged model path (an honest route there needs a prompt
+# line, and prompt changes force the eval gate: reported to the orchestrator,
+# not touched here).
 # ---------------------------------------------------------------------------
 
 _ADDRESS_LABEL_VERB: Final[str] = "label"
@@ -14549,16 +14670,19 @@ def _run_address_label_turn(
 ) -> bool:
     """Consume a label-by-address chat turn; True when the turn was consumed.
 
-    STORE-TRUTH narration (the bug's other half): the success line prints
-    ONLY from the record the typed writer read back after its commit — a row
-    exists whenever this line is narrated, and a failed/absent write narrates
-    a refusal instead, never a claim. The ack echoes the stored label
-    verbatim and names the surface ADDRESS-LEVEL; when the address's coins
-    are known from scan data the line still says only that the label applies
-    to the ADDRESS and lists nothing else (no outpoints, no amounts). The
-    coin-level ``/label`` command ships unchanged — the two surfaces coexist,
-    distinctly named. The model is never consulted for a consumed turn, so
-    label text never enters a prompt, the transcript, or FACTS (§7.10).
+    STORE-TRUTH narration (the bug's other half, now riding the v6 label
+    SET): the success line prints ONLY from the set the typed writer read
+    back after its commit — the addressed label exists whenever this line is
+    narrated, and a failed/absent write narrates a refusal instead, never a
+    claim. Adding is a UNION (TCK-LABELS-UNIFY: one address = one
+    provenance, coins inherit the address's set): a tag word canonicalizes
+    at the store ("KYC" stores as the engine id ``kyc`` and DOES place the
+    address's coins on the KYC side), free words join as display members,
+    and a label the address already carries answers HONESTLY with "already
+    carries — nothing changed" instead of a fake re-store. The ack echoes
+    the committed set verbatim and names the surface ADDRESS-LEVEL. The
+    model is never consulted for a consumed turn, so label text never enters
+    a prompt, the transcript, or FACTS (§7.10).
     """
     request = _address_label_request(line)
     if request is None:
@@ -14568,19 +14692,25 @@ def _run_address_label_turn(
         return True
     address, label = request
     try:
-        record = store.set_address_label(address, label)
+        before = store.get_address_label_set(address)
+        committed = store.add_address_labels(address, (label,))
     except (StoreError, sqlite3.Error):
         # Fail closed, value-free: the write did not commit → no row exists →
         # nothing may be claimed stored.
         output_fn(sanitize_tool_output(_ADDRESS_LABEL_STORE_ERROR))
         return True
-    output_fn(
-        sanitize_tool_output(
-            f'Address {record.address} is now labeled "{record.label}" — '
-            "an address-level label for the whole address; coin tags are a "
-            "separate surface (/label lists and sets those, per coin)."
+    stored = next((m for m in committed if m not in before), None)
+    if stored is None:
+        # Union idempotence: the member was already there (the store
+        # canonicalized our word onto an existing tag).
+        ack = _LABEL_SET_KEPT.format(address=address, labels=", ".join(committed))
+    else:
+        ack = (
+            f'Address {address} is now labeled "{stored}" — address-level: '
+            "every coin at this address, this one and any that land there "
+            "later, carries it. Your labels: " + ", ".join(committed) + "."
         )
-    )
+    output_fn(sanitize_tool_output(ack))
     return True
 
 
@@ -14807,8 +14937,9 @@ def _run_turn(
         return
     # TCK-LABEL-001: chat label-by-address ("label bc1… as 'KYC'") — the
     # deterministic pre-model intercept for the bug that had NO route: the
-    # code-parsed value writes the schema v5 address_labels row and the ack
-    # narrates only committed store truth (row exists ⟺ success line). The
+    # code-parsed value union-adds to the schema v6 address label set (one
+    # address = one provenance, coins inherit) and the ack narrates only
+    # committed store truth (member exists ⟺ success line). The
     # consumed turn never reaches the transcript or the model (§7.10);
     # value-free refusals consume too — a half-parsed label utterance must
     # not reach the model either. Checked after the conversation intercepts

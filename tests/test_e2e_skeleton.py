@@ -6071,8 +6071,9 @@ def test_prompt_live_and_startup_failure_narrated_after_hint(
 
 # ============================ TCK-UTXO-004: tag/consolidation card narration
 #
-# docs/ux-utxo-notes-design.md §4: the create_tx handler joins coin_labels
-# onto the snapshot (dispatcher-side, plain booleans only — §4.1), resolves
+# docs/ux-utxo-notes-design.md §4 (TCK-LABELS-UNIFY: the join now rides each
+# coin's inherited ADDRESS label set — dispatcher-side, plain booleans only,
+# §4.1), resolves
 # the three policy settings PER SELECTION, and the brief card renders the mix
 # warning (§4.3, above the ask line) and the consolidation clause (on the
 # From data line) from the FINAL selection — so a re-quote can never
@@ -6198,7 +6199,7 @@ def test_tag_aware_selection_flips_the_mix_on_requote(
     context, never output)."""
     addrs = derive_fixture_addresses(3)
     kyc_a, kyc_b, other = ("f" * 64, "a" * 64, "b" * 64)
-    table, store, wallet, client, _rec, flow, _session = _build_send_table(
+    table, store, _wallet, client, _rec, flow, _session = _build_send_table(
         lambda rec: _send_chain_handler(
             rec,
             utxos_by_addr={
@@ -6209,8 +6210,9 @@ def test_tag_aware_selection_flips_the_mix_on_requote(
         )
     )
     try:
-        store.set_coin_label(wallet.id, kyc_a, 0, ["kyc"], "alice refund zebra")
-        store.set_coin_label(wallet.id, kyc_b, 0, ["exchange"])
+        # Labels live on the ADDRESSES the coins sit at (inheritance):
+        store.add_address_labels(addrs[0], ["kyc", "alice refund zebra"])
+        store.add_address_labels(addrs[1], ["exchange"])
 
         def envelope(target: str) -> Envelope:
             return validate_payload(

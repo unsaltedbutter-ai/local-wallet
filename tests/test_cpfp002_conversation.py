@@ -240,7 +240,8 @@ def test_multiple_inbound_indexed_ask_verbatim_fields(world) -> None:
     fee-estimator calls."""
     _stuck(world, value=50_000, txid=STUCK_TXID, index=5)
     _stuck(world, value=25_000, txid="e" * 64, index=6)
-    world["store"].set_coin_label(world["wallet"].id, "e" * 64, 0, tags=("p2p",))
+    # the coin's ADDRESS carries the tag now (v6: coins inherit)
+    world["store"].add_address_labels(derive_fixture_addresses(8)[6], ["p2p"])
     result = _dispatch(world)
     assert result.get("ask") == "coin"
     entries = result["options"]
@@ -378,7 +379,7 @@ def test_label_word_answers_the_menu_never_via_model(world) -> None:
     in NO model prompt — not on the answer turn, not on a later one."""
     _stuck(world)
     _add_coin(world["store"], world["wallet"].id, 6, "b" * 64, 30_000)
-    world["store"].set_coin_label(world["wallet"].id, "b" * 64, 0, note="vault")
+    world["store"].add_address_labels(derive_fixture_addresses(8)[6], ["vault"])
     _add_coin(world["store"], world["wallet"].id, 7, "c" * 64, 130_000)
     result = _dispatch(world)
     assert result.get("ask") == "options"

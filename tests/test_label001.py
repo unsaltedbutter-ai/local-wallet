@@ -1,5 +1,9 @@
-"""TCK-LABEL-001 — chat label-by-address: schema v5 address labels + the
-deterministic pre-model intercept (the live honest-response bug).
+"""TCK-LABEL-001 — chat label-by-address: the address label store + the
+deterministic pre-model intercept (the live honest-response bug). The v5
+single-label table shipped here is FOLDED by TCK-LABELS-UNIFY into the
+schema v6 address label SET (one address = one provenance; adding is a
+union, tag words canonicalize to the engine ids, and the SAME set feeds
+selection) — the pins below ride that surface.
 
 The bug (user, 2026-09-12, verbatim): "label bc1qpvnux8s9tm6w2l2nssj7wthatf9hm926tu66zl
 as 'KYC'" → the narration claimed the label was set, but the store held
@@ -12,13 +16,14 @@ store writes (see TestTheRepro).
 
 The fix under test, both halves:
 
-* store: schema v5 ``address_labels`` (address-keyed, value-checked ≤500
-  chars, created/updated timestamps) — the RBF-001/CHAT-001 migration
-  pattern (versioned, additive, idempotent, fail-closed), typed accessors
-  ``set_address_label`` / ``get_address_label`` / ``get_address_labels``
-  as the only writers, and the table OUTSIDE the scan write-set (a rescan
-  can never clear or fabricate a label) — the foundation TCK-CHAT-003
-  builds on;
+* store: schema v6 ``address_label_set`` (address+member keyed, per-member
+  value-check ≤500 chars, tag-word canonicalization "KYC"→"kyc", union
+  idempotence, per-member write-once ``created_at``) — the RBF-001/
+  CHAT-001/LABELS-UNIFY migration pattern (versioned, atomic fold,
+  fail-closed), typed accessors ``add_address_labels`` /
+  ``get_address_label_set`` / ``get_address_label_sets`` as the only
+  writers, and the table OUTSIDE the scan write-set (a rescan can never
+  clear or fabricate a label) — the foundation TCK-CHAT-003 builds on;
 * app: a deterministic intercept BEFORE the model for the two
   address-literal phrasings ("label <addr> as <label>" / "label <addr>
   <label>"), strict mainnet-bech32 shape gate, quoted-or-trailing value
@@ -115,19 +120,22 @@ def _turn(
 
 class TestTheRepro:
     def test_live_bug_line_writes_address_label_and_consumes_the_model(self) -> None:
-        """The user's verbatim utterance: AFTER the fix a committed row
-        exists and the model was never asked. (Pre-fix the same call left
-        ``get_address_label`` None while the scripted model's "has been
-        labeled as 'KYC'" respond printed as fact — the honest-response
-        violation, reproduced against the pre-fix tree during this ticket
-        and captured in the module docstring.)"""
+        """The user's verbatim utterance: AFTER the fix the committed set
+        carries the member and the model was never asked — and since
+        LABELS-UNIFY the label is ENGINE-REAL: "KYC" canonicalizes to the
+        id ``kyc``, so the address's coins actually sit on the KYC side
+        (under v5 the free text changed no selection behavior at all — the
+        unified model closes that silent gap). (Pre-fix the call stored
+        NOTHING while the scripted model's "has been labeled as 'KYC'"
+        respond printed as fact — the honest-response violation, reproduced
+        against the pre-fix tree during this ticket and captured in the
+        original module docstring.)"""
         store, _wid, table = _world()
         try:
             out, gen = _turn(store, table, BUG_LINE)
-            rec = store.get_address_label(ADDR)
-            assert rec is not None and rec.label == "KYC"
+            assert store.get_address_label_set(ADDR) == ("kyc",)
             assert gen.prompts == []  # the model never saw the utterance
-            assert any(ADDR in line and "KYC" in line for line in out)
+            assert any(ADDR in line and "kyc" in line for line in out)
         finally:
             store.close()
 
@@ -140,20 +148,27 @@ class TestTheRepro:
         try:
             _out, gen = _turn(store, table, "label my strike address as KYC")
             assert len(gen.prompts) == 1
-            assert store.get_address_labels() == []
+            assert store.get_address_label_sets() == {}
         finally:
             store.close()
 
 
 # =========================================================================
-# 1. Store: schema v5 migration (the RBF-001 / CHAT-001 pattern)
+# 1. Store: the v5→v6 fold (the RBF-001 / CHAT-001 migration pattern, with
+#    the LABELS-UNIFY union semantics on top)
 # =========================================================================
 
 
-class TestSchemaV5Migration:
+class TestSchemaV6LabelSets:
     def _as_v4_file(self, db: Path) -> None:
+        """Simulate a REAL v4 file from a fresh v6 one: no address-label
+        tables at the v6 shape, coin_labels present (every v2+ file has it;
+        the v5→v6 fold demands the v5-contract tables), stamp 4."""
+        from localwallet.store.db import _COIN_LABELS_DDL
+
         raw = sqlite3.connect(db)
-        raw.execute("DROP TABLE address_labels")
+        raw.execute("DROP TABLE address_label_set")
+        raw.executescript(_COIN_LABELS_DDL)
         raw.execute("PRAGMA user_version=4")
         raw.commit()
         raw.close()
@@ -168,33 +183,37 @@ class TestSchemaV5Migration:
             assert (
                 store._conn.execute("PRAGMA user_version").fetchone()[0]
                 == SCHEMA_VERSION
-                == 5
+                == 6
             )
-            assert store.get_address_labels() == []  # empty, never fabricated
-            rec = store.set_address_label("bc1qa", "KYC")
-            assert rec.label == "KYC"
+            assert store.get_address_label_sets() == {}  # empty, never fabricated
+            rec = store.add_address_labels("bc1qa", ["KYC"])
+            assert rec == ("kyc",)  # the tag-word canonicalization
         with Store(db) as store:  # stable reopen, no re-run
-            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
-            assert store.get_address_label("bc1qa").label == "KYC"
-            # the v4 registry survived the v5 rung untouched
+            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 6
+            assert store.get_address_label_set("bc1qa") == ("kyc",)
+            # the v4 registry survived the v5 + v6 rungs untouched
             assert store.get_address_by_number(1, 1).address == "bc1qa"
 
-    def test_fresh_create_is_v5(self, tmp_path: Path) -> None:
+    def test_fresh_create_is_v6(self, tmp_path: Path) -> None:
         with Store(tmp_path / "fresh.db") as store:
-            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 6
 
     def test_migration_idempotent_half_applied(self, tmp_path: Path) -> None:
-        """Crash-mid-migration shape (v4 stamp, table ALREADY created): the
-        CREATE TABLE IF NOT EXISTS step is a no-op and the stamp completes."""
+        """Crash-mid-migration shape (v4 stamp, the v6 set table ALREADY
+        created): the CREATE TABLE IF NOT EXISTS step is a no-op and the
+        stamp completes (fold specifics pin in test_labels_unify.py)."""
         db = tmp_path / "store.db"
         with Store(db):
             pass
+        from localwallet.store.db import _COIN_LABELS_DDL
+
         raw = sqlite3.connect(db)
+        raw.executescript(_COIN_LABELS_DDL)  # a real v4 file carries it
         raw.execute("PRAGMA user_version=4")
         raw.commit()
         raw.close()
         with Store(db) as store:
-            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 6
 
     def test_newer_schema_fails_closed(self, tmp_path: Path) -> None:
         """A DB stamped ABOVE this build is refused, never opened (no
@@ -210,14 +229,14 @@ class TestSchemaV5Migration:
             Store(db)
         assert "newer" in str(excinfo.value)
 
-    def test_scan_persist_never_touches_address_labels(self) -> None:
+    def test_scan_persist_never_touches_address_label_sets(self) -> None:
         """The label is a USER fact: the scan's composite write (which owns
-        addresses/derivation/utxos/txs/sync_state) leaves address_labels
-        alone — a rescan can never clear, re-assign, or fabricate one
+        addresses/derivation/utxos/txs/sync_state) leaves address_label_set
+        alone — a rescan can never clear, re-assign, or fabricate a label
         (the CHAT-001 registry lesson, same write-set discipline)."""
         store = Store.memory()
         wallet = store.create_wallet("w", "d")
-        store.set_address_label(ADDR, "KYC")
+        store.add_address_labels(ADDR, ["KYC"])
         store.persist_scan_result(
             wallet.id,
             address_rows=[AddressRecord(wallet.id, 0, 0, ADDR, "p2wpkh", "used")],
@@ -235,77 +254,84 @@ class TestSchemaV5Migration:
             tx_rows=[],
             sync_state_updates={},
         )
-        assert store.get_address_label(ADDR).label == "KYC"
+        assert store.get_address_label_set(ADDR) == ("kyc",)
         store.close()
 
 
 # =========================================================================
-# 2. Store: typed accessors (set / get / get-s)
+# 2. Store: typed set accessors (union-add / get / get-all)
 # =========================================================================
 
 
-class TestAddressLabelAccessors:
-    def test_set_get_roundtrip_verbatim(self) -> None:
+class TestAddressLabelSetAccessors:
+    def test_add_get_roundtrip_verbatim(self) -> None:
         store = Store.memory()
-        rec = store.set_address_label(ADDR, "strike payout")
-        assert rec.address == ADDR
-        assert rec.label == "strike payout"  # stored verbatim
-        got = store.get_address_label(ADDR)
-        assert got == rec
-        # timestamps: ISO-8601 UTC, created written with the row
-        datetime.fromisoformat(rec.created_at)
-        datetime.fromisoformat(rec.updated_at)
+        got = store.add_address_labels(ADDR, ["strike payout"])
+        assert got == ("strike payout",)  # free text stored + echoed verbatim
+        got2 = store.add_address_labels(ADDR, ["kyc", "second note"])
+        assert got2 == ("kyc", "second note", "strike payout")  # canonical: tags first
+        assert store.get_address_label_set(ADDR) == got2
+        datetime.fromisoformat(_member_created(store, ADDR, "kyc"))
         store.close()
 
-    def test_relable_replaces_and_keeps_created_at(self) -> None:
+    def test_union_adds_never_replaces(self) -> None:
+        """THE model change (USER DECISION 2026-09-13): a label is an
+        ADDITION to the address's set. The v5 REPLACE semantic is gone —
+        the whole point of unify is that one address carries every label
+        its history earned (one provenance)."""
         store = Store.memory()
-        first = store.set_address_label(ADDR, "KYC")
-        second = store.set_address_label(ADDR, "KYC-free")
-        assert second.label == "KYC-free"
-        assert second.created_at == first.created_at  # the first date survives
-        assert second.updated_at >= first.updated_at
-        assert len(store.get_address_labels()) == 1  # one row, always
+        store.add_address_labels(ADDR, ["KYC"])
+        after = store.add_address_labels(ADDR, ["strike payout"])
+        assert after == ("kyc", "strike payout")  # kyc SURVIVES
+        assert store.add_address_labels(ADDR, ["strike payout"]) == after  # idempotent
         store.close()
 
-    def test_get_miss_is_none_never_a_fabrication(self) -> None:
+    def test_get_miss_is_empty_never_a_fabrication(self) -> None:
         store = Store.memory()
-        assert store.get_address_label(ADDR) is None
-        assert store.get_address_labels() == []
+        assert store.get_address_label_set(ADDR) == ()
+        assert store.get_address_label_sets() == {}
         store.close()
 
     def test_list_is_deterministic(self) -> None:
         store = Store.memory()
-        store.set_address_label(OTHER_ADDR, "b")
-        store.set_address_label(ADDR, "a")
-        assert [r.address for r in store.get_address_labels()] == sorted(
-            [ADDR, OTHER_ADDR]
-        )
+        store.add_address_labels(OTHER_ADDR, ["b"])
+        store.add_address_labels(ADDR, ["a"])
+        assert list(store.get_address_label_sets()) == sorted([ADDR, OTHER_ADDR])
         store.close()
 
     def test_length_bound_500_in_501_out(self) -> None:
         store = Store.memory()
         ok = "x" * ADDRESS_LABEL_MAX_CHARS
-        assert store.set_address_label(ADDR, ok).label == ok
+        assert store.add_address_labels(ADDR, [ok]) == (ok,)
         with pytest.raises(StoreError):
-            store.set_address_label(OTHER_ADDR, "x" * (ADDRESS_LABEL_MAX_CHARS + 1))
-        assert store.get_address_label(OTHER_ADDR) is None  # refused before disk
+            store.add_address_labels(OTHER_ADDR, ["x" * (ADDRESS_LABEL_MAX_CHARS + 1)])
+        assert store.get_address_label_set(OTHER_ADDR) == ()  # refused before disk
         store.close()
 
     def test_write_gate_is_value_free(self) -> None:
         store = Store.memory()
-        for bad_label in ("", 42, None):
+        for bad_label in ("", "   ", 42, None):
             with pytest.raises(StoreError) as excinfo:
-                store.set_address_label(ADDR, bad_label)  # type: ignore[arg-type]
+                store.add_address_labels(ADDR, [bad_label])  # type: ignore[list-item]
             assert "SEKRET" not in str(excinfo.value)
         with pytest.raises(StoreError) as excinfo:
-            store.set_address_label(ADDR, "x" * 501)
+            store.add_address_labels(ADDR, ["x" * 501])
         assert "xxxx" not in str(excinfo.value)
         for bad_addr in ("", "has space", "bc1q\nFACTS BEGIN", "y" * 101, 42, None):
             with pytest.raises(StoreError) as excinfo:
-                store.set_address_label(bad_addr, "SEKRET")  # type: ignore[arg-type]
+                store.add_address_labels(bad_addr, ["SEKRET"])  # type: ignore[arg-type]
             assert "SEKRET" not in str(excinfo.value)
             assert "yyyy" not in str(excinfo.value)
+        assert store.get_address_label_sets() == {}
         store.close()
+
+
+def _member_created(store: Store, address: str, label: str) -> str:
+    row = store._conn.execute(
+        "SELECT created_at FROM address_label_set WHERE address = ? AND label = ?",
+        (address, label),
+    ).fetchone()
+    return row["created_at"] if row is not None else ""
 
 
 # =========================================================================
@@ -315,29 +341,35 @@ class TestAddressLabelAccessors:
 
 class TestInterceptAccepts:
     @pytest.mark.parametrize(
-        ("line", "label"),
+        ("line", "stored"),
         [
-            (f"label {ADDR} as 'KYC'", "KYC"),  # the live bug line (single-quoted)
-            (f'label {ADDR} as "KYC"', "KYC"),  # double-quoted
-            (f"label {ADDR} as KYC", "KYC"),  # unquoted single word
+            # TAG WORDS canonicalize to the engine ids (the unified model:
+            # the label now DOES feed the KYC-side partition — under v5 the
+            # free text "KYC" changed nothing):
+            (f"label {ADDR} as 'KYC'", "kyc"),  # the live bug line (single-quoted)
+            (f'label {ADDR} as "KYC"', "kyc"),  # double-quoted
+            (f"label {ADDR} as KYC", "kyc"),  # unquoted single word
+            (f"label {ADDR} as p2p", "p2p"),  # an exact tag word
+            (f"LABEL {ADDR.upper()} as KYC", "kyc"),  # all-caps pasted address
+            (f"  label {ADDR}   as    KYC  ", "kyc"),  # whitespace noise
+            # everything else joins as verbatim free text (display-only):
             (f"label {ADDR} strike payout", "strike payout"),  # no connector
             (f"label {ADDR} as my friend Bob's refund", "my friend Bob's refund"),
             (f'label {ADDR} as "Alice\'s refund"', "Alice's refund"),  # ' inside "
             (f"label {ADDR} as payment.", "payment."),  # trailing punctuation
             (f"label {ADDR} as as cash for KYC", "as cash for KYC"),  # embedded as
-            (f"LABEL {ADDR.upper()} as KYC", "KYC"),  # all-caps pasted address
-            (f"  label {ADDR}   as    KYC  ", "KYC"),  # whitespace noise
+            # ("p2p refund" as ONE phrase is not the word "p2p" — free text):
+            (f"label {ADDR} as p2p refund", "p2p refund"),
         ],
     )
-    def test_accepted_shapes_write_and_ack_verbatim(self, line: str, label: str) -> None:
+    def test_accepted_shapes_write_and_ack_verbatim(self, line: str, stored: str) -> None:
         store, _wid, table = _world()
         try:
             out, gen = _turn(store, table, line)
-            rec = store.get_address_label(ADDR)
-            assert rec is not None and rec.label == label
+            assert store.get_address_label_set(ADDR) == (stored,)
             assert gen.prompts == []
             assert len(out) == 1
-            assert f'is now labeled "{label}"' in out[0]  # echoes the STORED text
+            assert f'is now labeled "{stored}"' in out[0]  # echoes the STORED text
         finally:
             store.close()
 
@@ -349,9 +381,9 @@ class TestInterceptAccepts:
             def _boom(*args: object, **kwargs: object) -> None:
                 raise StoreError("simulated store failure")
 
-            monkeypatch.setattr(store, "set_address_label", _boom)
+            monkeypatch.setattr(store, "add_address_labels", _boom)
             out, gen = _turn(store, table, f"label {ADDR} as KYC")
-            assert store.get_address_label(ADDR) is None
+            assert store.get_address_label_set(ADDR) == ()
             assert gen.prompts == []
             assert len(out) == 1
             assert "couldn't save" in out[0]
@@ -381,7 +413,7 @@ class TestInterceptRefusals:
         store, _wid, table = _world()
         try:
             out, gen = _turn(store, table, line)
-            assert store.get_address_labels() == []  # NOTHING stored
+            assert store.get_address_label_sets() == {}  # NOTHING stored
             assert gen.prompts == []  # the model never sees it either
             assert len(out) == 1
             assert ADDR not in out[0]  # value-free refusal
@@ -417,7 +449,7 @@ class TestInterceptMisses:
         try:
             _out, gen = _turn(store, table, line)
             assert len(gen.prompts) == 1
-            assert store.get_address_labels() == []
+            assert store.get_address_label_sets() == {}
         finally:
             store.close()
 
@@ -428,45 +460,62 @@ class TestInterceptMisses:
 
 
 class TestNarrationHonesty:
-    def test_row_exists_iff_success_narrated_matrix(self) -> None:
-        """The ticket's pin, both directions, over a mixed script: every
-        narrated success corresponds to a committed row echoing that ack
-        verbatim (the failure side — refused write, no row, no ack — is
-        pinned separately), and nothing the script narrated outside those
-        acks stored a thing."""
+    def test_member_exists_iff_success_narrated_matrix(self) -> None:
+        """The ticket's pin, both directions, over a mixed script (re-
+        expressed for the SET model): every narrated success corresponds to
+        a committed member the ack echoes verbatim — and the union is
+        ADDITIVE (v5's replace is gone): "strike payout" joins next to kyc,
+        it does not replace it. The failure side (refused write, no member,
+        no ack) is pinned separately; nothing outside the acks stored."""
         store, _wid, table = _world()
         try:
             acked_pairs: list[tuple[str, str]] = []
             for line in (
-                f"label {ADDR} as KYC",  # write
+                f"label {ADDR} as KYC",  # write (canonicalized: kyc)
                 f"label {ADDR} as",  # refuse
-                f'label {ADDR} as "strike payout"',  # relabel
+                f'label {ADDR} as "strike payout"',  # UNION-add, kyc survives
                 f"label {ADDR} as {'x' * 501}",  # overflow refuse
                 f"labels {ADDR} as nope",  # miss (verb shape) → model
-                f"label {OTHER_ADDR} as p2p refund",  # write (two words)
+                f"label {OTHER_ADDR} as p2p refund",  # write (free phrase)
             ):
                 out, _gen = _turn(store, table, line)
                 for o in out:
-                    if "is now labeled" in o:
+                    if " is now labeled \"" in o:
                         addr = o.split()[1]
                         label = o.split('is now labeled "')[1].rsplit('" —', 1)[0]
                         acked_pairs.append((addr, label))
-                        # success ⟹ the committed row is exactly what was said
-                        assert store.get_address_label(addr).label == label
+                        # success ⟹ the committed set carries exactly the
+                        # member the ack named (store truth, verbatim)
+                        assert label in store.get_address_label_set(addr)
             assert acked_pairs == [
-                (ADDR, "KYC"),
-                (ADDR, "strike payout"),  # relabel: ack again, row replaced
+                (ADDR, "kyc"),
+                (ADDR, "strike payout"),  # union-add: acked, BOTH members live
                 (OTHER_ADDR, "p2p refund"),
             ]
-            rows = store.get_address_labels()
-            assert {r.address for r in rows} == {ADDR, OTHER_ADDR}  # no phantom rows
-            assert store.get_address_label(ADDR).label == "strike payout"
-            assert store.get_address_label(OTHER_ADDR).label == "p2p refund"
+            sets = store.get_address_label_sets()
+            assert set(sets) == {ADDR, OTHER_ADDR}  # no phantom rows
+            assert sets[ADDR] == ("kyc", "strike payout")
+            assert sets[OTHER_ADDR] == ("p2p refund",)
         finally:
             store.close()
 
-    def test_ack_names_surfaces_distinctly_and_lists_no_coins(self) -> None:
-        """Address-level vs coin-level named distinctly; WITH the address's
+    def test_reack_of_a_carried_label_is_honest_about_idempotence(self) -> None:
+        """Union idempotence meets ack truth: re-labeling an address with a
+        tag word it already carries (in canonical form) NEVER narrates a
+        fresh store — the line says "already carries … nothing changed" and
+        quotes the committed set."""
+        store, _wid, table = _world()
+        try:
+            _out, _gen = _turn(store, table, f"label {ADDR} as KYC")
+            out, _gen = _turn(store, table, f"label {ADDR} as kyc")
+            assert len(out) == 1
+            assert "already carries those labels" in out[0] and "nothing changed" in out[0]
+            assert store.get_address_label_set(ADDR) == ("kyc",)
+        finally:
+            store.close()
+
+    def test_ack_names_the_set_membership_and_lists_no_coins(self) -> None:
+        """The ack states ADDRESS-level set membership; WITH the address's
         coins known (scan data), the narration still says the label applies
         to the ADDRESS and lists NOTHING else — no outpoints, no sats."""
         store, wid, table = _world()
@@ -479,7 +528,7 @@ class TestNarrationHonesty:
             line = out[0]
             assert ADDR in line  # the address itself, verbatim
             assert "address-level" in line
-            assert "/label" in line  # the coin-level surface, distinctly named
+            assert "every coin at this address" in line.lower()  # inheritance named
             assert TXID_A not in line  # no coin listing…
             assert "123,456" not in line and "123456" not in line  # …no amounts
             assert "sats" not in line
@@ -503,20 +552,29 @@ class TestNarrationHonesty:
         finally:
             store.close()
 
-    def test_intercept_never_touches_coin_labels(self) -> None:
-        """The address surface writes NOTHING to the coin surface (the two
-        coexist; coin_labels keeps its own outpoint-keyed life)."""
+    def test_intercept_writes_only_the_label_set(self) -> None:
+        """The unified surface writes ONE thing: the address's label set.
+        The scan snapshot and the CHAT-001 registry (untouched v4/v5
+        surfaces) gain nothing from a label turn — labeling never touches
+        derivation, registry, or utxo state (and never a network call)."""
         store, wid, table = _world()
         try:
+            store.replace_utxos_for_wallet(
+                wid, [UtxoRecord(wid, TXID_A, 0, ADDR, 50_000, 1, 900_000)]
+            )
             _out, _gen = _turn(store, table, f"label {ADDR} as KYC")
-            assert store.get_coin_labels(wid) == []
+            assert store.get_address_label_set(ADDR) == ("kyc",)
+            assert store.registry_number_for(wid, ADDR) is None  # not shown
+            rows = store.get_utxos_for_wallet(wid)
+            assert [(r.txid, r.value_sats) for r in rows] == [(TXID_A, 50_000)]
         finally:
             store.close()
 
-    def test_coin_level_label_command_unchanged_regression(self) -> None:
-        """The existing terminal /label (coin-level, txid-keyed) ships
-        UNCHANGED: it still lists and sets coin tags, and an address label
-        never leaks into its output or its storage."""
+    def test_chat_and_terminal_surfaces_ride_one_set(self) -> None:
+        """THE unification pin: the chat intercept and the terminal /label
+        no longer answer with two stores — a label written on either
+        surface is visible on the other (coins inherit the address's set),
+        and the terminal command UNION-ADDS beside it (never replaces)."""
         store, wid, table = _world()
         try:
             _out, _gen = _turn(store, table, f"label {ADDR} as KYC")
@@ -524,14 +582,13 @@ class TestNarrationHonesty:
                 wid, [UtxoRecord(wid, TXID_A, 0, ADDR, 50_000, 1, None)]
             )
             out: list[str] = []
-            app._handle_label_command(TXID_A + " kyc", store, app.SendSession(), out.append)
-            assert any("your coin tags: KYC" in line for line in out)
-            rec = store.get_coin_label(wid, TXID_A, 0)
-            assert rec is not None and rec.tags == ("kyc",)
-            # bare /label list: shows the COIN, never the address-label row
+            app._handle_label_command(TXID_A + " p2p", store, app.SendSession(), out.append)
+            assert any("Noted on address" in line for line in out)
+            assert store.get_address_label_set(ADDR) == ("kyc", "p2p")
+            # bare /label list shows the SAME inherited set on the coin line.
             listing: list[str] = []
             app._handle_label_command("", store, app.SendSession(), listing.append)
-            assert any(TXID_A in line for line in listing)
-            assert not any("address-level" in line for line in listing)
+            joined = "\n".join(listing)
+            assert TXID_A in joined and "kyc" in joined and "p2p" in joined
         finally:
             store.close()

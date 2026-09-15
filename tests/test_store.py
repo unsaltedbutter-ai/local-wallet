@@ -569,22 +569,23 @@ def test_coin_setting_valid_pair_roundtrips() -> None:
         assert store.get_coin_setting(MIN) == "50000000"
 
 
-# LOW fix (a): propagate_coin_lineage surfaces sqlite failures as the
-# store's value-free StoreError, like every sibling accessor.
+# LOW fix (a) (re-pinned for TCK-LABELS-UNIFY): add_address_labels surfaces
+# sqlite failures as the store's value-free StoreError, like every sibling
+# accessor.
 
-def test_lineage_sqlite_failure_wrapped_value_free(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_label_add_sqlite_failure_wrapped_value_free(monkeypatch: pytest.MonkeyPatch) -> None:
     with Store.memory() as store:
-        wid = store.create_wallet("w", DESCRIPTOR).id
-        txid = "aa" * 32
+        store.create_wallet("w", DESCRIPTOR)
 
         def boom(*args, **kwargs):
             raise sqlite3.OperationalError("database is locked")
 
-        monkeypatch.setattr(Store, "get_coin_label", boom)
+        monkeypatch.setattr(Store, "_atomic", boom)  # the write transaction
         with pytest.raises(StoreError) as excinfo:
-            store.propagate_coin_lineage(wid, txid, (0,), [(txid, 1)])
+            store.add_address_labels("bc1qaddr", ["kyc"])
         assert isinstance(excinfo.value.__cause__, sqlite3.OperationalError)
         assert "locked" not in str(excinfo.value)  # driver text never echoed
+        assert "kyc" not in str(excinfo.value)  # value-free refusal
 
 
 # LOW fix (b): the migration docstring states the ACTUAL guarantee

@@ -514,13 +514,13 @@ class TestConsolidatePlan:
 
     def test_pool_sides_never_mix_larger_total_wins_with_hint(self) -> None:
         addrs = derive_fixture_addresses(2)
-        t, s, w, c, _rec, flow, _se = _table(
+        t, s, _w, c, _rec, flow, _se = _table(
             {
-                addrs[0]: [_utxo("a" * 64, 0, 10_000)],  # → labeled kyc
+                addrs[0]: [_utxo("a" * 64, 0, 10_000)],  # → kyc-side ADDRESS
                 addrs[1]: [_utxo("b" * 64, 0, 20_000)],  # other side (unlabeled)
             }
         )
-        s.set_coin_label(w.id, "a" * 64, 0, tags=("kyc",))
+        s.add_address_labels(addrs[0], ["kyc"])  # coins inherit (v6)
         res = t[IntentName.SELF_TRANSFER](
             _self_env({"mode": "consolidate", "below_size_sats": 50_000})
         )
@@ -537,13 +537,13 @@ class TestConsolidatePlan:
 
     def test_tie_between_pools_breaks_other_side_first(self) -> None:
         addrs = derive_fixture_addresses(2)
-        t, s, w, c, _rec, flow, _se = _table(
+        t, s, _w, c, _rec, flow, _se = _table(
             {
                 addrs[0]: [_utxo("a" * 64, 0, 20_000)],
                 addrs[1]: [_utxo("b" * 64, 0, 20_000)],
             }
         )
-        s.set_coin_label(w.id, "a" * 64, 0, tags=("kyc",))
+        s.add_address_labels(addrs[0], ["kyc"])
         res = t[IntentName.SELF_TRANSFER](
             _self_env({"mode": "consolidate", "below_size_sats": 50_000})
         )
@@ -555,14 +555,14 @@ class TestConsolidatePlan:
 
     def test_single_pool_set_consolidates_without_hint(self) -> None:
         addrs = derive_fixture_addresses(2)
-        t, s, w, c, _rec, _flow, _se = _table(
+        t, s, _w, c, _rec, _flow, _se = _table(
             {
                 addrs[0]: [_utxo("a" * 64, 0, 10_000)],
                 addrs[1]: [_utxo("b" * 64, 0, 20_000)],
             }
         )
-        s.set_coin_label(w.id, "a" * 64, 0, tags=("kyc",))
-        s.set_coin_label(w.id, "b" * 64, 0, tags=("exchange",))  # SAME side
+        s.add_address_labels(addrs[0], ["kyc"])
+        s.add_address_labels(addrs[1], ["exchange"])  # SAME side
         res = t[IntentName.SELF_TRANSFER](
             _self_env({"mode": "consolidate", "below_size_sats": 50_000})
         )
@@ -835,8 +835,9 @@ class TestLifecycle:
 
     def test_broadcast_lineage_tags_every_own_output(self) -> None:
         addrs = derive_fixture_addresses(4)
-        t, s, w, c, _rec, _flow, se, _signer = _hwi_table({addrs[0]: [_utxo("d" * 64, 0, 300_000)]})
-        s.set_coin_label(w.id, "d" * 64, 0, tags=("kyc",))
+        t, s, _w, c, _rec, _flow, se, _signer = _hwi_table({addrs[0]: [_utxo("d" * 64, 0, 300_000)]})
+        s.add_address_labels(addrs[0], ["kyc"])  # the coin inherits; the
+        # broadcast propagates the ADDRESS's closed tags onto its own outputs
         res = t[IntentName.SELF_TRANSFER](_self_env({"mode": "split", "parts": 2}))
         ref = res["tx_ref"]
         se.gate_decision = GateDecision.CONFIRM
@@ -846,14 +847,14 @@ class TestLifecycle:
         t[IntentName.SIGN_TX](
             validate_payload({"v": 0, "intent": "sign_tx", "params": {"tx_ref": ref}})
         )
-        broadcast = t[IntentName.BROADCAST_TX](
+        t[IntentName.BROADCAST_TX](
             validate_payload({"v": 0, "intent": "broadcast_tx", "params": {"tx_ref": ref}})
         )
-        txid = broadcast["txid"]
-        # The reshuffle preserves the pool: BOTH new coins inherit kyc.
-        for vout in (0, 1):
-            row = s.get_coin_label(w.id, txid, vout)
-            assert row is not None and "kyc" in row.tags, f"vout {vout} lost its tag"
+        # The reshuffle preserves the pool: BOTH new coins' addresses
+        # inherit kyc (broadcast-stamped on the session, pre-rescan).
+        assert len(se.last_broadcast_addresses) == 2
+        for address in se.last_broadcast_addresses:
+            assert "kyc" in s.get_address_label_set(address), address
         s.close()
         c.close()
 
@@ -928,13 +929,13 @@ class TestCardAndFacts:
 
     def test_consolidate_card_lines_and_pool_hint(self) -> None:
         addrs = derive_fixture_addresses(3)
-        t, s, w, c, _rec, _flow, _se = _table(
+        t, s, _w, c, _rec, _flow, _se = _table(
             {
                 addrs[0]: [_utxo("a" * 64, 0, 10_000)],
                 addrs[1]: [_utxo("b" * 64, 0, 20_000)],
             }
         )
-        s.set_coin_label(w.id, "a" * 64, 0, tags=("kyc",))
+        s.add_address_labels(addrs[0], ["kyc"])
         res = t[IntentName.SELF_TRANSFER](
             _self_env({"mode": "consolidate", "below_size_sats": 50_000})
         )

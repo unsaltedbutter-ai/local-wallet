@@ -347,7 +347,7 @@ def test_funding_ask_framing_small_mid_large_with_labels(world) -> None:
     _add_coin(world["store"], world["wallet"].id, 4, "a" * 64, 10_000)
     _add_coin(world["store"], world["wallet"].id, 5, "b" * 64, 30_000)
     _add_coin(world["store"], world["wallet"].id, 6, "c" * 64, 50_000)
-    world["store"].set_coin_label(world["wallet"].id, "c" * 64, 0, tags=("exchange",))
+    world["store"].add_address_labels(derive_fixture_addresses(8)[6], ["exchange"])
     result = world["table"][IntentName.BUMP_FEE](_bump({"target": txid}))
     assert [option["framing"] for option in result["options"]] == [
         "smallest", "mid", "largest",
@@ -772,8 +772,8 @@ def test_labels_never_reach_the_model(world) -> None:
     txid = _ride(world["table"], world["session"], world["flow"], fee="medium")
     _add_coin(world["store"], world["wallet"].id, 4, "a" * 64, 10_000)
     _add_coin(world["store"], world["wallet"].id, 5, "b" * 64, 50_000)
-    world["store"].set_coin_label(
-        world["wallet"].id, "a" * 64, 0, tags=("exchange",), note="coffee money"
+    world["store"].add_address_labels(
+        derive_fixture_addresses(8)[4], ["exchange", "coffee money"]
     )
     ask = world["table"][IntentName.BUMP_FEE](_bump({"target": txid}))
     assert ask["options"][0]["label"]  # display material EXISTS on the result

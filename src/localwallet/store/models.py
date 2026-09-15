@@ -1,6 +1,6 @@
 """Typed row records for the store layer (TCK-P1-001).
 
-Each frozen dataclass mirrors one table row in the SQLite schema (schema v5,
+Each frozen dataclass mirrors one table row in the SQLite schema (schema v6,
 see :mod:`localwallet.store.db`). The store layer is an internal persistence
 boundary; these records deliberately avoid pydantic to keep the store
 dependency-free (stdlib only: :mod:`dataclasses`, :mod:`collections.abc`).
@@ -30,34 +30,25 @@ DIR_IN = "in"
 DIR_OUT = "out"
 DIR_SELF = "self"
 
-# Coin labels (TCK-UTXO-001, docs/ux-utxo-notes-design.md §1.4): a CLOSED tag
-# vocabulary in canonical storage order (the §1.4 table order), plus one
-# free-text note per coin. Tags/notes are user-authored facts about the user's
-# own coins, consumed exclusively by deterministic code — they never enter
-# model context (§1.1 / §7.10) and the model never authors them.
+# Coin labels (TCK-UTXO-001 → unified by TCK-LABELS-UNIFY, schema v6,
+# docs/ux-utxo-notes-design.md §1.4 + the USER MODEL ratified 2026-09-13): a
+# CLOSED tag vocabulary in canonical storage/display order (the §1.4 table
+# order) that survives as ENGINE VOCABULARY inside each ADDRESS's label set —
+# one address = one private key = one provenance, so the address-keyed label
+# set (``address_label_set``, schema v6) is the labeling source of truth and
+# coins inherit it for the selection engine. A tag word stored anywhere else
+# in a label set is free text (display-only); these five ids are what the
+# deterministic partition (``tx/selection.coin_partition``) acts on. Tags and
+# free-text members are user-authored facts consumed exclusively by
+# deterministic code — they never enter model context (§1.1 / §7.10) and the
+# model never authors them.
 COIN_TAGS: tuple[str, ...] = ("kyc", "exchange", "p2p", "purchase", "consolidation")
 
-#: Free-text note cap, characters (§1.3: "user's free text, verbatim, ≤ 500").
-COIN_NOTE_MAX_CHARS = 500
-
-#: Address-label cap, characters (TCK-LABEL-001, schema v5). Same bound as a
-#: coin note on purpose — both are short user-authored facts, one string per
-#: key; the cap is validated at the store write, value-free.
+#: Cap on ONE member of an address label set (TCK-LABEL-001 / TCK-LABELS-UNIFY,
+#: schema v6). Both tags and free-text labels are short user-authored facts;
+#: the cap is validated at the store write, value-free. (The v2 coin NOTE cap
+#: was the same 500; coin notes migrated into the address sets as members.)
 ADDRESS_LABEL_MAX_CHARS = 500
-
-
-def normalize_coin_tags(tags: Iterable[str]) -> tuple[str, ...]:
-    """Dedupe and canonically order tag ids against the closed set.
-
-    Raises :class:`ValueError` naming NOTHING but the cause (an unknown or
-    non-string tag) — the offending word is never echoed (value-free policy).
-    """
-    seen: set[str] = set()
-    for tag in tags:
-        if not isinstance(tag, str) or tag not in COIN_TAGS:
-            raise ValueError("coin tags must come from the closed tag set")
-        seen.add(tag)
-    return tuple(tag for tag in COIN_TAGS if tag in seen)
 
 
 @dataclass(frozen=True)
@@ -177,48 +168,6 @@ class UtxoRecord:
 
 
 @dataclass(frozen=True)
-class CoinLabelRecord:
-    """A user's coin label: closed-set tags + one free-text note (§1.3).
-
-    Keyed by OUTPOINT (wallet_id, txid, vout) — a separate table from the
-    DELETE+re-INSERTed UTXO snapshot, so labels survive every rescan and stay
-    on record after the coin is spent. ``tags`` is always canonically ordered
-    and deduped (stored comma-joined); ``note`` is the user's text verbatim
-    (already length-capped by the typed writer). Values in these fields are
-    user data: printed to the terminal verbatim, never logged, never model
-    context.
-    """
-
-    wallet_id: int
-    txid: str
-    vout: int
-    tags: tuple[str, ...]
-    note: str | None
-
-    _COLUMNS: ClassVar[tuple[str, ...]] = ("wallet_id", "txid", "vout", "tags", "note")
-
-    @classmethod
-    def from_row(cls, row: Any) -> CoinLabelRecord:
-        raw = row["tags"]
-        return cls(
-            wallet_id=row["wallet_id"],
-            txid=row["txid"],
-            vout=row["vout"],
-            tags=tuple(t for t in raw.split(",") if t) if raw else (),
-            note=row["note"],
-        )
-
-    def to_row(self) -> tuple[int, str, int, str, str | None]:
-        return (
-            self.wallet_id,
-            self.txid,
-            self.vout,
-            ",".join(self.tags),
-            self.note,
-        )
-
-
-@dataclass(frozen=True)
 class AddressRegistryRecord:
     """One entry of the referential-address registry (TCK-CHAT-001, schema v4).
 
@@ -255,49 +204,6 @@ class AddressRegistryRecord:
 
     def to_row(self) -> tuple[int, str, int, int]:
         return (self.wallet_id, self.address, self.number, self.first_shown)
-
-
-@dataclass(frozen=True)
-class AddressLabelRecord:
-    """A user's free-text label for one ADDRESS (TCK-LABEL-001, schema v5).
-
-    Deliberately ADDRESS-keyed, the sibling of ``coin_labels`` (which is
-    OUTPOINT-keyed): "label this address" is a fact about the address string
-    itself, never about one txid:vout — an address label is exactly what
-    coin_labels cannot carry, which is why the live bug had nowhere to land.
-    This table is the foundation TCK-CHAT-003's post-receive label capture
-    builds on. A globally-unique natural key (the address) on purpose,
-    matching the ``addresses.address`` UNIQUE discipline; an address that
-    later moves between wallets keeps its single user label.
-
-    The label is USER-AUTHORED free text (display-only, never selection input
-    and NEVER model context — §1.1/§7.10), stored verbatim up to
-    :data:`ADDRESS_LABEL_MAX_CHARS` (the typed writer validates fail-closed).
-    Like the registry, rows live OUTSIDE the scan write-set: a rescan can
-    never re-assign, clear, or fabricate a label. ``created_at`` is written
-    once; ``updated_at`` moves on every re-label (both ISO-8601 UTC, same
-    shape as ``wallets.created_at``). Values follow the blanket store
-    discipline: stored verbatim, never echoed into exception/log text.
-    """
-
-    address: str
-    label: str
-    created_at: str
-    updated_at: str
-
-    _COLUMNS: ClassVar[tuple[str, ...]] = (
-        "address",
-        "label",
-        "created_at",
-        "updated_at",
-    )
-
-    @classmethod
-    def from_row(cls, row: Any) -> AddressLabelRecord:
-        return cls(**{col: row[col] for col in cls._COLUMNS})
-
-    def to_row(self) -> tuple[str, str, str, str]:
-        return (self.address, self.label, self.created_at, self.updated_at)
 
 
 @dataclass(frozen=True)
