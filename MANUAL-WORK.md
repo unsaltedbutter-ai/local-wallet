@@ -16,6 +16,14 @@
 
 ---
 
+## AUTONOMOUS DECISIONS — overnight run 2026-09-14 (for your review)
+
+1. **No label-removal surface after LABELS-UNIFY** (you ratified union-add; the old v5 replace-on-relabel is gone). Options: (a) union-only tonight, add a `/label <addr> remove <word>` command later if you ever mislabel; (b) build removal now. **Chose (a)** — removal edits address-level truth and deserves its own ticket + copy pass; say the word and it gets ticketed.
+2. **coin_labels table retained write-frozen** after the v6 migration (its rows on SPENT coins have no address to resolve to — dropping them would silently destroy your history). Options: (a) retain as untouchable history; (b) export-then-drop. **Chose (a)**; a future ticket could surface it as spend-history if you want it visible.
+3. **HW-005 slice D ordering** (show-address button, static half): the ledger's "after WEB-015" is a serialization rule, not a functional blocker — tonight's static chain (WEB-020→023→027→022) frees app.js before slice D runs, so slice D proceeds without WEB-015.
+
+---
+
 ## MW-16 round 4 🔥 — re-test on the newest code (post part-8 wave)
 
 Wallet backends = **electrum or bitcoind ONLY** (de-scope stands). Already verified by you in round 3: electrum ✅ bitcoind ✅ TLS ✅ probe speed ✅ autodetect ✅ — re-verify only if something below touches them.
