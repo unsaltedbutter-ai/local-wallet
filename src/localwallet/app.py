@@ -1542,7 +1542,7 @@ NODE_STATUS_DETECTION_DISABLED: Final[str] = "disabled"
 #: is the designer-approved copy quoted VERBATIM from that doc's appendix
 #: block; every VALUE they carry comes verbatim from the handler result
 #: dict — the UI computes nothing (integer formatting of result values
-#: only, the same display-truncation class as txid shortening)).
+#: only; txids in these lines are FULL 64-hex, TCK-TXID-001)).
 _CARD_ASK_LINE: Final[str] = (
     'Pending — say "sign" to review it on your device, or "cancel" to discard.'
 )
@@ -7693,9 +7693,10 @@ def _narrate_incoming_event(
     Dispatcher-owned narration from dispatcher-owned facts (P2-004): every
     value (amount, address, height) is quoted verbatim from the event, which
     the poller built from tool output — the model is never in this loop, and
-    nothing is generated or "corrected". The short txid is display truncation
-    of tool output (the same class as the history narration). This text is
-    deliberately shown to the USER in the UI — the required exception to the
+    nothing is generated or "corrected". The txid is the FULL 64-hex value
+    verbatim (TCK-TXID-001: the transcript is copy material — truncation
+    would hand click-to-copy a fragment). This text is deliberately shown
+    to the USER in the UI — the required exception to the
     no-addresses/amounts rule; it is never logged.
 
     ``suffix`` — the value-free "last block ~N min ago" note computed ONCE
@@ -7707,20 +7708,19 @@ def _narrate_incoming_event(
     registration failure / address-less event) renders the pre-CHAT-001
     line UNCHANGED: the printer never fabricates a number.
     """
-    short = f"{event.txid[:12]}…"
     address_part = f"#{number} {event.address}" if number is not None else event.address
     if event.kind == "received":
         state = "confirmed" if event.confirmed else "in mempool"
         line = (
             f"Incoming: received {event.amount_sats} sats at {address_part} "
-            f"({state}, tx {short})."
+            f"({state}, tx {event.txid})."
         )
     else:
         height = event.height
         height_part = f" (height {height})" if height is not None else ""
         line = (
             f"Confirmed: {event.amount_sats} sats at {address_part} "
-            f"now confirmed{height_part} (tx {short})."
+            f"now confirmed{height_part} (tx {event.txid})."
         )
     if suffix:
         line = f"{line} · {suffix}"
@@ -16187,8 +16187,10 @@ def _print_turn(
     """Print one agent turn according to its status and intent.
 
     Every printed value comes verbatim from the handler result dict —
-    the UI computes nothing (txid shortening is display truncation of
-    tool output, per the narration contract). All strings pass through
+    the UI computes nothing (txids print FULL 64-hex per TCK-TXID-001:
+    the transcript is the user's own data and the click-to-copy token
+    scan needs the complete value; the value-free rule scrubs logs). All
+    strings pass through
     :func:`~localwallet.agent.context.sanitize_tool_output` immediately
     before printing (SR-006: the envelope grammar permits ``\\uXXXX`` so
     ESC/bidi control characters must never reach the terminal).
@@ -16346,10 +16348,12 @@ def _print_freshness_note(
 
 
 def _print_history(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
-    """Print history lines: ``tx <short-txid>… <direction> <height|unconfirmed>``.
+    """Print history lines: ``tx <txid> <direction> <height|unconfirmed>``.
 
     Address-free by contract (P1 narration): only txid/direction/height
-    are shown; values are verbatim from the handler result dict. A
+    are shown; values are verbatim from the handler result dict — the
+    txid FULL 64-hex (TCK-TXID-001: the transcript is copy material; the
+    value-free rule scrubs logs, not the user's own transaction ids). A
     stale-flagged answer (ADR-0022) leads with the value-free loading note
     — an empty cache during the first scan must never read as a final
     "No transactions found."
@@ -16366,11 +16370,11 @@ def _print_history(result: Mapping[str, object], output_fn: Callable[[str], None
         if not isinstance(tx, dict):  # pragma: no cover — handler-shaped data
             continue
         txid = str(tx.get("txid", ""))
-        short = f"{txid[:12]}…" if txid else "tx <unknown>"
+        txid_part = txid or "<unknown>"
         height = tx.get("height")
         height_label = str(height) if height is not None else "unconfirmed"
         direction = str(tx.get("direction", "?"))
-        output_fn(sanitize_tool_output(f"tx {short} {direction} {height_label}"))
+        output_fn(sanitize_tool_output(f"tx {txid_part} {direction} {height_label}"))
 
 
 def _print_utxos(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
@@ -16418,11 +16422,11 @@ def _print_utxos(result: Mapping[str, object], output_fn: Callable[[str], None])
         address_part = f"{number_part}{address} · " if address else ""
         confirmed_label = "confirmed" if utxo.get("confirmed") else "unconfirmed"
         txid = str(utxo.get("txid", ""))
-        short = f"{txid[:12]}…" if txid else "tx <unknown>"
+        txid_part = txid or "<unknown>"
         output_fn(
             sanitize_tool_output(
                 f"{address_part}{utxo.get('value_sats', 0)} sats · "
-                f"{confirmed_label} · tx {short} vout {utxo.get('vout', 0)}"
+                f"{confirmed_label} · tx {txid_part} vout {utxo.get('vout', 0)}"
             )
         )
 
@@ -16726,7 +16730,7 @@ def _print_bump_fee(
                 if not isinstance(entry, dict):  # pragma: no cover — handler-shaped
                     continue
                 txid = str(entry.get("txid", ""))
-                short = f"{txid[:12]}…" if txid else "tx <unknown>"
+                txid_part = txid or "<unknown>"
                 amount = entry.get("amount_sats")
                 amount_part = (
                     f"{amount:,} sats"
@@ -16747,7 +16751,7 @@ def _print_bump_fee(
                 )
                 output_fn(
                     sanitize_tool_output(
-                        f"  {entry.get('index')}. tx {short} · {amount_part} · "
+                        f"  {entry.get('index')}. tx {txid_part} · {amount_part} · "
                         f"{rate_part} · {age_part}"
                     )
                 )
@@ -16876,7 +16880,7 @@ def _print_cpfp_coin_ask(
         if not isinstance(entry, dict):  # pragma: no cover — handler-shaped
             continue
         txid = str(entry.get("txid", ""))
-        short = f"{txid[:12]}…" if txid else "tx <unknown>"
+        txid_part = txid or "<unknown>"
         amount = entry.get("value_sats")
         amount_part = (
             f"{amount:,} sats"
@@ -16891,7 +16895,7 @@ def _print_cpfp_coin_ask(
         )
         line = (
             f"  {entry.get('index')}. {amount_part} · {age_part} · "
-            f"tx {short} vout {entry.get('vout', 0)}"
+            f"tx {txid_part} vout {entry.get('vout', 0)}"
         )
         label = entry.get("label")
         if isinstance(label, str) and label:

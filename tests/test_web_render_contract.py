@@ -819,8 +819,14 @@ def test_linkify_regexes_and_click_to_copy_under_node() -> None:
       // accepted: standalone tokens only — the scan yields the token verbatim
       let a = linkify("send to " + addr + " now");
       if (a.length !== 1 || a[0] !== addr) throw new Error("addr");
-      a = linkify("tx " + tx + " confirmed");
-      if (a.length !== 1 || a[0] !== tx) throw new Error("tx");
+       a = linkify("tx " + tx + " confirmed");
+       if (a.length !== 1 || a[0] !== tx) throw new Error("tx");
+       // TCK-TXID-001: the SHIPPED narration sentences (full 64-hex ack +
+       // lineage copy) yield the token verbatim...
+       a = linkify("Sent! txid " + tx + " — tracking…");
+       if (a.length !== 1 || a[0] !== tx) throw new Error("ack-sentence");
+       if (linkify("Sent! txid " + tx.slice(0, 12) + "… — tracking…").length)
+         throw new Error("truncated-fragment-qualifies");
       // rejected: uppercase, longer-word embedding, oversized, wrong charset
       if (linkify("BC1QAR0SRRR7XFKVY5L643LYDNW9RE59GTZZWF5MDQ").length) throw new Error("upper");
       if (linkify("x" + addr).length) throw new Error("embedded-left");

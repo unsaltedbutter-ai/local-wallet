@@ -1012,9 +1012,9 @@ def test_history_narration_lines_are_address_free() -> None:
     lines = [line for line in outputs if line.startswith("tx ")]
     assert len(lines) == 5
     unconfirmed = "ee" * 32
-    assert f"tx {unconfirmed[:12]}… out unconfirmed" in joined
+    assert f"tx {unconfirmed} out unconfirmed" in joined
     top_confirmed = f"{24:02x}" * 32
-    assert f"tx {top_confirmed[:12]}… in 800024" in joined
+    assert f"tx {top_confirmed} in 800024" in joined
     # P1 narration contract: no addresses in history output.
     for addr in derive_fixture_addresses(3):
         assert addr not in joined
@@ -2338,8 +2338,8 @@ def test_repl_history_narration_with_stub_phrase(
     tx_lines = [line for line in outputs if line.startswith("tx ")]
     assert len(tx_lines) == 20  # default limit honored
     # Unconfirmed first, then height DESC.
-    assert tx_lines[0] == f"tx {('ee' * 32)[:12]}… out unconfirmed"
-    assert tx_lines[1] == f"tx {(f'{24:02x}' * 32)[:12]}… in 800024"
+    assert tx_lines[0] == f"tx {'ee' * 32} out unconfirmed"
+    assert tx_lines[1] == f"tx {f'{24:02x}' * 32} in 800024"
     for addr in derive_fixture_addresses(3):
         assert addr not in joined
     assert wd.descriptor not in joined
@@ -5078,7 +5078,7 @@ def test_send_lifecycle_file_signer_full_happy_path(
     assert f"broadcast_txid: {expected_txid}" in status_prompt
     assert "Confirmed at height 870001." in joined
     # --- history: the outbound row (store upsert after broadcast) -------
-    assert f"tx {expected_txid[:12]}… out unconfirmed" in joined
+    assert f"tx {expected_txid} out unconfirmed" in joined
     store_path = tmp_path / "store.db"
     with Store(store_path) as store:
         wallet_row = store.get_wallet_by_name("default")

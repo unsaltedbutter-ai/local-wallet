@@ -341,7 +341,7 @@ def test_ac2_full_lifecycle_file_signer_production_path(
             ("d" * 64, None, "in"),
         ]
     # History narration shows the outbound row.
-    assert f"tx {expected_txid[:12]}… out unconfirmed" in joined
+    assert f"tx {expected_txid} out unconfirmed" in joined
 
 
 # --------------------------------------------------------------------------
