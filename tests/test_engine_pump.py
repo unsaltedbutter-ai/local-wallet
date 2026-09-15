@@ -792,6 +792,9 @@ def test_watchkey_replaced_note_closes_its_own_turn() -> None:
         swap = None
         settings = None
         hwi = None
+        # TCK-CONS-002: the real _Wiring carries the shared estimator the
+        # pump rebinds onto — the fake follows the real shape.
+        fee_estimator = None
 
     class _Provision:
         wiring = _Wiring()

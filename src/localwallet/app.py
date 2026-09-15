@@ -1909,6 +1909,183 @@ _CONS_NO_COINS_AT: Final[str] = (
     "There are no coins at address #{number} — nothing to merge from it."
 )
 
+# --- TCK-CONS-002: the consolidation-TIMING answer (council qwen#9) --------
+#
+# "is now a good time to consolidate?" gets a CODE-OWNED answer, not a
+# model guess: the dispatcher reads the engine's own fee facts (the ONE
+# cached estimator snapshot — zero extra chain calls) and applies a PINNED
+# decision rule in integer centisat/vB. Never a fabricated probability,
+# never a digit in a user-facing line (the figures live only in the FACTS
+# snapshot), every line hedged — estimates about rates, never promises
+# about confirmation (the CHAT-002 §3b discipline, mirrored). The answer
+# closes with the deterministic bypass INTO the existing conversation: the
+# canonical utterance "consolidate my small utxos" is ALREADY intercepted
+# (TCK-CHAT-002) — no new gate vocabulary, no new intent, no prompt route.
+
+#: The timing branch that wins when the user's OWN fold threshold already
+#: covers the current cheapest bid. Comparisons (all integer centisat/vB,
+#: pinned order in :func:`_cons_timing_answer`):
+#:   FOLD-ACT   slow_bid <= consolidate_below_sat_vb*100 AND the wallet
+#:              holds >= 2 coins under its own utxo_target_min_sats
+#:              (waiting is pointless — step 5 folds them anyway; the unit
+#:              conversion mirrors tx/selection.py step 5 exactly);
+#:   NO-DATA    no six-hour average (or no bids at all) — never compare,
+#:              never guess, say so;
+#:   WAIT       slow_bid >  six_hour_low_average_centisat_vb (elevated
+#:              versus the recent norm — CHAT-002's §3b warning);
+#:   ACT        slow_bid <= six_hour_low_average_centisat_vb.
+#: B0/B1 are deliberately ABSENT from the FACTS snapshot: the estimator's
+#: public surface exposes only the final rung bids and the six-hour average
+#: (the bottoms are consumed inside chain/fees.py by the rung derivations),
+#: and TCK-CONS-002's no-new-chain-surface rule forbids a fresh accessor —
+#: the rungs + average carry the entire comparison, so nothing is guessed.
+_CONS_TIMING_WAIT: Final[str] = (
+    "Right now the cheapest slow bid sits above the roughly six-hour "
+    "average of the per-block lowest fees — fees look elevated against "
+    "that recent norm. If you can wait, waiting might cost you less; "
+    "nothing about future fees is certain, so this is an estimate, never "
+    "a promise."
+)
+_CONS_TIMING_ACT: Final[str] = (
+    "The cheapest slow bid sits at or below the roughly six-hour average "
+    "of the per-block lowest fees — by that measure it is as good a time "
+    "as any to consolidate. Estimates, never promises: fees can move "
+    "between one look and the next."
+)
+_CONS_TIMING_FOLD: Final[str] = (
+    "Your small coins would fold into ordinary sends on their own at "
+    "today's cheapest bid — it already sits within the consolidation fee "
+    "ceiling you set, so waiting buys little either way. As fine a time "
+    "as any to consolidate; an estimate, never a promise."
+)
+_CONS_TIMING_NO_DATA: Final[str] = (
+    "I can't compare today's bids with the recent six-hour average of the "
+    "per-block lowest fees — that data isn't available right now, so I "
+    "can't honestly say whether fees sit high or low against the norm at "
+    "the moment."
+)
+#: The bypass (deliverable 3): the path INTO the existing conversation,
+#: named by the canonical utterance the CHAT-002 intercept already
+#: consumes — the card stays the authority on every figure.
+_CONS_TIMING_BYPASS: Final[str] = (
+    "To consolidate anyway, just say 'consolidate my small utxos' — or "
+    "name the coins you want merged. The plan card shows the exact fee "
+    "before anything is signed or sent."
+)
+
+#: The timing matcher: consolidation VERB forms only (the noun
+#: "consolidation" is the CFG-004 settings-key wording — its questions
+#: must keep their settings route), a question shape, and a timing word
+#: (or a "when" opener). Anything the existing opener also matches keeps
+#: the opener (no behavioral change to a single golden phrasing); deny
+#: tokens suppress (the HW-005 rule); bare digits keep the model's
+#: threshold route (the CHAT-002 opener rule, mirrored).
+_CONS_TIMING_VERBS: Final[frozenset[str]] = frozenset({"consolidate", "consolidating"})
+_CONS_TIMING_STARTERS: Final[frozenset[str]] = frozenset(
+    {"is", "are", "should", "would", "could", "can", "do", "does", "when", "how",
+     "what", "whats"}
+)
+_CONS_TIMING_WORDS: Final[frozenset[str]] = frozenset(
+    {"now", "time", "today", "tonight", "moment", "soon", "currently", "good",
+     "wait", "waiting", "later", "right"}
+)
+
+
+def _consolidation_timing_ask(line: str) -> bool:
+    """True when the line is a consolidation-TIMING question (TCK-CONS-002
+    — "is now a good time to consolidate?", "should I consolidate now?",
+    "when should I consolidate?"). The caller only consults this when
+    :func:`_consolidation_intent` did NOT match, so a line that opens the
+    real conversation always keeps its existing behavior."""
+    words = [w for w in (t.strip(punctuation) for t in line.lower().split()) if w]
+    if not words or not any(w in _CONS_TIMING_VERBS for w in words):
+        return False
+    if any(w in _BUMP_DENY_TOKENS for w in words):
+        return False
+    if any(w.isdigit() for w in words) and not _digits_named_as_addresses(words):
+        return False  # an explicit size threshold keeps the model route
+    if not (line.strip().endswith("?") or words[0] in _CONS_TIMING_STARTERS):
+        return False
+    return words[0] == "when" or any(w in _CONS_TIMING_WORDS for w in words)
+
+
+def _consolidation_timing_facts(
+    fee_estimator: FeeEstimator,
+) -> dict[str, int | None]:
+    """The engine-owned FACTS snapshot behind the timing answer: the three
+    current rung bids and the six-hour average of per-block lowest fees,
+    ALL integer centisat/vB (``None`` = no honest figure — the comparison
+    then stands DOWN, never a guess). Rides the estimator's ONE cached
+    snapshot (TTL): at most a single regular refresh, no new chain call,
+    no new chain surface. A failing refresh degrades the bids to ``None``
+    exactly like the average seam already does fail-closed."""
+    try:
+        bids: dict[str, int | None] = {
+            f"{target.value}_bid_centisat_vb": fee_estimator.estimate(target).rate_centisat_vb
+            for target in (FeeTarget.SLOW, FeeTarget.MEDIUM, FeeTarget.FAST)
+        }
+    except Exception:  # noqa: BLE001 — a fee-source failure degrades, never fails a chat turn
+        bids = {
+            f"{target.value}_bid_centisat_vb": None
+            for target in (FeeTarget.SLOW, FeeTarget.MEDIUM, FeeTarget.FAST)
+        }
+    try:
+        avg_c = fee_estimator.six_hour_low_average_centisat_vb()
+    except Exception:  # noqa: BLE001 — the seam is itself fail-closed; belt only
+        avg_c = None
+    bids["six_hour_low_average_centisat_vb"] = avg_c
+    return bids
+
+
+def _cons_timing_answer(
+    store: Store,
+    coins: tuple[dict[str, object], ...],
+    fee_estimator: FeeEstimator,
+    output_fn: Callable[[str], None],
+) -> None:
+    """The code-owned timing answer (TCK-CONS-002): FACTS snapshot in,
+    pinned integer-centisat decision (module comment above), one hedged
+    value-free line out plus the deterministic bypass line. The user's own
+    coin-policy ladder (settings, resolved fresh exactly like the
+    small-utxos path) supplies the fold context; a malformed ladder or a
+    store surprise just drops the fold clause (the comparison against the
+    six-hour average still answers — fail QUIET on decoration, fail CLOSED
+    on claims)."""
+    facts = _consolidation_timing_facts(fee_estimator)
+    slow_c = facts["slow_bid_centisat_vb"]
+    avg_c = facts["six_hour_low_average_centisat_vb"]
+    fold_now = False
+    try:
+        policy = resolve_coin_selection_settings(
+            {key: getattr(Settings.from_env(), key, "") for key in COIN_SETTING_KEYS},
+            {key: store.get_coin_setting(key) for key in COIN_SETTING_KEYS},
+        )
+        fold_now = (
+            slow_c is not None
+            and policy.consolidate_below_sat_vb is not None
+            and policy.target_min_sats is not None
+            # whole sat/vB → centisat, the unit conversion tx/selection.py
+            # step 5 itself applies; >= 2 candidates is its own trigger.
+            and slow_c <= policy.consolidate_below_sat_vb * 100
+            and sum(
+                1 for c in coins if int(str(c["value_sats"])) < policy.target_min_sats
+            )
+            >= 2
+        )
+    except (ValueError, StoreError, sqlite3.Error):
+        fold_now = False
+    if fold_now:
+        line = _CONS_TIMING_FOLD
+    elif avg_c is None or slow_c is None:
+        line = _CONS_TIMING_NO_DATA
+    elif slow_c > avg_c:
+        line = _CONS_TIMING_WAIT
+    else:
+        line = _CONS_TIMING_ACT
+    output_fn(sanitize_tool_output(line))
+    output_fn(sanitize_tool_output(_CONS_TIMING_BYPASS))
+
+
 #: TCK-CHAT-002 opener vocabularies (deterministic, code-matched BEFORE
 #: the model — registry numbers are user data and the closed consolidate
 #: params cannot carry a coin reference, so this never becomes a prompt
@@ -2707,6 +2884,7 @@ def _run_consolidation_turn(
     output_fn: Callable[[str], None],
     *,
     table: DispatchTable,
+    fee_estimator: FeeEstimator | None = None,
 ) -> bool:
     """One consolidation-conversation turn (TCK-CONS-001), run BEFORE the
     gate and the model exactly like the hardware/bump/cpfp intercepts:
@@ -2725,7 +2903,16 @@ def _run_consolidation_turn(
     A group of exactly one coin answers the count ask by construction and
     goes straight to the plan (no fake question — the CPFP-002 collapse
     discipline). Any unmatched utterance CLEARS the ask (never-trap) and
-    the line falls through to the ordinary pipeline."""
+    the line falls through to the ordinary pipeline.
+
+    TCK-CONS-002 extends the ENTRY POINT with the timing question: "is now
+    a good time to consolidate?" / "should I consolidate now?" get the
+    code-owned FACTS answer (:func:`_cons_timing_answer`) — but ONLY when
+    the existing opener does not match (no golden phrasing changes) and an
+    estimator is wired (without one the line keeps today's model route).
+    A timing question while an ask stands open rides the never-trap above
+    (it closes the ask and falls through — the conversation's established
+    corner, same class as the documented double-open one)."""
     ask = session.cons_ask
     if ask is not None:
         choice = _cons_answer(line, ask)
@@ -2784,9 +2971,12 @@ def _run_consolidation_turn(
     ):
         return False  # gate territory (the pending card owns this turn)
     intent = _consolidation_intent(line)
-    if intent is None:
+    # TCK-CONS-002: the timing question answers ONLY lines the opener did
+    # not match (the opener keeps priority over every golden phrasing) and
+    # only with an estimator wired; otherwise today's model route stands.
+    timing = intent is None and fee_estimator is not None and _consolidation_timing_ask(line)
+    if intent is None and not timing:
         return False
-    tag, fee_target, small, numbers = intent
     try:
         wallet = store.get_active_wallet()
         if wallet is None:
@@ -2799,6 +2989,12 @@ def _run_consolidation_turn(
     if not coins:
         output_fn(sanitize_tool_output(_CONS_EMPTY))
         return True
+    if timing:
+        assert intent is None  # the opener had priority and did not match
+        _cons_timing_answer(store, coins, fee_estimator, output_fn)
+        return True
+    assert intent is not None  # (the guard above: timing returned or did not match)
+    tag, fee_target, small, numbers = intent
     if numbers:
         return _cons_by_numbers(
             session, store, wallet.id, coins, numbers, fee_target, line, output_fn,
@@ -10203,6 +10399,12 @@ class EngineContext:
     #: key; ``None`` on the first-run placeholder — there is no wallet to
     #: probe against yet, and every ordinary line is refused anyway).
     hwi: HwiUsbSigner | None = None
+    #: TCK-CONS-002: the ONE shared FeeEstimator the wiring already owns
+    #: (the same object create_tx/self_transfer bid over — passing it to the
+    #: pump lets the consolidation-timing answer read the engine's own fee
+    #: facts WITHOUT a second estimator or a fresh chain call). ``None`` on
+    #: the first-run placeholder (no wiring yet).
+    fee_estimator: FeeEstimator | None = None
 
 
 @dataclass(frozen=True)
@@ -11427,6 +11629,7 @@ def start_engine(
                 backend=ctx.backend,
                 settings=ctx.settings,
                 hwi=ctx.hwi,
+                fee_estimator=ctx.fee_estimator,
             )
         except BaseException as exc:  # noqa: BLE001 — engine-thread pump death
             handle.error = exc
@@ -11658,6 +11861,7 @@ def _pump(
     backend: ChainBackendFlow | None = None,
     settings: Settings | None = None,
     hwi: HwiUsbSigner | None = None,
+    fee_estimator: FeeEstimator | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
     ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
@@ -11772,7 +11976,7 @@ def _pump(
         the chat-provision intercept (TCK-ONB-007), so the two entries can
         never drift. Engine thread only (like every pump mutation)."""
         nonlocal loop, flow, session, table, watcher, client, store, scan
-        nonlocal backend, settings, hwi
+        nonlocal backend, settings, hwi, fee_estimator
         assert provision is not None and provision.wiring is not None
         wiring = provision.wiring
         loop = wiring.loop
@@ -11783,6 +11987,10 @@ def _pump(
         client = wiring.client
         store = wiring.store
         scan = wiring.scan
+        # TCK-CONS-002: the timing answer reads the ONE shared estimator the
+        # wiring already owns (the same object a hot-swap keeps — only its
+        # relay-floor client re-points); the rebind simply follows it.
+        fee_estimator = wiring.fee_estimator
         # TCK-BACKEND-002: the fresh wiring owns its own swap controller
         # (built by _wire) — the pump follows.
         backend = wiring.swap
@@ -12255,6 +12463,7 @@ def _pump(
                 loop, flow, session, line, output_fn, client=client, table=table,
                 scan_gate=scan.gate if scan is not None else None, hwi=hwi,
                 store=store, live_apply_setting=_apply_live_setting,
+                fee_estimator=fee_estimator,
             )
         if emitter is not None:
             emitter.emit(EVENT_TURN_END)
@@ -12663,6 +12872,7 @@ def run(
             preload=preload_flow,
             backend=wiring.swap,
             hwi=wiring.hwi,
+            fee_estimator=wiring.fee_estimator,
         )
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
@@ -14124,6 +14334,7 @@ def _run_web(
             backend=wiring.swap,
             settings=wiring.settings,
             hwi=wiring.hwi,
+            fee_estimator=wiring.fee_estimator,
         )
 
     try:
@@ -14415,6 +14626,7 @@ def _repl(
     preload: ModelPreloadFlow | None = None,
     backend: ChainBackendFlow | None = None,
     hwi: HwiUsbSigner | None = None,
+    fee_estimator: FeeEstimator | None = None,
 ) -> None:
     """The CLI transport over the engine pump (TCK-WEB-001, ADR-0024 §3).
 
@@ -14477,6 +14689,7 @@ def _repl(
             preload=preload,
             backend=backend,
             hwi=hwi,
+            fee_estimator=fee_estimator,
         )
     finally:
         stop.set()
@@ -16049,6 +16262,7 @@ def _run_turn(
     hwi: HwiUsbSigner | None = None,
     store: Store | None = None,
     live_apply_setting: Callable[[str, bool], str | None] | None = None,
+    fee_estimator: FeeEstimator | None = None,
 ) -> None:
     """Run ONE REPL turn: gate classification → agent → flow narration.
 
@@ -16255,7 +16469,10 @@ def _run_turn(
     if (
         store is not None
         and IntentName.SELF_TRANSFER in table
-        and _run_consolidation_turn(session, store, flow, line, output_fn, table=table)
+        and _run_consolidation_turn(
+            session, store, flow, line, output_fn,
+            table=table, fee_estimator=fee_estimator,
+        )
     ):
         return
     # TCK-LABEL-001: chat label-by-address ("label bc1… as 'KYC'") — the
