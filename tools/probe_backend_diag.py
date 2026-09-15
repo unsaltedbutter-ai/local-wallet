@@ -37,6 +37,8 @@ caller asked for still decide the cache key.
 
 Usage: python tools/probe_backend_diag.py URL [--user U --password P]
        [--insecure] [--json]
+       python tools/probe_backend_diag.py URL --minrelay [--user U --password P]
+       [--insecure] [--json]   # report min-relay floor per backend
 """
 from __future__ import annotations
 
@@ -46,11 +48,21 @@ import socket
 import ssl
 import sys
 import urllib.parse
+from decimal import ROUND_CEILING, Decimal
 
 import httpx
 
 MAINNET_GENESIS_HASH = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
 ELECTRUM_PORT, BITCOIND_PORT, TIMEOUT = 50002, 8332, 5.0
+#: BTC/kvB → CENTISAT/vB (TCK-FEE-004 floor conversion mirror): 1e8 sats/BTC
+#: × 1e2 cents/sat ÷ 1e3 vB/kvB = 10 000 000. The engine's ASSUMED floor
+#: today is 100 centisat/vB (= 1 sat/vB; see TCK-FEE-005: the Core default
+#: in policy.h master AND v31 is actually DEFAULT_MIN_RELAY_TX_FEE{100} =
+#: 100 sat/kvB = 0.1 sat/vB, so our assumed floor is 10x the shipped default
+#: and this tool exists to show the live node's real value).
+_CENTISAT_VB_PER_BTC_KVB = Decimal(10_000_000)
+_SATS_PER_BTC = Decimal(100_000_000)
+_ASSUMED_MIN_RELAY_CENTISAT_VB = 100
 _VERIFY_NONE = ssl.create_default_context()
 _VERIFY_NONE.check_hostname, _VERIFY_NONE.verify_mode = False, ssl.CERT_NONE
 
@@ -100,6 +112,144 @@ def strip_userinfo(url):
     return urllib.parse.urlunsplit((p.scheme, p.netloc.rsplit("@", 1)[-1], p.path, "", ""))
 
 
+def _fmt(d):
+    """Render a Decimal as a plain decimal string with trailing zeros
+    stripped (e.g. 100.000000 -> 100, 0.100000 -> 0.1)."""
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
+def _btc_per_kvb_to_units(raw):
+    """EXACT Decimal conversions of a BTC/kvB min-relay figure: sat/kvB,
+    sat/vB and integer centisat/vB (CEILED — a floor must never undercut
+    what the node enforces; bitcoind.py's exact conversion mirror)."""
+    btc = Decimal(str(raw))
+    sat_kvb = btc * _SATS_PER_BTC
+    sat_vb = sat_kvb / 1000
+    centisat_vb = int((btc * _CENTISAT_VB_PER_BTC_KVB).to_integral_value(rounding=ROUND_CEILING))
+    return btc, sat_kvb, sat_vb, centisat_vb
+
+
+def _engine_floor(advertised_centisat_vb):
+    """The engine's EFFECTIVE min-relay floor = MAX(advertised, assumed).
+    The assumed 1 sat/vB (=100 centisat/vB) is the today-constant the tx
+    build gates enforce; a node answering LOWER cannot license a bid our own
+    builder would refuse (fees.py _ASSUMED_MIN_RELAY_CENTISAT_VB mirror)."""
+    effective = max(advertised_centisat_vb, _ASSUMED_MIN_RELAY_CENTISAT_VB)
+    return {
+        "assumed_centisat_per_vb": _ASSUMED_MIN_RELAY_CENTISAT_VB,
+        "centisat_per_vb": effective,
+        "sat_per_vb": _fmt(Decimal(effective) / 100),
+        "note": "engine assumed floor 1 sat/vB — see TCK-FEE-005",
+    }
+
+
+def _minrelay_bitcoind(client, scheme, p, auth):
+    """bitcoind: one getmempoolinfo RPC → minrelaytxfee verbatim (BTC/kvB)
+    + exact sat/kvB/sat/vB + Core's shipped default (policy.h) + the
+    engine's effective floor (MAX with the assumed 1 sat/vB)."""
+    m = {"source": "bitcoind getmempoolinfo.minrelaytxfee"}
+    body = json.dumps({"jsonrpc": "1.0", "id": 2, "method": "getmempoolinfo", "params": []})
+    try:
+        resp = client.post(
+            f"{scheme}://{p.hostname}:{p.port or BITCOIND_PORT}/", content=body, auth=auth
+        )
+    except httpx.TimeoutException:
+        m["error_class"] = "timeout"
+        return m
+    except httpx.ConnectError as e:
+        m["error_class"] = classify(e)
+        return m
+    except Exception as e:  # noqa: BLE001
+        m["error_class"] = classify(e)
+        return m
+    try:
+        envelope = resp.json()
+    except ValueError:
+        envelope = None
+    error = envelope.get("error") if isinstance(envelope, dict) else None
+    if error:
+        m["error_class"] = "rpc-error"
+        return m
+    result = envelope.get("result") if isinstance(envelope, dict) else None
+    raw = result.get("minrelaytxfee") if isinstance(result, dict) else None
+    if raw is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        m["error_class"] = "missing-minrelaytxfee"
+        return m
+    btc, sat_kvb, sat_vb, centisat = _btc_per_kvb_to_units(raw)
+    core = _btc_per_kvb_to_units("0.00000100")
+    m.update({
+        "minrelaytxfee_btc_per_kvb": _fmt(btc),
+        "sat_per_kvb": _fmt(sat_kvb),
+        "sat_per_vb": _fmt(sat_vb),
+        "core_default": {
+            "btc_per_kvb": format(core[0], "f"),
+            "sat_per_kvb": _fmt(core[1]),
+            "sat_per_vb": _fmt(core[2]),
+            "cite": "bitcoin/src/policy/policy.h DEFAULT_MIN_RELAY_TX_FEE{100} (master & v31)",
+        },
+        "engine_effective_floor": _engine_floor(centisat),
+    })
+    return m
+
+
+def _minrelay_electrum(result):
+    """electrum: server.features relayfee printed raw IF advertised (unit
+    caveat), else "not advertised". relayfee is legacy/unit-ambiguous since
+    protocol 1.4.2 — shown verbatim, never converted/invented."""
+    m = {"source": "electrum server.features relayfee"}
+    relay = result.get("relayfee")
+    if relay is None or isinstance(relay, bool) or not isinstance(relay, (int, float)):
+        m["advertised"] = False
+        m["relayfee_raw"] = None
+        m["note"] = "not advertised (deprecated method) — engine assumed floor applies"
+    else:
+        m["advertised"] = True
+        m["relayfee_raw"] = str(relay)
+        m["unit_note"] = (
+            "relayfee is kB-based sats/kB (= sat/kvB) on many servers but the "
+            "field is deprecated/unit-ambiguous since protocol 1.4.2 — shown "
+            "verbatim, no conversion"
+        )
+    return m
+
+
+def _minrelay_mempool(client, base_url, api_root):
+    """publicinfo/mempool: GET /v1/fees/recommended → minimumFee (sat/vB) —
+    the congestion-derived minimum, NOT a relay floor (contrast only)."""
+    m = {"source": "mempool /v1/fees/recommended minimumFee"}
+    root = "" if api_root == "/" else api_root
+    url = base_url.rstrip("/") + root + "/v1/fees/recommended"
+    try:
+        resp = client.get(url)
+    except httpx.TimeoutException:
+        m["error_class"] = "timeout"
+        return m
+    except httpx.ConnectError as e:
+        m["error_class"] = classify(e)
+        return m
+    except Exception as e:  # noqa: BLE001
+        m["error_class"] = classify(e)
+        return m
+    if resp.status_code != 200:
+        m["error_class"] = "http-status"
+        return m
+    try:
+        payload = resp.json()
+    except ValueError:
+        m["error_class"] = "not-json"
+        return m
+    minfee = payload.get("minimumFee") if isinstance(payload, dict) else None
+    if minfee is None or isinstance(minfee, bool) or not isinstance(minfee, (int, float)):
+        m["error_class"] = "missing-minimumFee"
+        return m
+    m["minimum_fee_sat_per_vb"] = str(minfee)
+    m["label"] = "mempool congestion-derived minimum fee (sat/vB) — NOT a relay floor"
+    return m
+
+
 def _tip_height(resp):
     """The app's tip-height shape ladder (TCK-BACKEND-004 mirror) for a raw
     /blocks/tip response: returns the height, ``None`` for the empty-list
@@ -139,7 +289,7 @@ def _genesis_ok(payload):
     return False
 
 
-def probe_esplora(base_url, insecure, client):
+def probe_esplora(base_url, insecure, client, minrelay=False):
     r = {"kind": "esplora", "reachable": False, "tls_error": None,
          "http_status": None, "mainnet": None, "error_class": None,
          "api_root": None}
@@ -178,6 +328,8 @@ def probe_esplora(base_url, insecure, client):
             r["api_root"] = prefix or "/"
             blocks = client.get(f"{url}/blocks/0").json()
             r["mainnet"] = _genesis_ok(blocks)
+            if minrelay:
+                r["minrelay"] = _minrelay_mempool(client, base_url, r["api_root"])
             return r
         return r
     except httpx.InvalidURL:
@@ -204,7 +356,7 @@ def _tip_first_blocks(client, url):
     return "unusable"
 
 
-def probe_electrum(url, insecure):
+def probe_electrum(url, insecure, minrelay=False):
     r = {"kind": "electrum", "reachable": False, "tls_error": None,
          "http_status": None, "mainnet": None, "error_class": None}
     p = urllib.parse.urlsplit(url)
@@ -217,9 +369,12 @@ def probe_electrum(url, insecure):
         buf = b""
         while b"\n" not in buf:
             buf += sock.recv(4096)
-        gh = json.loads(buf.split(b"\n")[0]).get("result", {}).get("genesis_hash")
+        result = json.loads(buf.split(b"\n")[0]).get("result", {})
+        gh = result.get("genesis_hash")
         r["reachable"] = True
         r["mainnet"] = bool(gh) and str(gh).startswith(MAINNET_GENESIS_HASH[:8])
+        if minrelay:
+            r["minrelay"] = _minrelay_electrum(result)
     except ssl.SSLCertVerificationError as e:
         r["tls_error"] = r["error_class"] = classify(e)
     except ssl.SSLError as e:
@@ -236,7 +391,7 @@ def probe_electrum(url, insecure):
     return r
 
 
-def probe_bitcoind(url, user, password, insecure, client):
+def probe_bitcoind(url, user, password, insecure, client, minrelay=False):
     r = {"kind": "bitcoind", "reachable": False, "tls_error": None,
          "http_status": None, "mainnet": None, "error_class": None,
          "rpc_error_code": None}
@@ -272,6 +427,8 @@ def probe_bitcoind(url, user, password, insecure, client):
         else:
             r["reachable"] = True
             r["mainnet"] = (envelope or {}).get("result", {}).get("chain") == "main"
+            if minrelay:
+                r["minrelay"] = _minrelay_bitcoind(client, scheme, p, auth)
     except httpx.TimeoutException:
         r["tls_error"] = r["error_class"] = "timeout"
     except httpx.ConnectError as e:
@@ -289,15 +446,17 @@ def main():
     ap.add_argument("--insecure", action="store_true",
                     help="disable TLS verify (mirror LOCALWALLET_TLS_VERIFY=0)")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--minrelay", action="store_true",
+                    help="also report each backend's min-relay floor (see usage)")
     a = ap.parse_args()
     _install_dns_memo()
     # ONE pooled client for both HTTP probes (TCK-BACKEND-004): with the
     # DNS memo above the host is looked up ONCE for the whole run, however
     # many kinds/ports/paths it serves.
     with httpx.Client(timeout=TIMEOUT, verify=not a.insecure) as client:
-        results = [probe_esplora(a.url, a.insecure, client),
-                   probe_electrum(a.url, a.insecure),
-                   probe_bitcoind(a.url, a.user, a.password, a.insecure, client)]
+        results = [probe_esplora(a.url, a.insecure, client, a.minrelay),
+                   probe_electrum(a.url, a.insecure, a.minrelay),
+                   probe_bitcoind(a.url, a.user, a.password, a.insecure, client, a.minrelay)]
     if a.json:
         print(json.dumps({"url": strip_userinfo(a.url), "insecure": a.insecure,
                           "probes": results}, indent=2))
@@ -312,8 +471,35 @@ def main():
             line += f"\n  api_root : {r['api_root']}"
         if r.get("rpc_error_code") is not None:
             line += f"\n  rpc_code : {r['rpc_error_code']}"
+        if r.get("minrelay"):
+            line += "\n  minrelay : " + _format_minrelay(r["minrelay"])
         print(line)
     return 0
+
+
+def _format_minrelay(m):
+    """Human rendering of one backend's minrelay dict (JSON carries the
+    full structured shape)."""
+    if "error_class" in m:
+        return f"unavailable ({m['error_class']})"
+    if "minrelaytxfee_btc_per_kvb" in m:
+        core = m["core_default"]
+        eff = m["engine_effective_floor"]
+        return (
+            f"advertised {m['minrelaytxfee_btc_per_kvb']} BTC/kvB = "
+            f"{m['sat_per_kvb']} sat/kvB = {m['sat_per_vb']} sat/vB  |  Core default "
+            f"{core['btc_per_kvb']} BTC/kvB = {core['sat_per_kvb']} sat/kvB = "
+            f"{core['sat_per_vb']} sat/vB ({core['cite']})  |  engine effective floor "
+            f"{eff['centisat_per_vb']} centisat/vB = {eff['sat_per_vb']} sat/vB "
+            f"({eff['note']})"
+        )
+    if "advertised" in m:
+        if m["advertised"]:
+            return f"relayfee {m['relayfee_raw']} (raw; {m['unit_note']})"
+        return m["note"]
+    if "minimum_fee_sat_per_vb" in m:
+        return f"{m['minimum_fee_sat_per_vb']} sat/vB ({m['label']})"
+    return "unavailable"
 
 
 if __name__ == "__main__":
