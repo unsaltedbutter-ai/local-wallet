@@ -1,0 +1,5 @@
+{
+  "id": "golden-065",
+  "prompt": "how often do you check for incoming transactions?",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

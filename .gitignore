@@ -33,3 +33,6 @@ localwallet.db-shm
 *.db-shm
 psbt-transfer/
 .DS_Store
+
+# user config (CFG-003: repo-root config.json — never commit user settings)
+/config.json

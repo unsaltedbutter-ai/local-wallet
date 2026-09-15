@@ -131,8 +131,11 @@ class TestSummarization:
         # address-registry FACTS rule and three few-shots grew the fixed
         # system prompt ~1.8K chars (~13.8K chars ≈ ~6.9K tokens — still
         # inside the 8K budget; this bound is session-length-independent,
-        # the summary + recent window cap it).
-        assert len(prompt) < 14500
+        # the summary + recent window cap it). 14500 → 15500 by
+        # TCK-CFG-004: the APP SETTINGS ownership block grew the fixed
+        # system prompt ~1K chars (~14.8K ≈ ~7.4K tokens — inside the 8K
+        # budget, the same bound the CHAT-001 step left).
+        assert len(prompt) < 15500
         assert "SESSION SUMMARY" in prompt
         assert "CONVERSATION SO FAR" in prompt
         # The recent window holds the last 20 turns verbatim.

@@ -115,6 +115,7 @@ import webbrowser
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from string import punctuation
 from types import SimpleNamespace
@@ -164,14 +165,19 @@ from localwallet.config import (
     COIN_SETTING_BOUNDS,
     COIN_SETTING_DEFAULTS,
     COIN_SETTING_KEYS,
+    CONSOLIDATE_BELOW_SAT_VB_SETTING,
     DEFAULT_DISPLAY_CURRENCY,
     DISPLAY_CURRENCIES,
     DISPLAY_CURRENCY_SETTING,
     PUBLIC_ELECTRUM_URL,
+    UTXO_TARGET_MAX_SETTING,
+    UTXO_TARGET_MIN_SETTING,
     Settings,
+    read_config_file,
     resolve_chain_base_url,
     resolve_coin_selection_settings,
     resolve_display_currency,
+    write_config_file,
 )
 from localwallet.node import LocalNodeReport, NodeStatus, detect_local_nodes
 from localwallet.node.doctor import NodeDoctor
@@ -289,6 +295,8 @@ if TYPE_CHECKING:  # circular at runtime: ui.web.server imports this module
 
 __all__ = [
     "AUTO_SCAN_ENV_VAR",
+    "CHAT_MANAGED_SETTINGS",
+    "CONFIG_SHADOW_NOTE",
     "DEFAULT_HISTORY_LIMIT",
     "DEFAULT_SIGNER_DIR",
     "DISPLAY_CURRENCY_ENV_VAR",
@@ -10559,6 +10567,17 @@ def handle_settings_request(
                 extra["resync"] = backend.resync()
             else:
                 extra["resync"] = "unavailable"
+    if key in CHAT_MANAGED_SETTINGS and "note" not in extra:
+        # TCK-CFG-004 conflict rule on the PANE's surface: a pane write lands
+        # on the STORED rung, and a config-FILE rung OUTRANKS it — the pane
+        # must say so (value-free, rides the established data.note channel)
+        # instead of letting the write be silently shadowed.
+        try:
+            file_supplies_key = key in read_config_file()
+        except ValueError:
+            file_supplies_key = False  # malformed file: startup already refuses
+        if file_supplies_key:
+            extra["note"] = CONFIG_SHADOW_NOTE
     entry = next(e for e in _settings_entries(store, backend) if e["key"] == key)
     return _settings_reply(
         {"status": "applied", "settings": [entry], **extra}, backend
@@ -14714,6 +14733,525 @@ def _run_address_label_turn(
     return True
 
 
+# ---------------------------------------------------------------------------
+# TCK-CFG-004: chat-managed settings (deterministic, PRE-MODEL intercept).
+# USER DIRECTION (822d73f): manage gap_limit, watch_interval_s,
+# utxo_target_min_sats, utxo_target_max_sats and consolidate_below_sat_vb
+# FROM CHAT. Asking answers the EFFECTIVE value and NAMES the rung that
+# supplies it (environment variable / config file / stored setting / shipped
+# default — the ONE documented ladder). Changing WRITES config.json (the
+# user's explicit choice over the DB store) AND deletes that key's stored row
+# (the critique-pinned conflict rule: exactly one non-env surface stays
+# authoritative, so the settings pane's store-writes can never be silently
+# shadowed). An env rung still outranks the file — the narration says so
+# honestly whenever it shadows the change. Closed param shapes only: five
+# enumerated keys, whole-number values with closed unit words, and the
+# BTC→sats conversion computed ENGINE-SIDE (Decimal, exact; never by the
+# model, never by float). Validation mirrors the standing ladders (bounds
+# from the same single-source tables the pane's writers use; the UTXO-002
+# min<max cross-check runs against the OTHER key's effective value, i.e. the
+# pair as it will actually resolve). Refusals are value-free: they name the
+# key and the rule, never the submitted value. The consumed turn never
+# reaches the model or the transcript (the LABEL-001/FIAT-003 discipline);
+# a question phrasing the closed matcher does not recognize stays ordinary
+# chat, where the prompt line keeps the model honest (it never states a
+# settings value or claims a change — evals pin it).
+# ---------------------------------------------------------------------------
+
+#: THE closed set of chat-managed keys (an enum, not a namespace: anything
+#: else — an invented key, an env-only scalar — is refused, never guessed).
+CHAT_MANAGED_SETTINGS: Final[tuple[str, ...]] = (
+    wallet_scan.GAP_LIMIT_SETTING,
+    WATCH_INTERVAL_SETTING,
+    UTXO_TARGET_MIN_SETTING,
+    UTXO_TARGET_MAX_SETTING,
+    CONSOLIDATE_BELOW_SAT_VB_SETTING,
+)
+
+#: Display label + unit word per managed key (closed; the value is quoted
+#: verbatim from THIS engine's own ladder read — user-owned scalars, never
+#: wallet history data, so naming them in a chat line is the point).
+_CHAT_SETTING_DISPLAY: Final[Mapping[str, tuple[str, str]]] = {
+    wallet_scan.GAP_LIMIT_SETTING: ("Gap limit", ""),
+    WATCH_INTERVAL_SETTING: ("Background watch interval", "seconds"),
+    UTXO_TARGET_MIN_SETTING: ("Smallest UTXO target", "sats"),
+    UTXO_TARGET_MAX_SETTING: ("Largest UTXO target", "sats"),
+    CONSOLIDATE_BELOW_SAT_VB_SETTING: ("Consolidation fee ceiling", "sat/vB"),
+}
+
+#: Word sets for the closed matcher (whole words, the _chat_public_choice /
+#: HW-005 shape). A key is NAMED only through these; anything looser stays
+#: ordinary chat.
+_CHAT_COIN_WORDS: Final[frozenset[str]] = frozenset(
+    {"utxo", "utxos", "coin", "coins", "output", "outputs"}
+)
+_CHAT_MIN_WORDS: Final[frozenset[str]] = frozenset(
+    {"smallest", "smaller", "minimum", "min", "below", "under", "less"}
+)
+_CHAT_MAX_WORDS: Final[frozenset[str]] = frozenset(
+    {"largest", "biggest", "bigger", "maximum", "max", "above", "over", "greater"}
+)
+_CHAT_WATCH_WORDS: Final[frozenset[str]] = frozenset(
+    {"watch", "watches", "poll", "polls", "polling", "check", "checks"}
+)
+_CHAT_CONSOLIDATE_WORDS: Final[frozenset[str]] = frozenset(
+    {"consolidate", "consolidates", "consolidating", "consolidation"}
+)
+_CHAT_FEE_WORDS: Final[frozenset[str]] = frozenset(
+    {"fee", "fees", "rate", "rates", "ceiling", "threshold", "sat/vb", "sats/vb"}
+)
+_CHAT_SET_VERBS: Final[frozenset[str]] = frozenset(
+    {"set", "change", "make", "update", "use"}
+)
+_CHAT_NEGATE_FIRST: Final[frozenset[str]] = frozenset({"no", "dont", "never"})
+_CHAT_CREATE_WORDS: Final[frozenset[str]] = frozenset(
+    {"create", "creates", "creating", "generate", "generates", "generating",
+     "produce", "produces", "producing"}
+)
+_CHAT_ASK_START: Final[frozenset[str]] = frozenset(
+    {"what", "whats", "which", "how", "is", "are", "tell", "show", "may",
+     "can", "does"}
+)
+#: First-person possessive pronouns signal a WALLET query about the user's
+#: ACTUAL coins/state ("my smallest utxo", "my balance") rather than a READ
+#: of the CONFIGURED target ("the smallest UTXO we will generate") — the
+#: wallet-ask/wallet-query distinction the READ intercept enforces.
+_CHAT_POSSESSIVE_WORDS: Final[frozenset[str]] = frozenset(
+    {"my", "mine", "our", "ours"}
+)
+#: Units the value grammar admits, per family (closed). "" = the bare number.
+_CHAT_SAT_UNITS: Final[frozenset[str]] = frozenset(
+    {"", "sat", "sats", "satoshi", "satoshis"}
+)
+_CHAT_SEC_UNITS: Final[frozenset[str]] = frozenset(
+    {"", "s", "sec", "secs", "second", "seconds"}
+)
+_CHAT_MIN_UNITS: Final[frozenset[str]] = frozenset(
+    {"min", "mins", "minute", "minutes"}
+)
+_CHAT_VB_UNITS: Final[frozenset[str]] = frozenset({"", "sat/vb", "sats/vb"})
+#: One whole number per change line; a hyphen/word-preceded digit run is not
+#: a value token ("10-20", "v2" never parse as the setting's number).
+_CHAT_NUM_RE: Final = re.compile(r"(?<![\w.?-])(\d+(?:\.\d+)?)(?![\w.])")
+_CHAT_UNIT_AFTER_RE: Final = re.compile(r"[\s/]*(sat/vbs?|sats?/vb|sats?|satoshis?|btc|seconds?|secs?|mins?|minutes?|s)\b")
+
+# Ack/refusal copy (engine-owned; value-free refusals name the key and the
+# rule only — the submitted value never rides back).
+_CHAT_SET_ONE_NUMBER: Final[str] = (
+    "I need one whole number for that — try e.g. \"set the gap limit to 30\"; "
+    "nothing was stored."
+)
+_CHAT_SET_BAD_BTC: Final[str] = (
+    "That BTC amount does not land on whole satoshis — nothing was stored."
+)
+_CHAT_PAIR_REFUSE: Final[str] = (
+    "the smallest UTXO target must stay below the largest one — nothing was stored."
+)
+_CHAT_FILE_MALFORMED: Final[str] = (
+    "config.json is not valid right now, so I will not write onto it — fix "
+    "the file and try again; nothing was stored."
+)
+_CHAT_FILE_WRITE_FAIL: Final[str] = (
+    "Could not write the config file — nothing was stored."
+)
+_CHAT_STORE_CLEAR_NOTE: Final[str] = (
+    " The stored Settings copy was cleared too, so the config file is the "
+    "one non-environment surface that sets it."
+)
+_CHAT_STORE_CLEAR_FAIL: Final[str] = (
+    " I could not clear the stored Settings copy — the config file outranks "
+    "it, so the saved value still applies."
+)
+_CHAT_UNMANAGED: Final[str] = (
+    "That setting is not configurable from chat — chat manages the gap "
+    "limit, the background watch interval, the smallest and largest UTXO "
+    "targets, and the consolidation fee ceiling. Ask about one of those by "
+    "name, or use the Settings pane / config file for the rest."
+)
+#: TCK-CFG-004 conflict rule on the PANE's surface: a stored write is
+#: honest only if it says whether the config-file rung outranks it (value-
+#: free; the pane prints ``data.note`` on an applied reply).
+CONFIG_SHADOW_NOTE: Final[str] = (
+    "Saved — but config.json also sets this key, and the file outranks the "
+    "stored value: remove it from config.json to let this take effect."
+)
+
+#: The one file-keyed settings table the chat ladder reads (env/file rung
+#: attribution must survive a mid-session file edit — startup already
+#: refused any malformed file this session cannot have produced).
+_SATS_PER_BTC: Final[Decimal] = Decimal(100_000_000)
+
+
+def _chat_setting_bounds(key: str) -> tuple[int, int]:
+    """THE bounds for one managed key — from the same single-source tables
+    the config ladder and the pane's typed writers use (never a second set
+    of literals: the accept/refuse line cannot drift from the ladder)."""
+    if key == wallet_scan.GAP_LIMIT_SETTING:
+        return GAP_LIMIT_MIN, GAP_LIMIT_MAX
+    if key == WATCH_INTERVAL_SETTING:
+        return WATCH_INTERVAL_MIN, WATCH_INTERVAL_MAX
+    return COIN_SETTING_BOUNDS[key]
+
+
+def _chat_setting_default(key: str) -> int:
+    """The shipped default of one managed key, single-sourced."""
+    if key == wallet_scan.GAP_LIMIT_SETTING:
+        return wallet_scan.DEFAULT_GAP_LIMIT
+    if key == WATCH_INTERVAL_SETTING:
+        return int(WATCH_INTERVAL_DEFAULT_S)
+    return COIN_SETTING_DEFAULTS[key]
+
+
+def _chat_stored_rung(store: Store, key: str) -> str | None:
+    """The stored rung's text, fail-quiet (unreadable store = rung unset —
+    the watch-interval precedent: a surprise never stalls a chat answer)."""
+    try:
+        if key in COIN_SETTING_KEYS:
+            return store.get_coin_setting(key)
+        return store.get_setting(key)
+    except (StoreError, sqlite3.Error):
+        return None
+
+
+def _chat_effective_setting(store: Store, key: str) -> tuple[int, str] | str:
+    """Resolve one managed key over the ONE documented ladder and name the
+    winning rung: ``(whole_number, rung)`` where rung is ``"env" | "file" |
+    "stored" | "default"``, else a value-free refusal line when the winning
+    rung's current text is malformed (startup refuses such a config; a
+    mid-session edit is the only way here — the answer says so honestly
+    instead of quoting a broken rung)."""
+    env_raw = (os.environ.get(f"LOCALWALLET_{key.upper()}") or "").strip()
+    raw: str | None = None
+    rung = "default"
+    if env_raw:
+        raw, rung = env_raw, "env"
+    else:
+        try:
+            file_values = read_config_file()
+        except ValueError:
+            return _CHAT_FILE_MALFORMED
+        file_value = file_values.get(key)
+        if file_value is not None and str(file_value).strip():
+            raw, rung = str(file_value).strip(), "file"
+        else:
+            stored = _chat_stored_rung(store, key)
+            if stored is not None and stored.strip():
+                raw, rung = stored.strip(), "stored"
+    if raw is None:
+        return _chat_setting_default(key), "default"
+    if raw.isascii() and raw.isdigit():
+        value = int(raw)
+    else:
+        try:
+            as_float = float(raw)
+        except ValueError:
+            as_float = float("nan")
+        if not as_float.is_integer():
+            label, _unit = _CHAT_SETTING_DISPLAY[key]
+            return (
+                f"{label}: the value supplied by the {rung} rung is not a "
+                "valid whole number — check the "
+                f"{'environment variable' if rung == 'env' else rung}."
+            )
+        value = int(as_float)
+    lo, hi = _chat_setting_bounds(key)
+    if not lo <= value <= hi:
+        label, _unit = _CHAT_SETTING_DISPLAY[key]
+        return (
+            f"{label}: the value supplied by the {rung} rung is out of "
+            "range — check it."
+        )
+    return value, rung
+
+
+def _chat_rung_phrase(rung: str, key: str) -> str:
+    """The honest name of one rung, as quoted in the effective-value answer."""
+    if rung == "env":
+        return (
+            f"the LOCALWALLET_{key.upper()} environment variable — the "
+            "environment outranks the config file, the stored setting and "
+            "the default"
+        )
+    if rung == "file":
+        return "config.json (the config-file rung)"
+    if rung == "stored":
+        return "your stored Settings value (the settings pane)"
+    return "the shipped default"
+
+
+def _chat_words(line: str) -> list[str]:
+    """Normalized whole words (the _chat_public_choice shape: lowercase,
+    edge punctuation and apostrophes stripped)."""
+    return [
+        w.strip(punctuation).replace("'", "").replace("\u2019", "")
+        for w in line.lower().split()
+    ]
+
+
+def _chat_key_named(key: str, words: list[str], word_set: set[str]) -> bool:
+    """The closed naming rule for one managed key: its literal snake_case
+    name, or its whole-word set (gap; interval/how + a watch verb; a size
+    word + a coin word for the UTXO targets; consolidation + fee words)."""
+    if key == wallet_scan.GAP_LIMIT_SETTING:
+        return "gap" in word_set
+    if key == WATCH_INTERVAL_SETTING:
+        return bool(word_set & _CHAT_WATCH_WORDS) and bool(
+            word_set & {"interval", "often"}
+        )
+    if key == UTXO_TARGET_MIN_SETTING:
+        return bool(word_set & _CHAT_MIN_WORDS) and bool(
+            word_set & _CHAT_COIN_WORDS
+        )
+    if key == UTXO_TARGET_MAX_SETTING:
+        return bool(word_set & _CHAT_MAX_WORDS) and bool(
+            word_set & _CHAT_COIN_WORDS
+        )
+    return bool(word_set & _CHAT_CONSOLIDATE_WORDS) and bool(
+        word_set & _CHAT_FEE_WORDS
+    )
+
+
+def _chat_named_keys(words: list[str]) -> list[str]:
+    """The managed keys this word list NAMES (closed rules; more than one
+    name = ambiguity = no interception)."""
+    word_set = set(words)
+    return [
+        key
+        for key in CHAT_MANAGED_SETTINGS
+        if key in word_set or _chat_key_named(key, words, word_set)
+    ]
+
+
+def _chat_value_and_unit(lower: str, num: str) -> str:
+    """The unit word written right after the number ("", "sats", "btc",
+    "seconds", "min", "sat/vb" …), closed grammar."""
+    match = re.search(re.escape(num), lower)
+    if match is None:
+        return ""
+    tail = lower[match.end() :]
+    unit_match = _CHAT_UNIT_AFTER_RE.match(tail)
+    return unit_match.group(1) if unit_match else ""
+
+
+def _chat_convert_value(key: str, num: str, unit: str) -> int | None:
+    """Engine-side value parse for one managed key: closed unit family per
+    key, integer whole-number in the key's own semantics (BTC is exact
+    Decimal — 0.0005 BTC is 50000 sats, never a float product, never a
+    model-computed number). ``None`` = refused shape (value-free caller
+    line; NOTHING stored). Bounds are the caller's check, not this."""
+    if key in (UTXO_TARGET_MIN_SETTING, UTXO_TARGET_MAX_SETTING):
+        if unit == "btc":
+            try:
+                scaled = Decimal(num) * _SATS_PER_BTC
+            except InvalidOperation:
+                return None
+            if scaled != scaled.to_integral_value():
+                return -1  # distinct sentinel: whole-sat refusal line
+            return int(scaled)
+        if unit in _CHAT_SAT_UNITS:
+            return int(num) if num.isdigit() else None
+        return None
+    if key == WATCH_INTERVAL_SETTING:
+        if not num.isdigit():
+            return None
+        if unit in _CHAT_SEC_UNITS:
+            return int(num)
+        if unit in _CHAT_MIN_UNITS:
+            return int(num) * 60
+        return None
+    if key == CONSOLIDATE_BELOW_SAT_VB_SETTING:
+        if unit in _CHAT_VB_UNITS:
+            return int(num) if num.isdigit() else None
+        return None
+    # gap_limit: a bare count of addresses — any unit word is a shape miss.
+    return int(num) if num.isdigit() and unit == "" else None
+
+
+def _chat_settings_change(
+    store: Store, key: str, value: int, words: list[str], output_fn: Callable[[str], None]
+) -> None:
+    """Validate → write config.json → delete the stored rung → confirm +
+    honest rung narration (fail-closed at every gate; NOTHING is written on
+    any refusal, and no line echoes the submitted value back as if stored —
+    the ack quotes the engine's own canonical conversion of the user's
+    number, verbatim from this function's Decimal/whole-number result)."""
+    label, unit = _CHAT_SETTING_DISPLAY[key]
+    lo, hi = _chat_setting_bounds(key)
+    if not lo <= value <= hi:
+        output_fn(
+            sanitize_tool_output(
+                f"{key} must be a whole number between {lo} and {hi} — "
+                "nothing was stored."
+            )
+        )
+        return
+    # UTXO-002 pair rule against the PAIR AS IT WILL RESOLVE: the other
+    # target key's current effective value on the full ladder (the written
+    # key's own stored row is about to be deleted, the file row is about to
+    # carry the new value — the sibling's rung is exactly what a fresh
+    # launch will see).
+    if key in (UTXO_TARGET_MIN_SETTING, UTXO_TARGET_MAX_SETTING):
+        other_key = (
+            UTXO_TARGET_MAX_SETTING
+            if key == UTXO_TARGET_MIN_SETTING
+            else UTXO_TARGET_MIN_SETTING
+        )
+        other = _chat_effective_setting(store, other_key)
+        if isinstance(other, str):
+            output_fn(sanitize_tool_output(other))
+            return
+        other_value = other[0]
+        pair = (value, other_value) if key == UTXO_TARGET_MIN_SETTING else (other_value, value)
+        if pair[0] >= pair[1]:
+            output_fn(sanitize_tool_output(f"Refused — {_CHAT_PAIR_REFUSE}"))
+            return
+    # WRITE the file rung first (its own strict re-read makes a malformed
+    # pre-existing file a refusal that leaves it byte-untouched).
+    file_value: object = float(value) if key == WATCH_INTERVAL_SETTING else str(value)
+    try:
+        write_config_file({key: file_value})
+    except ValueError:
+        output_fn(sanitize_tool_output(_CHAT_FILE_MALFORMED))
+        return
+    except OSError:
+        output_fn(sanitize_tool_output(_CHAT_FILE_WRITE_FAIL))
+        return
+    # DELETE the stored rung (the conflict rule — coin keys clear through
+    # their typed accessor; gap/watch through the minimal store delete).
+    had_stored = bool((_chat_stored_rung(store, key) or "").strip())
+    clear_failed = False
+    if had_stored:
+        try:
+            if key in COIN_SETTING_KEYS:
+                store.set_coin_setting(key, "")
+            else:
+                store.clear_setting(key)
+        except (StoreError, sqlite3.Error):
+            clear_failed = True
+    ack = (
+        f"Set {label.lower()} to {value}{f' {unit}' if unit else ''} — saved"
+        " in config.json."
+    )
+    if clear_failed:
+        ack += _CHAT_STORE_CLEAR_FAIL
+    elif had_stored:
+        ack += _CHAT_STORE_CLEAR_NOTE
+    if (os.environ.get(f"LOCALWALLET_{key.upper()}") or "").strip():
+        ack += (
+            f" Heads-up: LOCALWALLET_{key.upper()} is set, and the "
+            "environment outranks the config file — while it is set the "
+            "effective value stays the environment's (a restart without it "
+            "applies the file)."
+        )
+    else:
+        ack += (
+            " The config file is read at launch, so it takes effect at the "
+            "next launch."
+        )
+    del words  # the ack quotes engine truth only, never the utterance
+    output_fn(sanitize_tool_output(ack))
+
+
+def _run_chat_settings_turn(
+    store: Store, line: str, output_fn: Callable[[str], None]
+) -> bool:
+    """Consume a chat-managed-settings turn; True when consumed. Closed
+    shapes only (see the section header):
+
+    * READ — no number, question-shaped, exactly one key named → the
+      EFFECTIVE value + the rung that supplies it (env/file/stored/default);
+    * CHANGE — exactly one key named and a number, with an explicit set verb
+      ("set the gap limit to 30") or the pinned negated-create shape ("Don't
+      create UTXOs smaller than 50000 sats.", "No UTXOs below 0.0005 BTC.")
+      → validate fail-closed, write config.json, delete the stored row,
+      confirm with the honest rung narration;
+    * a set verb that names one key but carries no value → the value-free
+      "one whole number" refusal (the turn is consumed: a half-parsed
+      settings utterance must not reach the model either, LABEL-001 rule);
+    * an unmanaged Settings key named by its literal snake_case name (with a
+      question or a set verb) → the honest "not configurable from chat"
+      line — never a guess;
+    * anything else returns False untouched (ordinary pipeline — including
+      every line naming two keys, and free prose that merely mentions a
+      setting in passing).
+    """
+    words = _chat_words(line)
+    if not words:
+        return False
+    lower = line.lower()
+    numbers = _CHAT_NUM_RE.findall(lower)
+    named = _chat_named_keys(words)
+    set_verb_first = words[0] in _CHAT_SET_VERBS
+    negated_create_shape = (
+        words[0] in _CHAT_NEGATE_FIRST and bool(set(words) & _CHAT_COIN_WORDS)
+    ) or bool(set(words) & _CHAT_CREATE_WORDS and set(words) & (_CHAT_MIN_WORDS | _CHAT_MAX_WORDS))
+    # The consolidate-below SETTINGS shape needs a discriminator beyond the
+    # bare "consolidate ... below N" action phrasing (which is an actual
+    # consolidation request and must fall through): explicit fee
+    # "ceiling"/"floor" wording, or a set/change verb.
+    # ponytail: "utxos we create/generate below" can't be a discriminator —
+    # "below"+"utxos" is itself the UTXO-min target's closed naming rule, so
+    # that phrasing names TWO keys and reads as ambiguous (never consumed).
+    consolidate_below_shape = (
+        words[0] == "consolidate"
+        and "below" in words
+        and bool(
+            (set(words) & {"ceiling", "floor"}) or (set(words) & _CHAT_SET_VERBS)
+        )
+    )
+    if len(named) == 1:
+        key = named[0]
+        if numbers:
+            if not (set_verb_first or negated_create_shape or consolidate_below_shape):
+                return False  # a number near a settings word is not a command
+            if len(numbers) != 1:
+                output_fn(sanitize_tool_output(_CHAT_SET_ONE_NUMBER))
+                return True
+            num = numbers[0]
+            value = _chat_convert_value(key, num, _chat_value_and_unit(lower, num))
+            if value is None:
+                output_fn(sanitize_tool_output(_CHAT_SET_ONE_NUMBER))
+                return True
+            if value == -1:
+                output_fn(sanitize_tool_output(_CHAT_SET_BAD_BTC))
+                return True
+            _chat_settings_change(store, key, value, words, output_fn)
+            return True
+        if set_verb_first or words[0] in _CHAT_NEGATE_FIRST or consolidate_below_shape:
+            # A command shape with no value: refuse, do not guess, do not
+            # forward (the half-parsed-utterance rule).
+            output_fn(sanitize_tool_output(_CHAT_SET_ONE_NUMBER))
+            return True
+        if lower.strip().endswith("?") or words[0] in _CHAT_ASK_START:
+            if set(words) & _CHAT_POSSESSIVE_WORDS:
+                # "my smallest utxo" / "my balance" = a question about the
+                # user's ACTUAL coins, not the configured settings target —
+                # ordinary chat, falls through to the model untouched.
+                return False
+            effective = _chat_effective_setting(store, key)
+            if isinstance(effective, str):
+                output_fn(sanitize_tool_output(effective))
+                return True
+            value, rung = effective
+            label, unit = _CHAT_SETTING_DISPLAY[key]
+            output_fn(
+                sanitize_tool_output(
+                    f"{label}: {value}{f' {unit}' if unit else ''} — supplied "
+                    f"by {_chat_rung_phrase(rung, key)}."
+                )
+            )
+            return True
+        return False
+    if not named and (set_verb_first or lower.strip().endswith("?") or words[0] in _CHAT_ASK_START):
+        # An UNMANAGED key asked about or commanded by its literal field
+        # name: the honest not-configurable line, never a guess.
+        settings_fields = set(Settings.__dataclass_fields__)
+        if (set(words) & settings_fields) - set(CHAT_MANAGED_SETTINGS):
+            output_fn(sanitize_tool_output(_CHAT_UNMANAGED))
+            return True
+    return False
+
+
 def _run_turn(
     loop: AgentLoop,
     flow: TxFlow,
@@ -14945,6 +15483,16 @@ def _run_turn(
     # not reach the model either. Checked after the conversation intercepts
     # (their open asks still close on a non-matching utterance — never-trap).
     if store is not None and _run_address_label_turn(store, line, output_fn):
+        return
+    # TCK-CFG-004: chat-managed settings — the deterministic pre-model
+    # intercept for the five closed keys (gap limit, watch interval, UTXO
+    # target min/max, consolidation fee ceiling): reads answer the EFFECTIVE
+    # value + the naming rung, changes write config.json AND delete the
+    # stored row (the conflict rule), fail-closed and value-free. Checked
+    # after the conversation + label intercepts (their asks/verbs keep
+    # priority); anything the closed matcher does not recognize falls
+    # through to the model, where the prompt line keeps it honest.
+    if store is not None and _run_chat_settings_turn(store, line, output_fn):
         return
     speed = _bump_speed_choice(line)
     if speed is not None and IntentName.BUMP_FEE in table:

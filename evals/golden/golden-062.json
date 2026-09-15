@@ -1,0 +1,5 @@
+{
+  "id": "golden-062",
+  "prompt": "What is the smallest UTXO we will generate?",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

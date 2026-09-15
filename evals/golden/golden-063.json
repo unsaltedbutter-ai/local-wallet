@@ -1,0 +1,5 @@
+{
+  "id": "golden-063",
+  "prompt": "Don't create UTXOs smaller than 50000 sats.",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

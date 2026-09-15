@@ -148,6 +148,26 @@ type refuses startup with a value-free error (the offending value is never
 echoed) — even if an env var would have overridden it. Fix the file and
 restart.
 
+**Managing settings from chat (TCK-CFG-004) — the two-surface rule.** Five
+settings are chat-managed: `gap_limit`, `watch_interval_s`,
+`utxo_target_min_sats`, `utxo_target_max_sats` and
+`consolidate_below_sat_vb`. Asking about one in chat ("what is the gap
+limit?", "What is the smallest UTXO we will generate?", "how often do you
+check for incoming transactions?") answers the **effective** value and
+names the rung that supplies it. Changing one ("set the gap limit to 30",
+"Don't create UTXOs smaller than 50000 sats.", "No UTXOs below 0.0005
+BTC." — unit conversions are computed engine-side, never by the model)
+writes **`config.json`** and **deletes that key's stored DB row** in the
+same step: exactly ONE non-env surface stays authoritative, so a change
+made in chat and a change made in the Settings pane can never silently
+shadow each other. (The environment still outranks both — when an env var
+is set, the app says so honestly instead of pretending the file won.) The
+Settings pane keeps writing the stored rung; while `config.json` sets the
+same key, the pane's reply names the file as the outranking surface.
+Chat-managed values take effect at the next launch (live apply is
+TCK-CFG-005); other settings are not configurable from chat and the app
+says so rather than guessing.
+
 **Self-hosted https with a private / self-signed cert** (`tls_verify`,
 `LOCALWALLET_TLS_VERIFY`; default `true`, env > config file > default, no
 stored rung): verification off means whoever controls the network path can

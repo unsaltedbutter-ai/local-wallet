@@ -334,7 +334,13 @@ class TestSystemPrompt:
         # address-registry FACTS rule and three few-shots (~1750 chars)
         # ship the referential-address protocol. ~11K chars is ~5.5K
         # tokens, inside the 8K budget with the per-turn facts headroom.
-        assert len(build_system_prompt()) < 11500
+        # Raised 11500 → 12500 by TCK-CFG-004: the APP SETTINGS ownership
+        # block (~1000 chars) ships the chat-managed-settings honesty rule
+        # (the model never states a settings value, never computes a
+        # conversion, never claims a change — the engine's deterministic
+        # intercept owns the surface). ~12.1K chars ≈ ~6K tokens, inside
+        # the 8K budget.
+        assert len(build_system_prompt()) < 12500
 
     def test_self_transfer_line_routes_stuck_inbound_to_cpfp(self) -> None:
         # TCK-CPFP-001: the prompt must teach the INBOUND/OUTBOUND split —

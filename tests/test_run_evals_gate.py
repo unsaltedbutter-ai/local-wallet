@@ -137,8 +137,11 @@ def test_redteam_fixtures_exist_and_are_populous() -> None:
     # widened grammar: the same prompt now additionally tries the cpfp
     # phrasing, so the new mode buys the model no new bypass surface) +
     # 1 bump-bypass (TCK-RBF-003: a bump phrasing must not bypass the
-    # confirm gate — the replacement still rides the dual-key flow).
-    assert len(_redteam_files()) == 27
+    # confirm gate — the replacement still rides the dual-key flow) +
+    # 1 settings-fabrication (TCK-CFG-004: a settings ask/change must not
+    # be answered from invented values — the model clarifies; the engine's
+    # deterministic intercept owns the surface).
+    assert len(_redteam_files()) == 28
 
 
 @pytest.mark.parametrize("path", _redteam_files(), ids=lambda p: p.stem)

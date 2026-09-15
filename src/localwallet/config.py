@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -115,6 +116,94 @@ DEFAULT_DISPLAY_CURRENCY: Final[str] = "usd"
 CONFIG_FILE_PATH: Final[Path] = Path(__file__).resolve().parents[2] / "config.json"
 
 
+def config_file_path(config_path: str | Path | None = None) -> Path:
+    """THE one config-file path resolution (the ladder's rung location):
+    explicit argument > ``LOCALWALLET_CONFIG_PATH`` env > :data:`CONFIG_FILE_PATH`.
+    Shared by :meth:`Settings.from_env` (reader) and
+    :func:`write_config_file` (the chat-write path, TCK-CFG-004) so the two
+    can never point at different files."""
+    if config_path is not None:
+        return Path(config_path)
+    return Path(os.environ.get("LOCALWALLET_CONFIG_PATH") or CONFIG_FILE_PATH)
+
+
+def read_config_file(
+    config_path: str | Path | None = None,
+) -> dict[str, object]:
+    """The config-file rung's current values (fail-closed parse, same rules
+    as the startup reader; ``{}`` when the file is absent). Used by the chat
+    settings surface to NAME the file rung's contribution (TCK-CFG-004); a
+    malformed file raises :class:`ValueError` (value-free) exactly like at
+    startup — never a silent empty rung for the reader that matters
+    (``from_env``), while the chat attribution answers honestly that the
+    file is unreadable."""
+    return _load_config_file(config_file_path(config_path), fields(Settings))
+
+
+def write_config_file(
+    updates: Mapping[str, object],
+    config_path: str | Path | None = None,
+) -> Path:
+    """Merge validated updates into the config file ATOMICALLY (TCK-CFG-004:
+    the chat-change surface writes the FILE rung, the user's explicit choice
+    over the stored DB). The writer's contract mirrors the reader's so our
+    own output can never trip the fail-closed parser:
+
+    * the existing file is parsed with the full strict reader first — a
+      malformed file raises :class:`ValueError` (value-free) and is left
+      byte-untouched (nothing is merged onto corruption);
+    * updates are FILTERED to known :class:`Settings` keys (unknown keys are
+      dropped — the reader refuses them, so we never write them; JSON has no
+      comments and none are handled or needed) and every surviving value is
+      type-checked per field with the reader's own check (a wrong type
+      raises, value-free);
+    * the merge lands via temp-file + ``os.replace`` in the same directory —
+      readers see either the old file or the new one, never a half-write —
+      preserving an existing file's mode (a fresh file gets ``0o600``: the
+      file may legitimately carry a ``bitcoind://user:pass@`` env-rung URL).
+
+    Returns the path written. Stdlib only, like the rest of this module.
+    """
+    path = config_file_path(config_path)
+    by_name = {f.name: f for f in fields(Settings)}
+    existing = _load_config_file(path, fields(Settings))
+    clean: dict[str, object] = {}
+    for name, value in updates.items():
+        field = by_name.get(name)
+        if field is None:
+            continue  # fail-closed reader would reject it — never write it
+        clean[name] = _validate_config_value(field, value)
+    merged = {**existing, **clean}
+    try:
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".config-", suffix=".json.tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(merged, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+        # fsync the parent directory so the rename itself survives power loss
+        # (same error contract: any failure reports the write as failed).
+        dir_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise OSError("config file could not be written") from exc
+    return path
+
+
 def _field_kind(field) -> type:
     """Expected JSON type for a Settings field (bool/int/float, else str)."""
     if isinstance(field.default, bool):
@@ -124,6 +213,28 @@ def _field_kind(field) -> type:
     if isinstance(field.default, float):
         return float
     return str
+
+
+def _validate_config_value(field, value: object) -> object:
+    """One key's strict JSON-type check (shared by the file READER and the
+    chat WRITE path, TCK-CFG-004, so the writer can never emit a value the
+    fail-closed reader would reject). Raises :class:`ValueError` naming only
+    the key and the expected type — never the offending value."""
+    kind = _field_kind(field)
+    name = field.name
+    if kind is bool:
+        if not isinstance(value, bool):
+            raise ValueError(f"config key {name} must be a boolean")
+    elif kind is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"config key {name} must be an integer")
+    elif kind is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"config key {name} must be a number")
+        return float(value)
+    elif not isinstance(value, str):
+        raise ValueError(f"config key {name} must be a string")
+    return value
 
 
 def _load_config_file(path: Path, known: tuple) -> dict[str, object]:
@@ -156,20 +267,7 @@ def _load_config_file(path: Path, known: tuple) -> dict[str, object]:
         field = by_name.get(name)
         if field is None:
             raise ValueError(f"unknown config key: {name}")
-        kind = _field_kind(field)
-        if kind is bool:
-            if not isinstance(value, bool):
-                raise ValueError(f"config key {name} must be a boolean")
-        elif kind is int:
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise ValueError(f"config key {name} must be an integer")
-        elif kind is float:
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"config key {name} must be a number")
-            value = float(value)
-        elif not isinstance(value, str):
-            raise ValueError(f"config key {name} must be a string")
-        out[name] = value
+        out[name] = _validate_config_value(field, value)
     return out
 
 
@@ -359,9 +457,7 @@ class Settings:
                 values[field.name] = _coerce(field.name, raw)
         # Config-file rung: fills in any key env did not set (env > file).
         # Strict fail-closed parse of the WHOLE file regardless of env.
-        path = Path(config_path) if config_path is not None else Path(
-            os.environ.get("LOCALWALLET_CONFIG_PATH") or CONFIG_FILE_PATH
-        )
+        path = config_file_path(config_path)
         for name, value in _load_config_file(path, fields(cls)).items():
             env_name = f"LOCALWALLET_{name.upper()}"
             if os.environ.get(env_name) is None:

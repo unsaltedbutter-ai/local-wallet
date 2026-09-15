@@ -1,0 +1,5 @@
+{
+  "id": "golden-061",
+  "prompt": "what is the gap limit?",
+  "expectation": {"intent": "clarify", "question_nonempty": true}
+}

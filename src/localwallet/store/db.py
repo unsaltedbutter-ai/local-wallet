@@ -1504,6 +1504,24 @@ class Store(AbstractContextManager["Store"]):
         except sqlite3.Error as exc:
             raise _wrap(exc) from exc
 
+    def clear_setting(self, key: str) -> None:
+        """DELETE one settings row outright (TCK-CFG-004 conflict rule): a
+        chat change writes the config-FILE rung and clears this key's STORED
+        rung so exactly one non-env surface stays authoritative. ``set_
+        setting(key, "")`` is NOT this: it leaves an empty row that every
+        ladder reads as unset but the settings surface would still display;
+        deletion leaves no row at all. The generic delete behind the two
+        keys that have no typed accessor of their own (``gap_limit`` and
+        ``watch_interval_s``); the coin keys clear through the typed
+        ``set_coin_setting(key, "")`` instead. Any OTHER key is refused with
+        a value-free :class:`StoreError` so a settings value can never be
+        dropped through this generic path.
+        """
+        if key not in ("gap_limit", "watch_interval_s"):
+            raise StoreError("cannot clear a non-managed settings key")
+        with self._transaction():
+            self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
     # ------------------------------------------- chain backend choice (ONB-002)
     #
     # The persisted first-run backend selection (ADR-0023, TCK-ONB-002). Same
