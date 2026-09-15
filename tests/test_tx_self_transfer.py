@@ -477,10 +477,11 @@ class TestConsolidatePlan:
         assert res["self_mode"] == "consolidate"
         assert res["inputs_count"] == 3  # 5k + 10k + 20k; the 50k coin stays
         assert res["self_inputs_total_sats"] == 35_000
-        # vsize(3-in, 1-out, changeless) = 246 vB; rate 2 → fee 492.
+        # vsize(3-in, 1-out, changeless) = 246 vB; consolidation DEFAULT rung
+        # is SLOW (TCK-CHAT-002 orchestrator ruling) → rate 1 sat/vB → fee 246.
         assert res["vsize"] == 246
-        assert res["fee_sats"] == 492
-        assert res["amount_sats"] == 35_000 - 492 == res["self_each_sats"]
+        assert res["fee_sats"] == 246
+        assert res["amount_sats"] == 35_000 - 246 == res["self_each_sats"]
         assert res["change_sats"] is None
         assert res["self_new_addresses"] == 1
         s.close()
@@ -503,11 +504,12 @@ class TestConsolidatePlan:
         res = t[IntentName.SELF_TRANSFER](
             _self_env({"mode": "consolidate", "below_size_sats": 1_000})
         )
-        # fee floor = vsize(1-in,1-out,changeless)=110 × 2 sat/vB = 220;
-        # 400 − 220 = 180 < 294 dust → the structured UI pair (ADR-0012).
+        # fee floor = vsize(1-in,1-out,changeless)=110 × SLOW 1 sat/vB = 110
+        # (consolidation DEFAULT rung, TCK-CHAT-002 orchestrator ruling);
+        # 400 − 110 = 290 < 294 dust → the structured UI pair (ADR-0012).
         assert res["error"] == "insufficient_funds"
         assert res["available_sats"] == 400
-        assert res["needed_sats"] == 220 + P2WPKH_DUST
+        assert res["needed_sats"] == 110 + P2WPKH_DUST
         assert flow.state is TxFlowStatus.IDLE
         s.close()
         c.close()
@@ -941,11 +943,21 @@ class TestCardAndFacts:
         )
         out: list[str] = []
         app_module._print_self_transfer(res, out.append)
+        # TCK-CHAT-002 FINDING 3: the threshold plan now carries the SAME
+        # plan-echo marker as the conversation paths, so its card opens with
+        # the "Merge N UTXOs…" echo line (not the generic small-coin line).
         assert out[1] == (
-            f"Plan: merge 1 small coin into 1 × {res['self_each_sats']:,} sats "
-            "(1 fresh address)"
+            f"Merge {res['inputs_count']} UTXO to create one new UTXO of "
+            f"{res['amount_sats']:,} sats"
         )
-        assert out[2] == "In: 20,000 sats from 1 source"
+        # TCK-CHAT-002 §3a: the consolidate card restates every source BY
+        # registry NUMBER + FULL address (value verbatim from the store)
+        # between the plan line and the In: total.
+        assert out[2] == app_module._CONS_SOURCE_HEADER
+        assert out[3] == (
+            f"  #{res['self_sources'][0]['number']}. {addrs[1]} · 20,000 sats"
+        )
+        assert out[4] == "In: 20,000 sats from 1 source"
         assert "consolidate again" in out[-2]  # the other-side hint line
         assert out[-1] == "full breakdown: /details"
         s.close()

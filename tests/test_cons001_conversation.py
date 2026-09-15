@@ -194,11 +194,28 @@ def test_rollup_knob_persists_across_every_intercept(world) -> None:
 def test_opener_is_conservative(world) -> None:
     """A digit (an explicit size threshold) keeps the existing model route
     (the TX-SELF-001 golden phrasings are NOT intercepted); a non-verb line
-    with a tag word is ordinary chat; a deny-shaped opener stands down."""
+    with a tag word is ordinary chat; a deny-shaped opener stands down.
+    (TCK-CHAT-002 shape note: the match returns a 4-tuple
+    ``(tag, fee, small, numbers)``, and the word SMALL now means the
+    consolidation-target filter — the pinned collision case "merge my
+    notes about SMALL coins" rides it, the card remaining the authority.)"""
     assert app._consolidation_intent("consolidate all my coins under 100000 sats") is None
     assert app._consolidation_intent("did the exchange confirm?") is None
     assert app._consolidation_intent("don't consolidate my coins") is None
-    assert app._consolidation_intent("merge my notes about small coins") == (None, None)
+    assert app._consolidation_intent("merge my notes about small coins") == (
+        None,
+        None,
+        True,
+        (),
+    )
+    assert app._consolidation_intent("consolidate address 3 & 9") == (
+        None,
+        None,
+        False,
+        (3, 9),
+    )
+    # an address-WORDLESS digit stays on the model route (threshold grammar)
+    assert app._consolidation_intent("consolidate my 3 favorite coins") is None
     _labeled(world)
     _, fake, _ = _turn(world, "consolidate all my coins under 100000 sats")
     assert len(fake.prompts) == 1  # reached the model, exactly as today
@@ -374,21 +391,24 @@ def test_plan_echo_from_the_record(world) -> None:
     assert f"Merge 2 UTXOs to create one new UTXO of {pending.amount_sats:,} sats" in outs
 
 
-def test_direct_threshold_plan_keeps_the_generic_card(world) -> None:
-    """The model-routed direct consolidate (no conversation) is
-    byte-unchanged: the generic plan line, NO echo, NO broadcast
-    annotation marker (the new lines belong to the conversation)."""
+def test_direct_threshold_plan_marks_and_reshows(world) -> None:
+    """TCK-CHAT-002 FINDING 3: the direct threshold (small-utxos) plan now
+    carries the SAME plan-echo marker + re-show record as the conversation
+    paths — its card opens with the "Merge N UTXOs…" echo and a pending
+    re-show keeps the §3a source/fee lines (the old generic small-coin plan
+    line is gone from the consolidate card)."""
     _labeled(world)
     result = world["table"][IntentName.SELF_TRANSFER](
         _env("self_transfer", {"mode": "consolidate", "below_size_sats": 50_000})
     )
     assert result["self_mode"] == "consolidate"
-    assert "cons_merge" not in result
-    assert world["session"].cons_pending is None
+    assert result["cons_merge"] is True
+    assert world["session"].cons_pending is not None
+    assert world["session"].cons_pending.tx_ref == result["tx_ref"]
     lines: list[str] = []
     app._print_self_plan(result, lines.append)
-    assert not any("create one new UTXO" in ln for ln in lines)
-    assert any(ln.startswith("Plan: merge ") for ln in lines)
+    assert any("create one new UTXO" in ln for ln in lines)
+    assert app._CONS_SOURCE_HEADER in lines
 
 
 # =========================================================================
@@ -530,7 +550,10 @@ def test_fresh_envelope_supersedes_open_ask(world) -> None:
     )
     assert world["session"].cons_ask is None  # superseded, not hijacked
     assert result["self_mode"] == "consolidate"
-    assert "cons_merge" not in result
+    # TCK-CHAT-002 FINDING 3: the threshold plan marks itself for re-show
+    # (cons_merge + cons_pending), even when it supersedes an open ask.
+    assert result["cons_merge"] is True
+    assert world["session"].cons_pending is not None
 
 
 def test_opener_stands_down_while_a_card_pends(world) -> None:

@@ -1854,6 +1854,73 @@ _CONS_PLAN_LINE: Final[str] = (
     "Merge {sources} UTXO{s} to create one new UTXO of {amount:,} sats"
 )
 
+# --- TCK-CHAT-002: consolidation fee narration + source restatement --------
+#
+# Designer §3 copy, SOFTENED per the council (glm #6: never promise
+# confirmation) — drafted in the ux-web-copy-2 voice, FLAGGED for §9 review.
+# Every line is value-free (no digits, no fabricated probability, no
+# clock); the money figures stay on the card's own Fee row (verbatim tool
+# output). COUNCIL CONSENSUS #1: 'later' is NOT a gate word and is NOT
+# taught here — the elevated-fee warning is narration-only, the gate
+# vocabulary stays confirm/cancel, and any next utterance already closes
+# the plan the same way it closes every ask.
+
+#: §3a fee line: consolidation implies the cheapest bid the policy knows —
+#: the target-follower's rate described honestly, with the estimate hedge.
+_CONS_FEE_LOW_LINE: Final[str] = (
+    "This plan bids the cheapest rate that confirmed reliably over roughly "
+    "the last six hours — an estimate, never a promise of confirmation."
+)
+#: §3b elevated-fee warning, hedged: printed ONLY when the plan's own bid
+#: sits above :meth:`~localwallet.chain.fees.FeeEstimator`'s six-hour
+#: average of per-block lowest fees (the comparison is integer centisat
+#: arithmetic in the handler — this line never quotes a number).
+_CONS_FEE_ELEVATED_LINE: Final[str] = (
+    "Heads up: this rate sits above that roughly six-hour average — "
+    "merging at a quieter moment might cost less, but nothing about future "
+    "fees is certain."
+)
+#: §3c calm line, softened — printed when the bid sits AT OR BELOW the
+#: six-hour average: reassurance, not a promise.
+_CONS_FEE_CALM_LINE: Final[str] = (
+    "Fees look near their recent average — no need to wait on fees."
+)
+
+#: §3a plan-preview rows: EVERY source is named BY its stable registry
+#: NUMBER plus the FULL address (glm #7: never number-only), value verbatim
+#: from the store rows the handler actually selected (the same rows the
+#: plan spends — never the ask's remembered set).
+_CONS_SOURCE_HEADER: Final[str] = "Merging these coins:"
+_CONS_SOURCE_ROW: Final[str] = "  #{number}. {address} · {sats:,} sats"
+
+#: The multi-number opener's pool guard: consolidation merges ONE privacy
+#: pool at a time (TCK-TX-SELF-001/UTXO-002), and a picked set spanning the
+#: KYC mark would mix sides the engine policy never mixes. Value-free,
+#: fail-closed, names no address; the two groups are the user's own words.
+_CONS_POOLS_APART: Final[str] = (
+    "Those addresses sit on both sides of your KYC mark — I only merge one "
+    "group's coins at a time. Say the numbers for one side, or just the "
+    "small-utxos merge."
+)
+#: A resolved registry number whose address holds no coins (allocated-but-
+#: unused is exactly the case the registry's shown-date tracking feeds):
+#: named honestly by number + the fact, NEVER folded into a generic empty.
+_CONS_NO_COINS_AT: Final[str] = (
+    "There are no coins at address #{number} — nothing to merge from it."
+)
+
+#: TCK-CHAT-002 opener vocabularies (deterministic, code-matched BEFORE
+#: the model — registry numbers are user data and the closed consolidate
+#: params cannot carry a coin reference, so this never becomes a prompt
+#: route; the model-routed "…under 100000 sats" threshold grammar is
+#: untouched).
+_CONS_SMALL_WORDS: Final[frozenset[str]] = frozenset(
+    {"small", "smaller", "smallest", "tiny", "little"}
+)
+_CONS_ADDRESS_WORDS: Final[frozenset[str]] = frozenset(
+    {"address", "addresses", "addr", "addrs"}
+)
+
 #: Closed-set tag words the deterministic opener/intercept match (the
 #: §1.4 vocabulary + honest display synonyms; user data stays in code).
 _CONS_TAG_TERMS: Final[dict[str, tuple[str, ...]]] = {
@@ -1898,6 +1965,8 @@ _CONS_OBJECT_TERMS: Final[frozenset[str]] = frozenset(
         "labeled",
         "unlabeled",
         "unlabelled",
+        "address",
+        "addresses",
     }
 )
 
@@ -1917,27 +1986,45 @@ _CONS_SLOW_PHRASES: Final[tuple[str, ...]] = ("no hurry", "not urgent", "slowly"
 _CONS_FAST_PHRASES: Final[tuple[str, ...]] = ("asap", "urgent", "hurry", "faster", "fast", "quick")
 
 
-def _consolidation_intent(line: str) -> tuple[str | None, str | None] | None:
+def _consolidation_intent(
+    line: str,
+) -> tuple[str | None, str | None, bool, tuple[int, ...]] | None:
     """Deterministic consolidation-opener match (TCK-CONS-001, BEFORE the
-    model sees the line): ``None`` = not a consolidation opener (ordinary
-    pipeline), else ``(tag, fee_target)`` where ``tag`` is a closed-set id,
-    ``""`` for the unlabeled path, or ``None`` for the label roll-up, and
-    ``fee_target`` is the rung the user's words named (``None`` = the
-    engine's MEDIUM default, unchanged). Any deny token suppresses the
-    intercept (the HW-005 slice-C review-MEDIUM rule) — except inside a
-    matched slow-rung phrase ("no hurry" is an urgency, not a refusal).
-    A line carrying a bare digit is NOT intercepted: an explicit size
-    threshold stays on the existing model route (golden phrasings
-    preserved). ponytail: word-set matching — "merge my notes about
-    coins" style collisions ride the never-trap; the card remains the
-    authority on what any plan actually spends."""
+    model sees the line; extended by TCK-CHAT-002): ``None`` = not a
+    consolidation opener (ordinary pipeline), else the 4-tuple
+    ``(tag, fee_target, small, numbers)`` where
+
+    * ``tag`` is a closed-set id, ``""`` for the unlabeled path, or ``None``
+      for the label roll-up (unchanged);
+    * ``fee_target`` is the rung the user's words named (``None`` = the
+      engine's MEDIUM default, unchanged);
+    * ``small`` (TCK-CHAT-002) marks "consolidate my SMALL utxos" — the
+      source set is the user's own consolidation target
+      (``utxo_target_min_sats``, the §2.3 settings ladder), never a
+      hardcoded size; the threshold envelope then rides the EXISTING
+      handler policy (pool sides never mix, larger side wins, honest
+      other-side note);
+    * ``numbers`` (TCK-CHAT-002) are REGISTRY NUMBERS for
+      "consolidate address 3 & 9" — digits ONLY alongside an address word
+      (a bare-digit threshold line stays on the model route, the golden
+      phrasings preserved). The caller resolves every number against the
+      stable CHAT-001 registry (miss = the value-free clarify, never a
+      guess) and picks the coins at the resolved addresses.
+
+    Any deny token suppresses the intercept (the HW-005 slice-C review-MEDIUM
+    rule) — except inside a matched slow-rung phrase ("no hurry"/"not
+    urgent" are urgencies, not refusals).
+    ponytail: word-set matching — "merge my notes about small coins" style
+    collisions ride the never-trap; the card remains the authority on what
+    any plan actually spends."""
     words = [w for w in (t.strip(punctuation) for t in line.lower().split()) if w]
     if not words or not any(w in _CONS_VERBS for w in words):
         return None
     if not any(w in _CONS_OBJECT_TERMS for w in words):
         return None
-    if any(w.isdigit() for w in words):
-        return None
+    digits = {int(w) for w in words if w.isdigit()}
+    if digits and not _digits_named_as_addresses(words):
+        return None  # an explicit size threshold stays on the model route
     joined = " ".join(words)
     fee: str | None = None
     # SLOW phrases are checked FIRST and win: "no hurry" contains the fast
@@ -1948,15 +2035,32 @@ def _consolidation_intent(line: str) -> tuple[str | None, str | None] | None:
         fee = "fast"
     # A deny token suppresses the intercept (HW-005 slice-C rule) — except
     # the deny-shaped word INSIDE a matched slow phrase ("no hurry"/"not
-    # urgent" are urgencies, not refusals).
+    # urgent are urgencies, not refusals).
     if fee != "slow" and any(w in _BUMP_DENY_TOKENS for w in words):
         return None
+    if digits:  # address-worded: registry-number pick (TCK-CHAT-002)
+        return None, fee, False, tuple(sorted(digits))
     if any(w in _CONS_UNLABELED_TERMS for w in words):
-        return "", fee
+        return "", fee, False, ()
     for tag, terms in _CONS_TAG_TERMS.items():
         if any(w in terms for w in words):
-            return tag, fee
-    return None, fee
+            return tag, fee, False, ()
+    if any(w in _CONS_SMALL_WORDS for w in words):
+        # TCK-CHAT-002: "my small utxos" — filter by the consolidation
+        # TARGET setting, checked AFTER label/tag words (an explicit group
+        # pick stays more specific: "my small kyc coins" is a tag ask).
+        return None, fee, True, ()
+    return None, fee, False, ()
+
+
+def _digits_named_as_addresses(words: list[str]) -> bool:
+    """True when bare digits in a consolidation line are ADDRESS referents
+    ("consolidate address 3 & 9"), not a size threshold ("under 100000
+    sats"): an explicit address word sits alongside them. TCK-CHAT-002's
+    opener routing hinges on this — a threshold line keeps its golden
+    model route, a registry-number line is resolved IN CODE (the envelope
+    can carry no coin reference and the model never authors a number)."""
+    return any(w in _CONS_ADDRESS_WORDS for w in words)
 
 
 # --- bump conversation copy (TCK-RBF-004) -----------------------------------
@@ -2410,9 +2514,17 @@ class _ConsPending:
     handler annotates the plan's own outputs (the §1.3 union inheritance
     already runs for every self-transfer; this record adds the
     ``consolidation`` tag + the "consolidated from N outputs" note on top —
-    N counted from the broadcast's own inputs, never from user text)."""
+    N counted from the broadcast's own inputs, never from user text).
+
+    ``display`` (TCK-CHAT-002) carries the plan card's consolidation-only
+    result keys (source restatements + the fee-narration flags — every
+    figure already verbatim from the staging handler's own read) so the
+    ``tx_pending`` re-show renders THE SAME card the user was shown,
+    sources and fee lines included (the ``_CpfpPending.display``
+    precedent; a re-show never re-registers and never re-fetches)."""
 
     tx_ref: str
+    display: Mapping[str, object] = dataclass_field(default_factory=dict)
 
 
 def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
@@ -2674,7 +2786,7 @@ def _run_consolidation_turn(
     intent = _consolidation_intent(line)
     if intent is None:
         return False
-    tag, fee_target = intent
+    tag, fee_target, small, numbers = intent
     try:
         wallet = store.get_active_wallet()
         if wallet is None:
@@ -2686,6 +2798,40 @@ def _run_consolidation_turn(
         return False  # sugar never crashes a turn; the ordinary pipeline continues
     if not coins:
         output_fn(sanitize_tool_output(_CONS_EMPTY))
+        return True
+    if numbers:
+        return _cons_by_numbers(
+            session, store, wallet.id, coins, numbers, fee_target, line, output_fn,
+            table=table,
+        )
+    if small:
+        # TCK-CHAT-002 "consolidate my small utxos": SMALL is defined by
+        # the user's own consolidation target (utxo_target_min_sats over
+        # the §2.3 ladder, resolved fresh exactly like create_tx resolves
+        # it per selection), and the pick rides the EXISTING threshold
+        # handler policy (one privacy pool, larger side wins, honest
+        # other-side note, MAX-inputs cap) — no second state machine. A
+        # malformed settings ladder releases the line to the ordinary
+        # pipeline instead of planning against a half-read policy.
+        try:
+            env_settings = Settings.from_env()
+            policy = resolve_coin_selection_settings(
+                {key: getattr(env_settings, key, "") for key in COIN_SETTING_KEYS},
+                {key: store.get_coin_setting(key) for key in COIN_SETTING_KEYS},
+            )
+        except (ValueError, StoreError, sqlite3.Error):
+            return False
+        _dispatch_code_self_turn(
+            session,
+            line,
+            SelfTransferParams(
+                mode="consolidate",
+                below_size_sats=policy.target_min_sats,
+                **({"fee_target": fee_target} if fee_target is not None else {}),
+            ),
+            output_fn,
+            table=table,
+        )
         return True
     if tag == "":
         unlabeled = tuple(c for c in coins if not (c.get("tags") or ()))
@@ -2795,6 +2941,74 @@ def _cons_finalize(
         # answered ask must never re-dispatch on a later utterance.
         session.cons_ask = None
     return True
+
+
+def _cons_by_numbers(
+    session: SendSession,
+    store: Store,
+    wallet_id: int,
+    coins: tuple[dict[str, object], ...],
+    numbers: tuple[int, ...],
+    fee_target: str | None,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+) -> bool:
+    """TCK-CHAT-002 "consolidate address 3 & 9": resolve each REGISTRY
+    NUMBER against the stable CHAT-001 registry (miss → the existing
+    value-free :data:`ADDRESS_REF_UNKNOWN` clarify, nothing staged, never
+    a nearest guess), then plan over every coin sitting at a resolved
+    address (coins at one address share its number and are all picked with
+    it — the list-ask semantics, unchanged). Every resolution RESTATES the
+    FULL address (glm #7, the ``_CONS_RESOLVED`` line) before anything is
+    planned. A pick that would SPAN the KYC privacy pools is refused with
+    :data:`_CONS_POOLS_APART` — consolidation merges one side at a time
+    (TCK-TX-SELF-001 policy; the threshold path's pool partition is not
+    reachable from an explicit cross-side pick, so the guard lives HERE).
+    The remainder rides the EXISTING conversation machinery:
+    :func:`_cons_finalize` stamps the picked coins dispatcher-side and the
+    handler's fresh-store revalidation stays the authority."""
+    addresses: dict[str, int] = {}
+    for n in numbers:
+        record = None
+        if n >= 1:  # registry numbers are 1-based; "address 0" is a miss
+            try:
+                record = store.get_address_by_number(wallet_id, n)
+            except (StoreError, sqlite3.Error):
+                return False  # DB surprise: release the line, never crash
+        if record is None:
+            output_fn(sanitize_tool_output(ADDRESS_REF_UNKNOWN))
+            return True  # consumed with the honest clarify; nothing staged
+        addresses[record.address] = n
+    try:
+        kyc_side = _kyc_side_addresses(store)
+    except (StoreError, sqlite3.Error):
+        return False
+    picked = tuple(c for c in coins if c.get("address") in addresses)
+    # Cross-pool guard first (TCK-CHAT-002 FINDING 4): a pick spanning the
+    # KYC mark shows ONLY the refusal — an empty-address notice alongside
+    # it would muddy the one real message (both fail closed either way).
+    sides = {(1 if str(c.get("address")) in kyc_side else 0) for c in picked}
+    if len(sides) > 1:
+        output_fn(sanitize_tool_output(_CONS_POOLS_APART))
+        return True
+    for address, n in addresses.items():
+        if not any(c.get("address") == address for c in picked):
+            output_fn(sanitize_tool_output(_CONS_NO_COINS_AT.format(number=n)))
+    if not picked:
+        return True  # every named address is empty: honest notice, no plan
+    for entry in picked:
+        output_fn(
+            sanitize_tool_output(
+                _CONS_RESOLVED.format(
+                    number=addresses[str(entry["address"])],
+                    address=entry.get("address"),
+                    sats=int(str(entry["value_sats"])),
+                )
+            )
+        )
+    return _cons_finalize(session, picked, fee_target, line, output_fn, table=table)
 
 
 @dataclass
@@ -5560,6 +5774,11 @@ def _make_self_transfer_handler(
                 and flow.pending.tx_ref == session.cons_pending.tx_ref
             ):
                 result["cons_merge"] = True
+                # TCK-CHAT-002: the staged card's source restatements and
+                # fee narration ride the record — the re-show IS the card
+                # the user was shown (the cpfp display precedent; no
+                # re-registration, no chain call on a re-show).
+                result.update(session.cons_pending.display)
             return result
 
         # 1.5 TCK-CONS-001: consume the consolidation conversation's ask
@@ -5582,7 +5801,14 @@ def _make_self_transfer_handler(
         # 2. Fee bid: the estimator ladder (the ONLY chain call this flow
         #    makes — exactly like create_tx; no new chain surface). The bid
         #    is min-relay floored inside the estimator (TCK-FEE-004).
-        target = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.MEDIUM
+        #    TCK-CHAT-002 orchestrator ruling: the consolidation flow's
+        #    DEFAULT rung is SLOW (the §3a copy "bids the cheapest rate that
+        #    confirmed reliably…" must be TRUE of the actual bid — only a
+        #    slow default makes the elevated-fee warning informative). Splits
+        #    keep their MEDIUM default; an EXPLICIT user rung/rate still
+        #    wins unchanged.
+        default_target = FeeTarget.SLOW if params.mode != "split" else FeeTarget.MEDIUM
+        target = FeeTarget(params.fee_target) if params.fee_target else default_target
         try:
             estimate = fee_estimator.estimate(target)
         except ChainError as exc:
@@ -5827,17 +6053,57 @@ def _make_self_transfer_handler(
         }
         if other_side_count:
             result["self_other_side_count"] = other_side_count
-        if cons_picked is not None:
-            # TCK-CONS-001: the plan-echo marker (the card renderer prints
-            # the pinned "Merge N UTXOs to create one new UTXO of X sats"
-            # line from this result's OWN inputs_count/amount_sats — engine
-            # totals, verbatim) and the broadcast annotation record (a
-            # successful broadcast tags the plan's outputs
-            # ``consolidation`` + notes "consolidated from N outputs";
-            # §1.3 union inheritance already ran for every self-transfer).
+        cons_display: dict[str, object] = {}
+        if not split:
+            # TCK-CHAT-002 — consolidation plan-preview extras (designer §3).
+            # Sources are restated BY registry NUMBER + FULL address (glm #7
+            # — showing is the CHAT-001 registration act, so the numbers
+            # printed here are the numbers the user's other surfaces use),
+            # every value verbatim from THIS handler's own store read (the
+            # rows it actually selected — never the ask's remembered set).
+            # The fee narration compares the plan's FINAL bid (post min-relay
+            # clamp — what the network will see) against the chain layer's
+            # six-hour average of per-block lowest fees: INTEGER centisat
+            # arithmetic, no figure on screen, and when the average is
+            # unavailable the whole block stands DOWN (fail-closed — no
+            # data, no claim, never a fabricated bound).
+            try:
+                avg_c = fee_estimator.six_hour_low_average_centisat_vb()
+            except Exception:  # noqa: BLE001 — the seam is itself fail-closed; decoration never fails a plan
+                avg_c = None
+            if avg_c is not None:
+                cons_display["cons_fee_note"] = True
+                cons_display["cons_fee_state"] = (
+                    "elevated" if pending.fee_rate_centisat_vb > avg_c else "calm"
+                )
+            try:
+                cons_display["self_sources"] = [
+                    {
+                        "number": store.note_address_shown(
+                            wallet_id, str(u.address)
+                        ).number,
+                        "address": u.address,
+                        "value_sats": u.value_sats,
+                    }
+                    for u in input_rows
+                ]
+            except (StoreError, sqlite3.Error):
+                # Registry decoration is display material: a write failure
+                # omits the rows (the printer draws nothing from an absent
+                # key), never fails the staged plan the gate is holding.
+                cons_display.pop("self_sources", None)
+            result.update(cons_display)
+            # TCK-CHAT-002 (FINDING 3): the plan-echo marker AND the
+            # re-show record attach to EVERY consolidation plan — the
+            # small-utxos threshold path included, not just an answered
+            # number/list pick. ``cons_display`` (built above) carries the
+            # §3a source rows + fee lines for exactly these, so a pending
+            # re-show renders the same card every other path does; the
+            # broadcast path keys its "consolidated from N outputs"
+            # annotation off this same record.
             result["cons_merge"] = True
             if session is not None:
-                session.cons_pending = _ConsPending(pending.tx_ref)
+                session.cons_pending = _ConsPending(pending.tx_ref, cons_display)
         return result
 
     return handler
@@ -16641,10 +16907,52 @@ def _print_self_plan(
         if isinstance(eta_wording, str) and eta_wording:
             # Verbatim chain/eta.py hedge appended — never re-punctuated.
             fee += f" — ETA {eta_wording}"
-    lines: list[str] = [_CARD_ASK_LINE, plan, in_line, fee]
+    lines: list[str] = [_CARD_ASK_LINE, plan]
+    # TCK-CHAT-002 §3a source restatement (consolidate cards only — the
+    # handler attaches ``self_sources`` to those): EVERY merged coin is
+    # named by its stable registry NUMBER plus the FULL address (glm #7:
+    # never number-only), value verbatim from the handler's own store read.
+    # Absent/malformed entries print nothing — the printer never guesses.
+    if mode == "consolidate" and isinstance(result.get("self_sources"), list):
+        rows: list[str] = []
+        for entry in result["self_sources"]:
+            if not isinstance(entry, dict):
+                continue
+            number = entry.get("number")
+            address = entry.get("address")
+            value = entry.get("value_sats")
+            if (
+                isinstance(number, int)
+                and not isinstance(number, bool)
+                and isinstance(address, str)
+                and address
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+            ):
+                rows.append(
+                    _CONS_SOURCE_ROW.format(number=number, address=address, sats=value)
+                )
+        if rows:
+            lines.append(_CONS_SOURCE_HEADER)
+            lines.extend(rows)
+    lines.append(in_line)
+    lines.append(fee)
     floor_note = _fee_floor_note_line(result)  # TCK-FEE-004 (see brief card)
     if floor_note is not None:
         lines.append(floor_note)
+    # TCK-CHAT-002 §3 fee narration (designer copy, softened per glm #6;
+    # the handler attaches these flags ONLY when the chain layer's six-hour
+    # average of per-block lowest fees exists — no data, no line, ever).
+    # The elevated-fee warning is NARRATION-ONLY: it teaches no gate word
+    # (council consensus #1 — 'later' stays off the vocabulary; cancel or
+    # any next utterance already closes the plan) and quotes no figure.
+    if result.get("cons_fee_note") is True:
+        lines.append(_CONS_FEE_LOW_LINE)
+        fee_state = result.get("cons_fee_state")
+        if fee_state == "elevated":
+            lines.append(_CONS_FEE_ELEVATED_LINE)
+        elif fee_state == "calm":
+            lines.append(_CONS_FEE_CALM_LINE)
     other = _card_sats(result, "self_other_side_count")
     if other is not None:
         # Honest cross-pool note (the privacy pools are never mixed — this

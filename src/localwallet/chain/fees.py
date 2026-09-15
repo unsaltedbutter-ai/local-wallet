@@ -25,6 +25,17 @@ USER SPEC 2026-09-12, refining the TCK-FEE-001 floor-follower):
                       ceil-2dp)
    =================  ==========================================================
 
+   **Six-hour average of per-block lowest fees (TCK-CHAT-002).** The SAME
+   bottoms list feeds one extra figure: the mean of the lowest ``feeRange``
+   of up to :data:`_SIX_HOUR_PROJECTED_BLOCKS` projected blocks (~6 × 10-min
+   blocks ≈ a six-hour horizon; a shorter payload averages what exists —
+   see the constant's bound note; a longer one uses only its first six).
+   Exact Decimal mean, half-even to 2 dp, out as integer centisat/vB — the
+   figure EXISTS only when mempool-blocks parsed; on the degraded/native
+   paths :meth:`FeeEstimator.six_hour_low_average_centisat_vb` answers
+   ``None`` (fail closed — the consumer drops its warning rather than
+   fabricating a bound). Nothing new is fetched: it rides the one snapshot.
+
    The parser **enforces** projected-block bottoms to be non-increasing with
    depth (a payload that breaks the order is rejected, not trusted — the
    FEE-001 security-review protection, kept because the code invariant
@@ -202,6 +213,17 @@ _CENT = Decimal("0.01")
 #: ``quantize`` out of the documented ChainError fallback as an
 #: InvalidOperation).
 _MAX_BOTTOM_SAT_VB = 10_000
+
+#: Projected blocks feeding the six-hour average (TCK-CHAT-002): the
+#: mempool-blocks projection models ~10-minute blocks, so SIX bottoms span
+#: a ~six-hour horizon. **The window bound, stated honestly:** the endpoint
+#: typically returns up to ~8 projected blocks — only the FIRST SIX feed the
+#: average; a SHORTER payload (a thin mempool projects fewer blocks) means
+#: the window is genuinely shorter than six hours, and the mean of what
+#: exists is returned unchanged — never padded, never extrapolated, never
+#: fabricated. Consumers treat the figure as "the average of the per-block
+#: lowest fees over up to six projected blocks".
+_SIX_HOUR_PROJECTED_BLOCKS = 6
 
 #: The ASSUMED min-relay floor in this module's unit (integer centisat/vB):
 #: Bitcoin Core's ``DEFAULT_MIN_RELAY_TX_FEE`` (``src/policy/policy.h``,
@@ -386,6 +408,12 @@ class _Snapshot:
     #: Esplora endpoints existed): ``minimum_fee_sat_vb`` has no value to
     #: serve and refuses instead of fabricating one.
     native: bool = False
+    #: TCK-CHAT-002: mean of the lowest ``feeRange`` of up to
+    #: :data:`_SIX_HOUR_PROJECTED_BLOCKS` projected blocks (integer
+    #: centisat/vB). SET only by the target-follower; ``None`` everywhere
+    #: else — a degraded or native snapshot has no per-block data to
+    #: average, and we never invent one.
+    avg_low_centisat_vb: int | None = None
 
 
 class FeeEstimator:
@@ -572,6 +600,10 @@ class FeeEstimator:
         With the parser's non-increasing-bottoms rule (``B₀ >= B₁``) this
         makes ``FAST >= MEDIUM >= SLOW`` a code invariant. All rounding is
         exact Decimal arithmetic; the outputs are integer centisat/vB.
+
+        Also records ``avg_low_centisat_vb`` (TCK-CHAT-002): the mean of
+        the first up-to-6 bottoms, same half-even 2-dp quantize — the only
+        snapshot that HAS per-block data is the only one that answers.
         """
         bottoms = _parse_projected_bottoms(
             self._client.get_json(_MEMPOOL_BLOCKS_PATH, _MEMPOOL_BLOCKS_KIND),
@@ -582,6 +614,8 @@ class FeeEstimator:
             target_c = _to_cents(bottoms[0], ROUND_CEILING)
         slow_c = _to_cents(bottoms[1] if len(bottoms) > 1 else bottoms[0], ROUND_CEILING)
         fast_c = 2 * target_c
+        window = bottoms[:_SIX_HOUR_PROJECTED_BLOCKS]
+        avg_c = _to_cents(sum(window, Decimal(0)) / Decimal(len(window)), ROUND_HALF_EVEN)
         estimates = {
             target: FeeEstimate(
                 target=target,
@@ -599,6 +633,7 @@ class FeeEstimator:
             estimates=estimates,
             minimum_fee_sat_vb=minimum_fee_sat_vb,
             fetched_at=now,
+            avg_low_centisat_vb=avg_c,
         )
 
     def estimate(self, target: FeeTarget) -> FeeEstimate:
@@ -655,6 +690,30 @@ class FeeEstimator:
         if rate_centisat_vb < floor_c:
             return floor_c, True
         return rate_centisat_vb, False
+
+    def six_hour_low_average_centisat_vb(self) -> int | None:
+        """The six-hour average of per-block lowest fees (TCK-CHAT-002),
+        integer centisat/vB — the mean of the lowest ``feeRange`` of up to
+        :data:`_SIX_HOUR_PROJECTED_BLOCKS` projected blocks (≈ six 10-minute
+        blocks; a shorter payload averages what exists, the window bound is
+        documented on the constant — never padded, never fabricated).
+
+        ``None`` means NO answer: the cached snapshot came from the
+        recommended-fees fallback or a backend-native source (no per-block
+        data to average). This is the honest bound the consolidation card's
+        elevated-fee warning compares the plan's bid against — a ``None``
+        makes the warning stand DOWN, it never fires on a guess.
+
+        Rides the ONE cached snapshot (:meth:`estimate` already refreshed
+        it): zero extra endpoint calls on the narration path. ANY failure
+        (an un-cacheable refresh — a broken recommended payload) answers
+        ``None`` fail-closed, value-free: narration decoration must never
+        fail a plan (the TCK-FEE-004 floor-seam discipline).
+        """
+        try:
+            return self._get_snapshot().avg_low_centisat_vb
+        except Exception:  # noqa: BLE001 — fail-closed narration seam, value-free
+            return None
 
     def minimum_fee_sat_vb(self) -> int:
         """Return the ``minimumFee`` field (sats/vB), cached by TTL.

@@ -1068,3 +1068,95 @@ def test_native_floor_junk_answer_falls_back(junk):
     est = FeeEstimator(client, ttl_s=30.0)
     assert est.clamp_to_min_relay_floor(9) == (10, True)
     assert est.clamp_to_min_relay_floor(100) == (100, False)
+
+
+# -- six-hour average of per-block lowest fees (TCK-CHAT-002) ---------------
+
+
+def _avg_with(server: RoutedServer) -> int | None:
+    """Refresh through the NORMAL estimator path, then ask the seam."""
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0)
+        est.estimate(FeeTarget.MEDIUM)
+        return est.six_hour_low_average_centisat_vb()
+
+
+def test_six_hour_avg_user_payload_exact():
+    # THE user payload bottoms: first SIX blocks of USER_PROJECTED
+    # (1.05567928730512, then five at 1.0) -> sum 6.05567928730512 / 6 =
+    # 1.00927988121752 -> half-even 2 dp = 1.01 -> 101 centisat/vB.
+    assert _avg_with(RoutedServer(_floor_routes())) == 101
+
+
+def test_six_hour_avg_window_bound_takes_at_most_six_blocks():
+    # 8 projected blocks exist; ONLY THE FIRST SIX feed the average (the
+    # endpoint projects further than the ~6h horizon — cheap deep blocks
+    # must not drag the bound down; the window bound is documented on
+    # _SIX_HOUR_PROJECTED_BLOCKS, never silently widened).
+    bottoms = [3.0, 2.0, 2.0, 2.0, 2.0, 2.0, 0.2, 0.2]
+    # first six: 3 + 2*5 = 13 / 6 = 2.1666... -> half-even 2dp = 2.17
+    assert _avg_with(RoutedServer(_floor_routes(projected=_projected_payload(bottoms)))) == 217
+
+
+@pytest.mark.parametrize(
+    ("bottoms", "expected"),
+    [
+        # A SHORTER payload averages what exists — the window is honestly
+        # under six hours then (never padded, never fabricated).
+        ([2.0, 1.0], 150),
+        # One projected block: the window is that single bottom.
+        ([1.05567928730512], 106),
+        # Exact half-even tie: 0.125 -> 0.12 (ties-to-even at the last dp).
+        ([0.13, 0.12], 12),
+    ],
+)
+def test_six_hour_avg_short_window_averages_what_exists(bottoms, expected):
+    server = RoutedServer(_floor_routes(projected=_projected_payload(bottoms)))
+    assert _avg_with(server) == expected
+
+
+def test_six_hour_avg_degraded_source_is_none():
+    # mempool-blocks unreachable (404): the ladder degrades to recommended
+    # and the average has NO per-block data to average -> None (the
+    # consumer's elevated-fee warning stands down; never a fallback figure).
+    routes = {
+        "/v1/fees/recommended": httpx.Response(200, json=RECOMMENDED),
+        "/v1/fees/mempool-blocks": httpx.Response(404, json=None),
+    }
+    assert _avg_with(RoutedServer(routes)) is None
+
+
+def test_six_hour_avg_native_path_is_none():
+    # A backend-native snapshot never saw a mempool-blocks payload.
+    client = _FloorNative({FeeTarget.FAST: 2, FeeTarget.MEDIUM: 2, FeeTarget.SLOW: 1}, floor=10)
+    est = FeeEstimator(client, ttl_s=30.0)
+    est.estimate(FeeTarget.MEDIUM)
+    assert est.six_hour_low_average_centisat_vb() is None
+
+
+def test_six_hour_avg_fails_closed_never_raises():
+    # A TOTAL source failure (recommended broken too): estimate() raises,
+    # the seam answers None — narration decoration never fails a plan.
+    with RoutedServer(
+        {
+            "/v1/fees/recommended": httpx.Response(500, json=None),
+            "/v1/fees/mempool-blocks": httpx.Response(404, json=None),
+        }
+    ).client() as client:
+        est = FeeEstimator(client, ttl_s=30.0)
+        with pytest.raises(ChainError):
+            est.estimate(FeeTarget.MEDIUM)
+        assert est.six_hour_low_average_centisat_vb() is None
+
+
+def test_six_hour_avg_costs_no_extra_chain_calls():
+    # The figure RIDES the one snapshot refresh the estimate already does
+    # (the ticket: "the per-block data is ALREADY fetched").
+    server = RoutedServer(_floor_routes())
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0)
+        est.estimate(FeeTarget.MEDIUM)
+        before = len(server.requests)
+        for _ in range(3):
+            assert est.six_hour_low_average_centisat_vb() == 101
+        assert len(server.requests) == before
