@@ -3835,9 +3835,37 @@ def test_ladder_rung_under_the_floor_is_clamped_up_and_narrated(
     assert result["fee_rate_centisat_vb"] == 100  # 0.34 lifted to the floor
     assert result["fee_sats"] == SEND_VSIZE  # ceil(141 x 100/100) == floor fee
     assert result["fee_floor_note"] is True
+    # TCK-SWAP-001 rider (FEE-004 ledger MINOR): the note NAMES the binding
+    # floor. This lift comes from the payload's congestion minimumFee (the
+    # assumed rail is 0.1 sat/vB since FEE-005) — the honest line is the
+    # congestion one, and the "min-relay"/"lowest rate this wallet builds"
+    # claim is gone.
+    assert result["fee_floor_source"] == "congestion"
     lines: list[str] = []
     app_module._print_create_tx(result, lines.append)
-    assert any("min-relay floor" in ln and "1 sat/vB" in ln for ln in lines), lines
+    assert any(
+        "congestion floor" in ln and "1 sat/vB" in ln for ln in lines
+    ), lines
+    assert not any("min-relay" in ln for ln in lines), lines
+
+
+def test_fee_floor_note_neutral_fallback_for_unknown_source() -> None:
+    """TCK-SWAP-001 rider (FINDING 3b): the floor note is fail-closed — when
+    the binding floor's source is ABSENT or unknown (never a guess at which
+    floor raised the bid), the shared line renders the honest source-neutral
+    sentence ("the floor this wallet enforces"), NOT a relay/congestion
+    claim. Rides the same ``_fee_floor_note_line`` the card builders use;
+    value-free, display-only."""
+    neutral = app_module._fee_floor_note_line(
+        {"fee_floor_note": True, "fee_rate_display": "3.00"}
+    )
+    assert neutral == app_module._CARD_FEE_FLOOR_NOTE.format(rate="3.00")
+    assert "min-relay" not in neutral and "congestion floor" not in neutral
+    # An explicitly unknown source behaves exactly like an absent one.
+    unknown = app_module._fee_floor_note_line(
+        {"fee_floor_note": True, "fee_rate_display": "3.00", "fee_floor_source": "???unknown???"}
+    )
+    assert unknown == neutral
 
 
 class _NodeFloorDouble:
@@ -3888,6 +3916,10 @@ def test_explicit_rate_below_the_node_floor_clamps_up_and_narrates(
     assert result["fee_rate_centisat_vb"] == 300  # 100 lifted to the NODE's floor
     assert result["fee_sats"] == -(-SEND_VSIZE * 300 // 100)  # ceil(141 x 3.00)
     assert result["fee_floor_note"] is True
+    # TCK-SWAP-001 rider (FINDING 3a): the EXPLICIT-rate relay seam names the
+    # binding floor — the floor here came from the NODE, so it is the relay
+    # source, never the congestion one.
+    assert result["fee_floor_source"] == "relay"
     lines: list[str] = []
     app_module._print_create_tx(result, lines.append)
     assert any("min-relay floor" in ln and "3 sat/vB" in ln for ln in lines), lines

@@ -12,9 +12,15 @@ The contract (USER DIRECTION 2026-09-09 items 5/6/8/9/10; ADR-0018 amendment
 * the probe runs BEFORE the save (deliverable 2): unreachable / foreign-chain
   → refused VALUE-FREE, nothing stored, the old client untouched
   (fail-closed — never left clientless);
-* concurrency rule PINNED: a swap never crosses an in-flight scan — while a
-  fetch owns the worker the (validated, stored) swap DEFERS and installs the
-  moment the scan's ``_ScanDone`` has been persisted;
+* concurrency contract (TCK-SWAP-001 RELAXATION — user-blessed): a swap
+  installs IMMEDIATELY, across an in-flight scan too. The write validates +
+  stores + REBINDS at once (the swap is live when the reply goes out); the
+  superseded fetch may run out but its ``_ScanDone`` is DISCARDED
+  unpersisted by the ``ScanFlow`` generation check, and the swap's own full
+  resync QUEUES on the worker behind it, riding the NEW client. (The old
+  pin — defer the install until the scan's ``_ScanDone`` persisted — is
+  exactly what forced a user restart behind a minutes-class scantxoutset
+  and is deliberately gone.);
 * ``ssl://`` is accepted everywhere (M3 acceptance, direction 9): the store's
   typed writer, the settings path, the /setup entry (pinned in
   test_setup_command.py); the Electrum probe reuses M1's handshake genesis
@@ -39,6 +45,7 @@ All hermetic: fake duck-typed chain clients, tmp stores, injected probes.
 from __future__ import annotations
 
 import queue
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -88,19 +95,30 @@ class _FakeChain:
         self.closed = False
         self.fetches = 0
         self.status_calls = 0
+        #: Distinguishable server truth (the stale-delivery pins read the
+        #: persisted tip back to prove WHICH generation's record set landed).
+        self.tip = 900_000
         #: Optional test brake: a fetch that must NOT finish on its own
         #: timing (deterministic mid-scan swap/busy pins).
         self.hold = hold
+        #: Set on the FIRST fetch entry (so a test knows a job is REALLY
+        #: in flight before it swaps over it — TCK-SWAP-001 pins).
+        self.entered = threading.Event()
+        #: Optional failure injected AFTER the brake (stale-delivery pins).
+        self.fail_with: BaseException | None = None
 
     def close(self) -> None:
         self.closed = True
 
     def get_tip_height(self) -> int:
-        return 900_000
+        return self.tip
 
     def get_address_txs(self, address: str) -> list[dict[str, Any]]:
+        self.entered.set()
         if self.hold is not None:
             self.hold.wait(5.0)
+        if self.fail_with is not None:
+            raise self.fail_with
         self.fetches += 1
         return []
 
@@ -351,36 +369,174 @@ def test_probe_failure_refuses_value_free_old_client_untouched(
     assert wiring.scan is not None and wiring.scan.gate.state == "disabled"
 
 
-def test_mid_scan_swap_defers_until_scan_done(
+def test_mid_scan_swap_installs_immediately_and_reply_is_applied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
 ) -> None:
-    """The PINNED concurrency rule (deliverable 1): a swap never crosses an
-    in-flight scan. The write validates + stores immediately, the INSTALL
-    defers; the old client keeps serving (its close is the install's, not
-    the write's), and the moment the scan's _ScanDone has been persisted the
-    deferred swap lands and its own resync runs."""
+    """TCK-SWAP-001 (REWRITES the old mid-scan-DEFER pin — the blessed
+    relaxation): an apply that lands while a scan fetch is in flight
+    installs IMMEDIATELY and the settings reply answers ``applied`` +
+    ``swapped: True`` + ``resync: started`` WITHOUT blocking on the
+    in-flight job (the user's stall: a minutes-class scantxoutset behind
+    the old defer meant the swap never landed in-session). The client
+    rebind, the old-client close and the stored write are all done by the
+    time apply returns; only the rebuild SCAN queues behind the superseded
+    fetch (pinned next)."""
     wiring, commands = _mk_wiring(tmp_path, monkeypatch)
     assert wiring.scan is not None
+    old = wiring.client
+    old.hold = threading.Event()  # brake the in-flight fetch (set at the end)
     wiring.scan.set_startup(
         wallet_scan.plan_scan(wiring.store, wiring.wallet, rebuild=False)
     )
-    wiring.scan.begin()  # a startup fetch is now in flight on the OLD client
+    wiring.scan.begin()
+    assert old.entered.wait(5.0)  # the stale fetch is REALLY in flight
+    t0 = time.monotonic()
+    reply = app.handle_settings_request(
+        wiring.store, "chain_base_url", NEW_URL, _mk_flow(wiring, commands)[0]
+    )
+    # Non-blocking: a deferred/drain-first install would wait on the held
+    # fetch (5 s brake); the applied reply arrives in milliseconds.
+    assert time.monotonic() - t0 < 2.0
+    assert reply["status"] == "applied"
+    assert reply["swapped"] is True and reply["resync"] == "started"
+    new = wiring.client
+    assert new is not old and wiring.worker._client is new  # live NOW
+    assert old.closed is True  # the retired client is released at once
+    assert wiring.store.get_chain_base_url() == NEW_URL  # stored
+    assert wiring.settings.chain_base_url == NEW_URL  # single selection point
+    assert wiring.scan.gate.state == "running"  # the swap's resync is armed
+    old.hold.set()  # let the superseded fetch run out (its result dies)
+    narration = _drain(wiring, commands)
+    assert wiring.scan.gate.state == "done"
+    assert any("Rescan complete" in line for line in narration)
+    wiring.store.close()
+
+
+def test_stale_scan_done_is_discarded_and_the_resync_rides_the_new_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """The generation mechanism end to end: the superseded fetch DOES run
+    out on the retired client (no cancel hook exists), its ``_ScanDone`` is
+    DISCARDED unpersisted — exactly ONE ``persist_scan`` for the whole
+    swap+resync sequence, engine-thread-only persistence preserved, no new
+    threads — and the swap's own resync QUEUES behind the stale job on the
+    one worker and serves from the NEW client."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    assert wiring.scan is not None
     old = wiring.client
+    old.hold = threading.Event()
+    old.tip = 888_000  # a tip ONLY the stale server can produce
+    wiring.scan.set_startup(
+        wallet_scan.plan_scan(wiring.store, wiring.wallet, rebuild=False)
+    )
+    wiring.scan.begin()
+    assert old.entered.wait(5.0)
     flow, _seen = _mk_flow(wiring, commands)
     error, fields = flow.apply(NEW_URL)
-    assert error is None
-    assert fields == {"swapped": False, "resync": "deferred"}
-    assert wiring.store.get_chain_base_url() == NEW_URL  # stored NOW
-    assert wiring.client is old and old.closed is False  # still serving
-    # The in-flight scan completes → the pump's take_deferred lands the swap.
-    _drain(wiring, commands)
-    assert flow.take_deferred() is True
+    assert error is None and fields == {"swapped": True, "resync": "started"}
     new = wiring.client
-    assert new is not old and old.closed is True
-    assert wiring.scan.gate.state == "running"  # the swap's resync is on
+
+    persisted: list[object] = []
+    real_persist = app.wallet_scan.persist_scan
+
+    def _counting(store_: object, records: object) -> object:
+        persisted.append(records)
+        return real_persist(store_, records)
+
+    monkeypatch.setattr(app.wallet_scan, "persist_scan", _counting)
+    old.hold.set()
+    _drain(wiring, commands)
+    assert old.fetches > 0  # the stale fetch really ran out on the old…
+    assert new.fetches > 0  # …and the resync rode the NEW client
+    assert wiring.scan.gate.state == "done"
+    # ONE persist for both deliveries: the stale ``_ScanDone`` was discarded
+    # (two would mean stale data landed first — the bug the pin forbids).
+    assert len(persisted) == 1
+    # The single persisted record set is the NEW client's (tip 900000), NOT
+    # the stale server's (888000): engine-thread-only persistence rode the
+    # current generation.
+    assert persisted[0].summary.tip_height == 900_000
+    wiring.store.close()
+
+
+def test_stale_scan_failure_is_discarded_silently_value_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """Discipline on the discard path: a superseded fetch that ERRORED (the
+    retired server refusing mid-flight is realistic) surfaces NOTHING — no
+    warning line, no raise through the pump (a current-generation
+    non-ChainError raises; the stale delivery is dropped before that
+    branch), no host/value anywhere. The swap's own resync then completes
+    normally on the new client. The stale failure's message here carries a
+    fake host precisely to prove the discard never narrates it."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    assert wiring.scan is not None
+    old = wiring.client
+    old.hold = threading.Event()
+    wiring.scan.set_startup(
+        wallet_scan.plan_scan(wiring.store, wiring.wallet, rebuild=False)
+    )
+    wiring.scan.begin()
+    assert old.entered.wait(5.0)
+    flow, _seen = _mk_flow(wiring, commands)
+    error, fields = flow.apply(NEW_URL)
+    assert error is None and fields["swapped"] is True
+    old.fail_with = RuntimeError("refused by http://super.secret.node:8332")
+    old.hold.set()
+    narration = _drain(wiring, commands)  # must NOT raise
+    assert wiring.scan.gate.state == "done"
+    assert not any("secret" in line or "warning" in line for line in narration)
+    assert any("Rescan complete" in line for line in narration)
+    wiring.store.close()
+
+
+def test_superseding_plan_failure_does_not_wedge_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_clean: None
+) -> None:
+    """TCK-SWAP-001 review FINDING 1 pin: when the swap's superseding resync
+    FAILS to plan (broken store → transient sqlite error) with a fetch still
+    in flight, the scan gate must NOT wedge. The generation is bumped ONLY
+    when a superseding fetch actually queues (review fix) — a failed plan
+    leaves it untouched, so the still-in-flight fetch's ``_ScanDone`` is NOT
+    stale and still resolves the gate to ``done``. A wedged gate (running
+    forever, zero queued fetches) would refuse every later
+    resync_now/kick_scan and block create_tx until restart."""
+    wiring, commands = _mk_wiring(tmp_path, monkeypatch)
+    assert wiring.scan is not None
+    old = wiring.client
+    old.hold = threading.Event()
+    wiring.scan.set_startup(
+        wallet_scan.plan_scan(wiring.store, wiring.wallet, rebuild=False)
+    )
+    wiring.scan.begin()
+    assert old.entered.wait(5.0)  # the fetch is REALLY in flight
+    assert wiring.scan.gate.state == "running"
+
+    real_plan = wallet_scan.plan_scan
+
+    def _broken_plan(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(wallet_scan, "plan_scan", _broken_plan)
+
+    started = wiring.scan.resync_superseding()
+    assert started is False  # planning failed: nothing superseded, nothing queued
+
+    # Generation UNTOUCHED by the failed plan → the in-flight fetch still owns
+    # the gate: its _ScanDone resolves it (never left running-forever).
+    old.hold.set()
     _drain(wiring, commands)
     assert wiring.scan.gate.state == "done"
+    assert not wiring.scan.gate.in_progress
+
+    # And the gate is not wedged: once the fetch resolves, a later repair
+    # resync is accepted (not refused forever on an in_progress ghost).
+    monkeypatch.setattr(wallet_scan, "plan_scan", real_plan)
+    assert wiring.scan.resync_now() is True
+    _drain(wiring, commands)  # let the accepted repair rescan finish cleanly
+    assert wiring.scan.gate.state == "done"
     wiring.store.close()
+
 
 
 def test_clear_write_without_consent_is_refused_fail_closed(

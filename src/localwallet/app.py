@@ -269,7 +269,6 @@ from localwallet.ui.onboarding import (
     CONFIRMED,
     PUBLIC_CHOSEN_ACK,
     PUBLIC_LOADING_NOW,
-    SWITCH_AFTER_SCAN,
     SWITCHING_NOW,
     WEB_SETUP_HINT,
     OnboardingFlow,
@@ -1408,19 +1407,74 @@ _CARD_RATE_FLOOR: Final[str] = (
     'the network minimum. Say "sign" to proceed or "cancel" to discard.'
 )
 #: TCK-FEE-004 min-relay clamp line: printed ONCE under the card's Fee line
-#: whenever the bid this card shows IS the min-relay floor (a policy rung
-#: the clamp raised, or an explicit user rate clamped UP toward it — never
-#: a silent alteration of an explicit rate). Deliberately source-neutral
-#: wording: the floor came from the node (bitcoind relayfee), from the fee
-#: source (recommended minimumFee) or from the ASSUMED 1 sat/vB every
-#: build gate here enforces — "the floor this wallet enforces" is honest
-#: for all three (no narration lie on the fail-closed rung); we never
-#: claim the node said something it didn't. The quoted rate is verbatim
-#: from the result's own fee_rate_display; no amounts.
+#: whenever the bid this card shows was RAISED to a floor (never a silent
+#: alteration of a stated or recommended rate). TCK-FEE-004 ledger MINOR
+#: (critique-confirmed, TCK-SWAP-001 rider): the lift has THREE possible
+#: sources — the node's advertised relay fee, the ASSUMED rail every build
+#: gate enforces, or the fee source's congestion ``minimumFee`` — and the
+#: line must name the RIGHT one: "min-relay floor … the lowest rate this
+#: wallet builds at" was a narration lie on the congestion rung (an explicit
+#: bid legitimately builds BELOW a congestion minimumFee — the explicit-rate
+#: seam clamps to the RELAY floor only). The handler therefore stamps the
+#: closed source beside the marker and :func:`_fee_floor_note_line` picks the
+#: honest sentence; the source-neutral fallback stays FEE-004's framing
+#: ("the floor this wallet enforces" is honest for all three sources). The
+#: quoted rate is verbatim from the result's own fee_rate_display; no
+#: amounts.
 _CARD_FEE_FLOOR_NOTE: Final[str] = (
-    "Note: the min-relay floor is {rate} sat/vB — the lowest rate this "
-    "wallet builds at, so the fee uses it."
+    "Note: the floor this wallet enforces is {rate} sat/vB — the fee uses it."
 )
+_CARD_FEE_FLOOR_NOTE_RELAY: Final[str] = (
+    "Note: the min-relay floor is {rate} sat/vB — no transaction can build "
+    "below it, so the fee uses it."
+)
+_CARD_FEE_FLOOR_NOTE_CONGESTION: Final[str] = (
+    "Note: your fee source's minimum to confirm in the next block is {rate} "
+    "sat/vB — the congestion floor under recommended rates, so the fee "
+    "uses it."
+)
+#: The closed set :attr:`_CARD_FEE_FLOOR_NOTE_*` sentences are keyed by
+#: (display-only, rides the result as ``fee_floor_source`` next to
+#: ``fee_floor_note``; an unknown/absent source falls back to the neutral
+#: line — fail-closed honesty, never a guess at which floor it was).
+_CARD_FEE_FLOOR_NOTES: Final[dict[str, str]] = {
+    "relay": _CARD_FEE_FLOOR_NOTE_RELAY,
+    "congestion": _CARD_FEE_FLOOR_NOTE_CONGESTION,
+}
+
+
+def _policy_floor_source(fee_estimator: FeeEstimator, rate_centisat_vb: int) -> str:
+    """Which floor raised a clamped POLICY rung (TCK-FEE-004 ledger MINOR,
+    the TCK-SWAP-001 rider): the estimator MAXes every recommended bid with
+    ``MAX(congestion minimumFee, relay floor)``, so the winning figure is
+    the one the finalized bid EQUALS — a bid AT the fee source's next-block
+    minimum is a congestion lift; anything strictly above it was raised by
+    the relay floor. The backend-native path has no congestion figure
+    (``minimum_fee_sat_vb`` raises ChainError) — there the only floor that
+    ever clamps is the relay one. Value-free: answers a closed source NAME.
+    A relay/congestion TIE lands on ``congestion``, which is honest (the
+    congestion floor did lift the bid to that figure — whether the relay
+    floor agrees is not a claim either sentence makes)."""
+    try:
+        minimum_centisat_vb = fee_estimator.minimum_fee_sat_vb() * 100
+    except ChainError:
+        return "relay"
+    return "congestion" if rate_centisat_vb == minimum_centisat_vb else "relay"
+
+
+def _fee_floor_note_fields(raised: bool, source: str | None) -> dict[str, object]:
+    """The display-only result keys a floor-raised bid carries (TCK-FEE-004
+    rider to the ledger MINOR): the ``fee_floor_note`` marker (ABSENT unless
+    the clamp fired — the TCK-FIAT-003 conditional-key pattern) plus the
+    closed ``fee_floor_source`` NAME so the shared
+    :func:`_fee_floor_note_line` can name the RIGHT floor. A None source
+    still marks the note (the neutral line renders; never a guess)."""
+    if not raised:
+        return {}
+    fields: dict[str, object] = {"fee_floor_note": True}
+    if source is not None:
+        fields["fee_floor_source"] = source
+    return fields
 #: Mix warning (TCK-UTXO-004, docs/ux-utxo-notes-design.md §4.3): a dedicated
 #: conditional line printed ONLY when the FINAL selection spans the KYC /
 #: not-KYC partitions — which happens only when no pure pool funds the amount
@@ -4316,10 +4370,13 @@ def _make_create_tx_handler(
         # INCREMENTAL relay floor (a bump must out-pay its original — a
         # different constant, untouched here; the clamp is INITIAL-bid only).
         floor_raised = False
+        floor_source: str | None = None  # FEE-004 rider: set ONLY on a raise
         if params.fee_rate_sat_vb is not None:
             fee_rate, floor_raised = fee_estimator.clamp_to_min_relay_floor(
                 params.fee_rate_sat_vb * 100
             )
+            if floor_raised:
+                floor_source = "relay"  # the explicit seam is RELAY-floor-only
         else:
             try:
                 estimate = fee_estimator.estimate(target)
@@ -4327,6 +4384,8 @@ def _make_create_tx_handler(
                 return {"error": "chain_unavailable", "detail": str(exc)}
             fee_rate = estimate.rate_centisat_vb
             floor_raised = estimate.clamped
+            if floor_raised:
+                floor_source = _policy_floor_source(fee_estimator, fee_rate)
 
         # 4. UTXO snapshot with the lazy first scan.
         try:
@@ -4551,13 +4610,7 @@ def _make_create_tx_handler(
             "expires_in_s": PENDING_TTL_S,
             **({} if eta is None else eta),
         }
-        if floor_raised:
-            # TCK-FEE-004: the min-relay clamp raised THIS bid to the floor
-            # (a policy rung under it, or an explicit user rate under a
-            # higher source/node floor). Display-only narration marker —
-            # one honest line under the Fee data line; ABSENT unless the
-            # clamp fired (conditional-key pattern, TCK-FIAT-003).
-            result["fee_floor_note"] = True
+        result.update(_fee_floor_note_fields(floor_raised, floor_source))
         if rate is not None and currency != DEFAULT_DISPLAY_CURRENCY:
             # TCK-FIAT-002 currency-tagged card fields (same design as the
             # balance answer): ``fiat_total_minor`` = the send amount in the
@@ -5081,6 +5134,9 @@ def _make_self_transfer_handler(
         except ChainError as exc:
             return {"error": "chain_unavailable", "detail": str(exc)}
         fee_rate = estimate.rate_centisat_vb  # TCK-FEE-004: floored in the estimator
+        cpfp_floor_source = (
+            _policy_floor_source(fee_estimator, fee_rate) if estimate.clamped else None
+        )
 
         # 7. The parent picture — honest both-or-neither (tx/cpfp.py).
         #    A stuck inbound is normally FOREIGN (watch-only sees its
@@ -5236,7 +5292,7 @@ def _make_self_transfer_handler(
             "fee_rate_display": format_sat_vb(pending.fee_rate_centisat_vb),
             # TCK-FEE-004: display-only min-relay narration, only when the
             # clamp actually raised the child's (initial) bid.
-            **({"fee_floor_note": True} if estimate.clamped else {}),
+            **_fee_floor_note_fields(estimate.clamped, cpfp_floor_source),
             "vsize": pending.vsize,
             "change_sats": None,
             "inputs_count": pending.inputs_count,
@@ -5332,6 +5388,9 @@ def _make_self_transfer_handler(
         except ChainError as exc:
             return {"error": "chain_unavailable", "detail": str(exc)}
         fee_rate = estimate.rate_centisat_vb
+        split_floor_source = (
+            _policy_floor_source(fee_estimator, fee_rate) if estimate.clamped else None
+        )
 
         # 3. UTXO snapshot with the lazy first scan (same path as
         #    create_tx step 4).
@@ -5542,7 +5601,7 @@ def _make_self_transfer_handler(
             "fee_rate_display": format_sat_vb(pending.fee_rate_centisat_vb),
             # TCK-FEE-004: display-only min-relay narration (see create_tx);
             # only when the clamp actually raised a plan rung.
-            **({"fee_floor_note": True} if estimate.clamped else {}),
+            **_fee_floor_note_fields(estimate.clamped, split_floor_source),
             "vsize": pending.vsize,
             "change_sats": None,
             "inputs_count": pending.inputs_count,
@@ -5877,6 +5936,7 @@ def _make_bump_fee_handler(
         old_txid: str,
         rung: FeeTarget | None,
         floor_raised: bool,
+        floor_source: str | None,
     ) -> dict[str, object]:
         """Build + stage the replacement (fail-closed; the flow record is
         touched ONLY after the full PSBT build and address bookkeeping
@@ -5979,7 +6039,7 @@ def _make_bump_fee_handler(
             # INITIAL bid, only when the clamp raised it (the BIP-125
             # incremental floor the builder applies below is a DISTINCT
             # rule, never narrated as this one).
-            **({"fee_floor_note": True} if floor_raised else {}),
+            **_fee_floor_note_fields(floor_raised, floor_source),
             "vsize": pending.vsize,
             "change_sats": pending.change_sats,
             "inputs_count": pending.inputs_count,
@@ -6107,11 +6167,14 @@ def _make_bump_fee_handler(
         #    out-pay its original by an increment of its own size) remains
         #    tx/replacement.py's alone, applied inside build_replacement_plan
         #    below and untouched here.
+        floor_source: str | None = None  # TCK-FEE-004 rider: set only on a raise
         if params.fee_rate_sat_vb is not None:
             rate_c, floor_raised = fee_estimator.clamp_to_min_relay_floor(
                 params.fee_rate_sat_vb * 100
             )
             rung: FeeTarget | None = None
+            if floor_raised:
+                floor_source = "relay"  # the explicit seam is RELAY-floor-only
         else:
             rung = FeeTarget(params.fee_target) if params.fee_target else FeeTarget.FAST
             try:
@@ -6120,6 +6183,8 @@ def _make_bump_fee_handler(
                 return {"error": "chain_unavailable", "detail": str(exc)}
             rate_c = estimate.rate_centisat_vb
             floor_raised = estimate.clamped
+            if floor_raised:
+                floor_source = _policy_floor_source(fee_estimator, rate_c)
 
         # 3. Decomposition of the recorded original (from the carried
         #    re-bump record, else the flow's retained broadcast record —
@@ -6209,7 +6274,7 @@ def _make_bump_fee_handler(
 
         # 5. Build + stage (the full TxFlow ride continues from CREATED —
         #    confirm/sign/broadcast handlers unchanged, dual-key intact).
-        return _stage(original, rec, plan, old_txid, rung, floor_raised)
+        return _stage(original, rec, plan, old_txid, rung, floor_raised, floor_source)
 
     return handler
 
@@ -8069,10 +8134,16 @@ class _ScanDone:
     """The worker's terminal delivery: ``value`` is the immutable
     :class:`~localwallet.wallet.scan.ScanRecords` (``ok=True``) or the
     exception the chain/scan phase raised (``ok=False``). Enqueued onto the
-    command queue so the ENGINE thread persists it (ADR-0022 decision 3)."""
+    command queue so the ENGINE thread persists it (ADR-0022 decision 3).
+
+    ``generation`` (TCK-SWAP-001) is the :class:`ScanFlow` generation the
+    fetch was submitted under: a delivery whose generation no longer matches
+    the flow's was superseded by a hot-swap install mid-flight — the engine
+    DISCARDS it unpersisted."""
 
     ok: bool
     value: object
+    generation: int = 0
 
 
 #: Worker-queue shutdown sentinel.
@@ -8148,12 +8219,16 @@ class ChainWorker:
 
     def set_client(self, client: ChainClient) -> None:
         """Rebind the fetch client IN PLACE (TCK-BACKEND-002 hot-swap;
-        ADR-0018 amendment). ENGINE-THREAD ONLY, and only while NO job is in
-        flight — the same precondition the blocking :meth:`scan` documents
-        (the swap controller checks the scan gate before installing): the
-        worker thread reads ``self._client`` once at the START of each job
-        and never touches it mid-fetch, so a swap between jobs is atomic by
-        construction. No worker/thread rebuild: the queue, the thread, and
+        ADR-0018 amendment). ENGINE-THREAD ONLY. The worker thread reads
+        ``self._client`` once at the START of each job, so the rebind is
+        atomic per job: a swap BETWEEN jobs serves the next fetch, and since
+        TCK-SWAP-001 a swap WHILE a fetch is in flight is also sanctioned —
+        the running job keeps the client it started with (it may run out on
+        it; the client's own ``close()`` is thread-safe/idempotent, and the
+        adapters' reads surface a closed connection as an ordinary fetch
+        failure), while its delivery is discarded by the :class:`ScanFlow`
+        generation check, never persisted. The queued next job already rides
+        the new client. No worker/thread rebuild: the queue, the thread, and
         every :class:`ScanFlow` bound method ride through unchanged."""
         self._client = client
 
@@ -8225,7 +8300,12 @@ class ScanFlow:
     engine persist) that the lazy in-handler scan and the watch poll ride, so
     every scan/watch chain fetch runs on the worker and every persist runs on
     the engine (the P5-001 "full scan per poll on the engine thread" cost is
-    retired). The web half (surfacing this in the browser) is TCK-WEB-005.
+    retired). A fetch superseded mid-flight by a hot-swap install (the
+    generation counter bumps — TCK-SWAP-001, :meth:`resync_superseding`) may
+    run out on the retired client, but its ``_ScanDone`` is DISCARDED
+    unpersisted by :meth:`_finish`'s generation check: only the CURRENT
+    generation's record set is ever written. The web half (surfacing this in
+    the browser) is TCK-WEB-005.
     """
 
     def __init__(
@@ -8250,6 +8330,12 @@ class ScanFlow:
         self._commands: queue.Queue[Any] | None = None
         self.gate = StartupScan(enabled=startup_plan is not None)
         self._started = False
+        #: TCK-SWAP-001: the fetch-generation counter. Every submit tags its
+        #: ``_ScanDone`` with the generation current AT SUBMISSION TIME; a
+        #: hot-swap install over an in-flight fetch bumps the counter, so the
+        #: engine's :meth:`_finish` recognizes the superseded delivery and
+        #: DISCARDS it (nothing persists off a client the user retired).
+        self._generation = 0
         #: One-shot first-run narration hook (TCK-ONB-003 step 4): called
         #: with the pump's output function ONCE, when the FIRST startup
         #: scan persists successfully (never on failure — the load did not
@@ -8324,13 +8410,14 @@ class ScanFlow:
         self._started = True
         self.gate.mark_running()
         commands = self._commands
+        generation = self._generation  # the delivery's staleness stamp (TCK-SWAP-001)
         self._worker.submit(
             self._startup_plan,
             on_progress=lambda: commands.put(_ScanTick()),
-            on_result=lambda ok, value: commands.put(_ScanDone(ok, value)),
+            on_result=lambda ok, value: commands.put(_ScanDone(ok, value, generation)),
         )
 
-    def _plan_arm_begin(self, *, rebuild: bool) -> bool:
+    def _plan_arm_begin(self, *, rebuild: bool, bump_generation: bool = False) -> bool:
         """The ONE plan→arm→begin tail shared by :meth:`release_backend`,
         :meth:`resync_now` and :meth:`kick_scan` (TCK-UX-012(d) review
         MINOR dedup; behavior identical): plan on engine-thread store reads
@@ -8339,8 +8426,14 @@ class ScanFlow:
         so a finished earlier scan cannot block the fresh plan). ``rebuild``
         is the ONLY per-caller difference — ``resync_now`` forces ``True``
         (the ``--rescan`` repair semantics); the release/kick paths carry the
-        launch's own ``self._rescan``. ``False`` when planning failed (a
-        broken store — the callers decide their stand-down); after a
+        launch's own ``self._rescan``. ``bump_generation`` (TCK-SWAP-001
+        review) is the superseding-resync flag: the generation is bumped ONLY
+        here, in the success path just before :meth:`begin` submits — so a
+        fetch is stamped with the NEW generation (and the in-flight one
+        thereby discarded) exactly when a superseding load actually queues;
+        a failed plan leaves the generation untouched and the prior fetch's
+        ``_ScanDone`` still resolves the gate. ``False`` when planning failed
+        (a broken store — the callers decide their stand-down); after a
         successful plan the gate is always armed ``pending``/``running``, so
         the answer says whether the load is on."""
         try:
@@ -8360,6 +8453,8 @@ class ScanFlow:
             return False
         self.set_startup(plan, rescan=rebuild)
         self._started = False  # let begin() submit the fresh plan once
+        if bump_generation:
+            self._generation += 1  # stamp the superseding fetch; marks the in-flight one stale
         self.begin()
         return self.gate.state in ("pending", "running")
 
@@ -8389,6 +8484,27 @@ class ScanFlow:
         if self.gate.in_progress or self._commands is None:
             return False
         return self._plan_arm_begin(rebuild=True)
+
+    def resync_superseding(self) -> bool:
+        """The hot-swap install's resync entry (TCK-SWAP-001, the blessed
+        relaxation of the old "a swap never crosses an in-flight scan" pin):
+        install WHILE a fetch is in flight. Bumps the generation (the
+        in-flight job is thereby marked stale — its ``_ScanDone`` will be
+        discarded unpersisted by :meth:`_finish`), then runs the SAME
+        plan→arm→begin tail as :meth:`resync_now`: the rebuild scan queues
+        behind the superseded fetch on the one worker and rides the NEW
+        client (the worker reads its rebound client at each job's start).
+        The swap is live the moment this returns; only the data catch-up
+        waits its turn — deferring the INSTALL (the old behavior) is exactly
+        what forced users through a restart. Unlike :meth:`resync_now` this
+        has NO in-progress guard: that guard refused the resync the swap
+        needed, and a genuine second swap just supersedes again. ``False``
+        (nothing superseded, nothing started) only when the pump queue is
+        not attached or planning failed (a broken store — the caller's
+        resync answer is the honest ``busy``)."""
+        if self._commands is None:
+            return False
+        return self._plan_arm_begin(rebuild=True, bump_generation=True)
 
     def kick_scan(self) -> bool:
         """TCK-UX-011 (ADR-0022 amendment 2): start the background scan for
@@ -8439,6 +8555,24 @@ class ScanFlow:
     ) -> None:
         if emitter is not None:
             emitter.emit(EVENT_PROGRESS, "\n")  # close the progress-dot line
+        if done.generation != self._generation:
+            # TCK-SWAP-001: this fetch was superseded by a hot-swap install.
+            # The old server may have run the fetch out (or errored under
+            # the retired client) — its result is DISCARDED: nothing
+            # persists, no gate flip (the superseding scan owns the gate),
+            # no narration (a failure off a server the user retired must not
+            # warn, and never reaches the model or the logs). A stale FAILURE
+            # is otherwise silent; emit ONE value-free console/log line
+            # (exception class only) so a genuine worker bug off a superseded
+            # fetch is not swallowed with no diagnostics (TCK-SWAP-001 review
+            # FINDING 2). Stale SUCCESS stays fully silent.
+            if not done.ok:
+                exc = done.value
+                out = self._output
+                if out is not None:
+                    fc, name, _extra = _failure_parts(exc)
+                    out.warning(f"scan: superseded fetch failed [class={fc} exc={name}]")
+            return
         if not done.ok:
             exc = done.value
             self.gate.mark_skipped()
@@ -9676,10 +9810,11 @@ BACKEND_PROBE_FAIL: Final[str] = (
 )
 
 #: The closed ``resync`` reply values on the settings/resync surfaces
-#: (TCK-BACKEND-002): ``started`` (the full rebuild scan is running),
-#: ``busy`` (another scan owns the chain worker right now — the regular
-#: scan will use the new value anyway), ``deferred`` (only via a
-#: chain_base_url swap queued behind an in-flight scan), ``skipped``
+#: (TCK-BACKEND-002): ``started`` (the full rebuild scan is running — since
+#: TCK-SWAP-001 a swap INSTALLS immediately and its resync QUEUES behind any
+#: superseded fetch, still answered ``started``), ``busy`` (the ``Resync
+#: now`` button refused: another scan owns the chain worker right now — the
+#: regular scan will use the new value anyway), ``skipped``
 #: (nothing to resync / the write is shadowed by an env/config-file rung),
 #: ``unchanged`` (a gap_limit apply whose value did not change),
 #: ``no_rescan`` (TCK-GAP-001: a gap_limit apply that NARROWED the window —
@@ -9691,7 +9826,6 @@ RESYNC_STATUSES: Final[frozenset[str]] = frozenset(
     {
         "started",
         "busy",
-        "deferred",
         "skipped",
         "unchanged",
         "no_rescan",
@@ -10227,9 +10361,11 @@ def handle_settings_request(
     engine's chain-backend controller wired, a ``chain_base_url`` write runs
     the probe-before-save path (deliverable 2 — an unreachable/foreign-chain
     URL is refused value-free, NOTHING stored, the old client untouched) and,
-    once stored, hot-swaps the live client + fires a full resync (or defers
-    both behind the in-flight scan); the applied reply carries the honest
-    ``swapped``/``resync`` fields. A ``gap_limit`` write whose value ACTUALLY
+    once stored, hot-swaps the live client + fires a full resync IMMEDIATELY
+    (TCK-SWAP-001: even across an in-flight scan — the superseded fetch's
+    result is discarded unpersisted and the resync queues behind it); the
+    applied reply carries the honest ``swapped``/``resync`` fields. A
+    ``gap_limit`` write whose value ACTUALLY
     CHANGED fires the same resync (user direction 8) — UNLESS it NARROWED the
     window (TCK-GAP-001): a SMALLER value is applied WITHOUT an auto-rescan
     (``resync: "no_rescan"``) plus the value-free :data:`GAP_NARROW_NOTE`
@@ -10867,19 +11003,20 @@ def _pump(
     serving CONTINUES, and a model turn that arrives mid-load waits inside
     the runtime's build lock — clean serialization, never an error.
 
-    Chain-backend hot-swap (TCK-BACKEND-002, ADR-0018 amendment): when
-    ``backend`` is given, ``chain_base_url`` settings writes run the probe→
-    store→SWAP path on this thread (the engine thread owns the client's
-    whole lifecycle), and ``ResyncRequest`` triggers the full rebuild scan.
-    The ONE concurrency rule (pinned): a swap never crosses an in-flight
-    scan — while the scan gate is in progress the (already-validated,
-    already-stored) swap is DEFERRED and installed the moment the worker's
-    ``_ScanDone`` has been persisted; the OLD client keeps serving untouched
-    until then (fail-closed, never clientless). ``client`` (this pump's
-    local: watch-drain + turn facts) rebinds on every swap, immediate or
-    deferred. A deferred swap whose session ends first is dropped — the
-    stored value simply takes effect at next launch, exactly the
-    pre-amendment behavior.
+    Chain-backend hot-swap (TCK-BACKEND-002, ADR-0018 amendment; the
+    concurrency contract RELAXED by TCK-SWAP-001): when ``backend`` is
+    given, ``chain_base_url`` settings writes run the probe→store→SWAP path
+    on this thread (the engine thread owns the client's whole lifecycle),
+    and ``ResyncRequest`` triggers the full rebuild scan. A swap installs
+    IMMEDIATELY, across an in-flight scan too — the rebind is live when the
+    write's reply goes out (the OLD "defer the install behind the scan" pin
+    is what forced a user restart when a minutes-class bitcoind scan
+    stalled it). The superseded fetch may run out on the retired client; the
+    :class:`ScanFlow` generation check makes :meth:`ScanFlow._finish`
+    DISCARD its ``_ScanDone`` unpersisted (engine-thread-only persistence
+    preserved, no new threads), and the swap's own resync queues on the
+    worker behind it, riding the NEW client. ``client`` (this pump's local:
+    watch-drain + turn facts) rebinds on every swap.
 
     Chat-first onboarding (TCK-ONB-007, user copy VERBATIM): a FRESH
     needs_watch_key launch opens with the deterministic greeting GROUP —
@@ -10986,15 +11123,16 @@ def _pump(
                 # (the beat pattern) — no two-texts-one-bubble grouping.
                 _onb_line(CONFIRMED)
                 if fields.get("swapped") is True:
+                    # TCK-SWAP-001: the install is IMMEDIATE — even across
+                    # an in-flight scan the switch is live NOW (the old
+                    # "deferred behind the scan" ack is gone with the pin).
                     _onb_line(SWITCHING_NOW)
-                elif fields.get("resync") in ("deferred", "busy"):
-                    _onb_line(SWITCH_AFTER_SCAN)
             return True
         if _chat_public_choice(line):
             started = set_public_backend_consent(store, backend)
             # Code-review fix 1 (TCK-DESCOPE-M3A): a consent install IS a
             # client swap — the pump's local follows the live client exactly
-            # like the sibling URL/settings/deferred branches rebind, or the
+            # like the sibling URL/settings branches rebind, or the
             # watch drain and the ETA facts keep narrating off the stale
             # (None/retired) client for the whole session.
             client = backend.client
@@ -11059,12 +11197,10 @@ def _pump(
             ready.set()
         command = commands.get()
         if scan is not None and scan.handle_command(command, _narrate_line, emitter):
-            # A swap DEFERRED behind this scan installs now that the worker
-            # has delivered (and the engine has persisted) its result — then
-            # the swap's own resync occupies the worker again (the pump's
-            # watch drain stands down on its own in-progress check).
-            if backend is not None and backend.take_deferred():
-                client = backend.client
+            # TCK-SWAP-001: a swap installed DURING this scan no longer
+            # installs here — its install was immediate, and if this
+            # delivery came from the superseded fetch the generation check
+            # in _finish already discarded it (nothing persisted).
             continue
         if model is not None and model.handle_command(command, output_fn, emitter):
             # A terminal download marker closes an (implicit) turn so the
@@ -11154,11 +11290,13 @@ def _pump(
             # the engine thread — the ONLY thread that reads/writes the
             # settings table for the transport. Fail-closed validation,
             # value-free refusals, unrelated keys structurally untouched.
-            # TCK-BACKEND-002: with the engine's ``backend`` controller wired,
-            # a chain_base_url write additionally probes BEFORE the save and
-            # hot-swaps the live client after it (or defers the install
-            # behind the in-flight scan) — the pump's ``client`` local (watch
-            # drain + turn facts) rebinds on an immediate swap.
+            # TCK-BACKEND-002 + TCK-SWAP-001: with the engine's ``backend``
+            # controller wired, a chain_base_url write additionally probes
+            # BEFORE the save and hot-swaps the live client IMMEDIATELY after
+            # it — across an in-flight scan too (the swap's resync supersedes
+            # it; the superseded fetch's result is discarded unpersisted) —
+            # the pump's ``client`` local (watch drain + turn facts) rebinds
+            # on the swap.
             reply = handle_settings_request(
                 store, command.key, command.value, backend, command.creds
             )
@@ -12221,22 +12359,22 @@ class ChainBackendFlow:
 
         idle ─apply(url)→ [probe → build → store-write] →
             install-now → swapped + full resync → idle
-                      ↘ (scan in flight) DEFERRED(url, client) ──┐
-        idle ─install_saved(url)→ (probe+store already done by    │ the
-                                           /setup conversation) ──┤ pump:
-        idle ─resync()→ full rebuild scan ────────────────────────┘
-        take_deferred() after the in-flight scan's _ScanDone → install → resync
+        idle ─install_saved(url)→ (probe+store already done by the
+                                           /setup conversation) ─ install-now
+        idle ─resync()→ full rebuild scan
 
     Fail-closed at every seam: a probe/build/store failure REFUSES the write
     (value-free) and the OLD client stays installed and serving — the engine
     is never left clientless. The install (worker rebind + handler rebuild +
-    BOUNDED close of the old client) runs only while NO scan fetch is in
-    flight: the worker reads its client once per job, so between-jobs is the
-    only moment an in-flight fetch cannot be holding the old reference —
-    hence the defer-instead-of-stand-down rule (pinned; the alternative —
-    blocking the engine on a job drain — would stall the pump for the whole
-    scan). Tags survive the resync by construction (``coin_labels`` is not
-    in the scan write-set).
+    BOUNDED close of the old client) runs IMMEDIATELY, even across an
+    in-flight scan (TCK-SWAP-001 — the deliberate RELAXATION of the old
+    "a swap never crosses an in-flight scan" pin, which is exactly what
+    forced the user's restart): the rebind takes effect at once, the swap's
+    own full resync QUEUES on the worker behind the superseded fetch, and
+    that fetch's :class:`_ScanDone` is DISCARDED unpersisted by the
+    :class:`ScanFlow` generation check (engine-thread-only persistence is
+    preserved, no new threads). Tags survive the resync by construction
+    (``coin_labels`` is not in the scan write-set).
     """
 
     def __init__(
@@ -12246,8 +12384,6 @@ class ChainBackendFlow:
     ) -> None:
         self._w = wiring
         self._probe = probe
-        #: A validated, stored-but-not-yet-installed swap: (url, client).
-        self._deferred: tuple[str, ChainClient] | None = None
 
     # ------------------------------------------------------------- surfaces
 
@@ -12287,14 +12423,6 @@ class ChainBackendFlow:
         :func:`_url_without_credentials` (the pane may show the user's own
         server; it may never show a login)."""
         return _url_without_credentials(_effective_chain_url(self._w.settings))
-
-    def _worker_occupied(self) -> bool:
-        """Whether a scan FETCH owns the worker right now (pending/running).
-        ``awaiting_backend`` deliberately does NOT count: a HELD first-run
-        scan has submitted nothing — the worker is idle, and installing over
-        it (then releasing on the new client) is exactly the point."""
-        scan = self._w.scan
-        return scan is not None and scan.gate.state in ("pending", "running")
 
     def apply(self, url: str) -> tuple[str | None, dict[str, object]]:
         """The settings-write path: PROBE-and-classify before the save
@@ -12339,11 +12467,10 @@ class ChainBackendFlow:
         if error is not None:
             _close_quietly(new_client)
             return error, {}
-        if self._worker_occupied():
-            # A fetch owns the worker: DEFER the install (the validated
-            # client idles — connected lazily, nothing is in flight on it).
-            self._deferred = (canonical, new_client)
-            return None, {"swapped": False, "resync": "deferred"}
+        # TCK-SWAP-001: install IMMEDIATELY even across an in-flight scan —
+        # _install's resync supersedes the running fetch (its _ScanDone is
+        # discarded unpersisted), so the swap is live the moment apply
+        # returns (no defer, no restart).
         return None, {
             "swapped": True,
             "resync": self._install(canonical, new_client),
@@ -12354,14 +12481,14 @@ class ChainBackendFlow:
         already ran its warned probe + doctor gate + typed store write —
         this only performs the SAME install ``apply`` would. Returns the
         closed ONBOARDING outcome (not the resync status): ``swapped`` (the
-        live client moved to the saved URL and the resync was started),
-        ``deferred`` (validated + stored, install queued behind the
-        in-flight scan), ``skipped`` (an env/config-file rung shadows the
-        stored one — the honest next-launch copy). An EMPTY url is the
-        /setup REVERT-to-public (TCK-DESCOPE-M3A): with the public marker
-        just recorded by the conversation there is no "clear the rung and
-        ride a default" meaning anymore — a revert INSTALLS the named
-        public Electrum server, same as a fresh consent would."""
+        live client moved to the saved URL and the resync was started —
+        across an in-flight scan too since TCK-SWAP-001), ``skipped`` (an
+        env/config-file rung shadows the stored one — the honest
+        next-launch copy). An EMPTY url is the /setup REVERT-to-public
+        (TCK-DESCOPE-M3A): with the public marker just recorded by the
+        conversation there is no "clear the rung and ride a default"
+        meaning anymore — a revert INSTALLS the named public Electrum
+        server, same as a fresh consent would."""
         if not url.strip():
             if not _public_consent_recorded(self._w.store):
                 return "skipped"  # cleared with no consent = unresolved
@@ -12381,9 +12508,6 @@ class ChainBackendFlow:
             )
         except ValueError:
             return "skipped"  # stored, honest next-launch line
-        if self._worker_occupied():
-            self._deferred = (text, new_client)
-            return "deferred"
         self._install(text, new_client)
         return "swapped"
 
@@ -12417,7 +12541,7 @@ class ChainBackendFlow:
     def _install_public(self) -> tuple[str, bool]:
         """The public-Electrum install shared by :meth:`install_public`
         (chat/web consent) and the ``/setup`` revert (``install_saved("")``
-        with the marker recorded). Returns ``(swapped|deferred|skipped,
+        with the marker recorded). Returns ``(swapped|skipped,
         held-scan-started)`` — the started flag is honest only when the
         release/report says the load began (security review F2)."""
         if self.shadowed:
@@ -12431,9 +12555,6 @@ class ChainBackendFlow:
             )
         except ValueError:
             return "skipped", False  # never strand the live client
-        if self._worker_occupied():
-            self._deferred = (PUBLIC_ELECTRUM_URL, new_client)
-            return "deferred", False
         status = self._install(PUBLIC_ELECTRUM_URL, new_client)
         return "swapped", status == "started"
 
@@ -12446,22 +12567,6 @@ class ChainBackendFlow:
         if scan is None:
             return "unavailable"
         return "started" if scan.resync_now() else "busy"
-
-    def take_deferred(self) -> bool:
-        """Called by the pump after every handled scan event: install the
-        deferred swap once no scan is in flight (the scan that was in
-        flight has just been persisted — or failed and stood down). Returns
-        whether a swap landed (the pump rebinds its ``client`` local). A
-        swap deferred across a session END is dropped: the stored value
-        simply applies at next launch (the pre-amendment behavior)."""
-        if self._deferred is None:
-            return False
-        if self._worker_occupied():
-            return False  # a newer job grabbed the worker again; wait it out
-        url, new_client = self._deferred
-        self._deferred = None
-        self._install(url, new_client)
-        return True
 
     # -------------------------------------------------------------- internals
 
@@ -12479,10 +12584,13 @@ class ChainBackendFlow:
         BOUNDED-close the old one, then fire the full resync (user
         directions 5/6: a new URL is always followed by a fresh sync).
 
-        Precondition (checked by every caller): NO scan fetch is in flight
-        (gate not pending/running) — the worker reads its client once per
-        job, and the engine-thread blocking scans cannot interleave with
-        this (single-threaded between turns)."""
+        TCK-SWAP-001: NO "no-fetch-in-flight" precondition anymore. The
+        worker rebind is atomic per job (the running fetch keeps the old
+        client it started with and may run out — the adapters' close is
+        idempotent — but its delivery is DISCARDED unpersisted by the
+        :class:`ScanFlow` generation check); the swap's resync queues behind
+        that superseded fetch and rides the NEW client. The install itself
+        never blocks on the worker."""
         w = self._w
         # The single selection point moves as ONE value: everything that
         # resolves the backend (banner, watch mode, node_status, the next
@@ -12502,7 +12610,10 @@ class ChainBackendFlow:
             # public default they refused (the ONB-006 promise, now kept
             # in-session instead of at next launch).
             return "started" if scan.release_backend() else "busy"
-        return "started" if scan.resync_now() else "busy"
+        # The swap's resync supersedes any in-flight fetch (TCK-SWAP-001):
+        # ``resync_superseding`` queues it on the worker regardless, so the
+        # only ``busy`` answer left is "no command queue yet" (pre-pump).
+        return "started" if scan.resync_superseding() else "busy"
 
     def _rebind_handlers(self, client: ChainClient) -> None:
         """Rebuild the client-riding dispatch-table entries over the
@@ -12969,9 +13080,11 @@ def _wire(
             ),
             # TCK-BACKEND-002: an OWN-server save now hot-swaps the live
             # client and resyncs in-session (the ADR-0018 amendment) — the
-            # conversation reports swapped/deferred/skipped and adjusts its
-            # honesty line accordingly. ``None`` until the tail builds the
-            # controller (never called before then: only the pump runs it).
+            # conversation reports swapped/skipped and adjusts its honesty
+            # line accordingly (TCK-SWAP-001: the install is immediate even
+            # across an in-flight scan, so ``deferred`` is gone). ``None``
+            # until the tail builds the controller (never called before
+            # then: only the pump runs it).
             backend_saved=(
                 lambda url: swap.install_saved(url) if swap is not None else "skipped"
             ),
@@ -15918,17 +16031,23 @@ def _card_fee_rate_text(result: Mapping[str, object]) -> str | None:
 
 
 def _fee_floor_note_line(result: Mapping[str, object]) -> str | None:
-    """The TCK-FEE-004 min-relay-floor note line, or ``None``. Present only
-    when the handler marked THIS bid as raised to the floor
-    (``fee_floor_note=True``, display-only) AND the card can quote the rate
-    verbatim from its own ``fee_rate_display`` (the clamped bid IS the
-    floor). Fail-closed like every card segment: no figure, no line — the
-    floor is never narrated as a number the result does not carry.
-    """
+    """The TCK-FEE-004 floor note line, or ``None``. Present only when the
+    handler marked THIS bid as raised to a floor (``fee_floor_note=True``,
+    display-only) AND the card can quote the rate verbatim from its own
+    ``fee_rate_display`` (the clamped bid IS the floor). Fail-closed like
+    every card segment: no figure, no line — the floor is never narrated as
+    a number the result does not carry. The sentence NAMES the floor the
+    handler stamped (``fee_floor_source``: relay vs congestion — the FEE-004
+    ledger MINOR: only the relay floor is "the lowest rate that builds");
+    a missing/unknown source takes the honest source-neutral line."""
     if result.get("fee_floor_note") is not True:
         return None
     rate = _card_fee_rate_text(result)
-    return None if rate is None else _CARD_FEE_FLOOR_NOTE.format(rate=rate)
+    if rate is None:
+        return None
+    source = result.get("fee_floor_source")
+    note = _CARD_FEE_FLOOR_NOTES.get(source if isinstance(source, str) else "", _CARD_FEE_FLOOR_NOTE)
+    return note.format(rate=rate)
 
 
 def _card_rate(result: Mapping[str, object]) -> str | None:
