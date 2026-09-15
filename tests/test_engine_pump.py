@@ -359,11 +359,12 @@ def test_state_snapshot_request_is_answered_on_the_engine_thread(
 
     def spy_build(flow, session, watcher, scan=None, model=None, backend_kind=None,
                   preload=None, privacy_mode=None, backend_host=None,
-                  wallet_fingerprint=None, suggested_servers=None):
+                  wallet_fingerprint=None, suggested_servers=None,
+                  signer_kind=None):
         build_threads.append(threading.get_ident())
         return real_build(flow, session, watcher, scan, model, backend_kind, preload,
                           privacy_mode, backend_host, wallet_fingerprint,
-                          suggested_servers)
+                          suggested_servers, signer_kind=signer_kind)
 
     monkeypatch.setattr(app, "build_state_snapshot", spy_build)
     events: list[EngineEvent] = []
@@ -795,6 +796,10 @@ def test_watchkey_replaced_note_closes_its_own_turn() -> None:
         # TCK-CONS-002: the real _Wiring carries the shared estimator the
         # pump rebinds onto — the fake follows the real shape.
         fee_estimator = None
+        # TCK-HW-005 slice B: the real _Wiring also carries the signer
+        # selection + parsed key the pump rebinds for /verifyaddress.
+        signer_selection = None
+        parsed = None
 
     class _Provision:
         wiring = _Wiring()

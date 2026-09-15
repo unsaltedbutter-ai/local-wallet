@@ -511,6 +511,45 @@ _QUICK_ACTION_INTENTS: Final[dict[str, IntentName]] = {
 #: ``/receive`` (next receive address) and ``/settings`` (settings read) are
 #: pure store reads, not model intents — handled directly (None marker).
 _QUICK_STORE_COMMANDS: Final[frozenset[str]] = frozenset({"/receive", "/settings"})
+#: TCK-HW-005 slice B (D3): the param-CARRYING quick action —
+#: ``/verifyaddress <branch> <index>`` asks the bound hardware wallet to
+#: DISPLAY the wallet's own address at that derivation point for
+#: on-device verification. The code-parsed-params form exists because
+#: :data:`_QUICK_ACTION_INTENTS` is empty-params-only (there is no intent
+#: for this — the device display is a deterministic UI feature, ADR-0020,
+#: never a model envelope). Matched on the command TOKEN (the rest is the
+#: two integer params), never on the whole line.
+VERIFY_ADDRESS_COMMAND: Final[str] = "/verifyaddress"
+#: Shared unavailable line: a quick action whose wiring is missing (bare
+#: test tables, first-run placeholder) — one code-owned sentence, one
+#: source (the inline literal in :func:`_run_quick_action`'s handler
+#: branch now names it).
+_ACTION_UNAVAILABLE: Final[str] = "That action is not available right now."
+#: ``/verifyaddress`` copy (TCK-HW-005 slice B). Value-free and honest:
+#: the usage line names the COMMAND, the refusal names the bound that
+#: failed without echoing any address; the success line quotes the
+#: address verbatim from the engine's own derivation + the device's own
+#: reported answer (both tool output — the model never authors either).
+#: The no-device case reuses the EXISTING guidance family (hwi
+#: ``_MSG_NO_DEVICES`` — "plug in and unlock your device") verbatim:
+#: zero new device strings (slice A's designer rule).
+_VERIFY_USAGE: Final[str] = (
+    "Usage: /verifyaddress <branch> <index> — the two numbers shown with "
+    "one of your wallet's own addresses."
+)
+_VERIFY_NOT_SHOWN: Final[str] = (
+    "That branch/index is not an address this wallet has shown — I can "
+    "only display your own addresses on your hardware wallet."
+)
+_VERIFY_SHOWN_TEMPLATE: Final[str] = (
+    "Your device says it is showing address{number_part} {address} — "
+    "confirm it matches on the device screen."
+)
+_VERIFY_MISMATCH_TEMPLATE: Final[str] = (
+    "WARNING: your device reported {device_address}, but this wallet's "
+    "address at branch {branch}, index {index} is {wallet_address} — do "
+    "not send funds to either until you have checked the device screen."
+)
 
 # ------------------------------------------- model preload (TCK-LAUNCH-003)
 #
@@ -8569,6 +8608,22 @@ EVENT_MODEL_PROGRESS: Final[str] = "model_progress"
 #: output, the WEB-001 seam); the ring buffer replays it like any event.
 EVENT_USER_TEXT: Final[str] = "user_text"
 
+#: TCK-HW-005 slice B (D6): an OWN address was just SHOWN to the user —
+#: emitted ADDITIVELY alongside (after) the receive/new_address narration
+#: line it belongs to, so the web static half can place the "show on my
+#: hardware wallet" button on OUR addresses only, never on recipient
+#: addresses (the event is the engine's own ownership statement; no client
+#: may infer it from text). Payload is a JSON document with exactly the
+#: address verbatim (the same string the narration printed — tool output,
+#: never model text) plus its derivation coordinates ({"address": str,
+#: "branch": int, "index": int}) — the branch/index are the parameters of
+#: the :data:`VERIFY_ADDRESS_COMMAND` utterance the button injects, so
+#: every button NAMES ITS OWN referent fixed (WEB-017 rule, never deictic
+#: "this"). The address rides the display channel only (same class as the
+#: narration text itself): never a log, never a model turn. The CLI sink
+#: ignores the kind; the ring buffer replays it like any event.
+EVENT_OWN_ADDRESS: Final[str] = "own_address"
+
 #: Command token the web transport stamps on a typed ``/state`` snapshot
 #: request (TCK-WEB-003). Recognized ONLY as the ``command`` label of a
 #: :class:`StateSnapshotRequest` (below) — it is never a model turn and never
@@ -10593,6 +10648,15 @@ class EngineContext:
     #: key; ``None`` on the first-run placeholder — there is no wallet to
     #: probe against yet, and every ordinary line is refused anyway).
     hwi: HwiUsbSigner | None = None
+    #: TCK-HW-005 slice B (D4/D7): the wiring's signing-backend
+    #: configuration and parsed account key — the same two objects the
+    #: lazy sign build closes over, threaded to the pump so the
+    #: ``/verifyaddress`` quick action can rebuild the device signer the
+    #: same way (D4) and ``/state`` can serve the ``signer_kind`` NAME
+    #: (D7). ``None`` on the first-run placeholder (field omitted from
+    #: the snapshot until a wallet is provisioned — never a guess).
+    signer_selection: SignerSelection | None = None
+    parsed: ParsedKey | None = None
     #: TCK-CONS-002: the ONE shared FeeEstimator the wiring already owns
     #: (the same object create_tx/self_transfer bid over — passing it to the
     #: pump lets the consolidation-timing answer read the engine's own fee
@@ -10669,6 +10733,7 @@ def build_state_snapshot(
     backend_host: str | None = None,
     wallet_fingerprint: str | None = None,
     suggested_servers: Sequence[Mapping[str, str]] | None = None,
+    signer_kind: str | None = None,
 ) -> dict[str, object]:
     """The value-free ``/state`` snapshot, built ON the engine thread.
 
@@ -10706,7 +10771,11 @@ def build_state_snapshot(
     user-owned-identifier disclosure class as the token-gated watch_key
     settings entry and rides ONLY the token-gated /state; the field name
     is deliberately NOT "master" — the device's master fingerprint is
-    unknowable watch-only (HW-002). — TCK-WEB-022 — the CODE-OWNED vetted
+    unknowable watch-only (HW-002). — TCK-HW-005 slice B (D7): the
+    configured signer backend CLASS (a closed ``SIGNER_KIND_*`` NAME the
+    pump passes precomputed: never a path, never a fingerprint), so the
+    static half knows whether a hardware wallet is configured at all. —
+    TCK-WEB-022 — the CODE-OWNED vetted
     public-Electrum chip list ``suggested_servers``: an array of
     ``{"url", "label"}`` objects the pump supplies verbatim from
     :data:`SUGGESTED_ELECTRUM_SERVERS` (probed-and-verified server literals
@@ -10780,6 +10849,17 @@ def build_state_snapshot(
         # An empty/absent list OMITS the key (never ``[]`` — the client reads
         # "absent" as "no chips to offer", the ``wallet_fingerprint`` rule).
         snapshot["suggested_servers"] = [dict(entry) for entry in suggested_servers]
+    if signer_kind is not None:
+        # TCK-HW-005 slice B (D7): additive under state/1 (same rule). The
+        # configured SIGNING backend class as a closed enum NAME
+        # (:data:`SIGNER_KIND_FILE` / :data:`SIGNER_KIND_HWI` — the two
+        # names the signer-selection ladder already owns, value-free by
+        # construction, the ``backend_kind`` pattern). The static half
+        # keys the "show on my hardware wallet" affordance off it
+        # (hidden for the file signer). Omitted = no wiring yet (the
+        # first-run placeholder) — never a guess (the
+        # ``privacy_mode``/``backend_kind`` absent pattern).
+        snapshot["signer_kind"] = signer_kind
     if scan is not None and scan.scan_error:
         # TCK-WEB-020: additive under state/1 (same rule): the last
         # scan/rescan failure as a value-free DIAG-001 class line (chain/
@@ -11824,6 +11904,8 @@ def start_engine(
                 settings=ctx.settings,
                 hwi=ctx.hwi,
                 fee_estimator=ctx.fee_estimator,
+                signer_selection=ctx.signer_selection,
+                parsed=ctx.parsed,
             )
         except BaseException as exc:  # noqa: BLE001 — engine-thread pump death
             handle.error = exc
@@ -11924,6 +12006,9 @@ def _run_quick_action(
     store: Store | None,
     output_fn: Callable[[str], None],
     backend: ChainBackendFlow | None = None,
+    emitter: EventEmitter | None = None,
+    signer_selection: SignerSelection | None = None,
+    parsed: ParsedKey | None = None,
 ) -> bool:
     """Execute one model-free quick action ON THE ENGINE THREAD; ``True``
     when handled (TCK-LAUNCH-002 deliverable 4).
@@ -11937,13 +12022,30 @@ def _run_quick_action(
     identically. ``/receive`` and ``/settings`` are pure store READS (same
     deterministic channel as ``/label``, ADR-0020). Values print verbatim
     from tool output; the UI computes nothing.
+
+    TCK-HW-005 slice B: ``emitter`` (D6) lets the address-showing paths
+    stamp their additive ``own_address`` event next to the narration;
+    ``signer_selection``/``parsed`` (D4) arm the PARAM-CARRYING
+    ``/verifyaddress <branch> <index>`` action — the device display
+    rebuilds its signer exactly like the lazy sign build in the
+    ``sign_tx`` handler does (fingerprint + descriptor account path).
     """
     command = line.split(maxsplit=1)[0].lower()
+    if command == VERIFY_ADDRESS_COMMAND:
+        parts = line.split(maxsplit=1)
+        _verify_own_address(
+            parts[1] if len(parts) > 1 else "",
+            store,
+            signer_selection,
+            parsed,
+            output_fn,
+        )
+        return True
     intent = _QUICK_ACTION_INTENTS.get(command)
     if intent is not None:
         handler = table.get(intent)
         if handler is None:  # pragma: no cover — bare test tables
-            output_fn("That action is not available right now.")
+            output_fn(_ACTION_UNAVAILABLE)
             return True
         params: NewAddressParams | GetBalanceParams
         if intent is IntentName.NEW_ADDRESS:
@@ -11963,10 +12065,11 @@ def _run_quick_action(
             ),
             output_fn,
             session=session,
+            emitter=emitter,
         )
         return True
     if command == "/receive":
-        _print_next_receive_address(store, output_fn)
+        _print_next_receive_address(store, output_fn, emitter=emitter)
         return True
     if command == "/settings":
         _print_settings_readout(store, output_fn, backend)
@@ -11974,8 +12077,182 @@ def _run_quick_action(
     return False
 
 
+def _verify_own_address(
+    args: str,
+    store: Store | None,
+    signer_selection: SignerSelection | None,
+    parsed: ParsedKey | None,
+    output_fn: Callable[[str], None],
+) -> None:
+    """``/verifyaddress <branch> <index>`` — show OUR address on the device
+    (TCK-HW-005 slice B; D2/D3/D4).
+
+    Deterministic channel (ADR-0020): no intent, no envelope, no model —
+    the code-parsed parameters are bounds-checked against the store's own
+    derivation state, the address is this wallet's own key material at
+    ``(branch, index)``, and the DEVICE is asked to display it so the
+    user verifies on the device screen (the whole point: the app's claim
+    and the device's truth compared side by side, by the human).
+
+    Resolution (D2): ``branch`` must be a real wallet branch;
+    ``index`` must sit inside the store's derivation state — issued or
+    scanned (``< next_index``) or the ``/receive`` preview of branch 0
+    (``== next_index``: the address that command just showed). Anything
+    beyond is an address this wallet has NEVER shown, and the command
+    refuses honestly and value-free WITHOUT touching the device — no
+    device prompt for a phantom. The address is then derived from the
+    parsed watch key (pure, deterministic); a store row carrying that
+    address must agree with the derivation (corruption / foreign key →
+    the same refusal, never a display of a disputed address).
+
+    Device path (D4): the signer is rebuilt per attempt exactly like the
+    lazy sign build in the ``sign_tx`` handler —
+    :class:`HwiUsbSigner` over ``signer_selection.fingerprint_hex`` and
+    the descriptor's account path (stateless, cheap, monkeypatchable
+    module attribute). ``display_address`` is READ-ONLY: it never signs,
+    never moves money, and the account-key bind inside runs before any
+    device interaction (wrong wallet → the existing mismatch guidance
+    family, value-free). Device absent/locked/busy/canceled → the
+    EXISTING guidance lines printed as a friendly narration line (never
+    an error page).
+
+    Narration: the success line quotes the address verbatim and names
+    the on-device check; a device answer that differs from the wallet's
+    own derivation is an EXPLICIT WARNING quoting both values (each
+    verbatim from its own source — tool output, never model text).
+    """
+    parts = args.split()
+    if len(parts) != 2 or any(not p.isdecimal() for p in parts):
+        output_fn(sanitize_tool_output(_VERIFY_USAGE))
+        return
+    branch, index = (int(p) for p in parts)
+    if branch not in (BRANCH_RECEIVE, BRANCH_CHANGE):
+        output_fn(sanitize_tool_output(_VERIFY_USAGE))
+        return
+    if store is None:
+        output_fn(sanitize_tool_output(_LABEL_STORE_UNAVAILABLE))
+        return
+    if signer_selection is None or parsed is None:
+        # No live wiring (first-run placeholder / bare test pump): nothing
+        # to bind a device to — the honest unavailable line.
+        output_fn(sanitize_tool_output(_ACTION_UNAVAILABLE))
+        return
+    try:
+        wallet = store.get_active_wallet()
+        if wallet is None:
+            output_fn(sanitize_tool_output(_LABEL_NO_WALLET))
+            return
+        next_index = store.get_derivation(wallet.id, branch).next_index
+    except (StoreError, sqlite3.Error):
+        output_fn(sanitize_tool_output(_LABEL_ERROR_STORE))
+        return
+    # D3 bounds vs the store's derivation state (see docstring).
+    if index > next_index or (index == next_index and branch != BRANCH_RECEIVE):
+        output_fn(sanitize_tool_output(_VERIFY_NOT_SHOWN))
+        return
+    try:
+        believed = BranchDeriver(parsed, branch).address(index)
+    except Exception:  # noqa: BLE001 — containment: derivation shape errors
+        # are internal (the key is gated mainnet); never echo the value.
+        output_fn(sanitize_tool_output(_ACTION_UNAVAILABLE))
+        return
+    try:
+        row = store.get_by_address(believed)
+        if row is not None and (
+            row.wallet_id != wallet.id or row.branch != branch or row.index != index
+        ):
+            # The very address we would display is stored somewhere else —
+            # a data inconsistency, not a displayable fact. Refuse.
+            output_fn(sanitize_tool_output(_VERIFY_NOT_SHOWN))
+            return
+    except (StoreError, sqlite3.Error):
+        output_fn(sanitize_tool_output(_LABEL_ERROR_STORE))
+        return
+    try:
+        # This IS a showing (CHAT-001): idempotent registry note — an
+        # address already shown keeps its number; a registry failure
+        # degrades to the number-free line, never a crash.
+        number = store.note_address_shown(wallet.id, believed).number
+    except (StoreError, sqlite3.Error):
+        number = None
+    # D4: mirror the lazy sign build (module attribute = the test seam the
+    # sign tests monkeypatch). Construction imports no hwilib.
+    signer = HwiUsbSigner(
+        signer_selection.fingerprint_hex, _descriptor_account_path(parsed)
+    )
+    try:
+        shown = signer.display_address(
+            parsed.hd_key.key.serialize().hex(), parsed.script_type, branch, index
+        )
+    except DeviceError as exc:
+        # The existing guidance family (absent → "plug in and unlock your
+        # device", locked → PIN lines, mismatch → wrong-wallet line) —
+        # friendly narration, never an error, value-free by construction.
+        output_fn(sanitize_tool_output(str(exc)))
+        return
+    except SignerError:
+        # Bad local input shape past the bounds (or a client that cannot
+        # report its master fp): the honest unavailable line, never the
+        # signer's internal wording.
+        output_fn(sanitize_tool_output(_ACTION_UNAVAILABLE))
+        return
+    if shown == believed:
+        output_fn(
+            sanitize_tool_output(
+                _VERIFY_SHOWN_TEMPLATE.format(
+                    number_part=f" #{number}" if number is not None else "",
+                    address=believed,
+                )
+            )
+        )
+        return
+    output_fn(
+        sanitize_tool_output(
+            _VERIFY_MISMATCH_TEMPLATE.format(
+                device_address=shown, branch=branch, index=index, wallet_address=believed
+            )
+        )
+    )
+
+
+def _emit_own_address(
+    emitter: EventEmitter | None, address: object, branch: object, index: object
+) -> None:
+    """Stamp the D6 ``own_address`` event beside an own-address narration
+    (TCK-HW-005 slice B): the engine's OWN ownership declaration — the
+    address verbatim (the same tool-output string the user just saw) plus
+    the derivation coordinates the ``/verifyaddress`` button injects.
+    Fail-quiet by construction (no emitter = display-only channel, e.g.
+    the bare CLI/older pumps): never raises, never invents — a result
+    missing the closed shape emits NOTHING (an absent event is honest;
+    a fabricated coordinate would arm a wrong device path)."""
+    if emitter is None:
+        return
+    if (
+        not isinstance(address, str)
+        or not address
+        or isinstance(branch, bool)
+        or not isinstance(branch, int)
+        or isinstance(index, bool)
+        or not isinstance(index, int)
+        or index < 0
+        or branch not in (BRANCH_RECEIVE, BRANCH_CHANGE)
+    ):
+        return
+    emitter.emit(
+        EVENT_OWN_ADDRESS,
+        json.dumps(
+            {"address": address, "branch": branch, "index": index},
+            separators=(",", ":"),
+        ),
+    )
+
+
 def _print_next_receive_address(
-    store: Store | None, output_fn: Callable[[str], None]
+    store: Store | None,
+    output_fn: Callable[[str], None],
+    *,
+    emitter: EventEmitter | None = None,
 ) -> None:
     """``/receive``: the NEXT receive address — pure derivation at the
     branch's live ``next_index``, NO allocation and NO network (an
@@ -12011,6 +12288,10 @@ def _print_next_receive_address(
             f'"/address" reserves a fresh one): {address}'
         )
     )
+    # D6: this is a SHOWN own address (the preview is this wallet's own
+    # key material at (0, next_index) — what /verifyaddress resolves to
+    # when its button is clicked on this bubble).
+    _emit_own_address(emitter, address, 0, index)
 
 
 def _print_settings_readout(
@@ -12056,6 +12337,8 @@ def _pump(
     settings: Settings | None = None,
     hwi: HwiUsbSigner | None = None,
     fee_estimator: FeeEstimator | None = None,
+    signer_selection: SignerSelection | None = None,
+    parsed: ParsedKey | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
     ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
@@ -12170,7 +12453,7 @@ def _pump(
         the chat-provision intercept (TCK-ONB-007), so the two entries can
         never drift. Engine thread only (like every pump mutation)."""
         nonlocal loop, flow, session, table, watcher, client, store, scan
-        nonlocal backend, settings, hwi, fee_estimator
+        nonlocal backend, settings, hwi, fee_estimator, signer_selection, parsed
         assert provision is not None and provision.wiring is not None
         wiring = provision.wiring
         loop = wiring.loop
@@ -12196,6 +12479,10 @@ def _pump(
         # TCK-HW-005 slice A: the probe signer belongs to the WALLET (its
         # account fingerprint comes from the key) — the rebind follows it.
         hwi = wiring.hwi
+        # TCK-HW-005 slice B (D4/D7): the verify-address seam and the
+        # /state signer_kind both follow the live wiring's config.
+        signer_selection = wiring.signer_selection
+        parsed = wiring.parsed
         if scan is not None:
             scan.attach(commands)
             scan.begin()
@@ -12452,6 +12739,12 @@ def _pump(
                 backend_host,
                 wallet_fingerprint,
                 SUGGESTED_ELECTRUM_SERVERS,
+                # TCK-HW-005 slice B (D7): the configured signer CLASS
+                # NAME (file|hwi) — precomputed closed enum value, no
+                # path, no fingerprint. No wiring yet = None = omitted.
+                signer_kind=(
+                    signer_selection.kind if signer_selection is not None else None
+                ),
             )
             if provision is not None and provision.wiring is None:
                 snapshot["needs_watch_key"] = True
@@ -12557,13 +12850,27 @@ def _pump(
             if (
                 utterance in _QUICK_ACTION_INTENTS
                 or utterance in _QUICK_STORE_COMMANDS
+                or (utterance and utterance.split(maxsplit=1)[0] == VERIFY_ADDRESS_COMMAND)
             ) and (provision is None or provision.wiring is not None):
                 # Model-free quick action (TCK-LAUNCH-002): dispatch the
                 # EXISTING handler directly (or a store read) — a code-owned
                 # deterministic bypass of the LLM, never model output. Falls
                 # through to the provision guard while unprovisioned.
+                # TCK-HW-005 slice B: /verifyaddress is the PARAM-CARRYING
+                # member (D3) — matched on its command token, args parsed
+                # and bounds-checked inside (lowercasing a numeric slash
+                # command is inert).
                 _run_quick_action(
-                    utterance, loop, table, session, store, output_fn, backend
+                    utterance,
+                    loop,
+                    table,
+                    session,
+                    store,
+                    output_fn,
+                    backend,
+                    emitter=emitter,
+                    signer_selection=signer_selection,
+                    parsed=parsed,
                 )
                 if emitter is not None:
                     emitter.emit(EVENT_TURN_END)
@@ -12658,6 +12965,9 @@ def _pump(
                 scan_gate=scan.gate if scan is not None else None, hwi=hwi,
                 store=store, live_apply_setting=_apply_live_setting,
                 fee_estimator=fee_estimator,
+                # TCK-HW-005 slice B (D6): the model-path new_address
+                # narration stamps its own_address event through the bus.
+                emitter=emitter,
             )
         if emitter is not None:
             emitter.emit(EVENT_TURN_END)
@@ -13067,6 +13377,8 @@ def run(
             backend=wiring.swap,
             hwi=wiring.hwi,
             fee_estimator=wiring.fee_estimator,
+            signer_selection=wiring.signer_selection,
+            parsed=wiring.parsed,
         )
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
@@ -13166,6 +13478,13 @@ class _Wiring:
     #: account key — construction is cheap, hwilib imports lazily inside
     #: it, and the object signs nothing on this path).
     hwi: HwiUsbSigner | None = None
+    #: TCK-HW-005 slice B (D4): the resolved signing-backend configuration
+    #: of THIS wiring (kind + account fingerprint). The pump serves the
+    #: kind to /state (D7) and the ``/verifyaddress`` quick action builds
+    #: its device signer from it exactly like the lazy sign build does
+    #: (D4). ``repr=False``: it carries the account fingerprint, which
+    #: never travels through object reprs into logs.
+    signer_selection: SignerSelection | None = dataclass_field(default=None, repr=False)
     #: The mode-aware output router (TCK-DIAG-003): kept on the wiring so
     #: the hot-swap rebind of the ``broadcast_tx`` handler re-attaches the
     #: console/log debug companion too (None = test seam, emits nothing).
@@ -14360,6 +14679,7 @@ def _wire(
         fee_estimator=fee_estimator,
         price_oracle=price_oracle,
         hwi=hwi_probe,
+        signer_selection=signer_selection,
         output=output,
     )
     # Build last so the controller sees the finished wiring it mutates (the
@@ -14529,6 +14849,8 @@ def _run_web(
             settings=wiring.settings,
             hwi=wiring.hwi,
             fee_estimator=wiring.fee_estimator,
+            signer_selection=wiring.signer_selection,
+            parsed=wiring.parsed,
         )
 
     try:
@@ -14821,6 +15143,8 @@ def _repl(
     backend: ChainBackendFlow | None = None,
     hwi: HwiUsbSigner | None = None,
     fee_estimator: FeeEstimator | None = None,
+    signer_selection: SignerSelection | None = None,
+    parsed: ParsedKey | None = None,
 ) -> None:
     """The CLI transport over the engine pump (TCK-WEB-001, ADR-0024 §3).
 
@@ -14884,6 +15208,8 @@ def _repl(
             backend=backend,
             hwi=hwi,
             fee_estimator=fee_estimator,
+            signer_selection=signer_selection,
+            parsed=parsed,
         )
     finally:
         stop.set()
@@ -14904,6 +15230,8 @@ _TRANSCRIPT_HELP: Final[str] = (
     "/scrub — clear the in-memory transcript; "
     "/balance, /receive, /address, /settings — model-free reads (work "
     "without the local LLM); /download, /later — answer the model card; "
+    "/verifyaddress <branch> <index> — show that own address on your "
+    "hardware wallet (read-only device check); "
     "/help — show this."
 )
 #: ``/details`` with no cached card (nothing has pended this session —
@@ -16909,6 +17237,7 @@ def _run_turn(
     store: Store | None = None,
     live_apply_setting: Callable[[str, bool], str | None] | None = None,
     fee_estimator: FeeEstimator | None = None,
+    emitter: EventEmitter | None = None,
 ) -> None:
     """Run ONE REPL turn: gate classification → agent → flow narration.
 
@@ -17269,7 +17598,7 @@ def _run_turn(
         turn = loop.run(line, facts)
     finally:
         session.fiat_ask_currency = None
-    _print_turn(turn, output_fn, session=session)
+    _print_turn(turn, output_fn, session=session, emitter=emitter)
     # GATE-MERGE (TCK-UX-002, ADR-0013 amendment): a successful confirm
     # chains straight into the device handoff IN THE SAME TURN — the
     # card's ask word "sign" completes "review + hand to device" in one
@@ -17324,6 +17653,7 @@ def _print_turn(
     output_fn: Callable[[str], None],
     *,
     session: SendSession | None = None,
+    emitter: EventEmitter | None = None,
 ) -> None:
     """Print one agent turn according to its status and intent.
 
@@ -17366,7 +17696,7 @@ def _print_turn(
     elif envelope.intent is IntentName.GET_ADDRESSES:
         _print_addresses(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.NEW_ADDRESS:
-        _print_new_address(turn.result or {}, output_fn)
+        _print_new_address(turn.result or {}, output_fn, emitter=emitter)
     elif envelope.intent is IntentName.CREATE_TX:
         _print_create_tx(turn.result or {}, output_fn, session=session)
     elif envelope.intent is IntentName.SELF_TRANSFER:
@@ -17601,13 +17931,24 @@ def _print_pending_block(
         output_fn(sanitize_tool_output(note))
 
 
-def _print_new_address(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+def _print_new_address(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    *,
+    emitter: EventEmitter | None = None,
+) -> None:
     """Print the fresh address verbatim from the handler's result dict.
 
     TCK-CHAT-001: the fresh address is a FIRST SHOWING — the handler
     registered it, so the line names its stable number too (a result
     without the number key renders the pre-CHAT-001 line unchanged: the
-    printer never fabricates one)."""
+    printer never fabricates one).
+
+    TCK-HW-005 slice B (D6): a printed fresh address is a SHOWN own
+    address, so the ``own_address`` event rides alongside the narration
+    (result-owned address/branch/index — the handler's tool output,
+    never a client-side guess; a result missing the closed shape emits
+    nothing)."""
     if result.get("error") is not None:
         output_fn(
             sanitize_tool_output(_error_line(result, "Could not allocate a new address"))
@@ -17616,6 +17957,9 @@ def _print_new_address(result: Mapping[str, object], output_fn: Callable[[str], 
     branch = result.get("branch", 0)
     kind = "change" if branch == 1 else "receive"
     number = result.get("address_number")
+    # The event carries the result's OWN values (never the display
+    # defaults below — a result that omitted index must not fabricate
+    # one): _emit_own_address shape-gates.
     if isinstance(number, int) and not isinstance(number, bool):
         output_fn(
             sanitize_tool_output(
@@ -17623,6 +17967,7 @@ def _print_new_address(result: Mapping[str, object], output_fn: Callable[[str], 
                 f"address #{number}): {result.get('address', '')}"
             )
         )
+        _emit_own_address(emitter, result.get("address"), result.get("branch"), result.get("index"))
         return
     output_fn(
         sanitize_tool_output(
@@ -17630,6 +17975,7 @@ def _print_new_address(result: Mapping[str, object], output_fn: Callable[[str], 
             f"{result.get('address', '')}"
         )
     )
+    _emit_own_address(emitter, result.get("address"), result.get("branch"), result.get("index"))
 
 
 def _print_addresses(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:

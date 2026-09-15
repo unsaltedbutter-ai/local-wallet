@@ -1134,6 +1134,47 @@ body {
   background: var(--c-surface-2);
 }
 
+/* ---- TCK-HW-005 static half: verify-on-device button ------------------- */
+
+/* The inline calculator chip after an OWN-address token (armed ONLY by the
+   engine's own_address event; hidden unless the typed /state signer_kind is
+   "hwi"). Icon-only — the svg carries no text nodes, so bubble copy/announce
+   text never gains button words. Same quiet inline register as the QR chip;
+   display:inline-flex overrides the UA [hidden] rule, so hidden is restated. */
+.hw-verify-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: -0.3em;
+  line-height: 1;
+  margin-inline: var(--sp-1) 0;
+  padding: 0.2rem var(--sp-1);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  background: var(--c-surface);
+  color: var(--c-text-muted);
+  cursor: pointer;
+}
+.hw-verify-btn[hidden] { display: none; }
+.hw-verify-btn svg {
+  inline-size: var(--fs-md);
+  block-size: var(--fs-md);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.hw-verify-btn:hover {
+  color: var(--c-text);
+  background: var(--c-surface-2);
+}
+/* in-flight (WEB-028 (5) disable-on-click) — same register as .btn */
+.hw-verify-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* Modal viewer: scrim + centered card. display:flex overrides the UA
    [hidden] rule, so the hidden state is restated. */
 .qr-viewer {

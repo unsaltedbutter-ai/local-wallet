@@ -197,6 +197,17 @@ _HWI_ERROR_MAP: dict[str, tuple[type[DeviceError], str]] = {
 _CHAIN_NAMES = ("main", "test", "testnet4", "signet", "regtest")
 _DEFAULT_CHAIN = "main"
 
+#: Wallet script type → the ``(open, close)`` descriptor wrapper for the
+#: rebuilt single-address display descriptor (TCK-HW-005 D1). The three
+#: v1 wallet shapes; the wrapper words are hwilib's descriptor grammar
+#: (``commands.displayaddress`` unwraps ``sh(wpkh(…))`` to the same
+#: singlesig path with the nested-p2wpkh address type).
+_DISPLAY_WRAPPER_BY_SCRIPT = {
+    "p2wpkh": ("wpkh", ")"),
+    "p2sh_p2wpkh": ("sh(wpkh", "))"),
+    "p2pkh": ("pkh", ")"),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class DeviceInfo:
@@ -911,28 +922,109 @@ class HwiUsbSigner(Signer):
             return result.strip()
         raise DeviceError(_MSG_UNEXPECTED)
 
-    # -- display address (verify-on-device, best-effort) ---------------------
+    # -- display address (verify-on-device, TCK-HW-005 slice B) --------------
 
-    def display_address(self, descriptor: str) -> str:
-        """Ask the matched device to derive and show an address on-screen.
+    def display_address(
+        self,
+        account_pubkey_hex: str,
+        script_type: str,
+        branch: int,
+        index: int,
+    ) -> str:
+        """Ask the fingerprint-bound device to show one of OUR addresses.
 
-        Best-effort verify-on-device support (PROJECT.md §10 "compare the
-        address on your device screen"): HWI's ``displayaddress`` takes a
-        derivation path or descriptor — devices derive and show the address
-        themselves, so this takes the wallet **descriptor**, not a literal
-        address string. Device support varies by model; failures map to
-        guidance and are never silently swallowed.
+        The address the user clicked is identified by the wallet's own
+        coordinates — ``(branch, index)`` under the descriptor's account
+        path — never by a free-floating address string. HWI's
+        ``displayaddress`` derives and displays ON the device, so this
+        rebuilds a single-address descriptor at call time instead of
+        handing the store descriptor to hwilib (TCK-HW-005 D1: the stored
+        descriptor's origin carries the ACCOUNT fingerprint, but
+        ``hwilib.commands.displayaddress`` requires the origin fingerprint
+        to equal the OPEN client's MASTER fingerprint
+        (``commands.py`` — ``pubkey.origin.fingerprint !=
+        client.get_master_fingerprint()`` → ``BadArgumentError``), and
+        hwilib 3.2.0 additionally refuses SLIP-132 (zpub) key bodies
+        outright; the stored string therefore ALWAYS fails).
+
+        The rebuilt descriptor (verified against the installed hwilib
+        source and its checks, in order):
+
+        * origin = ``[<client master fp>/<account path>]`` — satisfies the
+          master-fp equality (the fp is read from the OPEN client itself;
+          the wallet's account fp is never used here);
+        * key = the account key's compressed pubkey HEX (the store
+          descriptor's key carried in the one serialization hwilib's
+          match check accepts version-independently —
+          ``xpub_to_pub_hex`` equality at ``commands.py``; a zpub or xpub
+          STRING depends on which base58 version the device happens to
+          serialize and fails the equality);
+        * suffix = ``/<branch>/<index>`` — hwilib assembles the full
+          display path (origin + suffix) and passes it to
+          ``client.display_singlesig_address`` (Jade:
+          ``jade.get_receive_address``, the device's own screen).
+
+        Because the descriptor's key comes from THIS wallet and its origin
+        path is the account path, hwilib's own pre-display bind still
+        runs: the client must serve at ``get_pubkey_at_path(account
+        path)`` a key whose pubkey EQUALS the wallet's account key
+        (non-circular — device answer vs store material). The signer's
+        post-open account-key gate (:meth:`_open_matched_client`,
+        ADR-0015 amendment #2) runs BEFORE any of this, so
+        device-absent / locked / wrong-wallet surface as the existing
+        guidance classes. This call NEVER signs and never moves money —
+        it is a read-only device interaction.
 
         Returns the device-reported address verbatim (tool output — the
         caller narrates it verbatim; the model never invents addresses).
+
+        Raises:
+            SignerError: bad local inputs (key hex, script type, branch,
+                index) or an unreadable master fingerprint on a bound
+                client (value-free guidance).
+            DeviceError (hierarchy): mapped device/display failures —
+                including a device that reports a foreign key for the
+                account path (hwilib's own refusal → generic guidance,
+                the descriptor echo in its message never leaking:
+                :meth:`_map_hwi_error` names class only).
         """
-        if not isinstance(descriptor, str) or not descriptor.strip():
-            raise SignerError("descriptor must be a non-empty string")
+        if (
+            not isinstance(account_pubkey_hex, str)
+            or len(account_pubkey_hex) != 66
+            or any(c not in "0123456789abcdefABCDEF" for c in account_pubkey_hex)
+        ):
+            raise SignerError("account pubkey must be 33 bytes of hex")
+        wrapper = _DISPLAY_WRAPPER_BY_SCRIPT.get(script_type)
+        if wrapper is None:
+            raise SignerError("unsupported script type for address display")
+        for value in (branch, index):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise SignerError("branch and index must be non-negative integers")
         commands = self._ensure_commands()
         client, _device = self._open_matched_client(commands)
         try:
+            getter = getattr(client, "get_master_fingerprint", None)
+            if not callable(getter):
+                raise DeviceError(_MSG_REVERIFY)
             try:
-                result = commands.displayaddress(client, desc=descriptor.strip())
+                master_hex = _normalize_fingerprint(getter())
+            except Exception as exc:
+                raise self._map_hwi_error(exc) from exc
+            if master_hex is None or len(master_hex) != 8 or any(
+                c not in "0123456789abcdef" for c in master_hex
+            ):
+                raise DeviceError(_MSG_REVERIFY)
+            # The descriptor origin takes the account path WITHOUT the "m/"
+            # prefix (hwilib KeyOriginInfo shape); the apostrophe-hardened
+            # form this class was constructed with parses fine there.
+            origin_path = self.account_path.lstrip().removeprefix("m").lstrip("/")
+            origin_path = origin_path.rstrip("/")
+            key_expr = f"[{master_hex}/{origin_path}]{account_pubkey_hex}/{branch}/{index}"
+            descriptor = f"{wrapper[0]}({key_expr}{wrapper[1]}"
+            try:
+                result = commands.displayaddress(client, desc=descriptor)
+            except DeviceError:
+                raise
             except Exception as exc:
                 raise self._map_hwi_error(exc) from exc
         finally:

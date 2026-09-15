@@ -1712,6 +1712,7 @@ def test_stuck_pending_bubble_reconciles_from_typed_idle_state_under_node() -> N
       const applyWalletFpChip = () => {}; // TCK-WEB-027 chip painter (own harness)
       const applySuggestedServers = () => {}; // TCK-WEB-022 chips (own harness)
       const applyWatchKeyGate = () => {}; const applyModelPrompt = () => {};
+      const paintHwVerifyButtons = () => {}; // TCK-HW-005 chips (own harness)
       const paintSettingsDot = () => {}; const noteTrustFlip = () => {};
       const settingsPanelEl = { hidden: true };
       __APPLY__
@@ -2803,6 +2804,248 @@ def test_suggested_chips_tracker_is_typed_only_and_change_gated_under_node() -> 
       if (paints !== 2 || state.suggestedServers.length !== 0) throw new Error("clear");
       applySuggestedServers({ schema: "state/1" });
       if (paints !== 2) throw new Error("clear-spam");
+      console.log("ok");
+    """.replace("__FUNCS__", funcs)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# ------------------------------------------------------- TCK-HW-005 static half
+# Pins for the verify-on-device button: placement is armed ONLY by the
+# engine's own_address event plus a VERBATIM token match (never prose
+# sniffing — a recipient address has no such event and can never gain the
+# button), visibility rides ONLY the typed /state signer_kind NAME (file /
+# absent / unknown = hidden — no device to show on), the injected utterance
+# is the exact canonical "/verifyaddress <branch> <index>" built from the
+# EVENT's own coordinates (WEB-017: it names its referent, never deictic),
+# the click rides POST /action with the WEB-028 (5) disable-on-click, the
+# control is icon-only textContent-safe (no HTML sinks, no text nodes →
+# bubble copy text never gains button words), and the existing QR/copy
+# affordances are untouched.
+def test_hw005_own_address_button_source_pins() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    # the SSE branch: own_address routes to noteOwnAddress (unknown kinds
+    # stay ignored by the handleEvent chain — this ADDS one named branch).
+    assert 'kind === "own_address"' in code
+    assert '"own_address") noteOwnAddress(data)' in code
+    note = re.search(r"function noteOwnAddress\(raw\) \{.*?\n\}", code, re.DOTALL).group(0)
+    btn = re.search(r"function hwVerifyButton\(utterance\) \{.*?\n\}", code, re.DOTALL).group(0)
+    icon = re.search(r"function hardwareIcon\(\) \{.*?\n\}", code, re.DOTALL).group(0)
+    # ENGINE TRUTH ONLY: placement never sniffs narration prose — the note
+    # body carries no token/explorer regexes, and arms ONLY on the event's
+    # verbatim address matching a rendered token, from the event's own
+    # branch/index (the utterance is code-built, not text-mined).
+    for sniff in ("ADDRESS_RE", "LINK_SCAN_RE", "EXPLORER_LINK_LINE_RE", "turn-text"):
+        assert sniff not in note, f"noteOwnAddress sniffs prose via {sniff}"
+    assert 'token.textContent !== address' in note
+    assert '"/verifyaddress " + branch + " " + index' in note
+    # fail-closed guards: malformed payloads and a closed turn arm nothing.
+    assert "if (!turn) return;" in note
+    # the click rides the ONE /action channel, disable-on-click first.
+    assert 'submit("/action", "utterance", utterance)' in btn
+    assert "btn.disabled = true;" in btn
+    # icon-only: no text nodes anywhere in the button machinery (the global
+    # sink scan covers HTML; this covers the copy-text contract).
+    assert "textContent" not in icon
+    assert "createElementNS" in icon and "innerHTML" not in btn + icon
+    # pinned designer strings (tooltip + accessible name, exact wording).
+    assert 'hwVerifyTip: "Show on hardware wallet"' in code
+    assert 'hwVerifyAria: "Show this address on your hardware wallet"' in code
+    assert "LABELS.hwVerifyAria" in btn and "LABELS.hwVerifyTip" in btn
+    # signer gating: the typed read follows the backendName discipline; the
+    # applyState call hands the buttons to their own painter, which owns the
+    # WEB-028 (5) restore + the hwi-only visibility (file / absent = hidden).
+    apply = code[code.index("function applyState(snap)"):code.index("function noteTrustFlip")]
+    assert 'typed && typeof snap.signer_kind === "string"' in apply
+    assert "state.signerKind = snap.signer_kind" in apply
+    assert "paintHwVerifyButtons();" in apply
+    paint = re.search(
+        r"function paintHwVerifyButtons\(\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert '.hw-verify-btn' in paint
+    assert 'state.signerKind === "hwi"' in paint
+    assert "btn.disabled = false;" in paint and "btn.hidden = !show;" in paint
+    # existing QR/copy affordances UNCHANGED: lineText still skips only the
+    # QR word (the verify button contributes nothing to copy text anyway).
+    line = re.search(r"function lineText\(line\) \{.*?\n\}", code, re.DOTALL).group(0)
+    assert 'contains("qr-btn")' in line and "hw-verify" not in line
+    assert 'btn.textContent = LABELS.qr;' in code
+
+
+def test_hw005_own_address_button_marks_and_arms_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    # RAW source: _strip_js_comments would gut the createElementNS URI string
+    # inside hardwareIcon (a // that lives in a string literal).
+    raw = (_STATIC / "app.js").read_text(encoding="utf-8")
+    funcs = "\n".join(
+        re.search(rf"function {name}\(.*?\n\}}", raw, re.DOTALL).group(0)
+        for name in (
+            "hardwareIcon", "hwVerifyButton", "noteOwnAddress",
+            "paintHwVerifyButtons",
+        )
+    )
+    script = """
+      const OWN = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+      const RECIP = "bc1q76xkgxmkgdhmx2knr3l2xq4k0l37xv9l3l3l3l";
+      const state = { openTurn: null, signerKind: "", stopped: false };
+      const LABELS = { hwVerifyTip: "TIP", hwVerifyAria: "ARIA" };
+      const queued = [];
+      const submit = (path, field, value) => queued.push([path, field, value]);
+      const allButtons = [];
+      globalThis.document = {
+        createElement: (tag) => {
+          if (tag !== "button") throw new Error("createElement:" + tag);
+          const node = {
+            type: "", className: "", textContent: "", title: "",
+            dataset: {}, children: [], hidden: false, disabled: false,
+            setAttribute(name, value) { this[name] = value; },
+            appendChild(child) { this.children.push(child); },
+            addEventListener(name, fn) { if (name === "click") this._click = fn; },
+          };
+          allButtons.push(node);
+          return node;
+        },
+        createElementNS: (ns, tag) => {
+          if (ns !== "http://www.w3.org/2000/svg") throw new Error("ns:" + ns);
+          return { tag, setAttribute() {}, append() {} };
+        },
+      };
+      const transcriptEl = {
+        querySelectorAll: (sel) =>
+          sel === ".hw-verify-btn"
+            ? allButtons.filter((b) => b.className === "hw-verify-btn")
+            : (() => { throw new Error("transcript:" + sel); })(),
+      };
+      __FUNCS__
+      let tokens = [];
+      const turn = {
+        buttons: [],
+        querySelectorAll(sel) {
+          if (sel === ".explorer-link") return tokens;
+          throw new Error("querySelectorAll:" + sel);
+        },
+        querySelector(sel) {
+          if (!sel.startsWith('[data-utterance="')) throw new Error("sel:" + sel);
+          const want = /"([^"]*)"/.exec(sel)[1];
+          return this.buttons.find((b) => b.dataset.utterance === want) || null;
+        },
+      };
+      const mkToken = (text, qr) => ({
+        textContent: text, nextElementSibling: qr || null,
+        classList: { contains: () => false }, added: [],
+        after(btn) { this.added.push(btn); turn.buttons.push(btn); },
+      });
+      const event = (address, branch, index) =>
+        JSON.stringify({ address, branch, index });
+      // 1. OWN token matches, recipient does NOT: exactly one button,
+      //    anchored to the own token, exact utterance + pinned names.
+      state.openTurn = turn;
+      state.signerKind = "hwi";
+      tokens = [mkToken(OWN), mkToken(RECIP)];
+      noteOwnAddress(event(OWN, 0, 5));
+      if (tokens[1].added.length) throw new Error("recipient-marked");
+      if (tokens[0].added.length !== 1) throw new Error("not-marked");
+      const b1 = tokens[0].added[0];
+      if (b1.dataset.utterance !== "/verifyaddress 0 5") throw new Error("utterance");
+      if (b1.type !== "button" || b1.title !== "TIP" || b1["aria-label"] !== "ARIA")
+        throw new Error("names");
+      if (b1.textContent !== "" || b1.children.length !== 1 ||
+          b1.children[0].tag !== "svg") throw new Error("not-icon-only");
+      if (b1.hidden !== false) throw new Error("hwi-hidden");
+      // 2. the QR chip keeps its slot; the verify button anchors AFTER it.
+      const qr = mkToken("QR");
+      qr.classList = { contains: (c) => c === "qr-btn" };
+      tokens = [mkToken(OWN, qr)];
+      turn.buttons = [];
+      noteOwnAddress(event(OWN, 0, 5));
+      if (qr.added.length !== 1 || tokens[0].added.length !== 0)
+        throw new Error("anchor-order");
+      // 3. duplicate coordinates: still ONE button on the turn.
+      noteOwnAddress(event(OWN, 0, 5));
+      if (turn.buttons.length !== 1) throw new Error("duplicate");
+      // 3b. SAME address rendered as TWO .explorer-link tokens in one turn:
+      //     the loop breaks after the first match — still ONE button.
+      tokens = [mkToken(OWN), mkToken(OWN)];
+      turn.buttons = [];
+      noteOwnAddress(event(OWN, 0, 5));
+      if (turn.buttons.length !== 1) throw new Error("two-token-once");
+      if (tokens[1].added.length) throw new Error("two-token-second-marked");
+      // 4. signer gating: file / absent = armed but HIDDEN (no device to
+      //    show on — the engine's no-device line is the fallback, the
+      //    button never becomes an error state).
+      state.signerKind = "file";
+      tokens = [mkToken(OWN)];
+      turn.buttons = [];
+      noteOwnAddress(event(OWN, 1, 7));
+      if (turn.buttons.length !== 1) throw new Error("file-not-armed");
+      if (turn.buttons[0].hidden !== true) throw new Error("file-visible");
+      if (turn.buttons[0].dataset.utterance !== "/verifyaddress 1 7")
+        throw new Error("coords");
+      state.signerKind = "";
+      tokens = [mkToken(OWN)];
+      turn.buttons = [];
+      noteOwnAddress(event(OWN, 0, 9));
+      if (turn.buttons[0].hidden !== true) throw new Error("absent-visible");
+      // 5. malformed/unknown payloads arm NOTHING (ignored, never fatal).
+      const arm = () => { turn.buttons = []; tokens = [mkToken(OWN)]; };
+      const bad = [
+        "not json", "[]", '"x"',
+        JSON.stringify({ address: 123, branch: 0, index: 1 }),
+        JSON.stringify({ address: "", branch: 0, index: 1 }),
+        JSON.stringify({ address: OWN, branch: 2, index: 1 }),
+        JSON.stringify({ address: OWN, branch: 0, index: -1 }),
+        JSON.stringify({ address: OWN, branch: true, index: 1 }),
+        JSON.stringify({ address: OWN, branch: 0, index: 1.5 }),
+        JSON.stringify({ branch: 0, index: 1 }),
+      ];
+      for (const payload of bad) {
+        arm();
+        noteOwnAddress(payload);
+        if (turn.buttons.length) throw new Error("armed-bad:" + payload);
+      }
+      // 6. event with NO open turn (closed/misordered): fail-closed.
+      arm();
+      state.openTurn = null;
+      noteOwnAddress(event(OWN, 0, 5));
+      if (turn.buttons.length) throw new Error("closed-turn-armed");
+      state.openTurn = turn;
+      // 7. click: ONE /action POST with the exact canonical utterance,
+      //    disabled synchronously (WEB-028 (5)); double-click queues once;
+      //    a stopped tab never submits.
+      arm();
+      state.signerKind = "hwi";
+      noteOwnAddress(event(OWN, 0, 5));
+      const btn = turn.buttons[0];
+      btn._click();
+      if (queued.length !== 1 || queued[0][0] !== "/action" ||
+          queued[0][1] !== "utterance" ||
+          queued[0][2] !== "/verifyaddress 0 5") throw new Error("submit");
+      if (!btn.disabled) throw new Error("not-disabled");
+      btn._click();
+      if (queued.length !== 1) throw new Error("double-queued");
+      arm();
+      noteOwnAddress(event(OWN, 0, 6));
+      state.stopped = true;
+      turn.buttons[0]._click();
+      if (queued.length !== 1 || turn.buttons[0].disabled) throw new Error("stopped");
+      state.stopped = false;
+      // 8. the /state repaint: signer flip hides/shows EXISTING buttons and
+      //    clears the in-flight disable (WEB-028 (5) restore).
+      allButtons.length = 0;
+      arm();
+      state.signerKind = "hwi";
+      noteOwnAddress(event(OWN, 0, 5));
+      const painted = turn.buttons[0];
+      painted.disabled = true; // emulate the just-clicked state
+      state.signerKind = "file";
+      paintHwVerifyButtons();
+      if (!painted.hidden || painted.disabled) throw new Error("paint-hide");
+      state.signerKind = "hwi";
+      paintHwVerifyButtons();
+      if (painted.hidden || painted.disabled) throw new Error("paint-show");
       console.log("ok");
     """.replace("__FUNCS__", funcs)
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)

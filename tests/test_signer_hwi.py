@@ -13,13 +13,21 @@ stop, client that cannot serve the account key → fail closed (no skip,
 R1); str/bytes sign-result normalization incl. the empty-bytes refusal
 (rider R2); older-HWI bytes-input retry; locked/busy/canceled/unknown
 error mapping (guidance strings asserted, value-free); display_address
-best-effort mapping; SignedResult fields; no-network lint compliance.
+(TCK-HW-005 slice B / D1 — the call-time desc rebuild: origin fp = the
+OPEN client's MASTER fp, key = account pubkey hex, path = account path +
+clicked branch/index; pinned against the REAL installed
+hwilib.commands.displayaddress over a Jade-shaped client, plus the
+FakeCommands shape/branch/guidance matrix); SignedResult fields;
+no-network lint compliance.
 
 hwilib is faked via the ``commands_module`` constructor seam — the fake
 mirrors the empirically verified hwi 3.2.0 API surface (commands.enumerate /
 get_client / signtx / displayaddress; client.get_pubkey_at_path per the
-base Client contract and JadeClient jade.py:164). One env-gated test
-exercises the real wheel (HID enumeration only — device I/O, not network).
+base Client contract and JadeClient jade.py:164). The D1 display-route
+tests inject the REAL ``hwilib.commands.displayaddress`` (its fp-equality
+enforcement is the bug the old Fake-only pin masked) over a fake client —
+no hardware, no network. One env-gated test exercises the real wheel (HID
+enumeration only — device I/O, not network).
 """
 
 import base64
@@ -31,10 +39,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from embit.bip32 import HDKey
 from embit.hashes import hash160
+from embit.networks import NETWORKS
 from embit.psbt import PSBT
 from embit.script import Script
 from embit.transaction import Transaction, TransactionInput, TransactionOutput
+from hwilib.key import ExtendedKey  # REAL hwi shape for the D1 route pins
 
 from localwallet.signer.base import Signer, SignerError
 from localwallet.signer.hwi import (
@@ -80,6 +91,11 @@ _TX = Transaction(
 )
 PSBT_B64 = base64.b64encode(PSBT(tx=_TX).serialize()).decode("ascii")
 SIGNED_B64 = base64.b64encode(b"psbt\xff" + b"\x02" * 24).decode("ascii")
+
+# A display-address argument for the FAKE-commanded tests: 33-byte pubkey
+# hex (66 chars). The fake commands never parse it; shape validation is
+# pinned separately below, and the REAL hwilib route uses genuine keys.
+_DUMMY_PUBKEY_HEX = "02" + "ab" * 32
 
 DEVICE_WALLET = {
     "type": "trezor",
@@ -779,7 +795,7 @@ def test_post_open_recheck_also_gates_display_address():
         display_result={"address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"},
     )
     with pytest.raises(DeviceMismatchError):
-        make_signer(commands).display_address("wpkh([a1b2c3d4/84'/0'/0']zpub)")
+        make_signer(commands).display_address(_DUMMY_PUBKEY_HEX, "p2wpkh", 0, 0)
 
 
 def test_post_open_reverify_failure_closes_client():
@@ -919,19 +935,66 @@ def test_all_error_messages_value_free():
 
 
 # --------------------------------------------------------------------------
-# display_address (best-effort verify-on-device)
+# display_address (verify-on-device, TCK-HW-005 slice B / D1)
 # --------------------------------------------------------------------------
 
 
-def test_display_address_happy_path_uses_descriptor():
-    commands = FakeCommands(display_result={"address": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"})
+def test_display_address_happy_path_rebuilds_desc_with_client_master_fp():
+    """D1: the store descriptor (ACCOUNT fp origin + SLIP-132 key) can
+    NEVER reach hwilib's ``displayaddress`` — the call rebuilds a
+    single-address descriptor whose origin carries the OPEN CLIENT'S
+    MASTER fingerprint and whose key is the account pubkey hex at the
+    clicked branch/index."""
+    commands = FakeCommands(display_result={"address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"})
     signer = make_signer(commands)
-    address = signer.display_address("wpkh([a1b2c3d4/84'/1'/0']vpub)")
-    assert address == "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"  # verbatim
-    assert commands.rec["closed"] is True
+    address = signer.display_address(_DUMMY_PUBKEY_HEX, "p2wpkh", 1, 7)
+    assert address == "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"  # verbatim
     display_calls = [c for c in commands.calls if c[0] == "displayaddress"]
     assert len(display_calls) == 1
-    assert display_calls[0][1].startswith("wpkh(")  # desc=, not path=
+    desc = display_calls[0][1]
+    # origin fp = the CLIENT'S master fp (MASTER_FP above), never the
+    # wallet ACCOUNT fp (FP_WALLET) — the store descriptor always failed
+    # here; the FakeCommands-only pin kept the rebuild honest about its
+    # SHAPE, and the real-hwilib class below runs the REAL checks.
+    assert desc.startswith(f"wpkh([{MASTER_FP}/")
+    assert FP_WALLET not in desc
+    assert desc.endswith(f"]{_DUMMY_PUBKEY_HEX}/1/7)")
+    assert "zpub" not in desc  # SLIP-132 bodies: hwilib 3.x refuses them
+    assert commands.rec["closed"] is True
+    # read-only device interaction: nothing on the sign path ran.
+    assert not [c for c in commands.calls if c[0] == "signtx"]
+
+
+@pytest.mark.parametrize(
+    ("script_type", "prefix", "suffix"),
+    [
+        ("p2wpkh", "wpkh([", ")"),
+        ("p2sh_p2wpkh", "sh(wpkh([", "))"),
+        ("p2pkh", "pkh([", ")"),
+    ],
+)
+def test_display_address_wrapper_follows_script_type(script_type, prefix, suffix):
+    commands = FakeCommands(display_result={"address": "bc1qx"})
+    make_signer(commands).display_address(_DUMMY_PUBKEY_HEX, script_type, 0, 3)
+    desc = next(c for c in commands.calls if c[0] == "displayaddress")[1]
+    assert desc.endswith(f"{_DUMMY_PUBKEY_HEX}/0/3{suffix}")
+    assert desc.startswith(prefix)
+    # balanced parens (the wrapper closes once per open token):
+    assert desc.count("(") == desc.count(")")
+
+
+def test_display_address_input_validation_is_fail_closed():
+    signer = make_signer(FakeCommands())
+    for bad in (
+        ("zz" * 32, "p2wpkh", 0, 0),          # non-hex key
+        (_DUMMY_PUBKEY_HEX[:-2], "p2wpkh", 0, 0),  # short key
+        (_DUMMY_PUBKEY_HEX, "tr", 0, 0),      # unsupported script type
+        (_DUMMY_PUBKEY_HEX, "p2wpkh", -1, 0),  # negative branch
+        (_DUMMY_PUBKEY_HEX, "p2wpkh", True, 0),  # bool is not a branch
+        (_DUMMY_PUBKEY_HEX, "p2wpkh", 0, "5"),  # string index
+    ):
+        with pytest.raises(SignerError):
+            signer.display_address(*bad)
 
 
 def test_display_address_respects_fingerprint_gate():
@@ -942,20 +1005,189 @@ def test_display_address_respects_fingerprint_gate():
         client=FakeAccountClient({}, _OTHER_PUBKEY),
     )
     with pytest.raises(DeviceMismatchError):
-        make_signer(commands).display_address("wpkh([a1b2c3d4/84'/0'/0']zpub)")
+        make_signer(commands).display_address(_DUMMY_PUBKEY_HEX, "p2wpkh", 0, 0)
+
+
+def test_display_address_no_device_is_the_friendly_absent_guidance():
+    commands = FakeCommands(devices=[])
+    with pytest.raises(DeviceAbsentError) as excinfo:
+        make_signer(commands).display_address(_DUMMY_PUBKEY_HEX, "p2wpkh", 0, 0)
+    assert "plug in" in str(excinfo.value)
+
+
+def test_display_address_master_fp_read_failure_is_value_free_guidance():
+    """A bound client whose master-fp getter RAISES maps through the
+    standard hierarchy (class name only — no values travel)."""
+    commands = FakeCommands(
+        client=FakeAccountClient({}, master_fp=RuntimeError("getter exploded"))
+    )
+    with pytest.raises(DeviceError) as excinfo:
+        make_signer(commands).display_address(_DUMMY_PUBKEY_HEX, "p2wpkh", 0, 0)
+    assert "retry" in str(excinfo.value).lower()
+    assert "getter exploded" not in str(excinfo.value)  # never echoed
+    assert not [c for c in commands.calls if c[0] == "displayaddress"]
+
+
+def test_display_address_unusable_master_fp_shape_is_reverify_guidance():
+    """A master fingerprint that is not 4 bytes/8 hex is an unusable
+    shape — no descriptor can be built from it (value-free refusal)."""
+    commands = FakeCommands(client=FakeAccountClient({}, master_fp=b"\x01\x02"))
+    with pytest.raises(DeviceError) as excinfo:
+        make_signer(commands).display_address(_DUMMY_PUBKEY_HEX, "p2wpkh", 0, 0)
+    assert "re-verify" in str(excinfo.value).lower()
+
+
+def test_display_address_client_without_master_getter_fails_closed():
+    class _NoMasterGetter(FakeClient):
+        """Serves the account key (bind passes) but cannot report a
+        master fingerprint — the rebuild cannot start; fail closed."""
+
+        def get_pubkey_at_path(self, bip32_path: str) -> object:
+            return SimpleNamespace(pubkey=_ACCOUNT_PUBKEY)
+
+    commands = FakeCommands(client=_NoMasterGetter({}))
+    with pytest.raises(DeviceError):
+        make_signer(commands).display_address(_DUMMY_PUBKEY_HEX, "p2wpkh", 0, 0)
 
 
 def test_display_address_errors_map_to_guidance_never_silent():
     commands = FakeCommands(display_error=UnavailableActionError("display not supported"))
     with pytest.raises(DeviceError) as excinfo:
-        make_signer(commands).display_address("wpkh([a1b2c3d4/84'/1'/0']vpub)")
+        make_signer(commands).display_address(_DUMMY_PUBKEY_HEX, "p2wpkh", 0, 0)
     assert "retry" in str(excinfo.value).lower()
 
 
 def test_display_address_unexpected_shape_is_error():
     commands = FakeCommands(display_result={"unexpected": 1})
     with pytest.raises(DeviceError):
-        make_signer(commands).display_address("wpkh([a1b2c3d4/84'/1'/0']vpub)")
+        make_signer(commands).display_address(_DUMMY_PUBKEY_HEX, "p2wpkh", 0, 0)
+
+
+# --------------------------------------------------------------------------
+# display_address against the REAL installed hwilib (TCK-HW-005 D1)
+#
+# The FakeCommands above cannot catch the fp-equality trap that made the
+# old desc-passthrough dead code — so this class injects the ACTUAL
+# ``hwilib.commands.displayaddress`` (its real origin-fp equality, its
+# real get_pubkey_at_path bind, its real key-vs-device comparison) over a
+# Jade-SHAPED fake client (ExtendedKey answers, bytes master fp,
+# display_singlesig_address recording the final path). No hardware, no
+# network — pure installed-library logic.
+# --------------------------------------------------------------------------
+
+_REAL_ROOT = HDKey.from_seed(b"localwallet hwilib display route pin")
+_REAL_ACCT = _REAL_ROOT.derive("m/84'/0'/0'").to_public()
+REAL_ACCT_FP: str = _REAL_ACCT.my_fingerprint.hex()
+REAL_ACCT_PUBKEY_HEX: str = _REAL_ACCT.key.serialize().hex()
+# What a Jade-like firmware returns from get_xpub: BIP32-version base58
+# (SLIP-132 magic is REJECTED by hwilib's parser — a zpub body in the
+# descriptor never even reaches the fp check).
+REAL_ACCT_XPUB = _REAL_ACCT.to_base58(NETWORKS["main"]["xpub"])
+REAL_MASTER_FP: bytes = _REAL_ROOT.my_fingerprint
+REAL_DEVICE_SHOWN = "bc1q7realhwilibpin00000000000000000000000"
+
+
+class JadeLikeDisplayClient(FakeClient):
+    """Serves hwi 3.2.0 client shapes: ``get_pubkey_at_path`` →
+    ``hwilib.key.ExtendedKey``, master fp → bytes, and the display hook
+    that RECEIVES the final full path from hwilib's own assembly."""
+
+    def __init__(self, recorder: dict, served_xpub: str = REAL_ACCT_XPUB) -> None:
+        super().__init__(recorder)
+        self._served = served_xpub
+        self.display_paths: list[tuple[str, object]] = []
+        self.query_paths: list[str] = []
+
+    def get_pubkey_at_path(self, bip32_path: str) -> ExtendedKey:
+        self.query_paths.append(bip32_path)
+        if bip32_path.replace("'", "h") in ("m/84h/0h/0h", "m/44h/0h/0h"):
+            return ExtendedKey.deserialize(self._served)
+        if bip32_path.replace("'", "h") == "m/0h":
+            return ExtendedKey.deserialize(
+                _REAL_ROOT.derive("m/0'").to_public().to_base58(NETWORKS["main"]["xpub"])
+            )
+        raise AssertionError(f"unexpected path asked of the device: {bip32_path}")
+
+    def get_master_fingerprint(self) -> bytes:
+        return REAL_MASTER_FP
+
+    def display_singlesig_address(self, bip32_path: str, addr_type: object) -> str:
+        # str() normalizes hwilib's AddressType enum to its lowercase name
+        # ("wit", "sh_wit", "legacy") for the path/addr-type pins.
+        self.display_paths.append((bip32_path, str(addr_type)))
+        return REAL_DEVICE_SHOWN
+
+
+class RealHwilibDisplayCommands(FakeCommands):
+    """Fake enumerate/get_client, REAL ``hwilib.commands.displayaddress``
+    — the fp-equality enforcement the old code died on."""
+
+    def __init__(self, client: FakeClient, **kw: object) -> None:
+        super().__init__(client=client, **kw)  # type: ignore[arg-type]
+
+    def displayaddress(self, client, path=None, desc=None, addr_type=None):
+        self.calls.append(("displayaddress", desc))
+        from hwilib.commands import displayaddress as real_displayaddress
+
+        return real_displayaddress(client, path=path, desc=desc, addr_type=addr_type)
+
+
+def make_display_signer(commands: FakeCommands) -> HwiUsbSigner:
+    """Signer whose EXPECTED account fp is the REAL fixture key's — the
+    bind at the account path passes on the client that serves it."""
+    return HwiUsbSigner(REAL_ACCT_FP, ACCOUNT_PATH, commands_module=commands)
+
+
+def test_real_hwilib_route_display_path_is_the_clicked_branch_index():
+    client = JadeLikeDisplayClient({})
+    commands = RealHwilibDisplayCommands(client)
+    address = make_display_signer(commands).display_address(
+        REAL_ACCT_PUBKEY_HEX, "p2wpkh", 1, 7
+    )
+    assert address == REAL_DEVICE_SHOWN  # device answer, verbatim
+    # The final path hwilib assembled from the rebuilt descriptor:
+    assert client.display_paths == [("m/84h/0h/0h/1/7", "wit")]
+    # origin-fp equality was SATISFIED (not skipped): the rebuilt origin
+    # carried the client's master fp, and hwilib's own bind re-asked the
+    # device at the account path (origin) — apostrophe and h forms both
+    # route to the same key.
+    assert "m/84h/0h/0h" in client.query_paths
+    desc = next(c for c in commands.calls if c[0] == "displayaddress")[1]
+    assert desc == f"wpkh([{REAL_MASTER_FP.hex()}/84'/0'/0']{REAL_ACCT_PUBKEY_HEX}/1/7)"
+    assert REAL_ACCT_FP not in desc  # the ACCOUNT fp never rides the origin
+
+
+def test_real_hwilib_route_legacy_and_nested_wrappers():
+    for script_type, addr_name in (("p2pkh", "legacy"), ("p2sh_p2wpkh", "sh_wit")):
+        client = JadeLikeDisplayClient({})
+        commands = RealHwilibDisplayCommands(client)
+        address = make_display_signer(commands).display_address(
+            REAL_ACCT_PUBKEY_HEX, script_type, 0, 2
+        )
+        assert address == REAL_DEVICE_SHOWN
+        assert client.display_paths == [("m/84h/0h/0h/0/2", addr_name)]
+
+
+def test_real_hwilib_route_wrong_key_on_device_is_refused_value_free():
+    """The account bind passes (signer expects the key the device serves)
+    but the wallet DESCRIPTOR key differs → hwilib's own key-vs-device
+    equality (commands.py, 'Key in descriptor does not match device')
+    stops the display. Our mapping must not echo its message (it carries
+    the rebuilt descriptor: master fp + pubkey)."""
+    decoy = _REAL_ROOT.derive("m/84'/0'/1'").to_public()
+    decoy_xpub = decoy.to_base58(NETWORKS["main"]["xpub"])
+    client = JadeLikeDisplayClient({}, served_xpub=decoy_xpub)
+    commands = RealHwilibDisplayCommands(client)
+    signer = HwiUsbSigner(
+        decoy.my_fingerprint.hex(), ACCOUNT_PATH, commands_module=commands
+    )
+    with pytest.raises(DeviceError) as excinfo:
+        signer.display_address(REAL_ACCT_PUBKEY_HEX, "p2wpkh", 0, 0)
+    message = str(excinfo.value)
+    assert "BadArgumentError" in message  # class-name guidance only
+    assert REAL_ACCT_PUBKEY_HEX not in message
+    assert REAL_MASTER_FP.hex() not in message
+    assert client.display_paths == []  # never reached the device screen
 
 
 # --------------------------------------------------------------------------

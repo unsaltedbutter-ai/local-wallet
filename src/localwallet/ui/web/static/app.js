@@ -35,6 +35,12 @@
 // status is announced on the TRANSITION only, not per backoff attempt;
 // (4) the QR dialog (aria-modal) Tab-wraps focus inside itself; (5) action
 // buttons disable on click until the next /state repaint restores them.
+// TCK-HW-005 static half: the engine's additive ``own_address`` event marks
+// which just-shown bubble address is OURS (never client prose sniffing), and
+// ONLY that marking arms a small calculator-icon button that injects the
+// canonical ``/verifyaddress <branch> <index>`` utterance through the same
+// POST /action full-turn path. Hidden unless the typed /state signer_kind
+// is "hwi" (file signer / absent = no device to show on).
 
 const island = window.__LOCALWALLET__;
 const token = island && typeof island.token === "string" ? island.token : "";
@@ -257,6 +263,12 @@ const LABELS = {
   qr: "QR",
   qrTitle: "Receive address QR — scan with a wallet to send to this address",
   qrFailed: "Could not show the QR code.",
+  // TCK-HW-005 static half: the per-own-address verify-on-device button.
+  // Both strings are the ticket's pinned wording (tooltip + accessible
+  // name); the WEB-017 referent rule binds the INJECTED utterance, which
+  // carries its own coordinates (see noteOwnAddress below).
+  hwVerifyTip: "Show on hardware wallet",
+  hwVerifyAria: "Show this address on your hardware wallet",
   // copy pass 2 #44 dim/lit badge words (TCK-WEB-009 e): RETIRED by
   // TCK-DESCOPE-M3B; the TCK-WEB-023 AMENDMENT brings the electrum/bitcoind
   // kind pills BACK as neutral NAME pills (no dim/lit trust tier of their
@@ -473,6 +485,13 @@ const state = {
   // fetches anyway).
   backendName: "",
   trustSig: null,
+  // TCK-HW-005 static half (D7): the last TYPED snapshot's additive
+  // signer_kind NAME ("file" | "hwi"; omitted pre-provision). "" (absent /
+  // never typed / unknown) and "file" both HIDE the verify-on-device button
+  // — a file-signer user has no device to show on, and the client never
+  // guesses a signer from prose. state/0 keeps the last known value (the
+  // backendName discipline). Memory only, never logged.
+  signerKind: "",
   // TCK-WEB-023 (council fold): the last TYPED snapshot's additive
   // backend_host — the BARE hostname of the user's own configured server,
   // engine-extracted (scheme/port/path/creds already stripped), present ONLY
@@ -919,6 +938,117 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+// ------------------------------------------- verify-on-device (TCK-HW-005 static)
+// The engine's OWN ownership declaration: an ``own_address`` SSE event
+// ({address, branch, index} JSON) follows the narration text event of a
+// receive/new-address turn. ONLY that event — never a client-side sniff of
+// the prose — marks an address as OURS, so a RECIPIENT address in any
+// bubble can never gain the button. The event's payload address is matched
+// against the bubble's rendered token buttons VERBATIM (the same tool-output
+// string), and the button injects its utterance from the EVENT's own
+// coordinates — the utterance names its referent (WEB-017), never deictic.
+// A malformed/unknown-shaped payload arms nothing (ignored, never fatal);
+// an event whose turn already closed arms nothing either (fail-closed — a
+// missing affordance is honest, a misplaced one would claim ownership).
+
+// The calculator glyph (the device's screen + keys), built with
+// createElementNS exactly like copyIcon: CSP-safe, no markup strings, and
+// the shapes carry NO text nodes, so lineText/bubbleText/announceTurn are
+// untouched and the existing QR/copy affordances never gain button words.
+function hardwareIcon() {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  const body = document.createElementNS(ns, "rect");
+  body.setAttribute("x", "4");
+  body.setAttribute("y", "2");
+  body.setAttribute("width", "16");
+  body.setAttribute("height", "20");
+  body.setAttribute("rx", "2");
+  const screen = document.createElementNS(ns, "path");
+  screen.setAttribute("d", "M8 6h8");
+  const keys = document.createElementNS(ns, "path");
+  keys.setAttribute(
+    "d",
+    "M8 10h.01M12 10h.01M16 10h.01M8 14h.01M12 14h.01M16 14v4M8 18h.01M12 18h.01",
+  );
+  svg.append(body, screen, keys);
+  return svg;
+}
+
+// The click rides the SAME /action channel as every other button (ADR-0024
+// §8 — full _run_turn; nothing here touches a handler or the flow).
+// WEB-028 (5) disable-on-click: the control goes inert the moment it is
+// pressed and is restored by the next /state repaint (applyState). The
+// engine's own reply narrates the device handoff; a file signer or a
+// missing device gets the engine's guidance line — never an error here.
+function hwVerifyButton(utterance) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "hw-verify-btn";
+  btn.dataset.utterance = utterance;
+  btn.title = LABELS.hwVerifyTip;
+  btn.setAttribute("aria-label", LABELS.hwVerifyAria);
+  btn.hidden = state.signerKind !== "hwi"; // typed truth only; repaint follows
+  btn.appendChild(hardwareIcon());
+  btn.addEventListener("click", () => {
+    if (btn.disabled || state.stopped) return;
+    btn.disabled = true;
+    submit("/action", "utterance", utterance);
+  });
+  return btn;
+}
+
+function noteOwnAddress(raw) {
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return; // non-JSON payload: ignore, never render raw
+  }
+  if (!data || typeof data !== "object") return;
+  const address = data.address;
+  const branch = data.branch;
+  const index = data.index;
+  // Re-gate the wire shape client-side (the engine already shape-gates;
+  // untrusted server data is still validated before it arms an action).
+  if (typeof address !== "string" || !address) return;
+  if (!Number.isInteger(branch) || !Number.isInteger(index)) return;
+  if (branch < 0 || branch > 1 || index < 0) return;
+  const turn = state.openTurn;
+  if (!turn) return; // contract: the event follows its narration, pre-turn_end
+  const utterance = "/verifyaddress " + branch + " " + index;
+  // Duplicate/replayed marking of the SAME coordinates arms a second button
+  // nowhere (the id guard already drops true replays; this covers a repeat
+  // emission inside one turn).
+  if (turn.querySelector('[data-utterance="' + utterance + '"]')) return;
+  for (const token of turn.querySelectorAll(".explorer-link")) {
+    // ENGINE-TRUTH match: the button lands ONLY beside a rendered token
+    // whose whole text is the event's address — never on prose, never on a
+    // recipient address (no such event exists for those).
+    if (token.textContent !== address) continue;
+    const qr = token.nextElementSibling;
+    const anchor = qr && qr.classList && qr.classList.contains("qr-btn") ? qr : token;
+    anchor.after(hwVerifyButton(utterance));
+    break; // one button per (address,coords) per turn; see the dedupe above
+  }
+}
+
+// Called from applyState on EVERY /state repaint (after the typed
+// signer_kind read above): restores the WEB-028 (5) disable-on-click, and
+// visibility comes ONLY from the typed signer_kind NAME — file / absent /
+// unknown = hidden (no device to show on; the engine's own no-device line
+// is the fallback narration, this control never becomes an error state).
+function paintHwVerifyButtons() {
+  const show = state.signerKind === "hwi";
+  for (const btn of transcriptEl.querySelectorAll(".hw-verify-btn")) {
+    btn.disabled = false;
+    btn.hidden = !show;
+  }
+}
+
 function ensureTurn() {
   if (!state.openTurn) {
     state.openTurn = el("li", "turn turn-engine");
@@ -1180,6 +1310,11 @@ function applyState(snap) {
   if (typed && typeof snap.backend_kind === "string") {
     state.backendName = snap.backend_kind;
   }
+  // TCK-HW-005 static half: the signer KIND NAME rides typed truth only
+  // (state/0 keeps the last known value — the backendName discipline).
+  if (typed && typeof snap.signer_kind === "string") {
+    state.signerKind = snap.signer_kind;
+  }
   const visible = new Set(visibleActions(snap));
   for (const btn of actionsEl.querySelectorAll("button")) {
     // TCK-WEB-028 (5): every repaint is snapshot truth — RESTORE the
@@ -1196,6 +1331,7 @@ function applyState(snap) {
   for (const btn of quickbarEl.querySelectorAll("button")) {
     btn.disabled = false; // TCK-WEB-028 (5): same restore for the header quicks
   }
+  paintHwVerifyButtons(); // TCK-HW-005: own-address chips (restore + gating)
   applyScanChip(snap);
   applyPrivacyChip(snap);
   applyWalletFpChip(snap); // TCK-WEB-027: the header fingerprint chip
@@ -1612,6 +1748,7 @@ function handleEvent(id, kind, data) {
   else if (kind === "progress") appendProgress(data);
   else if (kind === "model_progress") renderModelProgress(data);
   else if (kind === "user_text") renderUserText(data);
+  else if (kind === "own_address") noteOwnAddress(data); // TCK-HW-005 static
   else if (kind === "turn_end") noteTurnEnd();
   else if (kind === "resync") {
     // too_far_behind: the cursor predates the server ring, so part of the
