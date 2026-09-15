@@ -1292,9 +1292,10 @@ def test_settings_get_lists_the_allowlist_shape_only(
         assert set(entries) == {
             "gap_limit",
             "chain_base_url",
-            # TCK-UX-009: the background-watch interval (the watcher-build
-            # ladder is its live reader; the watcher builds at launch →
-            # requires_restart True).
+            # TCK-UX-009, live since TCK-CFG-005: the background-watch
+            # interval (the pump re-resolves the ladder and rebinds the
+            # running watcher on applied writes → requires_restart False;
+            # only an env rung waits for a launch).
             "watch_interval_s",
             "watch_key",
             # TCK-ONB-004 M3: the credential keys join the read surface as

@@ -956,6 +956,58 @@ def _resolve_watch_interval(settings: Settings, store: Store) -> tuple[float, st
     return float(stored), None
 
 
+def _live_watch_interval(store: Store) -> float | None:
+    """The watch-interval ladder re-resolved MID-SESSION (TCK-CFG-005): the
+    same :func:`_resolve_watch_interval` precedence, but with the env/
+    config-file rung read FRESH (:meth:`Settings.from_env` re-reads the file,
+    which the chat settings path writes) instead of the boot snapshot.
+    ``None`` = the fresh read failed (a hand-tampered malformed file, an
+    out-of-bounds operator rung): the caller keeps the running watcher — a
+    broken mid-session edit never takes a live watch down (the boot-time
+    fail-closed startup refusal stands for launches)."""
+    try:
+        return _resolve_watch_interval(Settings.from_env(), store)[0]
+    except (_WiringError, ValueError):
+        return None
+
+
+def _rebind_watcher(
+    watcher: IncomingWatcher | None,
+    store: Store,
+    scan: ScanFlow | None,
+) -> tuple[IncomingWatcher | None, bool]:
+    """Apply the live watch interval to the pump's watcher (TCK-CFG-005, the
+    BACKEND-002 rebind discipline: engine thread only, NO new threads —
+    :class:`IncomingWatcher` spawns none, ADR-0019). The ladder is
+    re-resolved fresh (env > config-file > stored > default); an ON watcher
+    has its interval rebound IN PLACE (the dedup memory survives — the whole
+    reason for not rebuilding), ON→OFF returns ``None`` (watching stops from
+    the next cycle), and OFF→ON builds the watcher the same way :func:`_wire`
+    does (probe over the live scan — dedup starts empty because nothing was
+    ever surfaced while off). Returns ``(live_watcher, applied)``;
+    ``applied=False`` means the fresh ladder was unreadable, or the watcher
+    was off and cannot be built here (no scan wired — a bare test pump), and
+    the caller's narration must stay next-launch-honest.
+    """
+    interval = _live_watch_interval(store)
+    if interval is None:
+        return watcher, False
+    if interval <= 0:
+        return None, True
+    if watcher is None:
+        if scan is None:
+            return None, False
+        return (
+            IncomingWatcher(
+                _make_watch_probe(store, scan.wallet_id, scan.scan_now),
+                interval_s=interval,
+            ),
+            True,
+        )
+    watcher.set_interval_s(interval)
+    return watcher, True
+
+
 def _stored_display_currency(store: Store) -> str | None:
     """The stored ``display_currency`` rung, read fail-quiet (an unreadable
     store = rung unset, never a stall — the watch-interval precedent)."""
@@ -3037,7 +3089,6 @@ def build_dispatch_table(
             scan_fn,
             seconds_since_last_block_fn=seconds_since_last_block_fn,
             scan_gate=scan_gate,
-            settings=app_settings,
             session=send_session,
         ),
         IntentName.CONFIRM_TX: _make_confirm_tx_handler(tx_flow, send_session),
@@ -4172,7 +4223,6 @@ def _make_create_tx_handler(
     *,
     seconds_since_last_block_fn: Callable[[], int | None] | None = None,
     scan_gate: StartupScan | None = None,
-    settings: Settings | None = None,
     session: SendSession | None = None,
 ) -> Handler:
     """Create the ``create_tx`` handler: stage an unsigned pending transaction.
@@ -4481,14 +4531,17 @@ def _make_create_tx_handler(
                 for utxo in utxos
             ]
         # 6b. Coin-selection settings (doc §2.3 ladder) resolved PER
-        # SELECTION: the stored rung is read fresh here, so a settings-panel
-        # change lands on the next quote with no restart (the honest
-        # requires_restart False on those entries); the env/config-file rung
-        # is the startup Settings snapshot. A malformed value or a min>=max
-        # rung-cross refuses fail-closed — resolve's errors name keys and
-        # rungs only, never values (ADR-0009), so the detail is log-safe.
-        env_settings = settings if settings is not None else Settings()
+        # SELECTION: BOTH remaining rungs are read fresh here — the stored
+        # rung from the store, and (TCK-CFG-005) the env/config-file rung by
+        # a fresh ``Settings.from_env()`` re-read, so a chat settings change
+        # (which writes config.json and clears the stored row) lands on the
+        # NEXT selection with no restart; the boot ``settings`` snapshot used
+        # to ride here and froze the file rung at launch. A malformed fresh
+        # read (a hand-broken file mid-session) refuses the selection
+        # fail-closed — resolve/reader errors name keys and rungs only,
+        # never values (ADR-0009), so the detail is log-safe.
         try:
+            env_settings = Settings.from_env()
             coin_policy = resolve_coin_selection_settings(
                 {key: getattr(env_settings, key, "") for key in COIN_SETTING_KEYS},
                 {key: store.get_coin_setting(key) for key in COIN_SETTING_KEYS},
@@ -8387,6 +8440,9 @@ class ScanFlow:
         self._wallet = wallet
         self._wallet_id = wallet.id
         self._worker = worker
+        #: Boot-validated env/config-file gap rung — kept ONLY as the
+        #: fail-quiet fallback when a mid-session re-read of the file fails
+        #: (:attr:`_live_gap_limit`); never the live value anymore.
         self._gap_limit = gap_limit
         self._startup_plan = startup_plan
         self._rescan = rescan
@@ -8405,6 +8461,30 @@ class ScanFlow:
         #: scan persists successfully (never on failure — the load did not
         #: complete). ``_wire`` arms it only for an onboarding session.
         self.on_first_scan_done: Callable[[Callable[[str], None]], None] | None = None
+
+    @property
+    def wallet_id(self) -> int:
+        """The active wallet row's id (read-only; TCK-CFG-005 — the pump's
+        watcher rebind builds the watch probe from here without reaching
+        into the flow's privates)."""
+        return self._wallet_id
+
+    @property
+    def _live_gap_limit(self) -> int | None:
+        """The env/config-file gap-limit rung resolved PER PLAN BUILD
+        (TCK-CFG-005 read-at-use: the chat settings path writes
+        ``config.json`` mid-session; the boot snapshot used to freeze that
+        rung until restart). The stored rung and the shipped default resolve
+        downstream in :func:`localwallet.wallet.scan._resolve_gap_limit`,
+        which already reads fresh per plan. A failed fresh read (a file
+        hand-broken mid-session) falls back to the boot-validated snapshot —
+        a scan never stalls on a broken rung the startup preflight could not
+        have seen, and the broken value is never silently adopted either.
+        """
+        try:
+            return _env_gap_limit(Settings.from_env())
+        except ValueError:
+            return self._gap_limit
 
     def set_startup(self, plan: wallet_scan.ScanPlan, *, rescan: bool = False) -> None:
         """Arm the non-blocking startup scan (engine-thread wiring call).
@@ -8504,7 +8584,7 @@ class ScanFlow:
             plan = wallet_scan.plan_scan(
                 self._store,
                 self._wallet,
-                gap_limit=self._gap_limit,
+                gap_limit=self._live_gap_limit,
                 rebuild=rebuild,
             )
         except (
@@ -9906,10 +9986,12 @@ _SETTINGS_KEYS: Final[frozenset[str]] = frozenset(
     {
         wallet_scan.GAP_LIMIT_SETTING,
         _CHAIN_BASE_URL_KEY,
-        # TCK-UX-009: the background-watch interval. Allowlisted ONLY
-        # because the watcher build site in _wire reads it back through
-        # _resolve_watch_interval (env > stored > default) — the setting
-        # the "Change it in settings" line claims.
+        # TCK-UX-009: the background-watch interval. Allowlisted because
+        # the ladder (env > config file > stored > default) has LIVE
+        # readers: the watcher build site in _wire AND the pump's mid-
+        # session rebind (:func:`_rebind_watcher`, TCK-CFG-005) that
+        # applies every stored write to the running watcher on the next
+        # poll — the setting the "Change it in settings" line claims.
         WATCH_INTERVAL_SETTING,
         # TCK-FIAT-002: the display currency (closed enum, single-sourced
         # from localwallet.config). Allowlisted because the price oracle
@@ -10127,10 +10209,12 @@ def _settings_entries(
             "requires_restart": backend is None or shadowed,
             "env_override": _env_overridden(CHAIN_BASE_URL_ENV_VAR),
         },
-        # TCK-UX-009: the background-watch interval, same gap-limit shape.
-        # The ladder at the watcher build site (env > stored > default 60)
-        # is its live reader; the watcher is built ONCE at launch, so the
-        # honest effect flag is RESTART.
+        # TCK-UX-009, live since TCK-CFG-005: the pump RE-RESOLVES this
+        # ladder (env > config file > stored) and rebinds the running
+        # watcher's interval in place on every applied write — chat OR pane
+        # — so a change lands on the NEXT POLL, no restart. Only the ENV
+        # rung (immovable mid-process) still waits for a launch; a
+        # config-FILE shadow is named per-write by CONFIG_SHADOW_NOTE.
         {
             "key": WATCH_INTERVAL_SETTING,
             "type": "int",
@@ -10138,7 +10222,7 @@ def _settings_entries(
             "default": f"{WATCH_INTERVAL_DEFAULT_S:g}",
             "min": WATCH_INTERVAL_MIN,
             "max": WATCH_INTERVAL_MAX,
-            "requires_restart": True,
+            "requires_restart": _env_overridden(WATCH_INTERVAL_ENV_VAR),
             "env_override": _env_overridden(WATCH_INTERVAL_ENV_VAR),
         },
         # TCK-FIAT-002: the display currency — a CLOSED-ENUM entry (the
@@ -11157,6 +11241,34 @@ def _pump(
             scan.attach(commands)
             scan.begin()
 
+    def _apply_live_setting(key: str, resync_gap: bool) -> str | None:
+        """The TCK-CFG-005 live-apply seam (engine thread — the pump runs it
+        mid-turn, exactly like every other pump mutation; NO new threads,
+        the BACKEND-002 rebind discipline). Returns the honest "when does it
+        take effect" clause for the settings ack, or ``None`` when the
+        caller's static clause already says it. ``resync_gap`` is the chat
+        path's GAP-001 widen signal (increase ⇒ auto-rescan; a decrease
+        never passes it and gets its tradeoff note from the caller).
+        """
+        nonlocal watcher
+        if key == WATCH_INTERVAL_SETTING:
+            if store is None:
+                return _CHAT_APPLY_NEXT_LAUNCH
+            watcher, applied = _rebind_watcher(watcher, store, scan)
+            if not applied:
+                return _CHAT_APPLY_NEXT_LAUNCH
+            return _CHAT_APPLY_WATCH_OFF if watcher is None else _CHAT_APPLY_NEXT_POLL
+        if (
+            key == wallet_scan.GAP_LIMIT_SETTING
+            and resync_gap
+            and backend is not None
+            and backend.resync() == "started"
+        ):
+            # A widened window is only VISIBILITY upside — rescan now, same
+            # semantics the settings pane's apply flow fires (GAP-001).
+            return " Widening the window — a resync is running now."
+        return None
+
     def _chat_backend_intent(line: str) -> bool:
         """The chat surface of the backend choice, WHILE IT IS UNRESOLVED
         ONLY (TCK-ONB-007; critique Q4's state gate): a pasted backend URL
@@ -11378,6 +11490,18 @@ def _pump(
             command.reply.put(reply)
             if backend is not None and reply.get("swapped") is True:
                 client = backend.client
+            if (
+                store is not None
+                and command.key == WATCH_INTERVAL_SETTING
+                and reply.get("status") == "applied"
+            ):
+                # TCK-CFG-005: a PANE watch_interval_s write lands on the
+                # stored rung; the ladder re-resolves (env > config file >
+                # stored — a shadowing rung simply keeps its value, and the
+                # reply's CONFIG_SHADOW_NOTE already named it) and the
+                # running watcher is rebound on this (engine) thread — the
+                # NEXT poll already runs on the new interval, no restart.
+                watcher, _applied = _rebind_watcher(watcher, store, scan)
             continue
         if isinstance(command, ResyncRequest):
             # Typed resync_now trigger (TCK-BACKEND-002 deliverable 5): the
@@ -11547,7 +11671,7 @@ def _pump(
             _run_turn(
                 loop, flow, session, line, output_fn, client=client, table=table,
                 scan_gate=scan.gate if scan is not None else None, hwi=hwi,
-                store=store,
+                store=store, live_apply_setting=_apply_live_setting,
             )
         if emitter is not None:
             emitter.emit(EVENT_TURN_END)
@@ -12760,7 +12884,6 @@ class ChainBackendFlow:
             scan.scan_now if scan is not None else (lambda: None),
             seconds_since_last_block_fn=lambda: _safe_time_since_last_block(client),
             scan_gate=scan.gate if scan is not None else None,
-            settings=w.settings,
             session=w.session,
         )
         w.table[IntentName.BROADCAST_TX] = _make_broadcast_tx_handler(
@@ -12989,13 +13112,25 @@ def _wire(
     # "full scan per poll on the engine thread" cost note is retired — the
     # engine only persists what the worker fetched). TCK-UX-009: the
     # interval resolves on its ladder (env > stored setting > default 60)
-    # HERE — the stored rung's reader, which is what makes the plain
-    # "Change it in settings" claim true (the watcher is built at launch →
-    # the settings entry carries requires_restart). TCK-UX-012(b): "on" is
+    # HERE, and TCK-CFG-005 rebound the RUNNING watcher through the pump
+    # (:func:`_rebind_watcher`) — which is what makes the plain "Change it
+    # in settings" claim true in-session. TCK-UX-012(b): "on" is
     # the NORMAL state — an on launch prints NOTHING (UX-009's on-line is
     # retired); the off line keeps the settings pointer.
     scan = ScanFlow(store, wallet_row, worker, gap_limit=env_gap, output=output_fn)
-    watch_interval, watch_interval_warning = _resolve_watch_interval(settings, store)
+    # TCK-CFG-005: read the env/config-file rung FRESH here (the boot
+    # ``settings`` would re-freeze it): a re-provisioned wiring — a watch
+    # replace after a chat settings change — must not undo the live apply
+    # the pump already performed. The boot-validated snapshot is the
+    # fail-safe fallback for a file hand-broken in the boot-to-wire window
+    # (never a crash where run() would have refused cleanly).
+    try:
+        wire_settings = Settings.from_env()
+    except ValueError:
+        wire_settings = settings
+    watch_interval, watch_interval_warning = _resolve_watch_interval(
+        wire_settings, store
+    )
     if watch_interval_warning is not None:
         output_fn(watch_interval_warning)
     watcher: IncomingWatcher | None = None
@@ -14862,6 +14997,22 @@ _CHAT_STORE_CLEAR_FAIL: Final[str] = (
     " I could not clear the stored Settings copy — the config file outranks "
     "it, so the saved value still applies."
 )
+#: TCK-CFG-005 per-key immediacy clauses (the ack says what took effect
+#: NOW and what waits, honestly per key — never a blanket "next launch"):
+#: the watch interval rides the pump's live watcher rebind, gap_limit rides
+#: the per-plan gap re-read (+ the GAP-001 widen resync), the coin-policy
+#: keys ride the per-selection resolve in the create_tx handler. Without a
+#: pump seam (a bare harness call) nothing observes the file mid-session,
+#: so the watcher's honest answer is the launch line again.
+_CHAT_APPLY_NEXT_POLL: Final[str] = " The new interval takes effect on the next poll."
+_CHAT_APPLY_WATCH_OFF: Final[str] = " Background watch is off now."
+_CHAT_APPLY_NEXT_SCAN: Final[str] = " Takes effect on the next scan."
+_CHAT_APPLY_NEXT_TX: Final[str] = (
+    " Takes effect on the next transaction this wallet builds."
+)
+_CHAT_APPLY_NEXT_LAUNCH: Final[str] = (
+    " The config file is read at launch, so it takes effect at the next launch."
+)
 _CHAT_UNMANAGED: Final[str] = (
     "That setting is not configurable from chat — chat manages the gap "
     "limit, the background watch interval, the smallest and largest UTXO "
@@ -15068,13 +15219,28 @@ def _chat_convert_value(key: str, num: str, unit: str) -> int | None:
 
 
 def _chat_settings_change(
-    store: Store, key: str, value: int, words: list[str], output_fn: Callable[[str], None]
+    store: Store,
+    key: str,
+    value: int,
+    words: list[str],
+    output_fn: Callable[[str], None],
+    live_apply: Callable[[str, bool], str | None] | None = None,
 ) -> None:
     """Validate → write config.json → delete the stored rung → confirm +
     honest rung narration (fail-closed at every gate; NOTHING is written on
     any refusal, and no line echoes the submitted value back as if stored —
     the ack quotes the engine's own canonical conversion of the user's
-    number, verbatim from this function's Decimal/whole-number result)."""
+    number, verbatim from this function's Decimal/whole-number result).
+
+    ``live_apply`` (TCK-CFG-005) is the pump's engine-thread seam: it
+    rebinds the running watcher after a watch-interval change (and returns
+    that change's immediacy clause), and fires the GAP-001 widen resync for
+    a widened gap_limit. The coin-policy keys need NO seam — every consumer
+    re-reads its ladder at use (the create_tx selection resolve) — and
+    gap_limit's value itself is live from the next scan either way (the
+    scan plans re-read env/file/stored). ``None`` (a bare harness call, no
+    pump) keeps the honest degraded answer for the watcher only: next
+    launch, because nothing is watching the file here."""
     label, unit = _CHAT_SETTING_DISPLAY[key]
     lo, hi = _chat_setting_bounds(key)
     if not lo <= value <= hi:
@@ -15085,6 +15251,14 @@ def _chat_settings_change(
             )
         )
         return
+    # The GAP-001 direction needs the effective value BEFORE the write
+    # (the ladder as it stands, rung by rung) — widening auto-rescans,
+    # narrowing never does.
+    prior: tuple[int, str] | str | None = (
+        _chat_effective_setting(store, key)
+        if key == wallet_scan.GAP_LIMIT_SETTING
+        else None
+    )
     # UTXO-002 pair rule against the PAIR AS IT WILL RESOLVE: the other
     # target key's current effective value on the full ladder (the written
     # key's own stored row is about to be deleted, the file row is about to
@@ -15143,17 +15317,42 @@ def _chat_settings_change(
             "effective value stays the environment's (a restart without it "
             "applies the file)."
         )
+    elif key == WATCH_INTERVAL_SETTING:
+        # TCK-CFG-005: the pump re-resolves the ladder and rebinds the
+        # RUNNING watcher in place (no restart, no new thread); the seam
+        # owns the honest clause (it knows whether a watcher exists and
+        # whether the ladder read cleanly).
+        clause = live_apply(key, False) if live_apply is not None else None
+        ack += clause or _CHAT_APPLY_NEXT_LAUNCH
+    elif key == wallet_scan.GAP_LIMIT_SETTING:
+        # Every scan plan re-reads the gap ladder fresh (env/file:
+        # ScanFlow._live_gap_limit; stored: wallet.scan), so the written
+        # value is live from the NEXT scan — with the GAP-001 semantics
+        # the pane also fires: widen → resync now, narrow → NO rescan +
+        # the tradeoff note.
+        ack += _CHAT_APPLY_NEXT_SCAN
+        if isinstance(prior, tuple):
+            if value < prior[0]:
+                ack += " " + GAP_NARROW_NOTE
+            elif value > prior[0] and live_apply is not None:
+                started = live_apply(key, True)
+                if started is not None:
+                    ack += started
     else:
-        ack += (
-            " The config file is read at launch, so it takes effect at the "
-            "next launch."
-        )
+        # The coin-policy keys are resolved PER SELECTION inside the
+        # create_tx handler (env/file re-read since TCK-CFG-005) — the
+        # next transaction this wallet builds already uses them.
+        ack += _CHAT_APPLY_NEXT_TX
     del words  # the ack quotes engine truth only, never the utterance
     output_fn(sanitize_tool_output(ack))
 
 
 def _run_chat_settings_turn(
-    store: Store, line: str, output_fn: Callable[[str], None]
+    store: Store,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    live_apply: Callable[[str, bool], str | None] | None = None,
 ) -> bool:
     """Consume a chat-managed-settings turn; True when consumed. Closed
     shapes only (see the section header):
@@ -15215,7 +15414,9 @@ def _run_chat_settings_turn(
             if value == -1:
                 output_fn(sanitize_tool_output(_CHAT_SET_BAD_BTC))
                 return True
-            _chat_settings_change(store, key, value, words, output_fn)
+            _chat_settings_change(
+                store, key, value, words, output_fn, live_apply=live_apply
+            )
             return True
         if set_verb_first or words[0] in _CHAT_NEGATE_FIRST or consolidate_below_shape:
             # A command shape with no value: refuse, do not guess, do not
@@ -15264,6 +15465,7 @@ def _run_turn(
     scan_gate: StartupScan | None = None,
     hwi: HwiUsbSigner | None = None,
     store: Store | None = None,
+    live_apply_setting: Callable[[str, bool], str | None] | None = None,
 ) -> None:
     """Run ONE REPL turn: gate classification → agent → flow narration.
 
@@ -15492,7 +15694,9 @@ def _run_turn(
     # after the conversation + label intercepts (their asks/verbs keep
     # priority); anything the closed matcher does not recognize falls
     # through to the model, where the prompt line keeps it honest.
-    if store is not None and _run_chat_settings_turn(store, line, output_fn):
+    if store is not None and _run_chat_settings_turn(
+        store, line, output_fn, live_apply=live_apply_setting
+    ):
         return
     speed = _bump_speed_choice(line)
     if speed is not None and IntentName.BUMP_FEE in table:

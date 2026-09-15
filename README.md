@@ -164,9 +164,12 @@ shadow each other. (The environment still outranks both — when an env var
 is set, the app says so honestly instead of pretending the file won.) The
 Settings pane keeps writing the stored rung; while `config.json` sets the
 same key, the pane's reply names the file as the outranking surface.
-Chat-managed values take effect at the next launch (live apply is
-TCK-CFG-005); other settings are not configurable from chat and the app
-says so rather than guessing.
+Chat-managed values apply live (TCK-CFG-005): the watch interval rebinds
+the running poller for the next poll, the UTXO-target and consolidation
+keys are re-read on every coin selection, and a gap-limit change is live
+from the next scan (widening rescans immediately, like the Settings pane;
+narrowing only hides, so it never auto-rescans); other settings are not
+configurable from chat and the app says so rather than guessing.
 
 **Self-hosted https with a private / self-signed cert** (`tls_verify`,
 `LOCALWALLET_TLS_VERIFY`; default `true`, env > config file > default, no

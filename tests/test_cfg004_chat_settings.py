@@ -253,7 +253,10 @@ def test_change_writes_file_deletes_stored_and_narrates_both(_ladder_env) -> Non
         assert read_config_file() == {"gap_limit": "30"}
     assert "config.json" in ack
     assert "cleared" in ack  # the stored-delete is narrated, not silent
-    assert "next launch" in ack  # honest live-apply situation (pre-CFG-005)
+    # TCK-CFG-005: the gap ladder is re-read per scan plan — the ack says
+    # what is actually true without a pump seam (no stale "next launch").
+    assert "next scan" in ack
+    assert "next launch" not in ack
 
 
 def test_change_utxo_min_sats_alias(_ladder_env) -> None:

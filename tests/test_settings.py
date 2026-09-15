@@ -136,8 +136,11 @@ def test_allowlist_is_exactly_the_live_db_keys(env_clean: None, tmp_path: Path) 
         # ADR-0018 config-only switch: the client is built at bootstrap — the
         # honest flag is RESTART, never a silent hot-swap.
         assert chain["requires_restart"] is True
-        # TCK-UX-009: the watch-interval entry — bounded int, shipped
-        # default 60, honest RESTART flag (the watcher is built at launch).
+        # TCK-UX-009, live since TCK-CFG-005: the watch-interval entry —
+        # bounded int, shipped default 60; the pump rebinds the RUNNING
+        # watcher's interval on every applied write (chat OR pane, next
+        # poll, no restart), so the honest flag is False — only an ENV rung
+        # (immovable mid-process) still waits for a launch.
         assert entries["watch_interval_s"] == {
             "key": "watch_interval_s",
             "type": "int",
@@ -145,7 +148,7 @@ def test_allowlist_is_exactly_the_live_db_keys(env_clean: None, tmp_path: Path) 
             "default": "60",
             "min": 0,
             "max": 86400,
-            "requires_restart": True,
+            "requires_restart": False,
             "env_override": False,
         }
         # No wallet provisioned → the watch key reads configured: False with a
@@ -319,7 +322,9 @@ def test_watch_interval_write_matrix_validates_fail_closed_and_value_free(
             assert result["status"] == "applied", good
             assert result["settings"][0]["value"] == good.strip()
             assert store.get_setting("watch_interval_s") == good.strip()
-            assert result["settings"][0]["requires_restart"] is True
+            # TCK-CFG-005: the pump rebinds the running watcher on applied
+            # writes (stored rung is a live reader now) — no restart.
+            assert result["settings"][0]["requires_restart"] is False
 
         for bad in ("-1", "86401", "abc", "0.5", "60.0", "0060", "1e2", "", "  "):
             result = app.handle_settings_request(store, "watch_interval_s", bad)

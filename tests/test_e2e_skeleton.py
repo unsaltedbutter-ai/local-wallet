@@ -6351,6 +6351,247 @@ def test_malformed_selection_settings_refuse_the_selection(
         store.close()
 
 
+# ============ TCK-CFG-005: the coin-policy FILE rung is READ AT USE =========
+#
+# The three chat-managed selection keys used to enter the create_tx
+# handler through the BOOT Settings snapshot — a mid-session config.json
+# write (the CFG-004 chat path's surface) landed only at next launch, even
+# though the entries claimed requires_restart False. The handler now re-
+# resolves env + config file PER SELECTION; these pins write the file AFTER
+# the table (the snapshot moment) and prove the NEXT selection already
+# uses it. The stored-rung twin above (:func:`test_low_fee_consolidation_
+# narrates_the_fold`) always applied live; this is the file rung's half.
+
+
+def _cfg005_ladder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Clean rungs + the config file pointed at this test's tmp dir."""
+    cfg = tmp_path / "config.json"
+    for var in (
+        "LOCALWALLET_GAP_LIMIT",
+        "LOCALWALLET_WATCH_INTERVAL_S",
+        "LOCALWALLET_UTXO_TARGET_MIN_SATS",
+        "LOCALWALLET_UTXO_TARGET_MAX_SATS",
+        "LOCALWALLET_CONSOLIDATE_BELOW_SAT_VB",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("LOCALWALLET_CONFIG_PATH", str(cfg))
+    return cfg
+
+
+def test_file_rung_target_min_applies_to_the_next_selection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``utxo_target_min_sats`` written to config.json mid-session folds
+    on the NEXT create_tx with no restart: min=50000 makes the two 5k
+    coins the step-5 candidates at the slow rung while the 90k coin (>=
+    the new min, < the old default 100k) stays out — the store-rung test
+    asserts the same numbers through the other surface."""
+    from localwallet.config import write_config_file
+
+    _cfg005_ladder(monkeypatch, tmp_path)
+    addrs = derive_fixture_addresses(3)
+    table, store, _wallet, client, _rec, _flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(
+            rec,
+            utxos_by_addr={
+                addrs[0]: [_utxo("a" * 64, 5_000), _utxo("b" * 64, 5_000)],
+                addrs[1]: [_utxo("c" * 64, 120_000)],
+                addrs[2]: [_utxo("d" * 64, 90_000)],
+            },
+        )
+    )
+    try:
+        write_config_file({"utxo_target_min_sats": "50000"})  # AFTER the build
+        created = table[IntentName.CREATE_TX](
+            validate_payload(
+                json.dumps(
+                    {
+                        "v": 0,
+                        "intent": "create_tx",
+                        "params": {
+                            "recipient": SEND_RECIPIENT,
+                            "amount_sats": 110_000,
+                            "fee_target": "slow",
+                        },
+                    }
+                )
+            )
+        )
+        assert created.get("error") is None, created
+        assert created["folded_count"] == 2  # the 50k read landed; 90k stays out
+        assert created["inputs_count"] == 3
+    finally:
+        client.close()
+        store.close()
+
+
+def test_file_rung_consolidate_ceiling_applies_to_the_next_selection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``consolidate_below_sat_vb`` read at use: the fast rung (3 sat/vB)
+    folds under a file ceiling of 4 (written after the table was built)
+    and does NOT fold on a twin table whose file carries only the min —
+    the ceiling is what differs, live, per selection."""
+    from localwallet.config import write_config_file
+
+    _cfg005_ladder(monkeypatch, tmp_path)
+
+    def create(table: dict) -> Any:
+        return table[IntentName.CREATE_TX](
+            validate_payload(
+                json.dumps(
+                    {
+                        "v": 0,
+                        "intent": "create_tx",
+                        "params": {
+                            "recipient": SEND_RECIPIENT,
+                            "amount_sats": 110_000,
+                            "fee_target": "fast",
+                        },
+                    }
+                )
+            )
+        )
+
+    addrs = derive_fixture_addresses(3)
+    wallet = {
+        addrs[0]: [_utxo("a" * 64, 5_000), _utxo("b" * 64, 5_000)],
+        addrs[1]: [_utxo("c" * 64, 120_000)],
+        addrs[2]: [_utxo("d" * 64, 90_000)],
+    }
+    base, store_a, _w, client_a, _r, _f, _s = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr=wallet)
+    )
+    try:
+        write_config_file({"utxo_target_min_sats": "50000"})
+        created = create(base)
+        assert created.get("error") is None, created
+        # the default ceiling (2 sat/vB) never folds the fast rung (3):
+        assert created["folded_count"] == 0
+    finally:
+        client_a.close()
+        store_a.close()
+    # The SAME table shape with the ceiling raised to 4 in the file (after
+    # that twin's own build moment) — the next selection folds:
+    live, store_b, _w, client_b, _r, _f, _s = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr=wallet)
+    )
+    try:
+        write_config_file(
+            {"utxo_target_min_sats": "50000", "consolidate_below_sat_vb": "4"}
+        )
+        created = create(live)
+        assert created.get("error") is None, created
+        assert created["folded_count"] == 2  # 3 sat/vB <= the new ceiling 4
+        assert created["inputs_count"] == 3
+    finally:
+        client_b.close()
+        store_b.close()
+
+
+def test_file_rung_target_max_applies_to_the_next_selection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``utxo_target_max_sats`` read at use: the single-coin improvement
+    (step 3) takes the 120k coin while max rides the default 10M, but a
+    file max of 100k written mid-session PROTECTS it — the next selection
+    keeps the two-coin funding instead."""
+    from localwallet.config import write_config_file
+
+    _cfg005_ladder(monkeypatch, tmp_path)
+
+    def create(table: dict) -> Any:
+        return table[IntentName.CREATE_TX](
+            validate_payload(
+                json.dumps(
+                    {
+                        "v": 0,
+                        "intent": "create_tx",
+                        "params": {
+                            "recipient": SEND_RECIPIENT,
+                            "amount_sats": 110_000,
+                            "fee_target": "slow",
+                        },
+                    }
+                )
+            )
+        )
+
+    addrs = derive_fixture_addresses(3)
+    wallet = {
+        addrs[0]: [_utxo("a" * 64, 60_000), _utxo("b" * 64, 60_000)],
+        addrs[1]: [_utxo("c" * 64, 120_000)],
+        addrs[2]: [],
+    }
+    base, store_a, _w, client_a, _r, _f, _s = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr=wallet)
+    )
+    try:
+        write_config_file({"utxo_target_min_sats": "10000"})  # no step-5 noise
+        created = create(base)
+        assert created.get("error") is None, created
+        assert created["inputs_count"] == 1  # improved onto the 120k coin
+        assert created["folded_count"] == 0
+    finally:
+        client_a.close()
+        store_a.close()
+    live, store_b, _w, client_b, _r, _f, _s = _build_send_table(
+        lambda rec: _send_chain_handler(rec, utxos_by_addr=wallet)
+    )
+    try:
+        write_config_file(
+            {"utxo_target_min_sats": "10000", "utxo_target_max_sats": "100000"}
+        )
+        created = create(live)
+        assert created.get("error") is None, created
+        assert created["inputs_count"] == 2  # 120k protected; pair funds
+        assert created["folded_count"] == 0
+    finally:
+        client_b.close()
+        store_b.close()
+
+
+def test_file_rung_cross_check_refuses_the_selection_value_free(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The file rung participates in the min<max cross-check AT USE (the
+    env twin above pins the same shape through the env rung): a 15M min
+    over the default 10M max refuses the selection, fail-closed, and the
+    refusal names keys only — never the value."""
+    from localwallet.config import write_config_file
+
+    _cfg005_ladder(monkeypatch, tmp_path)
+    addrs = derive_fixture_addresses(1)
+    table, store, _wallet, client, _rec, flow, _session = _build_send_table(
+        lambda rec: _send_chain_handler(
+            rec, utxos_by_addr={addrs[0]: [SEND_UTXO]}
+        )
+    )
+    try:
+        write_config_file({"utxo_target_min_sats": "15000000"})
+        result = table[IntentName.CREATE_TX](
+            validate_payload(
+                json.dumps(
+                    {
+                        "v": 0,
+                        "intent": "create_tx",
+                        "params": {
+                            "recipient": SEND_RECIPIENT,
+                            "amount_sats": SEND_AMOUNT_SATS,
+                        },
+                    }
+                )
+            )
+        )
+        assert result["error"] == "selection_failed"
+        assert "utxo_target_min_sats" in str(result["detail"])
+        assert "15000000" not in json.dumps(result)  # value-free
+        assert flow.pending is None
+    finally:
+        client.close()
+        store.close()
+
+
 # ===================== TCK-FIAT-002: multi-currency display =================
 #
 # The display-currency setting (closed enum usd/eur/gbp/cad/chf/aud/jpy)

@@ -184,12 +184,29 @@ class IncomingWatcher:
         """The RESOLVED poll interval in seconds (``<= 0`` = off).
 
         TCK-UX-012(c): the resolution (env > stored setting > default) lives
-        at the watcher build site; this reader exposes the single resolved
+        at the watcher build site (and at the app's mid-session rebind,
+        :meth:`set_interval_s`); this reader exposes the single resolved
         value the watcher itself gates on, so the app's failure narration can
         name the deterministic retry delay honestly. Value-free: a configured
         timing number only — never a wallet value.
         """
         return self._interval_s
+
+    def set_interval_s(self, interval_s: float) -> None:
+        """Rebind the poll interval IN PLACE (TCK-CFG-005 live apply).
+
+        The app's engine pump calls this between turns when the resolved
+        ``watch_interval_s`` changes mid-session — mutate rather than rebuild
+        precisely because of what THIS object holds in process memory: the
+        ``_seen`` dedup map and the failure-streak flag. A freshly built
+        watcher would re-surface every past incoming transaction as new.
+        ``poll_due`` gates on the NEW interval from its next call;
+        ``_last_tick_at`` is deliberately NOT rebaselined — a SHORTENED
+        interval makes the very next pump cycle due (the live-apply point).
+        Thread model unchanged: no thread is spawned (ADR-0019); the caller's
+        thread (the engine pump) owns every mutation.
+        """
+        self._interval_s = interval_s
 
     def poll_due(self, *, now: float | None = None) -> bool:
         """True when an interval has elapsed since the last poll (or startup).
