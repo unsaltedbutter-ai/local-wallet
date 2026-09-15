@@ -170,9 +170,26 @@ class ElectrumFixture:
     def stop(self) -> None:
         self._stopping.set()
         try:
+            # SHUT_RDWR wakes a thread blocked in accept() (socket.close()
+            # alone does NOT — on Linux the blocked syscall pins the file
+            # reference, so close() wouldn't release the accept and the join
+            # backstop would burn its full 2.0s before timing out).
+            self._server.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # already-dead socket
+        try:
             self._server.close()
         except OSError:
             pass
+        # Join the accept loop so no serve thread can spawn after stop()
+        # returns — otherwise a connect racing the _stopping-check/accept()
+        # window is still accepted and served (a stop-race flake on loaded
+        # runners). Serve threads themselves are daemons and not tracked.
+        self._thread.join(timeout=2.0)
+        # Silent-degradation guard: if the accept loop is wedged the join
+        # above would silently time out at 2.0s every teardown. Never let a
+        # still-live listener masquerade as a stopped fixture.
+        assert not self._thread.is_alive(), "electrum fixture accept thread did not stop"
 
     # -- internals ----------------------------------------------------------
 
@@ -1056,6 +1073,21 @@ class TestRetryPolicy:
         ):
             client.get_tip_height()
         assert len(record_sleeps) == 1
+
+    def test_stopped_fixture_never_serves_a_racing_connect(self, electrum: Any) -> None:
+        # Hardening pin for the stop-race: shutdown() wakes the accept and
+        # the join returns promptly, and once stop() returns the accept
+        # thread is dead (asserted), so every connect is refused, not served
+        # an error envelope. Bounded + fast — no backoff sleeps run here.
+        server = electrum()
+        url = server.url
+        server.stop()
+        for _ in range(20):
+            with (
+                ElectrumClient(base_url=url, timeout_s=1.0, max_retries=0) as client,
+                pytest.raises(ChainError, match=r"network error \(ConnectionRefusedError\)"),
+            ):
+                client.get_tip_height()
 
     def test_error_response_is_not_retried_and_connection_survives(
         self, electrum: Any, record_sleeps: list[float]
