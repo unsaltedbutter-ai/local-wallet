@@ -32,6 +32,18 @@
        title). Color comes from data-privacy + styles.css selectors — no
        inline styles. -->
   <p id="privacy-chip" class="chip privacy" role="status" aria-live="polite" hidden>Privacy notice<span id="privacy-subline" class="privacy-subline"></span></p>
+  <!-- TCK-WEB-027: the wallet-fingerprint chip — a click-to-copy BUTTON
+       beside the privacy chip, driven ONLY by the typed /state snapshot's
+       additive wallet_fingerprint field (the engine-validated closed 8-hex
+       descriptor-origin ACCOUNT-key fingerprint — deliberately NOT the
+       device's master, unknowable watch-only, HW-002). ABSENT field =
+       hidden, never fabricated, never client-derived from the zpub; a
+       typed snapshot that omits the key CLEARS it (watch-key replace);
+       state/0 keeps the last value (the WEB-020/023 discipline — app.js
+       writes textContent/aria-label only on transition). Copy feedback
+       reuses the shared WEB-026 flashCopyResult path: ok/fail classes
+       here + the ONE #copy-status live region. -->
+  <button id="wallet-fp" class="chip wallet-fp" type="button" hidden></button>
   <p id="conn-status" class="status" role="status" aria-live="polite" data-state="connecting">Connecting…</p>
   <button id="settings-toggle" class="btn btn-ghost" type="button" aria-expanded="false" aria-controls="settings-panel">Settings</button>
 </header>

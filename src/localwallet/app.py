@@ -9929,6 +9929,46 @@ class StateSnapshotRequest:
     reply: queue.Queue[dict[str, object]]
 
 
+#: TCK-WEB-027: the CLOSED shape of the ``/state`` ``wallet_fingerprint`` —
+#: the 8-hex ORIGIN fingerprint embedded in the active wallet's descriptor
+#: (``wpkh([f1a2b3c4/84'/0'/0']zpub…``). This is the wallet's ACCOUNT-key
+#: fingerprint, NOT the device's master fingerprint: this project's descriptor
+#: convention carries the account key's own fp as the origin
+#: (wallet/descriptor.py:355-357) and the master fp is unknowable watch-only
+#: (HW-002's root cause — the two DIFFER and the device screen shows the
+#: MASTER). The regex IS the validator: anything not exactly this closed,
+#: lowercase 8-hex shape is omitted, never garbage-shipped.
+_WALLET_FINGERPRINT_RE: Final = re.compile(r"\[([0-9a-f]{8})/")
+
+
+def _active_wallet_fingerprint(store: Store | None) -> str | None:
+    """The active wallet's 8-hex descriptor-origin fingerprint, or ``None``.
+
+    Engine truth: read from the STORED descriptor on the engine thread (the
+    same read :func:`_watch_key_entry` does), never computed by any client
+    and never derived from model output. ``None`` — so the /state field is
+    OMITTED, never empty/fabricated — when there is no store (unprovisioned
+    first-run placeholder), no active wallet, a store read error, or a
+    descriptor whose origin does not carry the closed 8-hex shape. Because
+    the value rides the descriptor, a watch-key REPLACE (the pump rebinds
+    onto the new wiring's store/row) makes the next snapshot carry the NEW
+    wallet's fingerprint with no extra plumbing. Value-free class: a public
+    key identifier the user owns (same disclosure as the token-gated
+    watch_key settings entry) — it rides only the token-gated /state
+    (ADR-0024 §6); never logged.
+    """
+    if store is None:
+        return None
+    try:
+        wallet = store.get_active_wallet()
+    except (StoreError, sqlite3.Error):
+        return None
+    if wallet is None:
+        return None
+    match = _WALLET_FINGERPRINT_RE.search(wallet.descriptor)
+    return match.group(1) if match is not None else None
+
+
 def build_state_snapshot(
     flow: TxFlow,
     session: SendSession,
@@ -9939,6 +9979,7 @@ def build_state_snapshot(
     preload: ModelPreloadFlow | None = None,
     privacy_mode: str | None = None,
     backend_host: str | None = None,
+    wallet_fingerprint: str | None = None,
 ) -> dict[str, object]:
     """The value-free ``/state`` snapshot, built ON the engine thread.
 
@@ -9963,12 +10004,20 @@ def build_state_snapshot(
     extracts with :func:`_configured_url_host`: scheme/port/path/
     credentials already stripped, present only in the host-named modes,
     omitted otherwise). That host is the DOCUMENTED UX-009 display
-    exception to the value-free rule — the user's OWN config shown back
-    to them for the privacy subline ("Your node at <host> …"), the same
+    exception to the value-free rule — the user's OWN config shown back to
+    them for the privacy subline ("Your node at <host> …"), the same
     text the CLI banner and the node_status FACTS already carry; no
     credential can ride it (the parser drops userinfo) and no third-
     party host is ever named (public/local/awaiting modes omit the
-    field). No address,
+    field). — TCK-WEB-027 council fold — the wallet's 8-hex
+    ``wallet_fingerprint`` (the descriptor-origin ACCOUNT-key fingerprint
+    the pump reads from the stored descriptor; the closed shape is
+    validated in the reader, and a wallet-less or unparseable read OMITS
+    the field — never empty, never fabricated). It is the same
+    user-owned-identifier disclosure class as the token-gated watch_key
+    settings entry and rides ONLY the token-gated /state; the field name
+    is deliberately NOT "master" — the device's master fingerprint is
+    unknowable watch-only (HW-002). No address,
     amount, txid, ``tx_ref``, key
     material OR progress byte-count CAN appear — every value is an enum
     NAME, a boolean, a code-owned value-free failure line, or that one
@@ -10017,6 +10066,15 @@ def build_state_snapshot(
         # the new private-IP GREEN). Omitted = nothing to name, never a
         # guess (the ``privacy_mode``/``backend_kind`` absent pattern).
         snapshot["backend_host"] = backend_host
+    if wallet_fingerprint is not None:
+        # TCK-WEB-027 council fold: additive under state/1 (same rule).
+        # The pump precomputed this CLOSED 8-hex wallet fingerprint from
+        # the stored descriptor's origin (:func:`_active_wallet_fingerprint`
+        # — shape-validated there, engine truth only). Omitted = no wallet
+        # provisioned or an unparseable read — absent means "nothing to
+        # show", never an empty string and never a guess (the
+        # ``backend_host``/``privacy_mode`` absent pattern).
+        snapshot["wallet_fingerprint"] = wallet_fingerprint
     if scan is not None and scan.scan_error:
         # TCK-WEB-020: additive under state/1 (same rule): the last
         # scan/rescan failure as a value-free DIAG-001 class line (chain/
@@ -11650,6 +11708,14 @@ def _pump(
             # and the private-IP own_node_private) so the privacy subline
             # can say "Your node at <host> — …". The awaiting hold outranks
             # it too (no server to name while unresolved).
+            # TCK-WEB-027 (council fold): one more additive precomputed
+            # string — the wallet's CLOSED 8-hex fingerprint, read from the
+            # stored descriptor's ORIGIN (engine truth; the ACCOUNT-key fp,
+            # NOT the unknowable device-master fp — HW-002). No store /
+            # no active wallet / malformed shape → None → OMITTED, never
+            # fabricated. A watch-key replace rebinds ``store`` onto the
+            # new wiring before any later snapshot is served, so the field
+            # follows the new descriptor with no extra plumbing.
             privacy_mode = (
                 PRIVACY_MODE_AWAITING_BACKEND
                 if scan is not None and scan.gate.state == PRIVACY_MODE_AWAITING_BACKEND
@@ -11660,6 +11726,7 @@ def _pump(
                 if settings is not None and privacy_mode in _BACKEND_HOST_MODES
                 else None
             )
+            wallet_fingerprint = _active_wallet_fingerprint(store)
             snapshot = build_state_snapshot(
                 flow,
                 session,
@@ -11670,6 +11737,7 @@ def _pump(
                 preload,
                 privacy_mode,
                 backend_host,
+                wallet_fingerprint,
             )
             if provision is not None and provision.wiring is None:
                 snapshot["needs_watch_key"] = True

@@ -55,6 +55,9 @@ const scanChipEl = document.getElementById("scan-chip");
 const scanErrorEl = document.getElementById("scan-error");
 const privacyChipEl = document.getElementById("privacy-chip");
 const privacySublineEl = document.getElementById("privacy-subline");
+// TCK-WEB-027: the header wallet-fingerprint click-to-copy chip (index.html
+// markup; hidden until a typed /state snapshot carries the closed field).
+const walletFpEl = document.getElementById("wallet-fp");
 const settingsToggleEl = document.getElementById("settings-toggle");
 const settingsPanelEl = document.getElementById("settings-panel");
 const settingsHeadingEl = document.getElementById("settings-heading");
@@ -134,6 +137,20 @@ const LABELS = {
   privacyOwnPrivateAt:
     "Your node at {host} — only private if you run this server yourself.",
   privacyAwaiting: "No backend chosen yet.",
+  // TCK-WEB-027: the header wallet-fingerprint chip + the wallet-section
+  // hint. The chip's visible text is "Wallet <fp>" — the WHOLE 8-hex value
+  // verbatim, never truncated mid-hash (the WEB-026 naming rule). The hint
+  // ships the HW-002 honesty adjustment: the ticket's device-parity claim
+  // was FALSE (the chip carries the descriptor-origin ACCOUNT fp; the
+  // device shows its MASTER — they DIFFER watch-only), so the copy says
+  // exactly that. {fp} is substituted ONLY with the regex-gated value
+  // (the privacySublineText {host} discipline).
+  walletFpWord: "Wallet",
+  walletFpCopyName: "Copy wallet fingerprint",
+  walletFpHint:
+    "First characters: {fp} — your wallet's fingerprint. Your hardware " +
+    "wallet shows its own, different number (the device fingerprint) — " +
+    "they won't match, and that's expected.",
   // settings panel (TCK-WEB-005)
   settingsLoading: "Loading…",
   settingsUnavailable: "Could not load settings — the wallet is busy or unreachable.",
@@ -202,10 +219,14 @@ const LABELS = {
   watchKeyEnvOverride:
     "The key was set via environment variable — a replacement takes " +
     "effect once that override is removed.",
+  // TCK-WEB-027: the replace copy must NAME the fingerprint change — the
+  // header chip's number moves with the new key (the sentence is the
+  // ticket's exact wording; "Wallet …" quotes the chip's word pattern).
   watchKeyReplaceConfirm:
     "The cached balance and history belong to the current wallet; " +
     "replacing discards any pending transaction and re-scans for the new " +
-    "one (the old wallet's data stays on this machine, unused). Replace " +
+    "one (the old wallet's data stays on this machine, unused). The " +
+    "header's Wallet … number changes with the new key. Replace " +
     "the wallet's key?",
   watchKeyReplaceYes: "Replace",
   watchKeyReplaceCancel: "Cancel",
@@ -455,6 +476,13 @@ const state = {
   // the last known value like privacyMode. Rendered only through isBareHost.
   // Memory only, never logged (it is a host — the value-free rule).
   backendHost: "",
+  // TCK-WEB-027: the last TYPED snapshot's wallet_fingerprint (the engine-
+  // validated closed 8-hex account-key fingerprint; gated again here — see
+  // WALLET_FP_RE). "" = no chip, no settings hint: field ABSENT on a typed
+  // snapshot clears it (the chip never keeps a dead wallet's number),
+  // state/0 (busy engine) keeps the last value. Never fabricated, never
+  // logged, never derived client-side from the zpub.
+  walletFingerprint: "",
   stateSeq: 0,
   watchKeyDismissed: false,
   watchKeyPresent: null, // null = unknown | true | false (typed state/1 only)
@@ -1114,6 +1142,7 @@ function applyState(snap) {
   }
   applyScanChip(snap);
   applyPrivacyChip(snap);
+  applyWalletFpChip(snap); // TCK-WEB-027: the header fingerprint chip
   applyWatchKeyGate(snap);
   applyModelPrompt(snap);
   // TCK-WEB-021 (8): the settings-door dot (wallet/backend unset — drive
@@ -1451,6 +1480,68 @@ async function refreshState() {
     // server unreachable: leave visibility as-is; the stream status shows it
   }
 }
+
+// ------------------------------------------------- wallet fingerprint chip (TCK-WEB-027)
+// The CLOSED shape again gates the wire here (the engine validates upstream,
+// but every wire value is untrusted — same discipline as isBareHost): any
+// non-matching value counts as ABSENT, never painted, never guessed.
+const WALLET_FP_RE = /^[0-9a-f]{8}$/;
+
+// PURE (node-pinned): the chip's visible text, its value-bearing accessible
+// name, and the settings hint line. Only regex-valid fps ever reach them.
+function walletFpChipText(fp) {
+  return LABELS.walletFpWord + " " + fp;
+}
+
+function walletFpCopyName(fp) {
+  return LABELS.walletFpCopyName + " " + fp;
+}
+
+function walletFpHintText(fp) {
+  const tpl = LABELS.walletFpHint;
+  const at = tpl.indexOf("{fp}");
+  return tpl.slice(0, at) + fp + tpl.slice(at + "{fp}".length);
+}
+
+// Typed-state-only lifecycle (the WEB-020/023 doctrine): DOM writes ONLY on
+// transition — one write per change, the polite copy region never spams.
+// state/0 touches nothing (a busy engine must not flicker the chip); a typed
+// snapshot that OMITS the field clears and hides it (unprovisioned, or a
+// watch-key replace between snapshots). When the settings pane is open the
+// wallet-section hint follows the same typed truth (renderSettings rebuilds
+// from the cached entries — the noteTrustFlip/loadSettings precedent).
+function applyWalletFpChip(snap) {
+  if (!snap || snap.schema !== "state/1") return;
+  const raw = snap.wallet_fingerprint;
+  const fp = typeof raw === "string" && WALLET_FP_RE.test(raw) ? raw : "";
+  if (fp === state.walletFingerprint) return;
+  state.walletFingerprint = fp;
+  walletFpEl.textContent = fp ? walletFpChipText(fp) : "";
+  walletFpEl.hidden = fp === "";
+  if (fp) {
+    // WEB-026 naming rule: the NAME carries the whole value ("Copy wallet
+    // fingerprint f1a2b3c4"), the hover title keeps the plain garnish.
+    walletFpEl.setAttribute("aria-label", walletFpCopyName(fp));
+    walletFpEl.title = LABELS.clickToCopy;
+  } else {
+    walletFpEl.removeAttribute("aria-label");
+    walletFpEl.removeAttribute("title");
+  }
+  if (!settingsPanelEl.hidden) renderSettings();
+}
+
+// Click-to-copy reuses the SHARED WEB-026 machinery as-is — flashCopyResult
+// already takes the value-bearing base name explicitly (it is not address/
+// txid-coupled; clipboardWrite takes the raw fp). No new copy plumbing.
+// The value is read AT CLICK time: a chip re-rendered by a replace can
+// never hand out the OLD wallet's number.
+walletFpEl.addEventListener("click", async () => {
+  const fp = state.walletFingerprint;
+  if (!fp) return;
+  const name = walletFpCopyName(fp);
+  flashCopyResult(walletFpEl, await clipboardWrite(fp), LABELS.clickToCopy, name);
+});
+
 
 // ------------------------------------------------------------- event stream
 
@@ -1865,6 +1956,15 @@ function watchKeyRow(serverEntry) {
   });
   line.appendChild(editBtn);
   li.appendChild(line);
+  // TCK-WEB-027: the wallet section's fingerprint hint line — the same
+  // typed truth the header chip rides, plus the HW-002 honesty note (the
+  // device shows a DIFFERENT number; mismatch is expected). Typed-only:
+  // no known fingerprint, no line — never a guess at a value.
+  if (state.walletFingerprint) {
+    li.appendChild(
+      el("p", "setting-hint", walletFpHintText(state.walletFingerprint)),
+    );
+  }
   if (serverEntry && serverEntry.env_override === true) {
     li.appendChild(el("p", "setting-flag", LABELS.watchKeyEnvOverride));
   }

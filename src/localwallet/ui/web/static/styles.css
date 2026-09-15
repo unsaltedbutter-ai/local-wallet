@@ -233,6 +233,38 @@ body {
   font-size: var(--fs-xs);
   white-space: normal;
 }
+/* TCK-WEB-027: the wallet-fingerprint chip is a click-to-copy BUTTON —
+   .chip was written for <p>s, so the UA font/cursor get reset. NEUTRAL
+   surface ink (it is a public identifier, not a warning — the scan chip's
+   warn color would overstate it); the affordance is the pointer cursor +
+   the hover/focus border. The WEB-026 shared copy states ride the generic
+   .copy-ok/.copy-fail contract (floating ::after word = the non-color
+   cue; position:relative is its anchor). white-space: nowrap keeps
+   "Wallet f1a2b3c4" whole — at 320px the .bar's existing flex-wrap moves
+   the chip as ONE unit onto the next row: the value is never split and
+   the chip never grows the header's height on its own. */
+.wallet-fp {
+  font: inherit;
+  font-size: var(--fs-xs);
+  color: var(--c-text);
+  cursor: pointer;
+  position: relative;
+  white-space: nowrap;
+}
+.wallet-fp:hover,
+.wallet-fp:focus-visible {
+  border-color: var(--c-accent);
+}
+.wallet-fp.copy-ok {
+  color: var(--c-copy-ok);
+  border-color: var(--c-copy-ok);
+  background: var(--c-accent-soft);
+}
+.wallet-fp.copy-fail {
+  color: var(--c-danger);
+  border-color: var(--c-danger);
+  background: var(--c-danger-soft);
+}
 .privacy[data-privacy="public"],
 /* TCK-WEB-013 (2): the settings pane's trust badge is the chip's twin —
    the SAME data-privacy attribute selectors and the SAME --c-priv-* token

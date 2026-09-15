@@ -728,8 +728,12 @@ def test_linkify_client_shape_pins() -> None:
     assert "clipboardWrite(token)" in code
     assert "navigator.clipboard.writeText" in code
     assert '"Click to copy"' in raw
-    # WEB-010 ok/fail feedback pattern shared: one helper, both copy controls
-    assert code.count("flashCopyResult(") == 3
+    # WEB-010 ok/fail feedback pattern shared: one helper, three call sites —
+    # the token button, the bubble button, and (TCK-WEB-027) the header
+    # wallet-fingerprint chip. Any NEW copy affordance must ride the helper,
+    # never re-implement it — the count going up with a new flashCopyResult
+    # CALLER is the pin doing its job; an unshared copy path is the failure.
+    assert code.count("flashCopyResult(") == 4
     assert code.count("1600") == 1  # the revert window lives in the helper only
     assert ".style" not in code and "setAttribute(\"style\"" not in code
     # only the two bubble painters call the token pass (appendText,
@@ -1499,6 +1503,7 @@ def test_stuck_pending_bubble_reconciles_from_typed_idle_state_under_node() -> N
       const clearPendingBubble = () => { clears++; state.pendingBubble = null; };
       const visibleActions = () => [];
       const applyScanChip = () => {}; const applyPrivacyChip = () => {};
+      const applyWalletFpChip = () => {}; // TCK-WEB-027 chip painter (own harness)
       const applyWatchKeyGate = () => {}; const applyModelPrompt = () => {};
       const paintSettingsDot = () => {}; const noteTrustFlip = () => {};
       const settingsPanelEl = { hidden: true };
@@ -2262,3 +2267,163 @@ def test_web023_chip_lifecycle_pill_repaint_under_node() -> None:
     """
     )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# ============================================================== TCK-WEB-027
+# Wallet-fingerprint header chip (static half; the typed /state field and its
+# closed 8-hex shape are engine-pinned in test_engine_pump). The value is the
+# descriptor-origin ACCOUNT-key fingerprint — NEVER the device's master
+# (HW-002) — so every copy line keeps that honesty. Lifecycle is typed-state-
+# only: present = shown VERBATIM, absent = hidden (never fabricated, never
+# client-derived), typed-omit = cleared, state/0 = keeps the last value;
+# one DOM write per transition. Click-to-copy rides the SHARED WEB-026
+# flashCopyResult path with the value-bearing accessible name
+# "Copy wallet fingerprint <fp>".
+
+def test_web027_chip_markup_and_source_pins() -> None:
+    index_html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    # markup: a click-to-copy BUTTON beside the privacy chip (before the
+    # conn status), starting hidden, no role=status of its own (feedback
+    # rides the ONE shared #copy-status region), no inline handler/style.
+    chip = '<button id="wallet-fp" class="chip wallet-fp" type="button" hidden></button>'
+    assert chip in index_html
+    assert index_html.index('id="privacy-chip"') < index_html.index(chip)
+    assert index_html.index(chip) < index_html.index('id="conn-status"')
+    assert not re.search(r"\son[a-z]+=", index_html)  # global pin, restated
+    # typed-only lifecycle: state/1 gate, regex gate, transition gate,
+    # verbatim textContent, hide-on-empty, name-bearing aria-label.
+    fn = re.search(
+        r"function applyWalletFpChip\(snap\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert 'snap.schema !== "state/1"' in fn
+    assert "WALLET_FP_RE.test(raw)" in fn
+    assert "if (fp === state.walletFingerprint) return;" in fn  # one write/change
+    assert 'walletFpEl.textContent = fp ? walletFpChipText(fp) : "";' in fn
+    assert 'walletFpEl.hidden = fp === "";' in fn
+    assert "walletFpEl.setAttribute(\"aria-label\", walletFpCopyName(fp));" in fn
+    assert "removeAttribute" in fn  # hidden chip carries no stale name
+    assert ".style" not in fn and "innerHTML" not in fn
+    # exactly ONE reader of the wire key exists (the painter).
+    assert code.count("wallet_fingerprint") == 1
+    # wired into the snapshot path beside the other chips.
+    assert "applyPrivacyChip(snap);\n  applyWalletFpChip(snap);" in code
+    # click-to-copy rides the SHARED helper with the value read AT CLICK
+    # (no new copy machinery, no stale-render value).
+    wiring = code[code.index('walletFpEl.addEventListener("click"'):
+                  code.index("function handleEvent(id")]
+    assert "state.walletFingerprint" in wiring
+    assert "flashCopyResult(walletFpEl, await clipboardWrite(fp)" in wiring
+    # settings wallet section: the hint line rides the same typed truth.
+    wk = code[code.index("function watchKeyRow"):code.index("function watchKeyInput")]
+    assert "if (state.walletFingerprint) {" in wk
+    assert "walletFpHintText(state.walletFingerprint)" in wk
+    assert 'el("p", "setting-hint"' in wk
+    # CSS: token-only chip-button reset; nowrap = the 320px no-layout-shift
+    # guarantee (the .bar's existing flex-wrap moves the whole chip, the
+    # value never splits mid-hash — the existing block-pin pattern).
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    block = css[css.index(".wallet-fp {"):]
+    block = block[: block.index("}")]
+    for decl in ("font: inherit;", "cursor: pointer;", "white-space: nowrap;",
+                 "position: relative;", "color: var(--c-text);"):
+        assert decl in block, decl
+    assert "#" not in block  # no hardcoded visual values — tokens only
+    bar = css[css.index(".bar {"):]
+    assert "flex-wrap: wrap;" in bar[: bar.index("}")]  # 320px-safe family
+    # the WEB-026 shared ok/fail states reach the chip (copy feedback).
+    assert ".wallet-fp.copy-ok {" in css and ".wallet-fp.copy-fail {" in css
+
+
+def test_web027_chip_lifecycle_copy_and_label_copy_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    labels = re.search(r"const LABELS = \{.*?\n\};", code, re.DOTALL).group(0)
+    leak = re.search(r"const PUBLIC_LEAK_SENTENCE =.*?;\n", code, re.DOTALL).group(0)
+    block = code[code.index("const WALLET_FP_RE"):code.index("function handleEvent(id")]
+    script = (
+        """
+      const state = { walletFingerprint: "" };
+      let fpWrites = 0, paneRenders = 0;
+      const walletFpEl = {
+        hidden: true, _t: "", attrs: {}, title: "", handler: null,
+        set textContent(v) { fpWrites++; this._t = v; },
+        get textContent() { return this._t; },
+        setAttribute(k, v) { this.attrs[k] = v; },
+        removeAttribute(k) { delete this.attrs[k]; },
+        addEventListener(kind, fn) { this.handler = fn; },
+      };
+      const settingsPanelEl = { hidden: true };
+      const renderSettings = () => { paneRenders++; };
+      let copied = null;
+      const clipboardWrite = async (t) => { copied = t; return true; };
+      const flashCalls = [];
+      const flashCopyResult = (ctrl, ok, baseTitle, baseAria) => {
+        flashCalls.push([ctrl === walletFpEl, ok, baseTitle, baseAria]);
+      };
+      __LABELS__
+      __BLOCK__
+      // present -> shown VERBATIM, value-bearing name, ONE write.
+      applyWalletFpChip({ schema: "state/1", wallet_fingerprint: "f1a2b3c4" });
+      if (walletFpEl.hidden) throw new Error("hidden-when-present");
+      if (walletFpEl.textContent !== "Wallet f1a2b3c4") throw new Error("text");
+      if (walletFpEl.attrs["aria-label"] !== "Copy wallet fingerprint f1a2b3c4") throw new Error("name");
+      if (fpWrites !== 1) throw new Error("write-count");
+      const w1 = fpWrites;
+      // identical snapshot re-applied -> zero DOM writes (transition gate).
+      applyWalletFpChip({ schema: "state/1", wallet_fingerprint: "f1a2b3c4" });
+      if (fpWrites !== w1) throw new Error("spam");
+      // state/0 (busy engine) keeps the last value untouched.
+      applyWalletFpChip({ schema: "state/0" });
+      applyWalletFpChip(null);
+      if (fpWrites !== w1 || walletFpEl.hidden || state.walletFingerprint !== "f1a2b3c4") throw new Error("state0");
+      // click-to-copy rides the SHARED helper with the whole value.
+      await walletFpEl.handler();
+      if (copied !== "f1a2b3c4") throw new Error("copy-value");
+      const call = flashCalls[flashCalls.length - 1];
+      if (!call[0] || call[1] !== true || call[2] !== LABELS.clickToCopy
+          || call[3] !== "Copy wallet fingerprint f1a2b3c4") throw new Error("copy-wiring");
+      // typed snapshot OMITS the field -> cleared + hidden, name gone
+      // (unprovisioned / replace in flight: never a stale or empty chip).
+      applyWalletFpChip({ schema: "state/1" });
+      if (!walletFpEl.hidden || walletFpEl.textContent !== "" || "aria-label" in walletFpEl.attrs) throw new Error("omit-clears");
+      // a hidden chip's click is a no-op (nothing to copy, nothing flashed).
+      const n = flashCalls.length;
+      await walletFpEl.handler();
+      if (flashCalls.length !== n) throw new Error("ghost-copy");
+      // junk shapes are REFUSED at the gate (the wire is untrusted): never
+      // painted, never a partial render — uppercase/short/long/markup/non-string.
+      for (const bad of ["F1A2B3C4", "f1a2b3c", "f1a2b3c45", "<img src=x>",
+                         "f1a2b3c4 onerror", 12345678, null, {}, "0xdeadbeef"]) {
+        applyWalletFpChip({ schema: "state/1", wallet_fingerprint: bad });
+        if (!walletFpEl.hidden || walletFpEl.textContent !== "") throw new Error("junk:" + bad);
+      }
+      // the hint + chip + name texts render the WHOLE value, never truncated.
+      const hint = walletFpHintText("f1a2b3c4");
+      if (hint !== "First characters: f1a2b3c4 — your wallet's fingerprint. "
+                 + "Your hardware wallet shows its own, different number "
+                 + "(the device fingerprint) — they won't match, and that's expected.") throw new Error("hint-copy");
+      if (hint.includes("{fp}")) throw new Error("placeholder-leak");
+      if (walletFpChipText("abcdef01") !== "Wallet abcdef01") throw new Error("chip-text");
+      // the ticket's exact replace-copy sentence ships in the confirm rung.
+      if (!LABELS.watchKeyReplaceConfirm.includes(
+          "The header's Wallet … number changes with the new key.")) throw new Error("replace-copy");
+      // open pane follows the same typed truth — render only ON transition.
+      settingsPanelEl.hidden = false;
+      applyWalletFpChip({ schema: "state/1", wallet_fingerprint: "abcdef01" });
+      if (paneRenders !== 1) throw new Error("pane-flip");
+      applyWalletFpChip({ schema: "state/1", wallet_fingerprint: "abcdef01" });
+      if (paneRenders !== 1) throw new Error("pane-spam");
+      console.log("ok");
+    """
+        .replace("__LABELS__", leak + labels)
+        .replace("__BLOCK__", block)
+    )
+    subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        check=True, capture_output=True, text=True,
+    )

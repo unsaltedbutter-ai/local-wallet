@@ -21,6 +21,7 @@ Pins the queue-driven turn pump:
 from __future__ import annotations
 
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -357,10 +358,11 @@ def test_state_snapshot_request_is_answered_on_the_engine_thread(
     real_build = app.build_state_snapshot
 
     def spy_build(flow, session, watcher, scan=None, model=None, backend_kind=None,
-                  preload=None, privacy_mode=None, backend_host=None):
+                  preload=None, privacy_mode=None, backend_host=None,
+                  wallet_fingerprint=None):
         build_threads.append(threading.get_ident())
         return real_build(flow, session, watcher, scan, model, backend_kind, preload,
-                          privacy_mode, backend_host)
+                          privacy_mode, backend_host, wallet_fingerprint)
 
     monkeypatch.setattr(app, "build_state_snapshot", spy_build)
     events: list[EngineEvent] = []
@@ -1015,3 +1017,206 @@ def test_run_session_flows_through_the_queue_harness(
     assert texts  # the respond turn narrated
     assert all(text in outputs for text in texts)  # CLI forwarding intact
     assert [t for t in threading.enumerate() if t.name == "engine"] == []
+
+
+# --------------------------------------------- TCK-WEB-027 wallet fingerprint
+
+#: A second REAL mainnet BIP84 account key (BIP39 test vector seed
+#: "abandon … about", m/84'/0'/0') so the replace pin names a genuinely
+#: different wallet — never a fake key (the gated parser must accept it).
+ZPUB_B = (
+    "zpub6rCLFr1h7Jqbumwox2F3vW12jj4PsVVtCBJEyshncxUdPiWDbWRYwq5uP4TTtxM1"
+    "iaKr2xATbESKb87rFHP2nF4Coz84QDbqKUfTUAXkZnV"
+)
+#: Pinned descriptor-ORIGIN fingerprints (ACCOUNT-key fps, wallet/descriptor
+#: convention — the device MASTER fp is unknowable watch-only, HW-002).
+FP_ZPUB = "79e427d6"
+FP_ZPUB_B = "85f9fd4d"
+
+_FP_SHAPE = re.compile(r"[0-9a-f]{8}")
+
+
+def _fingerprint_snapshot(bootstrap: Any) -> dict[str, object]:
+    """One typed /state read through a real engine pump (the WEB-010 source
+    rule: the field is precomputed at the PUMP call site, so tests drive the
+    pump, never the builder)."""
+    events: list[EngineEvent] = []
+    handle = app.start_engine(bootstrap, events.append)
+    try:
+        snap = handle.request_state(5.0)
+    finally:
+        handle.shutdown()
+        assert handle.thread is not None
+        handle.thread.join(10)
+    assert snap is not None
+    return snap
+
+
+def _store_bootstrap(tmp_path: Path, *descriptor_rows: tuple[str, str]) -> Any:
+    """Bootstrap building an engine-thread Store with the given
+    (name, descriptor) wallets; the LAST row is the active one."""
+    from localwallet.config import Settings
+
+    def bootstrap() -> app.EngineContext:
+        store = Store(str(tmp_path / "fp.db"))
+        wallet = None
+        for name, descriptor in descriptor_rows:
+            wallet = store.create_wallet(name, descriptor)
+        if wallet is not None:
+            store.set_active_wallet(wallet.id)
+        return app.EngineContext(
+            loop=_make_loop(),
+            flow=TxFlow(),
+            session=app.SendSession(),
+            table={IntentName.RESPOND: app._respond_handler},
+            store=store,
+            settings=Settings(chain_base_url=""),
+        )
+
+    return bootstrap
+
+
+def test_state_snapshot_carries_wallet_fingerprint_from_known_descriptor(
+    tmp_path: Path,
+) -> None:
+    """Done-when 1+6: the additive /state field carries the 8-hex origin fp
+    of the STORED descriptor, verbatim and lowercase — engine truth read
+    from the row built from the fixture zpub (pinned value, not recomputed)."""
+    snap = _fingerprint_snapshot(
+        _store_bootstrap(
+            tmp_path, ("default", app.WalletDescriptor.from_key(ZPUB).descriptor)
+        )
+    )
+    fp = snap["wallet_fingerprint"]
+    assert fp == FP_ZPUB
+    assert _FP_SHAPE.fullmatch(fp)
+
+
+def test_state_snapshot_omits_wallet_fingerprint_when_unprovisioned(
+    tmp_path: Path,
+) -> None:
+    """Done-when 2: no store (first-run placeholder) or a store with no
+    active wallet → the field is ABSENT — never empty, never fabricated
+    (the ``privacy_mode``/``backend_host`` absent pattern)."""
+    assert "wallet_fingerprint" not in _fingerprint_snapshot(_bare_context())
+    assert "wallet_fingerprint" not in _fingerprint_snapshot(
+        _store_bootstrap(tmp_path)
+    )
+
+
+def test_wallet_fingerprint_reader_enforces_the_closed_shape(
+    tmp_path: Path,
+) -> None:
+    """Done-when 4: the regex IS the validator — the lowercase 8-hex origin
+    rides verbatim; uppercase, malformed, or descriptor-less rows yield
+    ``None`` (the /state field is then omitted by the builder), never
+    garbage and never a normalization."""
+    store = Store(str(tmp_path / "shape.db"))
+    cases = (
+        ("wpkh([abcdef01/84'/0'/0']x/{0,1}/*)", "abcdef01"),
+        ("wpkh([DEADBEEF/84'/0'/0']x/{0,1}/*)", None),  # not lowercase
+        ("wpkh([deadbee/84'/0'/0']x/{0,1}/*)", None),  # 7 hex — too short
+        ("desc", None),  # no origin at all
+    )
+    for i, (descriptor, expected) in enumerate(cases):
+        wallet = store.create_wallet(f"w{i}", descriptor)
+        store.set_active_wallet(wallet.id)
+        got = app._active_wallet_fingerprint(store)
+        assert got == expected, descriptor
+    # Store-read failure degrades to omission, never a raise:
+    store.close()
+    assert app._active_wallet_fingerprint(store) is None
+    assert app._active_wallet_fingerprint(None) is None
+
+
+def test_watch_key_provision_and_replace_moves_the_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Done-when 3: through the REAL provision path on one pump —
+    unprovisioned snapshot OMITS the field; accepting the fixture zpub
+    makes it carry FP_ZPUB; an explicit REPLACE onto ZPUB_B (which the pump
+    answers with the old-cache note) makes the NEXT snapshot carry the NEW
+    wallet's FP_ZPUB_B — the field follows the descriptor by construction.
+    The replace copy (static half) must name this change."""
+    for var in (
+        app.ZPUB_ENV_VAR, app.CHAIN_BASE_URL_ENV_VAR, app.GAP_LIMIT_ENV_VAR,
+        app.SIGNER_ENV_VAR, app.SIGNER_DIR_ENV_VAR, app.WATCH_INTERVAL_ENV_VAR,
+        app.AUTO_SCAN_ENV_VAR,
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        app,
+        "_build_chain_client",
+        lambda settings, auth=None: None,  # unresolved backend: never built
+    )
+    from localwallet.config import Settings
+
+    prov = app.WatchKeyProvision(
+        settings=Settings(store_path=str(tmp_path / "rep.db"), watch_interval_s=0.0),
+        signer_selection=app.SignerSelection(
+            kind="file", dir_path=tmp_path / "psbt", fingerprint_hex="00000000"
+        ),
+        env_gap=None,
+        rescan=False,
+        flow=None,
+        generate=app.stub_generate,
+        node_detect_fn=None,
+        output_fn=lambda _s: None,
+    )
+    events: list[EngineEvent] = []
+    emitter = EventEmitter(events.append)
+    commands: queue.Queue[Any] = queue.Queue()
+
+    def _snap() -> queue.Queue[dict[str, object]]:
+        reply: queue.Queue[dict[str, object]] = queue.Queue()
+        commands.put(app.StateSnapshotRequest(app.STATE_SNAPSHOT_COMMAND, reply))
+        return reply
+
+    pre = _snap()
+    commands.put(app.WatchKeyRequest(app.WATCHKEY_COMMAND, ZPUB, queue.Queue()))
+    post = _snap()
+    commands.put(
+        app.WatchKeyRequest(app.WATCHKEY_COMMAND, ZPUB_B, queue.Queue(), True)
+    )
+    replaced = _snap()
+    commands.put(app.QUIT)
+    app._pump(
+        _make_loop(),
+        emitter.text,
+        commands,
+        flow=TxFlow(),
+        session=app.SendSession(),
+        table={},
+        emitter=emitter,
+        provision=prov,
+    )
+    assert "wallet_fingerprint" not in pre.get()  # unprovisioned: omitted
+    assert post.get()["wallet_fingerprint"] == FP_ZPUB
+    snap = replaced.get()
+    assert snap["wallet_fingerprint"] == FP_ZPUB_B  # follows the NEW key
+    assert any(
+        e.kind == EVENT_TEXT and e.payload == app._WATCHKEY_REPLACED_NOTE
+        for e in events
+    )
+    if prov.wiring is not None:
+        prov.wiring.worker.stop()
+        prov.wiring.store.close()
+
+
+def test_build_state_snapshot_fingerprint_is_the_only_source() -> None:
+    """Done-when 5+6 (structure): the builder adds framing NOTHING — the
+    kwarg rides verbatim or the key is absent; and the snapshot carries no
+    descriptor/zpub material a client could derive (or "correct") the
+    fingerprint from — the field is the only source."""
+    bare = app.build_state_snapshot(TxFlow(), app.SendSession(), None)
+    assert "wallet_fingerprint" not in bare
+    with_fp = app.build_state_snapshot(
+        TxFlow(), app.SendSession(), None, wallet_fingerprint=FP_ZPUB
+    )
+    assert with_fp["wallet_fingerprint"] == FP_ZPUB
+    text = repr(with_fp)
+    assert ZPUB not in text and "zpub" not in text and "wpkh" not in text
+    # /state gating is UNCHANGED (no new surface): the field rides the one
+    # token-gated GET /state (pinned endpoint-wide in
+    # test_web_server.test_every_endpoint_requires_token_and_replies_http_1_0).
+
