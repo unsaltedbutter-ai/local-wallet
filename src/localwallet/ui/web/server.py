@@ -107,6 +107,12 @@ SEND_TIMEOUT_S: Final[float] = 30.0
 #: Ring buffer capacity (§5 replay window) and the per-connection queue cap.
 RING_SIZE: Final[int] = 2048
 QUEUE_MAXSIZE: Final[int] = 512
+#: Bounded engine/transport join at :meth:`WebServer.stop` (TCK-WEB-029) —
+#: QUIT is honored between turns (never-cancel), so the join waits for the
+#: in-flight turn to drain up to this bound; a wedged engine is abandoned
+#: (daemon) rather than hanging shutdown (F4.4). Same 5s drain bound the
+#: test-side joins reuse (TCK-TEST-002).
+_STOP_DRAIN_S: Final[float] = 5.0
 
 #: TCK-QR-001 shape rule — the EXACT client regex (app.js ``ADDRESS_RE``):
 #: lowercase mainnet bech32 only ("bc1" + BIP-173 charset, total 14..90).
@@ -1023,8 +1029,12 @@ class WebServer:
         self.httpd.shutdown()
         self.httpd.server_close()
         self.handle.shutdown()
+        # TCK-WEB-029: join the engine thread we just QUIT (never-cancel:
+        # the in-flight turn drains up to the bound, then it is abandoned).
+        if self.handle.thread is not None:
+            self.handle.thread.join(_STOP_DRAIN_S)
         if self._thread is not None:
-            self._thread.join(5)
+            self._thread.join(_STOP_DRAIN_S)
 
     def wait(self, timeout: float | None = None) -> bool:
         return self._stopped.wait(timeout)

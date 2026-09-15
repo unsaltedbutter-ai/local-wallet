@@ -14932,9 +14932,11 @@ def _run_web(
             # the engine thread inside provision()).
             wiring = provision.wiring
         if wiring is not None:
-            # server.stop() pushed QUIT and joined the engine thread (whose
-            # pump drained the startup scan to completion before returning);
-            # stopping the chain worker joins its idle loop. The httpx-backed
+            # server.stop() pushed QUIT and joined the engine thread (bounded
+            # by the production drain bound, TCK-WEB-029) — its pump drained
+            # the startup scan to completion within the bound; past it the
+            # daemon engine is abandoned; stopping the
+            # chain worker joins its idle loop. The httpx-backed
             # client has no thread affinity, closing after the worker is
             # fine. The Store is deliberately NOT closed from this thread
             # (check_same_thread pins it to the engine): the store is

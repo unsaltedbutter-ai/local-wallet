@@ -113,9 +113,9 @@ def test_bare_entry_launches_web(
         assert not any(line.startswith("Privacy notice:") for line in outputs)
     finally:
         server.stop()
-        # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() only
-        # joins the httpd thread) so it cannot leak into another test's
-        # threading.enumerate() check. Bound = the production drain.
+        # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() now
+        # does this too, TCK-WEB-029; this is a redundant safety net) so it
+        # cannot leak into another test's threading.enumerate() check.
         if server.handle.thread is not None:
             server.handle.thread.join(5)
         thread.join(15)
@@ -177,9 +177,9 @@ def test_web_flag_overrides_cli_env(
     thread.start()
     assert gate.wait(30)
     capture["server"].stop()
-    # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() only
-    # joins the httpd thread) so it cannot leak into another test's
-    # threading.enumerate() check. Bound = the production drain.
+    # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() now
+    # does this too, TCK-WEB-029; this is a redundant safety net) so it
+    # cannot leak into another test's threading.enumerate() check.
     if capture["server"].handle.thread is not None:
         capture["server"].handle.thread.join(5)
     thread.join(15)
@@ -224,9 +224,9 @@ def test_browser_open_failure_is_not_fatal(
     url_line = next(line for line in outputs if line.startswith("Web UI: "))
     url = url_line[len("Web UI: ") :]
     server.stop()
-    # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() only
-    # joins the httpd thread) so it cannot leak into another test's
-    # threading.enumerate() check. Bound = the production drain.
+    # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() now
+    # does this too, TCK-WEB-029; this is a redundant safety net) so it
+    # cannot leak into another test's threading.enumerate() check.
     if server.handle.thread is not None:
         server.handle.thread.join(5)
     thread.join(15)
@@ -258,9 +258,9 @@ def test_run_web_does_not_open_a_browser_without_the_flag(
     thread.start()
     assert gate.wait(30)
     capture["server"].stop()
-    # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() only
-    # joins the httpd thread) so it cannot leak into another test's
-    # threading.enumerate() check. Bound = the production drain.
+    # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() now
+    # does this too, TCK-WEB-029; this is a redundant safety net) so it
+    # cannot leak into another test's threading.enumerate() check.
     if capture["server"].handle.thread is not None:
         capture["server"].handle.thread.join(5)
     thread.join(15)
@@ -373,9 +373,9 @@ def test_fixed_port_is_honored(monkeypatch: pytest.MonkeyPatch) -> None:
         assert server.httpd.server_address[1] == port
     finally:
         server.stop()
-        # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() only
-        # joins the httpd thread) so it cannot leak into another test's
-        # threading.enumerate() check. Bound = the production drain.
+        # FLAKE-FIX TCK-TEST-002: join the daemon engine thread (stop() now
+        # does this too, TCK-WEB-029; this is a redundant safety net) so it
+        # cannot leak into another test's threading.enumerate() check.
         if server.handle.thread is not None:
             server.handle.thread.join(5)
         thread.join(15)

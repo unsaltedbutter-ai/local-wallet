@@ -54,9 +54,10 @@ def serve(tmp_path: Path) -> Any:
     yield _serve
     for server in servers:
         server.stop()
-        # FLAKE-FIX TCK-TEST-002: stop() only joins the httpd thread, never
-        # the daemon engine thread. Join it so no engine thread leaks into a
-        # later test's threading.enumerate() check. Bound = production drain.
+        # FLAKE-FIX TCK-TEST-002: stop() now joins the engine thread too
+        # (TCK-WEB-029); the manual join is a redundant safety net so no
+        # engine thread leaks into a later test's threading.enumerate()
+        # check.
         if server.handle.thread is not None:
             server.handle.thread.join(5)
 

@@ -109,10 +109,11 @@ def serve(tmp_path: Path) -> Any:
     yield _serve
     for server in servers:
         server.stop()
-        # FLAKE-FIX (TCK-TEST-002): stop() only joins the httpd thread, never
-        # the daemon engine thread. Join it here so no engine thread leaks
-        # into the next test's `threading.enumerate()` (the CLI-default check
-        # races leaked engine-thread death). Bound = the production drain.
+        # FLAKE-FIX (TCK-TEST-002): stop() now joins the engine thread too
+        # (TCK-WEB-029); the manual join is a redundant safety net so no
+        # engine thread leaks into the next test's `threading.enumerate()`
+        # (the CLI-default check races leaked engine-thread death). Bound =
+        # the production drain.
         if server.handle.thread is not None:
             server.handle.thread.join(5)
 
@@ -638,7 +639,9 @@ def test_stop_unblocks_parked_sse_thread_and_joins_the_engine(
     assert stream.read_to_eof(timeout=10.0) >= 0  # sentinel tore the stream down
     thread = server.handle.thread
     assert thread is not None
-    thread.join(10)
+    # TCK-WEB-029: production stop() joins the engine thread it QUITs
+    # (bounded by the production drain bound), so it is already dead here —
+    # no test-side join needed.
     assert thread.is_alive() is False  # QUIT honored between turns, thread joined
     stream.close()
     server.stop()  # idempotent
