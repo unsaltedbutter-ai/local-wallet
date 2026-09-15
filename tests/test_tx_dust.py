@@ -206,17 +206,38 @@ class TestValidationFailClosed:
 
 
 class TestMinRelayFloor:
+    """TCK-FEE-005: the floor's unit is integer CENTISAT/vB, the default is
+    Core's ``DEFAULT_MIN_RELAY_TX_FEE`` = 100 sat/kvB = 0.1 sat/vB = 10."""
+
     def test_default_is_core_minrelaytxfee(self):
-        # Core DEFAULT_MIN_RELAY_TX_FEE = 1000 sat/kvB = 1 sat/vB.
-        assert min_relay_fee_vbytes(141) == 141
-        assert min_relay_fee_vbytes(110, 1) == 110
+        # Core policy.h DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB = 0.1 sat/vB
+        # (master AND v31.0) — ceil, never under (a FLOOR must cover).
+        assert min_relay_fee_vbytes(141) == 15  # ceil(141 × 0.1)
+        assert min_relay_fee_vbytes(110) == 11
+        assert min_relay_fee_vbytes(10) == 1  # ceil(1.0) = 1
+        assert min_relay_fee_vbytes(1001) == 101  # ceil(100.1) -> 101
+
+    def test_whole_sat_rates_reproduce_the_legacy_product(self):
+        # Unit conversion is value-preserving at whole sat/vB (100 cents):
+        # the FEE-003/004-era 1 sat/vB numbers stand as EXPLICIT rates.
+        assert min_relay_fee_vbytes(110, 100) == 110
+        assert min_relay_fee_vbytes(141, 100) == 141
+
+    def test_rail_matches_the_estimator_assumed_floor(self):
+        # ONE source of truth (TCK-FEE-005): the build gate's default rail
+        # and chain/fees.py's fail-closed assumed floor can never diverge —
+        # a clamp-clean bid must never die at the gate.
+        from localwallet.chain.fees import _ASSUMED_MIN_RELAY_CENTISAT_VB
+        from localwallet.tx.dust import _DEFAULT_MIN_RELAY_CENTISAT_VB
+
+        assert _DEFAULT_MIN_RELAY_CENTISAT_VB == _ASSUMED_MIN_RELAY_CENTISAT_VB == 10
 
     def test_floor_is_at_least_one_sat(self):
         assert min_relay_fee_vbytes(0) == 1
         assert min_relay_fee_vbytes(0, 0) == 1
 
     def test_scales_with_rate(self):
-        assert min_relay_fee_vbytes(141, 5) == 705
+        assert min_relay_fee_vbytes(141, 500) == 705  # 5 sat/vB, exact
 
     @pytest.mark.parametrize("vsize", [-1, 100_001])
     def test_bad_vsize_value_refused(self, vsize):
@@ -228,8 +249,9 @@ class TestMinRelayFloor:
         with pytest.raises(TypeError):
             min_relay_fee_vbytes(vsize)
 
-    @pytest.mark.parametrize("rate", [-1, 10_001])
+    @pytest.mark.parametrize("rate", [-1, 1_000_001])
     def test_bad_rate_value_refused(self, rate):
+        # Bounds in centisat/vB: the physical ceiling stays 10_000 sat/vB.
         with pytest.raises(ValueError):
             min_relay_fee_vbytes(100, rate)
 
@@ -240,4 +262,4 @@ class TestMinRelayFloor:
 
     def test_standardness_bound_is_core_max_weight(self):
         # 100_000 vB == MAX_STANDARD_TX_WEIGHT (400_000 WU) / 4 is accepted.
-        assert min_relay_fee_vbytes(100_000) == 100_000
+        assert min_relay_fee_vbytes(100_000) == 10_000  # × 0.1 sat/vB

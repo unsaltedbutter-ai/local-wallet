@@ -388,7 +388,8 @@ class TestPolicyRefusals:
             )
 
     def test_fee_below_min_relay_refused(self):
-        # 300 sats in, 294 out: fee 6 sats is below the 110-vB floor at 1 sat/vB.
+        # 300 sats in, 294 out: fee 6 sats is below the 110-vB floor of 11
+        # sats at the Core-default 0.1 sat/vB rail (TCK-FEE-005).
         with pytest.raises(PsbtError):
             build_unsigned_psbt(
                 [source("ab" * 32, 0, 300)],

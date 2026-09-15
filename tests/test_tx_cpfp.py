@@ -164,13 +164,17 @@ class TestUnconfirmedInputHandling:
 
 class TestFeeRateBoundsRefusals:
     def test_rate_below_min_relay_refused(self) -> None:
-        # 0.99 sat/vB: fee 109 < the size-derived relay floor of 110 sats.
+        # TCK-FEE-005 rail: 0.09 sat/vB -> fee 10 < the size-derived floor
+        # of 11 sats (ceil(110 × 0.1)). The exact rail edge passes.
         with pytest.raises(CpfpError) as exc:
-            build(100_000, 99)
+            build(100_000, 9)
         assert exc.value.reason is CpfpRefusalReason.RATE_BELOW_MIN_RELAY
-        # the exact 1 sat/vB edge passes (fee == min_relay for this size)
-        assert min_relay_fee_vbytes(VSIZE_1) == VSIZE_1
-        assert build(100_000, 100).fee_sats == VSIZE_1
+        assert min_relay_fee_vbytes(VSIZE_1) == 11  # 110 × 10/100, exact
+        assert build(100_000, 10).fee_sats == 11  # at the rail: accepted
+        # And the over-floored band the whole FEE-005 fix is about: 0.99
+        # sat/vB (fee 109) was refused under the old 1 sat/vB gate — a
+        # default node relays it, so it now BUILDS.
+        assert build(100_000, 99).fee_sats == 109
 
     def test_fee_exceeds_funds_refused(self) -> None:
         # 1000 sat/vB on a 2000-sat coin: the bounded fee is unpayable.
@@ -197,7 +201,7 @@ class TestFeeRateBoundsRefusals:
     @pytest.mark.parametrize(
         ("value", "rate", "expected"),
         [
-            (100_000, 99, CpfpRefusalReason.RATE_BELOW_MIN_RELAY),
+            (100_000, 9, CpfpRefusalReason.RATE_BELOW_MIN_RELAY),
             (2_000, 100_000, CpfpRefusalReason.FEE_EXCEEDS_FUNDS),
         ],
     )

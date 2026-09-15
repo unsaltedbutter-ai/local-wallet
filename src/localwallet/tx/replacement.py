@@ -17,8 +17,12 @@ THE BIP-125 FLOOR (:func:`rbf_min_fee_sats`)
 -------------------------------------------
 BIP 125 ("Opt-in Full Replace-by-Fee"): a replacement is accepted only if
 it pays more than the original by at least the *incremental relay fee* of
-the new transaction's size (Bitcoin Core's default incremental relay rate
-is its 1 sat/vB ``minrelaytxfee``):
+the new transaction's size. Core's ``DEFAULT_INCREMENTAL_RELAY_FEE``
+(policy.h) currently ships at 100 sat/kvB (0.1 sat/vB — LOWERED upstream,
+TCK-FEE-005's fact-check, exactly like ``DEFAULT_MIN_RELAY_TX_FEE``); this
+engine deliberately keeps the HISTORICAL 1 sat/vB increment — a
+conservative, replacement-only floor, 10x what a default node demands,
+never the initial-bid min-relay question the psbt gate answers:
 
     floor(new_vsize) = old_fee + max(old_fee, incremental_relay_sat)
     incremental_relay_sat = ceil(new_vsize × 1 sat/vB)
@@ -125,10 +129,12 @@ _MAX_MONEY_SATS = 2_100_000_000_000_000
 _MAX_INPUTS = 1000  # same bound as the PSBT builder
 _MAX_RECIPIENTS = 100
 
-#: Core default incremental relay rate, sat/vB (BIP 125 rule 2 refers to
-#: the node's own minrelaytxfee; the tx layer takes it as plain data,
-#: exactly like the dust module does).
-_INCREMENTAL_RELAY_SAT_VB = 1
+#: BIP-125 replacement-only INCREMENTAL relay rate, sat/vB — deliberately
+#: the historical 1 sat/vB (10x Core's current DEFAULT_INCREMENTAL_RELAY_FEE
+#: = 100 sat/kvB, policy.h master AND v31.0). DISTINCT from the initial-bid
+#: min-relay rail (dust._DEFAULT_MIN_RELAY_CENTISAT_VB, TCK-FEE-005); the tx
+#: layer takes it as plain data. See the module docstring.
+_INCREMENTAL_RELAY_CENTISAT_VB = 100  # 1 sat/vB, engine's conservative floor
 
 
 class ReplacementError(TxEngineError):
@@ -244,8 +250,11 @@ def rbf_min_fee_sats(old_fee_sats: int, new_vsize: int) -> int:
 
     ``floor = old_fee + max(old_fee, ceil(new_vsize × 1 sat/vB))`` — the
     BIP 125 rule that a replacement must pay more than the original by at
-    least the incremental relay fee of its own size (Core's default
-    incremental relay rate = 1 sat/vB). The increment comes from
+    least the incremental relay fee of its own size. Core ships
+    ``DEFAULT_INCREMENTAL_RELAY_FEE`` at 100 sat/kvB (0.1 sat/vB); this
+    engine deliberately out-pays it with the historical 1 sat/vB
+    (conservative, replacement-only, DISTINCT from the initial-bid min-relay
+    gate — see the module docstring). The increment comes from
     :func:`~localwallet.tx.dust.min_relay_fee_vbytes` (computed from
     size, bounds-checked, never a hardcoded number). Integer-exact.
 
@@ -256,7 +265,7 @@ def rbf_min_fee_sats(old_fee_sats: int, new_vsize: int) -> int:
     old_fee_sats = _check_int(old_fee_sats, "old_fee_sats", 1, _MAX_MONEY_SATS)
     try:
         increment = min_relay_fee_vbytes(
-            new_vsize, min_relay_sat_vb=_INCREMENTAL_RELAY_SAT_VB
+            new_vsize, min_relay_centisat_vb=_INCREMENTAL_RELAY_CENTISAT_VB
         )
     except (TypeError, ValueError) as exc:
         raise ReplacementError("new_vsize must be an integer within standardness bounds") from exc

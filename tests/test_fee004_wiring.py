@@ -152,9 +152,10 @@ def test_wire_electrum_backend_floor_is_the_assumed_constant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Flip the backend to electrum-shaped (capability honestly absent):
-    the explicit floor is the assumed 1 sat/vB — the congested source's
-    minimumFee 3 does NOT lift an explicit 1 — and the seam costs ZERO
-    chain calls on any source (the restored FEE-002 property)."""
+    the explicit floor is the assumed 0.1 sat/vB rail (TCK-FEE-005) — the
+    congested source's minimumFee 3 does NOT lift an explicit 1 — and the
+    seam costs ZERO chain calls on any source (the restored FEE-002
+    property)."""
     recorded: list[httpx.Request] = []
     wiring = _wire_with(
         tmp_path, monkeypatch, _ElectrumLike(), _public_info(recorded)
@@ -162,7 +163,7 @@ def test_wire_electrum_backend_floor_is_the_assumed_constant(
     try:
         assert wiring.fee_estimator is not None
         assert wiring.fee_estimator.clamp_to_min_relay_floor(100) == (100, False)
-        assert wiring.fee_estimator.clamp_to_min_relay_floor(99) == (100, True)
+        assert wiring.fee_estimator.clamp_to_min_relay_floor(9) == (10, True)
         assert recorded == []
     finally:
         wiring.worker.stop()

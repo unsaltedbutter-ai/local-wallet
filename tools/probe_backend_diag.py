@@ -56,13 +56,13 @@ MAINNET_GENESIS_HASH = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b6
 ELECTRUM_PORT, BITCOIND_PORT, TIMEOUT = 50002, 8332, 5.0
 #: BTC/kvB → CENTISAT/vB (TCK-FEE-004 floor conversion mirror): 1e8 sats/BTC
 #: × 1e2 cents/sat ÷ 1e3 vB/kvB = 10 000 000. The engine's ASSUMED floor
-#: today is 100 centisat/vB (= 1 sat/vB; see TCK-FEE-005: the Core default
-#: in policy.h master AND v31 is actually DEFAULT_MIN_RELAY_TX_FEE{100} =
-#: 100 sat/kvB = 0.1 sat/vB, so our assumed floor is 10x the shipped default
-#: and this tool exists to show the live node's real value).
+#: is 10 centisat/vB = 0.1 sat/vB — TCK-FEE-005 applied the fact this tool
+#: surfaced: Core's policy.h DEFAULT_MIN_RELAY_TX_FEE{100} sat/kvB (master
+#: AND v31) is 0.1 sat/vB; the tool-era 1 sat/vB constant was the lowered
+#: historical default and 10x over-floored default nodes.
 _CENTISAT_VB_PER_BTC_KVB = Decimal(10_000_000)
 _SATS_PER_BTC = Decimal(100_000_000)
-_ASSUMED_MIN_RELAY_CENTISAT_VB = 100
+_ASSUMED_MIN_RELAY_CENTISAT_VB = 10
 _VERIFY_NONE = ssl.create_default_context()
 _VERIFY_NONE.check_hostname, _VERIFY_NONE.verify_mode = False, ssl.CERT_NONE
 
@@ -134,22 +134,23 @@ def _btc_per_kvb_to_units(raw):
 
 def _engine_floor(advertised_centisat_vb):
     """The engine's EFFECTIVE min-relay floor = MAX(advertised, assumed).
-    The assumed 1 sat/vB (=100 centisat/vB) is the today-constant the tx
-    build gates enforce; a node answering LOWER cannot license a bid our own
-    builder would refuse (fees.py _ASSUMED_MIN_RELAY_CENTISAT_VB mirror)."""
+    The assumed 0.1 sat/vB (=10 centisat/vB) is the constant the tx build
+    gates enforce (TCK-FEE-005: Core policy.h DEFAULT_MIN_RELAY_TX_FEE{100}
+    sat/kvB); a node answering LOWER cannot license a bid our own builder
+    would refuse (fees.py _ASSUMED_MIN_RELAY_CENTISAT_VB mirror)."""
     effective = max(advertised_centisat_vb, _ASSUMED_MIN_RELAY_CENTISAT_VB)
     return {
         "assumed_centisat_per_vb": _ASSUMED_MIN_RELAY_CENTISAT_VB,
         "centisat_per_vb": effective,
         "sat_per_vb": _fmt(Decimal(effective) / 100),
-        "note": "engine assumed floor 1 sat/vB — see TCK-FEE-005",
+        "note": "engine assumed floor 0.1 sat/vB (Core default, TCK-FEE-005)",
     }
 
 
 def _minrelay_bitcoind(client, scheme, p, auth):
     """bitcoind: one getmempoolinfo RPC → minrelaytxfee verbatim (BTC/kvB)
     + exact sat/kvB/sat/vB + Core's shipped default (policy.h) + the
-    engine's effective floor (MAX with the assumed 1 sat/vB)."""
+    engine's effective floor (MAX with the assumed 0.1 sat/vB)."""
     m = {"source": "bitcoind getmempoolinfo.minrelaytxfee"}
     body = json.dumps({"jsonrpc": "1.0", "id": 2, "method": "getmempoolinfo", "params": []})
     try:

@@ -59,9 +59,12 @@ See ADR-0012 for the full note.)
 
 Min-relay floor
 ---------------
-``min_relay_fee_vbytes`` mirrors Core's default ``minrelaytxfee`` of
-1000 sat/kvB = 1 sat/vB: a transaction paying less is not relayed. The
-floor is ``max(1, vsize * rate)`` with the vsize upper bound set to Core's
+``min_relay_fee_vbytes`` mirrors Core's ``DEFAULT_MIN_RELAY_TX_FEE`` of
+100 sat/kvB = 0.1 sat/vB (``src/policy/policy.h``, master AND v31.0;
+TCK-FEE-005 corrected this from the HISTORICAL 1000 sat/kvB = 1 sat/vB
+default that upstream LOWERED): a transaction paying less is not relayed
+by a default node. The floor is ``max(1, ceil(vsize * rate))`` at integer
+CENTISAT/vB granularity, with the vsize upper bound set to Core's
 ``MAX_STANDARD_TX_WEIGHT`` (400_000 WU = 100_000 vB).
 
 Watch-only / value-free invariants: pure integer math, no I/O, no logging;
@@ -94,9 +97,22 @@ _MAX_STANDARD_TX_WEIGHT_WU = 400_000
 #: Largest vsize this module accepts as input (Core standardness bound).
 _MAX_VBYTES = _MAX_STANDARD_TX_WEIGHT_WU // _WITNESS_SCALE_FACTOR
 
-#: Largest fee rate accepted (sat/vB); 10_000 sat/vB = 1000x min-relay —
-#: anything beyond that is caller error, refused (fail closed).
+#: Largest fee rate accepted (sat/vB) — anything beyond is caller error,
+#: refused (fail closed); dust_threshold's whole-sat/vB unit bound.
 _MAX_RATE_SAT_VB = 10_000
+
+#: Bitcoin Core's ``DEFAULT_MIN_RELAY_TX_FEE`` (``src/policy/policy.h``,
+#: master AND v31.0): 100 sat/kvB = 0.1 sat/vB = 10 CENTISAT/vB — the
+#: default floor a stock node relays at. TCK-FEE-005 corrected this from
+#: the historical 1000 sat/kvB (1 sat/vB) default that was LOWERED
+#: upstream. Mirrored by ``chain/fees.py`` ``_ASSUMED_MIN_RELAY_CENTISAT_VB``
+#: (the estimator's fail-closed rail) — pinned equal by tests/test_tx_dust.py
+#: so the build gate and the estimator can never diverge on what any node
+#: accepts.
+_DEFAULT_MIN_RELAY_CENTISAT_VB = 10
+
+#: Same physical ceiling as ``_MAX_RATE_SAT_VB`` in the floor's unit.
+_MAX_RATE_CENTISAT_VB = _MAX_RATE_SAT_VB * 100
 
 # Spend-cost components (see module docstring for the Core citation).
 _LEGACY_SATISFACTION_BYTES = 107  # ~72 B sig push item + 33 B pubkey push item
@@ -231,14 +247,22 @@ def dust_threshold(script: bytes, dust_relay_rate_sat_vb: int = 3) -> int:
     return rate * size
 
 
-def min_relay_fee_vbytes(vsize: int, min_relay_sat_vb: int = 1) -> int:
+def min_relay_fee_vbytes(
+    vsize: int, min_relay_centisat_vb: int = _DEFAULT_MIN_RELAY_CENTISAT_VB
+) -> int:
     """Minimum relay fee in sats for a transaction of ``vsize`` vB.
 
-    Core's default ``minrelaytxfee`` is 1000 sat/kvB = 1 sat/vB; a lower
-    fee is not relayed. The floor is ``max(1, vsize * rate)`` — at least
-    one sat even for degenerate sizes — with sane bounds: ``vsize`` is
-    capped at Core's standardness limit (``MAX_STANDARD_TX_WEIGHT`` /
-    4 = 100_000 vB) and the rate at 10_000 sat/vB.
+    Core's ``DEFAULT_MIN_RELAY_TX_FEE`` (``src/policy/policy.h``, master
+    AND v31.0) is 100 sat/kvB = 0.1 sat/vB = 10 centisat/vB (the TCK-FEE-005
+    correction — the historical 1000 sat/kvB = 1 sat/vB default was LOWERED
+    upstream); a lower fee is not relayed by a default node. The rate unit
+    is integer CENTISAT/vB (same money unit as the fee estimator); the
+    floor is ``max(1, ceil(vsize * rate_c / 100))`` — at least one sat even
+    for degenerate sizes — with sane bounds: ``vsize`` is capped at Core's
+    standardness limit (``MAX_STANDARD_TX_WEIGHT`` / 4 = 100_000 vB) and
+    the rate at 10_000 sat/vB (1_000_000 centisat/vB). Whole-sat/vB rates
+    reproduce the old integer product exactly (the ceil is inert at
+    multiples of 100).
 
     Raises:
         TypeError: non-integer/bool arguments. ValueError: out-of-range
@@ -248,5 +272,12 @@ def min_relay_fee_vbytes(vsize: int, min_relay_sat_vb: int = 1) -> int:
         raise TypeError("vsize must be an integer")
     if not 0 <= vsize <= _MAX_VBYTES:
         raise ValueError(f"vsize must be between 0 and {_MAX_VBYTES}")
-    rate = _validate_rate(min_relay_sat_vb)
-    return max(1, vsize * rate)
+    if not isinstance(min_relay_centisat_vb, int) or isinstance(
+        min_relay_centisat_vb, bool
+    ):
+        raise TypeError("fee rate must be an integer (centisat/vB)")
+    if not 0 <= min_relay_centisat_vb <= _MAX_RATE_CENTISAT_VB:
+        raise ValueError(
+            f"fee rate must be between 0 and {_MAX_RATE_CENTISAT_VB} centisat/vB"
+        )
+    return max(1, -(-vsize * min_relay_centisat_vb // 100))

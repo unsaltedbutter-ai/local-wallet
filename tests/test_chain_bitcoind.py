@@ -1173,11 +1173,14 @@ class TestFees:
     # -- TCK-FEE-004: the min-relay floor capability (getmempoolinfo) ------
 
     def test_min_relay_centisat_vb_exact_conversion(self, bitcoind: Any) -> None:
-        # The DECIMAL_EXACT ladder (TCK-FEE-003 discipline): the default
-        # minrelaytxfee lands on 100 centisat/vB; whole and half-cent floors
-        # convert without float residue (BTC/kvB x 10 000 000 = centisat/vB).
+        # The DECIMAL_EXACT ladder (TCK-FEE-003 discipline): whole and
+        # half-cent floors convert without float residue
+        # (BTC/kvB x 10 000 000 = centisat/vB). TCK-FEE-005 note: Core's
+        # CURRENT policy.h default is 0.000001 BTC/kvB (= 100 sat/kvB =
+        # 0.1 sat/vB = 10 centisat/vB); 0.00001 is the HISTORICAL default.
         cases = {
-            0.00001: 100,  # Core default = 1 sat/vB
+            0.000001: 10,  # Core default (policy.h, master AND v31.0)
+            0.00001: 100,  # historical default = 1 sat/vB
             0.00002: 200,  # 2 sat/vB
             0.000015: 150,  # 1.5 sat/vB (exact half-cent)
             0.001: 10_000,  # 10 sat/vB
@@ -1216,7 +1219,7 @@ class TestFees:
         # A node whose minrelaytxfee (5.5 sat/vB) sits ABOVE the MEDIUM/SLOW
         # estimatesmartfee answers but below FAST: MEDIUM/SLOW are MAX'd to
         # the floor and flagged; FAST (6) already clears it (unflagged). The
-        # floor is a node FIGURE, honoured over the assumed 1 sat/vB.
+        # floor is a node FIGURE, honoured over the assumed 0.1 sat/vB rail.
         server = bitcoind(
             script={
                 "estimatesmartfee": lambda p: {"feerate": 0.00001 * (7 - p[0]), "blocks": p[0]},
@@ -1234,8 +1237,9 @@ class TestFees:
 
     def test_min_relay_floor_unanswered_fails_closed(self, bitcoind: Any) -> None:
         # getmempoolinfo erroring (unscripted in the fixture) never breaks
-        # the ladder: the assumed 1 sat/vB floor applies (SLOW 100 stays),
-        # the estimate just is not flagged as raised.
+        # the ladder: the assumed 0.1 sat/vB rail applies, and the whole-sat
+        # native estimates (>= 1 sat/vB) clear it — SLOW 100 stays, not
+        # flagged as raised.
         server = bitcoind(
             script={
                 "estimatesmartfee": lambda p: {"feerate": 0.00001 * (7 - p[0]), "blocks": p[0]},

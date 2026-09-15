@@ -3799,11 +3799,23 @@ def test_ladder_rung_under_the_floor_is_clamped_up_and_narrated(
     """TCK-FEE-004 done-when END TO END (the user's live failure: "send
     100000 sats to bc1q… -> psbt_failed (fee is below the min-relay floor
     for this transaction size)"): the projected blocks bottom UNDER the
-    min-relay floor (B0 0.3 / B1 0.28, minimumFee 1 sat/vB), so policy-v2
-    TARGET 0.34 sat/vB would bid a fee the node refuses. The MAX(rung,
-    floor) clamp lifts the used MEDIUM rung to exactly 1 sat/vB — the
-    141-sat fee on the 141-vB shape clears the engine gate — and the card
-    narrates the floor once. No psbt_failed, no sub-floor bid, ever."""
+    build floor (B0 0.3 / B1 0.28), and the fixture's RECOMMENDED payload
+    carries minimumFee 1 sat/vB — so the MAX(rung, floor) clamp lifts the
+    used MEDIUM rung to exactly 1 sat/vB and the card narrates the floor
+    once. No psbt_failed, no sub-floor bid, ever.
+
+    TCK-FEE-005 RECOMPUTES THE ATTRIBUTION of this exact pin: the lift
+    here comes from the CONGESTION floor (FEE-003-sanctioned
+    max(minimumFee x 100, relay floor) — minimumFee 1 IS the binding
+    figure), NOT from the assumed min-relay rail, which the user's node
+    (and Core's policy.h default) answers at 0.1 sat/vB = 10 centisat.
+    At the corrected rail the user's original 0.34 bid would itself
+    relay — the engine gate refuses only bids under ceil(vsize x 0.1)
+    (pinned in tests/test_tx_fractional_fees.py); a sub-1 policy bid
+    still surfaces AT 1 sat/vB on this fixture because the payload's
+    congestion minimumFee out-vetoes the rail, and that is POLICY, not
+    a relay fact. One source of truth: rail == gate default == 10
+    centisat/vB (pinned in tests/test_tx_dust.py)."""
     addr0 = derive_fixture_addresses(1)[0]
     state = {
         "mempool_blocks": [

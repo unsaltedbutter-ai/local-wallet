@@ -399,7 +399,15 @@ def build_unsigned_psbt(
             8 + 1 + len(change_script) if change_script is not None else None
         ),
     )
-    if fee_sats < min_relay_fee_vbytes(meta_vsize, min_relay_sat_vb=1):
+    # TCK-FEE-005: the gate rides dust.min_relay_fee_vbytes' DEFAULT rate —
+    # Core's policy.h DEFAULT_MIN_RELAY_TX_FEE (100 sat/kvB = 0.1 sat/vB),
+    # the same assumed rail chain/fees.py fails closed to (pinned equal by
+    # tests/test_tx_dust.py). Wiring the NODE's advertised floor through
+    # here was deliberately NOT done: the tx engine is offline and must
+    # never grow a chain dependency; a floor-capable estimator clamps every
+    # bid it finalizes to MAX(advertised, assumed), so a node advertising
+    # higher is already out-bid before this gate sees the rate.
+    if fee_sats < min_relay_fee_vbytes(meta_vsize):
         raise PsbtError("fee is below the min-relay floor for this transaction size")
 
     vin = [
@@ -561,7 +569,7 @@ def validate_psbt_shape(psbt: PSBT, meta: PsbtMeta) -> None:
     fee_sats = inputs_total - outputs_total
     if fee_sats != meta.expected_fee_sats:
         raise PsbtValidationError("recomputed fee does not match metadata")
-    if fee_sats < min_relay_fee_vbytes(meta.vsize, min_relay_sat_vb=1):
+    if fee_sats < min_relay_fee_vbytes(meta.vsize):
         raise PsbtValidationError("fee is below the min-relay floor")
 
 

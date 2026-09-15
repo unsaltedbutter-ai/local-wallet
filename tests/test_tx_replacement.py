@@ -89,11 +89,13 @@ class TestFloorMath:
         assert rbf_min_fee_sats(50, vsize) == 50 + vsize
 
     def test_increment_is_min_relay_of_new_size_not_a_constant(self):
-        # The increment term is exactly the dust module's size-derived
-        # min-relay fee at Core's 1 sat/vB default.
+        # The increment term is exactly the dust module's size-derived fee
+        # at the replacement-only 1 sat/vB rate (CENTISAT unit post
+        # TCK-FEE-005; the BIP-125 increment is DISTINCT from the 0.1
+        # sat/vB initial-bid rail — conservative on purpose).
         for vsize in (110, 141, 178, 209, 555):
             assert rbf_min_fee_sats(1, vsize) == 1 + min_relay_fee_vbytes(
-                vsize, min_relay_sat_vb=1
+                vsize, min_relay_centisat_vb=100
             )
 
     def test_floor_refuses_bad_arguments(self):

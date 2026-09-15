@@ -497,7 +497,7 @@ def revalidate_signed_psbt(psbt_base64: str, intended: IntendedTx) -> Revalidate
         raise TamperedPsbtError("fee is not positive")
     if fee_sats > inputs_total:
         raise TamperedPsbtError("fee exceeds the total input value")
-    if fee_sats < min_relay_fee_vbytes(vsize, min_relay_sat_vb=1):
+    if fee_sats < min_relay_fee_vbytes(vsize):
         raise TamperedPsbtError(
             "fee is below the min-relay floor for the extracted transaction"
         )

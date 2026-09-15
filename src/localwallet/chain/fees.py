@@ -80,8 +80,11 @@ USER SPEC 2026-09-12, refining the TCK-FEE-001 floor-follower):
      with unit-ambiguous answers; we never invent a dialect).
    * any query failure — ANY exception flavor: fail-closed, never a
      failed send.
-   * **assumed floor** (the fallback and the irreducible rail): 1 sat/vB
-     (``_ASSUMED_MIN_RELAY_CENTISAT_VB``), the constant the tx engine's
+   * **assumed floor** (the fallback and the irreducible rail): 0.1 sat/vB
+     (= 100 sat/kvB, Core's ``DEFAULT_MIN_RELAY_TX_FEE`` in
+     ``src/policy/policy.h``, master AND v31.0 — TCK-FEE-005 corrected
+     this from the historical 1 sat/vB default that upstream LOWERED),
+     ``_ASSUMED_MIN_RELAY_CENTISAT_VB``, the constant the tx engine's
      own build gates enforce — a node answering lower cannot license a
      bid our builder would refuse.
 
@@ -137,7 +140,7 @@ layer. ``minimum_fee_sat_vb()`` raises :class:`ChainError` on this path (the
 backend exposes no such payload field and we never invent one). The
 min-relay floor on this path rides a SEPARATE optional capability
 (``min_relay_centisat_vb()``; present on bitcoind, honestly absent on
-electrum) with the assumed 1 sat/vB as its fail-closed fallback — see the
+electrum) with the assumed 0.1 sat/vB as its fail-closed fallback — see the
 floor section above.
 
 Payloads are cheap but rate-limited (R11), so estimates are cached with a
@@ -191,8 +194,9 @@ _CENT = Decimal("0.01")
 
 #: Magnitude ceiling for a projected/observed feeRange bottom (sats/vB),
 #: mirroring price.py's plausible-rate bound (ADR-0011 §6): it equals the
-#: tx engine's own maximum bid (10_000 sat/vB = 1000x min-relay — dust.py),
-#: so a bottom above it is a broken payload, not a pricey one — and every
+#: tx engine's own maximum bid (10_000 sat/vB — dust.py's rate ceiling,
+#: unchanged by TCK-FEE-005), so a bottom above it is a broken payload, not
+#: a pricey one — and every
 #: accepted value keeps the Decimal math inside the default 28-digit
 #: context (a finite-but-absurd ``1e40`` would otherwise blow
 #: ``quantize`` out of the documented ChainError fallback as an
@@ -200,18 +204,26 @@ _CENT = Decimal("0.01")
 _MAX_BOTTOM_SAT_VB = 10_000
 
 #: The ASSUMED min-relay floor in this module's unit (integer centisat/vB):
-#: Bitcoin Core's default ``minrelaytxfee`` of 1 sat/vB = 100 — the SAME
-#: assumption the tx engine's build/revalidate gates already enforce
-#: (``tx/dust.py`` ``min_relay_fee_vbytes`` default rate, applied to
-#: psbt.py/revalidate.py). TCK-FEE-004 uses it two ways: (a) the fail-closed
-#: floor when no backend/source can answer the floor query, and (b) the
-#: irreducible LOWER BOUND of a queried floor — a node answering below it
-#: cannot license a bid our own builder would still refuse. This is a rate
-#: floor, never a size-derived fee (the dust/min-relay-from-script-size
-#: invariant is untouched); it is DISTINCT from tx/replacement.py's BIP-125
-#: incremental-relay rate, which governs how much MORE a replacement must
-#: pay and is deliberately not touched here.
-_ASSUMED_MIN_RELAY_CENTISAT_VB = 100
+#: Bitcoin Core's ``DEFAULT_MIN_RELAY_TX_FEE`` (``src/policy/policy.h``,
+#: master AND v31.0) of 100 sat/kvB = 0.1 sat/vB = 10 centisat/vB.
+#: TCK-FEE-005 corrected this constant from 100 (= 1 sat/vB): that was the
+#: HISTORICAL Core default (1000 sat/kvB) which upstream LOWERED, and the
+#: FEE-004-era note claiming 1 sat/vB was justified by parity with the tx
+#: engine's build gate (``tx/psbt.py``'s min-relay refusal) — parity that
+#: held only because BOTH sides carried the same outdated figure. The gate
+#: now rides this same 10-centisat/vB rail (``tx/dust.py``
+#: ``_DEFAULT_MIN_RELAY_CENTISAT_VB``, pinned equal to this constant by
+#: tests/test_tx_dust.py — one source of truth: gate rail == estimator
+#: rail). TCK-FEE-004 uses it two ways: (a) the
+#: fail-closed floor when no backend/source can answer the floor query,
+#: and (b) the irreducible LOWER BOUND of a queried floor — a node
+#: answering below it cannot license a bid our own builder would still
+#: refuse (a node answering HIGHER still wins: MAX(advertised, assumed)).
+#: This is a rate floor, never a size-derived fee (the dust/min-relay-
+#: from-script-size invariant is untouched); it is DISTINCT from
+#: tx/replacement.py's BIP-125 incremental-relay rate, which governs how
+#: much MORE a replacement must pay and is deliberately not touched here.
+_ASSUMED_MIN_RELAY_CENTISAT_VB = 10
 
 
 def _apply_floor(snapshot: _Snapshot, floor_c: int) -> _Snapshot:
@@ -223,7 +235,7 @@ def _apply_floor(snapshot: _Snapshot, floor_c: int) -> _Snapshot:
     so once, quoting the floor verbatim). The floor never drops the bid, so
     an estimate that already met it is returned unchanged. The effective
     floor is ``max(queried, assumed)`` — our own build gate enforces the
-    assumed 1 sat/vB regardless of what a node answers.
+    assumed 0.1 sat/vB regardless of what a node answers.
     """
     floor_c = max(floor_c, _ASSUMED_MIN_RELAY_CENTISAT_VB)
     estimates = {
@@ -244,7 +256,7 @@ def _backend_min_relay_centisat_vb(client: Any) -> int:
     own floor exposes ``min_relay_centisat_vb() -> int`` (centisat/vB;
     today :class:`~localwallet.chain.bitcoind.BitcoindClient` via
     ``getmempoolinfo.minrelaytxfee``). Absence, an unusable answer or ANY
-    exception from the query fail CLOSED to the assumed 1 sat/vB (the
+    exception from the query fail CLOSED to the assumed 0.1 sat/vB (the
     code-review LOW: no exception flavor of a floor query may fail a send)
     — never a fabricated node figure. Electrum honestly ABSENTS this
     capability (:class:`~localwallet.chain.electrum.ElectrumClient` defines
@@ -407,7 +419,7 @@ class FeeEstimator:
             estimator must respect — duck-typed on the OPTIONAL
             ``min_relay_centisat_vb()`` capability, like every other seam
             here (bitcoind answers, electrum honestly doesn't, ``None`` or
-            any failure → the assumed 1 sat/vB). The bids keep riding
+            any failure → the assumed 0.1 sat/vB). The bids keep riding
             ``client`` (the public fee source); only the RELAY floor rides
             the node. Absent (or any client without the capability) the
             floor falls back to ``client`` itself — the backend-native
@@ -459,7 +471,7 @@ class FeeEstimator:
 
     def _relay_floor_centisat_vb(self) -> int:
         """The RELAY floor alone, TTL-cached: node capability → the assumed
-        1 sat/vB. NEVER the congestion ``minimumFee`` and NEVER a snapshot
+        0.1 sat/vB. NEVER the congestion ``minimumFee`` and NEVER a snapshot
         refresh — answering an explicit-rate clamp costs at most ONE floor
         query, zero chain calls when the floor source has no capability."""
         now = _now()
@@ -611,7 +623,7 @@ class FeeEstimator:
         change — never a silent alteration of an explicit rate, never a
         silent sub-floor bid that the node would refuse (MAX, never MIN —
         the user's corrected spec verbatim). The floor is the RELAY floor
-        ONLY (native node capability → the assumed 1 sat/vB): NEVER the
+        ONLY (native node capability → the assumed 0.1 sat/vB): NEVER the
         congestion ``minimumFee`` — an explicit 1 sat/vB bids 1 THROUGH
         congestion whenever the node's own floor is 1 sat/vB (the
         code-review MAJOR: a congestion estimate must not out-veto the
@@ -624,7 +636,7 @@ class FeeEstimator:
 
         Fail-closed like the floor itself: ANY failure of the floor query
         (not just ChainError — the code-review LOW) degrades to the
-        assumed 1 sat/vB (the floor the tx engine's build gate already
+        assumed 0.1 sat/vB (the floor the tx engine's build gate already
         enforces), so an explicit send never fails on a floor query and
         the schema's 1 sat/vB explicit floor then passes through untouched.
 

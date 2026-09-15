@@ -83,10 +83,11 @@ def test_bitcoind_minrelay_happy_path_renders_all_units(diag: Any) -> None:
     assert core["sat_per_vb"] == "0.1"
     assert "policy.h" in core["cite"]
     eff = m["engine_effective_floor"]
-    assert eff["centisat_per_vb"] == 100
-    assert eff["sat_per_vb"] == "1"
+    # TCK-FEE-005 applied: node 0.1 (10c) == assumed rail 0.1 (10c) -> MAX 10.
+    assert eff["centisat_per_vb"] == 10
+    assert eff["sat_per_vb"] == "0.1"
     assert "TCK-FEE-005" in eff["note"]
-    assert "1 sat/vB" in eff["note"]
+    assert "0.1 sat/vB" in eff["note"]
 
 
 def test_bitcoind_minrelay_effective_floor_is_max_of_advertised(diag: Any) -> None:

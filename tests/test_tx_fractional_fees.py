@@ -32,7 +32,8 @@ CHANGE_COST = 31
 class _SubFloorNative:
     """Backend-native estimator double (no get_json, no floor capability):
     its ``estimate_fee`` answers whole sats/vB, so the floor clamp falls
-    back to the assumed 1 sat/vB — exactly Electrum's honest-absence case."""
+    back to the assumed 0.1 sat/vB (TCK-FEE-005) — exactly Electrum's
+    honest-absence case."""
 
     def __init__(self, rates: dict) -> None:
         self._rates = dict(rates)
@@ -118,41 +119,60 @@ def _build(result, amount_sats):
     )
 
 
-def test_sub_one_bid_refuses_at_the_min_relay_gate_before_signing():
-    # TCK-FEE-003 pin, RE-SCOPED by TCK-FEE-004: the estimator can no longer
-    # deliver a sub-floor rung into this gate (MAX(rung, floor) fires first
-    # — see chain/fees.py and the e2e clamp test in test_e2e_skeleton.py),
-    # so the live "send 100000 sats -> psbt_failed" symptom is gone. The
-    # gate itself REMAINS as the last fail-closed defence for any caller
-    # that hands the ENGINE a sub-floor rate directly: valid data through
-    # selection (pure ceil fee math), refused at BUILD, value-free, before
-    # any device signature.
+def test_sub_rail_bid_refuses_at_the_min_relay_gate_before_signing():
+    # Defense-in-depth (TCK-FEE-003 pin, rail corrected by TCK-FEE-005):
+    # the estimator clamps explicit bids to MAX(rung, floor) upstream (see
+    # chain/fees.py and the e2e clamp tests), but ANY caller that hands the
+    # ENGINE a rate under the size-derived relay floor is still refused at
+    # BUILD, value-free, before any device signature. The rail is Core's
+    # policy.h DEFAULT_MIN_RELAY_TX_FEE (100 sat/kvB = 0.1 sat/vB), NOT the
+    # historical 1 sat/vB — which is precisely what FEE-005 fixed: a 0.55
+    # sat/vB bid (fee 78 on this 141-vB shape) used to die here and now
+    # builds, because a default node relays it.
     inputs = [source("ab" * 32, 0, 200_000, index=3)]
-    result = select_coins(inputs, 60_000, 55, CHANGE_COST, recipient_script())
-    assert result.fee_sats == 78  # ceil(141 x 0.55) < the 141-sat relay floor
+    result = select_coins(inputs, 60_000, 9, CHANGE_COST, recipient_script())
+    assert result.fee_sats == 13  # ceil(141 × 0.09) < the ceil(141 × 0.1) = 15 rail
     with pytest.raises(PsbtError) as exc:
         _build(result, 60_000)
     assert "min-relay" in str(exc.value)
-    assert "78" not in str(exc.value)  # value-free, as everywhere in tx/
+    assert "13" not in str(exc.value)  # value-free, as everywhere in tx/
 
 
-def test_estimator_floor_clamp_fixes_the_live_psbt_failed_send():
-    # TCK-FEE-004 end to end at the engine edge (the user's corrected spec:
-    # MAX(calculated, floor) — MIN would still fail): a MEDIUM rung that
-    # policy-v2 computes under the min-relay floor arrives at the builder
-    # ALREADY lifted (55 -> 100 centisat/vB here), so the same 141-vB send
-    # that used to die psbt_failed now builds at the floor fee.
+def test_the_055_bid_the_old_1_sat_vB_rail_refused_now_builds():
+    # TCK-FEE-005's user-visible meaning: a rate in the 0.1..1 sat/vB band
+    # (what the corrected rail admits) clears BOTH layers with no clamp
+    # and no refusal — estimator seam and gate share the 10-centisat rail.
     estimator = FeeEstimator(
         _SubFloorNative({t: 1 for t in FeeTarget}),
         ttl_s=30.0,
     )
-    bid_c, raised = estimator.clamp_to_min_relay_floor(55)  # explicit sub-floor
-    assert (bid_c, raised) == (100, True)  # MAX, never MIN, never a refusal
+    bid_c, raised = estimator.clamp_to_min_relay_floor(55)  # explicit 0.55
+    assert (bid_c, raised) == (55, False)  # above the 10-centisat rail
     inputs = [source("ab" * 32, 0, 200_000, index=3)]
     result = select_coins(inputs, 60_000, bid_c, CHANGE_COST, recipient_script())
-    assert result.fee_sats == 141  # ceil(141 x 1.00) == the relay floor
+    assert result.fee_sats == 78  # ceil(141 × 0.55) >= the 15-sat rail
     _psbt, meta = _build(result, 60_000)  # builds clean — no psbt_failed
-    assert meta.expected_fee_sats == 141
+    assert meta.expected_fee_sats == 78
+
+
+def test_estimator_floor_clamp_fixes_the_live_psbt_failed_send():
+    # TCK-FEE-004 end to end at the engine edge (the user's corrected spec:
+    # MAX(calculated, floor) — MIN would still fail), with TCK-FEE-005's
+    # corrected rail: a bid UNDER the floor (5 centisat/vB = 0.05 sat/vB,
+    # below Core's default 0.1) arrives at the builder ALREADY lifted to
+    # the rail (5 -> 10), so the same 141-vB send that would die psbt_failed
+    # now builds at the rail fee — ceil(141 × 0.1) = 15 sats.
+    estimator = FeeEstimator(
+        _SubFloorNative({t: 1 for t in FeeTarget}),
+        ttl_s=30.0,
+    )
+    bid_c, raised = estimator.clamp_to_min_relay_floor(5)  # explicit sub-rail
+    assert (bid_c, raised) == (10, True)  # MAX, never MIN, never a refusal
+    inputs = [source("ab" * 32, 0, 200_000, index=3)]
+    result = select_coins(inputs, 60_000, bid_c, CHANGE_COST, recipient_script())
+    assert result.fee_sats == 15  # ceil(141 x 0.10) == the relay rail
+    _psbt, meta = _build(result, 60_000)  # builds clean — no psbt_failed
+    assert meta.expected_fee_sats == 15
 
 
 def test_floor_so_high_the_send_is_unfundable_still_refuses():
@@ -167,7 +187,7 @@ def test_floor_so_high_the_send_is_unfundable_still_refuses():
 
 def test_fractional_bid_above_the_floor_builds_normally():
     # Positive control: the user's 1.21 target pays ceil(141 x 1.21) = 171
-    # sats >= the 141-sat relay floor and builds clean.
+    # sats >= the 15-sat (0.1 sat/vB) relay rail and builds clean.
     inputs = [source("ab" * 32, 0, 200_000, index=3)]
     result = select_coins(inputs, 60_000, 121, CHANGE_COST, recipient_script())
     assert result.fee_sats == 171

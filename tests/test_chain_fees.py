@@ -736,8 +736,9 @@ def test_bottom_magnitude_boundary_is_the_engine_ceiling():
 # max(minimumFee x 100, relay floor); native: the relay floor alone); the
 # EXPLICIT seam takes the RELAY FLOOR ONLY — node capability
 # (bitcoind min_relay_centisat_vb, injected as relay_floor_client like the
-# production wiring does) → the ASSUMED 1 sat/vB — NEVER minimumFee,
-# NEVER a snapshot refresh.
+# production wiring does) → the ASSUMED rail (TCK-FEE-005: 0.1 sat/vB =
+# Core's policy.h DEFAULT_MIN_RELAY_TX_FEE of 100 sat/kvB) — NEVER
+# minimumFee, NEVER a snapshot refresh.
 
 
 class _Native:
@@ -837,10 +838,13 @@ def test_clamp_to_min_relay_floor_explicit_seam():
     with server.client() as client:
         est = FeeEstimator(client, ttl_s=30.0)
         assert est.clamp_to_min_relay_floor(500) == (500, False)  # clears
-        assert est.clamp_to_min_relay_floor(100) == (100, False)  # at the floor
-        assert est.clamp_to_min_relay_floor(55) == (100, True)  # under -> MAX
+        assert est.clamp_to_min_relay_floor(55) == (55, False)  # 0.55: inside
+        # (TCK-FEE-005) the Core-default rail — no lift, no narration
+        assert est.clamp_to_min_relay_floor(10) == (10, False)  # at the rail
+        assert est.clamp_to_min_relay_floor(5) == (10, True)  # under -> MAX
     # Code-review fix: the seam answers from the RELAY floor alone — the
-    # assumed 1 sat/vB here, NO snapshot refresh, zero chain calls.
+    # assumed 0.1 sat/vB rail here (Core policy.h DEFAULT_MIN_RELAY_TX_FEE
+    # = 100 sat/kvB), NO snapshot refresh, zero chain calls.
     assert server.requests == []
 
 
@@ -892,15 +896,16 @@ def test_explicit_seam_floors_at_the_node_not_the_source():
 
 def test_explicit_seam_without_a_capable_node_uses_the_assumed_floor():
     # Electrum's honest absence on the production (publicinfo) wiring: the
-    # injected wallet client has NO floor capability -> assumed 1 sat/vB,
-    # and ZERO chain calls anywhere — this RESTORES FEE-002's "explicit
-    # rate => no chain calls" pin on that wiring.
+    # injected wallet client has NO floor capability -> assumed 0.1 sat/vB
+    # (TCK-FEE-005), and ZERO chain calls anywhere — this RESTORES FEE-002's
+    # "explicit rate => no chain calls" pin on that wiring.
     server = ScriptedServer(httpx.Response(200, json={**RECOMMENDED, "minimumFee": 3}))
     electrum_like = _Native({t: 1 for t in FeeTarget})  # no get_json, no capability
     with server.client() as client:
         est = FeeEstimator(client, ttl_s=30.0, relay_floor_client=electrum_like)
         assert est.clamp_to_min_relay_floor(100) == (100, False)  # congestion 3 does NOT lift
-        assert est.clamp_to_min_relay_floor(99) == (100, True)  # the assumed rail does
+        assert est.clamp_to_min_relay_floor(99) == (99, False)  # 0.99: rail 10 clears it
+        assert est.clamp_to_min_relay_floor(9) == (10, True)  # the assumed rail does
     assert server.requests == []
 
 
@@ -956,20 +961,21 @@ def test_explicit_seam_catches_every_floor_exception_flavor(boom):
     est = FeeEstimator(
         _Native({t: 2 for t in FeeTarget}), ttl_s=30.0, relay_floor_client=node
     )
-    assert est.clamp_to_min_relay_floor(99) == (100, True)
+    assert est.clamp_to_min_relay_floor(9) == (10, True)  # fail-closed to the rail
     assert est.clamp_to_min_relay_floor(100) == (100, False)
 
 
 def test_clamp_fails_closed_to_assumed_floor_when_source_down():
     # A floor query that cannot complete NEVER fails the send (the explicit
     # path historically made zero chain calls — it must stay sendable):
-    # the assumed 1 sat/vB applies, silently (no raise, no narration lie —
-    # it is the floor our own build gate enforces regardless).
+    # the assumed 0.1 sat/vB applies, silently (no raise, no narration lie —
+    # it is the floor our own build gate enforces regardless — dust.py's
+    # default rate, TCK-FEE-005).
     server = ScriptedServer(httpx.ConnectError("boom"))
     with server.client() as client:
         est = FeeEstimator(client, ttl_s=30.0)
         assert est.clamp_to_min_relay_floor(100) == (100, False)
-        assert est.clamp_to_min_relay_floor(99) == (100, True)
+        assert est.clamp_to_min_relay_floor(9) == (10, True)
 
 
 @pytest.mark.parametrize("bad", [1.0, "100", None, True, False, -1])
@@ -1006,12 +1012,12 @@ def test_native_floor_capability_lifts_rungs_and_is_cached():
 
 def test_native_absent_capability_uses_the_assumed_floor():
     # Electrum's honest absence (no capability method at all): bids serve
-    # unchanged and the floor is the assumed 1 sat/vB.
+    # unchanged and the floor is the assumed 0.1 sat/vB rail (TCK-FEE-005).
     client = _Native({FeeTarget.FAST: 3, FeeTarget.MEDIUM: 2, FeeTarget.SLOW: 1})
     est = FeeEstimator(client, ttl_s=30.0)
     medium = est.estimate(FeeTarget.MEDIUM)
     assert (medium.rate_centisat_vb, medium.clamped) == (200, False)
-    assert est.clamp_to_min_relay_floor(99) == (100, True)
+    assert est.clamp_to_min_relay_floor(9) == (10, True)
     assert est.clamp_to_min_relay_floor(100) == (100, False)
 
 
@@ -1024,27 +1030,41 @@ def test_native_floor_query_failure_fails_closed_not_fatal():
     )
     est = FeeEstimator(client, ttl_s=30.0)
     assert est.estimate(FeeTarget.MEDIUM).rate_centisat_vb == 200
-    assert est.clamp_to_min_relay_floor(50) == (100, True)
+    assert est.clamp_to_min_relay_floor(9) == (10, True)
 
 
 def test_native_floor_below_the_assumed_floor_cannot_lower_the_rail():
-    # A node answering 0.4 sat/vB cannot license a bid under the 1 sat/vB
-    # OUR build gate enforces (psbt.py/revalidate.py would refuse it): the
-    # effective floor is MAX(queried, assumed).
+    # A node answering 0.05 sat/vB cannot license a bid under the 0.1
+    # sat/vB OUR build gate enforces (psbt.py/revalidate.py would refuse
+    # it): the effective floor is MAX(queried, assumed). TCK-FEE-005 moved
+    # the rail from 100 to 10; the MAX semantics are unchanged.
+    client = _FloorNative({FeeTarget.FAST: 1, FeeTarget.MEDIUM: 1, FeeTarget.SLOW: 1}, floor=5)
+    est = FeeEstimator(client, ttl_s=30.0)
+    assert est.clamp_to_min_relay_floor(9) == (10, True)  # 9 < rail wins over 5
+    assert est.estimate(FeeTarget.SLOW).rate_centisat_vb == 100  # clears the rail
+
+
+def test_node_floor_between_the_rail_and_one_sat_vB_now_wins():
+    # THE FEE-005 OVER-FLOORING FIX: a node advertising 0.4 sat/vB used to
+    # be out-vetoed by the 1 sat/vB assumed rail (bid lifted to 100 — 2.5x
+    # what this node relays). The rail is now 0.1, so the NODE figure
+    # (40) is the effective floor: 35 lifts to 40, 60 passes untouched.
     client = _FloorNative({FeeTarget.FAST: 1, FeeTarget.MEDIUM: 1, FeeTarget.SLOW: 1}, floor=40)
     est = FeeEstimator(client, ttl_s=30.0)
-    assert est.clamp_to_min_relay_floor(60) == (100, True)  # 60 > 40, still < 100
-    assert est.estimate(FeeTarget.SLOW).rate_centisat_vb == 100
+    assert est.clamp_to_min_relay_floor(35) == (40, True)  # MAX, narrated
+    assert est.clamp_to_min_relay_floor(60) == (60, False)  # the old rail would have lifted this to 100
+    slow = est.estimate(FeeTarget.SLOW)  # native rung 1 sat/vB = 100 clears 40
+    assert (slow.rate_centisat_vb, slow.clamped) == (100, False)
 
 
 @pytest.mark.parametrize("junk", [0, -5, True, "250", 2.5, None])
 def test_native_floor_junk_answer_falls_back(junk):
     # Trust boundary: the capability's answer is re-validated here — only a
     # positive plain int lifts the floor; everything else fails closed to
-    # the assumed 1 sat/vB, value-free.
+    # the assumed 0.1 sat/vB rail, value-free.
     client = _FloorNative(
         {FeeTarget.FAST: 2, FeeTarget.MEDIUM: 2, FeeTarget.SLOW: 1}, floor=junk
     )
     est = FeeEstimator(client, ttl_s=30.0)
-    assert est.clamp_to_min_relay_floor(99) == (100, True)
+    assert est.clamp_to_min_relay_floor(9) == (10, True)
     assert est.clamp_to_min_relay_floor(100) == (100, False)
