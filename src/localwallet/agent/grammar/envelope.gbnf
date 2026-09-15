@@ -19,13 +19,25 @@
 #                                registry bound-check are schema/handler
 #                                layers — this grammar only carries the
 #                                shape)
-#                get_history -> {} or {"limit": <1-3 digit int>}
-#                               (semantic bound 1..100 at the schema layer;
-#                                omitted -> handler default 20)
+#                get_history -> {} or {"limit": <1-3 digit int>} or the
+#                               TCK-CHAT-005 money filters in strict order
+#                               after the leading key: {"direction":
+#                               "in"|"out"}, {"since": {"days"|"weeks"|
+#                               "months": <1-4 digit int>}}, {"label_set":
+#                               [string, ...]}, {"label_mode": "include"|
+#                               "exclude"} (semantic bounds 1..100 limit /
+#                               bounded since / 1..10 label words + the
+#                               mode↔set pairing at the schema layer;
+#                               since is RELATIVE ONLY — no timestamp or
+#                               absolute date is representable, the ENGINE
+#                               resolves it from tool-owned now)
 #                get_utxos   -> {} or {"address_number": <1-7 digit int>}
 #                               (TCK-CHAT-001 additive key, same contract
-#                                as get_balance: scopes the listing to one
-#                                registry address)
+#                               as get_balance: scopes the listing to one
+#                               registry address) plus the SAME TCK-
+#                               CHAT-005 money filters in strict order
+#                               after address_number (shared tail-chain
+#                               rules; get_balance keeps its narrow shape)
 #                get_addresses -> {} or {"address_number": <1-7 digit int>}
 #                               (TCK-CHAT-001: {} is the numbered LIST of
 #                                shown addresses, the number restates that
@@ -168,24 +180,85 @@ address-number-kv ::= "\"address_number\"" ws ":" ws address-number-int
 
 address-number-int ::= [1-9] [0-9]{0,6}
 
-# intent "get_history" -> params {} OR {"limit": <1-3 digit int>}
-# The optional key is expressed as a top-level alternation between the two
-# complete params objects (never an optional-token sequence), so key order
-# stays strict and no other key can slip in.
+# intent "get_history" -> {} | {"limit"} | one or more of the TCK-CHAT-005
+# money filters (direction, since, label_set, label_mode) IN STRICT ORDER
+# (limit < direction < since < label_set < label_mode), expressed as a
+# whole-params alternation over the leading key plus the shared optional
+# TAIL CHAIN (filter-tail-*), so key order stays strict, no key can appear
+# twice, and no other key can slip in (the bump_fee tail-chain idiom).
+# label_mode may legally decode WITHOUT label_set (its omission is just
+# leaving keys out); the schema/layer-3 pairing rule rejects that carrier.
 get-history ::= "\"intent\"" ws ":" ws "\"get_history\"" ws "," ws "\"params\"" ws ":" ws params-history
 
-params-history ::= "{" ws "}" ws "}" ws | "{" ws "\"limit\"" ws ":" ws limit-int ws "}" ws "}" ws
+params-history ::= "{" ws "}" ws "}" ws | "{" ws "\"limit\"" ws ":" ws limit-int ws filter-tail-all | "{" ws direction-kv ws filter-tail-after-direction | "{" ws since-kv ws filter-tail-after-since | "{" ws label-set-kv ws filter-tail-after-label-set | "{" ws label-mode-kv ws "}" ws "}" ws
 
 # limit: 1..999 syntactic (1-3 digits, no leading zero); the semantic
 # 1..100 business bound is enforced at the schema layer (layer 2/3).
 limit-int ::= [1-9] [0-9]? [0-9]?
 
-# intent "get_utxos" -> params {} OR {"address_number": <1-7 digit int>}
+# ---- TCK-CHAT-005 money-filter chain (shared by get_history/get_utxos).
+# Each tail offers the REMAINING keys in fixed order (direction < since <
+# label_set < label_mode) or closes params — the bump-fee-tail idiom, so
+# an out-of-order or duplicated key is syntactically impossible.
+
+filter-tail-all ::= "}" ws "}" ws | "," ws direction-kv ws filter-tail-after-direction | "," ws since-kv ws filter-tail-after-since | "," ws label-set-kv ws filter-tail-after-label-set | "," ws label-mode-kv ws "}" ws "}" ws
+
+filter-tail-after-direction ::= "}" ws "}" ws | "," ws since-kv ws filter-tail-after-since | "," ws label-set-kv ws filter-tail-after-label-set | "," ws label-mode-kv ws "}" ws "}" ws
+
+filter-tail-after-since ::= "}" ws "}" ws | "," ws label-set-kv ws filter-tail-after-label-set | "," ws label-mode-kv ws "}" ws "}" ws
+
+filter-tail-after-label-set ::= "}" ws "}" ws | "," ws label-mode-kv ws "}" ws "}" ws
+
+# direction: the closed enum, quoted literals only — deliberately the
+# STORE's own direction words ("in" received / "out" sent) so the handler
+# compares verbatim; the semantic resolution (which rows match) is the
+# handler's, never the model's.
+direction-kv ::= "\"direction\"" ws ":" ws direction-enum
+
+direction-enum ::= "\"in\"" | "\"out\""
+
+# since: a RELATIVE period window — an object carrying EXACTLY ONE unit
+# key (the whole-object alternation makes days+weeks etc. syntactically
+# impossible). period-int: 1..9999 syntactic (1-4 digits, no leading
+# zero); the per-unit semantic caps (days 3660 / weeks 522 / months 120)
+# are the schema layer's authority (loose-grammar/tight-schema, the
+# limit-int idiom). NO absolute timestamp or date form is representable:
+# the ENGINE resolves the window against tool-owned now; the model never
+# computes a timestamp.
+since-kv ::= "\"since\"" ws ":" ws since-value
+
+since-value ::= "{" ws since-days-kv ws "}" | "{" ws since-weeks-kv ws "}" | "{" ws since-months-kv ws "}"
+
+since-days-kv ::= "\"days\"" ws ":" ws period-int
+
+since-weeks-kv ::= "\"weeks\"" ws ":" ws period-int
+
+since-months-kv ::= "\"months\"" ws ":" ws period-int
+
+period-int ::= [1-9] [0-9]{0,3}
+
+# label_set: 1..10 label WORDS (strings) the user stated, quoted verbatim
+# — grammar admits >=1 element and unbounded length/count; the schema
+# bounds 1..10 words of 1..100 chars. Resolution against the v6 address-
+# label-set (address membership + coin inheritance) is ENGINE work.
+label-set-kv ::= "\"label_set\"" ws ":" ws label-set-value
+
+label-set-value ::= "[" ws string (ws "," ws string)* ws "]"
+
+# label_mode: the IN / NOT-IN selection, closed enum; omitted means
+# include. Valid only alongside label_set (schema pairing rule).
+label-mode-kv ::= "\"label_mode\"" ws ":" ws label-mode-enum
+
+label-mode-enum ::= "\"include\"" | "\"exclude\""
+
+# intent "get_utxos" -> {} OR {"address_number": <1-7 digit int>} OR the
+# TCK-CHAT-005 money filters (same strict order: address_number <
+# direction < since < label_set < label_mode; shared tail chain).
 # (TCK-CHAT-001 additive key: with a number the listing is scoped to that
-# ONE registry address's UTXOs; same alternation as params-balance.)
+# ONE registry address's UTXOs.)
 get-utxos ::= "\"intent\"" ws ":" ws "\"get_utxos\"" ws "," ws "\"params\"" ws ":" ws params-utxos
 
-params-utxos ::= "{" ws "}" ws "}" ws | "{" ws address-number-kv ws "}" ws "}" ws
+params-utxos ::= "{" ws "}" ws "}" ws | "{" ws address-number-kv ws filter-tail-all | "{" ws direction-kv ws filter-tail-after-direction | "{" ws since-kv ws filter-tail-after-since | "{" ws label-set-kv ws filter-tail-after-label-set | "{" ws label-mode-kv ws "}" ws "}" ws
 
 # intent "new_address" -> params {} OR {"branch": "0"|"1"}
 new-address ::= "\"intent\"" ws ":" ws "\"new_address\"" ws "," ws "\"params\"" ws ":" ws params-new-address

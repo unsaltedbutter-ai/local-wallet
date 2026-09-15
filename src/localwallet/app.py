@@ -101,6 +101,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import hashlib
 import ipaddress
 import json
@@ -113,7 +114,7 @@ import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from decimal import Decimal, InvalidOperation
@@ -201,6 +202,7 @@ from localwallet.protocol import (
     RespondParams,
     SelfTransferParams,
     SignTxParams,
+    SincePeriod,
     TxStatusParams,
 )
 from localwallet.signer.base import Signer, SignerError
@@ -3900,6 +3902,117 @@ def _make_get_balance_handler(
     return handler
 
 
+# ------------------------------------------------- TCK-CHAT-005 filter engine
+#
+# The money-query filters (direction / since / label) are CLOSED CARRIERS
+# the model quotes from the user's phrasing; every RESOLUTION is engine
+# work here: the relative ``since`` window becomes a cutoff epoch from
+# TOOL-owned now (the model never computes a timestamp and none is
+# representable in the envelope), label words resolve against the v6
+# address-label-set (address membership + coin inheritance — a coin's
+# labels ARE its address's set; never against the write-frozen v5
+# coin_labels table), and direction compares verbatim against the stored
+# row's direction word. All pure store-side computation: no network, and
+# the only clock is the injected ``now`` seam.
+
+
+def _resolve_since_cutoff(since: SincePeriod, *, now: int | None = None) -> int:
+    """Resolve a relative period to a cutoff epoch (unix seconds, UTC).
+
+    Deterministic given ``now``: ``days``/``weeks`` are exact day-count
+    arithmetic (86,400 s/day); ``months`` is CALENDAR-exact UTC
+    (same day-of-month, clamped to the shorter month's last day — one
+    month before 31 March is 28 February, not a fabricated 30-day
+    average). A period the envelope admits (schema-bounded ≈ a decade)
+    can never underflow the epoch. ``now=None`` reads :func:`time.time`
+    (tests inject a fixed clock — the resolution pin is then byte-exact).
+    """
+    clock = int(time.time()) if now is None else now
+    if since.days is not None:
+        return clock - since.days * 86_400
+    if since.weeks is not None:
+        return clock - since.weeks * 7 * 86_400
+    months = since.months if since.months is not None else 0
+    tm = time.gmtime(clock)
+    year, month0 = divmod(tm.tm_year * 12 + (tm.tm_mon - 1) - months, 12)
+    day = min(tm.tm_mday, calendar.monthrange(year, month0 + 1)[1])
+    return calendar.timegm((year, month0 + 1, day, tm.tm_hour, tm.tm_min, tm.tm_sec, 0, 0, 0))
+
+
+def _tx_within_since(tx: TxRecord, cutoff: int) -> bool:
+    """Whether a history row falls inside a resolved ``since`` window.
+
+    Recorded block time >= cutoff. A row with NO block time that is also
+    unconfirmed (``height is None``) is a still-pending payment — the
+    history ordering already sorts such rows as the newest entries
+    (:data:`_NEVER_CONFIRMED`), so a window ends up including them (a
+    payment received seconds ago is never hidden from "last 2 weeks").
+    A CONFIRMED row whose time was never recorded is unresolvable and
+    fails CLOSED (excluded) — the store cannot vouch for where it sits.
+    """
+    if tx.block_time is not None:
+        return tx.block_time >= cutoff
+    return tx.height is None
+
+
+def _coin_within_since(coin: UtxoRecord, source: TxRecord | None, cutoff: int) -> bool:
+    """Whether a coin falls inside a resolved ``since`` window.
+
+    The coin's arrival time is its creating transaction's: an
+    unconfirmed coin is pending (newest by the ordering convention —
+    included); a confirmed coin resolves through the store's tx row
+    (:func:`_tx_within_since`). A confirmed coin with NO tx row is
+    unresolvable and fails CLOSED (excluded)."""
+    if coin.height is None:
+        return True
+    return source is not None and _tx_within_since(source, cutoff)
+
+
+def _label_query_form(words: Sequence[str]) -> frozenset[str]:
+    """Normalize filter words for matching: stripped, casefolded.
+
+    The store canonicalizes TAG ids case-insensitively at write ("KYC" →
+    ``kyc``) and keeps free text verbatim; matching filter words the same
+    forgiving way (case/edge-whitespace only, never fuzzy) is what a user
+    asking for "labeled Spearmint" means — a word that still matches no
+    label anywhere is an honest empty result, not an error."""
+    return frozenset(word.strip().casefold() for word in words)
+
+
+def _labels_match(members: Iterable[str], wanted: frozenset[str], *, exclude: bool) -> bool:
+    """One set-membership test for a label filter.
+
+    ``include`` (the omitted-``label_mode`` default) keeps an entry whose
+    label set holds ANY of the quoted words (IN-set semantics, the SQL
+    ``IN`` reading); ``exclude`` keeps exactly those that hold NONE
+    (NOT-IN). Empty set = unlabeled: never an include match, always an
+    exclude match."""
+    hit = any(member.strip().casefold() in wanted for member in members)
+    return (not hit) if exclude else hit
+
+
+def _label_members_by_txid(store: Store, wallet_id: int) -> dict[str, tuple[str, ...]]:
+    """txid → the union of label members carried by that tx's UNSPENT coins.
+
+    The history label view rides coin inheritance (a coin's labels = its
+    address's v6 set) collected per creating txid — the documented
+    store-fidelity bound: the coin→address join survives only for still-
+    unspent coins, so a history tx whose coins all spent has NO
+    resolvable labels (``exclude`` matches it, ``include`` never does;
+    the honest limit of the cache, stated in the handler docstring and
+    pinned by test). One global label-set read + one UTXO snapshot read,
+    both store-only.
+    """
+    sets = store.get_address_label_sets()
+    members: dict[str, set[str]] = {}
+    for coin in store.get_utxos_for_wallet(wallet_id):
+        if coin.address:
+            found = sets.get(coin.address)
+            if found:
+                members.setdefault(coin.txid, set()).update(found)
+    return {txid: tuple(sorted(ms)) for txid, ms in members.items()}
+
+
 def _make_get_history_handler(
     store: Store,
     wallet_id: int,
@@ -3917,6 +4030,26 @@ def _make_get_history_handler(
     tool-owned ``freshness`` key (ADR-0022 decision 6: this read MAY
     answer cache-served and stale-flagged before the first scan
     completes). No network I/O.
+
+    TCK-CHAT-005 additive filters (all optional; compose AND-wise BEFORE
+    the cap, so the answer is the first ``limit`` MATCHES, never a
+    capped scan filtered afterward):
+
+    - ``direction``: rows whose stored direction word equals the quoted
+      literal verbatim (the closed "in"/"out" enum mirrors the store's
+      own words; ``self`` rows match neither — store truth, not a gap).
+    - ``since``: resolved engine-side to a cutoff from tool-owned now
+      (:func:`_resolve_since_cutoff` — the model never computes a
+      timestamp); see :func:`_tx_within_since` for the pending/
+      unresolvable conventions.
+    - ``label_set`` (+ optional ``label_mode``): the tx's label view is
+      the union of its still-unspent coins' address-label sets (v6
+      inheritance, :func:`_label_members_by_txid`); a fully-spent tx has
+      no resolvable labels and answers the honest empty include (and
+      passes exclude).
+    Filters NEVER change the result shape — an empty match is the
+    existing "No transactions found." answer, values verbatim from the
+    store either way.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -3927,8 +4060,26 @@ def _make_get_history_handler(
         try:
             txs = store.get_txs_for_wallet(wallet_id)
             freshness = _freshness(store, wallet_id, scan_gate)
+            label_members = (
+                _label_members_by_txid(store, wallet_id)
+                if params.label_set is not None
+                else None
+            )
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
+        if params.direction is not None:
+            txs = [t for t in txs if t.direction == params.direction]
+        if params.since is not None:
+            cutoff = _resolve_since_cutoff(params.since)
+            txs = [t for t in txs if _tx_within_since(t, cutoff)]
+        if label_members is not None and params.label_set is not None:
+            wanted = _label_query_form(params.label_set)
+            exclude = params.label_mode == "exclude"
+            txs = [
+                t
+                for t in txs
+                if _labels_match(label_members.get(t.txid, ()), wanted, exclude=exclude)
+            ]
         ordered = sorted(
             txs,
             key=lambda t: (
@@ -4111,6 +4262,22 @@ def _make_get_utxos_handler(
     listing to one registry address (engine-resolved, bound-checked; a
     miss is the value-free ``address_ref_unknown`` clarify and the answer
     RESTATES the full address).
+
+    TCK-CHAT-005 additive filters (compose AND-wise with each other and
+    with the address scope, resolved engine-side BEFORE the rows are
+    numbered/printed): ``direction`` matches the COIN's creating
+    transaction's stored direction (verbatim word compare; a coin whose
+    tx row is missing has no resolvable direction and is excluded);
+    ``since`` resolves the coin's arrival through the same tx row
+    (:func:`_coin_within_since` — pending coins included as newest,
+    unresolvable confirmed coins fail closed); ``label_set`` (+
+    optional ``label_mode``) resolves against the v6 ADDRESS-LABEL-SET
+    — a coin's labels are its address's set (inheritance), never the
+    write-frozen v5 coin rows. The pending block rides the filtered
+    view (the TCK-CHAT-001 scoped-answer precedent: a filtered listing's
+    summary describes the listing that was answered), and an empty match
+    is the existing honest "No unspent outputs." — the result shape is
+    unchanged.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -4129,6 +4296,33 @@ def _make_get_utxos_handler(
                 if scoped_address is None:
                     return {"error": _ADDRESS_REF_UNKNOWN}
                 records = [r for r in records if r.address == scoped_address]
+            if params.direction is not None or params.since is not None:
+                sources = {t.txid: t for t in txs}
+                if params.direction is not None:
+                    records = [
+                        r
+                        for r in records
+                        if (src := sources.get(r.txid)) is not None
+                        and src.direction == params.direction
+                    ]
+                if params.since is not None:
+                    cutoff = _resolve_since_cutoff(params.since)
+                    records = [
+                        r
+                        for r in records
+                        if _coin_within_since(r, sources.get(r.txid), cutoff)
+                    ]
+            if params.label_set is not None:
+                wanted = _label_query_form(params.label_set)
+                exclude = params.label_mode == "exclude"
+                label_sets = store.get_address_label_sets()
+                records = [
+                    r
+                    for r in records
+                    if _labels_match(
+                        label_sets.get(r.address or "", ()), wanted, exclude=exclude
+                    )
+                ]
             # Number every address this answer will PRINT (showing = the
             # registry's only writer; idempotent, so repeats never move a
             # number or re-stamp the date).

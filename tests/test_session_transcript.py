@@ -134,8 +134,13 @@ class TestSummarization:
         # the summary + recent window cap it). 14500 → 15500 by
         # TCK-CFG-004: the APP SETTINGS ownership block grew the fixed
         # system prompt ~1K chars (~14.8K ≈ ~7.4K tokens — inside the 8K
-        # budget, the same bound the CHAT-001 step left).
-        assert len(prompt) < 15500
+        # budget, the same bound the CHAT-001 step left). 15500 →
+        # 17400 by TCK-CHAT-005: the get_history/get_utxos structured-
+        # filter mappings and five filter few-shots grew the fixed system
+        # prompt ~1.8K chars (~16.6K assembled ≈ ~6.9K tokens — inside the
+        # 8K budget; the bound is session-length-independent, the summary
+        # + recent window cap it).
+        assert len(prompt) < 17400
         assert "SESSION SUMMARY" in prompt
         assert "CONVERSATION SO FAR" in prompt
         # The recent window holds the last 20 turns verbatim.

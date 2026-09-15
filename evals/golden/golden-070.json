@@ -1,0 +1,5 @@
+{
+  "id": "golden-070",
+  "prompt": "show my utxos not labeled kyc",
+  "expectation": {"intent": "get_utxos", "params": {"label_set": ["kyc"], "label_mode": "exclude"}}
+}

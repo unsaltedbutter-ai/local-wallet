@@ -1,0 +1,5 @@
+{
+  "id": "golden-069",
+  "prompt": "what coins have the label exchange",
+  "expectation": {"intent": "get_utxos", "params": {"label_set": ["exchange"]}}
+}

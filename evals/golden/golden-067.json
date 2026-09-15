@@ -1,0 +1,5 @@
+{
+  "id": "golden-067",
+  "prompt": "what bitcoin did I receive in the past 14 days",
+  "expectation": {"intent": "get_history", "params": {"direction": "in", "since": {"days": 14}}}
+}

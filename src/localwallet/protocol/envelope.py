@@ -14,11 +14,23 @@ Canonical envelope contract v0 — the model-emitted wire format::
   ``get_balance`` → ``{}`` or ``{"address_number": int, 1..9_999_999}``
   (TCK-CHAT-001: the optional key scopes the answer to ONE registry
   address; the number is carried, the RESOLUTION is the handler's);
-  ``get_history`` → ``{}`` or ``{"limit": int, 1..100}`` (omitted ⇒ the
-  handler applies its default of 20);
-  ``get_utxos`` → ``{}`` or ``{"address_number": int, 1..9_999_999}``
-  (TCK-CHAT-001: the optional key scopes the listing to ONE registry
-  address, answered from stored UTXO truth — never a widened handler);
+   ``get_history`` → ``{}`` or ``{"limit": int, 1..100}`` (omitted ⇒ the
+   handler applies its default of 20), plus the TCK-CHAT-005 additive
+   money-filter keys in strict order after ``limit``: optional
+   ``{"direction": "in"|"out"}`` (received vs sent — the store's own
+   direction words), ``{"since": {"days": N} | {"weeks": N} |
+   {"months": N}}`` (exactly ONE relative unit, bounded; the ENGINE
+   resolves it against tool-owned now — the model never computes a
+   timestamp), ``{"label_set": [word, ...], 1..10 words}`` and
+   ``{"label_mode": "include"|"exclude"}`` (valid only alongside
+   ``label_set``; omitted mode means include);
+   ``get_utxos`` → ``{}`` or ``{"address_number": int, 1..9_999_999}``
+   (TCK-CHAT-001: the optional key scopes the listing to ONE registry
+   address, answered from stored UTXO truth — never a widened handler),
+   plus the SAME TCK-CHAT-005 money-filter keys (strict order after
+   ``address_number``; label filters resolve against the v6
+   address-label-set, coin inheritance included — resolution is the
+   handler's, never the model's);
   ``get_addresses`` → ``{}`` or ``{"address_number": int, 1..9_999_999}``
   (TCK-CHAT-001 referential addresses: empty asks for the numbered list of
   addresses already SHOWN, the number asks to restate that ONE address in
@@ -130,13 +142,15 @@ import math
 from collections.abc import Mapping
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Final, Literal
+from typing import Annotated, Final, Literal
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StringConstraints,
     ValidationError,
+    field_serializer,
     field_validator,
     model_serializer,
     model_validator,
@@ -152,9 +166,14 @@ __all__ = [
     "MAX_AMOUNT_USD",
     "MAX_FEE_RATE_SAT_VB",
     "MAX_FUNDING_REF_CHARS",
+    "MAX_LABEL_FILTER_WORDS",
+    "MAX_LABEL_FILTER_WORD_CHARS",
     "MAX_QUESTION_CHARS",
     "MAX_RECIPIENT_CHARS",
     "MAX_SELF_TRANSFER_PARTS",
+    "MAX_SINCE_DAYS",
+    "MAX_SINCE_MONTHS",
+    "MAX_SINCE_WEEKS",
     "MAX_TEXT_CHARS",
     "MAX_TX_REF_CHARS",
     "MIN_AMOUNT_SATS",
@@ -178,6 +197,7 @@ __all__ = [
     "RespondParams",
     "SelfTransferParams",
     "SignTxParams",
+    "SincePeriod",
     "TxStatusParams",
     "validate_payload",
 ]
@@ -247,6 +267,30 @@ MAX_TX_REF_CHARS: Final[int] = 64
 #: headroom mirroring the recipient bound. Semantics are the handler's.
 MAX_FUNDING_REF_CHARS: Final[int] = 100
 
+#: Accepted bounds of the TCK-CHAT-005 relative time filter ``since``
+#: (schema layer; the grammar's syntactic bound is looser — 1..9999 for
+#: every unit, the same loose-grammar/tight-schema split as ``limit``).
+#: The caps keep one "last <period>" ask inside a decade of history
+#: (3660 days ≈ 522 weeks ≈ 120 months ≈ 10 years); anything larger is
+#: a transcription slip, not a wallet history question. The ENGINE
+#: resolves the period to a cutoff timestamp from tool-owned now
+#: (deterministic, calendar-exact months); the model NEVER computes a
+#: timestamp and no absolute date/time is representable in the shape.
+MAX_SINCE_DAYS: Final[int] = 3660
+MAX_SINCE_WEEKS: Final[int] = 522
+MAX_SINCE_MONTHS: Final[int] = 120
+
+#: Accepted bounds of the TCK-CHAT-005 label filter (schema layer).
+#: ``label_set`` carries 1..10 label WORDS the user stated, quoted
+#: verbatim; each word is 1..100 printable characters (a transport bound
+#: mirroring the store's own member rules generously — the store's
+#: ``ADDRESS_LABEL_MAX_CHARS`` write bound and the address-label-set
+#: membership check remain the semantic authority at the handler; a word
+#: that matches no label anywhere simply answers the honest empty
+#: result, never an error and never a nearest-match).
+MAX_LABEL_FILTER_WORDS: Final[int] = 10
+MAX_LABEL_FILTER_WORD_CHARS: Final[int] = 100
+
 #: Upper bound of the optional ``address_number`` param (TCK-CHAT-001,
 #: ADR-0002 amendment). Registry numbers are dense MAX+1 over shown
 #: addresses — a real wallet cannot approach this — so it is a transport
@@ -291,6 +335,13 @@ _KNOWN_LOC_FIELDS: Final[frozenset[str]] = frozenset(
         "txid",
         "target",
         "funding_ref",
+        "direction",
+        "since",
+        "days",
+        "weeks",
+        "months",
+        "label_set",
+        "label_mode",
         "error",
         "detail",
         "code",
@@ -378,6 +429,17 @@ class IntentName(StrEnum):
     dispatcher-owned engine work — the model never authors, computes, or
     "corrects" a number, and a number that misses the registry answers the
     value-free clarify.
+
+    TCK-CHAT-005 v0 extension (backward-compatible — see
+    ``docs/adr/0002-envelope-spec.md`` amendment): NO new intent joined —
+    the registry STAYS FIFTEEN. The existing read intents ``get_history`` /
+    ``get_utxos`` gain ADDITIVE optional money-filter keys (``direction``,
+    ``since``, ``label_set``, ``label_mode``) in strict key order after
+    their existing optional key. The model maps natural phrasings to these
+    CLOSED structured shapes and carries them; resolving ``since`` to a
+    timestamp (from tool-owned now) and resolving label words against the
+    v6 address-label-set (coin inheritance included) is ENGINE work — no
+    absolute date or timestamp is representable anywhere in the shapes.
     """
 
     RESPOND = "respond"
@@ -473,14 +535,187 @@ class GetBalanceParams(_AddressScopedParams):
     """
 
 
-class GetHistoryParams(_OmitNoneDump):
-    """Params for ``get_history``: optional result cap.
+class SincePeriod(_OmitNoneDump):
+    """TCK-CHAT-005 relative time window: EXACTLY ONE bounded unit count.
+
+    Closed shapes ``{"days": N}`` | ``{"weeks": N}`` | ``{"months": N}`` —
+    each a TRUE JSON integer (the strict-int pattern from ``limit``;
+    strings/bools/floats/explicit null rejected), bounded by the
+    ``MAX_SINCE_*`` caps (≈ a decade each). Two or three units at once is
+    ambiguous intent (rejected, one re-prompt, then ``clarify`` — the
+    ``create_tx`` fee-knob precedent); none is a malformed window.
+
+    NO absolute date, epoch, or timestamp is representable here BY
+    DESIGN: the model transcribes only the period number the USER stated
+    (verbatim, word→digit included — that is transcription, not
+    computation), and the HANDLER resolves it deterministically against
+    tool-owned ``now`` (calendar-exact months). The model never computes
+    a timestamp; an unverifiable "date math" can therefore never reach
+    the money queries.
+    """
+
+    days: int | None = Field(default=None, ge=1, le=MAX_SINCE_DAYS)
+    weeks: int | None = Field(default=None, ge=1, le=MAX_SINCE_WEEKS)
+    months: int | None = Field(default=None, ge=1, le=MAX_SINCE_MONTHS)
+
+    @field_validator("days", mode="before")
+    @classmethod
+    def _days_must_be_true_int(cls, value: object) -> object:
+        """Close pydantic's lax coercions for ``days`` (see ``limit``)."""
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        raise ValueError("since.days must be an integer when present")
+
+    @field_validator("weeks", mode="before")
+    @classmethod
+    def _weeks_must_be_true_int(cls, value: object) -> object:
+        """Close pydantic's lax coercions for ``weeks`` (see ``limit``)."""
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        raise ValueError("since.weeks must be an integer when present")
+
+    @field_validator("months", mode="before")
+    @classmethod
+    def _months_must_be_true_int(cls, value: object) -> object:
+        """Close pydantic's lax coercions for ``months`` (see ``limit``)."""
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        raise ValueError("since.months must be an integer when present")
+
+    @model_validator(mode="after")
+    def _exactly_one_unit(self) -> SincePeriod:
+        """Exactly one of ``days``/``weeks``/``months`` must be present.
+
+        The GBNF ``since-value`` alternation already makes multi-unit and
+        empty shapes syntactically impossible for a grammar-constrained
+        decode; this covers every other producer (fail closed, never a
+        guessed unit).
+        """
+        given = sum(1 for v in (self.days, self.weeks, self.months) if v is not None)
+        if given != 1:
+            raise ValueError(
+                "since must carry exactly one of days, weeks or months"
+            )
+        return self
+
+
+#: Element type for the TCK-CHAT-005 ``label_set``: a label WORD of 1..100
+#: characters (transport bound; blank/printable is layer 3 — the schema
+#: length rule already refuses the empty string the way ``min_length``
+#: refuses an empty array).
+_LabelFilterWord = Annotated[
+    str, StringConstraints(min_length=1, max_length=MAX_LABEL_FILTER_WORD_CHARS)
+]
+
+
+class _MoneyFilterParams(_OmitNoneDump):
+    """Shared TCK-CHAT-005 money-filter keys for ``get_history``/``get_utxos``.
+
+    All four are OPTIONAL (omission = the pre-CHAT-005 whole-wallet query,
+    so every previously-valid envelope keeps its shape — additive v0
+    extension, ADR-0002 bump policy) and compose AND-wise at the handler:
+
+    - ``direction``: closed enum literal ``"in"`` (received) | ``"out"``
+      (sent) — deliberately the STORE's own direction words so the handler
+      compares verbatim against the stored rows (rows stored as ``self``
+      match neither literal; that is store truth, not a gap). Explicit
+      ``null`` rejected (omission = leave the key out).
+    - ``since``: a :class:`SincePeriod` relative window, resolved by the
+      HANDLER against tool-owned now. Explicit ``null`` rejected.
+    - ``label_set``: 1..10 label WORDS the user stated, quoted verbatim
+      from their utterance — the model never invents a label and label
+      lists are never in FACTS. Resolution against the v6 address-label-
+      set (address membership + coin inheritance) is engine work.
+    - ``label_mode``: ``"include"|"exclude"`` — the IN / NOT-IN selection.
+      Only meaningful alongside ``label_set``; OMITTED means include (the
+      plain "labeled X" case), and a ``label_mode`` without a
+      ``label_set`` is rejected here (nothing to mode — an ambiguity, not
+      a default).
+
+    Key ORDER (``direction < since < label_set < label_mode``, after each
+    intent's own leading optional key) is pinned by the GBNF tail chain;
+    pydantic accepts any wire order of KNOWN keys (schema authority is
+    per-key shape, the strict-order discipline is the grammar's).
+    """
+
+    direction: Literal["in", "out"] | None = None
+    since: SincePeriod | None = None
+    label_set: tuple[_LabelFilterWord, ...] | None = Field(
+        default=None, min_length=1, max_length=MAX_LABEL_FILTER_WORDS
+    )
+    label_mode: Literal["include", "exclude"] | None = None
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def _direction_must_be_present_when_not_omitted(cls, value: object) -> object:
+        """Reject explicit ``null`` for ``direction`` (see ``fee_target``)."""
+        if value is None:
+            raise ValueError("direction must be 'in' or 'out' when present")
+        return value
+
+    @field_validator("since", mode="before")
+    @classmethod
+    def _since_must_be_present_when_not_omitted(cls, value: object) -> object:
+        """Reject explicit ``null`` for ``since`` (see ``fee_target``)."""
+        if value is None:
+            raise ValueError("since must be a relative period object when present")
+        return value
+
+    @field_validator("label_set", mode="before")
+    @classmethod
+    def _label_set_must_be_a_list_when_present(cls, value: object) -> object:
+        """Reject explicit ``null`` and non-lists for ``label_set``.
+
+        The contract admits only a JSON ARRAY of strings (the GBNF
+        ``label-set-value``); a bare string ("labeled kyc" typed as one
+        word-value) is a shape error, not a one-element set — never
+        guessed into one.
+        """
+        if value is None:
+            raise ValueError("label_set must be an array of label words when present")
+        if not isinstance(value, list):
+            raise ValueError("label_set must be an array when present")  # noqa: TRY004 — pydantic mode="before" validators must raise ValueError (see _v_must_be_zero_int)
+        return value
+
+    @field_validator("label_mode", mode="before")
+    @classmethod
+    def _label_mode_must_be_present_when_not_omitted(cls, value: object) -> object:
+        """Reject explicit ``null`` for ``label_mode`` (see ``fee_target``)."""
+        if value is None:
+            raise ValueError("label_mode must be 'include' or 'exclude' when present")
+        return value
+
+    @field_serializer("label_set")
+    def _serialize_label_set(
+        self, value: tuple[str, ...] | None, _info: object
+    ) -> list[str] | None:
+        """Dump the immutable tuple as a JSON list (python-mode round-trip).
+
+        The field stays a ``tuple`` internally (frozen model = truly
+        immutable — no mutating the caller's list), but ``model_dump``
+        emits a ``list`` so the wire/eval shape is a JSON array and
+        ``model_validate`` coerces it back to a tuple.
+        """
+        return None if value is None else list(value)
+
+    @model_validator(mode="after")
+    def _label_mode_requires_label_set(self) -> _MoneyFilterParams:
+        """``label_mode`` is a modifier OF ``label_set``, never standalone."""
+        if self.label_mode is not None and self.label_set is None:
+            raise ValueError("params.label_mode requires params.label_set")
+        return self
+
+
+class GetHistoryParams(_MoneyFilterParams):
+    """Params for ``get_history``: optional result cap + money filters.
 
     ``limit``: optional integer, business range 1..100 (schema-enforced;
     the grammar's syntactic bound is looser — 1..999, no leading zeros —
     and this layer is the authority). When omitted the handler applies its
     own default of 20; omission is the normal case, so ``"params": {}`` is
-    a fully valid body.
+    a fully valid body. The TCK-CHAT-005 filter keys (see
+    :class:`_MoneyFilterParams`) are evaluated BEFORE the cap: the answer
+    is the first ``limit`` matches, not a capped scan.
     """
 
     limit: int | None = Field(default=None, ge=1, le=100)
@@ -504,12 +739,15 @@ class GetHistoryParams(_OmitNoneDump):
         raise ValueError("limit must be an integer when present")
 
 
-class GetUtxosParams(_AddressScopedParams):
-    """Params for ``get_utxos``: ``{}`` (whole-wallet, the normal case) or
+class GetUtxosParams(_AddressScopedParams, _MoneyFilterParams):
+    """Params for ``get_utxos``: ``{}`` (whole-wallet, the normal case),
     ``{"address_number": <int>}`` — the TCK-CHAT-001 additive scope key
     (see :class:`_AddressScopedParams`; "the coins on address 2" rides the
-    SAME handler, scoped to that one registry address's UTXOs). Any key
-    other than ``address_number`` is rejected (closed world).
+    SAME handler, scoped to that one registry address's UTXOs) — plus the
+    TCK-CHAT-005 money-filter keys (see :class:`_MoneyFilterParams`;
+    "coins labeled X", "received since", direction over the coins'
+    creating transactions). Scope and filters compose AND-wise at the
+    handler. Any key other than these five is rejected (closed world).
     """
 
 

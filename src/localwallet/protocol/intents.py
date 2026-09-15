@@ -19,8 +19,12 @@ the URL path this user/model-supplied value is interpolated into; for
 below_size_sats, exactly one — and the bound re-checks, TCK-TX-SELF-001;
 for ``bump_fee``: the ``target`` / ``funding_ref`` shape — non-blank
 printable strings, the txid-vs-pending-ref resolution is the handler's,
-TCK-RBF-003) and return error strings for the dispatcher to surface. An
-empty list means valid.
+TCK-RBF-003; for ``get_history``/``get_utxos``: the TCK-CHAT-005 money
+filters — closed ``direction`` literals, exactly-one-bounded-unit
+``since``, 1..10 non-blank printable label words, ``label_mode`` only
+alongside ``label_set`` — carrier shape only: the timestamp and label
+RESOLUTION are handler-side, engine work, TCK-CHAT-005) and return error
+strings for the dispatcher to surface. An empty list means valid.
 
 Adding rules never widens the model's freedom: rules only reject, they
 never transform or execute.
@@ -48,7 +52,12 @@ from localwallet.protocol.envelope import (
     MAX_ADDRESS_NUMBER,
     MAX_AMOUNT_SATS,
     MAX_AMOUNT_USD,
+    MAX_LABEL_FILTER_WORD_CHARS,
+    MAX_LABEL_FILTER_WORDS,
     MAX_SELF_TRANSFER_PARTS,
+    MAX_SINCE_DAYS,
+    MAX_SINCE_MONTHS,
+    MAX_SINCE_WEEKS,
     MIN_AMOUNT_SATS,
     MIN_AMOUNT_USD,
     MIN_SELF_TRANSFER_PARTS,
@@ -69,6 +78,7 @@ from localwallet.protocol.envelope import (
     RespondParams,
     SelfTransferParams,
     SignTxParams,
+    SincePeriod,
     TxStatusParams,
 )
 
@@ -135,15 +145,87 @@ def _rule_get_balance(params: BaseParams) -> list[str]:
     return _address_number_failures(params)
 
 
+#: Closed literal sets for the TCK-CHAT-005 money-filter keys (layer-2
+#: Literal types admit exactly these; the layer-3 re-check is defense in
+#: depth against a validation-skipping constructor).
+_DIRECTIONS: frozenset[str] = frozenset({"in", "out"})
+_LABEL_MODES: frozenset[str] = frozenset({"include", "exclude"})
+
+
+def _money_filter_failures(params: GetHistoryParams | GetUtxosParams) -> list[str]:
+    """Layer-3 re-check of the TCK-CHAT-005 filter keys (both intents share it).
+
+    Everything here is CARRIER shape — meaning lives engine-side: the
+    ``since`` period's cutoff timestamp is resolved by the HANDLER from
+    tool-owned now (calendar-exact months; the model never computes a
+    timestamp and no absolute date is representable), and label words
+    resolve against the v6 address-label-set (address membership + coin
+    inheritance). A word that matches no label anywhere is an honest
+    empty RESULT, never a rule failure — these rules only reject
+    malformed carriers. VALUE-FREE by construction: no offending value
+    (label word included) is ever echoed into a failure string.
+    """
+    failures: list[str] = []
+    if params.direction is not None and params.direction not in _DIRECTIONS:
+        failures.append("params.direction must be 'in' or 'out' when present")
+    since = params.since
+    if since is not None:
+        if not isinstance(since, SincePeriod):
+            failures.append("params.since must be a relative period object")
+        else:
+            units = (
+                ("days", since.days, MAX_SINCE_DAYS),
+                ("weeks", since.weeks, MAX_SINCE_WEEKS),
+                ("months", since.months, MAX_SINCE_MONTHS),
+            )
+            given = [unit for unit in units if unit[1] is not None]
+            if len(given) != 1:
+                failures.append(
+                    "params.since must carry exactly one of days, weeks or months"
+                )
+            else:
+                name, value, cap = given[0]
+                if isinstance(value, bool) or not 1 <= value <= cap:
+                    failures.append(
+                        f"params.since.{name} must be an integer between 1 and {cap}"
+                    )
+    words = params.label_set
+    if words is not None:
+        if not 1 <= len(words) <= MAX_LABEL_FILTER_WORDS:
+            failures.append(
+                "params.label_set must carry between 1 and "
+                f"{MAX_LABEL_FILTER_WORDS} label words"
+            )
+        elif any(
+            not isinstance(w, str) or not w.strip() or not w.isprintable() or len(w) > MAX_LABEL_FILTER_WORD_CHARS
+            for w in words
+        ):
+            failures.append(
+                "params.label_set entries must be non-blank printable strings "
+                f"of at most {MAX_LABEL_FILTER_WORD_CHARS} characters"
+            )
+    if params.label_mode is not None:
+        if params.label_mode not in _LABEL_MODES:
+            failures.append(
+                "params.label_mode must be 'include' or 'exclude' when present"
+            )
+        elif words is None:
+            failures.append("params.label_mode requires params.label_set")
+    return failures
+
+
 def _rule_get_history(params: BaseParams) -> list[str]:
-    """``get_history``: limit, when present, must be a true int in 1..100.
+    """``get_history``: limit re-check + the additive money-filter keys.
+
+    ``limit``, when present, must be a true int in 1..100.
 
     The schema layer already bounds ``limit`` identically (and rejects
     bools); this is the layer-3 re-check (defense in depth), reachable via
     a constructor that skipped validation. ``bool`` is rejected explicitly
     because ``True``/``False`` pass the ``1 <= x <= 100`` comparison as the
     ints 1/0 — the layer-2 schema already refuses them, so layer 3 must
-    agree (bool is not a JSON integer).
+    agree (bool is not a JSON integer). The TCK-CHAT-005 keys ride the
+    shared :func:`_money_filter_failures` re-check.
     """
     if not isinstance(params, GetHistoryParams):
         return ["internal: 'get_history' params failed the type check"]
@@ -151,14 +233,15 @@ def _rule_get_history(params: BaseParams) -> list[str]:
         params.limit is not None and not 1 <= params.limit <= 100
     ):
         return ["params.limit must be an integer between 1 and 100 when present"]
-    return []
+    return _money_filter_failures(params)
 
 
 def _rule_get_utxos(params: BaseParams) -> list[str]:
-    """``get_utxos``: the additive ``address_number`` re-check (TCK-CHAT-001)."""
+    """``get_utxos``: the additive ``address_number`` re-check (TCK-CHAT-001)
+    + the additive money-filter keys re-check (TCK-CHAT-005)."""
     if not isinstance(params, GetUtxosParams):
         return ["internal: 'get_utxos' params failed the type check"]
-    return _address_number_failures(params)
+    return _address_number_failures(params) + _money_filter_failures(params)
 
 
 def _rule_get_addresses(params: BaseParams) -> list[str]:

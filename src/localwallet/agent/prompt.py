@@ -19,12 +19,17 @@ the model's side of the closed intent protocol (PROJECT.md §7.1, §8):
    plan is engine-derived, so the examples carry no address/outpoint;
    the third cpfp example, TCK-CPFP-001, teaches the stuck-INBOUND
    routing that keeps cpfp out of ``bump_fee``).
-    The ``bump_fee`` mapping lines (TCK-RBF-003) teach the phrasings that
-    route to ``bump_fee`` without ever computing the new fee. The address
-    examples (TCK-CHAT-001) teach the list phrasings and the numbered-
-    referent routing (``get_addresses`` / ``address_number``) — a NUMBER
-    quoted from the FACTS-injected registry, never an address the model
-    wrote.
+ The ``bump_fee`` mapping lines (TCK-RBF-003) teach the phrasings that
+     route to ``bump_fee`` without ever computing the new fee. The address
+     examples (TCK-CHAT-001) teach the list phrasings and the numbered-
+     referent routing (``get_addresses`` / ``address_number``) — a NUMBER
+     quoted from the FACTS-injected registry, never an address the model
+     wrote. The filter examples (TCK-CHAT-005) teach natural
+     time/direction/label phrasings as STRUCTURED filters on
+     ``get_history``/``get_utxos`` — a relative period the ENGINE
+     resolves, never a timestamp the model computes, and label words
+     quoted verbatim for engine-side resolution against the v6 address-
+     label-set.
 
 The prompt is kept compact on purpose: v0 runs with a ≤8K context budget
 (ADR-0006), and this text is paid for on every turn.
@@ -73,7 +78,19 @@ a fiat number, code or amount. A balance asked about one of the user's \
 numbered addresses ("balance of #3") is get_balance with \
 {"address_number": N}, N quoted VERBATIM from the ADDRESS REGISTRY fact.
 - get_history: show recent wallet transactions; params {} or \
-{"limit": 1-100} — when the user asks what happened recently.
+{"limit": 1-100} — when the user asks what happened recently. Natural \
+TIME/DIRECTION/LABEL asks are STRUCTURED FILTERS on this same intent, \
+never word-matching: "received in the last 2 weeks" → \
+{"direction": "in", "since": {"weeks": 2}}, "sent in the last month" → \
+{"direction": "out", "since": {"months": 1}} — quote the period NUMBER \
+the user stated VERBATIM ("two weeks" → {"weeks": 2} is transcription); \
+"since" is ALWAYS the relative form {"days": N} | {"weeks": N} | \
+{"months": N} — you NEVER compute a timestamp or date and no absolute \
+date fits: the app resolves the window from its own clock. \
+"labeled X" → {"label_set": ["X"]} with the user's label word quoted \
+VERBATIM; "not labeled X" adds "label_mode": "exclude" (omit \
+"label_mode" for plain "labeled X"). Filters compose (direction AND \
+since AND label); the app answers empty honestly.
 - get_utxos: show the wallet's unspent outputs; params {} — when the user \
 asks what is spendable, how many UTXOs/coins they have, or what is \
 pending/incoming/unconfirmed. "How many utxos do I have?", "what's \
@@ -82,7 +99,12 @@ ALL get_utxos — its answer carries the pending summary; tx_status is \
 only for a known 64-hex txid. Coins asked about ONE of the user's OWN \
 numbered addresses ("what's on address 3?", "UTXOs of #2") are get_utxos \
 with {"address_number": N}: quote the number VERBATIM from the ADDRESS \
-REGISTRY fact — never derive or guess a number.
+REGISTRY fact — never derive or guess a number. Coin listings take the \
+SAME structured filters as get_history ("direction", "since", \
+"label_set" + optional "label_mode"): "coins labeled X", "UTXOs not \
+labeled Y", "bitcoin received in the last N days" about your COINS are \
+get_utxos with those filters — the app resolves labels and time \
+engine-side.
 - get_addresses: the wallet's own numbered addresses; params {} to LIST \
 them ("what addresses have I used?", "show my addresses", "which \
 addresses are unused?") or {"address_number": N} to SHOW ONE ("show \
@@ -246,6 +268,25 @@ envelope: {"v": 0, "intent": "get_balance", "params": {"address_number": 3}}
 
 user: show address 2
 envelope: {"v": 0, "intent": "get_addresses", "params": {"address_number": 2}}
+
+user: bitcoin received in the last two weeks
+envelope: {"v": 0, "intent": "get_history", "params": {"direction": \
+"in", "since": {"weeks": 2}}}
+
+user: what bitcoin did I send in the last month
+envelope: {"v": 0, "intent": "get_history", "params": {"direction": \
+"out", "since": {"months": 1}}}
+
+user: show my coins labeled salary
+envelope: {"v": 0, "intent": "get_utxos", "params": {"label_set": ["salary"]}}
+
+user: any utxos not labeled salary
+envelope: {"v": 0, "intent": "get_utxos", "params": {"label_set": \
+["salary"], "label_mode": "exclude"}}
+
+user: coins received in the last 30 days labeled salary
+envelope: {"v": 0, "intent": "get_utxos", "params": {"direction": "in", \
+"since": {"days": 30}, "label_set": ["salary"]}}
 """
 
 
@@ -254,19 +295,24 @@ def build_system_prompt() -> str:
 
     The prompt fixes: exactly one envelope per turn with key order
     ``v, intent, params``; the closed intent list (fifteen intents as of
-    the TCK-CHAT-001 v0 extension) with usage guidance; the
+    the TCK-CHAT-001 v0 extension — TCK-CHAT-005 added NO intent, only
+    additive filter params) with usage guidance; the
     quote-verbatim rule for FACTS values (including the ``address_registry``
     fact: the model maps an "address N" referent to the right read intent
     with the NUMBER quoted verbatim from the registry, never an address it
-    wrote itself); the no-secrets (watch-only) rule; and twelve few-shot
+    wrote itself); the no-secrets (watch-only) rule; and seventeen few-shot
     exchanges (respond / clarify / get_balance /
     new_address / create_tx / self_transfer-split / self_transfer-
     consolidate / self_transfer-cpfp / bump_fee / get_addresses-list /
-    get_balance-by-number / get_addresses-by-number). The self_transfer
+    get_balance-by-number / get_addresses-by-number / history-
+    direction+since (x2: received, sent) / utxos-labeled /
+    utxos-not-labeled / utxos-composed-filters). The self_transfer
     examples carry NO address or
     outpoint — the money plan is engine-derived, never model-authored; the
     bump_fee example quotes the target VERBATIM and never invents a fee; the
     address examples carry a NUMBER only — full-address restatement is the
+    app's job; the TCK-CHAT-005 filter examples carry only RELATIVE period
+    numbers and label WORDS — timestamps and label resolution are the
     app's job.
     Intentionally parameter-free: intent membership and the wire format
     are owned by the protocol subsystem and the GBNF grammar — this text

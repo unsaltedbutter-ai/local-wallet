@@ -339,8 +339,14 @@ class TestSystemPrompt:
         # (the model never states a settings value, never computes a
         # conversion, never claims a change — the engine's deterministic
         # intercept owns the surface). ~12.1K chars ≈ ~6K tokens, inside
-        # the 8K budget.
-        assert len(build_system_prompt()) < 12500
+        # the 8K budget. Raised 12500 → 14000 by TCK-CHAT-005: the
+        # get_history/get_utxos structured-filter mappings (relative
+        # since only — never a model-computed timestamp — and verbatim
+        # label words the ENGINE resolves) plus five filter few-shots
+        # (~1800 chars) ship the money-query filters. ~13.9K chars ≈
+        # ~6.9K tokens, inside the 8K budget with the per-turn facts
+        # headroom.
+        assert len(build_system_prompt()) < 14000
 
     def test_self_transfer_line_routes_stuck_inbound_to_cpfp(self) -> None:
         # TCK-CPFP-001: the prompt must teach the INBOUND/OUTBOUND split —

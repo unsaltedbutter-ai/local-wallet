@@ -1,0 +1,5 @@
+{
+  "id": "golden-072",
+  "prompt": "which transactions are labeled kyc",
+  "expectation": {"intent": "get_history", "params": {"label_set": ["kyc"]}}
+}

@@ -42,6 +42,7 @@ from localwallet.protocol.envelope import (
     RespondParams,
     SelfTransferParams,
     SignTxParams,
+    SincePeriod,
     TxStatusParams,
     validate_payload,
 )
@@ -85,6 +86,7 @@ __all__ = [
     "RespondParams",
     "SelfTransferParams",
     "SignTxParams",
+    "SincePeriod",
     "TxStatusParams",
     "dispatch",
     "handle_raw",

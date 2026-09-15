@@ -1,0 +1,5 @@
+{
+  "id": "golden-071",
+  "prompt": "show me coins labeled spearmint that arrived in the last 2 weeks",
+  "expectation": {"intent": "get_utxos", "params": {"direction": "in", "since": {"weeks": 2}, "label_set": ["spearmint"]}}
+}

@@ -1,0 +1,5 @@
+{
+  "id": "golden-068",
+  "prompt": "list the bitcoin I sent in the last month",
+  "expectation": {"intent": "get_history", "params": {"direction": "out", "since": {"months": 1}}}
+}
