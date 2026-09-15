@@ -95,3 +95,6 @@ Add keys only when a log line or a feature asks for them; malformed/unknown keys
 
 ## MW-8 — optional packaging
 - [ ] NOTHING needed for the current install.sh+GitHub path. Only if you later want a double-clickable .app: Apple Developer account + Windows box (TCK-P6-002 stays pending on this).
+
+7. **Hot-swap contract change blessed (TCK-SWAP-001, pending implementation):** the debugger proved your settings edit IS saved immediately but the client swap is deferred until the in-flight (minutes-class) bitcoind scan terminates — that's why you needed a restart. Decision made autonomously: relax the pinned "a swap never crosses an in-flight scan" rule to a cooperative abort — an Apply during an active scan installs the new backend IMMEDIATELY and discards the stale scan result (no store corruption, no new threads). Options were: keep deferral (current, restart-inducing), cooperative abort (chosen), or block-until-done (already ruled out — probe isn't the blocker). Flag if you'd rather keep strict serialization.
+8. **Core min-relay fact-check:** you were right — policy.h (master AND v31.0) has `DEFAULT_MIN_RELAY_TX_FEE{100}` = 0.1 sat/vB; my "1 sat/vB default" claim was the historical value. TCK-FEE-005 will correct the engine's assumed floor; `tools/probe_backend_diag.py <url> ... --minrelay` now shows your node's actual advertised value.
