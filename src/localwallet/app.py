@@ -1184,7 +1184,9 @@ def _rebind_watcher(
     reason for not rebuilding), ON→OFF returns ``None`` (watching stops from
     the next cycle), and OFF→ON builds the watcher the same way :func:`_wire`
     does (probe over the live scan — dedup starts empty because nothing was
-    ever surfaced while off). Returns ``(live_watcher, applied)``;
+    ever surfaced while off, and is STAMPED for first-sighting absorption for
+    the same reason, TCK-CHAT-008: re-enabling must not per-line re-surface
+    every historical coin). Returns ``(live_watcher, applied)``;
     ``applied=False`` means the fresh ladder was unreadable, or the watcher
     was off and cannot be built here (no scan wired — a bare test pump), and
     the caller's narration must stay next-launch-honest.
@@ -1198,9 +1200,11 @@ def _rebind_watcher(
         if scan is None:
             return None, False
         return (
-            IncomingWatcher(
-                _make_watch_probe(store, scan.wallet_id, scan.scan_now),
-                interval_s=interval,
+            _stamp_watch_first_sighting(
+                IncomingWatcher(
+                    _make_watch_probe(store, scan.wallet_id, scan.scan_now),
+                    interval_s=interval,
+                )
             ),
             True,
         )
@@ -9795,6 +9799,43 @@ def _narrate_incoming_event(
     return line
 
 
+#: TCK-CHAT-008: recency window (in BLOCKS, ticket-pinned) for surfacing a
+#: FIRST-sighting confirmed event — ``tip - height <= N`` still narrates,
+#: anything older is absorbed silently. Compared against the scan-owned
+#: cached tip (:data:`wallet_scan.TIP_KEY`, written by every completed scan)
+#: — ZERO extra chain calls.
+_WATCH_FIRST_SIGHT_RECENT_BLOCKS: Final[int] = 3
+
+#: TCK-CHAT-008 first-sighting marker. Stored as an attribute STAMPED ON THE
+#: APP-BUILT WATCHER INSTANCE at construction
+#: (:func:`_stamp_watch_first_sighting`) — PROCESS-SCOPED by design, following the
+#: P5-001 dedup precedent: :attr:`IncomingWatcher._seen` is itself process
+#: memory, so every restart re-runs the startup scan and re-surfaces the same
+#: history from an empty dedup map. The stamp makes that re-surfacing re-ride
+#: the absorption rule: a restart re-absorbs SILENTLY (at most the value-free
+#: "N earlier transactions loaded" summary echoes again — never per-coin
+#: spam). A PERSISTED flag was the alternative and is actively wrong here:
+#: the flag would say "already sighted" while the fresh watcher's empty
+#: ``_seen`` surfaces every historical coin per-event on the first poll —
+#: the exact spam this ticket fixes, on every launch. The stamp flips off
+#: after the first successful tick that PRODUCED EVENTS (zero-event cycles
+#: are not a sighting of history); failures never flip it. Bare watchers
+#: built elsewhere (tests) carry no stamp → their pre-existing per-event
+#: narration is untouched.
+_WATCH_FIRST_SIGHT_ATTR: Final[str] = "_lw_awaiting_first_sighting"
+
+
+def _stamp_watch_first_sighting(watcher: IncomingWatcher) -> IncomingWatcher:
+    """Mark a freshly app-built watcher as yet-to-see its wallet's history
+    (TCK-CHAT-008). Both app construction sites (:func:`_wire`, the
+    TCK-CFG-005 OFF→ON rebind in :func:`_rebind_watcher`) stamp, so every
+    fresh dedup memory — launch, watch-key replace, re-enable — pairs with a
+    fresh first-sighting absorption. Returns the watcher (call-site inline).
+    """
+    setattr(watcher, _WATCH_FIRST_SIGHT_ATTR, True)
+    return watcher
+
+
 def _make_watch_probe(
     store: Store,
     wallet_id: int,
@@ -9891,8 +9932,30 @@ def _drain_watch(
     ONCE per drain via :func:`_last_block_suffix` and appended to each event's
     narration. Any failure yields no suffix (fail-closed).
 
+    First-sighting absorption (TCK-CHAT-008 — the connect-an-existing-wallet
+    spam fix): on the FIRST tick that surfaces events for a freshly built
+    watcher (the startup scan has already run — the pump stands the drain
+    down while a scan is in progress, so this is always the post-scan
+    history), only unconfirmed incoming and confirmed-recent transactions
+    narrate: ``confirmed`` with ``tip - height > 3`` rides no line, and the
+    whole silently-absorbed remainder echoes ONE value-free
+    ``"<N> earlier transactions loaded"`` summary at most. The tip is the
+    scan-owned cache (:func:`_stored_tip_height`, zero chain calls); absent
+    or unreadable the rule fails OPEN (per-event surfacing — an old
+    malformed store degrades to the pre-ticket behavior, wallet money is
+    never swallowed on doubt). The watch-event path is the single choke
+    point for BOTH report paths: the startup scan itself narrates no coin
+    lines, and the watch-key replace / OFF→ON rebinds build freshly stamped
+    watchers, so every first sighting — first connect, restart, replace —
+    absorbs. New incoming after that first event-producing cycle always
+    surfaces immediately (the stamp flips exactly once, process-scoped);
+    the absorbed coins entered the watcher's own ``_seen`` during ``tick``
+    before filtering, so dedup coordinates with the rule rather than
+    fighting it (later confirms of live coins still transition-surface).
+
     Returns:
-        The number of events surfaced this drain (0 when none / disabled).
+        The number of events surfaced this drain (0 when none / disabled;
+        absorbed first-sighting history is NOT a surfacing).
         The REPL records this value-free count into the session summary
         (R13) so long-session context notes how many watch events occurred.
     """
@@ -9909,6 +9972,36 @@ def _drain_watch(
             # value-free recovery line, symmetric to the once-per-streak
             # failure line below. A healthy poll prints nothing.
             output_fn("watch: recovered.")
+        wallet = None
+        if events:
+            # Defer the store lookup until a non-empty drain (TCK-CHAT-008
+            # MINOR-1): a quiet zero-event cycle must stay silent even if
+            # the store's get_active_wallet raises — the events path below
+            # still numbers/summarizes as pinned.
+            wallet = store.get_active_wallet() if store is not None else None
+        if events and getattr(watcher, _WATCH_FIRST_SIGHT_ATTR, False):
+            # One sighting per watcher lifetime (see the marker's docstring):
+            # flip FIRST — the filter runs once, failures and all.
+            setattr(watcher, _WATCH_FIRST_SIGHT_ATTR, False)
+            tip = _stored_tip_height(store, wallet.id) if wallet is not None else None
+            if tip is not None:
+                kept: list[IncomingEvent] = []
+                absorbed = 0
+                for event in events:
+                    if (
+                        event.confirmed
+                        and event.height is not None
+                        and tip - event.height > _WATCH_FIRST_SIGHT_RECENT_BLOCKS
+                    ):
+                        absorbed += 1
+                    else:
+                        kept.append(event)
+                if absorbed:
+                    # The sanctioned count echo (tool-output number in
+                    # user-facing narration — never a log line, never model
+                    # FACTS). No addresses, no amounts.
+                    output_fn(f"{absorbed} earlier transactions loaded")
+                events = kept
         suffix = (
             _last_block_suffix(client)
             if (client is not None and events)
@@ -9918,19 +10011,18 @@ def _drain_watch(
         # so each event address gets its stable registry number here
         # (idempotent first-showing write). A registry failure degrades
         # the NUMBER only — the surfacing itself never rides on it.
+        # Absorbed (never-printed) addresses take no registry number.
         numbers: dict[str, int] = {}
-        if store is not None:
-            wallet = store.get_active_wallet()
-            if wallet is not None:
-                for event in events:
-                    if not event.address or event.address in numbers:
-                        continue
-                    try:
-                        numbers[event.address] = store.note_address_shown(
-                            wallet.id, event.address
-                        ).number
-                    except (StoreError, sqlite3.Error):
-                        continue
+        if wallet is not None:
+            for event in events:
+                if not event.address or event.address in numbers:
+                    continue
+                try:
+                    numbers[event.address] = store.note_address_shown(
+                        wallet.id, event.address
+                    ).number
+                except (StoreError, sqlite3.Error):
+                    continue
         for event in events:
             output_fn(
                 sanitize_tool_output(
@@ -16017,9 +16109,11 @@ def _wire(
         output_fn(watch_interval_warning)
     watcher: IncomingWatcher | None = None
     if watch_interval > 0:
-        watcher = IncomingWatcher(
-            _make_watch_probe(store, wallet_row.id, scan.scan_now),
-            interval_s=watch_interval,
+        watcher = _stamp_watch_first_sighting(
+            IncomingWatcher(
+                _make_watch_probe(store, wallet_row.id, scan.scan_now),
+                interval_s=watch_interval,
+            )
         )
     else:
         output_fn("Background watch: off. Change it in settings.")
