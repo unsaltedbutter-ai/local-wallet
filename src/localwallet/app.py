@@ -162,7 +162,12 @@ from localwallet.chain.config import (
     BITCOIND_TLS_SCHEME,
     ELECTRUM_SCHEME,
 )
-from localwallet.chain.esplora import NETWORK_ERROR, RPC_ERROR, SERVER_REJECTED
+from localwallet.chain.esplora import (
+    HTTP_STATUS,
+    NETWORK_ERROR,
+    RPC_ERROR,
+    SERVER_REJECTED,
+)
 from localwallet.config import (
     COIN_SETTING_BOUNDS,
     COIN_SETTING_DEFAULTS,
@@ -3496,7 +3501,14 @@ class SendSession:
     #: sets it, and it dispatches in the same ``finally`` that clears
     #: it). ``public_bcast_txid`` names a broadcast that went out
     #: publicly, so the tx_status answer can be honest about the gossip
-    #: lag (binding condition 4).
+    #: lag (binding condition 4). Lifecycle (TCK-PUBLICBCAST-002, the
+    #: stale-slot MINOR): it is valid ONLY while the flow's own txid IS
+    #: that public broadcast. It is set only at the broadcast success site
+    #: — set to a via_public txid, cleared by a NON-public (own-node)
+    #: broadcast of a different transaction — so a stale slot can never be
+    #: answered about the wrong tx (a new create/confirm/reset also nulls
+    #: ``flow.txid``, and the lag branch requires ``flow.txid == queried
+    #: txid``). The model can never set, read, or clear it.
     public_offer_txref: str | None = None
     public_offer_shown: str | None = None
     public_bcast_once: bool = False
@@ -8108,8 +8120,13 @@ def _make_broadcast_tx_handler(
             # tx_status answers can say plainly that the user's own node
             # may not have seen the transaction yet.
             result["via_public"] = True
-            if session is not None:
-                session.public_bcast_txid = txid
+        # TCK-PUBLICBCAST-002 (a): the slot's whole lifecycle lives here —
+        # set to this broadcast's txid when it went PUBLIC, cleared when it
+        # did NOT (an own-node broadcast is a DIFFERENT transaction, so the
+        # earlier public slot must not linger and be readable by a later
+        # status answer). A public broadcast (re)sets it to the new txid.
+        if session is not None:
+            session.public_bcast_txid = txid if via_public else None
         if session is not None:
             session.public_offer_txref = None  # the failure is spent — offer retired
         confirmed = flow.confirmed
@@ -8369,6 +8386,31 @@ def _lineage_tx_status(
     return None
 
 
+def _is_not_found(exc: BaseException) -> bool:
+    """Whether ``exc`` is the chain layer's PROVABLE NOT-FOUND shape for a
+    tx-status lookup (TCK-PUBLICBCAST-002 review): the typed
+    ``failure_class`` HTTP_STATUS AND the explicit numeric ``http_status``
+    field == 404. The class alone is ambiguous — Esplora/Bitcoind attach it
+    both to an immediately-answered non-auth 4xx (the only shape that also
+    carries the explicit status field) and to a retry-EXHAUSTED 429/5xx
+    ("after N retries: status 502", field absent), and a transient failure
+    must never be read as "the chain provably does not know this txid": the
+    hedged-replaced branch's contract reserves its live-race claim for
+    genuine not-founds, and the lag branch's for genuine gossip lag. A
+    directly-answered 400/405 (misconfigured port) is explicit but not 404
+    — also a non-match. Keyed on the class+field, never on error-message
+    dialect text. The Electrum not-found dialect (an ``rpc-error`` class)
+    stays a non-match, exactly as before (see the handler's
+    backend-dependence note). Fail-closed: a class-less error, an error
+    carrying no ``http_status`` (any exhausted-retry or transport shape),
+    or a foreign class returns ``False`` — no provable not-found.
+    """
+    return (
+        getattr(exc, "failure_class", None) == HTTP_STATUS
+        and getattr(exc, "http_status", None) == 404
+    )
+
+
 def _make_tx_status_handler(
     client: ChainClient,
     flow: TxFlow,
@@ -8418,20 +8460,23 @@ def _make_tx_status_handler(
     broadcast txid and the lookup fails with the not-found status, the
     handler surfaces ``{"error": "unknown_tx", "detail": <value-free>}``
     instead of a generic chain failure, so the narration can say "not
-    indexed yet — try again shortly". The 404 detection matches the chain
-    layer's documented error-message contract ("status 404"); other
-    chain failures surface as ``{"error": "chain_unavailable",
-    "detail": <scrubbed>}``.
+    indexed yet — try again shortly". The 404 detection is the explicit
+    evidence check (:func:`_is_not_found` — HTTP_STATUS class AND the
+    numeric ``http_status`` field == 404, attached only at the
+    adapters' immediate-answer sites), never the error-message text;
+    other chain failures (including a retry-exhausted 429/5xx, which
+    carries the class but no explicit status) surface as
+    ``{"error": "chain_unavailable", "detail": <scrubbed>}``.
 
-    Backend-dependence note (TCK-RBF-004 review rider): the ``"status 404"``
-    hedge trigger is the Esplora/Bitcoind error dialect. Electrum reports a
-    not-found through a DIFFERENT dialect (:mod:`localwallet.chain.electrum`
-    raises ``request rejected by the server``, not ``status 404``), so on an
-    Electrum backend the 404→hedged-replaced and 404→eventual-consistency
-    branches do NOT fire — the lookup surfaces as an ordinary
-    ``chain_unavailable`` instead. Normalizing the trigger is deferred (the
-    honest smaller-diff is naming the dependence here); the terminal
-    lineage answers above are backend-independent (store-truth, no chain).
+    Backend-dependence note (TCK-RBF-004 review rider): the not-found
+    trigger is the Esplora/Bitcoind class (HTTP_STATUS). Electrum reports a
+    not-found through a DIFFERENT class/dialect (:mod:`localwallet.chain.electrum`
+    raises ``request rejected by the server``), so on an Electrum backend
+    the 404→hedged-replaced and 404→eventual-consistency branches do NOT
+    fire — the lookup surfaces as an ordinary ``chain_unavailable`` instead.
+    Normalizing the trigger is deferred (the honest smaller-diff is naming
+    the dependence here); the terminal lineage answers above are
+    backend-independent (store-truth, no chain).
 
     Store-read stand-down (TCK-RBF-004 review rider): when a store IS wired
     and the lineage read itself fails, this handler returns ``store_error``
@@ -8467,7 +8512,7 @@ def _make_tx_status_handler(
             status = client.get_tx_status(params.txid)
         except ChainError as exc:
             detail = str(exc)  # scrubbed by the chain layer (no txids)
-            if "status 404" in detail and lineage is not None:
+            if _is_not_found(exc) and lineage is not None:
                 # The backend never saw (or no longer relays) this txid, but
                 # the wallet's own lineage rows know: the recorded bump's
                 # hedged replaced copy — never an endless "try again" for a
@@ -8485,7 +8530,7 @@ def _make_tx_status_handler(
             if (
                 flow.txid is not None
                 and params.txid == flow.txid
-                and "status 404" in detail
+                and _is_not_found(exc)
             ):
                 if (
                     session is not None

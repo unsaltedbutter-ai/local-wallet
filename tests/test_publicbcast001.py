@@ -37,6 +37,7 @@ from localwallet import app
 from localwallet.agent.loop import AgentLoop
 from localwallet.chain import ChainError
 from localwallet.chain.esplora import (
+    HTTP_STATUS,
     RPC_ERROR,
     SERVER_REJECTED,
     TXID_BIND_MISMATCH,
@@ -136,10 +137,12 @@ class _Node:
         floor: Any = 100,
         capable: bool = True,
         gate: bool = False,
+        ret_txid: str = TXID_OK,
     ) -> None:
         self.exc = exc
         self.floor = floor
         self.broadcasts: list[str] = []
+        self.ret_txid = ret_txid
         if capable:
             self.min_relay_centisat_vb = self._floor
         if gate:
@@ -154,10 +157,18 @@ class _Node:
         self.broadcasts.append(tx_hex)
         if self.exc is not None:
             raise self.exc
-        return TXID_OK
+        return self.ret_txid
 
     def get_tx_status(self, txid: str) -> Any:  # duck-typed seam
-        raise ChainError("tx-status failed: status 404")
+        # TCK-PUBLICBCAST-002 review: the not-found is the typed class
+        # PLUS the explicit numeric 404 field — exactly what the real
+        # immediate-4xx raise sites carry; the lag detection keys on that
+        # evidence, never on dialect text.
+        raise ChainError(
+            "tx-status request failed: status 404",
+            failure_class=HTTP_STATUS,
+            http_status=404,
+        )
 
 
 class _Public:
@@ -720,6 +731,98 @@ def test_status_lag_honesty_does_not_move_other_answers(live) -> None:
             "try again in a moment."
         )
     ]
+    store.close()
+
+
+def test_public_bcast_slot_cleared_by_a_later_different_broadcast(live) -> None:
+    """TCK-PUBLICBCAST-002 (a): after a PUBLIC broadcast of tx A, a later
+    NON-public (own-node) broadcast of a DIFFERENT tx B clears the stale
+    public slot — the flow has left the public-broadcast context, so no
+    later status answer can read the old txid as gossip lag."""
+    store, wallet = live
+    flow, session, signed, node, _public, table = _harness(store, wallet)
+    # Public broadcast of tx A.
+    table[IntentName.BROADCAST_TX](_env({"tx_ref": signed.tx_ref}))
+    app._run_turn(
+        AgentLoop(_FakeGen(), table), flow, session, "yes", lambda _s: None,
+        table=table, store=store,
+    )
+    assert flow.txid == TXID_OK and session.public_bcast_txid == TXID_OK
+    # A NEW transaction B, broadcast through the OWN node (not public).
+    flow.reset()
+    signed_b = _drive_to_signed_at_fee(flow, 50)
+    txid_b = "bb" * 32
+    node.exc = None          # the own node accepts B now
+    node.ret_txid = txid_b   # B is a DIFFERENT txid than A
+    result = table[IntentName.BROADCAST_TX](_env({"tx_ref": signed_b.tx_ref}))
+    assert result["status"] == "broadcast"
+    assert flow.txid == txid_b
+    # The stale public slot is gone — no later status answer can read it.
+    assert session.public_bcast_txid is None
+    # And a status query for the OLD publicly-broadcast A no longer claims lag.
+    status_a = table[IntentName.TX_STATUS](
+        validate_payload(
+            json.dumps({"v": 0, "intent": "tx_status", "params": {"txid": TXID_OK}})
+        )
+    )
+    assert "public_lag" not in status_a
+    store.close()
+
+
+def test_lag_detection_keys_on_class_not_dialect_text(live) -> None:
+    """TCK-PUBLICBCAST-002 (b): the status-lag detection fires on the
+    explicit not-found EVIDENCE (HTTP_STATUS class + the 404 status field),
+    never on the error-message dialect text — a wording change upstream, a
+    FOREIGN class, or the class WITHOUT the explicit field (a retry-
+    exhausted 429/5xx) can neither break nor fake the lag claim."""
+    store, wallet = live
+    flow, session, signed, node, _public, table = _harness(store, wallet)
+    # Public broadcast A so the lag branch is reachable for TXID_OK.
+    table[IntentName.BROADCAST_TX](_env({"tx_ref": signed.tx_ref}))
+    app._run_turn(
+        AgentLoop(_FakeGen(), table), flow, session, "yes", lambda _s: None,
+        table=table, store=store,
+    )
+    assert session.public_bcast_txid == TXID_OK and flow.txid == TXID_OK
+    tx_status = table[IntentName.TX_STATUS]
+    status_env = validate_payload(
+        json.dumps({"v": 0, "intent": "tx_status", "params": {"txid": TXID_OK}})
+    )
+    # (i) not-found as the TYPED class + the explicit 404 status field,
+    # with a DIFFERENT dialect string: fires.
+    node.get_tx_status = lambda txid: (_ for _ in ()).throw(
+        ChainError(
+            "the server answered that it has no record of that transaction",
+            failure_class=HTTP_STATUS,
+            http_status=404,
+        )
+    )
+    result = tx_status(status_env)
+    assert result["public_lag"] is True
+    assert result["detail"] == app._PUBLIC_BCAST_STATUS_LAG
+    # (ii) the "status 404" TEXT on a NON-not-found class does NOT fire —
+    # fail-closed, dialect text is inert. (SERVER_REJECTED is Electrum's
+    # BROADCAST-refusal class; its tx-status refusal class is RPC_ERROR —
+    # either way a foreign class carries no not-found evidence.)
+    node.get_tx_status = lambda txid: (_ for _ in ()).throw(
+        ChainError("tx-status failed: status 404", failure_class=SERVER_REJECTED)
+    )
+    result = tx_status(status_env)
+    assert "public_lag" not in result
+    assert result["error"] == "chain_unavailable"
+    # (iii) the HTTP_STATUS class WITHOUT the explicit 404 field — the
+    # retry-EXHAUSTED 5xx shape (an unreachable/flaky backend) — does NOT
+    # fire: a transient failure is never claimed as structural gossip lag.
+    node.get_tx_status = lambda txid: (_ for _ in ()).throw(
+        ChainError(
+            "tx-status request failed after 3 retries: status 502",
+            failure_class=HTTP_STATUS,
+            exc_name="HTTPStatus",
+        )
+    )
+    result = tx_status(status_env)
+    assert "public_lag" not in result
+    assert result["error"] == "chain_unavailable"
     store.close()
 
 

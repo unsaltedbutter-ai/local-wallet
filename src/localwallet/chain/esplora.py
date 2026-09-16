@@ -227,6 +227,15 @@ class ChainError(Exception):
     a bitcoind refusal carried. It is a protocol constant (e.g. -8
     ``INVALID_PARAMETER``), not user data — the app may print it in the
     same debug line; the server's message text never rides anything.
+
+    ``http_status`` (TCK-PUBLICBCAST-002 review) is the optional NUMERIC
+    HTTP status of an IMMEDIATE non-auth 4xx/5xx answer — the EXPLICIT
+    404 evidence the app's not-found check keys on (the class alone is
+    ambiguous: it also rides retry-EXHAUSTED 429/5xx surfaces). Only the
+    immediate raise sites set it; exhausted-retry shapes stay ``None`` so
+    transient failures can never qualify as a provable not-found. A
+    protocol constant like ``rpc_code`` — value-free, int-only
+    (bool-rejected at the field, so no caller can smuggle one in).
     """
 
     def __init__(
@@ -236,11 +245,17 @@ class ChainError(Exception):
         failure_class: str | None = None,
         exc_name: str | None = None,
         rpc_code: int | None = None,
+        http_status: int | None = None,
     ) -> None:
         super().__init__(message)
         self.failure_class = failure_class
         self.exc_name = exc_name
         self.rpc_code = rpc_code
+        self.http_status = (
+            http_status
+            if isinstance(http_status, int) and not isinstance(http_status, bool)
+            else None
+        )
 
 
 class _ApiRootMismatch(ChainError):
@@ -901,10 +916,16 @@ class EsploraClient:
                 else:
                     # 4xx (rate limiting aside) and anything else: fail
                     # now — answered-but-not-here is the mismatch class.
+                    # TCK-PUBLICBCAST-002 review: this is an IMMEDIATE
+                    # answer, so the numeric status rides the explicit
+                    # ``http_status`` field (the exhausted-retry surface
+                    # below deliberately carries none — only a directly
+                    # answered 404 is provable not-found evidence).
                     raise _ApiRootMismatch(
                         f"{kind} request failed: status {status}",
                         failure_class=HTTP_STATUS,
                         exc_name="HTTPStatus",
+                        http_status=status,
                     )
             if attempt < self._config.max_retries:
                 _sleep_for(_backoff_delay(attempt))

@@ -24,6 +24,7 @@ import pytest
 
 from localwallet import app
 from localwallet.chain import ChainError
+from localwallet.chain.esplora import HTTP_STATUS, RPC_ERROR
 from localwallet.protocol import Envelope, IntentName, TxStatusParams
 from localwallet.store import (
     DIR_IN,
@@ -69,7 +70,8 @@ def _tx(
 
 class _StatusClient:
     """get_tx_status-only fake: canned status, or the chain layer's
-    documented failure shapes ("status 404" = not-found, else generic)."""
+    documented failure shapes (provable not-found = HTTP_STATUS class +
+    the explicit 404 status field, else generic)."""
 
     def __init__(
         self,
@@ -77,16 +79,28 @@ class _StatusClient:
         confirmed: bool = False,
         height: int | None = None,
         fail_404: bool = False,
+        fail_with: ChainError | None = None,
     ) -> None:
         self.calls: list[str] = []
         self._confirmed = confirmed
         self._height = height
         self._fail_404 = fail_404
+        self._fail_with = fail_with
 
     def get_tx_status(self, txid: str) -> Any:
         self.calls.append(txid)
+        if self._fail_with is not None:
+            raise self._fail_with
         if self._fail_404:
-            raise ChainError("transaction status request failed: status 404")
+            # TCK-PUBLICBCAST-002 review: the real immediate-4xx raise
+            # sites (esplora._request_json_at, bitcoind._attempt) carry the
+            # typed class AND the explicit numeric status — the hedge keys
+            # on that evidence, never on the message text.
+            raise ChainError(
+                "transaction status request failed: status 404",
+                failure_class=HTTP_STATUS,
+                http_status=404,
+            )
         return SimpleNamespace(
             txid=txid, confirmed=self._confirmed, block_height=self._height, block_time=None
         )
@@ -331,6 +345,48 @@ def test_status_live_race_404_resolves_to_hedged_replaced_copy() -> None:
         "replacement_height": None,
     }
     assert client.calls == [ORIG]  # the chain was asked, and was answered
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        # Class-less (a bare ChainError): no provable not-found, even with
+        # the old dialect text in the message.
+        ChainError("transaction status request failed: status 404"),
+        # Foreign class (Electrum's tx-status refusal rides RPC_ERROR).
+        ChainError(
+            "transaction status request rejected by the server",
+            failure_class=RPC_ERROR,
+        ),
+        # Retry-EXHAUSTED 5xx: the HTTP_STATUS class but NO explicit
+        # status field — a transient failure, never provable not-found.
+        ChainError(
+            "transaction status request failed after 3 retries: status 502",
+            failure_class=HTTP_STATUS,
+            exc_name="HTTPStatus",
+        ),
+    ],
+    ids=["class-less", "foreign-class", "5xx-retry-exhausted"],
+)
+def test_status_live_race_hedge_fails_closed_without_explicit_404(
+    exc: ChainError,
+) -> None:
+    """TCK-PUBLICBCAST-002 review pin: the hedged-replaced branch fires
+    ONLY on the explicit-404 evidence (class + status field). Live-race
+    lineage + anything else answers ``chain_unavailable`` — a transient or
+    unlabeled failure may never mint the live-race "replaced" claim."""
+    with _memory_store(
+        [
+            _tx(1, ORIG, replaced_by_txid=REPL, first_seen=SEEN),
+            _tx(1, REPL, first_seen=SEEN + 30),
+        ],
+        link=(ORIG, REPL),
+    ) as store:
+        client = _StatusClient(fail_with=exc)
+        result = _handler(client, store)(_env(ORIG))
+    assert result["error"] == "chain_unavailable"
+    assert "lineage" not in result  # the hedge stood down, fail-closed
+    assert client.calls == [ORIG]  # the chain WAS asked (no pre-emption)
 
 
 def test_status_live_race_never_preempts_a_chain_answer() -> None:

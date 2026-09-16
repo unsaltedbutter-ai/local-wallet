@@ -1264,6 +1264,10 @@ class BitcoindClient:
                     # WITH an error envelope — class + code, never text.
                     raise _rpc_rejected(kind, envelope)
                 if status == 429 or status >= 500:
+                    # Retryable: the exhausted surface this produces
+                    # carries NO ``http_status`` (TCK-PUBLICBCAST-002
+                    # review — a transient failure is never provable
+                    # not-found evidence, only the immediate answer below is).
                     raise _TransportRetry(
                         f"status {status}",
                         failure_class=HTTP_STATUS,
@@ -1273,6 +1277,7 @@ class BitcoindClient:
                     f"{kind} request failed: status {status}",
                     failure_class=HTTP_STATUS,
                     exc_name="HTTPStatus",
+                    http_status=status,
                 )
         finally:
             conn.close()
