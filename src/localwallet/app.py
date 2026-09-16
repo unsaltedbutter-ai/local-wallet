@@ -17997,8 +17997,12 @@ def _run_turn(
     completion state). ``None``/disabled/complete adds nothing.
 
     - DENY while pending: the gate decision is authoritative — the flow
-      is cancelled proactively (no model cancel intent is waited for)
-      and the cancellation is narrated after the turn's own output.
+      is cancelled proactively (no model cancel intent is waited for),
+      the cancellation line is printed, and the turn SHORT-CIRCUITS
+      before the model runs (TCK-CANCEL-001: asking the model to make
+      something of a word no intent covers only hallucinated narration,
+      and a create_tx it emitted in the same turn could re-create a
+      pending from CANCELLED — the "Still pending" resurrection).
     - AMBIGUOUS while pending: the turn proceeds normally and a guidance
       line asks the user to confirm or cancel explicitly.
     - CONFIRM while the flow is still CREATED after the turn (the model
@@ -18349,10 +18353,8 @@ def _run_turn(
         if flow.state is TxFlowStatus.CREATED
         else GateDecision.NOT_A_DECISION
     )
-    cancelled = False
     if session.gate_decision is GateDecision.DENY and flow.state is TxFlowStatus.CREATED:
         flow.cancel()
-        cancelled = True
         # TCK-HW-005 slice C: the device wish belonged to THIS flow — a
         # cancelled flow retires the latch (never leaks onto the next one).
         session.hw_sign_wanted = False
@@ -18371,6 +18373,12 @@ def _run_turn(
         # the next flow).
         session.cons_ask = None
         session.cons_pending = None
+        # TCK-CANCEL-001: the cancel is CODE-owned and DONE — print the
+        # cancellation line and leave the turn BEFORE the model runs. The
+        # model sees no cancel turn: it cannot narrate over it and cannot
+        # emit create_tx to resurrect a pending from CANCELLED.
+        output_fn(sanitize_tool_output(_CANCELLED_LINE))
+        return
     # Narration-only ETA fact (TCK-P5-002): the mempool hint is computed
     # lazily ONLY when the flow is CREATED (the ETA fact is needed); any
     # failure degrades to no congestion adjustment, never a crash.
@@ -18451,9 +18459,6 @@ def _run_turn(
             output_fn,
             session=session,
         )
-    if cancelled:
-        output_fn(sanitize_tool_output(_CANCELLED_LINE))
-        return
     if flow.state is TxFlowStatus.CREATED:
         guidance = (
             _GUIDANCE_AMBIGUOUS

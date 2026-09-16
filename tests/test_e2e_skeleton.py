@@ -3458,7 +3458,11 @@ def test_send_flow_deny_cancels_and_allows_new_create(
 ) -> None:
     """'no thanks' while pending → the gate DENY is authoritative: the
     flow cancels proactively, the cancellation is narrated, and a new
-    create succeeds afterwards (fresh tx_ref)."""
+    create succeeds afterwards (fresh tx_ref). TCK-CANCEL-001: the cancel
+    turn short-circuits BEFORE the model, so the plan carries NO entry for
+    it — the two "create" steps are consumed by the two send turns (the
+    old "respond" crutch for the cancel turn is gone: no model call, no
+    model narration, on a cancel turn)."""
     addr0 = derive_fixture_addresses(1)[0]
     handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
     _code, outputs, flow = _run_send_repl(
@@ -3473,7 +3477,7 @@ def test_send_flow_deny_cancels_and_allows_new_create(
             "/details",
             "exit",
         ],
-        ["create", "respond", "create"],
+        ["create", "create"],
     )
     joined = "\n".join(outputs)
     assert "Transaction cancelled." in joined
@@ -3482,6 +3486,71 @@ def test_send_flow_deny_cancels_and_allows_new_create(
     assert refs[0] != refs[1]  # a fresh pending transaction, new identity
     assert "already pending" not in joined
     assert flow.state is TxFlowStatus.CREATED
+
+
+class AlwaysCreateGenerate:
+    """TCK-CANCEL-001 hostile stub: emits a create_tx envelope on EVERY
+    call — exactly the resurrection the bug produced when the cancel turn
+    still reached the model (a word no intent covers → hallucinated
+    create_tx). Counts its invocations."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, prompt: str, grammar_text: str | None) -> str:
+        del prompt, grammar_text
+        self.calls += 1
+        return _create_tx_envelope_json()
+
+
+def test_cancel_turn_short_circuits_hostile_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """'cancel' while CREATED with a stub that answers create_tx on every
+    call: the deterministic short-circuit ends the turn CANCELLED with
+    'Transaction cancelled.' as the ONLY cancel-turn narration — no
+    resurrected pending, no second card."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    stub = AlwaysCreateGenerate()
+    _code, outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "cancel", "exit"],
+        [],
+        generate=stub,
+    )
+    assert flow.state is TxFlowStatus.CANCELLED
+    assert flow.pending is None  # no resurrection from CANCELLED
+    assert outputs.count("Transaction cancelled.") == 1
+    # The ONLY card ever printed is the original create's — the cancel
+    # turn emitted no model narration (the hostile stub never ran).
+    assert sum(1 for o in outputs if o.startswith(f"To: {SEND_RECIPIENT}")) == 1
+
+
+def test_cancel_turn_makes_zero_model_calls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cancel turn performs ZERO model invocations: the stub's counter
+    stands still from just before 'cancel' to just before 'exit'."""
+    addr0 = derive_fixture_addresses(1)[0]
+    handler = _send_chain_handler([], utxos_by_addr={addr0: [SEND_UTXO]})
+    stub = AlwaysCreateGenerate()
+    # before_line runs just before each input line (send, cancel, exit),
+    # sampling the counter at each boundary.
+    samples: list[int] = []
+    _code, _outputs, flow = _run_send_repl(
+        monkeypatch,
+        tmp_path,
+        handler,
+        [f"send 60000 sats to {SEND_RECIPIENT}", "cancel", "exit"],
+        [],
+        generate=stub,
+        before_line=lambda: samples.append(stub.calls),
+    )
+    assert samples == [0, 1, 1]  # one call for the create, NONE for 'cancel'
+    assert flow.state is TxFlowStatus.CANCELLED
 
 
 def test_send_flow_expired_pending_refuses_confirm(
@@ -4357,7 +4426,9 @@ def test_details_reprints_full_card_and_gates_on_pending(
             "/details",
             "exit",
         ],
-        ["create", "respond"],
+        # TCK-CANCEL-001: one entry only — the DENY-cancel turn short-
+        # circuits before the model (the old "respond" crutch is gone).
+        ["create"],
     )
     while_pending = "\n".join(outputs)
     # The full nine-line classic render, verbatim (the brief card's
