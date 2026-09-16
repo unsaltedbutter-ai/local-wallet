@@ -28,9 +28,11 @@ Part-9 decisions (HANDOFF §0c6) reviewed by the user:
 - The deleted details section's original numbering had a #3 between coin_labels and `.local` that is unrecoverable after the MANUAL-WORK cleanup — treated as default-ratified.
 - **FEE-006 floor decision (orchestrator, 2026-09-15, from your fee report):** the "1 sat/vB congestion floor" your reply quoted is mempool.space's whole-sat `minimumFee` field over-vetoing the policy bid — NOT the next-block floor. Decision: policy bids floor at MAX(relay rail, the projected next block's own bottom); `minimumFee` demoted to the fallback shape only; narration names the real source. Your 0.35-sat/vB case will bid ≈0.36 after this lands (TCK-FEE-006).
 
-## MW-16 round 4 🔥 — full checklist (post part-9 wave, HEAD 003dbdd)
+## MW-16 round 4 🔥 — full checklist (post part-10 continuation, HEAD b700cc0)
 
 Previously fixed (rounds 1–3, re-verify only if something below touches them): electrum ✅ bitcoind ✅ TLS ✅ probe speed ✅ autodetect ✅ bitcoind block-height scan ✅ EUR display ✅ labels persist ✅ chat creds hand-off ✅ broadcast debug lines ✅ min-relay rail 0.1 sat/vB ✅.
+
+Two "NEW" blocks below: the part-9 wave items first, then **"NEW from the part-10 continuation"** (fee floor honesty, cancel, scan speed, public electrum, flexible queries/consolidation, rate answers, show-on-device by voice, UTXO row rework, quiet first connect) — verify BOTH blocks.
 
 **NEW since your last run — verify these:**
 - **Hot-swap while a scan runs** (your restart pain): edit the chain URL during a minutes-class scan → it applies IMMEDIATELY now (swap live, reply says so; the data catch-up queues behind the old fetch). No restart needed. (TCK-SWAP-001)
@@ -77,8 +79,9 @@ Diagnostic command if anything fails (value-free, safe to paste):
 - [ ] Hardware-wallet unlock check: after unlocking via chat, the app now VERIFIES the device holds this wallet's key — mismatch says "…it is not the private key for this wallet" (TCK-HW-006 landed; verify live with your Jade).
 - [x] ✅ Header fingerprint chip built (WEB-027) — NOTE: it shows the wallet's ACCOUNT-key fingerprint; your Jade's screen shows its own device fingerprint and they won't match (the "same number" claim was false and was corrected). "Device connected" chip + header host line stay rejected.
 
-## MW-15 — live send/fee run (fee policy v2 + corrected rail)
+## MW-15 — live send/fee run (fee policy v2 + corrected floor)
 - [ ] Fee line per YOUR spec: MEDIUM = next projected block's lowest × 1.15; FASTER = double; SLOWER = second block's lowest. Pay line `@ $/BTC`; "faster" twice → asks for a sat/vB rate; explicit rate works. NOW WITH the corrected 0.1 sat/vB floor — sub-1 bids that your node accepts should build.
+- [ ] Rate answers consumed: consolidation → "slower" → "0.75 sat/vbyte" now rebuilds the plan (the ask appears ONCE — your round-3 repro). (FEE-007)
 - [ ] Split/consolidate plan: `/details` shows DESTINATION addresses; the raw ref lives in `/details` with its purpose stated.
 - [x] ✅ Address labeling — VERIFIED by you 2026-09-13 (persists across resync). Follow-up: labeling unit = the ADDRESS (your decision; coin labels fold into per-address label sets — TCK-LABELS-UNIFY, approved, queued for implementation).
 
