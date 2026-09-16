@@ -49,6 +49,18 @@ Previously fixed (rounds 1–3, re-verify only if something below touches them):
 - **"What are fees like right now?" / "block height?" / "open mempool for <txid>"** answered from engine facts with click-to-open links. (CHAT-006)
 - **Full txids** everywhere in replies (click-to-copy copies the whole thing). (TXID-001)
 
+**NEW from the part-10 continuation (2026-09-15, HEAD fa8ffb2) — verify these too:**
+- **Fee floor honesty**: your 0.35-sat/vB case now bids ≈0.36 (the old "1 sat/vB congestion floor" misnomer is gone; the note names the real binding source). (FEE-006)
+- **Cancel**: "cancel" on a pending tx is now fully deterministic — "Transaction cancelled." and nothing else; the model can never resurrect it. (CANCEL-001)
+- **Bitcoind scan speed**: one scantxoutset walk per scan instead of one per address — your 2-min-per-dot scan should now be minutes-once. (DIAG-006)
+- **Public electrum**: the suggested-server chip (electrum.blockstream.info) works now (it rejects verbose tx fetches; we degrade gracefully). (ELECTRUM-001/002)
+- **Flexible coin queries**: "show me my utxos smaller than 150000 sats", "show me my large coins", "coins I received in 2025", "show me my KYC coins" (capitalized/quoted now works). (CHAT-009)
+- **Flexible consolidation**: "consolidate #18 and #24 and #14", "consolidate utxos smaller than 100001 sats", "consolidate small utxos" (asks the threshold), "consolidate my small Peppermint UTXOs". (CONS-003)
+- **Rate answers consumed**: consolidation → "slower" → "0.75 sat/vbyte" now rebuilds the plan (ask appears once). (FEE-007)
+- **Show on device by voice**: "show it to me on my coldcard" / "show <address> on my hardware wallet" / "show #3 on my jade" now display on the device. (HW-007)
+- **UTXO list**: registry number, separated sats, confirmed/pending icon, copy-address + copy-txid buttons, click the amount to toggle sats ↔ BTC. (UTXO-005)
+- **First connect is quiet**: existing wallets no longer spam one "Incoming" line per historical UTXO — only unconfirmed or ≤3-blocks-confirmed surface, plus one summary line. (CHAT-008)
+
 - [ ] Re-verify the earlier "still open" items: **Resync now** keeps labels (now the v6 per-address set); **gap_limit apply** (increase → auto-rescan now, decrease → tradeoff note); **model-absent path** (download card / No → quick actions). Re-verify, re-file only if broken.
 
 Known limitation: label REMOVAL doesn't exist yet (labels are add-only per your union model — decision #1); say the word if you want a remove command.
