@@ -22,7 +22,9 @@ validates and resolves. One test family per done-when criterion:
   set, never the write-frozen v5 coin rows); direction compares
   verbatim against stored row words; filters compose AND-wise;
 * honest empty answers and UNCHANGED result/narration shape (filters
-  never add keys; label words and addresses never reach tool output).
+  never add keys — the ONE exception is the value-free ``label_unresolved``
+  honesty key when an include drops an unresolvable (fully-spent) tx; label
+  words and addresses never reach tool output).
 
 Offline, deterministic: in-memory stores, fixture zpub, frozen clock —
 no network (``chain/`` is untouched; the handlers were already pure
@@ -520,6 +522,59 @@ class TestHistoryFilters:
         )
         assert len(result["transactions"]) == 5
 
+    def test_label_include_flags_unresolvable_drop_for_hedge(self, frozen_clock: int) -> None:
+        # TCK-CHAT-005B (a): an include filter over fully-spent txs (no
+        # unspent coin carries the coin->address label join) drops them as
+        # unresolvable — the result must flag that so the narration hedges.
+        _store, _wid, table = self._seeded()
+        result = table[IntentName.GET_HISTORY](
+            _env(IntentName.GET_HISTORY, {"label_set": ["kyc"]})
+        )
+        assert result["transactions"] == []
+        assert result["label_unresolved"] is True
+
+    def test_label_include_no_flag_when_every_row_resolves(self, frozen_clock: int) -> None:
+        # every tx's labels resolve (its coin is unspent/address-carrying) —
+        # a plain non-match is genuine, not under-inclusion: no flag, no hedge
+        store, wid, table = _world()
+        _seed_tx(store, wid, "c" * 64, direction="in", height=10, block_time=NOW)
+        _seed_coin(store, wid, "c" * 64, ADDRS[0], 5_000)
+        store.add_address_labels(ADDRS[0], ("kyc",))
+        result = table[IntentName.GET_HISTORY](
+            _env(IntentName.GET_HISTORY, {"label_set": ["kyc"]})
+        )
+        assert [t["txid"] for t in result["transactions"]] == ["c" * 64]
+        assert "label_unresolved" not in result
+
+    def test_label_include_no_flag_when_dropped_tx_is_resolvable(self, frozen_clock: int) -> None:
+        # the dropped tx is RESOLVABLE (its coin is unspent and address-
+        # carrying) but simply does not carry the queried label — a genuine
+        # non-match, NOT an under-inclusion — so no flag/hedge, even though
+        # the include DID drop a row (the only no-flag cases pinned today
+        # are zero-drop worlds)
+        store, wid, table = _world()
+        _seed_tx(store, wid, "c" * 64, direction="in", height=10, block_time=NOW)
+        _seed_coin(store, wid, "c" * 64, ADDRS[0], 5_000)
+        store.add_address_labels(ADDRS[0], ("kyc",))
+        _seed_tx(store, wid, "d" * 64, direction="in", height=11, block_time=NOW)
+        _seed_coin(store, wid, "d" * 64, ADDRS[1], 5_000)
+        store.add_address_labels(ADDRS[1], ("other",))
+        result = table[IntentName.GET_HISTORY](
+            _env(IntentName.GET_HISTORY, {"label_set": ["kyc"]})
+        )
+        assert [t["txid"] for t in result["transactions"]] == ["c" * 64]
+        assert "label_unresolved" not in result
+
+    def test_label_exclude_never_flags(self, frozen_clock: int) -> None:
+        # exclude KEEPS unresolvable (fully-spent) rows — no under-inclusion,
+        # so no flag/hedge
+        _store, _wid, table = self._seeded()
+        result = table[IntentName.GET_HISTORY](
+            _env(IntentName.GET_HISTORY, {"label_set": ["kyc"], "label_mode": "exclude"})
+        )
+        assert len(result["transactions"]) == 5
+        assert "label_unresolved" not in result
+
     def test_unknown_label_answers_honest_empty(self, frozen_clock: int) -> None:
         store, wid, table = self._seeded()
         _seed_coin(store, wid, "c" * 64, ADDRS[0], 5_000)
@@ -738,9 +793,27 @@ class TestNarration:
         assert len(data) == len(result["transactions"]) > 0
         for line in data:
             parts = line.split(" ")
-            # "tx <64-hex> in <height|unconfirmed>" — the pre-ticket shape
+            # "tx <64-hex> <in|out> <height|unconfirmed>" — the pre-ticket shape
             assert parts[0] == "tx" and len(parts) == 4 and parts[2] == "in"
         assert not any("label" in ln.lower() for ln in lines)
+
+    def test_label_include_hedges_unresolvable_drop(self) -> None:
+        # TCK-CHAT-005B (a): a label-include filter that dropped fully-spent
+        # rows (labels unresolvable) narrates ONE value-free hedge — the
+        # filtered answer must never read as complete
+        __store, __wid, table = TestHistoryFilters()._seeded()
+        _result, lines = _say(table, IntentName.GET_HISTORY, {"label_set": ["kyc"]})
+        hedges = [ln for ln in lines if ln == app.LABEL_HEDGE_NOTE]
+        assert hedges == [app.LABEL_HEDGE_NOTE]  # exactly one hedge line
+
+    def test_label_include_no_hedge_when_everything_resolves(self) -> None:
+        store, wid, table = _world()
+        _seed_tx(store, wid, "c" * 64, direction="in", height=10, block_time=NOW)
+        _seed_coin(store, wid, "c" * 64, ADDRS[0], 5_000)
+        store.add_address_labels(ADDRS[0], ("kyc",))
+        result, lines = _say(table, IntentName.GET_HISTORY, {"label_set": ["kyc"]})
+        assert [t["txid"] for t in result["transactions"]] == ["c" * 64]
+        assert not any(ln == app.LABEL_HEDGE_NOTE for ln in lines)
 
     def test_utxos_lines_keep_their_shape(self) -> None:
         store, _wid, table = TestUtxosFilters()._seeded()
@@ -806,8 +879,9 @@ class TestLockstepPins:
         _seed_coin(store, wallet.id, "c" * 64, ADDRS[0], 5_000)
         assert store.get_address_label_set(ADDRS[0]) == ()  # unlabeled
         store.add_address_labels(ADDRS[0], ("kyc",))
-        members = app._label_members_by_txid(store, wallet.id)
+        members, unspent = app._label_members_by_txid(store, wallet.id)
         assert members == {"c" * 64: ("kyc",)}  # coin inheritance, verbatim set
+        assert unspent == {"c" * 64}  # the same single UTXO snapshot read
 
     def test_dust_of_semantics_direction_enum_mirrors_store_words(self) -> None:
         # the closed enum literals are the STORE's direction words — the

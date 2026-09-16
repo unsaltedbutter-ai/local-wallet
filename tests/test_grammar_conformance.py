@@ -1114,3 +1114,132 @@ def test_grammar_uses_installed_parser_dialect():
         assert _RULE_NAME_RE.fullmatch(name), (
             f"envelope.gbnf line {lineno} has an invalid rule name: {name!r}"
         )
+
+
+# ------------------------------------------------------------------ field-order pin
+#
+# TCK-CHAT-005B (b): the grammar enforces STRICT key order per intent's
+# params (envelope.gbnf header + each branch rule; cross-checked by the
+# ACCEPT/REJECT drift pins above), and the pydantic schema serializes params
+# in declaration/MRO order. These must agree, or a future field added to one
+# side silently desyncs the two (the grammar would accept keys in one order
+# while ``model_dump`` re-emits them in another — benign while the model is
+# the only producer, latent for any consumer that round-trips dumps). This
+# pin asserts the keys present in a ``model_dump`` keep the grammar's
+# relative order for EVERY intent, so a field addition on either side fails
+# the suite if it desyncs them.
+
+#: The GRAMMAR's strict param key set AND order per intent (envelope.gbnf
+#: branch rules). ``create_tx``/``self_transfer``/``bump_fee`` list BOTH
+#: alternatives of their alternation slots. The order check below is a
+#: subsequence; the set check (``set(model fields) == set(table)``) is a
+#: hard pin on the admitted key SET — so a future field added on either side
+#: fails the suite even if it happens to slot into the existing order.
+_GRAMMAR_PARAM_ORDER: dict[str, tuple[str, ...]] = {
+    "respond": ("text",),
+    "clarify": ("question",),
+    "get_balance": ("address_number",),
+    "get_history": ("limit", "direction", "since", "label_set", "label_mode"),
+    "get_utxos": (
+        "address_number",
+        "direction",
+        "since",
+        "label_set",
+        "label_mode",
+    ),
+    "get_addresses": ("address_number",),
+    "new_address": ("branch",),
+    "create_tx": ("recipient", "amount_sats", "amount_usd", "fee_target", "fee_rate_sat_vb"),
+    "sign_tx": ("tx_ref", "signer"),
+    "broadcast_tx": ("tx_ref",),
+    "tx_status": ("txid",),
+    "node_status": (),
+    "self_transfer": ("mode", "parts", "below_size_sats", "merge_coin", "fee_target"),
+    "bump_fee": ("target", "funding_ref", "fee_target", "fee_rate_sat_vb"),
+    "confirm_tx": ("tx_ref",),
+}
+
+# RESOLVED by TCK-CHAT-005B adjudication (schema reordered to match the
+# grammar): both ``get_history`` and ``get_utxos`` now dump in grammar order,
+# so the strict-xfail desync markers from this ticket's (never-committed)
+# intermediate state were removed and the pin is strict for all 15 intents.
+
+
+
+def _sample_params(intent: str) -> object:
+    from localwallet.protocol.envelope import (
+        BroadcastTxParams,
+        BumpFeeParams,
+        ClarifyParams,
+        ConfirmTxParams,
+        CreateTxParams,
+        GetAddressesParams,
+        GetBalanceParams,
+        GetHistoryParams,
+        GetUtxosParams,
+        NewAddressParams,
+        NodeStatusParams,
+        RespondParams,
+        SelfTransferParams,
+        SignTxParams,
+        SincePeriod,
+        TxStatusParams,
+    )
+    _BC1 = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+    return {
+        "respond": RespondParams(text="hi"),
+        "clarify": ClarifyParams(question="q"),
+        "get_balance": GetBalanceParams(address_number=3),
+        "get_history": GetHistoryParams(
+            limit=5,
+            direction="in",
+            since=SincePeriod(days=7),
+            label_set=["a"],
+            label_mode="exclude",
+        ),
+        "get_utxos": GetUtxosParams(
+            address_number=3, direction="in", since=SincePeriod(days=7), label_set=["a"]
+        ),
+        "get_addresses": GetAddressesParams(address_number=3),
+        "new_address": NewAddressParams(branch=1),
+        "create_tx": CreateTxParams(
+            recipient=_BC1, amount_sats=1000, fee_target="fast"
+        ),
+        "sign_tx": SignTxParams(tx_ref="abc", signer="file"),
+        "broadcast_tx": BroadcastTxParams(tx_ref="abc"),
+        "tx_status": TxStatusParams(txid="a" * 64),
+        "node_status": NodeStatusParams(),
+        "self_transfer": SelfTransferParams(mode="split", parts=4, fee_target="fast"),
+        "bump_fee": BumpFeeParams(target="abc", funding_ref="3", fee_target="fast"),
+        "confirm_tx": ConfirmTxParams(tx_ref="abc"),
+    }[intent]
+
+
+def _params_is_subsequence(dump_keys: list[str], grammar_order: tuple[str, ...]) -> bool:
+    """True iff the dumped keys keep the grammar's relative order."""
+    it = iter(grammar_order)
+    for key in dump_keys:
+        try:
+            while next(it) != key:
+                pass
+        except StopIteration:
+            return False
+    return True
+
+
+@pytest.mark.parametrize("intent", sorted(_GRAMMAR_PARAM_ORDER))
+def test_params_model_dump_order_matches_grammar(intent: str) -> None:
+    params = _sample_params(intent)
+    dump_keys = list(params.model_dump().keys())
+    assert _params_is_subsequence(dump_keys, _GRAMMAR_PARAM_ORDER[intent]), (
+        f"{intent} model_dump order {dump_keys} desyncs from the grammar's "
+        f"param order {list(_GRAMMAR_PARAM_ORDER[intent])}"
+    )
+    # The grammar's admitted key SET for this intent's params must exactly
+    # match the model's declared fields — a future field added to either side
+    # (grammar slot or schema) fails here even if it slots into the existing
+    # order, which the subsequence check above cannot catch.
+    assert set(type(params).model_fields) == set(_GRAMMAR_PARAM_ORDER[intent]), (
+        f"{intent} model fields {sorted(type(params).model_fields)} != grammar "
+        f"param slots {sorted(_GRAMMAR_PARAM_ORDER[intent])}"
+    )

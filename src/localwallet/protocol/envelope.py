@@ -707,16 +707,14 @@ class _MoneyFilterParams(_OmitNoneDump):
         return self
 
 
-class GetHistoryParams(_MoneyFilterParams):
-    """Params for ``get_history``: optional result cap + money filters.
+class _HistoryLimitParams(_OmitNoneDump):
+    """Shared ``get_history`` ``limit`` field (keeps dump order limit-first).
 
-    ``limit``: optional integer, business range 1..100 (schema-enforced;
-    the grammar's syntactic bound is looser — 1..999, no leading zeros —
-    and this layer is the authority). When omitted the handler applies its
-    own default of 20; omission is the normal case, so ``"params": {}`` is
-    a fully valid body. The TCK-CHAT-005 filter keys (see
-    :class:`_MoneyFilterParams`) are evaluated BEFORE the cap: the answer
-    is the first ``limit`` matches, not a capped scan.
+    Declared as a mixin that follows :class:`_MoneyFilterParams` in
+    ``GetHistoryParams``' base tuple so ``model_dump`` re-emits keys in the
+    grammar's strict order (``limit < direction < since < label_set <
+    label_mode``) — pydantic collects base fields in ``reversed(bases)``
+    order, so ``limit`` (on this mixin) lands before the filter keys.
     """
 
     limit: int | None = Field(default=None, ge=1, le=100)
@@ -740,7 +738,22 @@ class GetHistoryParams(_MoneyFilterParams):
         raise ValueError("limit must be an integer when present")
 
 
-class GetUtxosParams(_AddressScopedParams, _MoneyFilterParams):
+class GetHistoryParams(_MoneyFilterParams, _HistoryLimitParams):
+    """Params for ``get_history``: optional result cap + money filters.
+
+    ``limit``: optional integer, business range 1..100 (schema-enforced;
+    the grammar's syntactic bound is looser — 1..999, no leading zeros —
+    and this layer is the authority). When omitted the handler applies its
+    own default of 20; omission is the normal case, so ``"params": {}`` is
+    a fully valid body. The TCK-CHAT-005 filter keys (see
+    :class:`_MoneyFilterParams`) are evaluated BEFORE the cap: the answer
+    is the first ``limit`` matches, not a capped scan. Base order is
+    ``(_MoneyFilterParams, _HistoryLimitParams)`` so ``model_dump`` emits
+    the grammar's strict key order (``limit`` first).
+    """
+
+
+class GetUtxosParams(_MoneyFilterParams, _AddressScopedParams):
     """Params for ``get_utxos``: ``{}`` (whole-wallet, the normal case),
     ``{"address_number": <int>}`` — the TCK-CHAT-001 additive scope key
     (see :class:`_AddressScopedParams`; "the coins on address 2" rides the
@@ -749,6 +762,9 @@ class GetUtxosParams(_AddressScopedParams, _MoneyFilterParams):
     "coins labeled X", "received since", direction over the coins'
     creating transactions). Scope and filters compose AND-wise at the
     handler. Any key other than these five is rejected (closed world).
+    Base order is ``(_MoneyFilterParams, _AddressScopedParams)`` so
+    ``model_dump`` emits the grammar's strict key order (``address_number``
+    first — pydantic collects base fields in ``reversed(bases)`` order).
     """
 
 

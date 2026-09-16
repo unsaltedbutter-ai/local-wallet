@@ -1489,6 +1489,22 @@ PENDING_NO_ETA_NOTE: Final[str] = (
     "No confirmation estimate right now — pending transactions have no recorded fee target to estimate from"
 )
 
+#: TCK-CHAT-005B (a): the honest value-free hedge on a LABEL-INCLUDE history
+#: filter that dropped rows whose labels could not be resolved. The history
+#: label view rides coin->address inheritance, which survives only for
+#: still-UNSPENT coins (:func:`_label_members_by_txid`) — a fully-spent tx
+#: has NO resolvable labels, so an ``include`` filter silently under-includes
+#: it. Rather than present such a filtered answer as complete, the handler
+#: flags the drop (``label_unresolved`` result key) and this ONE static,
+#: value-free line hedges it (mirroring :data:`FRESHNESS_NOTE`'s note style;
+#: no address/amount/label-word — "fully spent" is the store's own observable
+#: fact, the hedge never names a specific entry). ``get_utxos`` needs no
+#: hedge: its listing is UNSPENT coins only, every one address-carrying, so
+#: labels always resolve there.
+LABEL_HEDGE_NOTE: Final[str] = (
+    "note: some transactions have fully spent coins, so their labels couldn't be checked here — a few may be missing from this result"
+)
+
 # ---------------------------------------------------------------- TCK-CHAT-001
 #
 # The referential-address surface: every address shown to the user carries
@@ -4203,26 +4219,38 @@ def _labels_match(members: Iterable[str], wanted: frozenset[str], *, exclude: bo
     return (not hit) if exclude else hit
 
 
-def _label_members_by_txid(store: Store, wallet_id: int) -> dict[str, tuple[str, ...]]:
-    """txid → the union of label members carried by that tx's UNSPENT coins.
+def _label_members_by_txid(
+    store: Store, wallet_id: int
+) -> tuple[dict[str, tuple[str, ...]], set[str]]:
+    """(txid → union of label members on UNSPENT coins, set of unspent txids).
 
     The history label view rides coin inheritance (a coin's labels = its
     address's v6 set) collected per creating txid — the documented
     store-fidelity bound: the coin→address join survives only for still-
-    unspent coins, so a history tx whose coins all spent has NO
-    resolvable labels (``exclude`` matches it, ``include`` never does;
-    the honest limit of the cache, stated in the handler docstring and
-    pinned by test). One global label-set read + one UTXO snapshot read,
-    both store-only.
+    unspent coins, so a history tx whose coins all spent has NO resolvable
+    labels (``exclude`` matches it, ``include`` never does; the honest
+    limit of the cache, stated in the handler docstring and pinned by
+    test). One global label-set read + one UTXO snapshot read, both
+    store-only — the second return is that same snapshot's txid set, so
+    callers can flag include-dropped unresolvable rows without a second
+    read. Partial-spend limit: a partially-spent tx whose ONLY labeled
+    coin was spent resolves via its surviving unspent rows (labels on the
+    spent coin are silently under-included — the store-honest maximum;
+    spent rows are deleted by snapshot replace).
     """
     sets = store.get_address_label_sets()
     members: dict[str, set[str]] = {}
+    unspent_txids: set[str] = set()
     for coin in store.get_utxos_for_wallet(wallet_id):
+        unspent_txids.add(coin.txid)
         if coin.address:
             found = sets.get(coin.address)
             if found:
                 members.setdefault(coin.txid, set()).update(found)
-    return {txid: tuple(sorted(ms)) for txid, ms in members.items()}
+    return (
+        {txid: tuple(sorted(ms)) for txid, ms in members.items()},
+        unspent_txids,
+    )
 
 
 def _make_get_history_handler(
@@ -4258,10 +4286,16 @@ def _make_get_history_handler(
       the union of its still-unspent coins' address-label sets (v6
       inheritance, :func:`_label_members_by_txid`); a fully-spent tx has
       no resolvable labels and answers the honest empty include (and
-      passes exclude).
+      passes exclude). When an INCLUDE filter drops such unresolvable
+      rows the result carries ``label_unresolved: True`` (value-free; the
+      narration hedges, TCK-CHAT-005B (a)) so a filtered answer never
+      reads as complete.
     Filters NEVER change the result shape — an empty match is the
     existing "No transactions found." answer, values verbatim from the
-    store either way.
+    store either way. The ONE exception is the value-free ``label_unresolved:
+    true`` honesty key, added when an include filter drops an unresolvable
+    (fully-spent) tx (see above) so a filtered answer never reads as
+    complete; it never alters a returned transaction's fields.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -4272,11 +4306,12 @@ def _make_get_history_handler(
         try:
             txs = store.get_txs_for_wallet(wallet_id)
             freshness = _freshness(store, wallet_id, scan_gate)
-            label_members = (
-                _label_members_by_txid(store, wallet_id)
-                if params.label_set is not None
-                else None
-            )
+            label_members: dict[str, tuple[str, ...]] | None = None
+            unspent_txids: set[str] = set()
+            if params.label_set is not None:
+                label_members, unspent_txids = _label_members_by_txid(
+                    store, wallet_id
+                )
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
         if params.direction is not None:
@@ -4284,14 +4319,28 @@ def _make_get_history_handler(
         if params.since is not None:
             cutoff = _resolve_since_cutoff(params.since)
             txs = [t for t in txs if _tx_within_since(t, cutoff)]
+        label_unresolved: bool | None = None
         if label_members is not None and params.label_set is not None:
             wanted = _label_query_form(params.label_set)
             exclude = params.label_mode == "exclude"
-            txs = [
-                t
-                for t in txs
-                if _labels_match(label_members.get(t.txid, ()), wanted, exclude=exclude)
-            ]
+            # TCK-CHAT-005B (a): the label view rides coin->address
+            # inheritance, which survives only for still-UNSPENT coins
+            # (_label_members_by_txid) — a fully-spent tx has NO resolvable
+            # labels, so an INCLUDE filter can never match it and silently
+            # under-includes it. Exclude keeps it (an empty label view
+            # matches NOT-IN), so only the include side can drop unresolvable
+            # rows. Flag that drop honestly so the narration hedges instead
+            # of presenting the filtered answer as complete.
+            resolvable = unspent_txids
+            kept: list[TxRecord] = []
+            for t in txs:
+                if _labels_match(
+                    label_members.get(t.txid, ()), wanted, exclude=exclude
+                ):
+                    kept.append(t)
+                elif not exclude and t.txid not in resolvable:
+                    label_unresolved = True
+            txs = kept
         ordered = sorted(
             txs,
             key=lambda t: (
@@ -4301,7 +4350,7 @@ def _make_get_history_handler(
             reverse=True,  # stable: equal keys keep the store's txid order
         )
         shown = ordered[:limit]
-        return {
+        result: dict[str, object] = {
             "transactions": [
                 {
                     "txid": t.txid,
@@ -4315,6 +4364,9 @@ def _make_get_history_handler(
             "shown": len(shown),
             "freshness": freshness,
         }
+        if label_unresolved is not None:
+            result["label_unresolved"] = label_unresolved
+        return result
 
     return handler
 
@@ -18748,6 +18800,11 @@ def _print_history(result: Mapping[str, object], output_fn: Callable[[str], None
         output_fn(sanitize_tool_output(_error_line(result, "History lookup failed")))
         return
     _print_freshness_note(result, output_fn)
+    if result.get("label_unresolved") is True:
+        # TCK-CHAT-005B (a): a label-include filter dropped fully-spent rows
+        # whose labels couldn't be resolved — hedge the answer as incomplete
+        # rather than implying it is complete.
+        output_fn(sanitize_tool_output(LABEL_HEDGE_NOTE))
     transactions = result.get("transactions")
     if not isinstance(transactions, list) or not transactions:
         output_fn(sanitize_tool_output("No transactions found."))
