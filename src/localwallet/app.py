@@ -4118,6 +4118,21 @@ class SendSession:
     public_offer_shown: str | None = None
     public_bcast_once: bool = False
     public_bcast_txid: str | None = None
+    #: TCK-HW-007: the own address this session LAST SHOWED the user —
+    #: ``(address, branch, index)``, the referent of "show it / that
+    #: address on my coldcard". DOCUMENTED MINIMAL FIELD (the ticket's
+    #: sanctioned shape): the CHAT-001 registry is the wallet-LIFETIME
+    #: shown-tracking, but a conversation's "it" means the address this
+    #: session just showed, so the stamp lives here, written ONLY at the
+    #: receive/new_address narration sites (:func:`_print_next_receive_address`,
+    #: :func:`_print_new_address`) and read by the show-on-device intercept.
+    #: The model can neither set, read, nor clear it (no envelope carries
+    #: it); display-channel data (the address is the string the user
+    #: already saw), never logged. WALLET-SAFE: not cleared on watch-key
+    #: replace / active-wallet switch — instead the pronoun path RE-BINDS
+    #: via :meth:`Store.get_by_address` against the active wallet before
+    #: use, so a stamp from a since-replaced wallet no longer resolves.
+    last_shown_own: tuple[str, int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -13455,7 +13470,7 @@ def _run_quick_action(
         )
         return True
     if command == "/receive":
-        _print_next_receive_address(store, output_fn, emitter=emitter)
+        _print_next_receive_address(store, output_fn, emitter=emitter, session=session)
         return True
     if command == "/settings":
         _print_settings_readout(store, output_fn, backend)
@@ -13634,11 +13649,38 @@ def _emit_own_address(
     )
 
 
+def _stamp_last_shown_own(
+    session: SendSession | None, address: object, branch: object, index: object
+) -> None:
+    """TCK-HW-007: remember the own address this turn SHOWED (the
+    "show it on my coldcard" referent). Same shape gate as
+    :func:`_emit_own_address` — a result missing the closed (address,
+    branch, index) shape stamps NOTHING (never a fabricated coordinate;
+    an unstamped session simply keeps "it" unresolved → the ask).
+    Display-channel data only: see the ``SendSession.last_shown_own``
+    docstring for the field contract."""
+    if session is None:
+        return
+    if (
+        not isinstance(address, str)
+        or not address
+        or isinstance(branch, bool)
+        or not isinstance(branch, int)
+        or isinstance(index, bool)
+        or not isinstance(index, int)
+        or index < 0
+        or branch not in (BRANCH_RECEIVE, BRANCH_CHANGE)
+    ):
+        return
+    session.last_shown_own = (address, branch, index)
+
+
 def _print_next_receive_address(
     store: Store | None,
     output_fn: Callable[[str], None],
     *,
     emitter: EventEmitter | None = None,
+    session: SendSession | None = None,
 ) -> None:
     """``/receive``: the NEXT receive address — pure derivation at the
     branch's live ``next_index``, NO allocation and NO network (an
@@ -13648,7 +13690,10 @@ def _print_next_receive_address(
     showing, so it gets its stable registry number HERE (the registry
     write is idempotent — the same string keeps the same number when
     ``/address`` later allocates it); a registry failure degrades to the
-    number-free line, never a crash on a read path."""
+    number-free line, never a crash on a read path. TCK-HW-007: the
+    preview is ALSO the session's last-shown own address (the stamp is
+    the "show it on my coldcard" referent — branch 0 at ``next_index``
+    is exactly what ``/verifyaddress`` bounds-checks as showable)."""
     if store is None:
         output_fn(_LABEL_STORE_UNAVAILABLE)
         return
@@ -13678,6 +13723,8 @@ def _print_next_receive_address(
     # key material at (0, next_index) — what /verifyaddress resolves to
     # when its button is clicked on this bubble).
     _emit_own_address(emitter, address, 0, index)
+    # TCK-HW-007: the session's last-shown referent (same coordinates).
+    _stamp_last_shown_own(session, address, 0, index)
 
 
 def _print_settings_readout(
@@ -14371,6 +14418,12 @@ def _pump(
                 # TCK-HW-005 slice B (D6): the model-path new_address
                 # narration stamps its own_address event through the bus.
                 emitter=emitter,
+                # TCK-HW-007: the show-on-device intercept rebuilds its
+                # device signer exactly like the /verifyaddress quick
+                # action does (config-authoritative; brand words never
+                # switch signers — the handler talks to THIS wiring).
+                signer_selection=signer_selection,
+                parsed=parsed,
             )
         if emitter is not None:
             emitter.emit(EVENT_TURN_END)
@@ -17337,6 +17390,261 @@ def _run_hardware_chat(
     return True
 
 
+# ---------------------------------------------------------------------------
+# TCK-HW-007: natural-language SHOW-ON-DEVICE routing (deterministic,
+# PRE-MODEL). USER BUG: "show it to me on my coldcard" after a receive
+# answered with the model's own "I am a hardware wallet-only wallet, so I
+# cannot display anything directly" — a DEAD END, because the device display
+# is by design NOT a model intent (HW-005 D3: a deterministic UI feature,
+# ADR-0020) and no intercept routed the words to the EXISTING /verifyaddress
+# handler. The matcher below maps show-on-device phrasings onto that handler
+# VERBATIM — bounds checks, store revalidation, device guards and the
+# mismatch warning are all reused, ZERO new device logic; the model is never
+# consulted on the matched path, so the misdirection line is structurally
+# unreachable there. Referents, all resolved ENGINE-side (the model never
+# authors an address, number, branch or index):
+#   * "it" / "this address" / "that address" → the session's last-shown own
+#     address (SendSession.last_shown_own — the minimal session field the
+#     ticket sanctions, stamped at the receive/new_address narration sites;
+#     the CHAT-001 registry tracks shown addresses WALLET-LIFETIME, which is
+#     not the same as "the one this conversation just showed");
+#   * a registry number ("show #3 on my jade", "show address 3 …") → the
+#     CHAT-001 registry, then the store's address row for its coordinates
+#     (an un-allocated /receive preview resolves through the session stamp);
+#   * a literal mainnet bech32 address → the store row: own → coordinates,
+#     foreign/never-shown → the EXISTING honest not-shown refusal line.
+# Device BRAND words (coldcard/jade/…) are MATCHER vocabulary only: the
+# handler talks to whatever signer is CONFIGURED — naming a brand never
+# switches signers (HW-004 config-authoritative discipline). An unresolved
+# referent (nothing shown yet) gets the deterministic "which address?" ask,
+# never a device prompt. Anything the closed matcher cannot FULLY classify
+# releases the line UNCHANGED (never-trap), deny/negation vocabulary
+# included (the slice-C review-MEDIUM rule).
+# ---------------------------------------------------------------------------
+
+_HW_DISPLAY_WORDS: Final[frozenset[str]] = frozenset(
+    {"show", "shows", "display", "displays"}
+)
+_HW_DISPLAY_PRONOUNS: Final[frozenset[str]] = frozenset(
+    {"it", "this", "these", "those"}
+)
+#: Words that make a bare digit a REGISTRY NUMBER referent (the CHAT-001
+#: taught shape; the ``#`` mark alone is also a number referent, the
+#: CONS-003 shape).
+_HW_DISPLAY_NUMBER_WORDS: Final[frozenset[str]] = frozenset(
+    {"address", "addresses", "number"}
+)
+#: A bare own-address noun ("show my address on the coldcard") is a
+#: pronoun-class referent: it resolves to the session's last-shown address.
+_HW_DISPLAY_REF_NOUNS: Final[frozenset[str]] = frozenset({"address", "addresses"})
+#: The closed determiner set that BINDS a bare own-address noun as a display
+#: referent ("show THE address on my jade", "display THAT address on my
+#: coldcard", "show MY address on the device"). Without one the noun is a
+#: wh-QUESTION ("show me WHAT address is on my coldcard") — a query, not a
+#: display command, so it is released, never consumed as a referent.
+_HW_DISPLAY_REF_BINDERS: Final[frozenset[str]] = frozenset(
+    {"the", "this", "that", "my", "our", "your"}
+)
+#: The closed wh-word set that RELEASES a binder that immediately follows it
+#: ("show me WHAT THE address is on my coldcard" is a query, not a display
+#: command — MINOR-2). Without this a wh-question's determiner would wrongly
+#: bind the bare noun.
+_HW_DISPLAY_WH_WORDS: Final[frozenset[str]] = frozenset(
+    {"what", "which", "whose", "where"}
+)
+#: The deterministic ask for an unresolved "it" (value-free; teaches the
+#: three ways to name an address; the example digits are phrasing shape,
+#: the ADDRESS_REF_HINT precedent, not values).
+_HW_DISPLAY_ASK: Final[str] = (
+    "Which address should I show on your device? Ask me for a receive "
+    'address first, or name one: "show #3 on my device", or paste the '
+    "full address."
+)
+
+
+def _show_on_device_request(line: str) -> tuple[str, object] | None:
+    """Classify a show-on-device utterance (the closed matcher).
+
+    Returns ``("address", <lowercase literal>)``, ``("number", <int>)``,
+    ``("pronoun", None)``, or ``None`` = NOT this grammar (the line falls
+    through to the unchanged pipeline). Requires ALL of: a show/display
+    verb (whole words), a device topic word (the HW-005 set — brand names
+    included, as vocabulary only), and NO coin words (a coin listing is
+    the CHAT-009 pipeline's, even with a device word attached). A
+    deny/negation token suppresses the match entirely (the slice-C rule —
+    "don't show it on my coldcard" is ordinary chat, not a display).
+
+    Resolution precedence is LITERAL > NUMBER > PRONOUN; two literals,
+    two numbers, or a mixed form in one line is ambiguous and releases —
+    one utterance shows at most one address. A pathological digit token
+    (py ``int_max_str_digits``, the CHAT-009 lesson) releases.
+    """
+    raw = line.lower().split()
+    words = [w for w in (t.strip(punctuation) for t in raw) if w]
+    if not words or not set(words) & _HW_DISPLAY_WORDS:
+        return None
+    if not set(words) & _HW_TOPIC_WORDS:
+        return None
+    if set(words) & _CHAT_COIN_WORDS:
+        return None
+    if _hardware_sign_denied(line):
+        return None
+    literals = [
+        token.lower()
+        for token in (t.strip(punctuation) for t in raw)
+        if token.islower() and _is_mainnet_bech32_address(token.lower())
+    ]
+    numbers: set[int] = set()
+    try:
+        for token in raw:
+            # The CONS-003 #-shape ("show #3"): the mark IS the referent.
+            if token.startswith("#") and token[1:].strip(punctuation).isdigit():
+                numbers.add(int(token[1:].strip(punctuation)))
+        for i, word in enumerate(words):
+            # The CHAT-001 taught shape: "address 3" / "number 3".
+            if (
+                word in _HW_DISPLAY_NUMBER_WORDS
+                and i + 1 < len(words)
+                and words[i + 1].isdigit()
+            ):
+                numbers.add(int(words[i + 1]))
+    except ValueError:
+        return None  # pathological digit length: release, never crash
+    if len(literals) > 1 or len(numbers) > 1 or (literals and numbers):
+        return None
+    if literals:
+        return "address", literals[0]
+    if numbers:
+        number = numbers.pop()
+        if number < 1:
+            return None  # registry numbers are 1-based; "address 0" releases
+        return "number", number
+    if set(words) & _HW_DISPLAY_PRONOUNS:
+        return "pronoun", None
+    # A bare own-address noun is a referent only when BOUND by an imperative
+    # head or a closed demonstrative/possessive determiner ("show THE address
+    # on my jade" / "display THAT address on my coldcard" / "show MY address
+    # on the device"). A wh-question ("show me WHAT address is on my
+    # coldcard") is a QUERY, not a display command — released; and a binder
+    # that itself sits right after a wh-word ("show me WHAT THE address is
+    # on my coldcard") is still a query, so the wh-release also applies
+    # immediately BEFORE a matched binder (MINOR-2). ("that" ALONE is not a
+    # candidate — far too common a conjunction; the bound noun is.)
+    if set(words) & _HW_DISPLAY_REF_NOUNS and any(
+        i > 0
+        and words[i - 1] in _HW_DISPLAY_REF_BINDERS
+        and not (i > 1 and words[i - 2] in _HW_DISPLAY_WH_WORDS)
+        for i, w in enumerate(words)
+        if w in _HW_DISPLAY_REF_NOUNS
+    ):
+        return "pronoun", None
+    return None
+
+
+def _run_show_on_device_turn(
+    session: SendSession,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    store: Store,
+    signer_selection: SignerSelection | None,
+    parsed: ParsedKey | None,
+) -> bool:
+    """Route a matched show-on-device utterance onto the EXISTING
+    ``/verifyaddress`` display handler (:func:`_verify_own_address`) with
+    engine-resolved ``"<branch> <index>"`` params — the handler's bounds
+    checks, store revalidation, absent/locked/mismatch guidance family
+    and value-free narration are REUSED WHOLESALE (no envelope, no model,
+    the same ADR-0020 deterministic channel the slash command and the web
+    button ride). The device is touched ONLY inside that handler, past
+    ALL of its guards; a referent the engine cannot locate never reaches
+    it. A store surprise releases the line (never-trap, never crash)."""
+    request = _show_on_device_request(line)
+    if request is None:
+        return False
+    kind, value = request
+    coords: tuple[int, int]
+    if kind == "pronoun":
+        try:
+            if session.last_shown_own is None:
+                output_fn(sanitize_tool_output(_HW_DISPLAY_ASK))
+                return True
+            _shown, branch, index = session.last_shown_own
+            # Wallet-safe re-bind: the stamp names an address this session
+            # SHOWED, but the ACTIVE wallet may have been replaced (watch
+            # key swapped) since. Re-bind against the active wallet — if
+            # the stamped address now belongs to a DIFFERENT wallet (or
+            # no wallet is active), the referent is stale: the "it" no
+            # longer resolves to the old stamp, so it gets the ask, never
+            # a display of a since-removed wallet's coordinates.
+            wallet = store.get_active_wallet()
+            if wallet is None:
+                output_fn(sanitize_tool_output(_HW_DISPLAY_ASK))
+                return True
+            row = store.get_by_address(_shown)
+            if row is not None:
+                if row.wallet_id != wallet.id:
+                    output_fn(sanitize_tool_output(_HW_DISPLAY_ASK))
+                    return True
+            else:
+                # No addresses row = an un-allocated /receive PREVIEW stamp
+                # (registry-only). It is still THIS wallet's ONLY if the
+                # registry says this wallet showed it — every showing writes
+                # that row at stamp time UNLESS the registry write itself
+                # failed (then the stamp still lands but this check sends
+                # the ask — safe side), so a preview stamp from a
+                # since-replaced wallet (registry now the new wallet's) fails
+                # this check and gets the ask instead of showing the old
+                # wallet's address under the word "it".
+                if store.registry_number_for(wallet.id, _shown) is None:
+                    output_fn(sanitize_tool_output(_HW_DISPLAY_ASK))
+                    return True
+            coords = (branch, index)
+        except (StoreError, sqlite3.Error):
+            return False  # DB surprise: release the line to the pipeline
+    else:
+        try:
+            wallet = store.get_active_wallet()
+            if wallet is None:
+                output_fn(sanitize_tool_output(_LABEL_NO_WALLET))
+                return True
+            if kind == "address":
+                row = store.get_by_address(str(value))
+                if row is None or row.wallet_id != wallet.id:
+                    # Not an address this wallet has shown — the EXISTING
+                    # honest display-refusal line, value-free, and the
+                    # device is never prompted for a foreign address.
+                    output_fn(sanitize_tool_output(_VERIFY_NOT_SHOWN))
+                    return True
+                coords = (row.branch, row.index)
+            else:  # "number": the CHAT-001 registry, then its coordinates.
+                record = store.get_address_by_number(wallet.id, int(value))
+                if record is None:
+                    # The value-free out-of-range clarify (never a nearest
+                    # guess) — the same line every registry consumer gives.
+                    output_fn(sanitize_tool_output(ADDRESS_REF_UNKNOWN))
+                    return True
+                row = store.get_by_address(record.address)
+                if row is not None and row.wallet_id == wallet.id:
+                    coords = (row.branch, row.index)
+                elif (
+                    session.last_shown_own is not None
+                    and session.last_shown_own[0] == record.address
+                ):
+                    # The not-yet-allocated /receive preview: numbered at
+                    # showing, coordinates live in the session's own stamp.
+                    coords = (session.last_shown_own[1], session.last_shown_own[2])
+                else:
+                    output_fn(sanitize_tool_output(_VERIFY_NOT_SHOWN))
+                    return True
+        except (StoreError, sqlite3.Error):
+            return False  # DB surprise: release the line to the pipeline
+    _verify_own_address(
+        f"{coords[0]} {coords[1]}", store, signer_selection, parsed, output_fn
+    )
+    return True
+
+
 def _dispatch_code_sign_turn(
     loop: AgentLoop,
     session: SendSession,
@@ -18895,6 +19203,7 @@ def _run_receive_label_turn(
     *,
     table: DispatchTable,
     emitter: EventEmitter | None = None,
+    session: SendSession | None = None,
 ) -> bool:
     """Consume a receive-address + label turn; True when the turn was
     consumed.
@@ -18929,7 +19238,7 @@ def _run_receive_label_turn(
         v=0, intent=IntentName.NEW_ADDRESS, params=NewAddressParams()
     )
     result = table[IntentName.NEW_ADDRESS](envelope)
-    _print_new_address(result, output_fn, emitter=emitter)
+    _print_new_address(result, output_fn, emitter=emitter, session=session)
     address = result.get("address")
     if result.get("error") is not None or not isinstance(address, str) or not address:
         # Allocation failed (or answered outside the closed shape): the
@@ -19424,6 +19733,8 @@ def _run_turn(
     live_apply_setting: Callable[[str, bool], str | None] | None = None,
     fee_estimator: FeeEstimator | None = None,
     emitter: EventEmitter | None = None,
+    signer_selection: SignerSelection | None = None,
+    parsed: ParsedKey | None = None,
 ) -> None:
     """Run ONE REPL turn: gate classification → agent → flow narration.
 
@@ -19726,7 +20037,7 @@ def _run_turn(
     # (that is the ticket's STOP-and-report eval gate). Checked after the
     # LABEL-001 intercept (its address-literal grammar keeps priority).
     if store is not None and _run_receive_label_turn(
-        store, line, output_fn, table=table, emitter=emitter
+        store, line, output_fn, table=table, emitter=emitter, session=session
     ):
         return
     # TCK-CFG-004: chat-managed settings — the deterministic pre-model
@@ -19767,6 +20078,22 @@ def _run_turn(
     # priority) and before the bump speed-word route.
     if store is not None and _run_coin_filter_turn(
         store, line, output_fn, scan_gate=scan_gate
+    ):
+        return
+    # TCK-HW-007: natural-language SHOW-ON-DEVICE ("show it to me on my
+    # coldcard" / "show bc1… on my hardware wallet" / "show #3 on my jade")
+    # — the deterministic pre-model route onto the EXISTING /verifyaddress
+    # display handler (the dead-end fix: a matched line never reaches the
+    # model, so its "hardware wallet-only wallet" misdirection is
+    # structurally unreachable; brand words are matcher vocabulary, NOT
+    # signer switches — the handler serves the CONFIGURED device). Checked
+    # after the coin filter (coin listings stay that pipeline's, even with
+    # a device word) and every earlier intercept; an unresolved "it" gets
+    # the deterministic ask, and anything the closed matcher cannot
+    # classify falls through to the unchanged pipeline (never-trap).
+    if store is not None and _run_show_on_device_turn(
+        session, line, output_fn,
+        store=store, signer_selection=signer_selection, parsed=parsed,
     ):
         return
     speed = _bump_speed_choice(line)
@@ -19981,7 +20308,9 @@ def _print_turn(
     elif envelope.intent is IntentName.GET_ADDRESSES:
         _print_addresses(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.NEW_ADDRESS:
-        _print_new_address(turn.result or {}, output_fn, emitter=emitter)
+        _print_new_address(
+            turn.result or {}, output_fn, emitter=emitter, session=session
+        )
     elif envelope.intent is IntentName.CREATE_TX:
         _print_create_tx(turn.result or {}, output_fn, session=session)
     elif envelope.intent is IntentName.SELF_TRANSFER:
@@ -20236,6 +20565,7 @@ def _print_new_address(
     output_fn: Callable[[str], None],
     *,
     emitter: EventEmitter | None = None,
+    session: SendSession | None = None,
 ) -> None:
     """Print the fresh address verbatim from the handler's result dict.
 
@@ -20248,7 +20578,8 @@ def _print_new_address(
     address, so the ``own_address`` event rides alongside the narration
     (result-owned address/branch/index — the handler's tool output,
     never a client-side guess; a result missing the closed shape emits
-    nothing)."""
+    nothing). TCK-HW-007: the same result-owned shape also stamps the
+    session's last-shown referent ("show it on my coldcard")."""
     if result.get("error") is not None:
         output_fn(
             sanitize_tool_output(_error_line(result, "Could not allocate a new address"))
@@ -20257,9 +20588,9 @@ def _print_new_address(
     branch = result.get("branch", 0)
     kind = "change" if branch == 1 else "receive"
     number = result.get("address_number")
-    # The event carries the result's OWN values (never the display
-    # defaults below — a result that omitted index must not fabricate
-    # one): _emit_own_address shape-gates.
+    # The event and the HW-007 stamp carry the result's OWN values (never
+    # the display defaults below — a result that omitted index must not
+    # fabricate one): both helpers shape-gate.
     if isinstance(number, int) and not isinstance(number, bool):
         output_fn(
             sanitize_tool_output(
@@ -20268,6 +20599,7 @@ def _print_new_address(
             )
         )
         _emit_own_address(emitter, result.get("address"), result.get("branch"), result.get("index"))
+        _stamp_last_shown_own(session, result.get("address"), result.get("branch"), result.get("index"))
         return
     output_fn(
         sanitize_tool_output(
@@ -20276,6 +20608,7 @@ def _print_new_address(
         )
     )
     _emit_own_address(emitter, result.get("address"), result.get("branch"), result.get("index"))
+    _stamp_last_shown_own(session, result.get("address"), result.get("branch"), result.get("index"))
 
 
 def _print_addresses(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
