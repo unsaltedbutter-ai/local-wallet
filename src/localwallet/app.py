@@ -15571,6 +15571,15 @@ _LABEL_SET_KEPT: Final[str] = (
     "Address {address} already carries those labels — nothing changed. "
     "Your labels: {labels}."
 )
+#: The ONE "a new member landed" ack, shared by both deterministic label
+#: intercepts (TCK-LABEL-001's address-literal write, TCK-CHAT-007's
+#: receive+label stamp): it echoes ONLY committed read-back — the stored
+#: (canonicalized) member and the whole committed set, never typed text.
+_LABEL_MEMBER_ACK: Final[str] = (
+    'Address {address} is now labeled "{stored}" — address-level: every '
+    "coin at this address, this one and any that land there later, "
+    "carries it. Your labels: {labels}."
+)
 #: Bare ``/label <target>`` now READS (there is no per-coin clear — the set
 #: belongs to the address, and one coin's command never rewrites it).
 _LABEL_SHOW_TARGET: Final[str] = (
@@ -16350,6 +16359,37 @@ _ADDRESS_LABEL_STORE_ERROR: Final[str] = (
     "stored."
 )
 
+#: Closed-circuit sentinels :func:`_bounded_label_value` answers with on a
+#: bad value. The NUL prefix makes a sentinel un-equal to any VALID label
+#: (the gate itself demands printable text), so callers map by equality —
+#: three outcomes, no new types.
+_LABEL_VALUE_EMPTY: Final[str] = "\x00label-empty"
+_LABEL_VALUE_TOO_LONG: Final[str] = "\x00label-too-long"
+_LABEL_VALUE_GARBAGE: Final[str] = "\x00label-garbage"
+
+
+def _bounded_label_value(rest: str) -> str:
+    """The ONE label-value gate shared by the two deterministic label
+    intercepts (TCK-LABEL-001's address-literal write, TCK-CHAT-007's
+    receive+label stamp): a quoted span (``"…"``/``'…'``, balanced, nothing
+    after the closing quote) or bounded trailing free text — non-empty,
+    ≤ :data:`ADDRESS_LABEL_MAX_CHARS`, printable. Returns the validated
+    label text or a :data:`_LABEL_VALUE_*` sentinel; each caller owns its
+    refusal copy (the RULES are single-source, the usage hints differ).
+    """
+    rest = rest.strip()
+    if rest[:1] in ("\"", "'"):
+        if len(rest) < 2 or rest[-1] != rest[0]:
+            return _LABEL_VALUE_GARBAGE  # unbalanced / trailing after close
+        rest = rest[1:-1].strip()
+    if not rest:
+        return _LABEL_VALUE_EMPTY
+    if len(rest) > ADDRESS_LABEL_MAX_CHARS:
+        return _LABEL_VALUE_TOO_LONG
+    if not rest.isprintable():
+        return _LABEL_VALUE_GARBAGE
+    return rest
+
 
 def _is_mainnet_bech32_address(token: str) -> bool:
     """Strict SHAPE gate for the intercept's address token (mainnet-only,
@@ -16408,18 +16448,14 @@ def _address_label_request(line: str) -> tuple[str, str] | str | None:
         rest = tail  # drop the connector; EVERYTHING after it is the label
     elif not sep and rest.lower() in _ADDRESS_LABEL_CONNECTORS:
         rest = ""  # connector with no value ("label <addr> as")
-    rest = rest.strip()
-    if rest[:1] in ("\"", "'"):
-        if len(rest) < 2 or rest[-1] != rest[0]:
-            return _ADDRESS_LABEL_GARBAGE  # unbalanced / trailing after close
-        rest = rest[1:-1].strip()
-    if not rest:
+    value = _bounded_label_value(rest)
+    if value == _LABEL_VALUE_EMPTY:
         return _ADDRESS_LABEL_NO_VALUE
-    if len(rest) > ADDRESS_LABEL_MAX_CHARS:
+    if value == _LABEL_VALUE_TOO_LONG:
         return _ADDRESS_LABEL_TOO_LONG
-    if not rest.isprintable():
+    if value == _LABEL_VALUE_GARBAGE:
         return _ADDRESS_LABEL_GARBAGE
-    return token, rest
+    return token, value
 
 
 def _run_address_label_turn(
@@ -16462,10 +16498,8 @@ def _run_address_label_turn(
         # canonicalized our word onto an existing tag).
         ack = _LABEL_SET_KEPT.format(address=address, labels=", ".join(committed))
     else:
-        ack = (
-            f'Address {address} is now labeled "{stored}" — address-level: '
-            "every coin at this address, this one and any that land there "
-            "later, carries it. Your labels: " + ", ".join(committed) + "."
+        ack = _LABEL_MEMBER_ACK.format(
+            address=address, stored=stored, labels=", ".join(committed)
         )
     output_fn(sanitize_tool_output(ack))
     return True
@@ -17054,6 +17088,246 @@ def _run_chat_settings_turn(
             output_fn(sanitize_tool_output(_CHAT_UNMANAGED))
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# TCK-CHAT-007: receive-address + label dual action (deterministic,
+# PRE-MODEL intercept).
+# USER REQUEST (2026-09-13): "I need a receive address labeled 'spearmint'"
+# → the wallet handed out the address but NO label — the LABEL-001 bug's
+# other half: the request was DOUBLE (allocate + name), the intent protocol
+# carries no label write, so the model could only answer half of it (best
+# case), or claim the label landed too (fabrication). This intercept
+# consumes the CLOSED phrasing family — a fresh/receive-address ask plus a
+# connector-led or trailing-quoted label value (:func:`_receive_label_request`
+# + LABEL-001's shared value gate) — runs the UNCHANGED ``new_address``
+# handler, and stamps the code-parsed label onto the address the HANDLER
+# RETURNED (the write key is engine-derived — never model- or user-authored
+# text) through the sanctioned v6 writer :meth:`Store.add_address_labels`.
+# The ack is STORE TRUTH: the address verbatim from the handler result + the
+# committed set as READ BACK after the commit; a refused write narrates the
+# honest split (the address is real, the label is NOT) instead of a claim.
+# The fresh-address narration/event path composes UNCHANGED — the CHAT-001
+# registry number line and the HW-005 ``own_address`` event ride the same
+# printer the model path uses, before the label ack. Label words never reach
+# the model: the consumed turn is transcript-free (the RBF-004/CPFP-002
+# discipline — history re-injects user text verbatim) and no generation
+# runs on it (§7.10). NON-matching phrasings fall through to the unchanged
+# pipeline; this ticket ships NO prompt or grammar line (an eval-gate
+# change is a STOP-and-report, not a silent widening here).
+# ---------------------------------------------------------------------------
+
+#: Connector words that lead a bounded label value in this grammar (whole
+#: words only). ``as``/``is`` are LABEL-001's connectors (its
+#: address-literal grammar keeps priority in :func:`_run_turn`); this
+#: grammar's request names a FRESH address instead of an address literal.
+_RECEIVE_LABEL_CONNECTORS: Final[frozenset[str]] = frozenset(
+    {"labeled", "labelled", "called", "named", "for"}
+)
+#: The request half of the head: the word ``address`` PLUS one of these
+#: (a fresh-address ask — new/fresh/next/receive, or the create/generate
+#: family reusing the CFG-004 word set, plus the get/give/want/need ask
+#: verbs: "give me an address labeled …" is the user's request shape).
+_RECEIVE_LABEL_FRESH_WORDS: Final[frozenset[str]] = (
+    frozenset(
+        {
+            "new", "fresh", "next", "receive",
+            "get", "gets", "getting", "give", "gives",
+            "want", "wants", "need", "needs", "make", "makes",
+        }
+    )
+    | _CHAT_CREATE_WORDS
+)
+#: Head words that make the line NOT this grammar: a money-flow verb (a
+#: send/bump/sign line stays the dispatcher's), ``change`` (the handler
+#: default is branch 0 — a "change address" ask must never silently
+#: receive a labeled RECEIVE address), and question words ("what/which/
+#: how do I get a new address labeled …" ASKS, it does not command).
+_RECEIVE_LABEL_BLOCKED_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "send", "sends", "sending", "pay", "pays", "paying", "spend",
+        "spending", "transfer", "transfers", "sign", "signs", "signing",
+        "confirm", "confirms", "cancel", "cancels", "broadcast", "bump",
+        "change", "what", "whats", "which", "whichs", "where", "wheres",
+        "when", "whens", "why", "whys", "how", "hows", "who", "whos",
+        "explorer", "verify", "balance", "history",
+        "status", "used",
+        # Question contractions ("what's the new address …" ASKS too —
+        # same family as the bare question words above). The matcher folds
+        # BOTH apostrophe glyphs ("'" U+0027 and "’" U+2019, mobile
+        # autocorrect) out of the HEAD tokens, so these stripped bare forms
+        # ("whats"/"wheres"/…/"dont") catch every contraction spelling.
+        # Negation heads ("don't create a new address labeled …") are NOT
+        # clean creation requests — the ordinary pipeline owns declines.
+        "dont", "not", "never", "no", "without", "skip", "stop",
+    }
+)
+#: Value-free refusals (the CHAT-007 copy of LABEL-001's gates — same
+#: rules, this grammar's usage; on every refusal line NOTHING was
+#: created, so there is no value to echo and no label to quote).
+_RECEIVE_LABEL_NO_VALUE: Final[str] = (
+    'No label to store — try: new receive address labeled "your label"; '
+    "nothing was created."
+)
+_RECEIVE_LABEL_TOO_LONG: Final[str] = (
+    f"Labels are capped at {ADDRESS_LABEL_MAX_CHARS} characters — shorten "
+    "the label and try again; nothing was created."
+)
+_RECEIVE_LABEL_GARBAGE: Final[str] = (
+    'I couldn\'t read that label — try: new receive address labeled '
+    '"your label" (quoted text must close, and nothing may follow the '
+    "closing quote); nothing was created."
+)
+_RECEIVE_LABEL_NO_WALLET: Final[str] = (
+    "No wallet is open yet — nothing to create or label."
+)
+_RECEIVE_LABEL_STORE_ERROR: Final[str] = (
+    "I couldn't save that label — the store refused the write. The "
+    "address above is yours for good, but it is NOT labeled."
+)
+
+
+def _receive_label_request(line: str) -> tuple[str] | str | None:
+    """Code-parse a receive-address + label utterance BEFORE the model.
+
+    Grammar (closed; the ticket's phrasings, nothing looser)::
+
+        <fresh-address ask> <connector> <label>
+        <fresh-address ask> "<label>"
+
+    ``<connector>`` is the first connector word; the ``<label>`` value is
+    LABEL-001's shared :func:`_bounded_label_value` gate (quoted span or
+    bounded free text — ≤ :data:`ADDRESS_LABEL_MAX_CHARS`, printable).
+    The HEAD (everything before the connector/quote) must contain the word
+    ``address``, at least one fresh word, and NO blocked word — a head
+    without a creation ask is not this grammar. Returns:
+
+    * ``None`` — NOT this grammar: the line falls through to the unchanged
+      pipeline (this includes every ask that never says "address", the
+      label-less "new address" request the model already answers, and
+      LABEL-001's address-literal forms);
+    * a code-owned refusal string — the shape matched but the VALUE is
+      missing/overflowed/garbage: the turn is still CONSUMED, with a
+      value-free "nothing was created" line (half-parsed label text
+      reaching the model is exactly the fabrication path this intercept
+      closes);
+    * ``(label,)`` — validated label text. NO address is matched: the
+      write key is engine-derived (whatever the handler returns).
+    """
+    words = line.split()
+    if not words:
+        return None
+    lowered = [w.lower() for w in words]
+    # Connector position: whole-word connector, else the trailing-quoted
+    # form ("new address \"spearmint\"") keys on the first word STARTING
+    # with a quote — the shared gate then demands a balanced span ending
+    # the line (anything else after an opening quote is a garbage refusal,
+    # not a fall-through: a half-parsed label must not reach the model).
+    idx: int | None = None
+    for i, w in enumerate(lowered):
+        if w in _RECEIVE_LABEL_CONNECTORS:
+            idx = i
+            break
+        if words[i][:1] in ('"', "'"):
+            idx = i
+            break
+    if idx is None or idx == 0:
+        return None  # no label phrase, or nothing but the label asked for
+    # Fold BOTH apostrophe glyphs out of the HEAD membership set only: the
+    # blocked words ("whats"/"dont") then catch ASCII and curly ("what’s",
+    # mobile autocorrect) contractions alike. The pivot and the label VALUE
+    # stay un-normalized — a label value may legitimately contain an
+    # apostrophe.
+    head = {w.replace("'", "").replace("\u2019", "") for w in lowered[:idx]}
+    if "address" not in head:
+        return None
+    if not head & _RECEIVE_LABEL_FRESH_WORDS:
+        return None
+    if head & _RECEIVE_LABEL_BLOCKED_WORDS:
+        return None
+    # Everything from the pivot word on (original spacing preserved by
+    # maxsplit): the quoted span, or the connector plus the label — the
+    # connector token drops, the shared gate then strips and validates.
+    rest = line.split(maxsplit=idx)[idx]
+    if lowered[idx] in _RECEIVE_LABEL_CONNECTORS:
+        rest = rest[len(words[idx]):]
+    value = _bounded_label_value(rest)
+    if value == _LABEL_VALUE_EMPTY:
+        return _RECEIVE_LABEL_NO_VALUE
+    if value == _LABEL_VALUE_TOO_LONG:
+        return _RECEIVE_LABEL_TOO_LONG
+    if value == _LABEL_VALUE_GARBAGE:
+        return _RECEIVE_LABEL_GARBAGE
+    return (value,)
+
+
+def _run_receive_label_turn(
+    store: Store,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+    emitter: EventEmitter | None = None,
+) -> bool:
+    """Consume a receive-address + label turn; True when the turn was
+    consumed.
+
+    ORDER IS THE TICKET'S: the EXISTING ``new_address`` handler first
+    (the same table dispatch the model path uses — allocation, registry
+    numbering, and the HW-005 ``own_address`` event compose through the
+    unchanged :func:`_print_new_address`), THEN the label write, keyed on
+    the address the handler RETURNED. The ack quotes only committed store
+    truth: :meth:`Store.add_address_labels` answers with the set it read
+    back after its own commit, so the label named in the success line
+    exists in the store whenever the line is narrated — a refused write
+    narrates the honest split line instead (the address is real and
+    shown; the label did NOT land), never a claim. Transcript-free by
+    construction: nothing here touches the loop, so the label words never
+    enter model context through any channel (§7.10).
+    """
+    request = _receive_label_request(line)
+    if request is None:
+        return False
+    if isinstance(request, str):
+        output_fn(sanitize_tool_output(request))
+        return True
+    (label,) = request
+    if IntentName.NEW_ADDRESS not in table:
+        # Wallet-less pump (the LABEL-001 no-wallet shape): the honest
+        # nothing-to-create line still consumes — the label words must
+        # not reach the model on a matched request either.
+        output_fn(sanitize_tool_output(_RECEIVE_LABEL_NO_WALLET))
+        return True
+    envelope = Envelope(
+        v=0, intent=IntentName.NEW_ADDRESS, params=NewAddressParams()
+    )
+    result = table[IntentName.NEW_ADDRESS](envelope)
+    _print_new_address(result, output_fn, emitter=emitter)
+    address = result.get("address")
+    if result.get("error") is not None or not isinstance(address, str) or not address:
+        # Allocation failed (or answered outside the closed shape): the
+        # printer narrated the failure line and there is NOTHING to
+        # label — no label claim may follow.
+        return True
+    try:
+        before = store.get_address_label_set(address)
+        committed = store.add_address_labels(address, (label,))
+    except (StoreError, sqlite3.Error):
+        # Fail closed, value-free. The address IS real (allocated and
+        # narrated above); the label is NOT — say exactly that.
+        output_fn(sanitize_tool_output(_RECEIVE_LABEL_STORE_ERROR))
+        return True
+    stored = next((m for m in committed if m not in before), None)
+    if stored is None:
+        # The crash-window same-string re-issue (the handler's documented
+        # corner): the "fresh" address already carries the member.
+        ack = _LABEL_SET_KEPT.format(address=address, labels=", ".join(committed))
+    else:
+        ack = _LABEL_MEMBER_ACK.format(
+            address=address, stored=stored, labels=", ".join(committed)
+        )
+    output_fn(sanitize_tool_output(ack))
+    return True
 
 
 # ------------------------------------- network status + explorer links (TCK-CHAT-006)
@@ -17806,6 +18080,22 @@ def _run_turn(
     # not reach the model either. Checked after the conversation intercepts
     # (their open asks still close on a non-matching utterance — never-trap).
     if store is not None and _run_address_label_turn(store, line, output_fn):
+        return
+    # TCK-CHAT-007: the receive-address + label dual action ("I need a
+    # receive address labeled 'spearmint'") — the half-answered request the
+    # USER reported: the model allocates the address, no intent carries a
+    # label. The closed matcher consumes the ask+label phrasing BEFORE the
+    # model, the UNCHANGED new_address handler allocates, and the
+    # code-parsed label union-adds to the address the HANDLER RETURNED
+    # (engine-derived key); the ack reads the committed set back from the
+    # store (store truth — a refused write says so, never claims).
+    # Consumed turns never reach the transcript or the model (§7.10);
+    # non-matching phrasings fall through UNCHANGED — no prompt line here
+    # (that is the ticket's STOP-and-report eval gate). Checked after the
+    # LABEL-001 intercept (its address-literal grammar keeps priority).
+    if store is not None and _run_receive_label_turn(
+        store, line, output_fn, table=table, emitter=emitter
+    ):
         return
     # TCK-CFG-004: chat-managed settings — the deterministic pre-model
     # intercept for the five closed keys (gap limit, watch interval, UTXO
