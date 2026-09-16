@@ -1693,8 +1693,8 @@ class TestSelectionAndProtocol:
             ("bitcoind://127.0.0.1:8332", "bitcoind"),
             ("bitcoind://u:p@h:1", "bitcoind"),
             ("ssl://h", "electrum"),
-            ("https://mempool.space/api", "esplora"),
-            ("http://127.0.0.1:3006", "esplora"),
+            ("https://mempool.space/api", "publicinfo"),
+            ("http://127.0.0.1:3006", "publicinfo"),
         ]:
             assert ChainConfig(base_url=url, timeout_s=5, max_retries=0).kind == kind, url
 

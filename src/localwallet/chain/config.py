@@ -99,17 +99,23 @@ class ChainConfig:
         """Adapter selected by the URL scheme: ``"electrum"`` for ``ssl://``
         (TCK-ONB-004 M1), ``"bitcoind"`` for the Core RPC family —
         ``bitcoind://`` and its https sibling ``bitcoind+tls://``
-        (TCK-ONB-004 M2; TCK-BACKEND-003) — ``"esplora"`` for http(s).
-        The construction site (``app._build_chain_client``) dispatches on
-        exactly this value; the transport difference between the two Core
-        schemes lives INSIDE the adapter, not in a second seam."""
+        (TCK-ONB-004 M2; TCK-BACKEND-003) — ``"publicinfo"`` for http(s)
+        (TCK-CHAINKIND-001: the kind was renamed from the leftover
+        ``"esplora"`` literal after DESCOPE-M4 — mempool.space-style Esplora
+        URLs are public-info only, never a wallet backend). The construction
+        site (``app._build_chain_client``) dispatches on exactly this value;
+        the transport difference between the two Core schemes lives INSIDE
+        the adapter, not in a second seam. NOTE: this kind is DERIVED from
+        the URL scheme and never persisted — the store keeps only the
+        ``chain_base_url`` URL, so no stored-settings migration for the old
+        ``"esplora"`` name is needed (there is nothing to normalize)."""
         if self.base_url.startswith(ELECTRUM_SCHEME):
             return "electrum"
         if self.base_url.startswith(
             (BITCOIND_SCHEME, BITCOIND_TLS_SCHEME)
         ):
             return "bitcoind"
-        return "esplora"
+        return "publicinfo"
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_url, str):

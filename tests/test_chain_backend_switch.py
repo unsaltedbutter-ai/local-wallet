@@ -102,6 +102,28 @@ def test_set_electrum_and_bitcoind_select_their_adapters(
     assert ChainConfig.from_settings(Settings.from_env()).kind == "electrum"
 
 
+def test_kind_matrix_covers_every_scheme(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin EVERY URL-scheme → kind classification the config layer produces
+    (TCK-CHAINKIND-001). http(s) is PUBLIC-INFO only (renamed from the
+    leftover ``"esplora"`` literal after DESCOPE-M4) — never a wallet
+    backend. The kind is DERIVED from the scheme, never persisted, so there
+    is no stored-settings normalization path (nothing carries the legacy
+    ``"esplora"`` name to migrate)."""
+    cases = [
+        ("ssl://h", "electrum"),
+        ("ssl://h:50002", "electrum"),
+        ("bitcoind://h", "bitcoind"),
+        ("bitcoind://u:p@h:1", "bitcoind"),
+        ("bitcoind+tls://h:1", "bitcoind"),
+        ("https://mempool.space/api", "publicinfo"),
+        ("http://127.0.0.1:3006", "publicinfo"),
+    ]
+    for url, kind in cases:
+        assert ChainConfig(base_url=url, timeout_s=5, max_retries=0).kind == kind, url
+    # The legacy public-info name must never be produced again.
+    assert ChainConfig(base_url="https://mempool.space/api", timeout_s=5, max_retries=0).kind != "esplora"
+
+
 def test_surrounding_whitespace_is_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LOCALWALLET_CHAIN_BASE_URL", f"  {ELECTRUM}  ")
     assert ChainConfig.from_settings(Settings.from_env()).base_url == ELECTRUM
