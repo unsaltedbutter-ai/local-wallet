@@ -1718,21 +1718,29 @@ def test_watch_stored_setting_malformed_warns_once_and_defaults(
     assert "Background watch" not in joined
 
 
-def test_backend_mode_three_state_classification() -> None:
+def test_backend_mode_three_state_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The mode classification (TCK-SEC-004 change 5, re-targeted by
     TCK-DESCOPE-M3A): no configured URL ⇒ UNRESOLVED (awaiting_backend —
     the silent public default is gone); the consented PUBLIC ELECTRUM host
     ⇒ public; loopback host ⇒ own_node_local; anything else ⇒
     own_node_remote. TCK-WEB-023 widens "anything else": a private-range
     LITERAL IP now answers own_node_private (the full matrix + the
-    CGNAT/link-local/.local exclusions are pinned in
-    tests/test_web023_private_green.py); names and public literals stay
-    own_node_remote."""
+    CGNAT/link-local exclusions are pinned in
+    tests/test_web023_private_green.py); names resolving to public answers
+    and public literals stay own_node_remote (TCK-WEB-030: the
+    resolves-to-private flip + the resolver stubs ride
+    tests/test_web030_hostname_trust.py — no unit test touches a real
+    resolver)."""
     from localwallet.app import (
         BACKEND_MODE_OWN_NODE_PRIVATE,
         PRIVACY_MODE_AWAITING_BACKEND,
         _backend_mode,
     )
+    from localwallet.chain import hostinfo as _hostinfo
+
+    monkeypatch.setattr(_hostinfo, "resolves_to_private", lambda host: False)
     from localwallet.config import PUBLIC_ELECTRUM_URL, Settings
 
     assert _backend_mode(Settings()) == PRIVACY_MODE_AWAITING_BACKEND

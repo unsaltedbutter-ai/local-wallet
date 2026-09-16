@@ -103,7 +103,6 @@ import argparse
 import base64
 import calendar
 import hashlib
-import ipaddress
 import json
 import os
 import queue
@@ -154,6 +153,7 @@ from localwallet.chain import (
     classify_failure,
     estimate_eta,
     format_sat_vb,
+    hostinfo,
     minor_per_unit,
     time_since_last_block,
 )
@@ -825,16 +825,23 @@ BACKEND_MODE_OWN_NODE_LOCAL: Final[str] = "own_node_local"
 BACKEND_MODE_OWN_NODE_REMOTE: Final[str] = "own_node_remote"
 
 #: TCK-WEB-023 (user direction "green if the IP address is a private IP
-#: address"): a configured backend whose host is a LITERAL IP in a private
-#: range (10/8, 172.16/12, 192.168/16, plus the wider 127/8 loopback). The
-#: badge tint surface reads this as GREEN (like :data:`BACKEND_MODE_OWN_NODE_LOCAL`),
-#: but the mode keeps the REMOTE trust-hedged copy verbatim — a private-range
-#: server the user does NOT run (roommate/venue LAN — the binding glm
-#: council hedge) still sees every query, so only the COLOR says "private
-#: network", never the sentence. The existing names keep their exact meanings
-#: (own_node_local stays "this machine"): one new value was the smallest
-#: honest change, over remapping own_node_local to "private-ish" (which
-#: would have made the "lookups stay here" copy a lie for LAN nodes).
+#: address"), WIDENED by TCK-WEB-030 (USER DIRECTION 2026-09-15, superseding
+#: the WEB-023 "``.local`` stays yellow" decision): a configured backend
+#: whose host is a private-range address (10/8, 172.16/12, 192.168/16, plus
+#: the wider 127/8 loopback) EITHER LITERAL in the URL text OR RESOLVED from
+#: a hostname (normal DNS or ``.local``/mDNS) through the chain-owned seam
+#: (:mod:`localwallet.chain.hostinfo`, cached per host — see
+#: :func:`_hostname_resolves_private`). Resolution FAILURE (unresolvable,
+#: timeout) and mixed private/public answers fall back to the previous
+#: classification (the yellow REMOTE hedge) — GREEN is only ever claimed on
+#: a POSITIVE all-private resolution. The badge tint surface reads this as
+#: GREEN (like :data:`BACKEND_MODE_OWN_NODE_LOCAL`), but the mode keeps the
+#: REMOTE trust-hedged copy verbatim — a private-range server the user does
+#: NOT run (roommate/venue LAN — the binding glm council hedge) still sees
+#: every query, so only the COLOR says "private network", never the
+#: sentence. The existing names keep their exact meanings (own_node_local
+#: stays "this machine"): NO new enum member was added — this member's
+#: meaning widened, still one new value in the smallest honest change.
 BACKEND_MODE_OWN_NODE_PRIVATE: Final[str] = "own_node_private"
 
 #: TCK-UX-010: the FOURTH ``/state`` ``privacy_mode`` name — the ONB-006
@@ -875,59 +882,56 @@ _BACKEND_HOST_MODES: Final[frozenset[str]] = frozenset(
 #: so the set is mirrored here; keep the two in sync).
 _LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "localhost", "::1"})
 
-#: The IPv4 ranges that classify a LITERAL-IP backend host as PRIVATE
-#: (TCK-WEB-023 user direction: 10/8, 172.16/12, 192.168/16, plus the whole
-#: 127/8 loopback block — 127.0.0.2 IS this machine as much as 127.0.0.1;
-#: only the exact legacy strings in :data:`_LOOPBACK_HOSTS` keep the
-#: host-less own_node_local wording, the wider block arrives green-with-
-#: hedge through own_node_private). DELIBERATELY NOT ``ipaddress``'s
-#: ``is_private``: it also counts 169.254/16 link-local (and the IPv6
-#: link-local/ULA blocks) private — the council ruled link-local NEVER
-#: green (auto-assigned, any device on the segment may hold it), and
-#: CGNAT 100.64/10 is excluded the same way (a carrier-shared address is
-#: not a network you run). IPv6 gets no private branch beyond the exact
-#: ``::1`` in :data:`_LOOPBACK_HOSTS`: ULA fc00::/7 was not in the ticket's
-#: enumerated ranges and a literal-only rule stays honest and reviewable.
-_PRIVATE_GREEN_NETS_V4: Final[tuple[ipaddress.IPv4Network, ...]] = (
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("127.0.0.0/8"),
-)
+#: The literal-IP private-range helper lives in the chain seam module (its
+#: range enum is shared verbatim with the RESOLVED-IP classification —
+#: :mod:`localwallet.chain.hostinfo`, TCK-WEB-030); this alias keeps the
+#: WEB-023 name and every existing pin riding it.
+_host_is_private_range = hostinfo.ip_in_private_green_range
+
+#: TCK-WEB-030: cache of hostname→"resolves to a private IP" answers, keyed
+#: by the lower-cased configured host. BOUNDED by both a TTL (a DNS answer
+#: can change; a stale GREEN claim must expire) and a hard entry cap (the
+#: realistic working set is one host — the cap is anti-unbounded-growth
+#: paranoia). INVALIDATED at the hot-swap seam (:meth:`ChainBackendFlow
+#: ._install`): a URL swap must never serve the previous host's resolution
+#: for the remainder of a TTL window. Failed resolutions are cached as
+#: ``False`` too — fail-closed (yellow is never a lie) AND it stops one
+#: unreachable name from stalling every /state read with a fresh resolver
+#: attempt. ponytail: no lock — a raced duplicate resolution is benign
+#: (last writer wins, both answers classify the same host).
+_HOST_TRUST_TTL_S: Final[float] = 300.0
+_HOST_TRUST_CACHE_MAX: Final[int] = 32
+_host_trust_cache: dict[str, tuple[float, bool]] = {}
 
 
-def _host_is_private_range(host: str) -> bool:
-    """Whether ``host`` is a literal IP address in a :data:`_PRIVATE_GREEN_NETS_V4`
-    range — PURE TEXT PARSING, no DNS, no socket (the whole engine module
-    answers without network calls; ``getaddrinfo`` here would classify on a
-    name's *resolver*, i.e. on data the engine cannot verify).
+def _invalidate_host_trust() -> None:
+    """Drop every cached host→private resolution (the hot-swap/settings-
+    apply seam calls this the moment the configured URL moves)."""
+    _host_trust_cache.clear()
 
-    The classification is honest-by-construction: only addresses whose range
-    is READABLE FROM THE TEXT count as private.
 
-    * ``10.x / 172.16-31.x / 192.168.x / 127.x`` literals (and the IPv4-
-      mapped IPv6 spelling ``::ffff:10.x``) → ``True``.
-    * ``100.64/10`` (CGNAT) and ``169.254/16`` (link-local) → ``False`` —
-      never green, per the council.
-    * EVERY hostname — including ``.local``/mDNS — → ``False``. DECISION
-      (documented, TCK-WEB-023): ``.local`` names typically resolve on-link,
-      but from here that is unverified — mDNS answers are unauthenticated
-      (any device on the segment may claim the name, the same threat shape
-      as the never-green 169.254 block) and resolvers/hosts files can route
-      a ``.local`` name anywhere. A name whose address cannot be read from
-      the text is classified on the honest non-green branch: the yellow
-      ``own_node_remote`` badge with its trust hedge stays TRUE for every
-      one of those worlds. VPN-overlay names ride the same rule.
-    * Anything :mod:`ipaddress` refuses to parse as an address (including
-      leading-zero octets) → ``False``. Never raises; value-free.
-    """
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
+def _hostname_resolves_private(host: str) -> bool:
+    """Whether hostname ``host`` RESOLVES (DNS or mDNS) to private-range
+    IPs, via the chain seam, cached per host for :data:`_HOST_TRUST_TTL_S`.
+
+    Fail-closed in every direction: a literal IP answers ``False`` here
+    WITHOUT any resolver or seam call (the WEB-023 text rule owns literals
+    in the branch ahead of this one), a mixed private/public answer is
+    ``False``, and a failed resolution is ``False`` — all keep today's
+    YELLOW ``own_node_remote`` answer for that input. Never raises, never
+    surfaces the IP."""
+    if hostinfo.is_ip_literal(host):
         return False
-    if addr.version == 6 and addr.ipv4_mapped is not None:
-        addr = addr.ipv4_mapped
-    return addr.version == 4 and any(addr in net for net in _PRIVATE_GREEN_NETS_V4)
+    key = host.lower()
+    cached = _host_trust_cache.get(key)
+    now = time.monotonic()
+    if cached is not None and cached[0] > now:
+        return cached[1]
+    private = hostinfo.resolves_to_private(key) is True
+    if len(_host_trust_cache) >= _HOST_TRUST_CACHE_MAX:
+        _host_trust_cache.clear()  # ponytail: full-clear; ceiling = configured hosts
+    _host_trust_cache[key] = (now + _HOST_TRUST_TTL_S, private)
+    return private
 
 #: The ``node_status`` narration predicates (TCK-SEC-004 change 5, approved
 #: copy) — "You are " + one of these, mirroring the banner's split. The
@@ -9585,7 +9589,8 @@ def _make_tx_status_handler(
 def _backend_mode(settings: Settings) -> str:
     """The chain-backend privacy mode (3-way classification, TCK-SEC-004
     change 5; the PUBLIC meaning re-targeted and the UNRESOLVED answer
-    added by TCK-DESCOPE-M3A; the PRIVATE-IP branch added by TCK-WEB-023).
+    added by TCK-DESCOPE-M3A; the PRIVATE-IP branch added by TCK-WEB-023
+    and widened to LITERAL-or-RESOLVED private IPs by TCK-WEB-030).
 
     Derived from the SAME single selection point the chain client uses
     (:func:`_effective_chain_url`, ADR-0018 as amended):
@@ -9601,17 +9606,22 @@ def _backend_mode(settings: Settings) -> str:
       node on THIS machine. Meaning unchanged (the ticket's smallest-
       honest-change rule — the "lookups stay here" copy stays true).
     - :data:`BACKEND_MODE_OWN_NODE_PRIVATE` — a configured URL whose host
-      is a LITERAL IP in a private range (:func:`_host_is_private_range`:
-      10/8, 172.16/12, 192.168/16, the wider 127/8). GREEN badge tint
-      (with own_node_local) on the trust surface, but the SAME host-named
-      trust-hedged wording as REMOTE — a private-IP server the user does
-      not run still sees the queries (the binding glm council hedge).
-      CGNAT 100.64/10 and link-local 169.254/16 are NEVER private here.
+      is a private-range address (10/8, 172.16/12, 192.168/16, the wider
+      127/8), LITERAL in the text (:func:`_host_is_private_range`) OR
+      RESOLVED from a hostname (:func:`_hostname_resolves_private`,
+      TCK-WEB-030 — normal DNS and ``.local``/mDNS ride the OS resolver
+      through the chain seam; CGNAT 100.64/10 and link-local 169.254/16
+      are NEVER private here). GREEN badge tint (with own_node_local) on
+      the trust surface, but the SAME host-named trust-hedged wording as
+      REMOTE — a private-IP server the user does not run still sees the
+      queries (the binding glm council hedge). Fail-closed: a name that
+      does not resolve (or resolves mixed/private+public) lands on REMOTE.
     - :data:`BACKEND_MODE_OWN_NODE_REMOTE` — any other configured host
-      (VPS/public IP, or ANY hostname including ``.local``/mDNS — names
-      cannot be range-checked offline, see :func:`_host_is_private_range`):
-      still the user's own server, but not classifiably private, so copy
-      must not claim lookups "stay on this machine".
+      (VPS/public IP, a hostname resolving to a public IP, or an
+      UNRESOLVABLE name — today's answer stays the honest default whenever
+      the resolver has nothing to say, see above): still the user's own
+      server, but not classifiably private, so copy must not claim lookups
+      "stay on this machine".
 
     The node_status narration mirrors this function (and the privacy banner
     renders its host-named REMOTE wording for both _BACKEND_HOST_MODES), so
@@ -9633,6 +9643,15 @@ def _backend_mode(settings: Settings) -> str:
     if host is not None and host.lower() in _LOOPBACK_HOSTS:
         return BACKEND_MODE_OWN_NODE_LOCAL
     if host is not None and _host_is_private_range(host):
+        return BACKEND_MODE_OWN_NODE_PRIVATE
+    # RESOLUTION (TCK-WEB-030 — normal DNS and ``.local``/mDNS ride the OS
+    # resolver through the chain seam; cached per host, see
+    # :func:`_hostname_resolves_private`). The public/loopback pins above
+    # already short-circuit their hosts and literal IPs never reach the
+    # resolver (text rule first). Anything the resolver cannot honestly
+    # confirm (failure, mixed answers, public) keeps the pre-WEB-030 YELLOW
+    # answer below — fail-closed.
+    if host is not None and _hostname_resolves_private(host):
         return BACKEND_MODE_OWN_NODE_PRIVATE
     return BACKEND_MODE_OWN_NODE_REMOTE
 
@@ -12408,7 +12427,10 @@ def build_state_snapshot(
     if privacy_mode is not None:
         # TCK-UX-010: additive under state/1 (same rule): the CLOSED
         # privacy-mode NAME (:data:`PRIVACY_MODES`) the pump precomputed —
-        # an enum name, never a URL/host. Absent (None) = no settings
+        # an enum name, never a URL/host. TCK-WEB-030: the
+        # ``own_node_private`` NAME may now be sourced from a hostname
+        # RESOLUTION as well as a literal IP — the resolved address itself
+        # NEVER rides the wire, only the name. Absent (None) = no settings
         # context; omitted, never guessed (the ``backend_kind`` pattern).
         snapshot["privacy_mode"] = privacy_mode
     if backend_host is not None:
@@ -14351,9 +14373,11 @@ def _pump(
             # string ``backend_host`` — the configured host's BARE NAME
             # (scheme/port/path/creds stripped by the parser, creds NEVER
             # ride), supplied only for the host-named modes (own_node_remote
-            # and the private-IP own_node_private) so the privacy subline
-            # can say "Your node at <host> — …". The awaiting hold outranks
-            # it too (no server to name while unresolved).
+            # and the private own_node_private — literal- OR resolved-IP
+            # since TCK-WEB-030; the RESOLVED IP itself never leaves the
+            # engine, only the closed enum NAME moves) so the privacy
+            # subline can say "Your node at <host> — …". The awaiting hold
+            # outranks it too (no server to name while unresolved).
             # TCK-WEB-027 (council fold): one more additive precomputed
             # string — the wallet's CLOSED 8-hex fingerprint, read from the
             # stored descriptor's ORIGIN (engine truth; the ACCOUNT-key fp,
@@ -15762,6 +15786,11 @@ class ChainBackendFlow:
         # resolves the backend (banner, watch mode, node_status, the next
         # plan/fetch) rides this same settings object.
         w.settings.chain_base_url = url
+        # TCK-WEB-030: the configured HOST may have just moved — drop every
+        # cached hostname→private resolution so no classification in this
+        # process can answer off the PREVIOUS host's resolution for the
+        # remainder of a TTL window.
+        _invalidate_host_trust()
         old = w.client
         w.worker.set_client(new_client)
         w.client = new_client  # type: ignore[assignment]

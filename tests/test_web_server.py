@@ -1202,6 +1202,11 @@ def test_state_snapshot_never_carries_values(
     partial binds THIS handle object, so patching its method is what the
     transport actually calls."""
     server = serve(state_timeout_s=10.0)
+    # TCK-WEB-030 hermetic: the configured NAME classifies as "resolves to a
+    # PUBLIC IP" (no unit test touches a resolver); mode expectation unchanged.
+    from localwallet.chain import hostinfo as _hostinfo
+
+    monkeypatch.setattr(_hostinfo, "resolves_to_private", lambda host: False)
 
     class _Pending:  # duck-typed flow.pending, packed with sensitive fields
         recipient = "bc1qattrrust"  # would-be leak

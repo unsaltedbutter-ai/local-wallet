@@ -3,13 +3,16 @@
 Three surfaces pinned here:
 
 1. The classification (:func:`localwallet.app._backend_mode`) resolves the
-   CONFIGURED chain host OFFLINE (URL text + literal IPs only — no DNS, no
-   sockets) and adds the fifth closed ``privacy_mode`` name
+   CONFIGURED chain host from the URL text (literal IPs — no DNS on the
+   WEB-023 path) and adds the fifth closed ``privacy_mode`` name
    ``own_node_private`` for private-range literal IPs (10/8, 172.16/12,
    192.168/16, the wider 127/8). CGNAT 100.64/10 and link-local 169.254/16
-   are NEVER green; hostnames — including ``.local``/mDNS — land on the
-   honest yellow ``own_node_remote`` branch (documented decision: the
-   engine does not resolve, so a name's range is unknowable text).
+   are NEVER green. HOSTNAMES (incl. ``.local``/mDNS) were documented
+   not-green here; TCK-WEB-030 SUPERSEDED that decision — names now resolve
+   through the chain seam (the whole matrix + cache live in
+   tests/test_web030_hostname_trust.py). This module pins the LITERAL
+   behavior as the fail-safe fallback and stubs the name resolutions
+   (hermetic: no unit test touches a resolver).
 2. The ``/state`` additive ``backend_host`` (council fold): the bare
    hostname of the configured URL (scheme/port/path/USERINFO stripped by
    the existing UX-009 parser) rides ONLY the two host-named modes
@@ -37,11 +40,25 @@ from typing import Any
 import pytest
 
 from localwallet import app
+from localwallet.chain import hostinfo
 from localwallet.config import PUBLIC_ELECTRUM_URL, Settings
 from localwallet.store import Store
 
 # ------------------------------------------------------- classification matrix
 
+
+@pytest.fixture(autouse=True)
+def _hermetic_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TCK-WEB-030 replaced this module's "names never resolve" premise:
+    every HOSTNAME here answers through a stubbed seam ("resolves to a
+    PUBLIC IP" — the yellow branch this module pins), and the app's module-
+    global host-trust cache is cleared around every test. Literal-IP pins
+    never reach the resolver at all (that IS pinned, call-count-zero
+    style, in tests/test_web030_hostname_trust.py)."""
+    app._invalidate_host_trust()
+    monkeypatch.setattr(hostinfo, "resolves_to_private", lambda host: False)
+    yield
+    app._invalidate_host_trust()
 
 PRIVATE_URLS = [
     "ssl://10.0.0.1:50002",
@@ -70,7 +87,7 @@ NOT_GREEN_LITERAL_IPS = [
 NOT_GREEN_NAMES = [
     "http://node.example.invalid:3006",
     "ssl://electrum.example.lan:50002",
-    "http://MyNode.LOCAL:50001",  # mDNS: documented NOT-green (no resolution)
+    "http://MyNode.LOCAL:50001",  # mDNS name: stubbed to resolve PUBLIC
     "http://vpn-overlay.local:50002",
     "http://barehost.example",
 ]

@@ -488,7 +488,9 @@ def _bare_context(**kwargs: Any) -> Any:
     return bootstrap
 
 
-def test_state_snapshot_carries_each_privacy_mode_name() -> None:
+def test_state_snapshot_carries_each_privacy_mode_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Done-when: the additive ``privacy_mode`` carries every closed enum
     NAME sourced from ``_backend_mode(settings)`` — and NEVER the URL
     behind it (the pinned contract: names over the wire). TCK-WEB-023
@@ -496,6 +498,11 @@ def test_state_snapshot_carries_each_privacy_mode_name() -> None:
     and added the separate documented ``backend_host`` exception: the bare
     HOSTNAME (no scheme/port/path, no credentials) rides ONLY the two
     host-named modes, never the name-shaped enum."""
+    # TCK-WEB-030 hermetic: the one HOSTNAME in the loop classifies as
+    # "resolves to a PUBLIC IP" (no unit test touches a resolver).
+    from localwallet.chain import hostinfo
+
+    monkeypatch.setattr(hostinfo, "resolves_to_private", lambda host: False)
     from localwallet.config import Settings
 
     # TCK-DESCOPE-M3A: an empty selection is AWAITING (no silent public
