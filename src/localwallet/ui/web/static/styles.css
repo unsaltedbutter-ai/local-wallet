@@ -1222,3 +1222,76 @@ body {
   border-radius: var(--r-md);
 }
 .qr-img { display: block; }
+
+/* ====== TCK-UTXO-005: typed UTXO render rows ====== */
+
+/* The row UPGRADES a narrated coin line in place inside the get_utxos
+   bubble: same mono type, one line per coin (no layout shift); it wraps
+   at 320px like every row line here (WEB-021 precedent). The DOM keeps
+   single-space text nodes between the parts (they carry the copyable
+   text); visual spacing rides the gap — the inherited .turn-text
+   pre-wrap is neutralized so the collapsed runs never double it. */
+.utxo-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-2);
+  white-space: normal;
+}
+
+/* The registry number stays pinned at the head of ITS OWN row (the line
+   itself is the grouping) — muted ink, tabular figures. */
+.utxo-number {
+  color: var(--c-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The amount: a click toggles sats ↔ BTC (both representations arrive
+   engine-computed; the client computes nothing). Same quiet dotted
+   affordance as the token copy control — it is a toggle, not a copy, so
+   it never carries copy feedback states and never gains a QR slot. */
+.utxo-amount {
+  margin: 0;
+  padding-inline: 0;
+  padding-block: var(--sp-1);
+  border: 0;
+  background: none;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-decoration-color: var(--c-border-strong);
+  text-underline-offset: 2px;
+}
+.utxo-amount:hover,
+.utxo-amount:focus-visible {
+  color: var(--c-accent);
+  text-decoration-color: var(--c-accent);
+}
+
+/* Confirmed/pending: the SHAPE is the cue (filled disc vs open ring),
+   the color only assists — WCAG 1.4.1, the WEB-026 non-color precedent.
+   The glyphs live in CSS content ONLY (never a DOM text node, so the
+   row's copy/announce text stays verbatim); the span's accessible name
+   is the pinned aria-label. */
+.utxo-state::before {
+  display: inline-block;
+  text-align: center;
+  inline-size: 1em;
+}
+.utxo-confirmed::before {
+  content: "●";
+  color: var(--c-priv-local);
+}
+.utxo-pending::before {
+  content: "○";
+  color: var(--c-priv-trust);
+}
+
+/* Label passthrough (the row contract's optional ``label`` — shown only
+   when the row carries one; absent in production get_utxos rows today).
+   Muted trailing aside. */
+.utxo-label {
+  color: var(--c-text-muted);
+}

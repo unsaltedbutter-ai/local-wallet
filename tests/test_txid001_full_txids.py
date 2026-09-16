@@ -140,7 +140,7 @@ def test_utxo_line_txid_is_full() -> None:
         _print_utxos,
         {"utxos": [{"txid": TXID, "vout": 1, "value_sats": 5000, "confirmed": 1}]},
     )
-    assert line == f"5000 sats · confirmed · tx {TXID} vout 1"
+    assert line == f"5,000 sats · confirmed · tx {TXID} vout 1"
     _assert_full_txid_line(line)
 
 

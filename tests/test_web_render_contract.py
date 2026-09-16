@@ -230,8 +230,9 @@ def test_copy_button_selector_guard_and_single_class_assignment() -> None:
     assert 'turn.querySelector(".copy-btn")' in code
     # exactly ONE button class assignment, shared by every call site.
     assert code.count('btn.className = "copy-btn"') == 1
-    # real call sites today: appendText, appendSystem, appendUser (3).
-    assert code.count("addCopyButton(turn);") == 3
+    # real call sites: appendText, appendSystem, appendUser, and (TCK-UTXO-005)
+    # noteUtxoRows re-arming the control after a rows upgrade (4).
+    assert code.count("addCopyButton(turn);") == 4
 
 
 # TCK-WEB-011 static pin: the engine's user_text echo is deduped against this
@@ -281,6 +282,11 @@ def test_kind_badges_return_amendment_shaped_mempool_stays_gone() -> None:
     code = code.replace(
         re.search(r"const EXPLORER_LINK_LINE_RE =\s*\n?\s*[^;]+;", code).group(0), ""
     )
+    # TCK-UTXO-005 carve-out: the pinned confirmed/pending icon NAME "pending
+    # in mempool" uses the English phrase (an aria-label, never a backend
+    # kind). Remove that literal too before the dead-word ban — the pin's
+    # intent (mempool never returns as a BACKEND BADGE) still holds.
+    code = code.replace('utxoPending: "pending in mempool",', "")
     # the old shape is still fully gone (only the new minimal painter exists):
     for gone in (
         "BADGE_FAMILIES",
@@ -3159,4 +3165,338 @@ def test_launch004_loading_indicator_lifecycle_under_node() -> None:
       if (inputEl.placeholder !== LABELS.chatNeedsKeyPlaceholder) throw new Error("precedence");
       console.log("ok");
     """.replace("__FUNCS__", funcs)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+# ============================================================== TCK-UTXO-005
+# Static half: the typed ``utxo_rows`` render contract. The engine's get_utxos
+# result carries an ADDITIVE ``utxo_rows`` list (one row per listed coin,
+# narration order; the field shapes are pinned engine-side in
+# tests/test_utxo005_render_rows.py) and the pump stamps it as a ``utxo_rows``
+# SSE event AFTER the coin narration lines it upgrades (the TCK-HW-005
+# own_address additive-stamp precedent; the CLI sink ignores the kind, so the
+# terminal keeps its byte-identical text). Client rule: PREFER the rows when
+# present and FULLY matched; absent key / garbage payload / any malformed row
+# / partial match / no open turn all leave the text fallback EXACTLY as today.
+# Everything renders over the shared WEB-014/026 copy machinery, textContent-
+# only (the global sink scan covers the new builders), CSP-clean (classes,
+# dataset and attributes only — never inline style).
+
+def test_utxo005_rows_static_pins() -> None:
+    raw = (_STATIC / "app.js").read_text(encoding="utf-8")
+    code = _strip_js_comments(raw)
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    # the bus branch + the fail-closed fallback gates (every miss keeps text).
+    assert 'kind === "utxo_rows") noteUtxoRows(data)' in code
+    assert "if (!Array.isArray(rows) || rows.length === 0) return;" in code
+    assert "if (!rows.every(utxoRowIsWellFormed)) return;" in code
+    assert "if (at === -1) return;" in code
+    assert "if (!turn) return;" in code
+    # already-upgraded rows can never re-match (a duplicate emission inside
+    # one turn no-ops; the replay guard covers the cross-turn case).
+    assert ":not(.utxo-row)" in code
+    # THE TOGGLE COMPUTES NOTHING: the BTC view is the engine string plus a
+    # unit word (swapped verbatim); the only client math is thousands
+    # GROUPING of the engine's own integer. The sats/BTC constant never
+    # appears client-side.
+    assert 'row.value_btc + " BTC"' in code
+    assert "100000000" not in code
+    assert "btn.dataset.satsText = satsText;" in code  # canonical copy view
+    # pinned icon names (aria-only; the glyph pairs live in the stylesheet
+    # alone — the WEB-026 ::after precedent — so copy text stays verbatim and
+    # the cue is SHAPE not color, WCAG 1.4.1).
+    assert 'utxoConfirmed: "confirmed",' in code
+    assert 'utxoPending: "pending in mempool",' in code
+    assert "\u25cf" not in raw and "\u25cb" not in raw
+    assert 'content: "\u25cf";' in css and 'content: "\u25cb";' in css
+    assert ".utxo-confirmed::before" in css and ".utxo-pending::before" in css
+    # the user-spec row: number, amount, icon, copy-address, copy-txid, with
+    # the label passthrough last, over the ONE WEB-014 copy-button builder.
+    builder = re.search(
+        r"function utxoRowElement\(row\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    for part in (
+        'el("span", "utxo-number", "#" + row.number)',
+        "utxoAmountButton(row)",
+        "utxoStateIcon(row.confirmed)",
+        "copyTokenButton(row.address)",
+        "copyTokenButton(row.txid)",
+        'el("span", "utxo-label", row.label)',
+    ):
+        assert part in builder, part
+    assert builder.index("utxoAmountButton") < builder.index("utxoStateIcon")
+    assert builder.index("utxoStateIcon") < builder.index("copyTokenButton(row.address)")
+    assert builder.index("copyTokenButton(row.address)") < builder.index("copyTokenButton(row.txid)")
+    assert builder.index("copyTokenButton(row.txid)") < builder.index('el("span", "utxo-label"')
+    assert "innerHTML" not in builder and "addEventListener" not in builder
+    # the row IS a transcript line: it joins the copy/announce seam, and the
+    # seam's canonical view ignores the toggle (lineText reads the dataset).
+    assert 'el("p", "turn-text utxo-row")' in code
+    line_fn = re.search(
+        r"function lineText\(line\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert 'contains("utxo-amount")' in line_fn and "dataset.satsText" in line_fn
+    # phone width + tokens only (320px wrap OK — the WEB-021 precedent).
+    block = css[css.index(".utxo-row {") :]
+    block = block[: block.index("}")]
+    assert "flex-wrap: wrap;" in block
+    assert "#" not in css[css.index("TCK-UTXO-005: typed UTXO render rows") :]
+
+
+# TCK-UTXO-005 behavioral check (node if present): the SHIPPED row machinery
+# runs against DOM stubs over a full narrated bubble — the rows upgrade the
+# matched coin lines IN PLACE (head/note lines untouched), every field renders
+# (registry number, thousands-separated sats, exact-BTC toggle swap BOTH ways
+# as per-row state, shape+aria icon, the shared value-bearing copy buttons,
+# the optional label), the row's copy/announce text is canonical (toggle-
+# proof, single-spaced around the textless icon), EVERY fallback path keeps
+# the text render byte-intact (no event, garbage JSON, per-field shape
+# refusals, the number/address paired-absence rule, partial match, no open
+# turn), and a duplicate emission inside one turn is a strict no-op (the
+# render-once/replay guarantee).
+def test_utxo005_rows_render_toggle_and_fallback_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    addr_re = re.search(r"const ADDRESS_RE = (/[^;]+);", code).group(1)
+    txid_re = re.search(r"const TXID_RE = (/[^;]+);", code).group(1)
+    funcs = "\n".join(
+        re.search(rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL).group(0)
+        for name in (
+            "el", "formatSats", "utxoRowIsWellFormed", "utxoAmountButton",
+            "utxoStateIcon", "utxoRowElement", "noteUtxoRows", "lineText",
+            "bubbleText", "copyTokenButton",
+        )
+    )
+    script = """
+      const ADDRESS_RE = __ADDR_RE__;
+      const TXID_RE = __TX_RE__;
+      const LABELS = { clickToCopy: "Click to copy", copyAddress: "Copy address",
+                       copyTxid: "Copy transaction id",
+                       utxoConfirmed: "confirmed", utxoPending: "pending in mempool" };
+      const mkNode = (tag, nodeType, text) => {
+        const node = {
+          tag, nodeType: nodeType || 1, className: "", textContent: text || "",
+          type: "", attrs: {}, dataset: {}, children: [], parent: null, handlers: {},
+          get childNodes() { return this.children; },
+          setAttribute(k, v) { this.attrs[k] = v; },
+          appendChild(n) {
+            if (n.parent) {
+              const i = n.parent.children.indexOf(n);
+              if (i !== -1) n.parent.children.splice(i, 1);
+            }
+            n.parent = this; this.children.push(n); return n;
+          },
+          before(n) {
+            if (n.parent) {
+              const i = n.parent.children.indexOf(n);
+              if (i !== -1) n.parent.children.splice(i, 1);
+            }
+            const i = this.parent.children.indexOf(this);
+            n.parent = this.parent; this.parent.children.splice(i, 0, n);
+          },
+          remove() {
+            if (!this.parent) return;
+            const i = this.parent.children.indexOf(this);
+            this.parent.children.splice(i, 1);
+            this.parent = null;
+          },
+          addEventListener(kind, fn) { this.handlers[kind] = fn; },
+          querySelectorAll(sel) {
+            const need = /^\\.([a-z-]+)/.exec(sel)[1];
+            const skip = [...sel.matchAll(/:not\\(\\.([a-z-]+)\\)/g)].map((m) => m[1]);
+            const out = [];
+            const walk = (n) => {
+              for (const c of n.children) {
+                const cs = c.className.split(/\\s+/).filter(Boolean);
+                if (cs.includes(need) && !skip.some((x) => cs.includes(x))) out.push(c);
+                walk(c);
+              }
+            };
+            walk(this);
+            return out;
+          },
+          querySelector() { return null; },
+        };
+        Object.defineProperty(node, "classList", {
+          get() {
+            const self = this;
+            const set = () => new Set(self.className.split(/\\s+/).filter(Boolean));
+            return {
+              add(c) { const s = set(); s.add(c); self.className = [...s].join(" "); },
+              remove(c) { const s = set(); s.delete(c); self.className = [...s].join(" "); },
+              contains(c) { return set().has(c); },
+            };
+          },
+        });
+        return node;
+      };
+      globalThis.document = {
+        createElement: (t) => mkNode(t),
+        createTextNode: (d) => mkNode("#text", 3, d),
+      };
+      globalThis.Node = { ELEMENT_NODE: 1 };
+      // the SHIPPED copyTokenButton calls exactly these two on click:
+      const clip = [];
+      const clipboardWrite = async (t) => { clip.push(t); return true; };
+      const flashes = [];
+      const flashCopyResult = (ctrl, ok, baseTitle, baseAria) => {
+        flashes.push([ctrl, ok, baseTitle, baseAria]);
+      };
+      const state = { openTurn: null };
+      let copyArms = 0;
+      const addCopyButton = () => { copyArms++; };
+      const scrollToEnd = () => {};
+      __FUNCS__
+      const addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+      const addr2 = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+      const t1 = "a".repeat(64), t2 = "b".repeat(64), t3 = "c".repeat(64), t4 = "d".repeat(64);
+      const rows = [
+        { number: 14, value_sats: 10000000, value_btc: "0.10000000",
+          confirmed: true, address: addr, txid: t1 },
+        { number: 2, value_sats: 12345, value_btc: "0.00012345",
+          confirmed: false, address: addr2, txid: t2 },
+        { value_sats: 100, value_btc: "0.00000100", confirmed: true, txid: t3 },
+        { number: 4, value_sats: 1, value_btc: "0.00000001", confirmed: false,
+          address: addr, txid: t4, label: "'kyc', 'exchange'" },
+      ];
+      const mkLine = (text) => {
+        const p = document.createElement("p");
+        p.className = "turn-text";
+        p.appendChild(document.createTextNode(text));
+        return p;
+      };
+      const buildTurn = () => {
+        const turn = mkNode("li");
+        turn.appendChild(mkLine("Unspent outputs \u2014 4 coins."));
+        turn.appendChild(mkLine("#14 " + addr + " \u00b7 10,000,000 sats \u00b7 confirmed \u00b7 tx " + t1 + " vout 0"));
+        turn.appendChild(mkLine("#2 " + addr2 + " \u00b7 12,345 sats \u00b7 unconfirmed \u00b7 tx " + t2 + " vout 1"));
+        turn.appendChild(mkLine("100 sats \u00b7 confirmed \u00b7 tx " + t3 + " vout 0"));
+        turn.appendChild(mkLine("#4 " + addr + " \u00b7 1 sats \u00b7 unconfirmed \u00b7 tx " + t4 + " vout 2"));
+        turn.appendChild(mkLine("Confirmation estimate: next block."));
+        state.openTurn = turn;
+        return turn;
+      };
+      const parts = (line) => line.children.filter((c) => c.nodeType === 1);
+      const textOf = (line) => parts(line).map((c) => c.textContent).join("");
+      const find = (line, cls) => parts(line).find((c) => c.classList.contains(cls));
+      const links = (line) => parts(line).filter((c) => c.classList.contains("explorer-link"));
+      const untouched = (turn) =>
+        turn.children.length === 6 && parts(turn.children[1]).length === 0;
+      const main = async () => {
+        // ---- 1. no event = today's render, untouched ----
+        if (!untouched(buildTurn())) throw new Error("plain-shape");
+        // ---- 2. the upgrade: rows replace the coin lines IN PLACE ----
+        const turn = buildTurn();
+        noteUtxoRows(JSON.stringify(rows));
+        if (turn.children.length !== 6) throw new Error("arity:" + turn.children.length);
+        if (lineText(turn.children[0]) !== "Unspent outputs \u2014 4 coins.") throw new Error("head-moved");
+        if (lineText(turn.children[5]) !== "Confirmation estimate: next block.") throw new Error("note-moved");
+        const r = turn.children.slice(1, 5);
+        for (const row of r) {
+          if (!row.classList.contains("turn-text") || !row.classList.contains("utxo-row"))
+            throw new Error("row-seam");
+        }
+        // row 1 fields: #number, sats-separated amount, confirmed icon,
+        // value-bearing copy-address + copy-txid (the SHARED WEB-014 button).
+        if (lineText(r[0]) !== "#14 10,000,000 sats " + addr + " " + t1) throw new Error("row1-text:" + lineText(r[0]));
+        const amount1 = find(r[0], "utxo-amount");
+        if (!amount1 || amount1.type !== "button") throw new Error("amount-not-a-button");
+        if (amount1.dataset.satsText !== "10,000,000 sats") throw new Error("sats-text");
+        const icon1 = find(r[0], "utxo-state");
+        if (lineText(r[0]).includes("confirmed") || icon1.textContent !== "") throw new Error("icon-has-text");
+        if (icon1.attrs["aria-label"] !== "confirmed" || icon1.attrs.role !== "img" ||
+            !icon1.classList.contains("utxo-confirmed")) throw new Error("icon-ok");
+        const l1 = links(r[0]);
+        if (l1.length !== 2) throw new Error("copy-arity");
+        if (l1[0].textContent !== addr || l1[0].attrs["aria-label"] !== "Copy address " + addr)
+          throw new Error("addr-btn");
+        if (l1[1].textContent !== t1 || l1[1].attrs["aria-label"] !== "Copy transaction id " + t1)
+          throw new Error("txid-btn");
+        // degenerate address-less row: NO number, NO address button.
+        if (find(r[2], "utxo-number")) throw new Error("degenerate-number");
+        if (links(r[2]).length !== 1 || links(r[2])[0].textContent !== t3) throw new Error("degenerate-btns");
+        if (lineText(r[2]) !== "100 sats " + t3) throw new Error("degenerate-text");
+        // pending icon name + label passthrough.
+        const icon2 = find(r[1], "utxo-state");
+        if (icon2.attrs["aria-label"] !== "pending in mempool" ||
+            !icon2.classList.contains("utxo-pending")) throw new Error("icon-pending");
+        const label = find(r[3], "utxo-label");
+        if (!label || label.textContent !== "'kyc', 'exchange'") throw new Error("label");
+        // row order is narration order (numbers ride the rows).
+        if (["r0", "r1", "r2", "r3"].map((k, i) => find(r[i], "utxo-number")).filter(Boolean).length !== 3)
+          throw new Error("number-count");
+        // ---- 3/4. the toggle: verbatim swap BOTH ways, per-row state; the
+        //           copied/announced text is canonical (never click state) ----
+        const canonical = bubbleText(turn);
+        amount1.handlers.click();
+        if (amount1.textContent !== "0.10000000 BTC") throw new Error("toggle-btc");
+        if (bubbleText(turn) !== canonical) throw new Error("toggle-moved-copy-text");
+        const amount2 = find(r[1], "utxo-amount");
+        amount2.handlers.click();
+        if (amount1.textContent !== "0.10000000 BTC") throw new Error("state-bleed-1");
+        if (amount2.textContent !== "0.00012345 BTC") throw new Error("state-bleed-2");
+        amount1.handlers.click();
+        if (amount1.textContent !== "10,000,000 sats") throw new Error("toggle-back");
+        if (amount2.textContent !== "0.00012345 BTC") throw new Error("per-row-holds");
+        // ---- 5. copy wiring: verbatim value, shared flash + base names ----
+        await l1[0].handlers.click();
+        if (clip[0] !== addr) throw new Error("clip-value");
+        const f = flashes[flashes.length - 1];
+        if (f[0] !== l1[0] || f[1] !== true || f[2] !== "Click to copy" ||
+            f[3] !== "Copy address " + addr) throw new Error("flash-wiring");
+        // the bubble copy control re-armed after the upgrade (WEB-010).
+        if (copyArms < 1) throw new Error("copy-not-armed");
+        // ---- 6. fallbacks: text stays byte-intact on EVERY miss ----
+        const bads = [
+          "not json", "[]", "{}", "null", "[[]]",
+          JSON.stringify([{ number: 1, value_sats: "5", value_btc: "0.00000005",
+                            confirmed: true, address: addr, txid: t1 }]),
+          JSON.stringify([{ number: 1, value_sats: 5, value_btc: "0.1",
+                            confirmed: true, address: addr, txid: t1 }]),
+          JSON.stringify([{ number: 1, value_sats: 5, value_btc: "0.00000005",
+                            confirmed: 1, address: addr, txid: t1 }]),
+          JSON.stringify([{ number: 1, value_sats: 5, value_btc: "0.00000005",
+                            confirmed: true, address: addr, txid: "f".repeat(63) }]),
+          JSON.stringify([{ value_sats: 5, value_btc: "0.00000005",
+                            confirmed: true, address: addr, txid: t1 }]),
+          JSON.stringify([{ number: 1, value_sats: 5, value_btc: "0.00000005",
+                            confirmed: true, txid: t1 }]),
+          JSON.stringify([{ number: 1, value_sats: 5, value_btc: "0.00000005",
+                            confirmed: true, address: addr, txid: t1, label: "" }]),
+        ];
+        for (const bad of bads) {
+          const t = buildTurn();
+          noteUtxoRows(bad);
+          if (!untouched(t)) throw new Error("malformed-rendered:" + bad.slice(0, 30));
+        }
+        // partial match (one row whose coin line is NOT here): ALL-or-nothing.
+        const tp = buildTurn();
+        noteUtxoRows(JSON.stringify([rows[0], { number: 9, value_sats: 7,
+          value_btc: "0.00000007", confirmed: true, address: addr2, txid: "e".repeat(64) }]));
+        if (!untouched(tp)) throw new Error("partial-rendered");
+        // no open turn (closed/misordered): the event dies quietly.
+        const tc = buildTurn();
+        state.openTurn = null;
+        noteUtxoRows(JSON.stringify(rows));
+        if (!untouched(tc)) throw new Error("closed-turn-rendered");
+        // ---- 7. render-once: a duplicate emission of the SAME rows is a
+        //           strict no-op (and the id guard covers true SSE replays) ----
+        const turn2 = buildTurn();
+        noteUtxoRows(JSON.stringify(rows));
+        const once = turn2.children.map((c) => c.className + "|" + lineText(c)).join("\\n");
+        noteUtxoRows(JSON.stringify(rows));
+        const twice = turn2.children.map((c) => c.className + "|" + lineText(c)).join("\\n");
+        if (once !== twice || turn2.children.length !== 6) throw new Error("replay-diff");
+        console.log("ok");
+      };
+      main().catch((e) => { console.error(e); process.exit(1); });
+    """
+    script = (
+        script.replace("__ADDR_RE__", addr_re)
+        .replace("__TX_RE__", txid_re)
+        .replace("__FUNCS__", funcs)
+    )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)

@@ -376,6 +376,10 @@ const LABELS = {
   // consentSubline above — one voice, value-free).
   chainChipsGroup: "Suggested public Electrum servers",
   chainChipsWarn: "A public server — " + PUBLIC_LEAK_SENTENCE,
+  // TCK-UTXO-005: the confirmed/pending icon's ACCESSIBLE NAMES (pinned
+  // copy — the CSS glyph is the non-color cue; these words carry the meaning).
+  utxoConfirmed: "confirmed",
+  utxoPending: "pending in mempool",
 };
 
 // Which buttons the typed /state snapshot shows, per flow position. The
@@ -761,6 +765,13 @@ function lineText(line) {
   let text = "";
   for (const node of line.childNodes) {
     if (node.nodeType === Node.ELEMENT_NODE && node.classList.contains("qr-btn")) continue;
+    // TCK-UTXO-005: the amount button's VISIBLE text is per-row click state;
+    // the copied/announced text is CANONICAL (always the row's sats view —
+    // the dataset carries the engine's own figure, nothing is re-derived).
+    if (node.nodeType === Node.ELEMENT_NODE && node.classList.contains("utxo-amount")) {
+      text += node.dataset.satsText;
+      continue;
+    }
     text += node.textContent;
   }
   return text;
@@ -1057,6 +1068,148 @@ function paintHwVerifyButtons() {
     btn.disabled = false;
     btn.hidden = !show;
   }
+}
+
+// ------------------------------------------------- UTXO render rows (TCK-UTXO-005)
+// A NON-EMPTY get_utxos result carries the additive typed ``utxo_rows`` list
+// (one row per listed coin, narration order; the field contract lives with the
+// engine's _utxo_render_rows docstring). The pump stamps it onto the bus as a
+// ``utxo_rows`` event AFTER the coin narration lines it upgrades — the exact
+// TCK-HW-005 own_address additive-stamp precedent (the CLI sink ignores the
+// kind, so every non-web surface keeps its byte-identical text).
+// CLIENT RULE (pinned): PREFER the rows when they arrive and match; anything
+// else — no event (empty listing, error/clarify shapes, legacy results), a
+// malformed payload, a partial match, no open turn — leaves the turn's text
+// render EXACTLY as today. The builder is a pure function of the rows array,
+// so an SSE replay renders identically (handleEvent's id guard already drops
+// a replayed turn before any of it runs).
+// The row COMPUTES NOTHING: value_btc swaps VERBATIM (engine math); the only
+// client arithmetic is thousands grouping of the engine's own integer — the
+// same `:,` shape the narration line prints.
+
+function formatSats(valueSats) {
+  // Digit grouping only (the Python :, format for the contract's ints).
+  return String(valueSats).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+function utxoRowIsWellFormed(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return false;
+  if (!Number.isInteger(row.value_sats) || row.value_sats < 0) return false;
+  if (typeof row.value_btc !== "string" || !/^[0-9]+\.[0-9]{8}$/.test(row.value_btc)) return false;
+  if (typeof row.confirmed !== "boolean") return false;
+  if (typeof row.txid !== "string" || !TXID_RE.test(row.txid)) return false;
+  // ``number`` and ``address`` are present TOGETHER or absent together (the
+  // degenerate address-less row carries neither — never a fabricated one).
+  const hasNumber = row.number !== undefined;
+  const hasAddress = row.address !== undefined;
+  if (hasNumber !== hasAddress) return false;
+  if (hasNumber && (!Number.isInteger(row.number) || row.number < 0)) return false;
+  if (hasAddress && (typeof row.address !== "string" || !row.address)) return false;
+  // label: optional passthrough; present means non-empty string.
+  if (row.label !== undefined && (typeof row.label !== "string" || !row.label)) return false;
+  return true;
+}
+
+function utxoAmountButton(row) {
+  const satsText = formatSats(row.value_sats) + " sats";
+  const btcText = row.value_btc + " BTC"; // verbatim engine string + unit word
+  const btn = el("button", "utxo-amount", satsText);
+  btn.type = "button";
+  // The CANONICAL copy view (lineText reads this, never the toggled text —
+  // copied message text can never depend on click state).
+  btn.dataset.satsText = satsText;
+  let showBtc = false; // PER-ROW state; no page-level toggle state exists
+  btn.addEventListener("click", () => {
+    showBtc = !showBtc;
+    btn.textContent = showBtc ? btcText : satsText;
+  });
+  return btn;
+}
+
+// Confirmed/pending: the glyph is a CSS ::before SHAPE (filled vs open — the
+// non-color cue, WCAG 1.4.1, the WEB-026 precedent; the word lives in the
+// stylesheet only, so the span carries NO DOM text and copy/announce text is
+// untouched). The accessible name carries the whole meaning.
+function utxoStateIcon(confirmed) {
+  const cls = confirmed ? "utxo-state utxo-confirmed" : "utxo-state utxo-pending";
+  const span = el("span", cls);
+  span.setAttribute("role", "img");
+  span.setAttribute("aria-label", confirmed ? LABELS.utxoConfirmed : LABELS.utxoPending);
+  return span;
+}
+
+// The user-spec row: <#number> <amount toggle> <confirmed/pending icon>
+// <copy-address> <copy-txid> (label last, ONLY when the row carries one).
+// The copy buttons ARE the WEB-014/026 machinery (verbatim token content,
+// value-bearing aria name, flashCopyResult + the shared #copy-status live
+// region) — no second copy path exists. The single-space text nodes between
+// parts survive in textContent (the copy text) even where flex collapses
+// them visually; the TEXTLESS icon span takes no seam of its own, so the
+// row copy is "#14 10,000,000 sats <addr> <txid>" — never a double space
+// around the glyph.
+function utxoRowElement(row) {
+  const line = el("p", "turn-text utxo-row");
+  if (row.number !== undefined) {
+    line.appendChild(el("span", "utxo-number", "#" + row.number));
+    line.appendChild(document.createTextNode(" "));
+  }
+  line.appendChild(utxoAmountButton(row));
+  line.appendChild(utxoStateIcon(row.confirmed));
+  line.appendChild(document.createTextNode(" "));
+  if (row.address !== undefined) {
+    line.appendChild(copyTokenButton(row.address));
+    line.appendChild(document.createTextNode(" "));
+  }
+  line.appendChild(copyTokenButton(row.txid));
+  if (row.label !== undefined) {
+    line.appendChild(document.createTextNode(" "));
+    line.appendChild(el("span", "utxo-label", row.label));
+  }
+  return line;
+}
+
+function noteUtxoRows(raw) {
+  let rows;
+  try {
+    rows = JSON.parse(raw);
+  } catch {
+    return; // non-JSON payload: ignore, never render raw
+  }
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  if (!rows.every(utxoRowIsWellFormed)) return; // untrusted wire: ALL-or-nothing
+  const turn = state.openTurn;
+  if (!turn) return; // contract: the event rides its narration, pre-turn_end
+  // Pair each row (narration order) with the coin line it restates: row and
+  // line are two renderings of ONE store truth, so the line is the one
+  // printing this row's "#N", separated sats figure, and FULL txid. First
+  // unconsumed match per row keeps same-txid/same-value coins paired in order
+  // (interchangeable rows produce an identical render — deterministic).
+  const lines = Array.from(
+    turn.querySelectorAll(
+      ".turn-text:not(.turn-progress):not(.turn-model):not(.utxo-row)",
+    ),
+  );
+  const coins = [];
+  for (const row of rows) {
+    const sats = formatSats(row.value_sats) + " sats";
+    const txNeedle = "tx " + row.txid;
+    const at = lines.findIndex((line) => {
+      const text = lineText(line);
+      return (
+        (row.number === undefined || text.startsWith("#" + row.number + " ")) &&
+        text.includes(sats) && text.includes(txNeedle)
+      );
+    });
+    if (at === -1) return; // partial coverage: keep the whole text fallback
+    coins.push(lines.splice(at, 1)[0]);
+  }
+  // Upgrade IN PLACE: the rows land where the first coin line was (the
+  // listing's head line stays above, the tool's note lines stay below), then
+  // the narrated coin lines they replace come out.
+  for (const row of rows) coins[0].before(utxoRowElement(row));
+  for (const line of coins) line.remove();
+  addCopyButton(turn); // WEB-010: (re-)arm the bubble copy over the row lines
+  scrollToEnd();
 }
 
 function ensureTurn() {
@@ -1781,6 +1934,7 @@ function handleEvent(id, kind, data) {
   else if (kind === "model_progress") renderModelProgress(data);
   else if (kind === "user_text") renderUserText(data);
   else if (kind === "own_address") noteOwnAddress(data); // TCK-HW-005 static
+  else if (kind === "utxo_rows") noteUtxoRows(data); // TCK-UTXO-005 static
   else if (kind === "turn_end") noteTurnEnd();
   else if (kind === "resync") {
     // too_far_behind: the cursor predates the server ring, so part of the

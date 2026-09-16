@@ -94,8 +94,10 @@ class TestCleanWalletUnchanged:
             [_utxo(wallet_id, "a" * 64, 0, addr0, 50_000, confirmed=1)],
         )
         result = _ask(store, wallet_id, completed_scan=True)
-        # Additive-only: NO pending keys on a clean wallet.
-        assert set(result) == {"utxos", "count", "freshness"}
+        # Additive-only: NO pending keys on a clean wallet. (The
+        # TCK-UTXO-005 render rows are the one sanctioned additive key —
+        # no pending_* key rides a clean-wallet answer.)
+        assert set(result) == {"utxos", "count", "freshness", "utxo_rows"}
         assert result["freshness"] == "fresh"
 
     def test_narration_grows_no_pending_line(self) -> None:

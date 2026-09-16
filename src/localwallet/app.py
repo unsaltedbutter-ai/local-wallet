@@ -5250,6 +5250,83 @@ def _resolve_in_flight_outgoing(
     return entries
 
 
+def _sats_to_btc_str(value_sats: int) -> str:
+    """Exact 8-decimal BTC rendering of a sat amount — integer math only,
+    never a float (TCK-UTXO-005: the amount-toggle client computes
+    nothing). ``10_000_000`` -> ``"0.10000000"``; whole and fractional
+    halves come from one ``divmod`` against 1e8 sat/BTC.
+
+    Precondition: ``value_sats`` is NON-NEGATIVE (the caller domain is
+    non-negative store values; a negative input would render a bogus
+    signed string — no caller passes one)."""
+    assert value_sats >= 0
+    whole, frac = divmod(value_sats, 100_000_000)
+    return f"{whole}.{frac:08d}"
+
+
+def _utxo_render_rows(
+    utxos: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """The typed per-coin render rows (TCK-UTXO-005) — one row per entry
+    of the ``utxos`` listing, in the SAME order as the printed narration.
+    Pure: reshapes values the handler already computed from the store; it
+    resolves NOTHING new (most importantly it never reads the v6 label
+    set — see ``label``).
+
+    Result-key contract (the web client renders these rows; the narrated
+    text stays the fallback — a client PREFERs ``utxo_rows`` when the key
+    is present and falls back to the bubble text when it is absent):
+
+    - ``number`` (int) — the stable CHAT-001 registry number of the
+      coin's address, identical to the ``#N`` prefix on the narration
+      line. Absent only on the degenerate address-less store row (the
+      narration prints no prefix there either — never a fabricated one).
+    - ``value_sats`` (int) — verbatim store value.
+    - ``value_btc`` (str) — the SAME value as an exact 8-decimal BTC
+      decimal string (10000000 sats <-> "0.10000000"), engine-computed via
+      :func:`_sats_to_btc_str`; the click-toggle shows ``value_sats``
+      (thousands-separated — the same ``:,`` the narration line prints)
+      and ``value_btc``, computing nothing itself.
+    - ``confirmed`` (bool) — verbatim store truth (True confirmed / False
+      pending) — the icon source.
+    - ``address`` (str) — verbatim; the copy-address button's value.
+      Absent exactly when ``number`` is.
+    - ``txid`` (str) — verbatim FULL 64-hex; the copy-txid button's value.
+    - ``label`` (str) — PASSTHROUGH ONLY: present exactly when the input
+      row already carries a non-empty ``label`` (the value copied
+      verbatim). The ``get_utxos`` listing shows NO per-row label, so its
+      rows never carry one and the key is ABSENT there; resolving the v6
+      set HERE would leak label text into tool output, which the
+      LABEL-001 "label words never reach the get_utxos result" invariant
+      forbids. A surface that DOES print a label per row wires its own
+      resolved value into the input row; this helper never invents or
+      fetches one.
+
+    Engine-computed from store truth only; the rows ride the handler
+    RESULT (tool output — addresses/txids/amounts are sanctioned there,
+    as in the narration), and never enter logs or model context.
+    """
+    rows: list[dict[str, object]] = []
+    for utxo in utxos:
+        row: dict[str, object] = {}
+        number = utxo.get("number")
+        if type(number) is int:  # exact int — a bool (an int subclass) is not a registry number
+            row["number"] = number
+        value_sats = utxo.get("value_sats")
+        row["value_sats"] = value_sats
+        row["value_btc"] = _sats_to_btc_str(int(value_sats))  # int per the contract
+        row["confirmed"] = utxo.get("confirmed")
+        address = utxo.get("address")
+        if isinstance(address, str) and address:
+            row["address"] = address
+        row["txid"] = utxo.get("txid")
+        label = utxo.get("label")
+        if isinstance(label, str) and label:
+            row["label"] = label  # verbatim passthrough — never resolved here
+        rows.append(row)
+    return rows
+
+
 def _make_get_utxos_handler(
     store: Store,
     wallet_id: int,
@@ -5301,6 +5378,20 @@ def _make_get_utxos_handler(
     summary describes the listing that was answered), and an empty match
     is the existing honest "No unspent outputs." — the result shape is
     unchanged.
+
+    TCK-UTXO-005 (rendering rework): a NON-EMPTY listing additionally
+    carries the typed ``utxo_rows`` key — one render row per printed coin
+    in narration order, engine-computed from store truth only (field
+    types and absence rules: :func:`_utxo_render_rows`). The web client
+    PREFERs ``utxo_rows`` when the key is present and falls back to the
+    narrated bubble text when it is ABSENT — which is exactly the empty
+    listing ("No unspent outputs."), every error/clarify shape, the
+    params-mismatch shape, and any legacy result that predates this key
+    (absent key = old answer, never a broken render). The pre-model
+    filtered listings (:func:`_run_coin_filter_turn`, TCK-CHAT-009) are
+    text-only surfaces that build no handler result, so their bubbles
+    ride the text fallback. Rows are tool output (values sanctioned in
+    the RESULT, as in the narration) — never logged, never model context.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -5373,6 +5464,12 @@ def _make_get_utxos_handler(
             "count": len(utxos),
             "freshness": freshness,
         }
+        # TCK-UTXO-005: the typed render rows ride the RESULT alongside the
+        # verbatim projection — ABSENT on an empty listing (the "No unspent
+        # outputs." answer has nothing to render; the client falls back to
+        # the narrated text) and on the error/params-mismatch shapes.
+        if utxos:
+            result["utxo_rows"] = _utxo_render_rows(utxos)
         if params.address_number is not None:
             result["address_number"] = params.address_number
             result["address"] = scoped_address
@@ -9899,6 +9996,15 @@ EVENT_USER_TEXT: Final[str] = "user_text"
 #: narration text itself): never a log, never a model turn. The CLI sink
 #: ignores the kind; the ring buffer replays it like any event.
 EVENT_OWN_ADDRESS: Final[str] = "own_address"
+
+#: Additive typed ``utxo_rows`` SSE event (TCK-UTXO-005 static half): the
+#: pump stamps a bare JSON array of the ``get_utxos`` row dicts VERBATIM
+#: (``json.dumps(..., separators=(",", ":"))``) AFTER the coin narration
+#: lines it upgrades and BEFORE ``turn_end`` — mirroring the HW-005
+#: ``own_address`` additive-stamp precedent. Only when the result carries
+#: ``utxo_rows`` (absent → no emission); the CLI sink ignores the kind, so
+#: the terminal keeps its byte-identical text.
+EVENT_UTXO_ROWS: Final[str] = "utxo_rows"
 
 #: Command token the web transport stamps on a typed ``/state`` snapshot
 #: request (TCK-WEB-003). Recognized ONLY as the ``command`` label of a
@@ -20304,7 +20410,7 @@ def _print_turn(
     elif envelope.intent is IntentName.GET_HISTORY:
         _print_history(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.GET_UTXOS:
-        _print_utxos(turn.result or {}, output_fn)
+        _print_utxos(turn.result or {}, output_fn, emitter=emitter)
     elif envelope.intent is IntentName.GET_ADDRESSES:
         _print_addresses(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.NEW_ADDRESS:
@@ -20472,7 +20578,12 @@ def _print_history(result: Mapping[str, object], output_fn: Callable[[str], None
         output_fn(sanitize_tool_output(f"tx {txid_part} {direction} {height_label}"))
 
 
-def _print_utxos(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+def _print_utxos(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    *,
+    emitter: EventEmitter | None = None,
+) -> None:
     """Print one line per UTXO with the address verbatim from the result.
 
     A stale-flagged answer (ADR-0022) leads with the value-free loading
@@ -20484,6 +20595,23 @@ def _print_utxos(result: Mapping[str, object], output_fn: Callable[[str], None])
     stated in copy, never an address — plus the tool's static
     confirm-likelihood note line (verbatim; on the cache-served pending
     path it is the honest no-estimate degrade, never a minute figure).
+
+    TCK-UTXO-005: this text is the client's FALLBACK render — the web
+    client prefers the handler's typed ``utxo_rows`` when the result
+    carries the key and prints this narration when it is absent (empty
+    listing, error/legacy shapes; see the ``get_utxos`` handler
+    docstring). The only formatting change is the deterministic
+    thousands separator on the per-coin sat figure the line already
+    showed (store integer, ``:,`` — matching the row contract's
+    ``value_sats`` display); every other byte is unchanged.
+
+    TCK-UTXO-005 static half: when the result carries ``utxo_rows`` the
+    pump stamps it as an additive ``utxo_rows`` SSE event AFTER the coin
+    narration lines above and BEFORE ``turn_end`` — the exact JSON of the
+    row dicts (``json.dumps(..., separators=(",", ":"))``), verbatim. A
+    result WITHOUT the key (empty/error/legacy) emits nothing. Mirrors
+    the HW-005 ``own_address`` additive-stamp precedent; the CLI sink
+    (emitter=None) ignores the kind and stays byte-identical.
     """
     if result.get("error") is not None:
         if result.get("error") == _ADDRESS_REF_UNKNOWN:
@@ -20525,9 +20653,17 @@ def _print_utxos(result: Mapping[str, object], output_fn: Callable[[str], None])
         txid_part = txid or "<unknown>"
         output_fn(
             sanitize_tool_output(
-                f"{address_part}{utxo.get('value_sats', 0)} sats · "
+                f"{address_part}{utxo.get('value_sats', 0):,} sats · "
                 f"{confirmed_label} · tx {txid_part} vout {utxo.get('vout', 0)}"
             )
+        )
+    # TCK-UTXO-005 static half: ship the typed rows to the web client
+    # AFTER the coin narration lines, BEFORE turn_end (absent key → no
+    # emission; the CLI sink's emitter=None path never reaches here).
+    if emitter is not None and "utxo_rows" in result:
+        emitter.emit(
+            EVENT_UTXO_ROWS,
+            json.dumps(result["utxo_rows"], separators=(",", ":")),
         )
 
 

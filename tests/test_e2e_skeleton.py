@@ -1068,8 +1068,8 @@ def test_utxos_narration_quotes_addresses_verbatim() -> None:
     joined = "\n".join(outputs)
     # Addresses verbatim from the store (tool output) — quote-verbatim rule.
     assert addr0 in joined and addr1 in joined
-    assert "50000 sats · confirmed" in joined
-    assert "12345 sats · unconfirmed" in joined
+    assert "50,000 sats · confirmed" in joined
+    assert "12,345 sats · unconfirmed" in joined
     client.close()
     store.close()
 
