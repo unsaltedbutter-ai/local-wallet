@@ -210,6 +210,10 @@ from localwallet.protocol import (
     SincePeriod,
     TxStatusParams,
 )
+
+# TCK-CHAT-009 (a): the SIZE-threshold bound reads the contract's own
+# whole-wallet ceiling (import only — the protocol layer stays untouched).
+from localwallet.protocol.envelope import MAX_AMOUNT_SATS
 from localwallet.signer.base import Signer, SignerError
 from localwallet.signer.file import FilePsbtSigner
 from localwallet.signer.hwi import DeviceError, HwiUsbSigner
@@ -1503,6 +1507,21 @@ PENDING_NO_ETA_NOTE: Final[str] = (
 #: labels always resolve there.
 LABEL_HEDGE_NOTE: Final[str] = (
     "note: some transactions have fully spent coins, so their labels couldn't be checked here — a few may be missing from this result"
+)
+
+#: TCK-CHAT-009 (c): the honest value-free hedge when an INCLUDE label
+#: filter found NO exact match and the answer was produced by the substring
+#: (LIKE) fallback pass. Like :data:`LABEL_HEDGE_NOTE` the line names no
+#: label word, no address, no amount (CHAT-005's discipline) — it only says
+#: the listing matched labels CONTAINING the asked word, so a closest-match
+#: answer is never read as an exact one. One line per listing surface (the
+#: two name different objects); the flag that triggers them is the value-free
+#: ``label_like_fallback`` result key.
+LABEL_LIKE_NOTE_COINS: Final[str] = (
+    "note: nothing carries that exact label — these coins' labels merely contain the word you asked for"
+)
+LABEL_LIKE_NOTE_TXS: Final[str] = (
+    "note: nothing carries that exact label — these transactions' labels merely contain the word you asked for"
 )
 
 # ---------------------------------------------------------------- TCK-CHAT-001
@@ -4167,7 +4186,9 @@ def _resolve_since_cutoff(since: SincePeriod, *, now: int | None = None) -> int:
     return calendar.timegm((year, month0 + 1, day, tm.tm_hour, tm.tm_min, tm.tm_sec, 0, 0, 0))
 
 
-def _tx_within_since(tx: TxRecord, cutoff: int) -> bool:
+def _tx_within_since(
+    tx: TxRecord, cutoff: int, until: int | None = None
+) -> bool:
     """Whether a history row falls inside a resolved ``since`` window.
 
     Recorded block time >= cutoff. A row with NO block time that is also
@@ -4177,46 +4198,164 @@ def _tx_within_since(tx: TxRecord, cutoff: int) -> bool:
     payment received seconds ago is never hidden from "last 2 weeks").
     A CONFIRMED row whose time was never recorded is unresolvable and
     fails CLOSED (excluded) — the store cannot vouch for where it sits.
-    """
+
+    TCK-CHAT-009 (b): an optional ``until`` closes the window
+    (``[cutoff, until)``, the absolute-calendar reading of "received in
+    2025"). A pending row is then EXCLUDED, not newest-by-convention —
+    a coin arriving NOW sits outside a closed past window; treating it as
+    inside would fabricate a receive time it does not have. Open windows
+    (``until=None``, every CHAT-005 relative ask) are unchanged."""
     if tx.block_time is not None:
-        return tx.block_time >= cutoff
-    return tx.height is None
+        return tx.block_time >= cutoff and (until is None or tx.block_time < until)
+    return tx.height is None and until is None
 
 
-def _coin_within_since(coin: UtxoRecord, source: TxRecord | None, cutoff: int) -> bool:
+def _coin_within_since(
+    coin: UtxoRecord, source: TxRecord | None, cutoff: int, until: int | None = None
+) -> bool:
     """Whether a coin falls inside a resolved ``since`` window.
 
     The coin's arrival time is its creating transaction's: an
     unconfirmed coin is pending (newest by the ordering convention —
     included); a confirmed coin resolves through the store's tx row
     (:func:`_tx_within_since`). A confirmed coin with NO tx row is
-    unresolvable and fails CLOSED (excluded)."""
-    if coin.height is None:
+    unresolvable and fails CLOSED (excluded). TCK-CHAT-009 (b): with a
+    closed window (``until`` set) a pending coin resolves through its tx
+    row like any other (it is arriving NOW — outside a past calendar
+    window), and a coin with no resolvable time fails CLOSED."""
+    if coin.height is None and until is None:
         return True
-    return source is not None and _tx_within_since(source, cutoff)
+    return source is not None and _tx_within_since(source, cutoff, until)
+
+
+#: Quote characters stripped from the ENDS of a user-stated label word
+#: (straight and curly double/single quotes plus the backtick). Only the
+#: quoting ACT is undone — inner punctuation is never touched.
+_LABEL_QUOTE_CHARS: Final[str] = "\"'`\u2018\u2019\u201c\u201d"
+
+
+def _normalize_label_word(word: str) -> str:
+    """TCK-CHAT-009 SHARED LABEL-WORD NORMALIZER — the ONE home (PINNED
+    CONTRACT, the RBF-005 resolver precedent: TCK-CONS-003 consumes exactly
+    this function and must NOT re-implement it). Name
+    :func:`_normalize_label_word`, positional ``word``, returns ``str``.
+
+    Undoes the QUOTING and CASING a user wraps around a label word when they
+    name it in prose: edge whitespace and edge quote characters (straight
+    and curly) are stripped, then the word is casefolded — ``'"KYC"'``,
+    ``"\u201cKYC\u201d"``, ``" KYC "``, ``"'kyc"`` all normalize to
+    ``"kyc"`` (the USER-reported case/quote bug, TCK-CHAT-009 (e)). Inner
+    whitespace and inner punctuation are PRESERVED (a quoted phrase stays a
+    phrase: ``'"graduation funds"'`` -> ``"graduation funds"``); blank and
+    quote-only input normalize to ``""`` — the callers' never-match guard,
+    an empty word must never LIKE-match every label. Idempotent:
+    normalizing an already-normalized word changes nothing. Pure text: no
+    store, no clock, no network; never raises.
+
+    This is NORMALIZATION, not fuzzy matching — it undoes the quoting/casing
+    act and nothing else; it never guesses between different words (the
+    substring LIKE fallback is a separate, explicitly-flagged pass, see
+    :func:`_labels_match`)."""
+    stripped = word.strip().strip(_LABEL_QUOTE_CHARS).strip()
+    return stripped.casefold()
 
 
 def _label_query_form(words: Sequence[str]) -> frozenset[str]:
-    """Normalize filter words for matching: stripped, casefolded.
+    """Normalize filter words for matching via the SHARED normalizer
+    :func:`_normalize_label_word` (quote-stripped, trimmed, casefolded; a
+    word that normalizes to empty — quote-only input — drops out).
 
     The store canonicalizes TAG ids case-insensitively at write ("KYC" →
     ``kyc``) and keeps free text verbatim; matching filter words the same
-    forgiving way (case/edge-whitespace only, never fuzzy) is what a user
-    asking for "labeled Spearmint" means — a word that still matches no
-    label anywhere is an honest empty result, not an error."""
-    return frozenset(word.strip().casefold() for word in words)
+    forgiving way (undoing case, edge whitespace and the QUOTING act, never
+    fuzzy) is what a user asking for "labeled Spearmint" or 'labeled "KYC"'
+    means — a word that still matches no label anywhere is an honest empty
+    result, not an error."""
+    return frozenset(
+        normalized
+        for normalized in (_normalize_label_word(word) for word in words)
+        if normalized
+    )
 
 
-def _labels_match(members: Iterable[str], wanted: frozenset[str], *, exclude: bool) -> bool:
+def _labels_match(
+    members: Iterable[str],
+    wanted: frozenset[str],
+    *,
+    exclude: bool,
+    like: bool = False,
+) -> bool:
     """One set-membership test for a label filter.
 
     ``include`` (the omitted-``label_mode`` default) keeps an entry whose
     label set holds ANY of the quoted words (IN-set semantics, the SQL
     ``IN`` reading); ``exclude`` keeps exactly those that hold NONE
     (NOT-IN). Empty set = unlabeled: never an include match, always an
-    exclude match."""
-    hit = any(member.strip().casefold() in wanted for member in members)
+    exclude match.
+
+    TCK-CHAT-009 (c): ``like=True`` flips the test to the SQL ``LIKE``
+    reading — a hit when a wanted word is a SUBSTRING of a stored member
+    (needle = the user's word, haystack = the stored label: "graduation"
+    matches a stored "graduation funds", never the reverse). An empty
+    wanted word never matches (the normalizer's blank guard — ``"" in
+    member`` is True for every member, which would claim the whole
+    wallet). Callers run the LIKE test ONLY as the flagged exact-miss
+    fallback of an INCLUDE filter (:func:`_select_coins_by_label` and the
+    history handler); ``exclude`` never falls back."""
+    if like:
+        hit = any(
+            word in member.strip().casefold()
+            for word in wanted
+            if word
+            for member in members
+        )
+    else:
+        hit = any(member.strip().casefold() in wanted for member in members)
     return (not hit) if exclude else hit
+
+
+def _select_coins_by_label(
+    coins: Sequence[UtxoRecord],
+    label_sets: Mapping[str, tuple[str, ...]],
+    wanted: frozenset[str],
+    *,
+    exclude: bool,
+) -> tuple[list[UtxoRecord], bool]:
+    """The label filter over a COIN listing (the v6 address-label-set — a
+    coin's labels are its address's set): exact match first, the substring
+    (LIKE) pass as the flagged fallback — ``(kept_rows, like_used)``.
+
+    TCK-CHAT-009 (c) ordering, pinned: the exact pass answers whenever it
+    has rows (an exact hit SKIPS the fallback — a "kyc" ask is never widened
+    to a "kyc-old" coin just because both contain "kyc"); only when the
+    exact pass kept NOTHING among non-empty candidates does the LIKE pass
+    run, and only when ITS hits are non-empty is the answer flagged
+    (``like_used`` — the caller carries the value-free
+    :data:`LABEL_LIKE_NOTE_COINS` hedge). ``exclude`` NEVER falls back:
+    substring-DROPPING more rows on a closest match would silently shrink a
+    "not labeled X" answer the store never promised. Empty ``wanted``
+    (a quote-only word) LIKEs nothing — the plain empty stands. Shared by
+    the ``get_utxos`` handler and the TCK-CHAT-009 listing intercept so both
+    resolve labels EXACTLY the same way; pure over the passed rows/sets."""
+    kept = [
+        coin
+        for coin in coins
+        if _labels_match(
+            label_sets.get(coin.address or "", ()), wanted, exclude=exclude
+        )
+    ]
+    if exclude or kept or not coins or not wanted:
+        return kept, False
+    like_kept = [
+        coin
+        for coin in coins
+        if _labels_match(
+            label_sets.get(coin.address or "", ()), wanted, exclude=False, like=True
+        )
+    ]
+    if like_kept:
+        return like_kept, True
+    return kept, False
 
 
 def _label_members_by_txid(
@@ -4289,13 +4428,18 @@ def _make_get_history_handler(
       passes exclude). When an INCLUDE filter drops such unresolvable
       rows the result carries ``label_unresolved: True`` (value-free; the
       narration hedges, TCK-CHAT-005B (a)) so a filtered answer never
-      reads as complete.
+      reads as complete. An INCLUDE EXACT miss runs the substring (LIKE)
+      fallback over the same rows before answering empty (TCK-CHAT-009 (c),
+      :func:`_labels_match`); a LIKE-won answer carries
+      ``label_like_fallback: True`` and the narration says so.
     Filters NEVER change the result shape — an empty match is the
     existing "No transactions found." answer, values verbatim from the
-    store either way. The ONE exception is the value-free ``label_unresolved:
-    true`` honesty key, added when an include filter drops an unresolvable
-    (fully-spent) tx (see above) so a filtered answer never reads as
-    complete; it never alters a returned transaction's fields.
+    store either way. The ONLY exceptions are the value-free honesty keys
+    ``label_unresolved: true`` (an include filter dropped an unresolvable
+    (fully-spent) tx, see above) and ``label_like_fallback: true`` (the
+    exact-miss LIKE pass won), added so a filtered answer never reads as
+    complete when it is not; they never alter a returned transaction's
+    fields.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -4320,6 +4464,7 @@ def _make_get_history_handler(
             cutoff = _resolve_since_cutoff(params.since)
             txs = [t for t in txs if _tx_within_since(t, cutoff)]
         label_unresolved: bool | None = None
+        label_like = False
         if label_members is not None and params.label_set is not None:
             wanted = _label_query_form(params.label_set)
             exclude = params.label_mode == "exclude"
@@ -4340,6 +4485,27 @@ def _make_get_history_handler(
                     kept.append(t)
                 elif not exclude and t.txid not in resolvable:
                     label_unresolved = True
+            # TCK-CHAT-009 (c): an INCLUDE exact miss is not "none" yet —
+            # the substring (LIKE) pass over the SAME candidate rows runs
+            # before the honest empty answer, and only ITS hits count
+            # (exact hit -> no fallback, no flag; exclude never falls back).
+            # The unresolved flag above stands either way: LIKE-kept rows
+            # carry a resolvable label by definition, and rows still dropped
+            # as unresolvable were flagged by the exact pass.
+            if not exclude and not kept and txs and wanted:
+                like_kept = [
+                    t
+                    for t in txs
+                    if _labels_match(
+                        label_members.get(t.txid, ()),
+                        wanted,
+                        exclude=False,
+                        like=True,
+                    )
+                ]
+                if like_kept:
+                    kept = like_kept
+                    label_like = True
             txs = kept
         ordered = sorted(
             txs,
@@ -4366,6 +4532,8 @@ def _make_get_history_handler(
         }
         if label_unresolved is not None:
             result["label_unresolved"] = label_unresolved
+        if label_like:
+            result["label_like_fallback"] = True
         return result
 
     return handler
@@ -4537,7 +4705,13 @@ def _make_get_utxos_handler(
     unresolvable confirmed coins fail closed); ``label_set`` (+
     optional ``label_mode``) resolves against the v6 ADDRESS-LABEL-SET
     — a coin's labels are its address's set (inheritance), never the
-    write-frozen v5 coin rows. The pending block rides the filtered
+    write-frozen v5 coin rows. An INCLUDE exact label MISS runs the
+    substring (LIKE) fallback before answering empty (TCK-CHAT-009 (c),
+    :func:`_select_coins_by_label`); a LIKE-won answer carries the
+    value-free ``label_like_fallback: True`` honesty key — the ONLY
+    result-shape exception besides that one key (an empty match is the
+    existing "No unspent outputs." answer, values verbatim either way).
+    The pending block rides the filtered
     view (the TCK-CHAT-001 scoped-answer precedent: a filtered listing's
     summary describes the listing that was answered), and an empty match
     is the existing honest "No unspent outputs." — the result shape is
@@ -4576,17 +4750,18 @@ def _make_get_utxos_handler(
                         for r in records
                         if _coin_within_since(r, sources.get(r.txid), cutoff)
                     ]
+            label_like = False
             if params.label_set is not None:
                 wanted = _label_query_form(params.label_set)
                 exclude = params.label_mode == "exclude"
                 label_sets = store.get_address_label_sets()
-                records = [
-                    r
-                    for r in records
-                    if _labels_match(
-                        label_sets.get(r.address or "", ()), wanted, exclude=exclude
-                    )
-                ]
+                # TCK-CHAT-009 (c): exact match first; the substring (LIKE)
+                # pass runs over the SAME candidate rows ONLY when the exact
+                # pass kept nothing (include side), and only its hits count
+                # (flagged — see :func:`_select_coins_by_label`).
+                records, label_like = _select_coins_by_label(
+                    records, label_sets, wanted, exclude=exclude
+                )
             # Number every address this answer will PRINT (showing = the
             # registry's only writer; idempotent, so repeats never move a
             # number or re-stamp the date).
@@ -4616,6 +4791,8 @@ def _make_get_utxos_handler(
         if params.address_number is not None:
             result["address_number"] = params.address_number
             result["address"] = scoped_address
+        if label_like:
+            result["label_like_fallback"] = True
         result.update(_pending_summary(records, txs))
         return result
 
@@ -17416,6 +17593,460 @@ def _run_chat_settings_turn(
 
 
 # ---------------------------------------------------------------------------
+# TCK-CHAT-009: flexible UTXO-listing filters (deterministic, PRE-MODEL
+# intercept on top of CHAT-005's landed shapes).
+# USER GAPS (SPEC 2026-09-15), all RESOLVED IN CODE from the user's own
+# utterance — the envelope stays byte-identical (no grammar, schema, rule,
+# prompt or eval line ships with this ticket; the CHAT-005 shapes cannot
+# carry these asks and a new protocol param would make the MODEL author a
+# size/timestamp it never may):
+#   (a) SIZE — "show me my utxos smaller than 150000 sats" (thousands
+#       separators tolerated; sats only) filters the STORE's verbatim
+#       value_sats; the fuzzy "show me my large coins"/"small coins"
+#       resolves to the user's OWN coin-size policy (the utxo_target_min/
+#       max settings ladder — the same §2.3 ladders the chat settings
+#       interceptor reads), never a hardcoded constant, and the answer
+#       NAMES the threshold and the supplying rung (user-owned scalars,
+#       the settings-read precedent — verbatim from this engine's read).
+#   (b) TIME on RECEIVE — "show me my new utxos" = the store's own
+#       unconfirmed coins (the honest definition of "new": there is no
+#       per-coin first-seen timestamp on the utxo rows; the confirmed
+#       receive-time route already exists as get_utxos ``since``, which is
+#       why "coins I've received in the past month" stays on the model
+#       route). "coins I received in 2025" resolves to the CLOSED calendar
+#       window [Jan-1, Jan-1-next) through :func:`_coin_within_since`'s
+#       new ``until`` bound (pending coins are arriving NOW — outside a
+#       past window, never claimed inside one).
+#   (c) LABEL LIKE fallback — handled in BOTH label paths (the
+#       ``get_utxos``/``get_history`` handlers share
+#       :func:`_select_coins_by_label`'s ordering: exact hits answer, the
+#       substring pass runs ONLY on an include exact-miss, flagged with the
+#       value-free :data:`LABEL_LIKE_NOTE_COINS`/`_TXS` hedge).
+#   (e) the USER REPRO ("KYC" capitalized/quoted answered ALL coins while
+#       "kyc" worked): embedded "my <word> coins" phrasings are now resolved
+#       HERE — before the model ever sees the line — through the SHARED
+#       normalizer :func:`_normalize_label_word` (via
+#       :func:`_label_query_form`), so quoting/casing can never silently
+#       drop the filter again; a label word that matches NO label anywhere
+#       (exact or substring) releases the line unchanged (it is not a label
+#       ask — never a misfire on "show me my bitcoin coins").
+# Everything else the closed matcher cannot FULLY resolve falls through to
+# the unchanged pipeline (never-trap): history-worded asks, the label-
+# CONNECTOR and exclude families (the model's taught CHAT-005 territory),
+# money-flow verbs, registry numbers, superlatives, unparsed digits,
+# malformed thresholds. Label words never enter model context on a consumed
+# turn (CHAT-005/LABEL-001 discipline); values are verbatim store rows.
+# ---------------------------------------------------------------------------
+
+#: The SHOW verbs that head the closed grammar (after an optional polite
+#: prefix) — this interceptor ANSWERS listings, it never starts with a bare
+#: noun question or a money verb.
+_CHAT_COIN_FILTER_VERBS: Final[frozenset[str]] = frozenset(
+    {"show", "list", "display"}
+)
+_CHAT_COIN_FILTER_POLITE: Final[frozenset[str]] = frozenset(
+    {"please", "can", "could", "would", "just", "hey", "hi"}
+)
+#: Words that make the line NOT this grammar: history nouns (transactions/
+#: payments are the envelope's own direction/since territory), the label-
+#: CONNECTOR and exclude/unlabeled families (the model's taught CHAT-005
+#: phrasings — deny tokens included, the HW-005 slice-C rule), money-flow
+#: and flow-state verbs (dispatcher territory), the registry word (CHAT-001
+#: address_number route), "pending" (the taught pending ask), superlatives
+#: and bare quantifiers (a TOP-N ask is not a threshold listing).
+_CHAT_COIN_FILTER_BLOCKED: Final[frozenset[str]] = frozenset(
+    {
+        "transaction", "transactions", "tx", "txs", "payment", "payments",
+        "history", "activity",
+        "labeled", "labelled", "called", "named", "tag", "tags", "note",
+        "notes", "not", "no", "dont", "never", "without", "exclude",
+        "except", "minus", "unlabeled", "unlabelled",
+        "send", "sends", "sending", "pay", "pays", "paying", "spend",
+        "spends", "spending", "consolidate", "consolidates", "merge",
+        "merges", "sweep", "sweeps", "bump", "bumps", "sign", "signs",
+        "confirm", "confirms", "cancel", "cancels", "broadcast",
+        "broadcasts",
+        "address", "addresses", "addr", "addrs",
+        "balance", "value", "amount",
+        "smallest", "largest", "biggest", "lowest", "highest", "top",
+        "pending",
+    }
+)
+#: Always-consumed shape words (determiners, pronouns, copulas, the verb
+#: head, ask framings). A WORD THAT IS NOT HERE falls to the label segment
+#: — an unknown word only ever consumes the turn if it resolves to a
+#: stored label (exact or substring), so a filler gap can never misfire
+#: into a wrong listing.
+_CHAT_COIN_FILTER_FILLERS: Final[frozenset[str]] = frozenset(
+    {
+        "i", "ive", "im", "me", "my", "mine", "we", "were", "our", "ours",
+        "you", "your", "they", "them", "he", "she", "it", "its",
+        "the", "a", "an", "all", "every", "some", "any", "of", "for",
+        "with", "that", "which", "who", "whom", "whose", "and", "as",
+        "have", "had", "has", "been", "be", "is", "are", "was", "do",
+        "does", "did", "want", "wanted", "need", "needed", "like", "to",
+        "at", "in", "on", "from", "whats", "what", "how", "many", "much",
+        "there", "here", "heres", "tell", "give", "get", "please", "just",
+        "can", "could", "would", "will", "show", "shows", "list", "lists",
+        "listed", "display", "displayed", "hey", "hi", "currently", "right",
+        "now", "received", "got", "gotten", "came", "arrived", "deposited",
+    }
+)
+#: Size words below/above a threshold. Comparators ("smaller than N") carry
+#: a stated number; WITHOUT a number every one of these words resolves to
+#: the user's own coin-size POLICY ladder — never a fabricated constant.
+#: Superlatives are NOT here (blocked: "largest coin" is a TOP-1 ask).
+_CHAT_SIZE_BELOW: Final[frozenset[str]] = frozenset(
+    {"small", "smaller", "tiny", "little", "less", "lower", "under", "below"}
+)
+_CHAT_SIZE_ABOVE: Final[frozenset[str]] = frozenset(
+    {"large", "larger", "big", "bigger", "huge", "over", "above", "greater"}
+)
+#: The unit words a stated threshold may carry (closed; SATS only — a BTC
+#: or unknown unit next to the number is NOT this grammar, it falls through
+#: exactly like every other unresolvable shape).
+_CHAT_SIZE_UNITS: Final[frozenset[str]] = frozenset(
+    {"sat", "sats", "satoshi", "satoshis"}
+)
+#: One whole number, THOUSANDS SEPARATORS TOLERATED ("150,000" = 150000);
+#: no sign, no decimal point (fractional sats do not exist).
+_CHAT_SIZE_NUM_RE: Final = re.compile(r"^(?:\d{1,3}(?:,\d{3})+|\d+)$")
+#: The closed absolute-receive grammar: "in <year>" / "during <year>".
+#: Anything finer (month names, ranges, quarters, "last March") is
+#: UNRESOLVABLE here and falls through to the existing hedged behavior —
+#: never fabricated into a window.
+_CHAT_YEAR_RE: Final = re.compile(r"\b(?:in|during)\s+(\d{4})\b")
+#: The floor a stated year must clear to be a wallet-history window at all
+#: (genesis-era nonsense releases the line).
+_CHAT_YEAR_MIN: Final[int] = 1900
+
+#: Header lines (engine-owned framing; every number in them is the
+#: engine's OWN parse/ladder read, echoed once so the listing's scope is
+#: never a mystery — the coin rows themselves stay store-verbatim).
+_CHAT_COIN_SIZE_HEAD: Final[str] = "Coins {relation} {sats} sats:"
+_CHAT_COIN_LADDER_HEAD: Final[str] = (
+    "Coins {relation} {sats} {unit} — {setting} ({rung}):"
+)
+_CHAT_COIN_YEAR_HEAD: Final[str] = "Coins received in {year}:"
+
+
+def _run_coin_filter_turn(
+    store: Store,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    scan_gate: StartupScan | None = None,
+) -> bool:
+    """Consume a filtered COIN-listing ask; ``True`` = consumed (the line
+    never reaches the model or the transcript — CHAT-005/LABEL-001's
+    discipline, so a quoted or capitalized label word can never be
+    silently dropped by the model again, the USER REPRO of TCK-CHAT-009
+    (e)). Anything the closed matcher cannot FULLY resolve returns
+    ``False`` UNTOUCHED (never-trap): the ordinary pipeline answers exactly
+    as before this ticket.
+
+    Grammar (all three heads/tests are whole-word, over
+    :func:`_chat_words` normalization): a SHOW/LIST verb head (optional
+    polite prefix) PLUS a possessive ("show me my …", "list our coins"),
+    OR a coin noun head ("coins I received in 2025"); a coin word from
+    :data:`_CHAT_COIN_WORDS` is required; no blocked word. Parsed
+    conjunctively (AND-wise), resolved engine-side:
+
+    * SIZE — ``<below/above word> [than] <number> [sats]`` filters the
+      store's verbatim ``value_sats`` (strict ``<``/``>``, thousands
+      separators tolerated, sats only, bounded 1..MAX_AMOUNT_SATS —
+      anything past all of bitcoin is a mis-parse, not a query); the same
+      word WITHOUT a number resolves to the user's coin-size policy
+      (utxo_target_min/max over the §2.3 ladder; a malformed ladder prints
+      the settings' own honest refusal line).
+    * TIME — "new" lists the store's unconfirmed coins (the only
+      store-honest "new"; confirmed coins' receive-times arrive through the
+      CHAT-005 relative ``since`` route, which this interceptor deliberately
+      does NOT take over); "in <year>" (or "during") closes the window to
+      that calendar year through :func:`_coin_within_since`'s ``until``.
+    * LABEL — whatever words the size/time parse leaves (the residual) is
+      ONE label phrase, normalized through the shared
+      :func:`_normalize_label_word` (via :func:`_label_query_form`) and
+      resolved against the stored v6 label sets EXACT first, substring
+      (LIKE) second; a phrase that matches no label anywhere releases the
+      line (it is not a label ask). A LIKE-won listing carries the
+      value-free :data:`LABEL_LIKE_NOTE_COINS` hedge, same flag as the
+      handlers.
+
+    The answer rides the PRODUCTION coin-listing narration
+    (:func:`_print_utxos`): CHAT-001 registry numbering for every printed
+    address (showing = the write), the ADR-0022 freshness flag, the
+    pending summary over the FILTERED view (the scoped-answer precedent),
+    values verbatim from the store. Pure store reads; no network, no model,
+    no envelope; the only clock is the tool-owned :func:`time.time` seam."""
+    words = _chat_words(line)
+    if not words:
+        return False
+    head = words[0]
+    verb_head = head in _CHAT_COIN_FILTER_VERBS or (
+        head in _CHAT_COIN_FILTER_POLITE
+        and (
+            (len(words) > 1 and words[1] in _CHAT_COIN_FILTER_VERBS)
+            or (
+                len(words) > 2
+                and words[1] == "you"
+                and words[2] in _CHAT_COIN_FILTER_VERBS
+            )
+        )
+    )
+    if not (verb_head or head in _CHAT_COIN_WORDS):
+        return False
+    word_set = set(words)
+    if word_set & _CHAT_COIN_FILTER_BLOCKED:
+        return False
+    if not word_set & _CHAT_COIN_WORDS:
+        return False
+    if verb_head and not word_set & _CHAT_POSSESSIVE_WORDS:
+        return False
+
+    consumed: set[int] = {
+        i
+        for i, word in enumerate(words)
+        if word in _CHAT_COIN_FILTER_FILLERS
+        or word in _CHAT_COIN_WORDS
+        or word in _CHAT_COIN_FILTER_POLITE
+    }
+
+    # --- SIZE: comparator [than] NUMBER [unit], else the policy ladder ---
+    below: int | None = None
+    above: int | None = None
+    fuzzy_below = False
+    fuzzy_above = False
+    for i, word in enumerate(words):
+        side = (
+            "below"
+            if word in _CHAT_SIZE_BELOW
+            else "above"
+            if word in _CHAT_SIZE_ABOVE
+            else None
+        )
+        if side is None:
+            continue
+        consumed.add(i)
+        j = i + 1
+        if j < len(words) and words[j] == "than":
+            consumed.add(j)
+            j += 1
+        if j < len(words) and _CHAT_SIZE_NUM_RE.match(words[j]):
+            digits = words[j].replace(",", "")
+            try:
+                value = int(digits)
+            except ValueError:
+                return False  # pathological digit-length token (> py int_max_str_digits): release
+            if not 1 <= value <= MAX_AMOUNT_SATS:
+                return False  # beyond all bitcoin (or zero): a mis-parse
+            consumed.add(j)
+            if j + 1 < len(words) and words[j + 1] in _CHAT_SIZE_UNITS:
+                consumed.add(j + 1)
+            elif j + 1 < len(words) and words[j + 1] in ("btc", "bitcoin", "coin"):
+                return False  # a non-sats unit is not this grammar
+            if below is not None or above is not None:
+                return False  # two stated thresholds = ambiguous
+            if side == "below":
+                below = value
+            else:
+                above = value
+            continue
+        if side == "below":
+            fuzzy_below = True
+        else:
+            fuzzy_above = True
+    if fuzzy_below and fuzzy_above:
+        return False
+    if (fuzzy_below and (below is not None or above is not None)) or (
+        fuzzy_above and (below is not None or above is not None)
+    ):
+        # A policy word next to ANY stated number (same OR opposite side) is
+        # ambiguous: the ladder resolves only a word WITHOUT a number (per
+        # the docstring), so release it to the ordinary pipeline instead of
+        # silently AND-composing a second, hidden threshold.
+        return False
+
+    # --- TIME: closed calendar window / the store's own unconfirmed rows ---
+    window: tuple[int, int] | None = None
+    year_phrase: int | None = None
+    year_match = _CHAT_YEAR_RE.search(line.lower())
+    if year_match is not None:
+        year = int(year_match.group(1))
+        current_year = time.gmtime(int(time.time())).tm_year
+        if not _CHAT_YEAR_MIN <= year <= current_year:
+            return False  # a future (or nonsense) window: never fabricated
+        window = (
+            calendar.timegm((year, 1, 1, 0, 0, 0, 0, 0, 0)),
+            calendar.timegm((year + 1, 1, 1, 0, 0, 0, 0, 0, 0)),
+        )
+        year_phrase = year
+        consumed.update(
+            i for i, w in enumerate(words) if w == str(year) or w == "during"
+        )
+    # "new" is BOTH the time-on-receive word AND a possible stored label.
+    # Resolve it as a LABEL FIRST (the never-trap existence check below);
+    # only when no label named "new" exists anywhere does it fall back to the
+    # unconfirmed-only reading — a stored label literally named "new" must
+    # stay queryable (MINOR-2). So "new" is deliberately left OUT of the
+    # consumed set here: it rides the label residual below, and the pending
+    # fallback re-consumes it.
+    pending_only = False
+    new_indexes: frozenset[int] = frozenset(
+        i for i, w in enumerate(words) if w == "new"
+    )
+
+    # --- LABEL: the unparsed residual is ONE label phrase (or nothing) ---
+    rest = [w for i, w in enumerate(words) if i not in consumed]
+    if any(any(c.isdigit() for c in w) for w in rest):
+        return False  # an unparsed number left over = ambiguous
+    label_phrase = " ".join(rest)
+    if (
+        not label_phrase
+        and below is None
+        and above is None
+        and window is None
+        and not pending_only
+        and not fuzzy_below
+        and not fuzzy_above
+    ):
+        return False  # "show me my coins" is the PLAIN listing — the model's
+
+    try:
+        wallet = store.get_active_wallet()
+        if wallet is None:
+            return False
+        wallet_id = wallet.id
+        records = list(store.get_utxos_for_wallet(wallet_id))
+        txs = store.get_txs_for_wallet(wallet_id)
+        freshness = _freshness(store, wallet_id, scan_gate)
+        label_sets = store.get_address_label_sets()
+    except (StoreError, sqlite3.Error) as exc:
+        output_fn(
+            sanitize_tool_output(_error_line(_store_error(exc), "UTXO lookup failed"))
+        )
+        return True
+
+    wanted: frozenset[str] = frozenset()
+    if label_phrase:
+        wanted = _label_query_form([label_phrase])
+        if not wanted:
+            return False  # quote-only residue is not a label ask
+        all_members = [m for ms in label_sets.values() for m in ms]
+        if not _labels_match(all_members, wanted, exclude=False) and not _labels_match(
+            all_members, wanted, exclude=False, like=True
+        ):
+            if label_phrase == "new" and new_indexes:
+                # No stored label named "new" anywhere: fall back to the TIME
+                # reading (unconfirmed-only), consuming the word — MINOR-2.
+                wanted = frozenset()
+                pending_only = True
+                consumed.update(new_indexes)
+            else:
+                # The word names no label ANYWHERE (exact or substring): this is
+                # not a label listing — release it unchanged to the ordinary
+                # pipeline (never a misfire on "show me my bitcoin coins").
+                return False
+
+    # The fuzzy size words resolve to the user's OWN coin-size policy — the
+    # same §2.3 ladder the settings interceptor reads, never a constant.
+    ladder_below: int | None = None
+    ladder_above: int | None = None
+    rungs: list[str] = []
+    if fuzzy_below or fuzzy_above:
+        key = UTXO_TARGET_MIN_SETTING if fuzzy_below else UTXO_TARGET_MAX_SETTING
+        resolved = _chat_effective_setting(store, key)
+        if isinstance(resolved, str):
+            output_fn(sanitize_tool_output(resolved))  # the honest ladder refusal
+            return True
+        ladder_below, ladder_above = (
+            (resolved[0], None) if fuzzy_below else (None, resolved[0])
+        )
+        label, unit = _CHAT_SETTING_DISPLAY[key]
+        rungs.append(
+            _CHAT_COIN_LADDER_HEAD.format(
+                relation="under" if fuzzy_below else "over",
+                sats=resolved[0],
+                unit=unit,
+                setting=label,
+                rung=_chat_rung_phrase(resolved[1], key),
+            )
+        )
+
+    # --- AND-compose the resolved filters (label LAST, like the handler,
+    # so its LIKE fallback runs over the rows the listing actually answers) ---
+    kept = records
+    if below is not None:
+        kept = [r for r in kept if r.value_sats < below]
+    if ladder_below is not None:
+        kept = [r for r in kept if r.value_sats < ladder_below]
+    if above is not None:
+        kept = [r for r in kept if r.value_sats > above]
+    if ladder_above is not None:
+        kept = [r for r in kept if r.value_sats > ladder_above]
+    if pending_only:
+        kept = [r for r in kept if r.confirmed != 1]
+    if window is not None:
+        sources = {t.txid: t for t in txs}
+        kept = [
+            r
+            for r in kept
+            if _coin_within_since(r, sources.get(r.txid), window[0], window[1])
+        ]
+    label_like = False
+    if wanted:
+        kept, label_like = _select_coins_by_label(
+            kept, label_sets, wanted, exclude=False
+        )
+
+    try:
+        numbers: dict[str, int] = {
+            r.address: r.number for r in store.list_address_registry(wallet_id)
+        }
+        for address in sorted({r.address for r in kept if r.address}):
+            numbers[address] = store.note_address_shown(wallet_id, address).number
+    except (StoreError, sqlite3.Error) as exc:
+        output_fn(
+            sanitize_tool_output(_error_line(_store_error(exc), "UTXO lookup failed"))
+        )
+        return True
+
+    heads = list(rungs)
+    if below is not None:
+        heads.insert(
+            0, _CHAT_COIN_SIZE_HEAD.format(relation="under", sats=below)
+        )
+    if above is not None:
+        heads.insert(
+            0, _CHAT_COIN_SIZE_HEAD.format(relation="over", sats=above)
+        )
+    if year_phrase is not None:
+        heads.append(_CHAT_COIN_YEAR_HEAD.format(year=year_phrase))
+    for head_line in heads:
+        output_fn(sanitize_tool_output(head_line))
+    result: dict[str, object] = {
+        "utxos": [
+            {
+                "txid": r.txid,
+                "vout": r.vout,
+                "address": r.address,
+                "value_sats": r.value_sats,
+                "confirmed": bool(r.confirmed),
+                "number": numbers.get(r.address) if r.address else None,
+            }
+            for r in kept
+        ],
+        "count": len(kept),
+        "freshness": freshness,
+    }
+    if label_like:
+        result["label_like_fallback"] = True
+    result.update(_pending_summary(kept, txs))
+    _print_utxos(result, output_fn)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # TCK-CHAT-007: receive-address + label dual action (deterministic,
 # PRE-MODEL intercept).
 # USER REQUEST (2026-09-13): "I need a receive address labeled 'spearmint'"
@@ -18451,6 +19082,22 @@ def _run_turn(
     # touch the transcript or the model.
     if _run_network_status_turn(store, line, output_fn, fee_estimator=fee_estimator):
         return
+    # TCK-CHAT-009: flexible COIN-listing filters — the deterministic
+    # pre-model intercept for the SHOW family the CHAT-005 envelope shapes
+    # cannot carry (explicit sats sizes with tolerated thousands separators,
+    # the policy-ladder fuzzy sizes, the closed absolute-receive window,
+    # "new", and embedded quoted/capitalized label words — the USER REPRO
+    # where "show me my KYC coins" answered ALL coins while "kyc" worked).
+    # Engine-side resolution only: this ticket ships NO prompt or grammar
+    # line (the eval gate stays closed), consumed turns never reach the
+    # model or the transcript, and anything the closed matcher cannot FULLY
+    # resolve falls through to the unchanged pipeline (never-trap). Checked
+    # after the settings and network-status intercepts (their keys keep
+    # priority) and before the bump speed-word route.
+    if store is not None and _run_coin_filter_turn(
+        store, line, output_fn, scan_gate=scan_gate
+    ):
+        return
     speed = _bump_speed_choice(line)
     if speed is not None and IntentName.BUMP_FEE in table:
         if (
@@ -18805,6 +19452,11 @@ def _print_history(result: Mapping[str, object], output_fn: Callable[[str], None
         # whose labels couldn't be resolved — hedge the answer as incomplete
         # rather than implying it is complete.
         output_fn(sanitize_tool_output(LABEL_HEDGE_NOTE))
+    if result.get("label_like_fallback") is True:
+        # TCK-CHAT-009 (c): the exact label pass matched nothing and the
+        # substring (LIKE) fallback won the answer — hedge, never present a
+        # closest-match list as an exact one.
+        output_fn(sanitize_tool_output(LABEL_LIKE_NOTE_TXS))
     transactions = result.get("transactions")
     if not isinstance(transactions, list) or not transactions:
         output_fn(sanitize_tool_output("No transactions found."))
@@ -18840,6 +19492,11 @@ def _print_utxos(result: Mapping[str, object], output_fn: Callable[[str], None])
         output_fn(sanitize_tool_output(_error_line(result, "UTXO lookup failed")))
         return
     _print_freshness_note(result, output_fn)
+    if result.get("label_like_fallback") is True:
+        # TCK-CHAT-009 (c): the exact label pass matched nothing and the
+        # substring (LIKE) fallback won the answer — hedge, never present a
+        # closest-match list as an exact one.
+        output_fn(sanitize_tool_output(LABEL_LIKE_NOTE_COINS))
     _print_pending_block(result, output_fn)
     if result.get("address_number") is not None:
         # TCK-CHAT-001 scoped listing: the full-address restatement leads.
