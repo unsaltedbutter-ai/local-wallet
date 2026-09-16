@@ -391,7 +391,7 @@ class TestBusinessRules:
             since=SincePeriod.model_construct(months=121)
         )
         assert BUSINESS_RULES[IntentName.GET_HISTORY](hostile) == [
-            "params.since.months must be an integer between 1 and 120"
+            "params.since.months must be an integer within the allowed range"
         ]
 
 

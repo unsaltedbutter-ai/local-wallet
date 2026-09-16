@@ -62,6 +62,8 @@ from localwallet.protocol.envelope import (
     MAX_AMOUNT_USD,
     MAX_FEE_RATE_SAT_VB,
     MAX_FUNDING_REF_CHARS,
+    MAX_LABEL_FILTER_WORD_CHARS,
+    MAX_LABEL_FILTER_WORDS,
     MAX_TX_REF_CHARS,
     MIN_AMOUNT_SATS,
     MIN_AMOUNT_USD,
@@ -750,10 +752,16 @@ def test_business_rule_create_tx_recipient_matrix():
         "recipient is not a mainnet bech32 address (wrong network prefix)"
     ]
     assert rule_for(taproot_v1) == [
-        "recipient must be a witness version 0 address (taproot v1 and later are not supported)"
+        (
+            "recipient must be a bech32 witness version zero address "
+            "(taproot and later versions are not supported)"
+        )
     ]
     assert rule_for(p2wsh_v0) == [
-        "recipient must be a P2WPKH address (witness v0 with a 20-byte program)"
+        (
+            "recipient must be a P2WPKH address (witness version zero with "
+            "a public-key-hash-length program)"
+        )
     ]
     for bad in ("not-an-address", MAINNET_P2WPKH[:-1] + "q", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3tSx"):
         failures = rule_for(bad)
@@ -957,7 +965,7 @@ def test_business_rule_tx_status_charset(txid: str, expect_failures: bool):
     failures = BUSINESS_RULES[IntentName.TX_STATUS](env.params)
     assert bool(failures) is expect_failures
     for failure in failures:
-        assert failure == "params.txid must be exactly 64 lowercase hexadecimal characters"
+        assert failure == "params.txid must be a full-length lowercase hexadecimal transaction id"
         if txid:  # value-free (the empty string is vacuously "in" anything)
             assert txid not in failure
 
@@ -968,7 +976,7 @@ def test_business_rule_tx_status_bypass_and_error_path():
     for bad in ("A" * 64, "a" * 63, "", "../etc/passwd".ljust(64, "a")):
         bypass = TxStatusParams.model_construct(txid=bad)
         assert BUSINESS_RULES[IntentName.TX_STATUS](bypass) == [
-            "params.txid must be exactly 64 lowercase hexadecimal characters"
+            "params.txid must be a full-length lowercase hexadecimal transaction id"
         ]
         table, _ = make_table()
         outcome = handle_raw(
@@ -978,6 +986,204 @@ def test_business_rule_tx_status_bypass_and_error_path():
         assert outcome.error is not None
         if bad:  # value-free end to end (empty string is vacuously present)
             assert bad not in outcome.error.error.detail
+
+
+# ------------------------------------------- digit-free retry-note text (TCK-RETRY-001)
+
+#: The only digit-bearing tokens a validator failure string may keep:
+#: proper-noun format NAMES (bech32, P2WPKH — the "2" is part of the name,
+#: never a value a model could transcribe as user data).
+_ALLOWED_DIGIT_TOKENS = ("bech32", "P2WPKH")
+
+
+def _digit_free_cases() -> list:
+    """One hostile params object per business-rule failure branch.
+
+    Built through the validation-skipping constructors so layer 3 is
+    reached directly. The hostile VALUES deliberately carry digits
+    (thresholds, sizes, addresses) — the point is that the rendered
+    message TEMPLATE never interpolates one into the model's retry note.
+    """
+    from embit import bech32
+
+    from localwallet.protocol.envelope import SincePeriod
+
+    cases: list = []
+    add = cases.append
+
+    # The "internal: ... failed the type check" branch of EVERY rule.
+    for intent, own in INTENT_REGISTRY.items():
+        wrong = next(m for m in INTENT_REGISTRY.values() if m is not own)
+        add(pytest.param(intent, wrong.model_construct(), id=f"type-{intent.value}"))
+
+    add(pytest.param(IntentName.RESPOND, RespondParams.model_construct(text=" \t "), id="respond-blank"))
+    add(pytest.param(IntentName.CLARIFY, ClarifyParams.model_construct(question=""), id="clarify-blank"))
+    add(pytest.param(IntentName.GET_BALANCE, GetBalanceParams.model_construct(address_number=False), id="balance-number-bool"))
+    add(pytest.param(IntentName.GET_ADDRESSES, GetAddressesParams.model_construct(address_number=MAX_ADDRESS_NUMBER * 10), id="addresses-number-range"))
+
+    gh = GetHistoryParams.model_construct
+    gu = GetUtxosParams.model_construct
+    sp = SincePeriod.model_construct
+    add(pytest.param(IntentName.GET_HISTORY, gh(limit=10 ** 4), id="history-limit"))
+    add(pytest.param(IntentName.GET_HISTORY, gh(direction="up"), id="history-direction"))
+    add(pytest.param(IntentName.GET_HISTORY, gh(since="yesterday"), id="history-since-type"))
+    add(pytest.param(IntentName.GET_HISTORY, gh(since=sp(days=4, weeks=2)), id="history-since-multi"))
+    add(pytest.param(IntentName.GET_HISTORY, gh(since=sp(days=False)), id="history-since-days-bool"))
+    add(pytest.param(IntentName.GET_HISTORY, gh(since=sp(months=10 ** 6)), id="history-since-months"))
+    add(pytest.param(IntentName.GET_HISTORY, gh(label_set=()), id="history-label-count"))
+    add(pytest.param(IntentName.GET_HISTORY, gh(label_set=("a" * 500 + "\x01",)), id="history-label-entry"))
+    add(pytest.param(IntentName.GET_HISTORY, gh(label_mode="only"), id="history-label-mode"))
+    add(pytest.param(IntentName.GET_HISTORY, gh(label_mode="exclude"), id="history-mode-no-set"))
+    add(pytest.param(IntentName.GET_UTXOS, gu(address_number=10 ** 8), id="utxos-number"))
+    add(pytest.param(IntentName.GET_UTXOS, gu(since=sp(weeks=10 ** 5)), id="utxos-since-weeks"))
+
+    add(pytest.param(IntentName.NEW_ADDRESS, NewAddressParams.model_construct(branch=7), id="new-address-branch"))
+    add(pytest.param(IntentName.NEW_ADDRESS, NewAddressParams.model_construct(branch=True), id="new-address-branch-bool"))
+
+    ct = CreateTxParams.model_construct
+    add(pytest.param(IntentName.CREATE_TX, ct(recipient=MAINNET_P2WPKH, amount_sats=54600, amount_usd=45.0), id="create-both-amounts"))
+    add(pytest.param(IntentName.CREATE_TX, ct(recipient=MAINNET_P2WPKH, amount_sats=True), id="create-sats-bool"))
+    add(pytest.param(IntentName.CREATE_TX, ct(recipient=MAINNET_P2WPKH, amount_sats=MIN_AMOUNT_SATS - 1), id="create-sats-below"))
+    add(pytest.param(IntentName.CREATE_TX, ct(recipient=MAINNET_P2WPKH, amount_sats=MAX_AMOUNT_SATS * 2), id="create-sats-above"))
+    add(pytest.param(IntentName.CREATE_TX, ct(recipient=MAINNET_P2WPKH, amount_usd=MAX_AMOUNT_USD + 1000.0), id="create-usd-above"))
+    add(pytest.param(IntentName.CREATE_TX, ct(recipient="not-an-address", amount_sats=MIN_AMOUNT_SATS), id="create-recipient-garbage"))
+    add(pytest.param(IntentName.CREATE_TX, ct(recipient="tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", amount_sats=MIN_AMOUNT_SATS), id="create-recipient-testnet"))
+    add(pytest.param(IntentName.CREATE_TX, ct(recipient=bech32.encode("bc", 1, b"\x11" * 32), amount_sats=MIN_AMOUNT_SATS), id="create-recipient-taproot"))
+    add(pytest.param(IntentName.CREATE_TX, ct(recipient=bech32.encode("bc", 0, b"\x22" * 32), amount_sats=MIN_AMOUNT_SATS), id="create-recipient-p2wsh"))
+
+    add(pytest.param(IntentName.CONFIRM_TX, ConfirmTxParams.model_construct(tx_ref="   "), id="confirm-blank"))
+    add(pytest.param(IntentName.CONFIRM_TX, ConfirmTxParams.model_construct(tx_ref="a\x07"), id="confirm-control"))
+    add(pytest.param(IntentName.SIGN_TX, SignTxParams.model_construct(tx_ref=""), id="sign-empty"))
+    add(pytest.param(IntentName.BROADCAST_TX, BroadcastTxParams.model_construct(tx_ref="b\x08"), id="broadcast-control"))
+    add(pytest.param(IntentName.TX_STATUS, TxStatusParams.model_construct(txid="Z" * 70), id="tx-status-charset"))
+
+    st = SelfTransferParams.model_construct
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="split", below_size_sats=1000), id="self-split-threshold"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="split", merge_coin=True), id="self-split-merge"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="split"), id="self-split-no-parts"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="split", parts=True), id="self-parts-bool"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="split", parts=4000), id="self-parts-range"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="cpfp", parts=3), id="self-cpfp-parts"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="cpfp", below_size_sats=5000), id="self-cpfp-threshold"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="cpfp", merge_coin=1), id="self-cpfp-merge-type"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="consolidate", parts=2), id="self-cons-parts"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="consolidate", merge_coin=False), id="self-cons-merge"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="consolidate"), id="self-cons-no-threshold"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="consolidate", below_size_sats=False), id="self-cons-bool"))
+    add(pytest.param(IntentName.SELF_TRANSFER, st(mode="consolidate", below_size_sats=MAX_AMOUNT_SATS * 3), id="self-cons-range"))
+
+    bf = BumpFeeParams.model_construct
+    add(pytest.param(IntentName.BUMP_FEE, bf(target=""), id="bump-target-empty"))
+    add(pytest.param(IntentName.BUMP_FEE, bf(target="a\x02"), id="bump-target-control"))
+    add(pytest.param(IntentName.BUMP_FEE, bf(target="tx-17", funding_ref="  "), id="bump-funding-blank"))
+    return cases
+
+
+@pytest.mark.parametrize(("intent", "params"), _digit_free_cases())
+def test_business_rule_failure_strings_are_digit_free(intent: IntentName, params):
+    """No layer-3 failure string may carry a digit (TCK-RETRY-001).
+
+    These strings are injected verbatim into the model's retry note
+    (``agent/loop.py::_with_retry_note``); a digit inside one is a digit
+    the model can transcribe back as user data — the "$45 → 546 sats" bug
+    class, where "546" came from a bounds message, not from the user.
+    Every case above carries hostile digit-bearing VALUES on purpose; the
+    rendered templates must still come out clean. Only proper-noun format
+    names (``bech32``, ``P2WPKH``) keep their digits (never a value).
+    """
+    failures = BUSINESS_RULES[intent](params)
+    assert failures, f"{intent.value}: adversarial case must produce a failure"
+    for message in failures:
+        stripped = message
+        for token in _ALLOWED_DIGIT_TOKENS:
+            stripped = stripped.replace(token, "")
+        assert not any(ch.isdigit() for ch in stripped), (
+            f"{intent.value}: digit-bearing validator text reaches the retry note"
+        )
+
+
+def _layer2_hostile_envelopes() -> list[dict]:
+    """One hostile envelope per layer-2 (pydantic schema) digit leak.
+
+    These trip pydantic's native bound validators (``ge``/``le``,
+    ``min_length``/``max_length``, tuple counts, ``Literal``, type
+    coercion) — the messages that used to carry the offending bound's
+    digits ("Input should be less than or equal to 100"). The hostile
+    VALUES carry digits on purpose; the rendered templates must come out
+    clean, exactly as the layer-3 pin above requires (TCK-RETRY-001).
+    """
+    ct = {
+        "recipient": MAINNET_P2WPKH,
+        "amount_sats": MIN_AMOUNT_SATS,
+    }
+    return [
+        # native ge/le bounds on ints/floats
+        {"v": 0, "intent": "get_history", "params": {"limit": 101}},
+        {"v": 0, "intent": "get_history", "params": {"limit": 0}},
+        {"v": 0, "intent": "new_address", "params": {"branch": 2}},
+        {"v": 0, "intent": "self_transfer", "params": {"mode": "split", "parts": 5000}},
+        {"v": 0, "intent": "get_balance", "params": {"address_number": 0}},
+        {"v": 0, "intent": "create_tx", "params": {**ct, "amount_usd": MAX_AMOUNT_USD + 1}},
+        # native length bounds on str and tuple (incl. per-element index)
+        {"v": 0, "intent": "respond", "params": {"text": "x" * (MAX_TEXT_CHARS + 1)}},
+        {"v": 0, "intent": "get_history", "params": {"label_set": []}},
+        {"v": 0, "intent": "get_history", "params": {"label_set": [str(i) for i in range(MAX_LABEL_FILTER_WORDS + 1)]}},
+        {"v": 0, "intent": "get_history", "params": {"label_set": ["x" * (MAX_LABEL_FILTER_WORD_CHARS + 1)]}},
+        # Literal / type-coercion / strict-int rejections
+        {"v": 0, "intent": "get_history", "params": {"direction": "up"}},
+        {"v": 0, "intent": "get_history", "params": {"label_mode": "only"}},
+        {"v": 0, "intent": "get_history", "params": {"since": "yesterday"}},
+        {"v": 0, "intent": "get_history", "params": {"limit": "5"}},
+        {"v": 0, "intent": "respond", "params": {"text": 5}},
+        {"v": 0, "intent": "get_balance", "params": {"address_number": True}},
+        {"v": 0, "intent": "create_tx", "params": {**ct, "amount_usd": "abc"}},
+        # extra keys
+        {"v": 0, "intent": "get_history", "params": {"days": 1, "weeks": 2}},
+        # the strict-zero v validator (true bool/string/1 rejected)
+        {"v": 1, "intent": "get_balance", "params": {}},
+        {"v": "0", "intent": "get_balance", "params": {}},
+        {"v": True, "intent": "get_balance", "params": {}},
+    ]
+
+
+@pytest.mark.parametrize("envelope", _layer2_hostile_envelopes())
+def test_layer2_bound_failure_strings_are_digit_free(envelope):
+    """No layer-2 (pydantic schema) failure string may carry a digit.
+
+    Layer-3 strings were already pinned digit-free; this closes the layer-2
+    leak the same way (TCK-RETRY-001). Both feed the model's retry note.
+    """
+    with pytest.raises(EnvelopeValidationError) as excinfo:
+        validate_payload(envelope)
+    for message in excinfo.value.failures:
+        stripped = message
+        for token in _ALLOWED_DIGIT_TOKENS:
+            stripped = stripped.replace(token, "")
+        assert not any(ch.isdigit() for ch in stripped), (
+            f"{envelope['intent']}: digit-bearing layer-2 text reaches the retry note"
+        )
+
+
+def test_unknown_pydantic_type_fallback_is_digit_free():
+    """An unrecognized pydantic error type still renders digit-free.
+
+    The remap table covers every type the Envelope models produce today; a
+    future pydantic/upstream type not in it must degrade to a digit-scrubbed
+    phrase (or the generic fallback) — never a digit that reaches the model
+    (TCK-RETRY-001).
+    """
+    from localwallet.protocol.envelope import _error_phrase
+
+    phrase = _error_phrase(
+        {"type": "made_up_bound_99", "msg": "Input should be within 10 and 20", "loc": ("params", "limit")}
+    )
+    assert phrase
+    assert not any(ch.isdigit() for ch in phrase)
+
+    # a wholly numeric message collapses to the generic fallback
+    numeric = _error_phrase({"type": "nonsense", "msg": "42"})
+    assert not any(ch.isdigit() for ch in numeric)
+    assert numeric
 
 
 @pytest.mark.parametrize(

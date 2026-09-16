@@ -110,7 +110,12 @@ class ErrorEnvelope(BaseModel):
     @field_validator("v", mode="before")
     @classmethod
     def _v_must_be_zero_int(cls, value: object) -> object:
-        """Require a true integer 0; pydantic validators must raise ValueError."""
+        """Require a true integer 0; pydantic validators must raise ValueError.
+
+        Wording is the word-for-word twin of ``envelope.Envelope``'s
+        same-named validator — the layer-2 and system→UI validators read
+        identically, and both stay digit-free (TCK-RETRY-001).
+        """
         if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError("v must be the integer 0")  # noqa: TRY004 — see docstring
+            raise ValueError("v must be the integer zero")  # noqa: TRY004 — see docstring
         return value

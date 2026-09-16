@@ -29,6 +29,16 @@ strings for the dispatcher to surface. An empty list means valid.
 Adding rules never widens the model's freedom: rules only reject, they
 never transform or execute.
 
+DIGIT-FREE failure text (TCK-RETRY-001): failure strings reach the model
+verbatim through the retry note (``agent/loop.py::_with_retry_note``), and
+a digit inside them is a digit the model can transcribe back as user data
+(the historical "$45 → 546 sats" bug class — "546" came from a bounds
+message, not from the user). So every failure string here states WHAT was
+wrong without naming any bound: "within the allowed range", never
+"between 1 and N". The only digit-bearing tokens allowed are the format
+NAMES ``bech32``/``P2WPKH`` (proper nouns no model reads as a value).
+Pinned by ``test_business_rule_failure_strings_are_digit_free`` in tests/.
+
 Dependency note — embit in ``protocol/``: this module imports
 ``embit.bech32`` for offline address decoding ONLY. That is acceptable
 inside the stdlib+pydantic rule because embit is a pure, offline
@@ -130,10 +140,7 @@ def _address_number_failures(
         number is not None and not 1 <= number <= MAX_ADDRESS_NUMBER
     ):
         return [
-            (
-                "params.address_number must be an integer between 1 and "
-                f"{MAX_ADDRESS_NUMBER} when present"
-            )
+            "params.address_number must be an integer within the allowed range when present"
         ]
     return []
 
@@ -187,22 +194,22 @@ def _money_filter_failures(params: GetHistoryParams | GetUtxosParams) -> list[st
                 name, value, cap = given[0]
                 if isinstance(value, bool) or not 1 <= value <= cap:
                     failures.append(
-                        f"params.since.{name} must be an integer between 1 and {cap}"
+                        f"params.since.{name} must be an integer within the allowed range"
                     )
     words = params.label_set
     if words is not None:
         if not 1 <= len(words) <= MAX_LABEL_FILTER_WORDS:
             failures.append(
-                "params.label_set must carry between 1 and "
-                f"{MAX_LABEL_FILTER_WORDS} label words"
+                "params.label_set must carry a number of label words "
+                "within the allowed range"
             )
         elif any(
             not isinstance(w, str) or not w.strip() or not w.isprintable() or len(w) > MAX_LABEL_FILTER_WORD_CHARS
             for w in words
         ):
             failures.append(
-                "params.label_set entries must be non-blank printable strings "
-                f"of at most {MAX_LABEL_FILTER_WORD_CHARS} characters"
+                "params.label_set entries must be non-blank printable "
+                "strings within the allowed length"
             )
     if params.label_mode is not None:
         if params.label_mode not in _LABEL_MODES:
@@ -232,7 +239,7 @@ def _rule_get_history(params: BaseParams) -> list[str]:
     if isinstance(params.limit, bool) or (
         params.limit is not None and not 1 <= params.limit <= 100
     ):
-        return ["params.limit must be an integer between 1 and 100 when present"]
+        return ["params.limit must be an integer within the allowed range when present"]
     return _money_filter_failures(params)
 
 
@@ -271,7 +278,7 @@ def _rule_new_address(params: BaseParams) -> list[str]:
     if isinstance(params.branch, bool) or (
         params.branch is not None and params.branch not in (0, 1)
     ):
-        return ["params.branch must be the integer 0 or 1 when present"]
+        return ["params.branch must be the receive or the change branch when present"]
     return []
 
 
@@ -306,9 +313,19 @@ def _recipient_rule_failure(params: CreateTxParams) -> list[str]:
         # witness program (length outside 2..40 bytes).
         return ["recipient is not a valid mainnet bech32 address"]
     if witver != _WITNESS_V0:
-        return ["recipient must be a witness version 0 address (taproot v1 and later are not supported)"]
+        return [
+            (
+                "recipient must be a bech32 witness version zero address "
+                "(taproot and later versions are not supported)"
+            )
+        ]
     if len(program) != _P2WPKH_PROGRAM_LEN:
-        return ["recipient must be a P2WPKH address (witness v0 with a 20-byte program)"]
+        return [
+            (
+                "recipient must be a P2WPKH address (witness version zero with "
+                "a public-key-hash-length program)"
+            )
+        ]
     return []
 
 
@@ -337,14 +354,14 @@ def _rule_create_tx(params: BaseParams) -> list[str]:
         or not MIN_AMOUNT_SATS <= params.amount_sats <= MAX_AMOUNT_SATS
     ):
         return [
-            f"params.amount_sats must be an integer between {MIN_AMOUNT_SATS} and {MAX_AMOUNT_SATS}"
+            "params.amount_sats must be an integer within the allowed range"
         ]
     if params.amount_usd is not None and (
         isinstance(params.amount_usd, bool)
         or not MIN_AMOUNT_USD <= params.amount_usd <= MAX_AMOUNT_USD
     ):
         return [
-            f"params.amount_usd must be a number between {MIN_AMOUNT_USD} and {MAX_AMOUNT_USD}"
+            "params.amount_usd must be a number within the allowed range"
         ]
     return _recipient_rule_failure(params)
 
@@ -428,7 +445,7 @@ def _rule_tx_status(params: BaseParams) -> list[str]:
     txid = params.txid
     if len(txid) != TXID_LENGTH_CHARS or not set(txid) <= _TXID_CHARSET:
         return [
-            "params.txid must be exactly 64 lowercase hexadecimal characters"
+            "params.txid must be a full-length lowercase hexadecimal transaction id"
         ]
     return []
 
@@ -480,10 +497,7 @@ def _rule_self_transfer(params: BaseParams) -> list[str]:
             MIN_SELF_TRANSFER_PARTS <= params.parts <= MAX_SELF_TRANSFER_PARTS
         ):
             return [
-                (
-                    "params.parts must be an integer between "
-                    f"{MIN_SELF_TRANSFER_PARTS} and {MAX_SELF_TRANSFER_PARTS}"
-                )
+                "params.parts must be an integer within the allowed range"
             ]
         return []
     if params.mode == "cpfp":
@@ -504,10 +518,7 @@ def _rule_self_transfer(params: BaseParams) -> list[str]:
         MIN_AMOUNT_SATS <= params.below_size_sats <= MAX_AMOUNT_SATS
     ):
         return [
-            (
-                f"params.below_size_sats must be an integer between {MIN_AMOUNT_SATS} "
-                f"and {MAX_AMOUNT_SATS}"
-            )
+            "params.below_size_sats must be an integer within the allowed range"
         ]
     return []
 

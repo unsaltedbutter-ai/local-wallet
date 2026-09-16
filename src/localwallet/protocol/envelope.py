@@ -139,6 +139,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping
 from enum import StrEnum
 from types import MappingProxyType
@@ -1331,7 +1332,7 @@ class Envelope(BaseModel):
         ``AssertionError`` for the failure to surface as a field error.
         """
         if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError("v must be the integer 0")  # noqa: TRY004 — see docstring
+            raise ValueError("v must be the integer zero")  # noqa: TRY004 — see docstring
         return value
 
     @model_validator(mode="after")
@@ -1369,8 +1370,13 @@ def validate_payload(raw: str | bytes | Mapping[str, object]) -> Envelope:
             data = json.loads(raw)
         except UnicodeDecodeError:
             raise EnvelopeValidationError(["payload is not valid UTF-8 JSON"]) from None
-        except json.JSONDecodeError as exc:
-            raise EnvelopeValidationError([f"payload is not valid JSON: {exc.msg}"]) from None
+        except json.JSONDecodeError:
+            # TCK-RETRY-001: the decode position in the JSON error message
+            # ("line 1 column 12…") is digit-bearing and this string
+            # reaches the model's retry note — dropped, the malformed-JSON
+            # fact is the whole teaching point (layer 1 grammar makes real
+            # model output fail far earlier).
+            raise EnvelopeValidationError(["payload is not valid JSON"]) from None
     else:
         raise EnvelopeValidationError(
             ["payload must be a JSON object, or a str/bytes JSON document"]
@@ -1391,18 +1397,69 @@ def _render_loc(loc: tuple[object, ...]) -> str:
     String components are kept only when they are known schema field names
     (:data:`_KNOWN_LOC_FIELDS`); anything else — typically an extra-key
     name chosen by the untrusted payload, possibly huge or full of control
-    characters — is replaced by the literal ``<key>``. Integer indices are
-    kept as-is. Yields ``<root>`` for an empty location.
+    characters — is replaced by the literal ``<key>``. Integer indices
+    (e.g. ``('label_set', 0)``) become the positional word ``entry`` so no
+    digit can leak into a retry note (TCK-RETRY-001). Yields ``<root>``
+    for an empty location.
     """
     parts: list[str] = []
     for part in loc:
         if isinstance(part, int) and not isinstance(part, bool):
-            parts.append(str(part))
+            parts.append("entry")
         elif isinstance(part, str) and part in _KNOWN_LOC_FIELDS:
             parts.append(part)
         else:
             parts.append("<key>")
     return ".".join(parts) or "<root>"
+
+
+#: pydantic error ``type`` → digit-free phrase remap (TCK-RETRY-001, layer 2).
+#:
+#: pydantic v2's default bound messages interpolate the offending bound's
+#: digits ("Input should be less than or equal to 100", "String should have
+#: at most 4000 characters"). Those digits reach the model's retry note and
+#: can be transcribed back as user data. These are the English error types
+#: the Envelope models' Field constraints can actually produce; each is
+#: remapped to a digit-free phrase. Any type not listed (or our own
+#: ``value_error`` validator messages) falls back to digit-scrubbing, so a
+#: digit-bearing message can never escape.
+_ERROR_TYPE_PHRASES = {
+    "greater_than_equal": "must be within the allowed range",
+    "less_than_equal": "must be within the allowed range",
+    "string_too_short": "must be of the required length",
+    "string_too_long": "must be of the required length",
+    "too_short": "must be of the required length",
+    "too_long": "must be of the required length",
+    "literal_error": "must be one of the allowed constants",
+    "missing": "is required",
+    "extra_forbidden": "is not allowed here",
+    "string_type": "must be text",
+    "int_type": "must be an integer",
+    "float_type": "must be a number",
+    "model_type": "must be an object",
+}
+
+#: Generic phrase used if digit-scrubbing leaves nothing.
+_FALLBACK_PHRASE = "is invalid"
+
+#: Scrub every digit from a pydantic message; collapse the surrounding
+#: punctuation the removed digits leave behind. Our own ``value_error``
+#: messages are written digit-free, so this is a no-op for them.
+_DIGITS_RE = re.compile(r"\d")
+
+
+def _scrub_digits(text: str) -> str:
+    cleaned = _DIGITS_RE.sub("", text).strip(" :;,.")
+    return cleaned or _FALLBACK_PHRASE
+
+
+def _error_phrase(err: Mapping[str, object]) -> str:
+    """Render a single pydantic error's reason value- and digit-free."""
+    phrase = _ERROR_TYPE_PHRASES.get(err.get("type"))
+    if phrase is not None:
+        return phrase
+    # Unknown type, or our own ``value_error``: never let a digit through.
+    return _scrub_digits(str(err.get("msg", "")))
 
 
 def _cap_failures(failures: list[str]) -> list[str]:
@@ -1428,10 +1485,12 @@ def _format_pydantic_errors(exc: ValidationError) -> list[str]:
     rendered value-free too: extra-key names become the literal ``<key>``
     (see :func:`_render_loc`), and the total ``"; "-joined`` failure text
     is capped at :data:`_MAX_FAILURE_CHARS` characters with a trailing
-    ``…`` marker when truncated.
+    ``…`` marker when truncated. Reasons are digit-free (see
+    :data:`_ERROR_TYPE_PHRASES`): a pydantic bound message's digits never
+    reach the model's retry note (TCK-RETRY-001).
     """
     rendered = [
-        f"{_render_loc(err.get('loc', ()))}: {err['msg']}"
+        f"{_render_loc(err.get('loc', ()))}: {_error_phrase(err)}"
         for err in exc.errors(include_url=False, include_context=False, include_input=False)
     ]
     return _cap_failures(rendered)
