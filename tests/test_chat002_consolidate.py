@@ -11,10 +11,12 @@ done-when criterion of the ticket gets its own beat:
   clarify (never a nearest guess), and refuses a cross-KYC-pool pick
   (TCK-TX-SELF-001: one pool at a time) — the plan rides the same
   dispatcher-owned picked-set revalidation as the list ask;
-* "consolidate my small utxos" filters by the user's OWN consolidation
-  target (utxo_target_min_sats over the settings ladder — never a
-  hardcoded size) and dispatches the threshold envelope the existing
-  handler policy already owns (pool sides never mix, larger side wins);
+* "consolidate my small utxos" (TCK-CONS-003 RE-PIN: was the CHAT-002
+  ladder-defaulted direct plan) now opens the ONE deterministic threshold
+  ASK — the named default offer is the user's effective consolidation fee
+  ceiling (CFG-004 read), the stated number then dispatches the threshold
+  envelope the existing handler policy already owns (pool sides never mix,
+  larger side wins); the fee rung stated at the OPENING survives the ask;
 * the plan preview lists every source BY NUMBER + FULL address (designer
   §3a rows), value verbatim from the handler's own store read;
 * the §3 fee narration: the consolidation fee line ("…the cheapest rate
@@ -173,29 +175,53 @@ def test_cross_pool_pick_with_empty_address_shows_only_the_refusal(world) -> Non
     assert world["flow"].state is not TxFlowStatus.CREATED
 
 
-def test_bare_digit_threshold_stays_on_the_model_route(world) -> None:
-    """Address-wordless digits are a SIZE threshold, not a registry pick:
-    the TX-SELF-001 golden phrasing keeps its existing model route."""
+def test_parsed_threshold_is_deterministic_unparsed_digit_is_not(world) -> None:
+    """TCK-CONS-003 RE-PIN (was: bare-digit thresholds stayed on the model
+    route): a FULLY PARSED comparator ("under 100000 sats" — CHAT-009's
+    shape, below side, sats unit, envelope-bounded) is consumed
+    deterministically BEFORE the model and rides the EXISTING threshold
+    handler policy — the card restates every source (glm #7). A digit no
+    comparator parses (an address-wordless, #-less number) keeps the
+    ordinary-pipeline release, and a pathological digit token cannot crash
+    the matcher (the CHAT-009 int_max_str_digits release lesson)."""
     _labeled(world)
-    _, fake, _ = _turn(world, "consolidate all my coins under 100000 sats")
-    assert len(fake.prompts) == 1
+    outs, fake, _ = _turn(world, "consolidate all my coins under 100000 sats")
+    assert fake.prompts == []  # never the model: code owns the threshold
+    assert world["flow"].state is TxFlowStatus.CREATED
+    assert app._CONS_SOURCE_HEADER in outs  # every source restated fully
+    _turn(world, "cancel")
+    _, fake2, _ = _turn(world, "consolidate my 3 favorite coins")
+    assert len(fake2.prompts) == 1  # unparseable digit shape: released
+    assert world["session"].cons_ask is None
+    # a 5000-digit token neither parses nor crashes:
+    assert app._consolidation_intent("consolidate my coins under " + "1" * 5000) is None
+    assert app._consolidation_intent("consolidate my coins under 100000 btc") is None
 
 
 # =========================================================================
-# 2. "consolidate my small utxos" — the settings-filtered path
+# 2. "consolidate my small utxos" — the threshold ASK (TCK-CONS-003 re-pin)
 # =========================================================================
 
 
-def test_small_utxos_filters_by_the_target_setting(world) -> None:
-    """SMALL = the user's OWN consolidation target (utxo_target_min_sats,
-    stored rung wins over the shipped 100k default — proving the setting
-    drives it); the pick rides the EXISTING threshold handler policy
-    (pool sides never mix, larger side wins, honest other-side hint)."""
+def test_small_utxos_asks_once_then_plans_by_the_stated_cut(world) -> None:
+    """TCK-CONS-003 (3): a fuzzy "small" with no stated size ASKS for the
+    cut (one deterministic ask; the default offer NAMES the user's own
+    effective consolidation fee ceiling with its supplying rung — never a
+    hardcoded size); the ANSWERED number then rides the EXISTING threshold
+    handler policy (pool sides never mix, larger side wins, honest
+    other-side hint)."""
     _labeled(world)
-    world["store"].set_coin_setting("utxo_target_min_sats", "20000")
-    # below 20k: the 12k kyc coin + the 7k unlabeled coin (pools apart)
+    # below the ANSWERED 20k: the 12k kyc coin + the 7k unlabeled coin
+    # (pools apart)
     outs, fake, loop = _turn(world, "consolidate my small utxos")
     assert fake.prompts == [] and loop.history == ()  # deterministic intercept
+    ask = world["session"].cons_ask
+    assert ask is not None and ask.kind == "threshold" and ask.entries == ()
+    assert app._CONS_THRESHOLD_ASK.format(scope="") in outs
+    assert "Consolidation fee ceiling" in " ".join(outs)  # the named default
+    outs2, fake2, loop2 = _turn(world, "20000")
+    assert fake2.prompts == [] and loop2.history == ()  # the answer too
+    assert world["session"].cons_ask is None
     assert world["flow"].state is TxFlowStatus.CREATED
     pending = world["flow"].pending
     assert pending is not None
@@ -203,20 +229,27 @@ def test_small_utxos_filters_by_the_target_setting(world) -> None:
     # silent cross-pool merge of the 7k coin
     assert pending.inputs_count == 1
     assert 0 < pending.amount_sats < 12_000
-    assert any("small coin" in ln and "other marked coins" in ln for ln in outs)
+    assert any("small coin" in ln and "other marked coins" in ln for ln in outs2)
     # §3a: even this threshold path restates its one source fully
-    assert any(" · 12,000 sats" in ln for ln in outs)
+    assert any(" · 12,000 sats" in ln for ln in outs2)
 
 
-def test_small_utxos_empty_wallet_answer_honest(world) -> None:
-    """Nothing under the target is the EXISTING handler answer ('None of
-    your coins are smaller than that…') — no plan, no crash, no model."""
+def test_small_utxos_ask_never_traps_and_honest_empty(world) -> None:
+    """Any unmatched utterance CLOSES the threshold ask (the house
+    never-trap) and reaches the model as ordinary chat; and nothing under
+    the answered cut is the EXISTING handler answer ('None of your coins
+    are smaller than that…') — no plan, no crash, no model."""
     _coin(world, "a1" + "0" * 62, 500_000, index=3)  # one big coin only
-    world["store"].set_coin_setting("utxo_target_min_sats", "20000")
-    outs, fake, _ = _turn(world, "consolidate my small utxos")
+    _turn(world, "consolidate my small utxos")
+    assert world["session"].cons_ask is not None
+    _, fake, _ = _turn(world, "what is the meaning of life")
+    assert world["session"].cons_ask is None  # closed, never traps
+    assert len(fake.prompts) == 1  # and the line was released to the model
+    _turn(world, "consolidate my small utxos")
+    outs, fake2, _ = _turn(world, "20000")
     assert app._SELF_NOTHING_BELOW in outs
     assert world["flow"].state is not TxFlowStatus.CREATED
-    assert fake.prompts == []
+    assert fake2.prompts == []
 
 
 # =========================================================================
@@ -229,12 +262,15 @@ def test_elevated_fee_warning_fires_and_hedges(world) -> None:
     elevated warning now fires on a STEEPLY dropping projection: the SLOW
     bid (B₁ 4.0 → 400) sits ABOVE the six-hour average of per-block lowest
     fees ((5+4+1+1+1+1)/6 → 217) → the §3a fee line plus the §3b hedged
-    warning render. No figure, no probability, no new gate word."""
+    warning render. No figure, no probability, no new gate word. (The plan
+    is reached through the TCK-CONS-003 threshold ask: opener, then the
+    stated cut.)"""
     _labeled(world)
     world["state"]["mempool_blocks"] = _blocks(
         [5.0, 4.0, 1.0, 1.0, 1.0, 1.0]
     )
-    outs, *_ = _turn(world, "consolidate my small utxos")
+    _turn(world, "consolidate my small utxos")
+    outs, *_ = _turn(world, "100000")
     assert world["flow"].state is TxFlowStatus.CREATED
     assert app._CONS_FEE_LOW_LINE in outs
     assert app._CONS_FEE_ELEVATED_LINE in outs
@@ -250,7 +286,8 @@ def test_calm_line_when_bid_at_or_below_average(world) -> None:
     line, never the warning."""
     _labeled(world)
     world["state"]["mempool_blocks"] = _blocks([2.0] * 6)
-    outs, *_ = _turn(world, "consolidate my small utxos slowly")
+    _turn(world, "consolidate my small utxos slowly")
+    outs, *_ = _turn(world, "100000")
     assert world["flow"].state is TxFlowStatus.CREATED
     assert app._CONS_FEE_LOW_LINE in outs
     assert app._CONS_FEE_CALM_LINE in outs
@@ -263,7 +300,8 @@ def test_no_per_block_data_no_fee_claim(world) -> None:
     byte-unchanged and NO fee claim of any kind renders — the six-hour
     bound does not exist to promise or to compare against. Fail closed."""
     _labeled(world)  # state has no "mempool_blocks" route -> 404 -> fallback
-    outs, *_ = _turn(world, "consolidate my small utxos")
+    _turn(world, "consolidate my small utxos")
+    outs, *_ = _turn(world, "100000")
     assert world["flow"].state is TxFlowStatus.CREATED
     assert app._CONS_FEE_LOW_LINE not in outs
     assert app._CONS_FEE_ELEVATED_LINE not in outs
@@ -283,7 +321,8 @@ def test_consolidation_defaults_slow_and_card_shows_slow_rate(world) -> None:
     target word."""
     _labeled(world)
     world["state"]["mempool_blocks"] = _blocks([2.0] * 6)
-    outs, *_ = _turn(world, "consolidate my small utxos")
+    _turn(world, "consolidate my small utxos")
+    outs, *_ = _turn(world, "100000")
     pending = world["flow"].pending
     assert pending is not None and pending.fee_target == app.FeeTarget.SLOW.value
     fee_line = next(ln for ln in outs if ln.startswith("Fee:"))
@@ -293,10 +332,14 @@ def test_consolidation_defaults_slow_and_card_shows_slow_rate(world) -> None:
 
 def test_consolidation_explicit_faster_overrides_default(world) -> None:
     """An EXPLICIT user rung still wins over the SLOW default: "faster"
-    names FAST, the plan stages FAST, and the card shows the fast rate."""
+    names FAST at the OPENING, the rung PERSISTS across the threshold ask
+    (the RBF-004 MAJOR lesson — the answer envelope re-quotes it), and the
+    plan stages FAST with the fast rate on the card."""
     _labeled(world)
     world["state"]["mempool_blocks"] = _blocks([2.0] * 6)
-    outs, *_ = _turn(world, "consolidate my small utxos faster")
+    _turn(world, "consolidate my small utxos faster")
+    assert world["session"].cons_ask.fee_target == "fast"  # type: ignore[union-attr]
+    outs, *_ = _turn(world, "100000")
     pending = world["flow"].pending
     assert pending is not None and pending.fee_target == app.FeeTarget.FAST.value
     fee_line = next(ln for ln in outs if ln.startswith("Fee:"))
@@ -304,15 +347,15 @@ def test_consolidation_explicit_faster_overrides_default(world) -> None:
 
 
 def test_small_utxos_pending_reshow_carries_sources(world) -> None:
-    """TCK-CHAT-002 FINDING 3: the small-utxos (threshold) path stages the
-    SAME re-show record the number/list paths do, so a pending re-show
-    carries the §3a source rows + fee lines (the initial card always had
-    them; the re-show must too)."""
+    """TCK-CHAT-002 FINDING 3: the small-utxos (threshold) plan — reached
+    through the TCK-CONS-003 ask — stages the SAME re-show record the
+    number/list paths do, so a pending re-show carries the §3a source rows
+    + fee lines (the initial card always had them; the re-show must too)."""
     _labeled(world)
-    world["store"].set_coin_setting("utxo_target_min_sats", "20000")
     world["state"]["mempool_blocks"] = _blocks([5.0, 4.0, 1.0, 1.0])
-    first, *_ = _turn(world, "consolidate my small utxos")
-    assert app._CONS_FEE_ELEVATED_LINE in first
+    _turn(world, "consolidate my small utxos")
+    outs, *_ = _turn(world, "20000")
+    assert app._CONS_FEE_ELEVATED_LINE in outs
     # a direct handler call (the create_tx-pending shape) re-shows the
     # staged threshold consolidation with its display fields
     result = world["table"][IntentName.SELF_TRANSFER](
@@ -320,9 +363,9 @@ def test_small_utxos_pending_reshow_carries_sources(world) -> None:
     )
     assert result["error"] == "tx_pending"
     assert result["cons_merge"] is True
-    # the kyc 12k coin was the small-utxos pick; its §3a row re-shows
-    assert app._CONS_SOURCE_HEADER in first
-    assert any(" · 12,000 sats" in ln for ln in first)
+    # the kyc 12k coin was the answered-ask pick; its §3a row re-shows
+    assert app._CONS_SOURCE_HEADER in outs
+    assert any(" · 12,000 sats" in ln for ln in outs)
     lines: list[str] = []
     app._print_self_plan(result, lines.append)
     assert app._CONS_SOURCE_HEADER in lines
@@ -350,7 +393,8 @@ def test_later_is_never_a_gate_word(world) -> None:
     to confirm/cancel alone."""
     _labeled(world)
     world["state"]["mempool_blocks"] = _blocks([5.0, 4.0, 1.0, 1.0])
-    outs, *_ = _turn(world, "consolidate my small utxos")
+    _turn(world, "consolidate my small utxos")
+    outs, *_ = _turn(world, "100000")
     assert app._CONS_FEE_ELEVATED_LINE in outs
     for word in ("later", "maybe", "not now"):
         _turn(world, word)
@@ -417,15 +461,17 @@ def test_pending_reshow_carries_sources_and_fee_lines(world) -> None:
 
 
 def test_small_utxos_spanning_pools_takes_the_larger_side(world) -> None:
-    """Default target 100k over the _labeled set: small coins sit on BOTH
+    """A 100k cut over the _labeled set: small coins sit on BOTH
     sides (kyc 42k vs other 52k) — the EXISTING policy consolidates the
     larger side and the card honestly says the other side waits. The
-    small-utxos opener did not invent a second selection rule."""
+    small-utxos opener (answered through the TCK-CONS-003 ask) did not
+    invent a second selection rule."""
     _labeled(world)
     world["store"].add_address_labels(  # keep p2p on the OTHER side (it is)
         "bc1qneverused" + "0" * 22, ["nothing"]
     )
-    outs, *_ = _turn(world, "consolidate my small utxos")
+    _turn(world, "consolidate my small utxos")
+    outs, *_ = _turn(world, "100000")
     pending = world["flow"].pending
     assert pending is not None and pending.inputs_count == 2  # 45k + 7k side
     assert any("other marked coins" in ln for ln in outs)

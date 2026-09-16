@@ -316,18 +316,31 @@ def test_opener_keeps_priority_over_timing(world) -> None:
 
 def test_bypass_routing_into_the_conversation(world) -> None:
     """The answer's own words are the way in: saying the canonical
-    utterance the BYPASS line names runs the EXISTING CHAT-002 intercept —
-    the plan stages (the card, not the advice, carries every figure)."""
+    utterance the BYPASS line names runs the EXISTING intercept —
+    TCK-CONS-003 re-pins its endpoint as the ONE threshold ask (still
+    fully intercepted, zero model prompts); the stated number then plans
+    (the card, not the advice, carries every figure)."""
     _labeled(world)
     world["state"]["mempool_blocks"] = _blocks([10.0, 8.0, 5.0, 4.0, 3.0, 2.0])
     outs, *_ = _ask(world, "is now a good time to consolidate?")
     assert app._CONS_TIMING_BYPASS in outs and "consolidate my small utxos" in outs[-1]
     # the recommended path is already intercepted — no new vocabulary:
-    assert app._consolidation_intent("consolidate my small utxos") == (None, None, True, ())
+    assert app._consolidation_intent("consolidate my small utxos") == (
+        None,
+        None,
+        True,
+        (),
+        None,
+        "",
+    )
     outs2, fake2, _ = _ask(world, "consolidate my small utxos")
     assert fake2.prompts == []  # consumed by the existing intercept
+    assert world["session"].cons_ask is not None  # the ONE threshold ask
+    assert app._CONS_THRESHOLD_ASK.format(scope="") in outs2
+    outs3, fake3, _ = _ask(world, "100000")
+    assert fake3.prompts == []  # the answer is intercepted too
     assert world["flow"].state is TxFlowStatus.CREATED
-    assert any("Merge" in ln or "Fee" in ln for ln in outs2)
+    assert any("Merge" in ln or "Fee" in ln for ln in outs3)
 
 
 def test_gate_territory_and_no_estimator_stand_down(world) -> None:

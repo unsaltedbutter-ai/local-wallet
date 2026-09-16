@@ -192,14 +192,25 @@ def test_rollup_knob_persists_across_every_intercept(world) -> None:
 
 
 def test_opener_is_conservative(world) -> None:
-    """A digit (an explicit size threshold) keeps the existing model route
-    (the TX-SELF-001 golden phrasings are NOT intercepted); a non-verb line
-    with a tag word is ordinary chat; a deny-shaped opener stands down.
-    (TCK-CHAT-002 shape note: the match returns a 4-tuple
-    ``(tag, fee, small, numbers)``, and the word SMALL now means the
-    consolidation-target filter — the pinned collision case "merge my
-    notes about SMALL coins" rides it, the card remaining the authority.)"""
-    assert app._consolidation_intent("consolidate all my coins under 100000 sats") is None
+    """TCK-CONS-003 RE-PIN of the shape note: the match returns a 6-tuple
+    ``(tag, fee, small, numbers, below, label_phrase)``. A FULLY PARSED
+    size comparator ("under 100000 sats") is now consumed deterministically
+    (the model never authors the threshold — the ticket moved this grammar
+    pre-model); an address-wordless, #-less digit that no comparator parses
+    ("my 3 favorite coins") keeps its ordinary-pipeline release, a non-verb
+    line with a tag word is ordinary chat, and a deny-shaped opener stands
+    down. The pinned collision case "merge my notes about SMALL coins"
+    rides the fuzzy SMALL reading (the ask just asks; the phrase matches
+    no stored label); the card remains the authority on what any plan
+    actually spends."""
+    assert app._consolidation_intent("consolidate all my coins under 100000 sats") == (
+        None,
+        None,
+        False,
+        (),
+        100_000,
+        "",
+    )
     assert app._consolidation_intent("did the exchange confirm?") is None
     assert app._consolidation_intent("don't consolidate my coins") is None
     assert app._consolidation_intent("merge my notes about small coins") == (
@@ -207,18 +218,24 @@ def test_opener_is_conservative(world) -> None:
         None,
         True,
         (),
+        None,
+        "notes about",
     )
     assert app._consolidation_intent("consolidate address 3 & 9") == (
         None,
         None,
         False,
         (3, 9),
+        None,
+        "",
     )
-    # an address-WORDLESS digit stays on the model route (threshold grammar)
+    # an address-WORDLESS, #-less bare digit no comparator parses: released
     assert app._consolidation_intent("consolidate my 3 favorite coins") is None
     _labeled(world)
     _, fake, _ = _turn(world, "consolidate all my coins under 100000 sats")
-    assert len(fake.prompts) == 1  # reached the model, exactly as today
+    assert fake.prompts == []  # the deterministic threshold intercept
+    assert world["flow"].state is TxFlowStatus.CREATED
+    _turn(world, "cancel")
 
 
 def test_opener_tag_and_unlabeled_paths(world) -> None:

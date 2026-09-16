@@ -213,7 +213,7 @@ from localwallet.protocol import (
 
 # TCK-CHAT-009 (a): the SIZE-threshold bound reads the contract's own
 # whole-wallet ceiling (import only — the protocol layer stays untouched).
-from localwallet.protocol.envelope import MAX_AMOUNT_SATS
+from localwallet.protocol.envelope import MAX_AMOUNT_SATS, MIN_AMOUNT_SATS
 from localwallet.signer.base import Signer, SignerError
 from localwallet.signer.file import FilePsbtSigner
 from localwallet.signer.hwi import DeviceError, HwiUsbSigner
@@ -2122,6 +2122,60 @@ _CONS_NO_COINS_AT: Final[str] = (
     "There are no coins at address #{number} — nothing to merge from it."
 )
 
+# --- TCK-CONS-003: the flexible-selection opener extensions ---------------
+#
+# USER SPEC (2026-09-15) on top of the LANDED conversation: a multi-number
+# registry pick in ONE utterance ("consolidate #18 and #24 and #14"), an
+# explicit size cut ("consolidate utxos smaller than 100001 sats"), a fuzzy
+# "small" ask that ASKS for the threshold instead of guessing one, a direct
+# v6 label pool ("consolidate my KYC coins"), and the label∧size conjunction
+# ("consolidate my small Peppermint UTXOs"). All five stay deterministic
+# PRE-MODEL parses (the model never authors a threshold or a selection) and
+# every resulting plan rides the EXISTING self_transfer consolidate mode +
+# dual-key gate + SLOW default rung — no new intent, no envelope key ever
+# carries a coin reference. The {value}/{unit}/{rung} slots of the default
+# offer below are filled ONLY from this engine's own settings-ladder read
+# (the CFG-004 named-rung pattern — user-owned scalars, never wallet data).
+
+#: The ONE threshold ask (phrasing 3): a fuzzy "small" with no stated size
+#: asks ONCE; any other utterance closes it (the house never-trap).
+_CONS_THRESHOLD_ASK: Final[str] = (
+    "What size counts as small{scope}? Say a number of sats — coins below "
+    "it merge into one new coin; any other words set this aside."
+)
+#: The named default offer + the honest unit distinction (the ceiling is a
+#: fee rate, so it is CONTEXT the user can restate as a sats number, never
+#: silently applied as a size).
+_CONS_THRESHOLD_DEFAULT: Final[str] = (
+    "For reference: your {label} is {value} {unit}, supplied by {rung}. "
+    "That is a fee ceiling, not a size — say the sats number you want as "
+    "the cut."
+)
+
+#: Fee-rung words consumed from the label residual when a rung phrase
+#: matched (the whole closed vocabularies of _CONS_SLOW_PHRASES /
+#: _CONS_FAST_PHRASES — a matched urgency is never a label word).
+_CONS_FEE_RUNG_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "no", "hurry", "not", "urgent", "slowly", "slow", "cheap",
+        "asap", "faster", "fast", "quick",
+    }
+)
+#: Grammar filler consumed from the label residual (closed, conservative:
+#: determiners, pronouns, connectors, politeness). Anything left over that
+#: is not a verb/object/tag/small/address word or a parsed number is ONE
+#: label phrase, resolved against the store's v6 sets in the runner (an
+#: unknown word falls through to the roll-up EXACTLY like today — the
+#: phrase never invents a pool the store does not hold).
+_CONS_FILLER_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "i", "we", "you", "your", "me", "my", "mine", "our", "ours", "it",
+        "its", "they", "them", "this", "that", "these", "those", "the",
+        "a", "an", "all", "and", "of", "to", "for", "into", "with", "one",
+        "please", "just", "now", "then", "again",
+    }
+)
+
 # --- TCK-CONS-002: the consolidation-TIMING answer (council qwen#9) --------
 #
 # "is now a good time to consolidate?" gets a CODE-OWNED answer, not a
@@ -2302,8 +2356,9 @@ def _cons_timing_answer(
 #: TCK-CHAT-002 opener vocabularies (deterministic, code-matched BEFORE
 #: the model — registry numbers are user data and the closed consolidate
 #: params cannot carry a coin reference, so this never becomes a prompt
-#: route; the model-routed "…under 100000 sats" threshold grammar is
-#: untouched).
+#: route; since TCK-CONS-003 the fully parsed "…smaller than N sats"
+#: threshold is intercepted here too, and only UNPARSED digit shapes
+#: keep the TX-SELF-001 model route).
 _CONS_SMALL_WORDS: Final[frozenset[str]] = frozenset(
     {"small", "smaller", "smallest", "tiny", "little"}
 )
@@ -2323,9 +2378,9 @@ _CONS_TAG_TERMS: Final[dict[str, tuple[str, ...]]] = {
 _CONS_UNLABELED_TERMS: Final[tuple[str, ...]] = ("unlabeled", "unlabelled")
 
 #: The opener's conservative phrase shape: a consolidation VERB plus a
-#: consolidation OBJECT word, and NO bare digit (an explicit
-#: "…under 100000 sats" threshold stays on the existing TX-SELF-001 model
-#: route — the golden phrasings are untouched).
+#: consolidation OBJECT word (or a ``#``-marked registry pick, whose ``#``
+#: IS the object word — TCK-CONS-003 (1)). Address-wordless, #-less bare
+#: digits that no comparator fully parses stay on the ordinary pipeline.
 _CONS_VERBS: Final[frozenset[str]] = frozenset(
     {
         "consolidate",
@@ -2376,45 +2431,103 @@ _CONS_SLOW_PHRASES: Final[tuple[str, ...]] = ("no hurry", "not urgent", "slowly"
 _CONS_FAST_PHRASES: Final[tuple[str, ...]] = ("asap", "urgent", "hurry", "faster", "fast", "quick")
 
 
+def _cons_size_threshold(
+    words: list[str],
+) -> tuple[int | None, frozenset[int]]:
+    """TCK-CONS-003 (2): the explicit SIZE comparator of a consolidation
+    line, parsed deterministically in the CHAT-009 shape —
+    ``<below-word> [than] <number> [sats unit]`` (thousands separators
+    tolerated, sats only; the envelope's own bounds gate the value).
+    Only the BELOW side is meaningful (a merge sweeps coins UNDER a cut —
+    an above-shaped line is not this grammar). Returns
+    ``(threshold, consumed_word_indexes)``; anything short of a FULLY
+    parsed comparator (no number, a non-sats unit, two stated cuts, a
+    pathological digit length per the CHAT-009 ``int_max_str_digits``
+    release, a value outside MIN..MAX_AMOUNT_SATS) is ``(None, frozenset())``
+    — the line keeps the ordinary pipeline, never a half-read threshold.
+    A below-word WITHOUT an adjacent number is deliberately NOT consumed:
+    it is the fuzzy "small" the threshold ask resolves (phrasing 3)."""
+    for i, word in enumerate(words):
+        if word not in _CHAT_SIZE_BELOW:
+            continue
+        j = i + 1
+        local = {i}
+        if j < len(words) and words[j] == "than":
+            local.add(j)
+            j += 1
+        if j >= len(words) or not _CHAT_SIZE_NUM_RE.match(words[j]):
+            continue  # the fuzzy reading (no number): not consumed here
+        digits = words[j].replace(",", "")
+        try:
+            value = int(digits)
+        except ValueError:
+            return None, frozenset()  # pathological digit length: release
+        if not MIN_AMOUNT_SATS <= value <= MAX_AMOUNT_SATS:
+            return None, frozenset()  # beyond all bitcoin (or sub-dust)
+        local.add(j)
+        if j + 1 < len(words) and words[j + 1] in _CHAT_SIZE_UNITS:
+            local.add(j + 1)
+        elif j + 1 < len(words) and words[j + 1] in ("btc", "bitcoin"):
+            return None, frozenset()  # a non-sats unit is not this grammar
+        return value, frozenset(local)
+    return None, frozenset()
+
+
 def _consolidation_intent(
     line: str,
-) -> tuple[str | None, str | None, bool, tuple[int, ...]] | None:
+) -> (
+    tuple[str | None, str | None, bool, tuple[int, ...], int | None, str]
+    | None
+):
     """Deterministic consolidation-opener match (TCK-CONS-001, BEFORE the
-    model sees the line; extended by TCK-CHAT-002): ``None`` = not a
-    consolidation opener (ordinary pipeline), else the 4-tuple
-    ``(tag, fee_target, small, numbers)`` where
+    model sees the line; extended by TCK-CHAT-002 and TCK-CONS-003):
+    ``None`` = not a consolidation opener (ordinary pipeline), else the
+    6-tuple ``(tag, fee_target, small, numbers, below, label_phrase)`` where
 
     * ``tag`` is a closed-set id, ``""`` for the unlabeled path, or ``None``
       for the label roll-up (unchanged);
     * ``fee_target`` is the rung the user's words named (``None`` = the
       engine's MEDIUM default, unchanged);
-    * ``small`` (TCK-CHAT-002) marks "consolidate my SMALL utxos" — the
-      source set is the user's own consolidation target
-      (``utxo_target_min_sats``, the §2.3 settings ladder), never a
-      hardcoded size; the threshold envelope then rides the EXISTING
-      handler policy (pool sides never mix, larger side wins, honest
-      other-side note);
-    * ``numbers`` (TCK-CHAT-002) are REGISTRY NUMBERS for
-      "consolidate address 3 & 9" — digits ONLY alongside an address word
-      (a bare-digit threshold line stays on the model route, the golden
-      phrasings preserved). The caller resolves every number against the
-      stable CHAT-001 registry (miss = the value-free clarify, never a
-      guess) and picks the coins at the resolved addresses.
+    * ``small`` (TCK-CHAT-002 → TCK-CONS-003 (3)) marks a fuzzy "small" with
+      NO stated size — the runner opens the ONE deterministic threshold ask
+      (never a hardcoded size, never a silently applied setting);
+    * ``numbers`` (TCK-CHAT-002, list bounded per TCK-CONS-003 (1)) are
+      REGISTRY NUMBERS — digits alongside an address word OR ANY ``#``-
+      marked digit ("consolidate #18 and #24 and #14" — the ``#`` IS the
+      address referent, no object word required). The caller resolves every
+      number against the stable CHAT-001 registry (miss = the value-free
+      clarify, never a guess) and restates every resolved FULL address
+      (glm #7);
+    * ``below`` (TCK-CONS-003 (2)) is an explicit size cut parsed by
+      :func:`_cons_size_threshold` ("smaller than 100001 sats") — the model
+      never authors it;
+    * ``label_phrase`` (TCK-CONS-003 (4)/(5)) is the word residue after the
+      verbs, object/tag/small/address/filler words and every parsed token
+      are consumed — ONE candidate label phrase the runner resolves against
+      the store's v6 label sets through the SHARED
+      :func:`_normalize_label_word` (via :func:`_label_query_form`); an
+      empty string means the line named no extra words.
 
     Any deny token suppresses the intercept (the HW-005 slice-C review-MEDIUM
     rule) — except inside a matched slow-rung phrase ("no hurry"/"not
-    urgent" are urgencies, not refusals).
+    urgent" are urgencies, not refusals). A registry pick AND a stated size
+    cut in one line are ambiguous and release (``None``), as does a
+    pathological digit token (the CHAT-009 ``int_max_str_digits`` lesson).
     ponytail: word-set matching — "merge my notes about small coins" style
-    collisions ride the never-trap; the card remains the authority on what
-    any plan actually spends."""
-    words = [w for w in (t.strip(punctuation) for t in line.lower().split()) if w]
+    collisions ride the never-trap (the phrase matches no stored label, the
+    ask still just asks); the card remains the authority on what any plan
+    actually spends."""
+    raw = line.lower().split()
+    words = [w for w in (t.strip(punctuation) for t in raw) if w]
     if not words or not any(w in _CONS_VERBS for w in words):
         return None
-    if not any(w in _CONS_OBJECT_TERMS for w in words):
+    # TCK-CONS-003 (1): a "#"-marked digit is a registry referent AND an
+    # object in itself ("consolidate #18 and #24" — no address/coin word).
+    hash_marked = any(
+        t.startswith("#") and t[1:].strip(punctuation).isdigit() for t in raw
+    )
+    if not hash_marked and not any(w in _CONS_OBJECT_TERMS for w in words):
         return None
-    digits = {int(w) for w in words if w.isdigit()}
-    if digits and not _digits_named_as_addresses(words):
-        return None  # an explicit size threshold stays on the model route
     joined = " ".join(words)
     fee: str | None = None
     # SLOW phrases are checked FIRST and win: "no hurry" contains the fast
@@ -2428,28 +2541,56 @@ def _consolidation_intent(
     # urgent are urgencies, not refusals).
     if fee != "slow" and any(w in _BUMP_DENY_TOKENS for w in words):
         return None
-    if digits:  # address-worded: registry-number pick (TCK-CHAT-002)
-        return None, fee, False, tuple(sorted(digits))
+    try:
+        digits = {int(w) for w in words if w.isdigit()}
+    except ValueError:
+        return None  # pathological digit-length token: release (CHAT-009)
+    below, size_consumed = _cons_size_threshold(words)
+    registry = digits - ({below} if below is not None else set())
+    if registry and not (hash_marked or _digits_named_as_addresses(words)):
+        return None  # an address-wordless, #-less bare digit stays released
+    if registry and below is not None:
+        return None  # a number list AND a size cut in one line: ambiguous
+    if registry:
+        if len(registry) > MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS:
+            return None  # bounded pick; over-cap rides the ordinary pipeline
+        return None, fee, False, tuple(sorted(registry)), None, ""
+    tag_words = {t for terms in _CONS_TAG_TERMS.values() for t in terms}
+    consumed: set[int] = set(size_consumed)
+    for i, w in enumerate(words):
+        if (
+            w.isdigit()
+            or w in _CONS_VERBS
+            or w in _CONS_OBJECT_TERMS
+            or w in _CONS_SMALL_WORDS
+            or w in _CONS_ADDRESS_WORDS
+            or w in _CONS_UNLABELED_TERMS
+            or w in tag_words
+            or w == "than"
+            or w in _CHAT_SIZE_UNITS
+            or w in _CONS_FILLER_WORDS
+            or (fee is not None and w in _CONS_FEE_RUNG_WORDS)
+        ):
+            consumed.add(i)
+    label_phrase = " ".join(w for i, w in enumerate(words) if i not in consumed)
+    small = any(
+        w in _CONS_SMALL_WORDS for i, w in enumerate(words) if i not in size_consumed
+    )
     if any(w in _CONS_UNLABELED_TERMS for w in words):
-        return "", fee, False, ()
+        return "", fee, small, (), below, label_phrase
     for tag, terms in _CONS_TAG_TERMS.items():
         if any(w in terms for w in words):
-            return tag, fee, False, ()
-    if any(w in _CONS_SMALL_WORDS for w in words):
-        # TCK-CHAT-002: "my small utxos" — filter by the consolidation
-        # TARGET setting, checked AFTER label/tag words (an explicit group
-        # pick stays more specific: "my small kyc coins" is a tag ask).
-        return None, fee, True, ()
-    return None, fee, False, ()
+            return tag, fee, small, (), below, label_phrase
+    return None, fee, small, (), below, label_phrase
 
 
 def _digits_named_as_addresses(words: list[str]) -> bool:
     """True when bare digits in a consolidation line are ADDRESS referents
     ("consolidate address 3 & 9"), not a size threshold ("under 100000
-    sats"): an explicit address word sits alongside them. TCK-CHAT-002's
-    opener routing hinges on this — a threshold line keeps its golden
-    model route, a registry-number line is resolved IN CODE (the envelope
-    can carry no coin reference and the model never authors a number)."""
+    sats"): an explicit address word sits alongside them (the ``#`` mark is
+    the other naming route, checked by the caller — TCK-CONS-003 (1)). A
+    fully parsed ``<below-word> [than] NUMBER [sats]`` comparator is NOT
+    this case: its number is the size cut, consumed separately."""
     return any(w in _CONS_ADDRESS_WORDS for w in words)
 
 
@@ -2877,9 +3018,12 @@ class _ConsRow:
 @dataclass
 class _ConsAsk:
     """An OPEN consolidation-conversation ask. ``kind`` is ``"rollup"``
-    (pick a label group), ``"count"`` ("1 coin or N?" over the group), or
+    (pick a label group), ``"count"`` ("1 coin or N?" over the group),
     ``"list"`` (the ascending coin list, answered by CHAT-001 registry
-    NUMBER). ``fee_target`` carries the rung the opener's words resolved so
+    NUMBER), or ``"threshold"`` (TCK-CONS-003: "what size counts as
+    small?" — answered by ONE stated sats number; ``entries`` carry the
+    scoped pool when a label was in the line, empty = the whole wallet).
+    ``fee_target`` carries the rung the opener's words resolved so
     every later intercept re-quotes it instead of silently defaulting (the
     RBF-004 MAJOR lesson, applied to this conversation's multi-step asks:
     the knob AND the label group persist across every intercept). ``choice``
@@ -2917,6 +3061,17 @@ class _ConsPending:
     display: Mapping[str, object] = dataclass_field(default_factory=dict)
 
 
+def _cons_int(token: str) -> int | None:
+    """``int()`` that cannot explode on a pathologically long digit token
+    (the CHAT-009 ``int_max_str_digits`` release lesson — these matchers
+    read raw user text): a number that cannot parse is simply NOT an
+    answer (the caller's never-trap closes the ask)."""
+    try:
+        return int(token)
+    except ValueError:
+        return None
+
+
 def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
     """Deterministic answer for an OPEN consolidation ask (the never-trap
     discipline shared with :func:`_bump_funding_answer`: deny tokens
@@ -2925,16 +3080,32 @@ def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
     ``"rollup"`` → the 1-based ROW (number or unique tag word);
     ``"count"`` → ``1`` (pick a single coin) or ``2`` (merge them all —
     "all"/the literal count digit);
+    ``"threshold"`` (TCK-CONS-003) → the stated sats size itself (one whole
+    number, thousands separators tolerated, optional sats unit, bounded to
+    the envelope's own MIN..MAX_AMOUNT_SATS — anything else is NOT an
+    answer and CLOSES the ask, the never-trap);
     ``"list"`` → the chosen CHAT-001 registry NUMBER itself (never a row
     position — the council invariant), answering only when every digit in
     the line names one known number."""
     words = [w for w in (t.strip(punctuation) for t in line.lower().split()) if w]
     if not words or any(w in _BUMP_DENY_TOKENS for w in words):
         return None
+    if ask.kind == "threshold":
+        stated = [w for w in words if _CHAT_SIZE_NUM_RE.match(w)]
+        rest = [w for w in words if not _CHAT_SIZE_NUM_RE.match(w)]
+        if len(stated) != 1 or any(w not in _CHAT_SIZE_UNITS for w in rest):
+            return None
+        value = _cons_int(stated[0].replace(",", ""))
+        if value is None:
+            return None  # pathological digit length: close (CHAT-009 lesson)
+        if not MIN_AMOUNT_SATS <= value <= MAX_AMOUNT_SATS:
+            return None  # a cut outside all of bitcoin is not an answer
+        return value
     if ask.kind == "rollup":
         first = words[0]
         if first.isdigit():
-            return int(first) if 1 <= int(first) <= len(ask.rows) else None
+            row = _cons_int(first)
+            return row if row is not None and 1 <= row <= len(ask.rows) else None
         term_to_row: dict[str, int] = {}
         ambiguous: set[str] = set()
         for i, row in enumerate(ask.rows):
@@ -2949,8 +3120,9 @@ def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
     if ask.kind == "count":
         ws = set(words)
         one = bool(ws & _CONS_ONE_TERMS)
+        stated_count = _cons_int(words[0]) if words[0].isdigit() else None
         allt = bool(ws & _CONS_ALL_TERMS) or (
-            words[0].isdigit() and int(words[0]) == len(ask.entries)
+            stated_count is not None and stated_count == len(ask.entries)
         )
         if one and not allt:
             return 1
@@ -2959,7 +3131,10 @@ def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
         return None
     # kind == "list": the registry number is the referent (coins at one
     # address share its number and are all picked with it).
-    digits = {int(w) for w in words if w.isdigit()}
+    parsed = [_cons_int(w) for w in words if w.isdigit()]
+    if any(p is None for p in parsed):
+        return None  # unparseable digit token: not an answer (CHAT-009)
+    digits = {int(p) for p in parsed}  # type: ignore[arg-type]
     known = {int(str(e["number"])) for e in ask.entries}
     if len(digits) == 1 and digits <= known:
         return digits.pop()
@@ -3108,7 +3283,9 @@ def _run_consolidation_turn(
     State machine (dispatcher-owned, mirrors ``_CpfpAsk``):
     ``rollup`` (pick a label) → ``count`` ("1 coin or N?") → optional
     ``list`` (ascending UTXO list, CHAT-001 registry number pick) →
-    dispatch. The final answer stamps ``choice``/``picked`` on the ask and
+    dispatch, plus the TCK-CONS-003 ``threshold`` ask ("what size counts
+    as small?" — ONE ask, a number answers, anything else closes). The
+    final answer stamps ``choice``/``picked`` on the ask and
     CODE builds the ``self_transfer`` consolidate envelope (params carry
     ONLY the engine-computed threshold + the persisted fee rung — never a
     coin reference); the handler consumes the ask and revalidates every
@@ -3117,6 +3294,14 @@ def _run_consolidation_turn(
     goes straight to the plan (no fake question — the CPFP-002 collapse
     discipline). Any unmatched utterance CLEARS the ask (never-trap) and
     the line falls through to the ordinary pipeline.
+
+    The opener (TCK-CONS-003, all deterministic BEFORE the model): a
+    multi-number ``#`` list resolves every registry referent and restates
+    every FULL address; an explicit ``<below-word> N sats`` cut dispatches
+    the existing threshold policy (whole wallet) or the pool∧size
+    intersection (a label in the line); a fuzzy "small" opens the
+    threshold ask (scoped to a closed tag or a v6 free label the phrase
+    resolves to, via the SHARED normalizer).
 
     TCK-CONS-002 extends the ENTRY POINT with the timing question: "is now
     a good time to consolidate?" / "should I consolidate now?" get the
@@ -3132,6 +3317,36 @@ def _run_consolidation_turn(
         if choice is None:
             session.cons_ask = None  # never-trap
             return False
+        if ask.kind == "threshold":
+            # TCK-CONS-003 (3): the ONE threshold ask. The answered number
+            # is the size cut (code-parsed, the model never authors it);
+            # the persisted fee rung is re-quoted onto the envelope (the
+            # RBF-004 lesson). An ask opened over a label pool plans the
+            # INTERSECTION of that pool with the stated cut; the unscoped
+            # ask rides the EXISTING threshold handler policy (pool sides
+            # never mix, larger side wins, honest other-side note).
+            session.cons_ask = None
+            if not ask.entries:
+                _dispatch_code_self_turn(
+                    session,
+                    line,
+                    SelfTransferParams(
+                        mode="consolidate",
+                        below_size_sats=choice,
+                        **(
+                            {"fee_target": ask.fee_target}
+                            if ask.fee_target is not None
+                            else {}
+                        ),
+                    ),
+                    output_fn,
+                    table=table,
+                )
+                return True
+            return _cons_size_plan(
+                session, store, ask.entries, choice, ask.fee_target, line,
+                output_fn, table=table,
+            )
         if ask.kind == "rollup":
             row = ask.rows[choice - 1]
             if row.tag == "":
@@ -3207,60 +3422,85 @@ def _run_consolidation_turn(
         _cons_timing_answer(store, coins, fee_estimator, output_fn)
         return True
     assert intent is not None  # (the guard above: timing returned or did not match)
-    tag, fee_target, small, numbers = intent
+    tag, fee_target, small, numbers, below, label_phrase = intent
     if numbers:
         return _cons_by_numbers(
             session, store, wallet.id, coins, numbers, fee_target, line, output_fn,
             table=table,
         )
-    if small:
-        # TCK-CHAT-002 "consolidate my small utxos": SMALL is defined by
-        # the user's own consolidation target (utxo_target_min_sats over
-        # the §2.3 ladder, resolved fresh exactly like create_tx resolves
-        # it per selection), and the pick rides the EXISTING threshold
-        # handler policy (one privacy pool, larger side wins, honest
-        # other-side note, MAX-inputs cap) — no second state machine. A
-        # malformed settings ladder releases the line to the ordinary
-        # pipeline instead of planning against a half-read policy.
-        try:
-            env_settings = Settings.from_env()
-            policy = resolve_coin_selection_settings(
-                {key: getattr(env_settings, key, "") for key in COIN_SETTING_KEYS},
-                {key: store.get_coin_setting(key) for key in COIN_SETTING_KEYS},
+    # --- resolve the POOL the words name (closed tag > v6 free label) ---
+    pool: tuple[dict[str, object], ...] | None = None
+    pool_display: str | None = None
+    unlabeled_pool = False
+    if tag == "":
+        pool = tuple(c for c in coins if not (c.get("tags") or ()))
+        pool_display = _CONS_ROLLUP_UNLABELED
+        unlabeled_pool = True
+    elif tag is not None:
+        pool = tuple(c for c in coins if tag in (c.get("tags") or ()))
+        pool_display = tag
+    elif label_phrase:
+        # TCK-CONS-003 (4)/(5): a direct label phrase over the v6 address
+        # label sets — resolved through the SHARED _normalize_label_word
+        # (quote-stripping and case-folding come free, the CHAT-009 pinned
+        # contract), EXACT first and substring (LIKE) second, the same
+        # ordering as the listing intercept. A phrase that names no label
+        # anywhere is not a label pick: the line falls through to the
+        # roll-up EXACTLY as an unknown word always has.
+        hit = _cons_label_pool(store, coins, label_phrase)
+        if hit is not None:
+            pool, pool_display = hit
+    if pool is not None and not pool:
+        output_fn(sanitize_tool_output(_CONS_EMPTY))
+        return True
+    # --- TCK-CONS-003: the size dimension (explicit cut, or the ask) ---
+    if below is not None:
+        if pool is None:
+            # Whole-wallet cut ("consolidate utxos smaller than 100001
+            # sats"): the CODE-parsed number rides the EXISTING threshold
+            # handler policy — one privacy pool at a time, larger side
+            # wins, honest other-side note, MAX-inputs cap.
+            _dispatch_code_self_turn(
+                session,
+                line,
+                SelfTransferParams(
+                    mode="consolidate",
+                    below_size_sats=below,
+                    **(
+                        {"fee_target": fee_target}
+                        if fee_target is not None
+                        else {}
+                    ),
+                ),
+                output_fn,
+                table=table,
             )
-        except (ValueError, StoreError, sqlite3.Error):
-            return False
-        _dispatch_code_self_turn(
-            session,
-            line,
-            SelfTransferParams(
-                mode="consolidate",
-                below_size_sats=policy.target_min_sats,
-                **({"fee_target": fee_target} if fee_target is not None else {}),
-            ),
-            output_fn,
+            return True
+        return _cons_size_plan(
+            session, store, pool, below, fee_target, line, output_fn,
             table=table,
         )
-        return True
-    if tag == "":
-        unlabeled = tuple(c for c in coins if not (c.get("tags") or ()))
-        if not unlabeled:
-            output_fn(sanitize_tool_output(_CONS_EMPTY))
-            return True
-        return _cons_open_list(
-            session, store, wallet.id, unlabeled, fee_target, output_fn
+    if small:
+        # TCK-CONS-003 (3): "consolidate small utxos" ASKS which threshold
+        # (one ask, never-trap) instead of silently applying a setting —
+        # the model never authors a number the user did not state. Over a
+        # resolved pool the ask is SCOPED (phrasing 5's label∧size
+        # conjunction: the answer intersects with the pool); the fee rung
+        # persists across it (the RBF-004 lesson).
+        return _cons_open_threshold_ask(
+            session, store, wallet.id, pool, pool_display, fee_target, output_fn
         )
-    if tag is not None:
-        group = tuple(c for c in coins if tag in (c.get("tags") or ()))
-        if not group:
-            output_fn(sanitize_tool_output(_CONS_EMPTY))
-            return True
-        if len(group) == 1:
-            return _cons_finalize(session, group, fee_target, line, output_fn, table=table)
+    if unlabeled_pool:
+        return _cons_open_list(
+            session, store, wallet.id, pool or (), fee_target, output_fn
+        )
+    if pool is not None:
+        if len(pool) == 1:
+            return _cons_finalize(session, pool, fee_target, line, output_fn, table=table)
         session.cons_ask = _ConsAsk(
             kind="count",
-            entries=group,
-            label_display=tag,
+            entries=pool,
+            label_display=pool_display,
             fee_target=fee_target,
             wallet_id=wallet.id,
         )
@@ -3271,6 +3511,148 @@ def _run_consolidation_turn(
         kind="rollup", rows=rows, fee_target=fee_target, wallet_id=wallet.id
     )
     _print_cons_ask(session.cons_ask, output_fn)
+    return True
+
+
+def _cons_label_pool(
+    store: Store,
+    coins: tuple[dict[str, object], ...],
+    phrase: str,
+) -> tuple[tuple[dict[str, object], ...], str] | None:
+    """Resolve ONE label phrase against the store's v6 address label sets
+    (TCK-CONS-003 (4)): normalized through the SHARED
+    :func:`_normalize_label_word` (via :func:`_label_query_form` — quote
+    stripping and case-folding come free, never re-implemented), EXACT
+    membership first, substring (LIKE) second, the same order
+    :func:`_select_coins_by_label` pins. ``(coins, phrase)`` when the
+    phrase names a label stored ANYWHERE (the coins may legitimately be an
+    empty group — the honest "nothing to consolidate" answer, mirroring the
+    closed-tag route); ``None`` = the phrase is not a label at all (store
+    surprise included) → the caller falls through to the roll-up.
+    The consolidation card restates every planned source by FULL address
+    (§3a / glm #7), so a LIKE-won pool needs no separate hedge line — the
+    user reads exactly what would merge."""
+    wanted = _label_query_form([phrase])
+    if not wanted:
+        return None
+    try:
+        label_sets = store.get_address_label_sets()
+    except (StoreError, sqlite3.Error):
+        return None
+    members = [m for ms in label_sets.values() for m in ms]
+    if not _labels_match(members, wanted, exclude=False):
+        if not _labels_match(members, wanted, exclude=False, like=True):
+            return None
+        pool = tuple(
+            c
+            for c in coins
+            if _labels_match(
+                label_sets.get(str(c.get("address") or ""), ()),
+                wanted,
+                exclude=False,
+                like=True,
+            )
+        )
+        return pool, phrase
+    pool = tuple(
+        c
+        for c in coins
+        if _labels_match(
+            label_sets.get(str(c.get("address") or ""), ()), wanted, exclude=False
+        )
+    )
+    return pool, phrase
+
+
+def _cons_size_plan(
+    session: SendSession,
+    store: Store,
+    pool: tuple[dict[str, object], ...],
+    threshold: int,
+    fee_target: str | None,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+) -> bool:
+    """Plan the INTERSECTION of a named pool with a stated size cut
+    (TCK-CONS-003 (5) resolved): coins strictly below the cut, the
+    cross-KYC-pool guard every explicit pick passes (``_cons_by_numbers``'
+    rule — merging one side at a time), then the EXISTING
+    :func:`_cons_finalize` stamp-and-dispatch (the handler's fresh-store
+    revalidation stays the authority; its §3a card restates every FULL
+    address, glm #7). Nothing under the cut is the same honest value-free
+    answer the threshold handler gives; a store surprise releases the line
+    (never-trap, fail closed)."""
+    inter = tuple(c for c in pool if int(str(c["value_sats"])) < threshold)
+    if not inter:
+        output_fn(sanitize_tool_output(_SELF_NOTHING_BELOW))
+        return True
+    try:
+        kyc_side = _kyc_side_addresses(store)
+    except (StoreError, sqlite3.Error):
+        return False
+    sides = {(1 if str(c.get("address")) in kyc_side else 0) for c in inter}
+    if len(sides) > 1:
+        output_fn(sanitize_tool_output(_CONS_POOLS_APART))
+        return True
+    return _cons_finalize(session, inter, fee_target, line, output_fn, table=table)
+
+
+def _cons_open_threshold_ask(
+    session: SendSession,
+    store: Store,
+    wallet_id: int,
+    pool: tuple[dict[str, object], ...] | None,
+    pool_display: str | None,
+    fee_target: str | None,
+    output_fn: Callable[[str], None],
+) -> bool:
+    """Open the ONE threshold ask (TCK-CONS-003 (3)): the head line names
+    the scope when the phrase also carried a label (phrasing 5's
+    conjunction), and the default offer cites the user's OWN effective
+    ``consolidate_below_sat_vb`` — named, with its unit and the supplying
+    rung, read through the CFG-004 ladder seam (a user-owned settings
+    scalar, the read-precedent for quoting it; never a hardcoded constant,
+    never silently applied — the line says plainly it is a fee ceiling, not
+    a size). A malformed ladder rung prints the settings' own honest
+    refusal in the offer's place (the CHAT-009 precedent) — the ask still
+    opens. Any next utterance closes it (never-trap): a number answers,
+    everything else falls through to the ordinary pipeline."""
+    output_fn(
+        sanitize_tool_output(
+            _CONS_THRESHOLD_ASK.format(
+                scope=(
+                    f" among the '{pool_display}' coins"
+                    if pool is not None and pool_display
+                    else ""
+                )
+            )
+        )
+    )
+    key = CONSOLIDATE_BELOW_SAT_VB_SETTING
+    default = _chat_effective_setting(store, key)
+    if isinstance(default, str):
+        output_fn(sanitize_tool_output(default))  # the honest ladder refusal
+    else:
+        label, unit = _CHAT_SETTING_DISPLAY[key]
+        output_fn(
+            sanitize_tool_output(
+                _CONS_THRESHOLD_DEFAULT.format(
+                    label=label,
+                    value=default[0],
+                    unit=unit,
+                    rung=_chat_rung_phrase(default[1], key),
+                )
+            )
+        )
+    session.cons_ask = _ConsAsk(
+        kind="threshold",
+        entries=pool or (),
+        label_display=pool_display,
+        fee_target=fee_target,
+        wallet_id=wallet_id,
+    )
     return True
 
 
@@ -3333,7 +3715,10 @@ def _cons_finalize(
     values = [int(str(c["value_sats"])) for c in coins]
     params_kwargs: dict[str, object] = {
         "mode": "consolidate",
-        "below_size_sats": max(values) + 1,
+        # max+1 floored at the envelope's transport minimum: a dust-value
+        # pick can never trip schema validation at dispatch (the stamped
+        # picked set, not this number, drives the handler's choice).
+        "below_size_sats": max(max(values) + 1, MIN_AMOUNT_SATS),
     }
     if fee_target is not None:
         params_kwargs["fee_target"] = fee_target

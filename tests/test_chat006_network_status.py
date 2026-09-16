@@ -389,7 +389,8 @@ def test_gate_words_keep_the_gate(world) -> None:
     """A status line while a card pends is answered WITHOUT touching the
     flow or the gate vocabulary, and the gate's own words ("sign",
     "yes") never match the status matchers."""
-    _ask(world, "consolidate my small utxos")
+    _ask(world, "consolidate my small utxos")  # TCK-CONS-003: the ONE ask
+    _ask(world, "100000")  # ...answered, and the plan pends
     assert world["flow"].state is TxFlowStatus.CREATED
     assert app._fees_now_ask("sign") is False
     assert app._block_height_ask("yes") is False
