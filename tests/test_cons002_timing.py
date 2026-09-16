@@ -103,15 +103,20 @@ def test_wait_branch_elevated_slow_bid(world) -> None:
 
 
 def test_act_branch_at_or_below_average(world) -> None:
-    """slow 2.0 (200c) <= avg 3.33 (333c) → ACT. The fold clause is
-    switched OFF by the user's OWN target (no coins under 1000 sats), so
-    the average comparison is what answers (integer boundary: EQUAL slow
-    and avg is ACT, never WAIT — pinned separately)."""
+    """TCK-FEE-006 RE-PIN: this payload (B₀ 8.0, then a cliff to 2.0) once
+    acted on the strength of a slow bid BELOW the next block's floor
+    (B₁ 2.0 = 200c <= avg 333c). Under the corrected policy floor a
+    target-follower bid never undercuts the projected next block's OWN
+    bottom: slow lifts to 800c, sits ABOVE the six-hour average, and the
+    answer is WAIT. (The ACT branch stays pinned on projections that do
+    not undercut themselves: test_act_boundary_equal_bids_is_not_wait.)
+    The fold clause is switched OFF by the user's OWN target (no coins
+    under 1000 sats), so the average comparison is what answers."""
     _labeled(world)
     world["store"].set_coin_setting("utxo_target_min_sats", "1000")
     world["state"]["mempool_blocks"] = _blocks([8.0, 2.0, 2.0, 2.0, 2.0, 2.0])
     outs, *_ = _ask(world, "should I consolidate now")
-    assert outs == [app._CONS_TIMING_ACT, app._CONS_TIMING_BYPASS]
+    assert outs == [app._CONS_TIMING_WAIT, app._CONS_TIMING_BYPASS]
 
 
 def test_act_boundary_equal_bids_is_not_wait(world) -> None:

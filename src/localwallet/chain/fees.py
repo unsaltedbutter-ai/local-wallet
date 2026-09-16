@@ -10,13 +10,16 @@ USER SPEC 2026-09-12, refining the TCK-FEE-001 floor-follower):
    ``B₁`` = second block's bottom. Rates are **integer centisat/vB**
    (1 sat/vB = 100; ``121`` renders as ``1.21``):
 
-   =================  ==========================================================
-   ``FeeTarget``      rate
-   =================  ==========================================================
-   ``FAST`` (faster)  ``2 × MEDIUM`` (doubling of the ROUNDED target); every
-                      rung is then MAX'd with the min-relay floor below
-                      (section 3) — the old FAST-only ``minimumFee`` floor
-                      (FEE-001) is generalized to all rungs
+    =================  ==========================================================
+    ``FeeTarget``      rate
+    =================  ==========================================================
+    ``FAST`` (faster)  ``2 × MEDIUM`` (doubling of the ROUNDED target); every
+                       rung is then MAX'd with the policy floor below
+                       (section 3): on the target-follower shape that is
+                       ``max(B₀ ceil-2dp, relay floor)`` — the projected
+                       next block's OWN bottom (TCK-FEE-006); the coarse
+                       whole-sat ``minimumFee`` lifts rungs on the
+                       FALLBACK shape only
    ``MEDIUM`` (the   ``B₀ × 1.15`` rounded HALF-EVEN to 2 decimals, clamped up
     target)          so it is never below ``B₀`` itself (a floor never
                       undercuts its source)
@@ -99,15 +102,20 @@ USER SPEC 2026-09-12, refining the TCK-FEE-001 floor-follower):
      own build gates enforce — a node answering lower cannot license a
      bid our builder would refuse.
 
-   Two consumers, two deliberately DIFFERENT floors (the code-review
-   MAJOR: a congestion figure must never out-veto the node's relay floor
-   on an EXPLICIT bid):
+    Two consumers, deliberately DIFFERENT floors (the code-review MAJOR:
+    a congestion figure must never out-veto the node's relay floor on an
+    EXPLICIT bid):
 
-   * **policy rungs** (``estimate``): congestion-informed — every rung is
-     MAX'd with ``max(minimumFee×100, relay floor)`` on the
-     Esplora/publicinfo path (the next-block congestion bound is a
-     legitimate POLICY bid floor, FEE-003-sanctioned) and with the relay
-     floor alone on the backend-native path (no minimumFee exists there).
+    * **policy rungs** (``estimate``): every rung is MAX'd with the
+      POLICY floor (TCK-FEE-006 re-adjudication of the FEE-004 rule).
+      On the TARGET-FOLLOWER shape the floor is
+      ``max(B₀ ceil-2dp, relay floor)`` — the projected next block's own
+      bottom IS the next-block floor; mempool.space's coarse whole-sat
+      ``minimumFee`` (= typically 1) lifted EVERY rung to 1 sat/vB and
+      priced sub-1 congestion policy bids out of existence, so it is
+      DEMOTED to the FALLBACK shape (mempool-blocks unavailable), where
+      the floor stays ``max(minimumFee×100, relay floor)``. The relay
+      floor alone on the backend-native path (no minimumFee exists there).
    * **the EXPLICIT-rate seam** (``clamp_to_min_relay_floor``): the RELAY
      floor ONLY — node capability, else the assumed constant; NEVER
      ``minimumFee``. An explicit 1 sat/vB bids 1 THROUGH congestion
@@ -404,6 +412,12 @@ class _Snapshot:
     estimates: dict[FeeTarget, FeeEstimate]
     minimum_fee_sat_vb: int
     fetched_at: float
+    #: TCK-FEE-006: the projected NEXT block's own bottom (block-0
+    #: ``feeRange[0]``, ceil at 2 dp so no bid undercuts it) in integer
+    #: centisat/vB — the POLICY floor on the target-follower shape
+    #: (``minimumFee`` is demoted to the fallback shape). ``None``
+    #: everywhere else: a fallback or native snapshot has no projection.
+    next_block_floor_centisat_vb: int | None = None
     #: True when the bids came from a backend-native ``estimate_fee`` (no
     #: Esplora endpoints existed): ``minimum_fee_sat_vb`` has no value to
     #: serve and refuses instead of fabricating one.
@@ -515,14 +529,15 @@ class FeeEstimator:
     def _get_snapshot(self) -> _Snapshot:
         """Return the cache if fresh, otherwise fetch + parse + clamp + cache.
 
-        Every snapshot leaves here with each rung MAX'd against the
-        congestion-informed POLICY floor (TCK-FEE-004 + code-review fix):
-        the native path uses the relay floor (:meth:`_relay_floor_centisat_
-        vb`, no minimumFee exists there), the Esplora/publicinfo path
-        ``max(minimumFee×100, relay floor)`` — the next-block congestion
-        bound is a legitimate POLICY bid floor (FEE-003-sanctioned) and the
-        node's floor participates (MAX in) when one is wired. A degraded
-        target-follower attempt clamps the fallback snapshot the same way.
+        Every snapshot leaves here with each rung MAX'd against the POLICY
+        floor (TCK-FEE-004, re-adjudicated by TCK-FEE-006): the native path
+        uses the relay floor (:meth:`_relay_floor_centisat_vb`, no
+        minimumFee exists there); the TARGET-FOLLOWER shape takes
+        ``max(the projected next block's own bottom, relay floor)`` — the
+        coarse whole-sat ``minimumFee`` no longer out-prices sub-1
+        congestion bids; the FALLBACK shape (mempool-blocks unavailable)
+        keeps the congestion-informed ``max(minimumFee×100, relay floor)``.
+        The node's floor always participates (MAX in) when one is wired.
         """
         now = _now()
         if self._cache is not None and now - self._cache.fetched_at < self._ttl_s:
@@ -541,10 +556,18 @@ class FeeEstimator:
             snapshot = self._target_follower(recommended.minimum_fee_sat_vb, now)
         except ChainError:
             snapshot = recommended  # fail-closed degrade; value-free, never logged
-        snapshot = _apply_floor(
-            snapshot,
-            max(snapshot.minimum_fee_sat_vb * 100, self._relay_floor_centisat_vb()),
-        )
+        if snapshot.next_block_floor_centisat_vb is None:
+            # FALLBACK shape: minimumFee is a floor HERE ONLY (TCK-FEE-006
+            # demotion — on the target-follower branch below, the projected
+            # block's own bottom is the honest next-block figure).
+            policy_floor_c = max(
+                snapshot.minimum_fee_sat_vb * 100, self._relay_floor_centisat_vb()
+            )
+        else:
+            policy_floor_c = max(
+                snapshot.next_block_floor_centisat_vb, self._relay_floor_centisat_vb()
+            )
+        snapshot = _apply_floor(snapshot, policy_floor_c)
         self._cache = snapshot
         return snapshot
 
@@ -591,11 +614,13 @@ class FeeEstimator:
           block ⇒ ``B₀`` itself).
 
         Then :func:`_apply_floor` (applied by the caller) MAXes EACH rung
-        independently with the source's min-relay floor — FEE-001's
-        old "minimumFee bounds the FAST rung only" rule is generalized to
-        every rung (TCK-FEE-004 pinned semantics: a sub-floor bid never
-        leaves this module; the ladder can collapse onto the floor and
-        that is honest, it cannot bid under it).
+        independently with the POLICY floor ``max(B₀ ceil-2dp, relay
+        floor)`` (TCK-FEE-006: the projected next block's OWN bottom, not
+        the coarse minimumFee; TCK-FEE-004 pinned semantics kept — a
+        sub-floor bid never leaves this module; the ladder can collapse
+        onto the floor and that is honest, it cannot bid under it). B₀
+        rides the snapshot as :attr:`_Snapshot.next_block_floor_centisat_
+        vb` for the floor and for honest narration.
 
         With the parser's non-increasing-bottoms rule (``B₀ >= B₁``) this
         makes ``FAST >= MEDIUM >= SLOW`` a code invariant. All rounding is
@@ -609,9 +634,10 @@ class FeeEstimator:
             self._client.get_json(_MEMPOOL_BLOCKS_PATH, _MEMPOOL_BLOCKS_KIND),
             _MEMPOOL_BLOCKS_KIND,
         )
+        next_block_floor_c = _to_cents(bottoms[0], ROUND_CEILING)
         target_c = _to_cents(bottoms[0] * _TARGET_MARKUP, ROUND_HALF_EVEN)
         if Decimal(target_c).scaleb(-2) < bottoms[0]:  # rounding dipped under the floor
-            target_c = _to_cents(bottoms[0], ROUND_CEILING)
+            target_c = next_block_floor_c
         slow_c = _to_cents(bottoms[1] if len(bottoms) > 1 else bottoms[0], ROUND_CEILING)
         fast_c = 2 * target_c
         window = bottoms[:_SIX_HOUR_PROJECTED_BLOCKS]
@@ -634,6 +660,7 @@ class FeeEstimator:
             minimum_fee_sat_vb=minimum_fee_sat_vb,
             fetched_at=now,
             avg_low_centisat_vb=avg_c,
+            next_block_floor_centisat_vb=next_block_floor_c,
         )
 
     def estimate(self, target: FeeTarget) -> FeeEstimate:
@@ -641,9 +668,12 @@ class FeeEstimator:
         = 100), cached by TTL. Format with :func:`format_sat_vb` for display.
 
         TCK-FEE-004: the returned bid is already floored — every rung leaves
-        the snapshot layer as ``MAX(policy rung, min-relay floor)``; check
-        :attr:`FeeEstimate.clamped` to narrate a floor-raised rung once,
-        honestly (the displayed rate IS the floor then).
+        the snapshot layer as ``MAX(policy rung, policy floor)`` (the
+        next-block bottom on the target-follower shape, the congestion
+        minimumFee on the fallback — TCK-FEE-006; the relay floor always
+        participates); check :attr:`FeeEstimate.clamped` to narrate a
+        floor-raised rung once, honestly (the displayed rate IS the floor
+        then).
         """
         if not isinstance(target, FeeTarget):
             raise TypeError("target must be a FeeTarget")
@@ -718,6 +748,10 @@ class FeeEstimator:
     def minimum_fee_sat_vb(self) -> int:
         """Return the ``minimumFee`` field (sats/vB), cached by TTL.
 
+        TCK-FEE-006: its POLICY role is the FALLBACK-shape floor only —
+        with projected blocks available the next block's own bottom
+        (:meth:`next_block_floor_centisat_vb`) is the honest floor.
+
         Raises:
             ChainError: On the backend-native path — a non-Esplora backend
                 exposes no separate minimum-fee figure and we never invent
@@ -728,6 +762,26 @@ class FeeEstimator:
         if snapshot.native:
             raise ChainError("fees-native backend exposes no minimum-fee endpoint")
         return snapshot.minimum_fee_sat_vb
+
+    def next_block_floor_centisat_vb(self) -> int | None:
+        """The projected next block's OWN bottom (block-0 ``feeRange[0]``,
+        ceil at 2 dp), integer centisat/vB — the TCK-FEE-006 policy floor
+        on the target-follower shape, retained on the one cached snapshot
+        (zero extra endpoint calls).
+
+        ``None`` means NO projection: the cached snapshot came from the
+        recommended-fees FALLBACK (the coarse ``minimumFee`` is the floor
+        there, and narration must say so) or is otherwise block-data-less.
+
+        Raises:
+            ChainError: On the backend-native path, mirroring
+                :meth:`minimum_fee_sat_vb` — no such endpoint figure
+                exists and we never invent one.
+        """
+        snapshot = self._get_snapshot()
+        if snapshot.native:
+            raise ChainError("fees-native backend exposes no projected-block floor")
+        return snapshot.next_block_floor_centisat_vb
 
     def invalidate(self) -> None:
         """Drop the cached payload AND the cached relay floor; the next

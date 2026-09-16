@@ -2694,8 +2694,10 @@ def _send_chain_handler(
             if state.get("fees_fail"):
                 return httpx.Response(500, json=None)
             # TCK-FEE-004 seam: ``state["fees_payload"]`` overrides the
-            # recommended body (a higher minimumFee drives the min-relay
-            # floor clamp); absent = the historical payload, byte-identical.
+            # recommended body (a higher minimumFee drives the congestion
+            # floor clamp ON THE FALLBACK SHAPE this default fixture is —
+            # TCK-FEE-006 demoted minimumFee to exactly that role); absent
+            # = the historical payload, byte-identical.
             fees_payload = state.get("fees_payload")
             if fees_payload is not None:
                 return httpx.Response(200, json=fees_payload)
@@ -3885,33 +3887,30 @@ def test_explicit_rate_fresh_create_bids_the_literal_rate(
 def test_ladder_rung_under_the_floor_is_clamped_up_and_narrated(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """TCK-FEE-004 done-when END TO END (the user's live failure: "send
-    100000 sats to bc1q… -> psbt_failed (fee is below the min-relay floor
-    for this transaction size)"): the projected blocks bottom UNDER the
-    build floor (B0 0.3 / B1 0.28), and the fixture's RECOMMENDED payload
-    carries minimumFee 1 sat/vB — so the MAX(rung, floor) clamp lifts the
-    used MEDIUM rung to exactly 1 sat/vB and the card narrates the floor
-    once. No psbt_failed, no sub-floor bid, ever.
+    """TCK-FEE-006 RE-PIN of the FEE-004/005 end-to-end clamp story on the
+    user's live congestion shape: the projected next block bottoms at 0.34
+    (second block 0.31) while the recommended payload's coarse whole-sat
+    minimumFee is 1. The superseded wiring lifted EVERY rung to 1 sat/vB
+    and called it "the minimum to confirm in the next block" — a narration
+    lie (the next block's own floor IS 0.34). Now:
 
-    TCK-FEE-005 RECOMPUTES THE ATTRIBUTION of this exact pin: the lift
-    here comes from the CONGESTION floor (FEE-003-sanctioned
-    max(minimumFee x 100, relay floor) — minimumFee 1 IS the binding
-    figure), NOT from the assumed min-relay rail, which the user's node
-    (and Core's policy.h default) answers at 0.1 sat/vB = 10 centisat.
-    At the corrected rail the user's original 0.34 bid would itself
-    relay — the engine gate refuses only bids under ceil(vsize x 0.1)
-    (pinned in tests/test_tx_fractional_fees.py); a sub-1 policy bid
-    still surfaces AT 1 sat/vB on this fixture because the payload's
-    congestion minimumFee out-vetoes the rail, and that is POLICY, not
-    a relay fact. One source of truth: rail == gate default == 10
-    centisat/vB (pinned in tests/test_tx_dust.py)."""
+    * the default MEDIUM bid is B₀ x 1.15 = 0.391 -> 0.39 sat/vB — sub-1,
+      UNCLAMPED, and the floor note exists to explain a CLAMPED bid, so
+      the card carries NO note here (honest per the note's purpose);
+    * the SLOW rung (B₁ 0.31) sits under the next block's OWN bottom: it
+      lifts to exactly 0.34, flagged, and the note names the projected
+      next block's floor — never "congestion", never "min-relay".
+
+    Still true from FEE-004/005: no psbt_failed, no sub-floor bid ever
+    (the 10-centisat relay rail MAXes in), and one source of truth for
+    the rail (pinned in tests/test_tx_dust.py)."""
     addr0 = derive_fixture_addresses(1)[0]
     state = {
         "mempool_blocks": [
             {"blockSize": 1_000_000, "medianFee": 0.6,
-             "feeRange": [0.3, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]},
+             "feeRange": [0.34, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]},
             {"blockSize": 1_000_000, "medianFee": 0.56,
-             "feeRange": [0.28, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]},
+             "feeRange": [0.31, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]},
         ]
     }
     table = _build_send_table(
@@ -3921,21 +3920,86 @@ def test_ladder_rung_under_the_floor_is_clamped_up_and_narrated(
     )[0]
     result = table[IntentName.CREATE_TX](validate_payload(_create_tx_envelope_json()))
     assert result.get("error") is None
-    assert result["fee_rate_centisat_vb"] == 100  # 0.34 lifted to the floor
-    assert result["fee_sats"] == SEND_VSIZE  # ceil(141 x 100/100) == floor fee
-    assert result["fee_floor_note"] is True
-    # TCK-SWAP-001 rider (FEE-004 ledger MINOR): the note NAMES the binding
-    # floor. This lift comes from the payload's congestion minimumFee (the
-    # assumed rail is 0.1 sat/vB since FEE-005) — the honest line is the
-    # congestion one, and the "min-relay"/"lowest rate this wallet builds"
-    # claim is gone.
-    assert result["fee_floor_source"] == "congestion"
+    assert result["fee_rate_centisat_vb"] == 39  # 0.34 x 1.15 -> 0.39, NOT 1
+    assert result["fee_sats"] == -(-SEND_VSIZE * 39 // 100) == 55
+    assert "fee_floor_note" not in result  # unclamped bid: nothing to explain
     lines: list[str] = []
     app_module._print_create_tx(result, lines.append)
+    assert not any("Note:" in ln and "floor" in ln for ln in lines), lines
+
+    slower = table[IntentName.CREATE_TX](_requote_envelope("slow"))
+    assert slower.get("error") is None
+    assert slower["fee_rate_centisat_vb"] == 34  # 0.31 lifted to the bottom
+    assert slower["fee_floor_note"] is True
+    assert slower["fee_floor_source"] == "next_block"
+    lines = []
+    app_module._print_create_tx(slower, lines.append)
     assert any(
-        "congestion floor" in ln and "1 sat/vB" in ln for ln in lines
+        "next block's own floor" in ln and "0.34 sat/vB" in ln for ln in lines
     ), lines
+    assert not any("congestion floor" in ln for ln in lines), lines
     assert not any("min-relay" in ln for ln in lines), lines
+
+
+def test_fallback_shape_keeps_the_minimum_fee_congestion_floor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TCK-FEE-006's demotion REMEDY: with mempool-blocks unavailable the
+    estimator bids the recommended mapping and minimumFee is the floor
+    again — hourFee 1 under minimumFee 2 lifts the SLOW rung to 2 sat/vB,
+    and the note names the fee source's CONGESTION floor (never the
+    next-block wording — no projection exists to promise a floor)."""
+    addr0 = derive_fixture_addresses(1)[0]
+    state = {
+        "fees_payload": {
+            "fastestFee": 4, "halfHourFee": 3, "hourFee": 1,
+            "economyFee": 1, "minimumFee": 2,
+        }
+    }  # no "mempool_blocks" -> 404 -> fallback shape (the historical wiring)
+    table = _build_send_table(
+        lambda rec: _send_chain_handler(
+            rec, utxos_by_addr={addr0: [SEND_UTXO]}, state=state
+        )
+    )[0]
+    result = table[IntentName.CREATE_TX](validate_payload(_create_tx_envelope_json()))
+    assert result.get("error") is None
+    assert result["fee_rate_centisat_vb"] == 300  # halfHourFee 3 clears the 2 floor
+    assert "fee_floor_note" not in result
+    slower = table[IntentName.CREATE_TX](_requote_envelope("slow"))
+    assert slower["fee_rate_centisat_vb"] == 200  # hourFee 1 lifted to minimumFee 2
+    assert slower["fee_floor_note"] is True
+    assert slower["fee_floor_source"] == "congestion"
+    lines: list[str] = []
+    app_module._print_create_tx(slower, lines.append)
+    assert any(
+        "congestion floor" in ln and "2 sat/vB" in ln for ln in lines
+    ), lines
+    assert not any("next block's own floor" in ln for ln in lines), lines
+
+
+def test_policy_floor_source_names_the_actually_binding_floor() -> None:
+    """TCK-FEE-006 unit pin of the attribution seam: next-block bottom on
+    the target-follower shape, congestion minimumFee ONLY on the fallback,
+    relay whenever the bid clears the public figure, and relay-only when
+    the backend exposes no public fee payload at all (ChainError)."""
+
+    class _Est:
+        def __init__(self, next_block: int | None, minimum: int | None) -> None:
+            self._next, self._min = next_block, minimum
+
+        def next_block_floor_centisat_vb(self) -> int | None:
+            return self._next
+
+        def minimum_fee_sat_vb(self) -> int:
+            if self._min is None:
+                raise app_module.ChainError("native")
+            return self._min
+
+    assert app_module._policy_floor_source(_Est(34, 1), 34) == "next_block"
+    assert app_module._policy_floor_source(_Est(34, 1), 50) == "relay"
+    assert app_module._policy_floor_source(_Est(None, 2), 200) == "congestion"
+    assert app_module._policy_floor_source(_Est(None, 2), 250) == "relay"
+    assert app_module._policy_floor_source(_Est(None, None), 100) == "relay"
 
 
 def test_fee_floor_note_neutral_fallback_for_unknown_source() -> None:

@@ -1676,18 +1676,21 @@ _CARD_RATE_FLOOR: Final[str] = (
 #: TCK-FEE-004 min-relay clamp line: printed ONCE under the card's Fee line
 #: whenever the bid this card shows was RAISED to a floor (never a silent
 #: alteration of a stated or recommended rate). TCK-FEE-004 ledger MINOR
-#: (critique-confirmed, TCK-SWAP-001 rider): the lift has THREE possible
-#: sources — the node's advertised relay fee, the ASSUMED rail every build
-#: gate enforces, or the fee source's congestion ``minimumFee`` — and the
-#: line must name the RIGHT one: "min-relay floor … the lowest rate this
-#: wallet builds at" was a narration lie on the congestion rung (an explicit
-#: bid legitimately builds BELOW a congestion minimumFee — the explicit-rate
-#: seam clamps to the RELAY floor only). The handler therefore stamps the
-#: closed source beside the marker and :func:`_fee_floor_note_line` picks the
-#: honest sentence; the source-neutral fallback stays FEE-004's framing
-#: ("the floor this wallet enforces" is honest for all three sources). The
-#: quoted rate is verbatim from the result's own fee_rate_display; no
-#: amounts.
+#: (critique-confirmed, TCK-SWAP-001 rider): the line must name the RIGHT
+#: floor — the lift comes from the node's relay fee / the ASSUMED rail
+#: (relay), the projected next block's own bottom (next_block — TCK-FEE-006),
+#: or the fee source's congestion ``minimumFee`` (congestion, FALLBACK shape
+#: only) — and "min-relay floor … the lowest rate this wallet builds at"
+#: was a narration lie on the non-relay rungs (an explicit bid legitimately
+#: builds BELOW them — the explicit-rate seam clamps to the RELAY floor
+#: only). TCK-FEE-006 also retired the old congestion sentence's "minimum
+#: to confirm in the next block" claim: with projections live the next-
+#: block floor is the block's own feeRange bottom, NOT the coarse whole-sat
+#: minimumFee. The handler therefore stamps the closed source beside the
+#: marker and :func:`_fee_floor_note_line` picks the honest sentence; the
+#: source-neutral fallback stays FEE-004's framing ("the floor this wallet
+#: enforces" is honest for every source). The quoted rate is verbatim from
+#: the result's own fee_rate_display; no amounts.
 _CARD_FEE_FLOOR_NOTE: Final[str] = (
     "Note: the floor this wallet enforces is {rate} sat/vB — the fee uses it."
 )
@@ -1695,10 +1698,14 @@ _CARD_FEE_FLOOR_NOTE_RELAY: Final[str] = (
     "Note: the min-relay floor is {rate} sat/vB — no transaction can build "
     "below it, so the fee uses it."
 )
-_CARD_FEE_FLOOR_NOTE_CONGESTION: Final[str] = (
-    "Note: your fee source's minimum to confirm in the next block is {rate} "
-    "sat/vB — the congestion floor under recommended rates, so the fee "
+_CARD_FEE_FLOOR_NOTE_NEXT_BLOCK: Final[str] = (
+    "Note: the projected next block's own floor is {rate} sat/vB — the fee "
     "uses it."
+)
+_CARD_FEE_FLOOR_NOTE_CONGESTION: Final[str] = (
+    "Note: your fee source's congestion floor is {rate} sat/vB — the "
+    "minimum it quotes under recommended rates (no projection was "
+    "available), so the fee uses it."
 )
 #: The closed set :attr:`_CARD_FEE_FLOOR_NOTE_*` sentences are keyed by
 #: (display-only, rides the result as ``fee_floor_source`` next to
@@ -1706,23 +1713,32 @@ _CARD_FEE_FLOOR_NOTE_CONGESTION: Final[str] = (
 #: line — fail-closed honesty, never a guess at which floor it was).
 _CARD_FEE_FLOOR_NOTES: Final[dict[str, str]] = {
     "relay": _CARD_FEE_FLOOR_NOTE_RELAY,
+    "next_block": _CARD_FEE_FLOOR_NOTE_NEXT_BLOCK,
     "congestion": _CARD_FEE_FLOOR_NOTE_CONGESTION,
 }
 
 
 def _policy_floor_source(fee_estimator: FeeEstimator, rate_centisat_vb: int) -> str:
     """Which floor raised a clamped POLICY rung (TCK-FEE-004 ledger MINOR,
-    the TCK-SWAP-001 rider): the estimator MAXes every recommended bid with
-    ``MAX(congestion minimumFee, relay floor)``, so the winning figure is
-    the one the finalized bid EQUALS — a bid AT the fee source's next-block
-    minimum is a congestion lift; anything strictly above it was raised by
-    the relay floor. The backend-native path has no congestion figure
-    (``minimum_fee_sat_vb`` raises ChainError) — there the only floor that
-    ever clamps is the relay one. Value-free: answers a closed source NAME.
-    A relay/congestion TIE lands on ``congestion``, which is honest (the
-    congestion floor did lift the bid to that figure — whether the relay
-    floor agrees is not a claim either sentence makes)."""
+    the TCK-SWAP-001 rider, re-adjudicated by TCK-FEE-006): the estimator
+    MAXes every rung with ``max(next-block bottom, relay floor)`` on the
+    target-follower shape and ``max(congestion minimumFee, relay floor)``
+    on the FALLBACK shape, so the winning figure is the one the finalized
+    bid EQUALS — a bid AT the projected next block's own bottom is a
+    next-block lift, one AT the coarse minimumFee (which only floors
+    fallback-shape bids) is a congestion lift, and anything strictly above
+    both was raised by the relay floor. The backend-native path has no
+    public fee figure at all (the accessors raise ChainError) — there the
+    only floor that ever clamps is the relay one. Value-free: answers a
+    closed source NAME. A relay tie lands on the congestion/next-block
+    source, which is honest (that floor did lift the bid to that figure —
+    whether the relay floor agrees is not a claim either sentence makes).
+    The clamped bid is the floor itself, so these equality checks are the
+    applied floor, never a coincidence."""
     try:
+        next_block_c = fee_estimator.next_block_floor_centisat_vb()
+        if next_block_c is not None:
+            return "next_block" if rate_centisat_vb == next_block_c else "relay"
         minimum_centisat_vb = fee_estimator.minimum_fee_sat_vb() * 100
     except ChainError:
         return "relay"
@@ -19593,9 +19609,10 @@ def _fee_floor_note_line(result: Mapping[str, object]) -> str | None:
     ``fee_rate_display`` (the clamped bid IS the floor). Fail-closed like
     every card segment: no figure, no line — the floor is never narrated as
     a number the result does not carry. The sentence NAMES the floor the
-    handler stamped (``fee_floor_source``: relay vs congestion — the FEE-004
-    ledger MINOR: only the relay floor is "the lowest rate that builds");
-    a missing/unknown source takes the honest source-neutral line."""
+    handler stamped (``fee_floor_source``: relay vs congestion vs
+    next_block — the FEE-004 ledger MINOR: only the relay floor is "the
+    lowest rate that builds"); a missing/unknown source takes the honest
+    source-neutral line."""
     if result.get("fee_floor_note") is not True:
         return None
     rate = _card_fee_rate_text(result)

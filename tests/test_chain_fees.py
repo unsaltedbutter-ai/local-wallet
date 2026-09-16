@@ -439,14 +439,17 @@ def test_user_payload_pins_target_faster_slower():
     # 1.05567928730512 -> TARGET = 1.0557 x 1.15 = 1.21403... -> "We should
     # offer 1.21" (normal 2-dp rounding, NOT ceil-to-1.22); FASTER = 2 x
     # 1.21 = 2.42 EXACTLY (the doubling acts on the rounded target); SLOWER
-    # = block2 feeRange[0] = 1.0, no markup.
+    # = block2 feeRange[0] = 1.0, no markup — then TCK-FEE-006: the SLOW
+    # rung sits UNDER the projected next block's own bottom (ceil-2dp of
+    # B₀ = 1.06), so the policy floor lifts it to 1.06 (the minimumFee 1
+    # of the payload no longer participates on this shape).
     rates = _rates(RoutedServer(_floor_routes()))
     assert rates[FeeTarget.MEDIUM] == 121
     assert rates[FeeTarget.FAST] == 242
-    assert rates[FeeTarget.SLOW] == 100
+    assert rates[FeeTarget.SLOW] == 106  # 1.0 lifted to the next-block floor
     assert format_sat_vb(rates[FeeTarget.MEDIUM]) == "1.21"
     assert format_sat_vb(rates[FeeTarget.FAST]) == "2.42"
-    assert format_sat_vb(rates[FeeTarget.SLOW]) == "1"
+    assert format_sat_vb(rates[FeeTarget.SLOW]) == "1.06"
 
 
 def test_user_case_source_is_target_follower():
@@ -458,28 +461,32 @@ def test_user_case_source_is_target_follower():
 
 
 def test_target_never_undercuts_its_own_floor():
-    # Two nested protections, pinned since TCK-FEE-004:
+    # Two nested protections:
     #  * INTERNAL (policy v2): rounding dips under B₀ only for tiny bottoms
     #    (0.15 x B₀ < 0.005): B₀ = 0.021 -> 0.02415 -> half-even would say
     #    0.02 < the floor -> the target clamp lifts to ceil-2dp (0.03);
-    #  * MIN-RELAY FLOOR (TCK-FEE-004): every rung then MAXes with the
-    #    source floor (minimumFee 1 sat/vB here), so the sub-1 policy rungs
-    #    all surface AT the floor — a bid below what relays accept never
-    #    leaves this module (the live psbt_failed this ticket fixed).
+    #  * POLICY FLOOR (TCK-FEE-004, re-adjudicated by TCK-FEE-006): every
+    #    rung then MAXes with max(next-block bottom, relay rail) — on the
+    #    TARGET-FOLLOWER shape the whole-sat minimumFee 1 lifts NOTHING
+    #    (it is demoted to the fallback shape), so the sub-1 rungs surface
+    #    AT the 0.1 sat/vB relay rail (TCK-FEE-005): a bid below what
+    #    relays accept still never leaves this module (the live
+    #    psbt_failed FEE-004 fixed), it just no longer overpays 10x.
     rates = _rates(
         RoutedServer(_floor_routes(projected=_projected_payload([0.021] * 8)))
     )
-    assert rates[FeeTarget.MEDIUM] == 100  # 3 lifted to the min-relay floor
-    assert rates[FeeTarget.SLOW] == 100  # 3 lifted to the min-relay floor
-    assert rates[FeeTarget.FAST] == 100  # max(2 x 3, minimumFee 1 sat/vB)
+    assert rates[FeeTarget.MEDIUM] == 10  # 3 lifted to the 10c relay rail
+    assert rates[FeeTarget.SLOW] == 10  # 3 lifted to the 10c relay rail
+    assert rates[FeeTarget.FAST] == 10  # max(2 x 3, the 10c relay rail)
 
 
 def test_half_even_rounding_ties():
     # Decimal ROUND_HALF_EVEN at 2dp, pinned on the exact tie B₀=2.3:
     # 2.3 x 1.15 = 2.645 -> ties-to-even -> 2.64 (2.65 would be half-up).
-    # (The tie stays above the 1 sat/vB min-relay floor so the clamp cannot
-    # mask it — the sub-1 tie case 0.3 -> 0.345 -> 0.34 now clamps to the
-    # floor and is pinned in test_min_relay_clamp_*.)
+    # (The tie stays above every floor here — B₀ 2.3, rail 0.1 — so the
+    # clamp cannot mask it; the sub-1 tie case 0.3 -> 0.345 -> 0.34 now
+    # bids UNCLAMPED at 34, pinned in
+    # test_live_2026_09_07_case_still_bids_at_most_1_sat_vb.)
     rates = _rates(
         RoutedServer(
             _floor_routes(
@@ -499,13 +506,12 @@ def test_single_projected_block_slow_is_the_floor_itself():
     assert rates[FeeTarget.SLOW] == 450  # 4.5 exactly, no markup
 
 
-def test_minimum_fee_floor_clamps_every_rung():
-    # TCK-FEE-004 SUPERSEDES FEE-001's "minimumFee bounds the FAST rung
-    # only" rule: the publicinfo payload's minimumFee is the floor FOR THAT
-    # SOURCE, and EACH rung is MAX'd with it independently (pinned
-    # semantics). B₀ = 0.4 -> policy 46/92/35, minimumFee 5 -> every rung
-    # lifts to 500 (the ladder collapses onto the floor and that is
-    # honest — sub-floor bids simply fail at the node).
+def test_minimum_fee_does_not_lift_target_follower_rungs():
+    # TCK-FEE-006 RE-ADJUDICATION (re-pins the FEE-004 "minimumFee clamps
+    # every rung" choice): over a live projection the coarse whole-sat
+    # minimumFee (5 sat/vB here) lifts NOTHING — the floor is the next
+    # block's OWN bottom (ceil-2dp of B₀ 0.4 = 40): MEDIUM 46 and FAST 92
+    # stand, SLOW 35 lifts to 40 (the bottom, never minimumFee's 500).
     rates = _rates(
         RoutedServer(
             _floor_routes(
@@ -514,27 +520,75 @@ def test_minimum_fee_floor_clamps_every_rung():
             )
         )
     )
+    assert rates[FeeTarget.MEDIUM] == 46
+    assert rates[FeeTarget.FAST] == 92
+    assert rates[FeeTarget.SLOW] == 40
+
+
+def test_minimum_fee_floor_clamps_every_rung_on_the_fallback_shape():
+    # The demotion keeps the FALLBACK: with no projected-block data
+    # (mempool-blocks unrouted), minimumFee is the source's whole-ladder
+    # floor (FEE-004 semantics live on only here): rungs 300/200/100 with
+    # minimumFee 5 all lift to 500 (the ladder collapses onto the floor
+    # and that is honest — sub-floor bids simply fail at the node).
+    routes = _floor_routes(
+        recommended={
+            "fastestFee": 3, "halfHourFee": 2, "hourFee": 1,
+            "economyFee": 1, "minimumFee": 5,
+        }
+    )
+    del routes["/v1/fees/mempool-blocks"]  # 404 -> recommended fallback
+    rates = _rates(RoutedServer(routes))
     assert rates[FeeTarget.MEDIUM] == 500
     assert rates[FeeTarget.FAST] == 500
     assert rates[FeeTarget.SLOW] == 500
 
 
+def test_user_live_congestion_payload_bids_below_one_sat_vb():
+    # TCK-FEE-006's motivating live shape (the user's mempool payloads):
+    # /v1/fees/recommended is the flat whole-sat body (every rung and the
+    # minimumFee at 1 sat/vB) while the projected next block bottoms at
+    # 0.34 (second block 0.31). The old wiring pinned the whole ladder AT
+    # 1 sat/vB; the correction bids the POLICY values — MEDIUM = 0.34 x
+    # 1.15 = 0.391 -> 0.39, FAST 0.78, SLOW 0.31 lifted to the next
+    # block's own bottom 0.34 — every bid under 1 sat/vB, none under the
+    # floor the projection actually states.
+    rates = _rates(
+        RoutedServer(
+            _floor_routes(
+                recommended={
+                    "fastestFee": 1, "halfHourFee": 1, "hourFee": 1,
+                    "economyFee": 1, "minimumFee": 1,
+                },
+                projected=_projected_payload([0.34, 0.31]),
+            )
+        )
+    )
+    assert rates[FeeTarget.MEDIUM] == 39
+    assert rates[FeeTarget.FAST] == 78
+    assert rates[FeeTarget.SLOW] == 34
+    assert all(r < 100 for r in rates.values())  # sub-1, the whole point
+
+
 def test_congested_next_block_lifts_the_whole_ladder():
-    # Policy, not a cap: an 8.4 sat/vB next-block floor bids 8.4 x 1.15.
+    # Policy, not a cap: an 8.4 sat/vB next-block floor bids 8.4 x 1.15 —
+    # and since TCK-FEE-006 the floor term lifts even the SLOW rung
+    # (B₁ 6.0 -> ceil 600 is UNDER the 840 next-block bottom -> 840).
     rates = _rates(
         RoutedServer(_floor_routes(projected=_projected_payload([8.4, 6.0, 6.0, 6.0])))
     )
     assert rates[FeeTarget.MEDIUM] == 966  # 9.66
     assert rates[FeeTarget.FAST] == 1932  # 19.32
-    assert rates[FeeTarget.SLOW] == 600
+    assert rates[FeeTarget.SLOW] == 840  # 6.0 lifted to the next-block floor
 
 
 def test_ordering_invariant_faster_target_slower():
     for bottoms in (
-        [1.05567928730512, 1.0, 1.0, 1.0],
+        [1.05567928730512, 1.0, 1.0, 1.0],  # SLOW clamps onto the next-block floor
         [5.0, 5.0, 5.0],  # ties are non-increasing and accepted
         [0.4, 0.39, 0.2, 0.1],
-        [12.345, 0.01],
+        [12.345, 0.01],  # deep SLOW collapses onto the floor
+        [0.34, 0.31],  # the TCK-FEE-006 live sub-1 shape
     ):
         rates = _rates(
             RoutedServer(_floor_routes(projected=_projected_payload(bottoms)))
@@ -545,12 +599,16 @@ def test_ordering_invariant_faster_target_slower():
 
 
 def test_live_2026_09_07_case_still_bids_at_most_1_sat_vb():
-    # FEE-001's binding observed case, re-derived under v2 + the FEE-004
-    # floor: the next block bottomed at 0.3 with the last blocks confirming
-    # down to 0.34. The bid must not exceed 1 sat/vB, and TCK-FEE-004's
-    # min-relay clamp now pins every rung AT the 1 sat/vB floor (minimumFee
-    # 1): policy TARGET 0.34 / SLOW 0.28 both lift to 1.00 — never below
-    # what relays accept, never the 2 sat/vB overbid FEE-001 replaced.
+    # FEE-001's binding observed case, re-derived under v2 + the
+    # TCK-FEE-006 floor: the next block bottomed at 0.3 with the last
+    # blocks confirming down to 0.34. The bid must not exceed 1 sat/vB —
+    # and the FEE-006 correction keeps it there WITHOUT the coarse
+    # minimumFee 1 flattening the ladder: policy MEDIUM 0.345 -> 0.34
+    # (unclamped, the half-even tie), FAST 0.68, SLOW 0.28 lifted to the
+    # next block's OWN bottom 0.30. Never below what the projection
+    # states, never the 2 sat/vB overbid FEE-001 replaced (the FEE-004
+    # pin this row carried — every rung AT 1.00 — encoded the superseded
+    # minimumFee-as-floor choice).
     rates = _rates(
         RoutedServer(
             _floor_routes(
@@ -559,9 +617,10 @@ def test_live_2026_09_07_case_still_bids_at_most_1_sat_vb():
             )
         )
     )
-    assert rates[FeeTarget.FAST] == 100
-    assert rates[FeeTarget.MEDIUM] == 100
-    assert rates[FeeTarget.SLOW] == 100
+    assert rates[FeeTarget.FAST] == 68
+    assert rates[FeeTarget.MEDIUM] == 34
+    assert rates[FeeTarget.SLOW] == 30
+    assert all(r <= 100 for r in rates.values())
 
 
 def _raw_json(text: str) -> httpx.Response:
@@ -727,14 +786,16 @@ def test_bottom_magnitude_boundary_is_the_engine_ceiling():
 
 
 # -- min-relay floor clamp (TCK-FEE-004, USER CORRECTED SPEC 2026-09-13,
-#    code-review fix 2026-09-14) -------------------------------------------
+#    code-review fix 2026-09-14; POLICY floor re-adjudicated by
+#    TCK-FEE-006 2026-09-16) -----------------------------------------------
 #
 # MAX(policy rung, floor), EACH rung independently — a sub-floor bid never
 # leaves this module (the live failure was MEDIUM computing under the
 # min-relay floor and the send dying psbt_failed). TWO distinct floors:
-# policy rungs take the congestion-informed floor (publicinfo:
-# max(minimumFee x 100, relay floor); native: the relay floor alone); the
-# EXPLICIT seam takes the RELAY FLOOR ONLY — node capability
+# policy rungs take the POLICY floor (target-follower: max(next-block
+# bottom, relay floor); fallback shape only: max(minimumFee x 100, relay
+# floor); native: the relay floor alone); the EXPLICIT seam takes the
+# RELAY FLOOR ONLY — node capability
 # (bitcoind min_relay_centisat_vb, injected as relay_floor_client like the
 # production wiring does) → the ASSUMED rail (TCK-FEE-005: 0.1 sat/vB =
 # Core's policy.h DEFAULT_MIN_RELAY_TX_FEE of 100 sat/kvB) — NEVER
@@ -771,16 +832,18 @@ class _FloorNative(_Native):
 
 
 def test_healthy_ladder_is_never_marked_clamped():
-    # The user's 2026-09-12 payload clears the 1 sat/vB floor on every rung
-    # (121 / 242 / 100 — SLOW equals the floor, it is not lifted to it):
-    # the clamp must not narrate where it did not fire.
-    server = RoutedServer(_floor_routes())
+    # A flat projection (every bottom 1.0) clears its own next-block floor
+    # on every rung (115 / 230 / 100 — SLOW equals the floor, it is not
+    # lifted to it), and the whole-sat minimumFee 1 lifts NOTHING on this
+    # shape (TCK-FEE-006): the clamp must not narrate where it did not
+    # fire.
+    server = RoutedServer(_floor_routes(projected=_projected_payload([1.0] * 8)))
     with server.client() as client:
         est = FeeEstimator(client, ttl_s=30.0)
         estimates = {target: est.estimate(target) for target in FeeTarget}
     assert {t: e.rate_centisat_vb for t, e in estimates.items()} == {
-        FeeTarget.MEDIUM: 121,
-        FeeTarget.FAST: 242,
+        FeeTarget.MEDIUM: 115,
+        FeeTarget.FAST: 230,
         FeeTarget.SLOW: 100,
     }
     assert not any(e.clamped for e in estimates.values())
@@ -788,9 +851,10 @@ def test_healthy_ladder_is_never_marked_clamped():
 
 def test_clamped_flag_marks_only_the_floor_raised_rungs():
     # B₀ = 0.9 -> TARGET = 1.035 half-even -> 1.04 (clears the floor);
-    # FAST = 2.08 clears; SLOW = ceil2(0.8) = 0.80 UNDER the 1 sat/vB
-    # minimumFee floor -> lifted to exactly 1.00, flagged. Per-rung honesty:
-    # only the rung that moved says so.
+    # FAST = 2.08 clears; SLOW = ceil2(0.8) = 0.80 UNDER the 0.90 next-
+    # block floor (TCK-FEE-006: the projection's own bottom, not the
+    # payload's minimumFee 1) -> lifted to exactly 0.90, flagged.
+    # Per-rung honesty: only the rung that moved says so.
     server = RoutedServer(_floor_routes(projected=_projected_payload([0.9, 0.8, 0.8])))
     with server.client() as client:
         est = FeeEstimator(client, ttl_s=30.0)
@@ -799,7 +863,30 @@ def test_clamped_flag_marks_only_the_floor_raised_rungs():
         slow = est.estimate(FeeTarget.SLOW)
     assert (medium.rate_centisat_vb, medium.clamped) == (104, False)
     assert (fast.rate_centisat_vb, fast.clamped) == (208, False)
-    assert (slow.rate_centisat_vb, slow.clamped) == (100, True)
+    assert (slow.rate_centisat_vb, slow.clamped) == (90, True)
+
+
+def test_next_block_floor_accessor_answers_per_shape():
+    # TCK-FEE-006 narration seam: the accessor answers the projected
+    # bottom (ceil-2dp) on the target-follower shape, None on the
+    # FALLBACK (no per-block data — the congestion note is the honest one
+    # there), and fails closed (ChainError) on the native path, mirroring
+    # minimum_fee_sat_vb. It RIDES the one cached snapshot (zero extra
+    # fetches).
+    server = RoutedServer(_floor_routes())
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0)
+        est.estimate(FeeTarget.MEDIUM)
+        assert est.next_block_floor_centisat_vb() == 106  # ceil2(1.0556...)
+        assert len(server.requests) == 2  # still the ONE combined refresh
+    routes = _floor_routes()
+    del routes["/v1/fees/mempool-blocks"]
+    with RoutedServer(routes).client() as client:
+        est = FeeEstimator(client, ttl_s=30.0)
+        est.estimate(FeeTarget.MEDIUM)
+        assert est.next_block_floor_centisat_vb() is None
+    with pytest.raises(ChainError):
+        FeeEstimator(_Native({t: 1 for t in FeeTarget}), ttl_s=30.0).next_block_floor_centisat_vb()
 
 
 def test_recommended_fallback_rungs_clamped_to_minimum_fee():
@@ -866,11 +953,12 @@ class _FloorOnly:
 
 
 def test_explicit_seam_ignores_the_congestion_minimum_fee():
-    # CODE-REVIEW MAJOR pin: minimumFee (3 sat/vB next-block CONGESTION
-    # estimate) must NEVER lift an explicit 1 sat/vB — the node's own relay
-    # floor decides explicit bids, and answering costs ZERO fee-source
-    # calls (the old wiring refreshed the whole snapshot and MAXed against
-    # the congestion figure; both are gone).
+    # CODE-REVIEW MAJOR pin (UNCHANGED by TCK-FEE-006, which only demoted
+    # minimumFee to the FALLBACK-shape policy floor): even where minimumFee
+    # IS the policy floor it must NEVER lift an explicit 1 sat/vB — the
+    # node's own relay floor decides explicit bids, and answering costs
+    # ZERO fee-source calls (the old wiring refreshed the whole snapshot
+    # and MAXed against the congestion figure; both are gone).
     server = ScriptedServer(httpx.Response(200, json={**RECOMMENDED, "minimumFee": 3}))
     node = _FloorOnly(100)
     with server.client() as client:
@@ -928,11 +1016,12 @@ def test_native_explicit_seam_is_one_floor_query_no_refresh(monkeypatch: pytest.
 
 
 def test_node_floor_participates_in_the_congestion_informed_policy_rungs():
-    # POLICY rungs KEEP the FEE-003-sanctioned congestion-informed floor —
-    # max(minimumFee x 100, relay floor): a node floor ABOVE the source's
-    # minimumFee lifts every rung onto itself (MAX in). The explicit seam
-    # over the same wiring answers the RELAY floor alone (1000, not the
-    # minimum figure) — the two concepts stay separate.
+    # POLICY rungs KEEP the congestion-informed floor ON THE FALLBACK
+    # SHAPE (ScriptedServer: mempool-blocks malformed -> recommended
+    # mapping) — max(minimumFee x 100, relay floor): a node floor ABOVE
+    # the source's minimumFee lifts every rung onto itself (MAX in). The
+    # explicit seam over the same wiring answers the RELAY floor alone
+    # (1000, not the minimum figure) — the two concepts stay separate.
     payload = {
         "fastestFee": 5,
         "halfHourFee": 4,
@@ -950,6 +1039,23 @@ def test_node_floor_participates_in_the_congestion_informed_policy_rungs():
         assert est.clamp_to_min_relay_floor(100) == (1000, True)
     assert len(server.requests) == 2  # one combined refresh, untouched shape
     assert node.floor_calls == 1  # the floor query rode the refresh, TTL-cached
+
+
+def test_node_floor_participates_on_the_target_follower_shape_too():
+    # TCK-FEE-006 demotes minimumFee, NOT the node: with projections live
+    # the policy floor is max(next-block bottom, relay floor) — a node
+    # advertising 5 sat/vB still lifts the 0.34-congestion ladder onto
+    # itself (MAX in; without the node the same rungs bid 39/78/34).
+    server = RoutedServer(
+        _floor_routes(projected=_projected_payload([0.34, 0.31]))
+    )
+    node = _FloorOnly(500)
+    with server.client() as client:
+        est = FeeEstimator(client, ttl_s=30.0, relay_floor_client=node)
+        for target in FeeTarget:
+            estimate = est.estimate(target)
+            assert (estimate.rate_centisat_vb, estimate.clamped) == (500, True)
+    assert node.floor_calls == 1  # one TTL-cached floor query per refresh
 
 
 @pytest.mark.parametrize("boom", [RuntimeError("rpc exploded"), ChainError("no"), KeyError("k")])
