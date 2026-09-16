@@ -163,8 +163,15 @@ class ModelRuntime:
         self._llama: object | None = None
         # TCK-LAUNCH-003: guards model construction so a background preload
         # (:meth:`load`) and the engine thread's first :meth:`generate`
-        # cannot build the (multi-GB) runtime twice.
-        self._llama_lock = threading.Lock()
+        # cannot build the (multi-GB) runtime twice. TCK-LAUNCH-004 widened
+        # it to guard the WHOLE llama call: the startup warm-up generation
+        # runs on its own daemon thread, and one shared Llama instance
+        # (single KV context) must never evaluate two prompts concurrently
+        # — a user turn landing mid-warm-up blocks on this lock (short,
+        # bounded by the warm-up's tiny token cap) and then rides the warm
+        # runtime. Re-entrant: :meth:`generate` holds it across the nested
+        # :meth:`_ensure_llama` acquisition.
+        self._llama_lock = threading.RLock()
         self._grammar_cls: type | None = None
         self._grammar: object | None = None
         self._grammar_text: str | None = None
@@ -180,7 +187,13 @@ class ModelRuntime:
             return self.model_path
         return os.environ.get(MODEL_PATH_ENV_VAR) or None
 
-    def generate(self, prompt: str, *, grammar_text: str | None = None) -> str:
+    def generate(
+        self,
+        prompt: str,
+        *,
+        grammar_text: str | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
         """Produce one grammar-constrained completion for ``prompt``.
 
         With an injected ``generate_fn``, delegates to it, passing the
@@ -193,6 +206,9 @@ class ModelRuntime:
                 conversation + user turn — see ``agent/loop.py``).
             grammar_text: Optional grammar override; defaults to the
                 package's ``envelope.gbnf`` text.
+            max_tokens: Optional per-call completion cap (TCK-LAUNCH-004:
+                the startup warm-up bounds itself to a handful of tokens;
+                ordinary turns never pass it and keep the runtime default).
 
         Returns:
             The raw model output string. Callers must treat it as
@@ -206,7 +222,7 @@ class ModelRuntime:
         text = grammar_text if grammar_text is not None else load_grammar_text()
         if self._generate_fn is not None:
             return self._generate_fn(prompt, text)
-        return self._generate_with_llama(prompt, text)
+        return self._generate_with_llama(prompt, text, max_tokens)
 
     def load(self) -> None:
         """Build the llama runtime NOW instead of lazily (TCK-LAUNCH-003
@@ -232,7 +248,9 @@ class ModelRuntime:
             return
         self._ensure_llama()
 
-    def _generate_with_llama(self, prompt: str, grammar_text: str) -> str:
+    def _generate_with_llama(
+        self, prompt: str, grammar_text: str, max_tokens: int | None
+    ) -> str:
         """Real llama.cpp path: cached model + cached grammar, one call.
 
         ``Llama.__call__`` returns the full non-streaming completion mapping,
@@ -242,23 +260,35 @@ class ModelRuntime:
         unwrap ``choices[0]["text"]`` here. This was latent only because the
         TCK-P6-004 grammar-load segfault meant this path never returned a
         value, so the mapping leaked straight through to ``handle_raw``.
+
+        TCK-LAUNCH-004: the whole ensure-and-call block runs under the
+        (re-entrant) runtime lock — the shared Llama context serializes the
+        startup warm-up thread against engine-thread turns, with the same
+        bounded-wait semantics as the build (a wedged holder surfaces as a
+        busy error the next turn retries, never a silent drop).
         """
-        llama = self._ensure_llama()
-        grammar = self._ensure_grammar(grammar_text)
-        result = llama(  # type: ignore[operator]
-            prompt=prompt,
-            grammar=grammar,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            max_tokens=self.max_tokens,
-        )
+        if not self._llama_lock.acquire(timeout=LOAD_WAIT_TIMEOUT_S):
+            msg = "the model is busy with another generation — try again"
+            raise ModelRuntimeError(msg)
         try:
-            return result["choices"][0]["text"]
-        except (KeyError, IndexError, TypeError) as exc:
-            # Value-free: never leak prompt/model text or raw completions.
-            msg = "llama.cpp returned an unexpected completion shape"
-            raise ModelRuntimeError(msg) from exc
+            llama = self._ensure_llama()
+            grammar = self._ensure_grammar(grammar_text)
+            result = llama(  # type: ignore[operator]
+                prompt=prompt,
+                grammar=grammar,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                max_tokens=self.max_tokens if max_tokens is None else max_tokens,
+            )
+            try:
+                return result["choices"][0]["text"]
+            except (KeyError, IndexError, TypeError) as exc:
+                # Value-free: never leak prompt/model text or raw completions.
+                msg = "llama.cpp returned an unexpected completion shape"
+                raise ModelRuntimeError(msg) from exc
+        finally:
+            self._llama_lock.release()
 
     def _ensure_llama(self) -> object:
         """Lazily import llama_cpp and load the model (first use only).

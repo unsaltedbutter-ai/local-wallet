@@ -313,6 +313,8 @@ __all__ = [
     "MODEL_LATER_COMMAND",
     "MODEL_PRELOADED_NOTICE",
     "MODEL_PRELOAD_NOTICE",
+    "MODEL_WARMUP_MAX_TOKENS",
+    "MODEL_WARMUP_PROMPT",
     "NODE_STATUS_DETECTION_DISABLED",
     "NO_MODEL_DEMO_BANNER",
     "OUT_OF_WINDOW_NOTICE",
@@ -568,8 +570,12 @@ _VERIFY_MISMATCH_TEMPLATE: Final[str] = (
 # genuinely corrupt GGUF fails inside llama.cpp's own build anyway, and
 # a verdict that bricks a working wallet is the worse failure).
 
-#: Narrated by the pump when the background preload begins (web: the
-#: transcript, CLI: the terminal). Value-free. (TCK-UX-009 user copy.)
+#: Narrated by the pump when the background preload begins (CLI: the
+#: terminal). Value-free. (TCK-UX-009 user copy; TCK-LAUNCH-004 beat order:
+#: the WEB launch no longer puts it in the transcript — the loading state
+#: rides ``/state`` ``model_state='loading'`` and the static half renders
+#: it in the compose area; the transcript's only preload line is the final
+#: :data:`MODEL_PRELOADED_NOTICE`.)
 MODEL_PRELOAD_NOTICE: Final[str] = "Loading local llm."
 #: Narrated ONCE when the preload reaches ``ready`` (TCK-UX-009). The
 #: failed/declined paths never print it, and a launch with no preload
@@ -589,6 +595,30 @@ MODEL_INTEGRITY_WARNING: Final[str] = (
 _MODEL_PRELOAD_FAILED_LOG: Final[str] = (
     "model failed to preload at startup; the next request will retry the load"
 )
+
+# ------------------------------------------- startup warm-up (TCK-LAUNCH-004)
+#
+# User spec 2026-09-13: after the preload reaches ``ready``, ONE tiny REAL
+# generation runs against the model (bounded prompt + token cap, value-free,
+# LOG-ONLY — never narrated, never a transcript/SSE turn) so the first USER
+# query never pays the cold first-token cost (page-in of the mmap'd weights,
+# grammar compile). Best-effort: any failure logs value-free and changes
+# nothing. It fires only AFTER readiness (the pump stays live — the warm-up
+# runs on its own daemon thread; a user generate that lands mid-warm-up
+# waits behind the runtime's inference lock and rides the warm model).
+# The completion/failure line carries elapsed-ms — the launch-log timing
+# hook for first-query-latency diagnosis (the retired PERF-001 question).
+
+#: The warm-up prompt: two characters, no facts, no user text, no values.
+MODEL_WARMUP_PROMPT: Final[str] = "ok"
+#: Completion budget for the warm-up call — a bound, not a correctness
+#: floor (the real turns keep the runtime default; the grammar forces EOS
+#: the instant an envelope completes, so this only caps a pathological run).
+MODEL_WARMUP_MAX_TOKENS: Final[int] = 16
+#: Per-launch-log lines at warm-up completion (value-free: fixed words +
+#: one integer). ``failed`` never reaches the transcript or the state.
+_MODEL_WARMUP_LOG_OK: Final[str] = "model warmup completed in {}ms"
+_MODEL_WARMUP_LOG_FAIL: Final[str] = "model warmup failed (ignored) in {}ms"
 
 #: TCK-WEB-008 follow-up (a): the watch key surfaced in GET /settings — a
 #: display-TRUNCATED entry by default, the full value on an explicit
@@ -9115,14 +9145,31 @@ class _Output:
         it; fixed at construction, so it is a fact, not a mutable flag."""
         return self._web
 
-    def bind_emitter(self, emitter: EventEmitter) -> None:
+    def bind_emitter(self, emitter: EventEmitter, *, hold_startup: bool = False) -> None:
         """Attach the engine emitter (once available) and flush any buffered
         startup narration to it — each line as its own closed turn (see the
-        class docstring, TCK-UX-012(a)). Engine-thread only."""
+        class docstring, TCK-UX-012(a)). Engine-thread only.
+
+        TCK-LAUNCH-004 beat order: ``hold_startup=True`` (web launch WITH a
+        preload flow — the caller's decision) binds WITHOUT flushing; the
+        startup lines wait for :meth:`flush_startup`, which the pump calls
+        right after the preload's terminal marker narrates, so the
+        transcript order is "Local llm fully loaded." FIRST, then the
+        privacy notice, then the checking-for-new-transactions line. Only
+        PRE-bind buffered lines are ever held (post-bind narration routes
+        directly, exactly as before)."""
         self._emitter = emitter
+        if not hold_startup:
+            self.flush_startup()
+
+    def flush_startup(self) -> None:
+        """Emit any held startup lines in order (no-op once drained — safe
+        on every terminal preload outcome, ok or failed). Engine thread."""
+        if self._emitter is None:
+            return
         for line in self._buffered:
-            emitter.text(line)
-            emitter.emit(EVENT_TURN_END)
+            self._emitter.text(line)
+            self._emitter.emit(EVENT_TURN_END)
         self._buffered.clear()
 
     def __call__(self, line: str) -> None:  # narration
@@ -10275,6 +10322,16 @@ class _IntegrityDone:
     ok: bool
 
 
+@dataclass(frozen=True)
+class _WarmupDone:
+    """The warm-up thread's delivery (TCK-LAUNCH-004): the outcome flag +
+    elapsed whole milliseconds. VALUE-FREE by construction — never the
+    prompt, the completion, the model path, or the failure's message."""
+
+    ok: bool
+    elapsed_ms: int
+
+
 class ModelPreloadFlow:
     """Background preload + launch checksum for a resolved REAL local
     model (TCK-LAUNCH-003; the absent-file sibling is
@@ -10310,8 +10367,13 @@ class ModelPreloadFlow:
     thread-local state, no signal handlers and no Python-level caches;
     ctypes foreign calls RELEASE THE GIL, so the engine loop keeps
     ticking while the native load runs, and the finished object is handed
-    over under the build lock and thereafter used by exactly one thread
-    (the engine). The one process-wide side effect is the wheel's
+    over under the build lock. Thereafter the llama instance is used by
+    the engine thread ONLY, except for the TCK-LAUNCH-004 warm-up
+    generation (a second, brief user on a daemon thread): the runtime's
+    inference lock in :meth:`localwallet.agent.runtime.ModelRuntime.generate`
+    serializes it against real turns — a user query landing mid-warm-up
+    waits behind it (seconds-class, bounded) and rides the warm model.
+    The one process-wide side effect is the wheel's
     ``suppress_stdout_stderr`` around the model read (fd dup2 + sys.stdout
     swap for the build's few seconds): launch lines are printed BEFORE the
     arm (the web launcher queues :data:`PRELOAD_START` after the token
@@ -10337,6 +10399,7 @@ class ModelPreloadFlow:
         sha256: str | None = None,
         log_fn: Callable[[str], None] | None = None,
         hash_chunk_bytes: int = 1 << 23,
+        loading_notice: bool = True,
     ) -> None:
         self.state: str = "loading"
         self._runtime = runtime
@@ -10344,8 +10407,15 @@ class ModelPreloadFlow:
         self._sha256 = sha256 if isinstance(sha256, str) and sha256 else None
         self._log_fn = log_fn
         self._chunk = hash_chunk_bytes
+        # TCK-LAUNCH-004 beat order: the WEB launch suppresses the initial
+        # "Loading local llm." transcript bubble (the loading state lives
+        # in the compose area, typed off ``model_state='loading'``); the
+        # CLI keeps both lines byte-identically (a terminal has no compose
+        # area — the progress line is its honest loading surface).
+        self._loading_notice = loading_notice
         self._commands: queue.Queue[Any] | None = None
         self._started = False
+        self._warmed_up = False
 
     def attach(self, commands: queue.Queue[Any]) -> None:
         """Bind the pump's command queue (the workers deliver onto it)."""
@@ -10360,7 +10430,8 @@ class ModelPreloadFlow:
         preload marker flips the state machine; the checksum marker only
         narrates (see the class docstring's ordering decision)."""
         if isinstance(command, _PreloadStart):
-            output_fn(MODEL_PRELOAD_NOTICE)  # prints BEFORE the fd window opens
+            if self._loading_notice:
+                output_fn(MODEL_PRELOAD_NOTICE)  # prints BEFORE the fd window opens
             commands = self._commands
             if commands is not None and not self._started:
                 self._started = True
@@ -10385,8 +10456,23 @@ class ModelPreloadFlow:
                 # the single loader thread (the _started guard spawns it
                 # once), and the failed path never prints it.
                 output_fn(MODEL_PRELOADED_NOTICE)
+                # TCK-LAUNCH-004: readiness already flipped and narrated —
+                # fire the best-effort warm-up AFTER it, on its own daemon
+                # thread, so the pump keeps servicing the queue.
+                self._start_warmup()
             elif self._log_fn is not None:
                 self._log_fn(_MODEL_PRELOAD_FAILED_LOG)
+            return True
+        if isinstance(command, _WarmupDone):
+            # LOG-ONLY by contract (user spec 2): no output_fn, no emitter
+            # event, no state change — a failed warm-up changes nothing.
+            # The elapsed-ms is the launch-log timing hook for future
+            # first-query-latency diagnosis (the retired PERF-001 ask).
+            if self._log_fn is not None:
+                template = (
+                    _MODEL_WARMUP_LOG_OK if command.ok else _MODEL_WARMUP_LOG_FAIL
+                )
+                self._log_fn(template.format(command.elapsed_ms))
             return True
         if isinstance(command, _IntegrityDone):
             if not command.ok:
@@ -10405,6 +10491,43 @@ class ModelPreloadFlow:
             # caches SUCCESS only), never from a worker thread.
             ok = False
         commands.put(_PreloadDone(ok=ok))
+
+    def _start_warmup(self) -> None:
+        """Spawn the ONE warm-up thread (TCK-LAUNCH-004, engine thread —
+        called only from the single ready transition, so the flag guard is
+        belt-and-braces). The ``callable(generate)`` check is the same
+        duck-typing seam as the launcher's ``hasattr(runtime, "load")``:
+        a fake runtime without a generate hook warms nothing and errors
+        nowhere."""
+        if self._warmed_up:
+            return
+        self._warmed_up = True
+        commands = self._commands
+        if commands is None:
+            return
+        if not callable(getattr(self._runtime, "generate", None)):
+            return  # duck-typed fake runtime with no generate hook
+        threading.Thread(
+            target=self._warm,
+            args=(commands,),
+            name="model-warmup",
+            daemon=True,
+        ).start()
+
+    def _warm(self, commands: queue.Queue[Any]) -> None:  # warm-up thread
+        """ONE tiny REAL generation. Best-effort: any exception is swallowed
+        to the value-free flag + elapsed-ms (the prompt and token cap are
+        code constants — no user text, no facts, nothing that could carry
+        a value enters the call)."""
+        started = time.monotonic()
+        ok = True
+        try:
+            self._runtime.generate(  # type: ignore[union-attr]
+                MODEL_WARMUP_PROMPT, max_tokens=MODEL_WARMUP_MAX_TOKENS
+            )
+        except Exception:  # noqa: BLE001 — warm-up failure changes NOTHING
+            ok = False
+        commands.put(_WarmupDone(ok=ok, elapsed_ms=int((time.monotonic() - started) * 1000)))
 
     def _integrity(self, commands: queue.Queue[Any]) -> None:  # checksum thread
         digest = hashlib.sha256()
@@ -12137,11 +12260,21 @@ def start_engine(
         except BaseException as exc:  # noqa: BLE001 — engine-thread bootstrap
             handle.error = exc
             return
+        flush_startup: Callable[[], None] | None = None
         if ctx.output is not None:
             # Bind the engine emitter to the router so buffered startup
             # narration flushes to the SSE stream and provisioning narration
             # routes there directly (single emitter writer: engine thread).
-            ctx.output.bind_emitter(handle.emitter)
+            # TCK-LAUNCH-004: with a preload flow armed on a WEB launch, the
+            # buffered startup lines (privacy notice, checking-for-new-
+            # transactions) are HELD until the pump narrates the preload's
+            # terminal marker, so "Local llm fully loaded." lands FIRST in
+            # the transcript (user spec 2; the CLI has no emitter bind here
+            # and keeps its byte-identical order).
+            hold = ctx.preload is not None and ctx.output.web
+            ctx.output.bind_emitter(handle.emitter, hold_startup=hold)
+            if hold:
+                flush_startup = ctx.output.flush_startup
         # TCK-WEB-016: a pump death OUTSIDE the contained turn path (the
         # re-raised _PumpError, a store fault, any bug) must never strand a
         # client mid-turn: flag the handle FIRST (every transport's
@@ -12170,6 +12303,7 @@ def start_engine(
                 fee_estimator=ctx.fee_estimator,
                 signer_selection=ctx.signer_selection,
                 parsed=ctx.parsed,
+                flush_startup=flush_startup,
             )
         except BaseException as exc:  # noqa: BLE001 — engine-thread pump death
             handle.error = exc
@@ -12603,6 +12737,7 @@ def _pump(
     fee_estimator: FeeEstimator | None = None,
     signer_selection: SignerSelection | None = None,
     parsed: ParsedKey | None = None,
+    flush_startup: Callable[[], None] | None = None,
 ) -> None:
     """The transport-agnostic turn pump (ADR-0024 §3): blocking
     ``queue.get()`` → the UNCHANGED :func:`_run_turn` path.
@@ -12663,6 +12798,13 @@ def _pump(
     ``/state``), a checksum mismatch narrates one value-free warning and
     serving CONTINUES, and a model turn that arrives mid-load waits inside
     the runtime's build lock — clean serialization, never an error.
+    TCK-LAUNCH-004: the ready transition also spawns the ONE best-effort
+    warm-up generation (bounded, value-free, LOG-ONLY — it consumes a
+    ``_WarmupDone`` marker and never touches the transcript), and
+    ``flush_startup`` (web launches only, supplied by :func:`start_engine`
+    when startup narration was held for the beat order) releases the held
+    privacy/checking lines right AFTER the "Local llm fully loaded."
+    bubble, so that line leads the transcript on a web launch.
 
     Chain-backend hot-swap (TCK-BACKEND-002, ADR-0018 amendment; the
     concurrency contract RELAXED by TCK-SWAP-001): when ``backend`` is
@@ -12912,8 +13054,17 @@ def _pump(
             # the client re-reads /state (model_state loading → ready/failed);
             # _IntegrityDone narrates the value-free warning inline (no state
             # change — the session keeps serving a mismatched file).
+            # TCK-LAUNCH-004: _WarmupDone is handled inside the flow
+            # (launch-log line only — deliberately NOT in the turn_end
+            # tuple, and it emits no text: warm-up never touches the
+            # transcript). The terminal preload marker (either outcome)
+            # releases the held startup lines right after the notice was
+            # narrated and its turn closed — beat order: loaded → privacy
+            # → checking.
             if isinstance(command, (_PreloadStart, _PreloadDone)) and emitter is not None:
                 emitter.emit(EVENT_TURN_END)
+            if isinstance(command, _PreloadDone) and flush_startup is not None:
+                flush_startup()
             continue
         if isinstance(command, _PumpError):
             raise command.exc
@@ -13524,6 +13675,9 @@ def run(
                 model_path=env_model,
                 sha256=_manifest_pin_for(Path(env_model)),
                 log_fn=log.warning,
+                # TCK-LAUNCH-004 beat order: web keeps the loading state in
+                # the compose area (/state model_state), CLI keeps the line.
+                loading_notice=not web_mode,
             )
     elif args.stub_llm:
         # Explicit dev choice (unchanged from TCK-LAUNCH-001): the stub
@@ -13557,6 +13711,8 @@ def run(
                     model_path=str(default[1]),
                     sha256=_manifest_pin_for(default[1]),
                     log_fn=log.warning,
+                    # TCK-LAUNCH-004 beat order (see the env rung above).
+                    loading_notice=not web_mode,
                 )
         elif default is not None:
             generate = stub_generate

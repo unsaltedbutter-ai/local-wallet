@@ -119,11 +119,11 @@ def test_first_run_never_opens_the_pane_and_chat_stays_enabled() -> None:
                 code.index("function dismissWatchKeyForm")]
     assert "openSettings" not in gate and "closeSettings" not in gate
     assert "inputEl.disabled" not in gate and "sendBtn.disabled" not in gate
-    # placeholder flips ON the typed needs (restore rides the same flag):
-    assert (
-        "inputEl.placeholder = needs ? LABELS.chatNeedsKeyPlaceholder : chatPlaceholder;"
-        in gate
-    )
+    # placeholder flips ON the typed needs (restore rides the same flag) —
+    # TCK-LAUNCH-004 folded the old inline ternary into the ONE placeholder
+    # painter, which the gate now calls (the painter holds the precedence):
+    assert "paintChatPlaceholder();" in gate
+    assert "inputEl.placeholder" not in gate  # single writer: only the painter
     # openSettings has exactly three occurrences: definition + the two
     # EXPLICIT controls (the settings quick action + the header toggle).
     assert code.count("openSettings()") == 3
@@ -152,13 +152,18 @@ def test_watch_key_gate_keeps_chat_open_under_node() -> None:
     if shutil.which("node") is None:
         pytest.skip("node not installed")
     code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
-    gate = re.search(
-        r"function applyWatchKeyGate\(snap\) \{.*?\n\}", code, re.DOTALL
-    ).group(0)
+    # TCK-LAUNCH-004: the gate delegates to the ONE placeholder painter —
+    # extract both (the gate alone can no longer flip the placeholder).
+    funcs = "\n".join(
+        re.search(rf"function {name}\(.*?\n\}}", code, re.DOTALL).group(0)
+        for name in ("paintChatPlaceholder", "applyWatchKeyGate")
+    )
     script = """
-      const LABELS = { chatNeedsKeyPlaceholder: "Paste your xpub or zpub to get started…" };
+      const LABELS = { chatNeedsKeyPlaceholder: "Paste your xpub or zpub to get started…",
+                       chatLoadingPlaceholder: "Loading local llm…" };
       const chatPlaceholder = "Ask your wallet…";
-      const state = { watchKeyDismissed: false, watchKeyPresent: null, watchKeyNeeded: false };
+      const state = { watchKeyDismissed: false, watchKeyPresent: null, watchKeyNeeded: false,
+                      modelLoading: false };
       const inputEl = { disabled: false, placeholder: chatPlaceholder };
       const sendBtn = { disabled: false };
       const quickbarEl = { hidden: true };
@@ -168,7 +173,7 @@ def test_watch_key_gate_keeps_chat_open_under_node() -> None:
       const closeSettings = () => { closeCalls++; };
       const renderSettings = () => { renders++; };
       const focusWatchInput = () => {};
-      __GATE__
+      __FUNCS__
       applyWatchKeyGate({ schema: "state/1", needs_watch_key: true });
       if (inputEl.disabled || sendBtn.disabled) throw new Error("chat-disabled");
       if (inputEl.placeholder !== LABELS.chatNeedsKeyPlaceholder) throw new Error("placeholder");
@@ -178,7 +183,7 @@ def test_watch_key_gate_keeps_chat_open_under_node() -> None:
       if (inputEl.placeholder !== chatPlaceholder) throw new Error("placeholder-restore");
       if (openCalls || closeCalls) throw new Error("pane-touched-2");
       console.log("ok");
-    """.replace("__GATE__", gate)
+    """.replace("__FUNCS__", funcs)
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 
@@ -3046,6 +3051,112 @@ def test_hw005_own_address_button_marks_and_arms_under_node() -> None:
       state.signerKind = "hwi";
       paintHwVerifyButtons();
       if (painted.hidden || painted.disabled) throw new Error("paint-show");
+      console.log("ok");
+    """.replace("__FUNCS__", funcs)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# ------------------------------------------- TCK-LAUNCH-004 web loading surface
+# The engine half retired the web launch's "Loading local llm." transcript
+# line (the pump now emits a bare turn_end at the preload's terminal marker,
+# which refreshes /state); the compose-area PLACEHOLDER SWAP is the loading
+# surface, driven ONLY by the typed model_state NAME — never prose-inferred.
+# Pins: exact copy (ellipsis variant only), the transcript copies never appear
+# client-side (no duplicate "Local llm fully loaded."), one placeholder
+# writer, zero layout-shift mechanics (text-only assignment — no element,
+# class, visibility, style, or live-region churn), and the failed outcome
+# never strands the indicator (the existing model-absent card owns that).
+def test_launch004_loading_placeholder_source_pins() -> None:
+    raw = (_STATIC / "app.js").read_text(encoding="utf-8")
+    code = _strip_js_comments(raw)
+    index_html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    # exact designer copy (the ticket's ellipsis variant):
+    assert 'chatLoadingPlaceholder: "Loading local llm…"' in code
+    # the transcript copies never live client-side (engine owns the single
+    # loaded line; the retired period-ended preload line never reappears):
+    assert "fully loaded" not in raw and "Loading local llm." not in raw
+    assert "Loading local llm" not in index_html
+    # typed-only flip: the 'loading' comparison sits BEHIND the typed guard
+    # (state/0 keeps the last known value), riding the same model_state read
+    # as the WEB-002 card logic — no other reader of the name exists.
+    assert 'if (typed) state.modelLoading = modelState === "loading";' in code
+    assert code.count('modelState === "loading"') == 1
+    painter = re.search(
+        r"function paintChatPlaceholder\(\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert (
+        "else if (state.modelLoading) inputEl.placeholder = LABELS.chatLoadingPlaceholder;"
+        in painter
+    )
+    # needs-key entry ask outranks loading (the entry state owns the page):
+    assert painter.index("watchKeyNeeded") < painter.index("modelLoading")
+    # zero layout shift + calm AT: the painter's ONLY mechanics are
+    # placeholder text assignments — no DOM insertion, class/visibility/
+    # style toggles, text nodes, or announcements.
+    for shift in ("classList", "hidden", "style", "createElement", "insert",
+                  "textContent", "aria", "announce", "aria-live"):
+        assert shift not in painter, f"painter touches layout/AT via {shift!r}"
+    # ONE placeholder writer: exactly the painter's three branch
+    # assignments in the whole shipped client.
+    assert code.count("inputEl.placeholder = ") == 3
+    assert code.count("paintChatPlaceholder();") == 2  # both gate callers
+
+
+def test_launch004_loading_indicator_lifecycle_under_node() -> None:
+    """Node-executed lifecycle pin: the indicator renders IFF the TYPED
+    model_state name is 'loading' — ready/failed/absent-field/unknown and
+    the pre-typed state/0 never show it, state/0 mid-load never blanks it,
+    and the needs-key ask outranks it."""
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    funcs = "\n".join(
+        re.search(rf"function {name}\(.*?\n\}}", code, re.DOTALL).group(0)
+        for name in ("paintChatPlaceholder", "applyModelPrompt")
+    )
+    script = """
+      const LABELS = { chatNeedsKeyPlaceholder: "Paste your xpub or zpub to get started…",
+                       chatLoadingPlaceholder: "Loading local llm…" };
+      const chatPlaceholder = "Ask your wallet…";
+      const state = { watchKeyNeeded: false, modelLoading: false };
+      const inputEl = { placeholder: chatPlaceholder };
+      const actionsEl = { querySelectorAll: () => [] };
+      const MODEL_CARD_STATES = new Set(["absent", "failed"]);
+      const MODEL_QUICK_STATES = new Set(["declined", "running"]);
+      __FUNCS__
+      const snap = (ms) => ms === null
+        ? { schema: "state/1" }
+        : { schema: "state/1", model_state: ms };
+      // pre-typed state/0: never a guess — the normal placeholder stands.
+      applyModelPrompt({ schema: "state/0" });
+      if (inputEl.placeholder !== chatPlaceholder) throw new Error("state0-guess");
+      // loading: the indicator is the placeholder swap.
+      applyModelPrompt(snap("loading"));
+      if (inputEl.placeholder !== LABELS.chatLoadingPlaceholder) throw new Error("show");
+      // state/0 mid-load (engine briefly busy): keeps it — no flicker.
+      applyModelPrompt({ schema: "state/0" });
+      if (inputEl.placeholder !== LABELS.chatLoadingPlaceholder) throw new Error("flicker");
+      // ready: gone.
+      applyModelPrompt(snap("ready"));
+      if (inputEl.placeholder !== chatPlaceholder) throw new Error("stuck-ready");
+      // failed: gone too — the model-absent card owns that state, no
+      // stranded indicator.
+      applyModelPrompt(snap("loading"));
+      applyModelPrompt(snap("failed"));
+      if (inputEl.placeholder !== chatPlaceholder) throw new Error("stuck-failed");
+      // absent field (a real model) and an unknown name: never it.
+      applyModelPrompt(snap(null));
+      if (inputEl.placeholder !== chatPlaceholder) throw new Error("absent");
+      applyModelPrompt(snap("loading2"));
+      if (inputEl.placeholder !== chatPlaceholder) throw new Error("unknown-guess");
+      // needs-key entry ask outranks loading (the entry state owns the page).
+      applyModelPrompt(snap("loading"));
+      state.watchKeyNeeded = true;
+      paintChatPlaceholder();
+      if (inputEl.placeholder !== LABELS.chatNeedsKeyPlaceholder) throw new Error("precedence");
       console.log("ok");
     """.replace("__FUNCS__", funcs)
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)

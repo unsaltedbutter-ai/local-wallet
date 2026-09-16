@@ -105,6 +105,11 @@ const LABELS = {
   // stays ENABLED and asks for the key; the normal placeholder (index.html
   // markup) returns from the engine snapshot the moment a key is wired.
   chatNeedsKeyPlaceholder: "Paste your xpub or zpub to get started…",
+  // TCK-LAUNCH-004: the compose-area loading state (see paintChatPlaceholder
+  // — the ONLY renderer of it). A web launch emits no preload line in the
+  // transcript; this placeholder swap IS the loading surface, typed off
+  // model_state='loading'. Ellipsis per the ticket's exact-copy pin.
+  chatLoadingPlaceholder: "Loading local llm…",
   unreachable:
     "Could not reach the wallet server — is it still running? Check the terminal where you started it.",
   // TCK-WEB-028 (2): a non-ok /turn or /action reply that ISN'T a transport
@@ -531,6 +536,13 @@ const state = {
   // model_state NAME (never prose); the progress line is an inline element
   // fed by the int-only model_progress events (percent + bytes, value-free).
   downloadLine: null, // <p> currently receiving the inline download bar
+  // TCK-LAUNCH-004: the compose-area loading indicator, driven ONLY by the
+  // typed snapshot's additive model_state NAME ('loading' → true; unknown
+  // values never guess; state/0 keeps the last known value — the same
+  // discipline as every other typed field). The bare turn_end the pump emits
+  // at the preload's terminal marker re-reads /state, so this flips to false
+  // on ready AND failed (no stuck indicator).
+  modelLoading: false,
   // TCK-WEB-009: the pane's data. The last successfully read settings
   // entries (in memory only — never persisted, never logged) so the zpub
   // row can flip form↔display on a /state transition without a refetch
@@ -1386,6 +1398,12 @@ function paintSettingsDot() {
 function applyModelPrompt(snap) {
   const typed = snap && snap.schema === "state/1";
   const modelState = typed && typeof snap.model_state === "string" ? snap.model_state : "";
+  // TCK-LAUNCH-004: the compose-area loading indicator rides this SAME typed
+  // read — 'loading' only (ready/failed/absent/unknown never hold it); an
+  // untyped state/0 reply keeps the last known value (no flicker while the
+  // engine is briefly busy, the privacyMode discipline).
+  if (typed) state.modelLoading = modelState === "loading";
+  paintChatPlaceholder();
   const gated = state.watchKeyNeeded; // no wallet yet — the entry state owns the page
   const showCard = !gated && MODEL_CARD_STATES.has(modelState);
   const showQuick = !gated && MODEL_QUICK_STATES.has(modelState);
@@ -1395,6 +1413,22 @@ function applyModelPrompt(snap) {
   for (const btn of actionsEl.querySelectorAll(".quick-only")) {
     btn.hidden = !showQuick;
   }
+}
+
+// TCK-LAUNCH-004: the ONE writer of the compose placeholder (the old inline
+// ternary in applyWatchKeyGate folded here — both callers run on every /state
+// snapshot; idempotent). The placeholder swap is the whole loading surface:
+// same input, text only, ZERO layout shift, nothing announced (an AT reads a
+// placeholder on focus; a chip would need a live region and shove the row).
+// Precedence: the watch-key entry ask outranks loading (the entry state owns
+// the page), loading outranks the normal placeholder. Both gate callers run
+// per snapshot, so precedence is always re-applied from state truth — the
+// failed outcome's honest surface is the existing model-absent card (shown by
+// applyModelPrompt), never a stuck indicator.
+function paintChatPlaceholder() {
+  if (state.watchKeyNeeded) inputEl.placeholder = LABELS.chatNeedsKeyPlaceholder;
+  else if (state.modelLoading) inputEl.placeholder = LABELS.chatLoadingPlaceholder;
+  else inputEl.placeholder = chatPlaceholder;
 }
 
 // TCK-LAUNCH-001 first-run, chat-first per TCK-ONB-007's STATIC half (user
@@ -1414,7 +1448,7 @@ function applyWatchKeyGate(snap) {
   if (typed) state.watchKeyPresent = !needs;
   const wasNeeded = state.watchKeyNeeded;
   state.watchKeyNeeded = needs;
-  inputEl.placeholder = needs ? LABELS.chatNeedsKeyPlaceholder : chatPlaceholder;
+  paintChatPlaceholder();
   // TCK-WEB-009 (h): the header quick buttons appear once a wallet is
   // provisioned and never before (typed truth only — unknown = hidden).
   quickbarEl.hidden = state.watchKeyPresent !== true;
