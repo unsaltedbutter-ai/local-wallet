@@ -46,6 +46,11 @@ Coverage (ticket gates):
   watch-poll failures). Fixtures serve the shape a REAL Core answers for
   the verbosity actually requested; shape refusals still carry
   ``not-core-shape`` (never the network-error collapse).
+* SCAN BATCHING (TCK-DIAG-006): ``prefetch_scan`` covers the scan's whole
+  possible window with ONE ``scantxoutset`` walk; a full-window batched
+  scan asserts ``counts["scantxoutset"] == 1`` whatever the window size,
+  per-probe ticks still fire once per probed address, and the batched
+  scan persists byte-identical rows to the legacy per-probe-walk path.
 """
 
 from __future__ import annotations
@@ -56,6 +61,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -90,9 +96,17 @@ from localwallet.chain.esplora import NOT_CORE_SHAPE
 from localwallet.chain.watch import time_since_last_block
 from localwallet.config import Settings
 from localwallet.wallet import scan as wallet_scan
+from localwallet.wallet.scan import _MAX_WINDOW_ADDRESSES
 from tests.test_chain_electrum import _esplora_scenario, _fresh_plan, _spk_hex
 from tests.test_chain_esplora import BROADCAST_TXID, TX_HEX
-from tests.test_wallet_scan import _EXTERNAL, ADDRS, TIP, FakeChain, utxo_entry
+from tests.test_wallet_scan import (
+    _EXTERNAL,
+    ADDRS,
+    TIP,
+    WD,
+    FakeChain,
+    utxo_entry,
+)
 
 BH: str = "ab" * 32  # a deterministic 64-hex "bestblockhash"
 TIP_TIME: int = 1_700_000_000
@@ -696,6 +710,10 @@ class TestSnapshotCache:
         assert server.counts["scantxoutset"] == 1
 
     def test_new_address_extends_the_descriptor_union(self, bitcoind: Any) -> None:
+        # The legacy PER-PROBE walk (no prefetch — watch polls, direct
+        # adapter use): every newly-asked script still extends the union.
+        # The SCAN path is batched since TCK-DIAG-006 (see
+        # test_prefetch_scan_covers_the_whole_window_with_one_walk).
         server = bitcoind(script={"scantxoutset": lambda p: _scan_result([])})
         with _client(server) as client:
             client.get_address_utxos(ADDRS[0][0])
@@ -706,6 +724,40 @@ class TestSnapshotCache:
             f"raw({_spk_hex(ADDRS[0][0])})",
             f"raw({_spk_hex(ADDRS[0][1])})",
         ]
+
+    def test_prefetch_scan_covers_the_whole_window_with_one_walk(
+        self, bitcoind: Any
+    ) -> None:
+        """TCK-DIAG-006: one batched walk serves every window probe."""
+        server = bitcoind(script={"scantxoutset": lambda p: _scan_result([])})
+        window = ADDRS[0][:40]
+        with _client(server) as client:
+            client.prefetch_scan(window)
+            for address in window:
+                client.get_address_txs(address)
+                client.get_address_utxos(address)
+            # A repeat prefetch over the same window at the same tip (the
+            # next scan between blocks) starts no second walk either.
+            client.prefetch_scan(window)
+        assert server.counts["scantxoutset"] == 1
+        (_action, descriptors), = [
+            x for m, x in server.requests if m == "scantxoutset"
+        ]
+        assert _action == "start"
+        assert descriptors == [
+            f"raw({script})" for script in sorted({_spk_hex(a) for a in window})
+        ]
+
+    def test_probe_outside_the_prefetched_window_still_walks(
+        self, bitcoind: Any
+    ) -> None:
+        """Honesty ceiling: prefetch never fabricates an answer for a script
+        the walk did not cover — an uncovered probe takes a fresh walk."""
+        server = bitcoind(script={"scantxoutset": lambda p: _scan_result([])})
+        with _client(server) as client:
+            client.prefetch_scan(ADDRS[0][:20])
+            client.get_address_txs(ADDRS[0][20])
+        assert server.counts["scantxoutset"] == 2
 
     def test_tip_movement_invalidates(self, bitcoind: Any) -> None:
         state = {"h": TIP}
@@ -1085,6 +1137,143 @@ def test_fetch_scan_bitcoind_matches_where_the_data_allows(
     sync_b = dict(over_bitcoind.sync_state_updates)
     assert sync_b[wallet_scan.TIP_KEY] == sync_e[wallet_scan.TIP_KEY]
     assert sync_b[wallet_scan.CURSOR_KEY] == json.dumps({"0": 23, "1": 20}, sort_keys=True)
+
+
+# ------------------------------------------- scan batching (TCK-DIAG-006)
+
+
+class _Unbatched(BitcoindClient):
+    """The PRE-batching client: with the optional ``prefetch_scan``
+    capability masked, ``fetch_scan`` falls back to the legacy one-walk-
+    per-new-address path — the equality oracle for the batched scan."""
+
+    prefetch_scan = None  # type: ignore[assignment]
+
+
+def _funded_window_script(addresses: list[str]) -> dict[str, Any]:
+    """Node script where EVERY listed address holds one live confirmed
+    coin (distinct index-derived funding txids — the ``_used_everywhere``
+    shape), so the gap walk chains through them to the window's end."""
+    coins: dict[str, tuple[str, str]] = {
+        _addr_script_hex(address): (f"{index:064x}", address)
+        for index, address in enumerate(addresses)
+    }
+
+    def scantx(params: list[Any]) -> dict[str, Any]:
+        scripts = {d[len("raw(") : -1] for d in params[1]}
+        return _scan_result(
+            [
+                _unspent_row(txid, 0, address, 9_000, TIP)
+                for script, (txid, address) in sorted(coins.items())
+                if script in scripts
+            ]
+        )
+
+    by_txid = {txid: address for txid, address in coins.values()}
+
+    def gettx(params: list[Any]) -> Any:
+        address = by_txid[params[0]]
+        return _core_verbose(
+            params[0],
+            vins=(_EXTERNAL,),
+            vouts=(address,),
+            confirmed=True,
+            height=TIP,
+            block_time=TIP_TIME,
+            fee_sats=1_000,
+        )
+
+    return {"scantxoutset": scantx, "getrawtransaction": gettx}
+
+
+@pytest.mark.parametrize("funded", [(2,), tuple(range(60))])
+def test_batched_scan_walks_once_whatever_the_window(
+    bitcoind: Any, funded: tuple[int, ...]
+) -> None:
+    """DONE-WHEN 1: a full-window scan via the batched path issues exactly
+    ONE ``scantxoutset`` walk regardless of window size — the walk's
+    descriptor union covers the scan's whole POSSIBLE window (both branches
+    to the TCK-SEC-002 ceiling), so probing a fresh 43-address window or a
+    deeply-used 100-address window costs the same one walk. Pre-fix, this
+    was one full walk per newly-probed address.
+    """
+    window = [ADDRS[0][i] for i in funded]
+    server = bitcoind(script=_funded_window_script(window))
+    store, plan = _fresh_plan()
+    ticks: list[int] = []
+    try:
+        with _client(server) as client:
+            records = wallet_scan.fetch_scan(
+                plan, client, progress_fn=lambda: ticks.append(1)
+            )
+    finally:
+        store.close()
+    assert server.counts["scantxoutset"] == 1
+    (_action, descriptors), = [x for m, x in server.requests if m == "scantxoutset"]
+    assert len(descriptors) == _MAX_WINDOW_ADDRESSES * 2
+    # The single walk runs BEFORE the probe loop: the batched fetch is
+    # what the per-address probes then ride, not something they trigger.
+    methods = server.methods()
+    assert methods.index("scantxoutset") < methods.index("getrawtransaction")
+    # Per-dot progress semantics preserved honestly: one tick per PROBED
+    # address (the ticks may burst after the walk — the count is the pin).
+    scanned = sum(b.scanned for b in records.summary.branches.values())
+    assert len(ticks) == scanned
+    # Usage is still found exactly where it lives, window and all.
+    assert records.summary.branches[0].max_used_index == funded[-1]
+    assert records.summary.branches[0].scanned == funded[-1] + 21
+    assert len(records.tx_rows) == len(funded)
+
+
+def test_batched_scan_persists_rows_identical_to_the_unbatched_walk(
+    bitcoind: Any,
+) -> None:
+    """DONE-WHEN 3 (equality pin): the batched scan and the PRE-batching
+    per-probe-walk scan of an equivalent fixture persist byte-identical
+    store rows — batching is a fetch-plan optimization, not a behavior
+    change. The unbatched run (the optional capability masked) proves the
+    oracle really took the legacy many-walk path; the batched run walked
+    once."""
+    txs, utxos = _esplora_scenario()
+    script = _bitcoind_script_from_scenario(txs, utxos)
+
+    def _scan_via(cls: type[BitcoindClient]) -> tuple[dict[str, Any], Any, int]:
+        server = bitcoind(script=script)
+        store, _plan = _fresh_plan()
+        try:
+            with cls(base_url=server.url, timeout_s=2.0, max_retries=0) as client:
+                summary = wallet_scan.scan_wallet(store, client, WD)
+            wid = store.get_wallet_by_name("main").id  # type: ignore[union-attr]
+            persisted = {
+                "addresses": {
+                    branch: store.get_addresses(wid, branch) for branch in (0, 1)
+                },
+                "derivation": {
+                    branch: store.get_derivation(wid, branch) for branch in (0, 1)
+                },
+                "utxos": store.get_utxos_for_wallet(wid),
+                "txs": store.get_txs_for_wallet(wid),
+                "cursor": store.get_sync_state(wid, wallet_scan.CURSOR_KEY),
+                "tip": store.get_sync_state(wid, wallet_scan.TIP_KEY),
+                "out_of_window": store.get_sync_state(
+                    wid, wallet_scan.OUT_OF_WINDOW_KEY
+                ),
+            }
+            return persisted, summary, server.counts["scantxoutset"]
+        finally:
+            store.close()
+
+    batched_rows, batched_summary, batched_walks = _scan_via(BitcoindClient)
+    legacy_rows, legacy_summary, legacy_walks = _scan_via(_Unbatched)
+
+    # The bug being fixed, pinned from both sides of the seam.
+    assert batched_walks == 1
+    assert legacy_walks > 20  # one walk per newly-probed script (was ~all 43)
+
+    assert batched_rows == legacy_rows
+    assert replace(batched_summary, scanned_at="") == replace(
+        legacy_summary, scanned_at=""
+    )
 
 
 # -------------------------------------------------------------- broadcast

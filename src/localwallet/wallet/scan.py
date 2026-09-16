@@ -46,6 +46,13 @@ Ordering (rate-limit friendly): strictly sequential; per branch indices
 ascend, transactions are fetched before UTXOs, branch 0 runs before
 branch 1. Exactly one txs call per scanned window address, and one utxo
 call per window address whose txs result was non-empty (TCK-SCAN-001).
+Batching (TCK-DIAG-006): a backend that answers address queries from an
+expensive whole-window scan (bitcoind's ``scantxoutset`` snapshot) may
+expose an OPTIONAL ``prefetch_scan(addresses)`` capability; the scan then
+issues ONE batched fetch covering its whole possible window before the
+first probe and the per-address calls ride the adapter's cache. Probing
+behavior, counts of logical per-address fetches, and persisted results
+are identical either way (see :func:`_prefetch_window`).
 
 Absolute per-branch window ceiling (TCK-SEC-002): the gap-limited walk
 above is unbounded when usage itself is attacker-driven — an observer of
@@ -472,13 +479,18 @@ def fetch_scan(
     ``progress_fn`` (TCK-UX-001) is invoked on the WORKER thread — one
     bare value-free tick per probed address; the caller owns delivery
     (the app queues ticks for the engine, never renders from this
-    thread). ``None`` (the default) performs no callback.
+    thread). ``None`` (the default) performs no callback. An adapter
+    offering the optional ``prefetch_scan`` capability is asked to cover
+    the whole possible window BEFORE the first probe (TCK-DIAG-006), so
+    the ticks may burst after one batched backend walk — the per-probe
+    tick contract is unchanged.
 
     Raises:
         ChainError: a chain query failed (nothing was produced).
         ScanError: a chain payload failed validation (fail closed).
     """
     # ---- chain phase (immutable snapshots in, immutable records out)
+    _prefetch_window(plan, client)
     tip_height = client.get_tip_height()
     scanned_at = datetime.now(UTC).isoformat()
 
@@ -675,6 +687,45 @@ def _resolve_wallet(
                 return wallet, row.id
         raise ScanError("no stored wallet matches the supplied descriptor")
     raise ScanError("wallet must be a WalletRecord or WalletDescriptor")
+
+
+def _prefetch_window(plan: ScanPlan, client: ChainClient) -> None:
+    """Batch the walk's first chain fetch into ONE adapter call when the
+    backend can pre-cover a window (TCK-DIAG-006).
+
+    The bitcoind adapter answers every address query from a
+    ``scantxoutset`` snapshot whose cached walk only covers the scripts
+    that walk saw — probing the gap window one address at a time cost one
+    FULL-UTXO-SET walk (minutes-class) per NEW address, the user-reported
+    2-minutes-per-dot startup scan. Adapters that can cover a whole
+    window in one walk expose an OPTIONAL ``prefetch_scan(addresses)``
+    method (the same duck-typed capability seam as ``min_relay_centisat_vb``
+    — deliberately NOT declared on :class:`~localwallet.chain.esplora.ChainClient`
+    so presence and absence stay distinguishable); when present, the scan's
+    FULL POSSIBLE window — every index the walk may derive under the
+    TCK-SEC-002 ceiling, both branches, derived from the key — is covered
+    by ONE batched call before the first probe.
+
+    Results are unaffected: prefetching only seeds the adapter's snapshot
+    cache — the walk then probes exactly the same addresses in the same
+    order, one ``progress_fn`` tick per probe as before (the ticks may
+    BURST after the single batched walk completes: the honest shape of
+    batching, ticket-approved). An address the window does not cover (a
+    corrupt cache row disagreeing with the key) simply takes the adapter's
+    legacy per-probe walk. Electrum exposes no such method: its
+    scripthash lookups are server-indexed and were never the problem —
+    no attribute, no prefetch, no change.
+    """
+    prefetch = getattr(client, "prefetch_scan", None)
+    if prefetch is None:
+        return
+    window: list[str] = []
+    for branch in BRANCHES:
+        deriver = BranchDeriver(plan.descriptor.parsed, branch)
+        window.extend(
+            deriver.address(index) for index in range(_MAX_WINDOW_ADDRESSES)
+        )
+    prefetch(window)
 
 
 def _walk_history(

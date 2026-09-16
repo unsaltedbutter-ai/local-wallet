@@ -82,7 +82,13 @@ The scan problem — the plan's option (a), watch-only exact:
   is SYNCHRONOUS server-side (Core answers only after it completes), so
   the start call runs with the dedicated :data:`_SCAN_TIMEOUT_S` budget and
   ZERO retries — see the constant for the timeout→retry→"Scan already in
-  progress" trap that pairing fixes. Ceiling
+  progress" trap that pairing fixes. SCAN BATCHING (TCK-DIAG-006): probing
+  a gap window address-by-address on that rule cost one full walk per NEW
+  script (the user-reported 2-minutes-per-dot startup scan), so
+  :meth:`BitcoindClient.prefetch_scan` lets the scan cover its WHOLE
+  possible window with ONE union walk up front and probe the cached
+  snapshot locally; per-probe walks remain only for non-prefetched paths
+  (watch polls) and genuinely-uncovered scripts. Ceiling
   (``ponytail:`` comment at the cache): a same-height reorg between probes
   keeps the stale snapshot until the next block lands — watch polls make
   that window minutes on a live node.
@@ -132,6 +138,7 @@ import http.client
 import json
 import ssl
 import threading
+from collections.abc import Sequence
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from types import TracebackType
@@ -611,7 +618,7 @@ class BitcoindClient:
         script_hex = self._script_hex(address)
         with self._lock:
             self._scripts.add(script_hex)
-            return list(self._scan_snapshot(script_hex).get(script_hex, []))
+            return list(self._scan_snapshot({script_hex}).get(script_hex, []))
 
     def get_address_txs(self, address: str) -> list[dict[str, Any]]:
         """History for ``address`` as far as the data allows, Esplora shape.
@@ -635,7 +642,7 @@ class BitcoindClient:
         script_hex = self._script_hex(address)
         with self._lock:
             self._scripts.add(script_hex)
-            unspents = self._scan_snapshot(script_hex).get(script_hex, [])
+            unspents = self._scan_snapshot({script_hex}).get(script_hex, [])
             # SCAN TRUTH (TCK-SCAN-BITCOIND-002): the confirmation height
             # comes from the scantxoutset rows — Core's verbose txs carry
             # no height field under any name. Rows that proved none are
@@ -656,6 +663,41 @@ class BitcoindClient:
                 verbose = self._rpc("getrawtransaction", [txid, 2], _KIND_ADDRESS_TXS)
                 entries.append(self._tx_entry(verbose, txid, heights.get(txid)))
             return entries
+
+    def prefetch_scan(self, addresses: Sequence[str]) -> None:
+        """Cover a whole scan window with ONE ``scantxoutset`` walk
+        (TCK-DIAG-006 — the batched-scan seam :func:`wallet.scan.fetch_scan`
+        discovers through the OPTIONAL ``prefetch_scan`` capability, the
+        same duck-typed pattern as ``min_relay_centisat_vb``).
+
+        The problem this solves: the cached walk only answers scripts IT
+        covered, so the gap walk's one-address-at-a-time probing cost ONE
+        FULL-UTXO-SET WALK (minutes-class) PER NEW ADDRESS. Prefetching
+        every script the scan MAY probe (its whole possible window) turns
+        the probe loop into local cache reads: one walk for the whole
+        scan, whatever the window size. Results are unaffected — the
+        per-address probes afterwards ride the exact same
+        :meth:`_scan_snapshot` path and read THIS snapshot; a script added
+        later that the walk never covered (an address outside the
+        prefetched window, a tip move) simply takes the legacy fresh-walk
+        path. When the cached snapshot at the current tip already covers
+        every listed script, no new walk runs (rescans between blocks and
+        repeated prefetches of the same window are free).
+
+        ``addresses`` are the wallet's own derived receive/change
+        addresses (watch-only: bare scripts enter the descriptor union,
+        never keys, never the node wallet — the same rule as every probe
+        here). Value-free throughout.
+        """
+        scripts = {self._script_hex(address) for address in addresses}
+        if not scripts:
+            return
+        with self._lock:
+            self._scripts |= scripts
+            # One coverage check, one walk: _scan_snapshot's fresh walk
+            # takes the UNION of every script asked about so far, so this
+            # single call leaves every prefetched script cache-served.
+            self._scan_snapshot(scripts)
 
     def get_tip_height(self) -> int:
         """Tip height via ``getblockchaininfo`` ``.blocks``.
@@ -878,28 +920,28 @@ class BitcoindClient:
         except Exception:  # noqa: BLE001 — containment: embit errors vary and must not echo the address
             raise ChainError("invalid address argument") from None
 
-    def _scan_snapshot(self, queried: str) -> dict[str, list[dict[str, Any]]]:
+    def _scan_snapshot(self, queried: set[str]) -> dict[str, list[dict[str, Any]]]:
         """``{script hex: Esplora-shaped utxo entries}`` at the current tip.
 
-        Caller holds the lock and has ALREADY added the queried script to
-        ``self._scripts``. A cached walk serves only while the tip height
-        is unchanged AND the CACHED WALK COVERED the queried script (an
+        Caller holds the lock and has ALREADY added every ``queried`` script
+        to ``self._scripts``. A cached walk serves only while the tip height
+        is unchanged AND the CACHED WALK COVERED every queried script (an
         uncovered script has no honest answer in the cache — not even
         "empty"); otherwise a fresh ``scantxoutset`` covers the UNION of
-        every script asked about so far (all of them ours). A walk with a
-        growing descriptor set (each first-time address re-walks once,
-        taking every earlier script with it) is the accepted M2 cost;
-        steady-state windows hit the cache and only re-walk when the tip
-        moves. An interrupted/failed walk (``success`` not true, or
-        Core's ``complete: false`` — e.g. a concurrent scanner on a
-        shared node) fails closed: an unreliable UTXO snapshot never
-        becomes a balance.
+        every script asked about so far (all of them ours). :meth:`prefetch_scan`
+        (TCK-DIAG-006) uses exactly this union property to batch a whole scan
+        window into ONE walk; probes without a preceding prefetch still take
+        one walk per newly-asked script (the accepted per-probe cost on
+        non-scan paths like the watch poll). An interrupted/failed walk
+        (``success`` not true, or Core's ``complete: false`` — e.g. a
+        concurrent scanner on a shared node) fails closed: an unreliable UTXO
+        snapshot never becomes a balance.
         """
         height = self.get_tip_height()
         if (
             self._snapshot is not None
             and self._snapshot_height == height
-            and queried in self._snapshot_scripts
+            and queried <= self._snapshot_scripts
         ):
             return self._snapshot
         # BARE ``raw(<hex>)`` descriptors — the shape scantxoutset's own

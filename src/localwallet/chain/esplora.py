@@ -458,6 +458,13 @@ class ChainClient(Protocol):
     1 sat/vB; electrum honestly ABSENTS it. Adding it to this Protocol would
     make presence-of-capability indistinguishable from absence, so it is
     duck-typed like ``get_json``, not declared.
+    Equally OPTIONAL (TCK-DIAG-006, same reasoning): ``prefetch_scan
+    (addresses) -> None`` — pre-cover a whole scan window in one batched
+    backend fetch so the scan's per-address probes ride the adapter's
+    cache (bitcoind implements it: ONE ``scantxoutset`` walk for the whole
+    window instead of one per new address; electrum honestly ABSENTS it —
+    its lookups are server-indexed and were never the problem).
+    ``wallet.scan.fetch_scan`` gates on presence, not on the declared type.
     """
 
     #: Whether this backend serves a USD price feed (ADR-0011 ladder input;
