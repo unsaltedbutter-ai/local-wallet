@@ -1579,7 +1579,13 @@ class TestSelectionAndProtocol:
         finally:
             client.close()
 
-    def test_both_new_clients_structurally_satisfy_chain_client(self, bitcoind: Any) -> None:
+    def test_wallet_adapters_satisfy_chain_client_public_info_does_not(
+        self, bitcoind: Any
+    ) -> None:
+        """TCK-DESCOPE-M4 separation pin: the bitcoind wallet adapter satisfies
+        ``ChainClient``; the public-info Esplora client deliberately does NOT
+        (its wallet-data paths were deleted — it can't be duck-typed back in
+        as a wallet backend)."""
         server = bitcoind()
         with (
             BitcoindClient(base_url=server.url, timeout_s=5.0, max_retries=0) as client_b,
@@ -1591,7 +1597,7 @@ class TestSelectionAndProtocol:
             ) as client_e,
         ):
             assert isinstance(client_b, ChainClient)
-            assert isinstance(client_e, ChainClient)
+            assert not isinstance(client_e, ChainClient)
 
     def test_get_json_is_esplora_only(self, bitcoind: Any) -> None:
         server = bitcoind()

@@ -50,11 +50,12 @@ from localwallet.app import (
     Settings,
     run,
 )
-from localwallet.chain import EsploraClient, FeeEstimator, PriceOracle, PublicInfoClient
+from localwallet.chain import FeeEstimator, PriceOracle, PublicInfoClient
 from localwallet.config import resolve_chain_base_url
 from localwallet.store import Store
 from localwallet.ui.onboarding import BACKEND_CHOICE_PUBLIC, BACKEND_CHOICE_SETTING
 from localwallet.wallet import WalletDescriptor
+from tests.chaindouble import WalletShapeClient
 from tests.test_e2e_skeleton import ZPUB
 
 
@@ -97,10 +98,10 @@ class _Out(list):
         pass
 
 
-def _mock_client(*_args: Any, **_kwargs: Any) -> EsploraClient:
-    """An Esplora-shaped mock (all three wallet adapters satisfy the same
-    protocol at the seams these tests exercise)."""
-    return EsploraClient(
+def _mock_client(*_args: Any, **_kwargs: Any) -> WalletShapeClient:
+    """A wallet-shape mock (TCK-DESCOPE-M4 double — the wallet adapters
+    satisfy the same protocol at the seams these tests exercise)."""
+    return WalletShapeClient(
         base_url=Settings().esplora_base_url,
         timeout_s=2.0,
         max_retries=0,

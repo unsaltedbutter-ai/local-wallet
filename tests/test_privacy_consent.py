@@ -27,12 +27,7 @@ import httpx
 import pytest
 
 from localwallet import app
-from localwallet.chain import (
-    EsploraClient,
-    FeeEstimator,
-    PriceOracle,
-    time_since_last_block,
-)
+from localwallet.chain import FeeEstimator, PriceOracle, time_since_last_block
 from localwallet.protocol import (
     CreateTxParams,
     Envelope,
@@ -44,13 +39,14 @@ from localwallet.protocol import (
 from localwallet.store import Store
 from localwallet.ui.onboarding import BACKEND_CHOICE_PUBLIC, BACKEND_CHOICE_SETTING
 from localwallet.wallet.descriptor import WalletDescriptor
+from tests.chaindouble import WalletShapeClient
 from tests.test_e2e_skeleton import SEND_RECIPIENT, ZPUB
 from tests.test_web_server import _request, _Stream
 
 TXID: Final[str] = "ab" * 32  # shape-valid 64-hex (the stub's own placeholder)
 
 
-def _counting_client(calls: list[str]) -> EsploraClient:
+def _counting_client(calls: list[str]) -> WalletShapeClient:
     """The TCK-ONB-006 counting discipline (tests/test_onboarding.py),
     extended to record ``host+path`` so a pin can name WHERE traffic would
     have gone. MockTransport: nothing can leave the process even if a gate
@@ -67,7 +63,7 @@ def _counting_client(calls: list[str]) -> EsploraClient:
             return httpx.Response(200, json={"confirmed": True, "block_height": 1})
         return httpx.Response(200, json=[])
 
-    return EsploraClient(
+    return WalletShapeClient(
         base_url="https://mempool.space/api",  # the public default under audit
         timeout_s=2.0,
         max_retries=0,

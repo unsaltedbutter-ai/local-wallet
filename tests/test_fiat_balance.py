@@ -20,11 +20,12 @@ import httpx
 import pytest
 
 from localwallet.app import StartupScan, _print_balance, build_dispatch_table
-from localwallet.chain import EsploraClient, PriceOracle
+from localwallet.chain import PriceOracle
 from localwallet.protocol import DispatchTable, IntentName, validate_payload
 from localwallet.store import Store
 from localwallet.wallet import GAP_LIMIT_SETTING, scan_wallet
 from localwallet.wallet.descriptor import WalletDescriptor
+from tests.chaindouble import WalletShapeClient
 from tests.test_e2e_skeleton import (
     EXPECTED_TOTAL,
     GET_BALANCE_JSON,
@@ -50,10 +51,10 @@ def _balance_table(
     *,
     usd: float = PRICE_USD,
     prices_state: dict[str, Any] | None = None,
-    make_oracle: Callable[[EsploraClient], Any] | None = None,
+    make_oracle: Callable[[WalletShapeClient], Any] | None = None,
     funded: bool = True,
     scan_gate: Any | None = None,
-) -> tuple[DispatchTable, Store, EsploraClient, list[httpx.Request]]:
+) -> tuple[DispatchTable, Store, WalletShapeClient, list[httpx.Request]]:
     """Store-backed dispatch table over a mock chain that ALSO serves
     ``/v1/prices`` (scan/tip shapes come from the e2e fixtures).
 

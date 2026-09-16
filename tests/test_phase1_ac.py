@@ -59,7 +59,8 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from localwallet.app import build_dispatch_table
-from localwallet.chain import EsploraClient
+from localwallet.chain import ElectrumClient
+from localwallet.config import PUBLIC_ELECTRUM_URL
 from localwallet.protocol import IntentName, validate_payload
 from localwallet.store import (
     ADDRESS_ALLOCATED,
@@ -704,10 +705,14 @@ def test_ac4_store_view_narration_inputs_match_truth(store: Store) -> None:
     reason="live-network test: set LOCALWALLET_E2E_LIVE=1 to include",
 )
 def test_live_phase1_ac_explorer_crosscheck_sheet() -> None:
-    """Real scan_wallet (gap 30) against mempool.space mainnet for the
-    zpub in LOCALWALLET_AC_ZPUB; prints a human comparison sheet (balance
-    totals, utxo/tx counts, per-branch max_used, first/last window
-    address) for the literal Phase 1 AC sign-off (see docs/phase1-ac.md).
+    """Real scan_wallet (gap 30) against the PUBLIC ELECTRUM mainnet server
+    (TCK-DESCOPE-M4: re-pointed from the retired mempool.space WALLET path —
+    wallet information comes only from electrum/bitcoind) for the zpub in
+    LOCALWALLET_AC_ZPUB; prints a human comparison sheet (balance totals,
+    utxo/tx counts, per-branch max_used, first/last window address) for the
+    literal Phase 1 AC sign-off (see docs/phase1-ac.md; the human may still
+    cross-read the public mempool.space explorer — it is a comparison
+    surface, never this app's wallet source).
 
     Run (add -s to see the sheet):
 
@@ -722,7 +727,7 @@ def test_live_phase1_ac_explorer_crosscheck_sheet() -> None:
         pytest.skip("LOCALWALLET_AC_ZPUB not set")
 
     descriptor = WalletDescriptor.from_key(zpub)
-    client = EsploraClient()  # default: https://mempool.space/api
+    client = ElectrumClient(base_url=PUBLIC_ELECTRUM_URL)  # ssl://electrum.blockstream.info:50002
     try:
         with Store.memory() as store:
             wallet = store.create_wallet("default", descriptor.descriptor)

@@ -1,7 +1,7 @@
 """Tests for Phase 5 ``watch_incoming`` (TCK-P5-001): poller + time-since-block.
 
-All hermetic: the poller is driven by an injected probe (test double) and the
-chain client is served by ``httpx.MockTransport`` — no real network.
+All hermetic: the poller and the tip helper are driven by injected test
+doubles — no real network.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ import sys
 import time
 from pathlib import Path
 
-import httpx
 import pytest
 
 _SRC = Path(__file__).resolve().parent.parent / "src"
@@ -20,7 +19,6 @@ if str(_SRC) not in sys.path:
 from localwallet.app import _drain_watch, _make_watch_probe, _narrate_incoming_event
 from localwallet.chain import (
     ChainError,
-    EsploraClient,
     IncomingEvent,
     IncomingWatcher,
     TipBlock,
@@ -37,7 +35,6 @@ from localwallet.store import (
     UtxoRecord,
 )
 
-BASE_URL = "https://mempool.space/testnet4/api"
 TXID = "a" * 64
 ADDR = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
 
@@ -82,64 +79,6 @@ def test_time_since_block_none_on_chain_error():
 
 def test_time_since_block_none_on_bad_shape():
     assert time_since_last_block(_FakeTipClient(None), now=1_000_000) is None
-
-
-class _Scripted:
-    """Minimal MockTransport backend for get_tip_block shape tests."""
-
-    def __init__(self, payload: object) -> None:
-        self._payload = payload
-
-    def handler(self, request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=self._payload)
-
-
-def _tip_client(payload: object) -> EsploraClient:
-    return EsploraClient(
-        base_url=BASE_URL, timeout_s=5.0, max_retries=0,
-        transport=httpx.MockTransport(_Scripted(payload).handler),
-    )
-
-
-def test_get_tip_block_list_shape_extracts_max_height_timestamp():
-    with _tip_client(
-        [
-            {"height": 100, "timestamp": 1_000_000},
-            {"height": 101, "timestamp": 1_000_100},
-        ]
-    ) as client:
-        tip = client.get_tip_block()
-    assert tip.height == 101
-    assert tip.timestamp == 1_000_100
-
-
-def test_get_tip_block_list_shape_missing_timestamp_is_none():
-    with _tip_client([{"height": 101}]) as client:
-        tip = client.get_tip_block()
-    assert tip.height == 101
-    assert tip.timestamp is None
-
-
-def test_get_tip_block_bare_integer_shape_timestamp_none():
-    with _tip_client(101) as client:
-        tip = client.get_tip_block()
-    assert tip.height == 101
-    assert tip.timestamp is None
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        [],  # empty list
-        [{"height": "x"}],  # malformed height
-        "junk",  # not an int or list
-        True,  # bool is not an int
-        [{"height": -1}],  # negative height
-    ],
-)
-def test_get_tip_block_malformed_shape_fails_closed(payload: object):
-    with _tip_client(payload) as client, pytest.raises(ChainError):
-        client.get_tip_block()
 
 
 # ---------------------------------------------------------------- poller (tick-driven)

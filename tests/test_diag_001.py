@@ -20,9 +20,7 @@ from localwallet.chain import classify_failure
 from localwallet.chain.esplora import (
     CONNECT_REFUSED,
     NETWORK_ERROR,
-    NOT_MAINNET,
     TLS_VERIFY_FAILURE,
-    check_backend,
 )
 from localwallet.config import Settings
 
@@ -52,36 +50,6 @@ def test_classify_failure_maps_transport_classes() -> None:
     wrapped.__cause__ = ConnectionResetError("reset")
     assert classify_failure(wrapped) == CONNECT_REFUSED
     assert classify_failure(ValueError("unrelated")) == NETWORK_ERROR
-
-
-# ------------------------------------------------------- check_backend report
-
-
-def test_check_backend_report_not_mainnet() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/blocks/tip"):
-            return httpx.Response(200, json=100)
-        return httpx.Response(200, json=[{"id": "1" * 64, "height": 0}])
-
-    report: dict[str, str] = {}
-    assert not check_backend("https://n.example/api", transport=_mt(handler), report=report)
-    assert report["failure_class"] == NOT_MAINNET
-
-
-def test_check_backend_report_transport_failure() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("refused") from ConnectionRefusedError("refused")
-
-    report: dict[str, str] = {}
-    assert not check_backend("https://n.example/api", transport=_mt(handler), report=report)
-    assert report["failure_class"] == CONNECT_REFUSED
-    assert report["exc_name"]  # non-empty
-
-
-def test_check_backend_report_malformed_url() -> None:
-    report: dict[str, str] = {}
-    assert not check_backend("https://user:pass@n.example", report=report)
-    assert report["failure_class"] == NETWORK_ERROR
 
 
 # ------------------------------------------------- probe emission (no network)

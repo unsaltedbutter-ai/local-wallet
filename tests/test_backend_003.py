@@ -42,8 +42,8 @@ from localwallet.app import BACKEND_PROBE_FAIL, BitcoindClient, _build_chain_cli
 from localwallet.chain import (
     MAINNET_GENESIS_HASH,
     ChainConfig,
+    ChainError,
     EsploraClient,
-    check_backend,
 )
 from localwallet.chain.esplora import _ApiRootMismatch
 from localwallet.config import Settings
@@ -223,16 +223,15 @@ class TestRepro1ApiTolerance:
     def test_probe_rejects_the_bare_host_for_the_wallet_seam(
         self, esplora_factory: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """TCK-DESCOPE-M3B split: check_backend (the CHAIN-level Esplora
-        readiness probe, alive until M4's deletion) still tolerates the
-        bare host via the auto-tried /api segment with
-        LOCALWALLET_TLS_VERIFY=0 — but the SETTINGS/ONBOARDING entry probe
-        no longer accepts an Esplora shape as a wallet backend at all:
-        it gets ONE Core-RPC attempt, fails, and REFUSES (None — nothing
-        to store). The URL never reaches the store's typed writer."""
+        """TCK-DESCOPE-M3B/M4: the SETTINGS/ONBOARDING entry probe does not
+        accept an Esplora shape as a wallet backend at all — it gets ONE
+        Core-RPC attempt, fails, and REFUSES (None — nothing to store). The
+        URL never reaches the store's typed writer. (The CHAIN-level
+        ``check_backend`` Esplora readiness probe was deleted in M4 with the
+        wallet role; the surviving /api tolerance is pinned at the client
+        level below and in the public-info suites.)"""
         url, _paths = esplora_factory()
         monkeypatch.setenv("LOCALWALLET_TLS_VERIFY", "0")
-        assert check_backend(url, timeout_s=5.0, max_retries=0) is True
         assert app_module._probe_chain_backend(url, _SETTINGS) is None
 
     def test_live_client_joins_the_saved_bare_url(
@@ -257,22 +256,24 @@ class TestRepro1ApiTolerance:
 
     def test_probe_refused_under_default_verify(self, esplora_factory: Any) -> None:
         """Fail-closed default (TLS verify ON): the self-signed backend is a
-        verify-failure class → probe False, readiness None."""
+        verify-failure class → the wallet-entry probe answers None."""
         url, _paths = esplora_factory()
-        assert check_backend(url, timeout_s=5.0, max_retries=0) is False
         assert app_module._probe_chain_backend(url, _SETTINGS) is None
 
     def test_api_suffixed_url_unchanged_single_join(
         self, esplora_factory: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A base already ending /api (the old public default's shape) is
-        PRE-RESOLVED at the CHAIN level: never double-requested, never
-        /api/api'd. (The wallet-entry refusal of this shape is pinned next
-        door — _probe_chain_backend gets ONE Core attempt and answers None.)"""
+        """A base already ending /api (the public-info default's shape) is
+        PRE-RESOLVED on the client: never double-requested, never
+        /api/api'd. (The wallet-entry refusal of an http(s) shape is pinned
+        next door — _probe_chain_backend gets ONE Core attempt and None.)"""
         url, paths = esplora_factory()
         monkeypatch.setenv("LOCALWALLET_TLS_VERIFY", "0")
         suffixed = f"{url}/api"
-        assert check_backend(suffixed, timeout_s=5.0, max_retries=0) is True
+        with EsploraClient(
+            base_url=suffixed, timeout_s=5.0, max_retries=0
+        ) as client:
+            assert client.get_tip_height() == TIP
         assert "/api/api" not in "".join(paths.seen)  # no doubled segment
         assert "/blocks/tip" not in paths.seen  # bare join never attempted
 
@@ -313,17 +314,18 @@ class TestApiFallbackMechanics:
 
     def test_transport_failure_never_walks_the_prefix(self) -> None:
         """Unreachable/timeout is NOT the mismatch class (a path change fixes
-        nothing): one attempt class, one collapse, snappy probe budget."""
+        nothing): one attempt class, one collapse, snappy budget."""
         seen: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             seen.append(request.url.path)
             raise httpx.ConnectError("nope")
 
-        assert check_backend(
-            "https://down.self", timeout_s=0.5, max_retries=0,
+        with EsploraClient(
+            base_url="https://down.self", timeout_s=0.5, max_retries=0,
             transport=httpx.MockTransport(handler),
-        ) is False
+        ) as client, pytest.raises(ChainError):
+            client.get_tip_height()
         assert seen == ["/blocks/tip"]  # no /api second try after a transport loss
 
     def test_persistent_mismatch_surfaces_the_original_error(self) -> None:
@@ -559,15 +561,16 @@ def test_probe_diag_script_mirrors_the_app(
         ).stdout
     )
     probes = {p["kind"]: p for p in insecure["probes"]}
-    assert probes["esplora"]["reachable"] is True
-    assert probes["esplora"]["api_root"] == "/api"
-    assert probes["esplora"]["mainnet"] is True
+    # TCK-DESCOPE-M4: the Esplora shape is re-scoped to a PUBLICINFO probe.
+    assert probes["publicinfo"]["reachable"] is True
+    assert probes["publicinfo"]["api_root"] == "/api"
+    assert probes["publicinfo"]["mainnet"] is True
     strict = json.loads(
         subprocess.run(
             [sys.executable, str(script), url, "--json"],
             capture_output=True, text=True, timeout=30, check=True,
         ).stdout
     )
-    strict_esplora = {p["kind"]: p for p in strict["probes"]}["esplora"]
+    strict_esplora = {p["kind"]: p for p in strict["probes"]}["publicinfo"]
     assert strict_esplora["reachable"] is False
     assert strict_esplora["tls_error"] == "verify-failure"

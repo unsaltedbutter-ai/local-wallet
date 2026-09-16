@@ -602,9 +602,8 @@ class BitcoindClient:
         Answered from the ``scantxoutset`` UTXO snapshot (the plan's option
         (a)); entries map ``{txid, vout, value, status:{confirmed
         [,block_height]}}`` exactly like the electrum adapter's
-        ``listunspent`` translation, so ``scan._parse_utxo_entry`` and
-        :func:`~localwallet.chain.esplora.balance_from_utxos` cannot tell
-        the backends apart. **Unconfirmed outputs are not in the UTXO set —
+        ``listunspent`` translation, so ``scan._parse_utxo_entry`` cannot
+        tell the backends apart. **Unconfirmed outputs are not in the UTXO set —
         they surface as honest absence, never as fabricated entries** (the
         documented M2 history tradeoff; rescan widens, spent history needs
         Esplora/electrum).

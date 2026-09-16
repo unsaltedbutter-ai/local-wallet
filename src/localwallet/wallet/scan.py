@@ -1,8 +1,8 @@
 """Gap-limited chain scan and cache orchestration (TCK-P1-002).
 
-Scans a watch-only wallet against an :class:`~localwallet.chain.EsploraClient`
-(the chain module is the only networked code; this module performs no I/O
-itself), and persists the result — derivation state, address statuses, UTXO
+Scans a watch-only wallet through a :class:`~localwallet.chain.ChainClient`
+backend — Electrum or bitcoind (TCK-DESCOPE-M3A/M4; the chain module is the
+only networked code; this module performs no I/O itself), and persists the result — derivation state, address statuses, UTXO
 snapshot, transaction history, and sync cursors — in a single atomic store
 transaction (:meth:`localwallet.store.Store.persist_scan_result`).
 
@@ -109,7 +109,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Final
 
-from localwallet.chain import EsploraClient
+from localwallet.chain import ChainClient
 from localwallet.store import (
     ADDRESS_ALLOCATED,
     ADDRESS_UNUSED,
@@ -313,7 +313,7 @@ class _RawTx:
 
 def scan_wallet(
     store: Store,
-    client: EsploraClient,
+    client: ChainClient,
     wallet: WalletRecord | WalletDescriptor,
     *,
     gap_limit: int | None = None,
@@ -366,7 +366,7 @@ def scan_wallet(
 
 def rescan_wallet(
     store: Store,
-    client: EsploraClient,
+    client: ChainClient,
     wallet: WalletRecord | WalletDescriptor,
     *,
     gap_limit: int | None = None,
@@ -456,7 +456,7 @@ def plan_scan(
 
 def fetch_scan(
     plan: ScanPlan,
-    client: EsploraClient,
+    client: ChainClient,
     *,
     progress_fn: Callable[[], None] | None = None,
 ) -> ScanRecords:
@@ -678,7 +678,7 @@ def _resolve_wallet(
 
 
 def _walk_history(
-    client: EsploraClient,
+    client: ChainClient,
     parsed: ParsedKey,
     branch: int,
     existing: dict[int, AddressRecord],
@@ -787,7 +787,7 @@ def _max_allocated_index(existing: dict[int, AddressRecord]) -> int:
 
 
 def _scan_utxos(
-    client: EsploraClient,
+    client: ChainClient,
     wallet_id: int,
     branch: int,
     final_map: dict[int, str],
@@ -1048,9 +1048,8 @@ def _parse_utxo_entry(
     """Validate one Esplora address-utxo entry (fail closed).
 
     Returns ``(txid, vout, value_sats, confirmed, block_height | None)``.
-    Same strictness as the chain module's ``balance_from_utxos``, plus
-    the txid shape check; error messages name the entry position and
-    field, never the value.
+    Fails closed on any missing/malformed field; error messages name the
+    entry position and field, never the value.
     """
     txid = entry.get("txid")
     if (

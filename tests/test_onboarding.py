@@ -1,8 +1,10 @@
 """TCK-ONB-003 — first-run onboarding conversation (ADR-0023).
 
 Every branch of the five-step flow, driven through ``app.run()`` with
-injected I/O (the established harness pattern) — plus ``chain.check_backend``
-at the transport seam and the stored-rung/banner consistency pins.
+injected I/O (the established harness pattern) plus the stored-rung/banner
+consistency pins. (The chain-level ``check_backend`` Esplora-shape probe
+unit tests retired with the probe itself in TCK-DESCOPE-M4; the app's own
+``_probe_chain_backend`` pins live in the backend-switch suites.)
 
 Branches pinned (ticket requirement 6): fresh-user full flow (steps 1-5),
 seed-word refusal at the key ask, node-ask skip, URL accepted, URL rejected
@@ -32,21 +34,19 @@ from localwallet.app import (
     run,
     stub_generate,
 )
-from localwallet.chain import MAINNET_GENESIS_HASH, EsploraClient, check_backend
 from localwallet.config import Settings
 from localwallet.node import LocalNodeReport, NodeStatus
 from localwallet.node.detect import CoreHealth, CoreRpcProbe
 from localwallet.store import Store
 from localwallet.ui import onboarding as ob
 from localwallet.wallet.descriptor import WalletDescriptor
+from tests.chaindouble import WalletShapeClient
 
 # Public fixture key material ONLY (the canonical suite zpub, one fixed seed).
 from tests.test_e2e_skeleton import XPRV, ZPUB
 
 # The web test-door seam (wake the pump's watch drain via a real /state).
 from tests.test_web_server import _request
-
-TESTNET_GENESIS = "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"
 
 
 def _web_stream_contains(server: Any, needle: str, timeout: float = 10.0) -> bool:
@@ -107,8 +107,8 @@ def _tip_or_empty_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json=[])
 
 
-def _fake_client() -> EsploraClient:
-    return EsploraClient(
+def _fake_client() -> WalletShapeClient:
+    return WalletShapeClient(
         base_url="https://mempool.space/api",
         timeout_s=5.0,
         max_retries=0,
@@ -116,7 +116,7 @@ def _fake_client() -> EsploraClient:
     )
 
 
-def _counting_client(calls: list[int], target: Any = 1) -> EsploraClient:
+def _counting_client(calls: list[int], target: Any = 1) -> WalletShapeClient:
     """A fake backend that COUNTS every chain request — the TCK-ONB-006
     leak pin: the count must stay 0 until a backend choice resolves.
     TCK-BACKEND-002: ``target`` tags WHICH client served (the harness
@@ -128,7 +128,7 @@ def _counting_client(calls: list[int], target: Any = 1) -> EsploraClient:
         calls.append(target)
         return _tip_or_empty_handler(request)
 
-    return EsploraClient(
+    return WalletShapeClient(
         base_url="https://mempool.space/api",
         timeout_s=5.0,
         max_retries=0,
@@ -160,7 +160,7 @@ def _drive(
     node_report: LocalNodeReport | None = None,
     chain_env: str | None = None,
     detection_enabled: bool = True,
-    client: Callable[..., EsploraClient] | None = None,
+    client: Callable[..., WalletShapeClient] | None = None,
 ) -> tuple[int, Recorder, str | None, dict[str, int]]:
     """Run a scripted session; returns ``(code, recorder, stored, state)``.
 
@@ -193,7 +193,7 @@ def _drive(
     # base_url so the ``target``-tagged leak pins keep telling servers apart.
     _factory = client or (lambda **_kw: _fake_client())
 
-    def _fake_build(settings: Settings, auth: Any = None) -> EsploraClient:
+    def _fake_build(settings: Settings, auth: Any = None) -> WalletShapeClient:
         return _factory(base_url=settings.chain_base_url)
 
     monkeypatch.setattr(app_module, "_build_chain_client", _fake_build)
@@ -462,7 +462,7 @@ def test_second_run_stored_choice_skipped_and_banner_flips(
     _preset_wallet(tmp_path, base_url=LOCAL_URL)
     seen: dict[str, Any] = {}
 
-    def spy_client(**kw: Any) -> EsploraClient:
+    def spy_client(**kw: Any) -> WalletShapeClient:
         seen.update(kw)
         return _fake_client()
 
@@ -865,8 +865,8 @@ def test_startup_scan_failure_never_narrates_load_complete(
     scan persist — including a scan released by a public CONSENT (the
     deferred first-run path) — never on the failure's scrubbed warning."""
 
-    def failing_client(**_kw: Any) -> EsploraClient:
-        return EsploraClient(
+    def failing_client(**_kw: Any) -> WalletShapeClient:
+        return WalletShapeClient(
             base_url="https://mempool.space/api",
             timeout_s=5.0,
             max_retries=0,
@@ -891,8 +891,8 @@ def test_malformed_live_backend_url_fails_scan_closed_not_pump(
     ChainError surface), never re-raise on the engine pump and die
     mid-session."""
 
-    def broken_client(**_kw: Any) -> EsploraClient:
-        return EsploraClient(base_url="http://h:port/api", timeout_s=0.5, max_retries=0)
+    def broken_client(**_kw: Any) -> WalletShapeClient:
+        return WalletShapeClient(base_url="http://h:port/api", timeout_s=0.5, max_retries=0)
 
     code, rec, _stored, _ = _drive(
         monkeypatch, tmp_path, lines=["exit"],
@@ -1110,77 +1110,3 @@ def test_web_auto_scan_zero_watch_never_probes_the_default(
     assert capture.get("code") == 0
     assert ob.WEB_SETUP_HINT not in "\n".join(outputs)  # narration → emitter
     assert calls == []  # the watch drain stood down behind the held gate
-
-
-# ---------------------------------------------------------- chain probe unit
-
-
-def _mt(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.MockTransport:
-    return httpx.MockTransport(handler)
-
-
-#: Canonical Esplora /blocks/<height> entry: a block OBJECT whose "id" is
-#: the block hash (the shape real backends serve, and the shape
-#: ``EsploraClient.get_tip_block`` parses). The bare-hash string form below
-#: is the tolerated lenient variant, NOT canonical (ONB-003 review, f-2).
-_MAINNET_GENESIS_BLOCK = {
-    "id": MAINNET_GENESIS_HASH,
-    "height": 0,
-    "timestamp": 1231006505,
-}
-
-
-@pytest.mark.parametrize(
-    "genesis_entry",
-    [
-        _MAINNET_GENESIS_BLOCK,  # canonical Esplora block-object shape
-        MAINNET_GENESIS_HASH,    # tolerated lenient bare-hash shape
-    ],
-    ids=["block-object", "bare-hash"],
-)
-def test_check_backend_accepts_mainnet_esplora_shape(genesis_entry: Any) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/blocks/tip"):
-            return httpx.Response(200, json=870_000)
-        if request.url.path.endswith("/blocks/0"):
-            return httpx.Response(200, json=[genesis_entry])
-        return httpx.Response(404)
-
-    assert check_backend("https://n.example/api", transport=_mt(handler))
-
-
-@pytest.mark.parametrize(
-    "shape", ["testnet", "testnet-object", "garbage", "down", "dead-port", "typo-url"]
-)
-def test_check_backend_refuses_every_other_shape(shape: str) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if shape == "down":
-            raise httpx.ConnectError("refused")
-        if request.url.path.endswith("/blocks/tip"):
-            if shape == "garbage":
-                return httpx.Response(200, json={"unexpected": "shape"})
-            return httpx.Response(200, json=100)
-        if shape == "testnet-object":
-            # The real-world shape (block objects) carrying the WRONG genesis.
-            return httpx.Response(200, json=[{"id": TESTNET_GENESIS, "height": 0}])
-        return httpx.Response(200, json=[TESTNET_GENESIS])
-
-    if shape == "dead-port":
-        # Nothing listening: a genuine transport failure (port 1, no bind).
-        assert not check_backend("http://127.0.0.1:1/api", timeout_s=0.5)
-        return
-    if shape == "typo-url":
-        # Review finding 1: a non-numeric port passes ChainConfig's shape
-        # check but raises httpx.InvalidURL at REQUEST time — it must
-        # collapse to False, never escape (an escaping exception killed the
-        # engine pump mid-session). No transport: the URL parse fails before
-        # any socket opens.
-        assert not check_backend("http://h:port/api", timeout_s=0.5)
-        return
-    assert not check_backend("https://n.example/api", transport=_mt(handler))
-
-
-def test_check_backend_refuses_malformed_url_without_network() -> None:
-    # No transport ever: the fail-closed shape check precedes any I/O.
-    assert not check_backend("ftp://n.example")
-    assert not check_backend("https://user:pass@n.example")  # userinfo

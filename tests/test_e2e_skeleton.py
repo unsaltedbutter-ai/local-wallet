@@ -4,7 +4,7 @@ Full pipeline WITHOUT network or model:
 
     user text → AgentLoop (stub/scripted generate_fn) → handle_raw
     validation → allowlist dispatch → store-backed handlers →
-    EsploraClient over httpx.MockTransport (via wallet scan) → result
+    wallet-shape double over httpx.MockTransport (via wallet scan) → result
     dict → CLI printing.
 
 Phase 1 shape: the app persists to a real SQLite store (tmp file via
@@ -70,7 +70,7 @@ from localwallet.app import (
     run,
     stub_generate,
 )
-from localwallet.chain import EsploraClient, FeeEstimator, PriceOracle
+from localwallet.chain import ElectrumClient, FeeEstimator, PriceOracle
 from localwallet.config import PUBLIC_ELECTRUM_URL, Settings
 from localwallet.node import LocalNodeReport, NodeStatus
 from localwallet.node.detect import CoreHealth, CoreRpcProbe
@@ -91,6 +91,7 @@ from localwallet.wallet.descriptor import (
     parse_wallet_key,
     parse_watch_key,
 )
+from tests.chaindouble import WalletShapeClient
 
 # --------------------------------------------------------------- fixtures
 # All keys below are derived via embit from this fixed seed (see
@@ -336,9 +337,12 @@ def _utxo_handler(
 
 def _mock_client(
     handler: Callable[[httpx.Request], httpx.Response], *, max_retries: int = 0
-) -> EsploraClient:
-    """EsploraClient wired to a MockTransport (no real network)."""
-    return EsploraClient(
+) -> WalletShapeClient:
+    """Wallet-shape double (TCK-DESCOPE-M4: canonical translated payloads
+    over the surviving public-info transport) wired to a MockTransport
+    (no real network) — serves BOTH seams the app builds: wallet reads
+    (scan/status/broadcast) and public info (fees/prices/tip)."""
+    return WalletShapeClient(
         base_url="https://mempool.space/api",
         timeout_s=5.0,
         max_retries=max_retries,
@@ -348,7 +352,7 @@ def _mock_client(
 
 def _patch_run_backends(
     monkeypatch: pytest.MonkeyPatch,
-    make_client: Callable[[], EsploraClient],
+    make_client: Callable[[], WalletShapeClient],
     *,
     chain_url: str | None = None,
 ) -> None:
@@ -385,7 +389,7 @@ def _build_table(
     make_handler: Callable[[list[httpx.Request]], Callable[[httpx.Request], httpx.Response]],
     *,
     gap_limit: int | None = TEST_GAP,
-) -> tuple[dict[IntentName, Any], Store, Any, EsploraClient, list[httpx.Request]]:
+) -> tuple[dict[IntentName, Any], Store, Any, WalletShapeClient, list[httpx.Request]]:
     """Store-backed dispatch table wired to a mock-transport client.
 
     ``make_handler`` receives the recorded-request list and returns the
@@ -2758,12 +2762,20 @@ def _build_send_table(
     make_handler: Callable[[list[httpx.Request]], Callable[[httpx.Request], httpx.Response]],
     *,
     flow: Any | None = None,
-    make_price_oracle: Callable[[EsploraClient], Any] | None = None,
+    make_price_oracle: Callable[[WalletShapeClient], Any] | None = None,
     gap_limit: int | None = TEST_GAP,
     signer: Any | None = None,
     signer_selection: Any | None = None,
     fee_estimator: Any | None = None,
-) -> tuple[dict[IntentName, Any], Store, Any, EsploraClient, list[httpx.Request], Any, SendSession]:
+) -> tuple[
+        dict[IntentName, Any],
+        Store,
+        Any,
+        WalletShapeClient,
+        list[httpx.Request],
+        Any,
+        SendSession,
+    ]:
     """Send-flow dispatch table: like :func:`_build_table` but returning
     the shared ``TxFlow``/``SendSession`` pair the handlers own, and
     accepting a price-oracle factory for oracle-behavior tests plus the
@@ -5756,16 +5768,18 @@ def test_send_lifecycle_tx_status_unknown_vs_chain_error(tmp_path: Path) -> None
     os.environ.get("LOCALWALLET_E2E_LIVE") != "1",
     reason="live-network test: set LOCALWALLET_E2E_LIVE=1 to include",
 )
-def test_live_mainnet_balance_via_mempool_space() -> None:
-    """Real-network integration: the Phase 1 path against mempool.space
-    mainnet — lazy scan populates the store, balance reads it, and a
-    new_address allocation derives a valid bc1 address at index 0."""
+def test_live_mainnet_balance_via_public_electrum() -> None:
+    """Real-network integration (TCK-DESCOPE-M4: re-pointed from the retired
+    mempool.space WALLET path to the consented PUBLIC ELECTRUM server): the
+    Phase 1 path against mainnet — lazy scan populates the store, balance
+    reads it, and a new_address allocation derives a valid bc1 address at
+    index 0."""
     zpub = os.environ.get("LOCALWALLET_E2E_ZPUB", "").strip()
     if not zpub:
         pytest.skip("LOCALWALLET_E2E_ZPUB not set")
     parsed = parse_wallet_key(zpub)
     descriptor = WalletDescriptor.from_key(zpub)
-    client = EsploraClient()  # defaults: https://mempool.space/api
+    client = ElectrumClient(base_url=PUBLIC_ELECTRUM_URL)  # ssl://electrum.blockstream.info:50002
     try:
         with Store.memory() as store:
             wallet = store.create_wallet("default", descriptor.descriptor)
@@ -6619,7 +6633,7 @@ EUR_PRICES_PAYLOAD: Final[dict[str, Any]] = {
 
 def _fiat_state_table(
     currency: str, *, state: dict[str, Any] | None = None
-) -> tuple[dict[IntentName, Any], Store, EsploraClient, dict[str, Any]]:
+) -> tuple[dict[IntentName, Any], Store, WalletShapeClient, dict[str, Any]]:
     """Send-fixture dispatch table over a EUR/JPY-serving price endpoint
     with the oracle wired to the given display currency."""
     prices_state = state if state is not None else {}

@@ -1,9 +1,10 @@
 """Chain subsystem: THE ONLY networked module (Electrum, bitcoind, fees, price).
 
 Wallet information flows only through the two wallet adapters (Electrum /
-Bitcoin Core RPC, TCK-DESCOPE-M3A); the mempool.space Esplora shape remains
-solely as the PUBLIC-INFO source behind :class:`PublicInfoClient` (fees and
-prices — payloads carry no wallet addresses). Network I/O lives exclusively
+Bitcoin Core RPC, TCK-DESCOPE-M3A/M4); the mempool.space Esplora shape
+remains solely as the PUBLIC-INFO source behind :class:`PublicInfoClient`
+(fees, prices and the consented public-broadcast POST — payloads carry no
+wallet addresses and no address queries). Network I/O lives exclusively
 here and is lint-enforced by ``tools/lint_network.py``: only
 ``src/localwallet/chain/**`` may import network modules.
 """
@@ -18,14 +19,11 @@ from localwallet.chain.config import (
 from localwallet.chain.electrum import ElectrumClient
 from localwallet.chain.esplora import (
     MAINNET_GENESIS_HASH,
-    Balance,
     ChainClient,
     ChainError,
     EsploraClient,
     TipBlock,
     TxStatus,
-    balance_from_utxos,
-    check_backend,
     classify_failure,
 )
 from localwallet.chain.eta import EtaEstimate, estimate_eta
@@ -56,7 +54,6 @@ __all__ = [
     "BITCOIND_TLS_SCHEME",
     "ELECTRUM_SCHEME",
     "MAINNET_GENESIS_HASH",
-    "Balance",
     "BitcoindClient",
     "ChainClient",
     "ChainConfig",
@@ -78,8 +75,6 @@ __all__ = [
     "TipBlock",
     "TxStatus",
     "WatchedTx",
-    "balance_from_utxos",
-    "check_backend",
     "classify_failure",
     "estimate_eta",
     "format_sat_vb",

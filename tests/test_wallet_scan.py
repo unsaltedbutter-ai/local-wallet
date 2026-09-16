@@ -37,7 +37,7 @@ if str(_SRC) not in sys.path:
 from embit.bip32 import NETWORKS, HDKey
 from embit.descriptor.checksum import add_checksum
 
-from localwallet.chain import ChainError, EsploraClient
+from localwallet.chain import ChainError
 from localwallet.store import (
     ADDRESS_ALLOCATED,
     AddressRecord,
@@ -56,6 +56,7 @@ from localwallet.wallet import (
 from localwallet.wallet import scan as wallet_scan_module
 from localwallet.wallet.descriptor import WatchKeyError
 from localwallet.wallet.scan import _MAX_WINDOW_ADDRESSES, ScanError
+from tests.chaindouble import WalletShapeClient
 
 FIXTURE_SEED: Final = b"local-wallet phase 1 scan test seed (not a real wallet)"
 TIP: Final = 870_000
@@ -129,7 +130,8 @@ def utxo_entry(
 
 
 class FakeChain:
-    """Scripted Esplora backend over MockTransport; records request order."""
+    """Scripted wallet-shape backend (canonical translated payload shapes,
+    TCK-DESCOPE-M4) over MockTransport; records request order."""
 
     def __init__(
         self,
@@ -163,8 +165,8 @@ class FakeChain:
             return httpx.Response(200, json=self.utxos.get(address, []))
         return httpx.Response(404, json=None)
 
-    def client(self) -> EsploraClient:
-        return EsploraClient(
+    def client(self) -> WalletShapeClient:
+        return WalletShapeClient(
             base_url="https://mempool.space/api",
             timeout_s=5.0,
             max_retries=0,

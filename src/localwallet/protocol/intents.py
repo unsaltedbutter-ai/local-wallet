@@ -415,13 +415,13 @@ def _rule_tx_status(params: BaseParams) -> list[str]:
     """``tx_status``: ``txid`` must be EXACTLY 64 lowercase hex characters.
 
     Strict charset check, fail closed: this user/model-supplied value is
-    interpolated into a request URL path by the chain layer
-    (``localwallet.chain.esplora.get_tx_status``), so the charset check IS
-    the injection guard — uppercase hex, whitespace, ``../`` traversal
-    fragments, unicode, and wrong lengths are all rejected here, before any
-    URL is ever constructed. The GBNF ``hex_txid`` rule pins the identical
-    shape at decode time; this layer is the authority for non-grammar
-    producers. Value-free failures: the txid itself is never echoed.
+    passed to the wallet adapters' ``get_tx_status`` (Electrum/bitcoind),
+    so the charset check IS the injection guard — uppercase hex, whitespace,
+    ``../`` traversal fragments, unicode, and wrong lengths are all rejected
+    here, before any request URL is constructed. The GBNF ``hex_txid`` rule
+    pins the identical shape at decode time; this layer is the authority for
+    non-grammar producers. Value-free failures: the txid itself is never
+    echoed.
     """
     if not isinstance(params, TxStatusParams):
         return ["internal: 'tx_status' params failed the type check"]

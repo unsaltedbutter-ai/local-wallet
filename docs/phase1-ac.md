@@ -10,7 +10,7 @@ The AC is verified at **two layers**:
 | Layer | What it proves | Where |
 |---|---|---|
 | **Offline composite story** (runs in CI, no network) | The full explorer→scan→store→handler chain agrees with a hand-constructed ground truth ("explorer view") EXACTLY — store state, derivation, UTXO set, history, cursor, balance; rescan repairs a corrupted cache; the >20-gap is missed at gap 20 and found at gap 30 with the documented R3 warning. | `tests/test_phase1_ac.py` |
-| **LIVE procedure** (this document, manual) | The literal AC: the app's numbers match real Electrum + mempool.space data on a funded mainnet wallet. | Steps 1–5 below + the env-gated live test |
+| **LIVE procedure** (this document, manual) | The literal AC: the app's numbers match real Electrum/Bitcoin Core data on a funded mainnet wallet (mempool.space remains a human comparison surface, never the wallet source). | Steps 1–5 below + the env-gated live test |
 
 AC coverage map (AC line → offline test):
 
@@ -40,8 +40,8 @@ AC coverage map (AC line → offline test):
      control (e.g. an exchange withdrawal or a Sparrow/Electrum mainnet
      wallet) — keep the amounts dust-level (a few hundred sats) if you only
      need the gap-behavior proof.
-   - Wait for ≥1 confirmation on both funding transactions (check on
-     mempool.space, Step 1).
+   - Wait for ≥1 confirmation on both funding transactions (check on any
+     block explorer, e.g. mempool.space — Step 1).
 2. The app installed/importable (`.venv` with `pip install -e .` or
    `PYTHONPATH=src`).
 3. `sqlite3` CLI available (one step widens the gap setting).
@@ -50,25 +50,30 @@ AC coverage map (AC line → offline test):
 
 ## Step 1 — Record the explorer ground truth
 
-For **each funded address** (and any address you expect coins on):
+For **each funded address** (and any address you expect coins on), record the
+ground truth from the app's wallet source AND an independent cross-read:
 
-- mempool.space address view:
-  `https://mempool.space/address/<ADDRESS>`
-- mempool.space API (what the app itself queries):
-  `https://mempool.space/api/address/<ADDRESS>/txs` and
-  `https://mempool.space/api/address/<ADDRESS>/utxo`
-- transaction detail: `https://mempool.space/tx/<TXID>`
+- Electrum (the app's wallet source): a trusted mainnet Electrum server (the
+  default is `ssl://electrum.blockstream.info:50002`). Query the funded
+  addresses' confirmed balance, unconfirmed balance, exact UTXO set
+  (`txid:vout`, sats, confirmation status), and transaction list.
+- Bitcoin Core (the self-hosted wallet source): `getreceivedbyaddress`,
+  `listunspent`, and the address's tx history — or any block explorer over the
+  same node.
+- mempool.space (comparison surface only — never the wallet source):
+  - address view: `https://mempool.space/address/<ADDRESS>`
+  - transaction detail: `https://mempool.space/tx/<TXID>`
 
 Record: confirmed balance, unconfirmed balance, the exact UTXO set
 (`txid:vout`, sats, confirmation status), and the transaction list.
 
-**Electrum (manual cross-check):** Electrum's mainnet support is mature,
-but the connecting Electrum server must be one you trust — the same
-trust/privacy caveats as any public Esplora apply. If an Electrum
-cross-check is unavailable at run time, record that in the sign-off;
-mempool.space remains the numeric
-reference (it serves the same Esplora API shape the app consumes — a useful
-but not independent cross-check).
+**Cross-check caveats:** any public explorer / Electrum server is a
+trust/privacy tradeoff — use a server you trust, and prefer your own node's
+data for the numeric reference. mempool.space serves the same Esplora API
+shape the app reads for fees/prices, so it is a useful but not independent
+cross-check; the wallet numbers the app shows come from Electrum/bitcoind.
+If an independent Electrum/Core cross-check is unavailable at run time,
+record that in the sign-off rather than fabricating it.
 
 ## Step 2 — Run the app
 
@@ -122,12 +127,15 @@ LOCALWALLET_E2E_LIVE=1 LOCALWALLET_AC_ZPUB=<zpub> \
     pytest tests/test_phase1_ac.py -k live -s
 ```
 
-Runs the real `scan_wallet` (gap 30) against mempool.space mainnet and
+Runs the real `scan_wallet` (gap 30) against the PUBLIC ELECTRUM mainnet
+server (`ssl://electrum.blockstream.info:50002`) and
 prints a comparison sheet — balance totals, utxo count, tx count,
 per-branch `max_used_index`, first/last window address — for the human
 sign-off. It asserts **structural sanity only** (no exception, non-negative
 totals, cursor set); the numeric comparison against the explorer remains
-the human's job. Skipped unless both env vars are set.
+the human's job. Skipped unless both env vars are set. (Mempool.space is a
+comparison surface only; wallet data comes from Electrum/bitcoind,
+TCK-DESCOPE-M4.)
 
 ## Pass criteria
 
@@ -147,10 +155,10 @@ the human's job. Skipped unless both env vars are set.
 - **Electrum cross-check availability must be verified when this procedure
   is run** (a trusted server is required). If unavailable, the sign-off
   records it; do not fabricate an Electrum cross-check.
-- mempool.space URL patterns are given above; the operator sees every
-  queried address together with your IP (public-Esplora privacy caveat,
-  ADR-0003 / PROJECT.md §9).
-- **No SPV-level verification claim:** Esplora responses are not
+- The public Electrum server (or any public explorer you consult) sees every
+  queried address together with your IP — a public-backend privacy caveat
+  (ADR-0003 / PROJECT.md §9); a self-hosted Electrum/Core backend avoids it.
+- **No SPV-level verification claim:** Electrum/Core responses are not
   SPV-provable — integrity rests on TLS to a trusted operator until the
   Phase 4 self-hosted backend (ADR-0003). The AC "match" is a consistency
   check against explorers, not cryptographic proof; UI copy must not

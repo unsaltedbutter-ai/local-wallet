@@ -12,8 +12,9 @@ Coverage (ticket gates):
   ``server.features`` mainnet proof (testnet genesis refused value-free);
 * balance/history/utxo TRANSLATION to the EXACT shapes ``scan.py``
   consumes — pinned hardest by running ``fetch_scan`` against BOTH the
-  scan tests' Esplora mock and this adapter over one scenario and
-  comparing the ``ScanRecords`` field-by-field (indistinguishable);
+  scan tests' wallet-shape mock (canonical Esplora-shaped payloads over
+  the M4 test double) and this adapter over one scenario and comparing
+  the ``ScanRecords`` field-by-field (indistinguishable);
 * broadcast: txid binding, single-attempt (never retried), arg guards;
 * fee mapping (estimatefee → sat/vB, -1 fails closed) + the FeeEstimator
   native branch, and the PriceOracle capability refusal;
@@ -63,7 +64,6 @@ from localwallet.chain import (
     PriceUnavailableError,
     TipBlock,
     TxStatus,
-    check_backend,
 )
 from localwallet.chain import electrum as electrum_module
 from localwallet.chain.esplora import (
@@ -1048,22 +1048,6 @@ class TestFees:
             with pytest.raises(ChainError):
                 estimator.estimate(FeeTarget.FAST)  # no lower layer, never fabricated
 
-    def test_esplora_estimate_fee_protocol_member(self) -> None:
-        payload = {"fastestFee": 30, "halfHourFee": 25, "hourFee": 18, "economyFee": 10, "minimumFee": 1}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            assert request.url.path == "/api/v1/fees/recommended"
-            return httpx.Response(200, json=payload)
-
-        with EsploraClient(
-            base_url="https://mempool.space/api",
-            timeout_s=5.0,
-            max_retries=0,
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            assert client.estimate_fee(FeeTarget.SLOW) == 18
-
-
 # ------------------------------------------------------- tip and status
 
 
@@ -1303,13 +1287,6 @@ class TestSelectionAndProtocol:
         with pytest.raises(ValueError, match="ElectrumClient"):
             EsploraClient(base_url="ssl://h:1")
 
-    def test_check_backend_stays_esplora_shaped(self, electrum: Any) -> None:
-        # The M1 /setup probe is unchanged: an ssl:// endpoint simply does
-        # not pass the Esplora-shape check (M3 replaces it with a
-        # scheme-aware probe).
-        server = electrum()
-        assert check_backend(server.url, timeout_s=0.5, max_retries=0) is False
-
     def test_build_chain_client_picks_by_scheme(self) -> None:
         # TCK-DESCOPE-M3A: the wallet construction site dispatches the two
         # wallet families and REFUSES the Esplora (http) shape value-free —
@@ -1336,9 +1313,14 @@ class TestSelectionAndProtocol:
         finally:
             client.close()
 
-    def test_both_clients_structurally_satisfy_chain_client(self, electrum: Any) -> None:
-        """scan/watch/fees/price code against the EsploraClient-typed seam;
-        this protocol test is the contract pin for the swapped client."""
+    def test_wallet_adapters_satisfy_chain_client_public_info_does_not(
+        self, electrum: Any
+    ) -> None:
+        """TCK-DESCOPE-M4 separation pin: the wallet adapters satisfy the
+        ``ChainClient`` protocol scan/watch/fees/price code against, and the
+        public-info client deliberately does NOT anymore — its wallet-data
+        paths were deleted, so it can never be wired back as a wallet
+        backend by duck-typing."""
         server = electrum()
         with (
             ElectrumClient(base_url=server.url, timeout_s=5.0, max_retries=0) as client_x,
@@ -1350,7 +1332,7 @@ class TestSelectionAndProtocol:
             ) as client_e,
         ):
             assert isinstance(client_x, ChainClient)
-            assert isinstance(client_e, ChainClient)
+            assert not isinstance(client_e, ChainClient)
 
     def test_get_json_is_esplora_only(self, electrum: Any) -> None:
         server = electrum()

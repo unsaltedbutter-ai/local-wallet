@@ -43,7 +43,6 @@ from localwallet.chain import (
     ChainConfig,
     ChainError,
     EsploraClient,
-    check_backend,
 )
 from localwallet.config import Settings
 from tests.test_e2e_skeleton import ZPUB
@@ -191,16 +190,6 @@ def test_selfsigned_env_disable_succeeds(
     ) as client:
         assert client.get_tip_height() == _TIP_HEIGHT
 
-
-def test_check_backend_selfsigned_ladder(
-    self_signed_url: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The onboarding probe shares the ladder: default verify fails closed,
-    the disable rung reaches the self-signed mainnet backend."""
-    monkeypatch.delenv("LOCALWALLET_TLS_VERIFY", raising=False)
-    assert check_backend(self_signed_url, timeout_s=5.0, max_retries=0) is False
-    monkeypatch.setenv("LOCALWALLET_TLS_VERIFY", "0")
-    assert check_backend(self_signed_url, timeout_s=5.0, max_retries=0) is True
 
 
 # ---------------------------------------------------------------------------

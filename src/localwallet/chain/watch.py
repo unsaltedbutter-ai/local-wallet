@@ -7,8 +7,9 @@ This module owns the *deterministic* polling and narration-fact logic. The
 LLM is NOT in the polling loop — detection is plain code (AGENTS.md). It
 performs no network I/O itself: the probe and the chain client are injected
 (so tests drive cycles with a test double, never the network), and the single
-config-selected :class:`~localwallet.chain.esplora.EsploraClient` is reused
-(ADR-0018) by the production probe.
+config-selected wallet :class:`~localwallet.chain.esplora.ChainClient`
+(Electrum or bitcoind, TCK-DESCOPE-M3A/M4) is reused by the production
+probe.
 
 Design (pinned in ADR-0019): **single-threaded / tick-driven**. The watcher
 exposes :meth:`IncomingWatcher.tick` which runs exactly ONE poll cycle
@@ -34,7 +35,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from localwallet.chain.esplora import ChainError, EsploraClient
+from localwallet.chain.esplora import ChainClient, ChainError
 
 __all__ = [
     "IncomingEvent",
@@ -91,13 +92,13 @@ class IncomingEvent:
 
 
 def time_since_last_block(
-    client: EsploraClient, *, now: float | None = None
+    client: ChainClient, *, now: float | None = None
 ) -> int | None:
     """Integer seconds since the last block's timestamp; None when unavailable.
 
-    The tip timestamp comes from the configured backend
-    (:meth:`EsploraClient.get_tip_block` — tolerant of the mempool.space
-    ``/blocks/tip`` divergence, HANDOFF §5). Returns:
+    The tip timestamp comes from the configured wallet backend's
+    ``get_tip_block`` (Electrum/bitcoind — tolerant of the backend tip
+    shapes, HANDOFF §5). Returns:
 
     - ``None`` when the backend exposed no timestamp (clean unavailable state)
       or the tip lookup failed — never a crash, never a fabricated value;
@@ -120,7 +121,7 @@ def time_since_last_block(
 
 #: The probe signature: run one chain refresh and return the wallet's
 #: observed transactions. In production the app wires this to a scan over the
-#: single EsploraClient (ADR-0018) plus store reads; tests inject a fake.
+#: single wallet client (ADR-0018) plus store reads; tests inject a fake.
 Probe = Callable[[], Sequence[WatchedTx]]
 
 

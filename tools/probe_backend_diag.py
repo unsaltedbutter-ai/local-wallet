@@ -2,23 +2,30 @@
 """Diagnose why a self-hosted backend URL is rejected by the app's setup probe.
 
 The app classifies a candidate URL by scheme, then runs ONE bounded probe per
-backend class (Esplora-HTTP, Electrum-SSL, Bitcoin Core RPC); every failure
-collapses to a single value-free refusal line, so a user whose self-hosted
-(Start9 etc.) backend "did not check out" can't see where it failed. This
-read-only tool replays the three probe shapes against one URL and reports,
-per backend, reachability, the TLS-error class (verify-failure vs
-tls-handshake vs timeout vs connect), HTTP status, and the mainnet check.
+backend class (Electrum-SSL and Bitcoin Core RPC are the ONLY wallet
+backends; the Esplora API shape is probed as a PUBLIC fee/price source the
+app still reads — never a wallet backend); every failure collapses to a
+single value-free refusal line, so a user whose self-hosted (Start9 etc.)
+backend "did not check out" can't see where it failed. This read-only tool
+replays the three probe shapes against one URL and reports, per backend,
+reachability, the TLS-error class (verify-failure vs tls-handshake vs
+timeout vs connect), HTTP status, and the mainnet check.
 
 It writes nothing and echoes NO secrets: the password is never printed, URL
 userinfo is stripped, no addresses/xpubs are touched — safe to paste in chat.
 
 Probes mirror src/localwallet/chain/{esplora,electrum,bitcoind}.py:
-  esplora : GET {base}/blocks/tip then {base}/api/blocks/tip (the app
-            auto-tries the /api API-root segment, TCK-BACKEND-003, latching
-            whichever answers in shape); an empty-list tip falls back to the
-            tip-first GET {root}/blocks page (TCK-BACKEND-004); then
-            /blocks/0 (mainnet genesis proof: bare hash, or object with
-            id + height == 0, list-wrapped tolerated)
+  publicinfo : the Esplora API shape (mempool-compatible) probed as a PUBLIC
+            fee/price source the app still reads (chain/publicinfo) — NOT a
+            wallet backend (the app persists wallet backends as
+            electrum/bitcoind only; an http(s) URL is a Core-RPC alias,
+            TCK-DESCOPE-M3B). GET {base}/blocks/tip then {base}/api/
+            blocks/tip (the app auto-tries the /api API-root segment,
+            TCK-BACKEND-003, latching whichever answers in shape); an
+            empty-list tip falls back to the tip-first GET {root}/blocks
+            page (TCK-BACKEND-004); then /blocks/0 (mainnet genesis proof:
+            bare hash, or object with id + height == 0, list-wrapped
+            tolerated)
   electrum: TLS socket + server.features genesis_hash == mainnet
   bitcoind: POST getblockchaininfo (chain == "main") — over http for
             http:// and bitcoind:// inputs, over https for https:// and
@@ -291,7 +298,17 @@ def _genesis_ok(payload):
 
 
 def probe_esplora(base_url, insecure, client, minrelay=False):
-    r = {"kind": "esplora", "reachable": False, "tls_error": None,
+    """Probe the Esplora API shape as a PUBLIC fee/price source.
+
+    TCK-DESCOPE-M4: the app persists wallet backends as electrum/bitcoind
+    only — an http(s) URL is a Core-RPC alias (TCK-DESCOPE-M3B), never an
+    Esplora wallet. What remains here is the PUBLIC-INFO read the app still
+    performs (chain/publicinfo fees/prices): the reachability/tip/API-root/
+    genesis shapes diagnose that source, so the ``kind`` is ``publicinfo``
+    with a value-free ``role`` note — never a wallet-backend verdict."""
+    r = {"kind": "publicinfo",
+         "role": "public fee/price source (mempool-compatible), never a wallet backend",
+         "reachable": False, "tls_error": None,
          "http_status": None, "mainnet": None, "error_class": None,
          "api_root": None}
     try:
@@ -468,6 +485,8 @@ def main():
         line = (f"\n[{r['kind']}]\n  reachable: {r['reachable']}\n  tls_error: "
                 f"{r['tls_error']}\n  http     : {r['http_status']}\n  mainnet  : "
                 f"{r['mainnet']}\n  error    : {r['error_class']}")
+        if r.get("role"):
+            line += f"\n  role     : {r['role']}"
         if r.get("api_root"):
             line += f"\n  api_root : {r['api_root']}"
         if r.get("rpc_error_code") is not None:

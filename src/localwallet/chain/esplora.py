@@ -1,31 +1,49 @@
-"""Esplora HTTP client and the UTXO-balance helper.
+"""The PUBLIC-INFO HTTP client (Esplora API shape) and the shared chain-error taxonomy.
 
 This module is the one legitimate user of network I/O in local-wallet
 (``tools/lint_network.py`` forbids network imports anywhere else). It speaks
 the Esplora API shape served by mempool.space and by self-hosted mempool /
-electrs instances — the Phase 4 backend swap targets this same interface
-(ADR-0003).
+electrs instances.
 
-Backend selection (TCK-DESCOPE-M3A amendment of ADR-0018): this client is
-no longer the wallet's chain backend — wallet information comes ONLY from
-the Electrum/bitcoind adapters (USER REDIRECTION 2026-09-11). Its base URL
-comes from ``Settings.esplora_base_url`` (``LOCALWALLET_ESPLORA_BASE_URL``,
-the repurposed PUBLIC-INFO base, default ``https://mempool.space/api``) or
-an explicit constructor argument — never from the wallet selection point
-``ChainConfig.from_settings`` (an unset ``chain_base_url`` there now means
-UNRESOLVED, not "public default"). The remaining WALLET-shaped methods are
-dead-code-pending-M4 (deleted in TCK-DESCOPE-M4); the live post-M3 consumer
-is :class:`localwallet.chain.publicinfo.PublicInfoClient`, which wraps this
-client's GET path for fees/prices only. A malformed selected URL fails
-closed with a value-free :class:`ValueError` at construction — never a
-mid-request crash.
+Role (TCK-DESCOPE-M3A + M4, USER REDIRECTION 2026-09-11; ADR-0003/0011/0018
+amendments): wallet information comes ONLY from the Electrum/bitcoind
+adapters — this client's WALLET-data paths (address txs/utxo scans,
+tip-block reads, tx status, the ``check_backend`` Esplora-shape probe) are
+DELETED, not deprecated. What remains is exactly the surface
+:class:`localwallet.chain.publicinfo.PublicInfoClient` rides for PUBLIC
+info, plus the shared types the two live wallet adapters import from here:
+
+- :meth:`EsploraClient.get_json` — the public fee/price GETs
+  (``/v1/fees/recommended``, ``/v1/fees/mempool-blocks``, ``/v1/blocks/…``,
+  ``/v1/prices``),
+- :meth:`EsploraClient.get_tip_height` — the recent-blocks floor's tip
+  anchor (public data; no address in the request),
+- :meth:`EsploraClient.broadcast_tx` — the ONE sanctioned write: the
+  ``POST /tx`` behind the app's consented public-broadcast fallback
+  (TCK-PUBLICBCAST-001), never a wallet read path,
+- the transport/retry/error machinery they share (:class:`ChainError`,
+  :func:`classify_failure` and its value-free class taxonomy, the backoff,
+  the /api-root tolerance),
+- and the contract/shape types the Electrum and bitcoind adapters reuse:
+  the :class:`ChainClient` protocol (the two-backend wallet contract),
+  :class:`TxStatus`, :class:`TipBlock`, :data:`MAINNET_GENESIS_HASH`, and
+  the argument-validation guards.
+
+Its base URL comes from ``Settings.esplora_base_url``
+(``LOCALWALLET_ESPLORA_BASE_URL``, the PUBLIC-INFO base, default
+``https://mempool.space/api``) or an explicit constructor argument — never
+from the wallet selection point ``ChainConfig.from_settings`` (an unset
+``chain_base_url`` there means UNRESOLVED, not "public default"). A
+malformed selected URL fails closed with a value-free :class:`ValueError`
+at construction — never a mid-request crash.
 
 Design notes:
 
 - Synchronous ``httpx`` client: one ``httpx.Client`` per ``EsploraClient``
   instance, context-manager closeable, identifying ``User-Agent``, no API
   keys; GET endpoints only — plus the single POST ``/tx`` broadcast
-  primitive (TCK-P3-004), which is the only write this client performs.
+  primitive (TCK-P3-004 / TCK-PUBLICBCAST-001), which is the only write
+  this client performs.
 - Bounded retries with exponential backoff + jitter, applied ONLY to
   connection errors, timeouts, HTTP 429 and 5xx — GET endpoints only.
   ``broadcast_tx`` is deliberately exempt: a POST is not idempotent, so it
@@ -35,7 +53,7 @@ Design notes:
   :class:`ChainError`.
 - Log-scrubbing invariant (PROJECT.md §7.8): no error string produced here
   ever contains a full address, txid, tx hex, or amount. Endpoint *kinds*
-  such as ``address-utxos`` are used in messages instead of request URLs,
+  such as ``tip-height`` are used in messages instead of request URLs,
   and HTTP error details are limited to status codes / exception class names.
 - No logging and no printing in library code.
 """
@@ -48,7 +66,7 @@ import ssl
 import time
 from dataclasses import dataclass
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, ClassVar, Final, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Protocol, Self, runtime_checkable
 
 import httpx
 from embit.transaction import Transaction
@@ -66,14 +84,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MAINNET_GENESIS_HASH",
-    "Balance",
     "ChainClient",
     "ChainError",
     "EsploraClient",
     "TipBlock",
     "TxStatus",
-    "balance_from_utxos",
-    "check_backend",
     "classify_failure",
 ]
 
@@ -98,14 +113,13 @@ _MIN_TX_HEX_CHARS = 64
 _MAX_TX_HEX_CHARS = 100_000
 
 # Endpoint kinds used in error messages instead of URLs (which embed the
-# queried address — never leak it into errors or logs).
-_KIND_ADDRESS_TXS = "address-txs"
-_KIND_ADDRESS_UTXOS = "address-utxos"
+# queried address — never leak it into errors or logs). The wallet-era
+# kinds (address-txs/address-utxos/tx-status/tip-block/blocks-at-height)
+# were retired with the wallet-data paths in TCK-DESCOPE-M4; the two live
+# adapters keep their own copies of the historical names for error-surface
+# parity.
 _KIND_TIP_HEIGHT = "tip-height"
-_KIND_TIP_BLOCK = "tip-block"
 _KIND_BROADCAST = "broadcast"
-_KIND_TX_STATUS = "tx-status"
-_KIND_BLOCKS_AT_HEIGHT = "blocks-at-height"
 
 #: Mainnet genesis block hash — Bitcoin's protocol constant, the canonical
 #: proof that a backend serves MAINNET (ADR-0021/0023 decision 5; the
@@ -197,8 +211,8 @@ class ChainError(Exception):
     """A chain-data or chain-transport failure that callers must handle.
 
     Raised for network errors after the retry budget is exhausted, immediate
-    non-retryable HTTP failures, malformed JSON, unexpected response shapes,
-    and malformed UTXO payloads (see :func:`balance_from_utxos`).
+    non-retryable HTTP failures, malformed JSON, and unexpected response
+    shapes.
 
     Message contract: safe for logs and chat narration — never contains full
     addresses, txids, or amounts (log-scrubbing invariant, PROJECT.md §7.8).
@@ -240,63 +254,6 @@ class _ApiRootMismatch(ChainError):
     ChainError): the server never spoke or is busy, and a path change fixes
     neither. Subclasses ChainError, so every caller-visible surface (types,
     messages, value-freeness) is unchanged."""
-
-
-@dataclass(frozen=True)
-class Balance:
-    """Satoshi totals for a set of UTXOs, split by confirmation status.
-
-    ``total_sats`` is derived as ``confirmed_sats + unconfirmed_sats`` and
-    cannot be set independently (any caller-supplied value is overwritten in
-    ``__post_init__``). Values are plain non-negative ``int`` sats.
-
-    Raises:
-        ValueError: If a component is negative or not an ``int`` (bools are
-            rejected; config/value errors are programmer errors).
-    """
-
-    confirmed_sats: int
-    unconfirmed_sats: int
-    total_sats: int = 0  # derived; always overwritten in __post_init__
-
-    def __post_init__(self) -> None:
-        for name in ("confirmed_sats", "unconfirmed_sats"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer")
-        object.__setattr__(self, "total_sats", self.confirmed_sats + self.unconfirmed_sats)
-
-
-def balance_from_utxos(utxos: list[dict[str, Any]]) -> Balance:
-    """Sum an Esplora ``/address/{addr}/utxo`` payload into a :class:`Balance`.
-
-    Entries are split on ``entry["status"]["confirmed"]`` (a strict boolean).
-    This helper fails closed: any missing or malformed field raises
-    :class:`ChainError` rather than silently undercounting a balance. Error
-    messages name the entry index and field, never the value (amounts are
-    never logged).
-    """
-    if not isinstance(utxos, list):
-        raise ChainError("utxos payload must be a list")
-    confirmed = 0
-    unconfirmed = 0
-    for index, entry in enumerate(utxos):
-        if not isinstance(entry, dict):
-            raise ChainError(f"utxo entry {index} is not an object")
-        status = entry.get("status")
-        if not isinstance(status, dict):
-            raise ChainError(f"utxo entry {index} has missing or malformed 'status'")
-        is_confirmed = status.get("confirmed")
-        if not isinstance(is_confirmed, bool):
-            raise ChainError(f"utxo entry {index} has missing or non-boolean 'status.confirmed'")
-        value = entry.get("value")
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ChainError(f"utxo entry {index} has missing or invalid 'value'")
-        if is_confirmed:
-            confirmed += value
-        else:
-            unconfirmed += value
-    return Balance(confirmed_sats=confirmed, unconfirmed_sats=unconfirmed)
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -385,7 +342,7 @@ class TxStatus:
     error string). ``confirmed`` — strict boolean from the response.
     ``block_height`` / ``block_time`` — the confirming block's height and
     timestamp, or ``None`` while unconfirmed. All fields are shape-validated
-    in :meth:`EsploraClient.get_tx_status` before this record exists.
+    by the wallet adapters (Electrum/bitcoind) that return this record.
     """
 
     txid: str
@@ -404,8 +361,8 @@ class TipBlock:
     no timestamp; the mempool.space block-list shape carries one). A
     ``None`` timestamp is the *clean unavailable* state — the
     time-since-block helper reports nothing rather than fabricating a value.
-    Both fields are shape-validated in :meth:`EsploraClient.get_tip_block`
-    before this record exists.
+    Both fields are shape-validated by the wallet adapters (Electrum/
+    bitcoind) that return this record.
     """
 
     height: int
@@ -418,13 +375,6 @@ def _parse_json(response: httpx.Response, kind: str) -> Any:
         return response.json()
     except ValueError as exc:  # json.JSONDecodeError and encoding errors
         raise ChainError(f"{kind} response was not valid JSON") from exc
-
-
-def _require_object_list(payload: Any, kind: str) -> list[dict[str, Any]]:
-    """Enforce the expected list-of-objects response shape (fail closed)."""
-    if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
-        raise ChainError(f"{kind} response was not a list of objects")
-    return payload
 
 
 #: Static endpoint names for the tip-fallback refusal detail (TCK-BACKEND-004:
@@ -484,14 +434,16 @@ def _tip_block_page(payload: Any, kind: str) -> dict[str, Any]:
 
 @runtime_checkable
 class ChainClient(Protocol):
-    """The backend-agnostic contract every chain adapter satisfies.
+    """The backend-agnostic contract every WALLET adapter satisfies.
 
     Derived from the ACTUAL call sites (docs/onb-004-backend-adapters-plan.md
     §0): ``wallet.scan``, ``chain.watch`` and the app's broadcast/recovery and
-    fee paths code against exactly these members. ``EsploraClient`` and
-    ``ElectrumClient`` both structurally satisfy it (pinned by
-    ``tests/test_chain_electrum.py``); the TCK-ONB-004 plan's M2 ``bitcoind``
-    adapter must too.
+    fee paths code against exactly these members. Since TCK-DESCOPE-M3A/M4
+    the wallet backends are exactly TWO adapters — ``ElectrumClient`` and
+    ``BitcoindClient`` — and both structurally satisfy this protocol (pinned
+    by ``tests/test_chain_electrum.py`` / ``tests/test_chain_bitcoind.py``).
+    ``EsploraClient`` deliberately does NOT (its wallet-data paths were
+    deleted in M4; it survives only as the public-info transport).
 
     Deliberately NOT on the protocol: ``get_json`` — raw Esplora JSON is
     Esplora-only, and every consumer that needs it (the fee floor-follower,
@@ -540,7 +492,14 @@ class ChainClient(Protocol):
 
 
 class EsploraClient:
-    """Synchronous client for a public or self-hosted Esplora API.
+    """Synchronous client for a public or self-hosted Esplora API — PUBLIC
+    info only (TCK-DESCOPE-M3A/M4): the fee/price GETs the standalone
+    :class:`~localwallet.chain.publicinfo.PublicInfoClient` rides, the
+    public tip height, and the ONE consented public-broadcast POST
+    (TCK-PUBLICBCAST-001). It holds NO wallet state and answers NO
+    address-shaped query: the wallet-data paths were deleted in
+    TCK-DESCOPE-M4 — wallet information comes only from the Electrum and
+    bitcoind adapters.
 
     Defaults come from :class:`localwallet.config.Settings` loaded via
     ``Settings.from_env()``, so ``LOCALWALLET_*`` environment overrides are
@@ -582,16 +541,6 @@ class EsploraClient:
     #: price oracle may query it (capability seam, TCK-ONB-004 plan §0).
     supports_price: bool = True
 
-    #: Recommended-fee payload key per confirmation target (the single
-    #: native fee source for this backend; kept here as PLAIN STRINGS
-    #: because ``fees.FeeTarget`` would import-cycle — the lookup uses
-    #: ``target.value``).
-    _RECOMMENDED_FEE_KEYS: ClassVar[dict[str, str]] = {
-        "fast": "fastestFee",
-        "medium": "halfHourFee",
-        "slow": "hourFee",
-    }
-
     def __init__(
         self,
         base_url: str | None = None,
@@ -602,10 +551,10 @@ class EsploraClient:
     ) -> None:
         defaults = Settings.from_env()
         self._config = ChainConfig(
-            # TCK-DESCOPE-M3A: the Esplora shape is PUBLIC-INFO surface now
-            # (fees/prices via ``chain.publicinfo``; the wallet-role removal
-            # lands in M4). The default base therefore comes from the
-            # repurposed ``esplora_base_url`` public-info base, NEVER from
+            # TCK-DESCOPE-M3A/M4: the Esplora shape is PUBLIC-INFO surface
+            # only (fees/prices via ``chain.publicinfo``; the wallet-data
+            # paths are DELETED). The default base therefore comes from the
+            # ``esplora_base_url`` public-info base, NEVER from
             # the wallet selection point ``ChainConfig.from_settings`` (an
             # unset ``chain_base_url`` is UNRESOLVED there now, and an
             # ``ssl://``/``bitcoind://`` wallet URL is not this client's).
@@ -617,8 +566,7 @@ class EsploraClient:
             # TLS trust rides the SAME resolution as base_url (ADR-0018
             # amendment, TCK-BACKEND-001): no explicit argument — env >
             # config-file > fail-closed default, so a self-hosted config
-            # gets URL and trust knob from one place. check_backend's probe
-            # inherits the same value through this construction path.
+            # gets URL and trust knob from one place.
             tls_verify=defaults.tls_verify,
         )
         if self._config.base_url.startswith((BITCOIND_SCHEME, BITCOIND_TLS_SCHEME)):
@@ -670,27 +618,6 @@ class EsploraClient:
     ) -> None:
         self.close()
 
-    def get_address_txs(self, address: str) -> list[dict[str, Any]]:
-        """Fetch the full transaction history for ``address``.
-
-        ``GET {base}/address/{address}/txs``. Raises :class:`ChainError` per
-        the class retry/error policy; the address is never echoed in errors.
-        """
-        _validate_address(address)
-        payload = self._request_json(_KIND_ADDRESS_TXS, f"/address/{address}/txs")
-        return _require_object_list(payload, _KIND_ADDRESS_TXS)
-
-    def get_address_utxos(self, address: str) -> list[dict[str, Any]]:
-        """Fetch the unspent outputs for ``address``.
-
-        ``GET {base}/address/{address}/utxo``. Entries carry ``txid``,
-        ``vout``, ``value``, and ``status.confirmed``; deeper per-entry
-        validation happens in :func:`balance_from_utxos`.
-        """
-        _validate_address(address)
-        payload = self._request_json(_KIND_ADDRESS_UTXOS, f"/address/{address}/utxo")
-        return _require_object_list(payload, _KIND_ADDRESS_UTXOS)
-
     def get_tip_height(self) -> int:
         """Fetch the current chain tip height (``GET {base}/blocks/tip``).
 
@@ -740,75 +667,6 @@ class EsploraClient:
                 failure_class=NOT_ESPLORA_SHAPE,
             )
         return parsed
-
-    def get_tip_block(self) -> TipBlock:
-        """Fetch the chain-tip block info (``GET {base}/blocks/tip``).
-
-        The same tolerant parsing spirit as :meth:`get_tip_height` (the
-        mempool.space ``/blocks/tip`` divergence — HANDOFF §5): a bare
-        non-negative integer (the documented Esplora shape) yields a
-        :class:`TipBlock` with that height and ``timestamp=None``; a
-        non-empty list of block objects yields the entry with the maximum
-        ``height``, carrying its ``timestamp`` when present (a malformed or
-        absent ``timestamp`` is the clean ``None`` unavailable state, never
-        a fabricated value). The TCK-BACKEND-004 empty-list shape
-        (``/blocks/tip`` answering ``[]``) falls back to the tip-first entry
-        of ``GET {api}/blocks``, its ``timestamp`` riding the same tolerant
-        per-entry rule. Anything else fails closed as a
-        :data:`NOT_ESPLORA_SHAPE`-classed :class:`ChainError` — we never
-        guess a tip or a timestamp.
-        """
-        payload = self._request_json(_KIND_TIP_BLOCK, "/blocks/tip")
-        if isinstance(payload, list) and not payload:
-            payload = [
-                _tip_block_page(
-                    self._request_json(_KIND_TIP_BLOCK, "/blocks"), _KIND_TIP_BLOCK
-                )
-            ]
-        if isinstance(payload, bool):
-            raise ChainError(
-                f"{_KIND_TIP_BLOCK} response was not an integer or block list",
-                failure_class=NOT_ESPLORA_SHAPE,
-            )
-        if isinstance(payload, int):
-            if payload < 0:
-                raise ChainError(
-                    f"{_KIND_TIP_BLOCK} response was a negative integer",
-                    failure_class=NOT_ESPLORA_SHAPE,
-                )
-            return TipBlock(height=payload, timestamp=None)
-        if isinstance(payload, list):
-            if not payload:
-                raise ChainError(
-                    f"{_KIND_TIP_BLOCK} response was an empty block list",
-                    failure_class=NOT_ESPLORA_SHAPE,
-                )
-            best_index = 0
-            best_height = -1
-            for index, entry in enumerate(payload):
-                if not isinstance(entry, dict):
-                    raise ChainError(
-                        f"{_KIND_TIP_BLOCK} response block {index} is not an object",
-                        failure_class=NOT_ESPLORA_SHAPE,
-                    )
-                height = entry.get("height")
-                if isinstance(height, bool) or not isinstance(height, int) or height < 0:
-                    raise ChainError(
-                        f"{_KIND_TIP_BLOCK} response block {index} has invalid 'height'",
-                        failure_class=NOT_ESPLORA_SHAPE,
-                    )
-                if height > best_height:
-                    best_height = height
-                    best_index = index
-            entry = payload[best_index]
-            timestamp = entry.get("timestamp")
-            if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
-                timestamp = None
-            return TipBlock(height=best_height, timestamp=timestamp)
-        raise ChainError(
-            f"{_KIND_TIP_BLOCK} response was not an integer or block list",
-            failure_class=NOT_ESPLORA_SHAPE,
-        )
 
     def broadcast_tx(self, tx_hex: str) -> str:
         """Broadcast a signed transaction (``POST {base}/tx``, single attempt).
@@ -920,71 +778,6 @@ class EsploraClient:
             )
         return reported
 
-    def get_tx_status(self, txid: str) -> TxStatus:
-        """Fetch a transaction's confirmation status (``GET {base}/tx/{txid}/status``).
-
-        The response is shape-validated fail-closed: ``confirmed`` must be
-        a strict boolean, ``block_height``/``block_time`` non-negative
-        integers or ``null`` (bools rejected). An unknown txid surfaces as
-        the client's ordinary non-2xx handling (404 → :class:`ChainError`,
-        value-free) — callers that want "unconfirmed" semantics for unknown
-        ids decide that at the handler layer, never here.
-
-        Args:
-            txid: The transaction id, validated by :func:`_validate_txid`
-                (EXACTLY 64 lowercase hex) BEFORE the URL is constructed —
-                the charset check is the injection guard for this
-                user/model-supplied path component.
-
-        Raises:
-            ChainError: malformed argument, non-2xx status per the GET
-                retry policy, malformed JSON, or an unexpected shape.
-        """
-        _validate_txid(txid)
-        payload = self._request_json(_KIND_TX_STATUS, f"/tx/{txid}/status")
-        if not isinstance(payload, dict):
-            raise ChainError(f"{_KIND_TX_STATUS} response was not an object")
-        confirmed = payload.get("confirmed")
-        if not isinstance(confirmed, bool):
-            raise ChainError(f"{_KIND_TX_STATUS} response has missing or non-boolean 'confirmed'")
-        parsed: list[int | None] = []
-        for name in ("block_height", "block_time"):
-            value = payload.get(name)
-            if value is None:
-                parsed.append(None)
-            elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ChainError(f"{_KIND_TX_STATUS} response has invalid '{name}'")
-            else:
-                parsed.append(value)
-        return TxStatus(
-            txid=txid,
-            confirmed=confirmed,
-            block_height=parsed[0],
-            block_time=parsed[1],
-        )
-
-    def estimate_fee(self, target: FeeTarget) -> int:
-        """Backend-native single fee bid in sat/vB (``ChainClient`` contract).
-
-        Source: ``GET {base}/v1/fees/recommended`` (mempool.space shape), the
-        key matching ``target``. Strictly validated (positive ``int``, bools
-        rejected — a 0 sat/vB bid is a broken payload, never a free one;
-        same fail-closed rule as :func:`localwallet.chain.fees._parse_recommended`).
-        Note: the app's fee path for THIS backend goes through
-        :class:`~localwallet.chain.fees.FeeEstimator`, which prefers its
-        richer floor-follower over this single-source endpoint; this method
-        exists so the Esplora client satisfies the same protocol as every
-        other adapter.
-        """
-        key = self._RECOMMENDED_FEE_KEYS[target.value]
-        payload = self._request_json("fees-recommended", "/v1/fees/recommended")
-        if not isinstance(payload, dict):
-            raise ChainError("fees-recommended response was not an object")
-        value = payload.get(key)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ChainError(f"fees-recommended response has missing or invalid '{key}'")
-        return value
-
     def get_json(self, path: str, kind: str) -> Any:
         """Public GET + retry + parse for any path on this client.
 
@@ -1028,9 +821,9 @@ class EsploraClient:
         immediately, preserving the snappy probe budget; a base already
         ending in ``/api`` (the public default, well-known self-hosted
         roots) only ever tries itself, so no request is ever doubled on a
-        correct configuration. The same join serves check_backend's probe
-        and the live client — a saved bare-host URL works after save, not
-        just at probe time. (Benign race: concurrent first requests may
+        correct configuration. The same join serves every public-info read
+        on this client — a saved bare-host base works after save, not just
+        at first contact. (Benign race: concurrent first requests may
         each negotiate; they latch the same value.)
         """
         if self._api_prefix is not None:
@@ -1113,107 +906,3 @@ class EsploraClient:
             failure_class=last_fc or NETWORK_ERROR,
             exc_name=last_name,
         )
-
-
-def check_backend(
-    base_url: str,
-    *,
-    timeout_s: float = 10.0,
-    max_retries: int = 0,
-    transport: httpx.BaseTransport | None = None,
-    report: dict[str, str] | None = None,
-) -> bool:
-    """Probe a candidate self-hosted backend (ADR-0023 decision 5).
-
-    ``True`` only when the URL (a) constructs through the fail-closed
-    :class:`ChainConfig` shape check (well-formed http(s), no userinfo),
-    (b) answers in Esplora shape (the strict tip-height parse proves
-    reachability *and* the API family) — at ``{base}`` OR, when the base
-    is a bare frontend host whose root does not answer in API shape, at
-    ``{base}/api`` (the mempool.space-style API-root segment, auto-tried
-    and latched by :meth:`EsploraClient._request_json`, TCK-BACKEND-003),
-    and     (c) serves **mainnet** — its
-    block-height-0 answer (a list or a wrapped/list-wrapped object) must
-    contain the genesis proof: a bare hash equal to
-    :data:`MAINNET_GENESIS_HASH`, or an object carrying that ``"id"`` AND
-    ``"height": 0``. A testnet/other-network instance fails (c) and is
-    refused (ADR-0021).
-
-    Every failure collapses to ``False`` — construction, transport, HTTP,
-    parse and shape alike, including any httpx request error outside the
-    :class:`ChainError` surface (an escaping exception would kill the
-    engine pump this runs on; TCK-ONB-003 review, finding 1). The caller
-    owns the one honest user-facing message, so no URL, host, status, or
-    exception detail ever leaves this function (value-free by
-    construction). Retries are pointless for a setup probe of a server the
-    user just pointed at — default ``max_retries=0`` keeps the prompt
-    snappy; the caller may raise it.
-
-    ``transport`` is the standard test seam; production passes ``None``.
-    TLS trust is NOT a parameter here: the probe shares the client's ladder
-    (env > config file > fail-closed default), so a self-hosted backend with
-    a self-signed cert is only reachable through an explicit
-    ``LOCALWALLET_TLS_VERIFY=0`` that also drives the real client — the check
-    and the wallet can never disagree on transport policy.
-
-    ``report`` (optional, TCK-DIAG-001): a dict the caller may pass that, on
-    a ``False`` refusal, is populated with value-free debug keys
-    ``failure_class`` and ``exc_name`` (never a host, credential, address, or
-    amount). The bool return and ACCEPT/REJECT semantics are unchanged.
-    """
-    try:
-        client = EsploraClient(
-            base_url=base_url,
-            timeout_s=timeout_s,
-            max_retries=max_retries,
-            transport=transport,
-        )
-    except ValueError:
-        if report is not None:
-            report["failure_class"] = NETWORK_ERROR
-            report["exc_name"] = "ValueError"
-        return False  # malformed URL: ChainConfig failed closed at construction
-    try:
-        client.get_tip_height()
-        blocks = client.get_json("/blocks/0", _KIND_BLOCKS_AT_HEIGHT)
-    except (ChainError, httpx.InvalidURL) as exc:
-        # The whole request surface collapses to False — ChainError covers
-        # transport/HTTP/JSON/shape failures, and httpx.InvalidURL is
-        # belt-and-braces for request-time URL breakage (non-numeric port)
-        # that _request_json also converts; the contract here is that
-        # NOTHING escapes to the caller (finding 1).
-        if report is not None:
-            report["failure_class"] = getattr(exc, "failure_class", None) or classify_failure(exc)
-            report["exc_name"] = getattr(exc, "exc_name", None) or type(exc).__name__
-        return False
-    finally:
-        client.close()
-    if not isinstance(blocks, (list, dict)):
-        if report is not None:
-            report["failure_class"] = NOT_ESPLORA_SHAPE
-            report["exc_name"] = "not-a-list"
-        return False
-    # Esplora's /blocks/<height> canonically serves the list of BLOCK HASHES
-    # at that height; mempool.space-style servers answer block OBJECTS whose
-    # "id" is the hash (the same canonical shape :meth:`EsploraClient.get_tip_block`
-    # parses), including LIST-WRAPPED genesis objects (private mempool.space
-    # instance, 2026-09, TCK-BACKEND-004) and bare hashes. Matching the raw
-    # entries rejected every genuine object-shaped mainnet backend
-    # (TCK-ONB-003 review, finding 2). Object entries must prove BOTH the
-    # mainnet genesis hash AND the height-0 position (fail closed — a hash
-    # riding at any other height is not a genesis proof); bare-hash entries
-    # carry no height and keep their lenient hash-equality tolerance.
-    for entry in blocks if isinstance(blocks, list) else [blocks]:
-        if isinstance(entry, str) and entry == MAINNET_GENESIS_HASH:
-            return True
-        if (
-            isinstance(entry, dict)
-            and entry.get("id") == MAINNET_GENESIS_HASH
-            and entry.get("height") == 0
-            and not isinstance(entry.get("height"), bool)
-        ):
-            return True
-    if report is not None:
-        report["failure_class"] = NOT_MAINNET
-        report["exc_name"] = "not-mainnet"
-    return False

@@ -28,9 +28,11 @@ seed phrases in the app.
 - **Revalidation before broadcast.** Signed PSBTs are re-parsed and
   re-validated against the intended transaction before anything is broadcast.
   Any mismatch is a hard stop.
-- **Self-hosted or public Esplora backend.** Chain data (balances, fees,
-  prices) comes from an Esplora instance — point it at your own node's
-  Esplora or a public one.
+- **Electrum or Bitcoin Core wallet backend; public fee/price source.** Wallet
+  data (balances, fees, history) comes from your chosen Electrum server or
+  Bitcoin Core node — point the app at your own instance. A public
+  Esplora-compatible source (e.g. mempool.space) feeds fees and prices only,
+  never wallet data.
 - **Auditable core.** The LLM interprets intent and narrates results; every
   action it triggers runs through deterministic Python you can read, and the
   network-touching surface is confined to a single module (`chain/`).

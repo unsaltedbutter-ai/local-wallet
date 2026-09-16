@@ -382,8 +382,7 @@ class ElectrumClient:
         ``blockchain.scripthash.listunspent`` entries ``{tx_hash, tx_pos,
         value, height}`` map to ``{txid, vout, value, status:{confirmed
         [,block_height]}}`` with ``confirmed = height > 0`` (0/mempool is
-        unconfirmed), exactly what ``scan._parse_utxo_entry`` and
-        :func:`~localwallet.chain.esplora.balance_from_utxos` consume.
+        unconfirmed), exactly what ``scan._parse_utxo_entry`` consumes.
         """
         rows = self._rpc(
             "blockchain.scripthash.listunspent",

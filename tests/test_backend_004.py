@@ -57,11 +57,10 @@ if str(_SRC) not in sys.path:
 
 from localwallet import app as app_module
 from localwallet.app import Settings, _probe_chain_backend
-from localwallet.chain import ChainError, EsploraClient, check_backend
+from localwallet.chain import ChainError, EsploraClient
 from localwallet.chain.esplora import (
     MAINNET_GENESIS_HASH,
     NOT_ESPLORA_SHAPE,
-    NOT_MAINNET,
     RPC_ERROR,
 )
 
@@ -160,37 +159,15 @@ def _client_for(handler: Any, base: str = "https://h.example") -> EsploraClient:
 
 
 class TestTipEmptyListRepro:
-    def test_check_backend_accepts_the_user_payload(self) -> None:
-        """[] tip + tip-first /blocks page + list-wrapped genesis → ACCEPT.
-        (check_backend runs on the BARE host; the /api auto-try latches,
-        then the [] fallback rides the same latched root.)"""
-        report: dict[str, str] = {}
-        seen: list[str] = []
-
-        def counting(request: httpx.Request) -> httpx.Response:
-            seen.append(request.url.path)
-            return _mempool_handler()(request)
-
-        assert check_backend(
-            "https://h.example", transport=httpx.MockTransport(counting), report=report
-        )
-        assert seen == [
-            "/blocks/tip",        # bare root: the frontend 404s (mismatch)
-            "/api/blocks/tip",    # [] — latches /api, triggers the fallback
-            "/api/blocks",        # tip-first page → height
-            "/api/blocks/0",      # list-wrapped genesis object
-        ]
-        assert report == {}
+    """The public-info tip path (``get_tip_height``) survives; the
+    ``check_backend`` probe and the Esplora ``get_tip_block`` wallet read
+    were deleted in TCK-DESCOPE-M4, and their pins retired with them (the
+    tip-BLOCK shape tolerance now lives only in the two wallet adapters —
+    pinned in their own suites)."""
 
     def test_get_tip_height_takes_the_tip_first_entry(self) -> None:
         with _client_for(_mempool_handler()) as client:
             assert client.get_tip_height() == 900_000  # page[0], NOT the max
-
-    def test_get_tip_block_falls_back_with_timestamp(self) -> None:
-        with _client_for(_mempool_handler()) as client:
-            block = client.get_tip_block()
-        assert block.height == 900_000
-        assert block.timestamp == 1_750_000_000
 
     def test_fallback_page_failure_names_both_endpoints(self) -> None:
         """[] tip AND a malformed /blocks page → honest refusal naming the
@@ -214,15 +191,12 @@ class TestTipEmptyListRepro:
         """THE user symptom: with TLS verify off the app read
         ``class=network-error`` at the esplora-shape stage. A shape refusal
         (valid JSON, wrong shape, fallback ALSO wrong) now reports
-        not-esplora-shape."""
-        report: dict[str, str] = {}
-        ok = check_backend(
-            "https://h.example",
-            transport=httpx.MockTransport(_mempool_handler(blocks_page="junk")),
-            report=report,
-        )
-        assert not ok
-        assert report["failure_class"] == NOT_ESPLORA_SHAPE
+        not-esplora-shape — pinned on the surviving public tip read."""
+        with _client_for(_mempool_handler(blocks_page="junk")) as client, pytest.raises(
+            ChainError
+        ) as excinfo:
+            client.get_tip_height()
+        assert excinfo.value.failure_class == NOT_ESPLORA_SHAPE
 
     def test_bare_integer_tip_shape_unchanged(self) -> None:
         calls: list[str] = []
@@ -234,41 +208,6 @@ class TestTipEmptyListRepro:
         with _client_for(handler, base="https://h.example/api") as client:
             assert client.get_tip_height() == 870_000
         assert calls == ["/api/blocks/tip"]  # no fallback request was made
-
-
-class TestGenesisProof:
-    @pytest.mark.parametrize(
-        ("entry", "accepted"),
-        [
-            (_USER_GENESIS_OBJECT, True),   # list-wrapped object, height 0
-            ({"id": MAINNET_GENESIS_HASH, "height": 12345}, False),  # wrong height
-            ({"id": MAINNET_GENESIS_HASH}, False),  # no height proof → fail closed
-            ({"id": MAINNET_GENESIS_HASH, "height": True}, False),  # bool height
-            (MAINNET_GENESIS_HASH, True),   # tolerated bare hash
-        ],
-        ids=["object-h0", "object-hWrong", "object-noHeight", "object-boolH", "bare-hash"],
-    )
-    def test_genesis_entry_shapes(self, entry: Any, accepted: bool) -> None:
-        report: dict[str, str] = {}
-        ok = check_backend(
-            "https://h.example/api",
-            transport=httpx.MockTransport(_mempool_handler(genesis_entry=entry)),
-            report=report,
-        )
-        assert ok is accepted
-        if not accepted:
-            assert report["failure_class"] == NOT_MAINNET
-
-    def test_bare_object_payload_tolerated(self) -> None:
-        """/blocks/0 answering a bare (UNWRAPPED) genesis object is still
-        proven by hash + height==0."""
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path.endswith("/blocks/tip"):
-                return httpx.Response(200, json=870_000)
-            return httpx.Response(200, json=_USER_GENESIS_OBJECT)
-
-        assert check_backend("https://h.example/api", transport=httpx.MockTransport(handler))
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +386,10 @@ class TestDiagTool:
         assert r["reachable"] is True
         assert r["mainnet"] is True
         assert r["api_root"] == "/api"
+        # TCK-DESCOPE-M4: the Esplora shape is re-scoped to a PUBLICINFO
+        # probe — a public fee/price source, never a wallet backend.
+        assert r["kind"] == "publicinfo"
+        assert "never a wallet backend" in r["role"]
         assert calls == ["/blocks/tip", "/api/blocks/tip", "/api/blocks", "/api/blocks/0"]
 
     def test_esplora_probe_names_the_fallback(self, diag: Any) -> None:

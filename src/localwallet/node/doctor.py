@@ -23,10 +23,12 @@ Recommendation tiers (PROJECT.md §7.7 / OQ11, expanded by ADR-0016):
    pruning enabled to bound disk use (``prune`` + ``txindex`` tradeoff
    documented); exposes the RPC cookie the app detects. Least software, most
    manual.
-3. **Self-hosted mempool / electrs — "explorer + Esplora API".** A
+3. **Self-hosted mempool / electrs — "explorer + public fee/price API".** A
    self-hosted mempool.space instance (or electrs) layered on a Core node
-   provides both a human-readable explorer and the Esplora HTTP API the app's
-   chain adapter can consume on localhost (ADR-0003 Phase 4 swap target).
+   provides a human-readable explorer and the Esplora API shape this app's
+   PUBLIC fee/price reader can consume on localhost — never a wallet backend
+   (wallet information comes only from the Electrum/bitcoind adapters,
+   TCK-DESCOPE-M3A/M4).
 
 The tiers are ordered from "easiest for a newcomer" to "most manual but most
 control". Each tier is a self-contained :class:`SetupOption` so the UI/agent
@@ -135,8 +137,9 @@ SETUP_OPTIONS: tuple[SetupOption, ...] = (
         summary=(
             "Layer a self-hosted mempool.space instance (or electrs) on top of "
             "a Bitcoin Core node. You get a human-readable block explorer and "
-            "the local Esplora HTTP API this app's chain adapter can use — "
-            "closing the public-explorer privacy gap (PROJECT.md §9)."
+            "a self-hosted PUBLIC fee/price source (the Esplora API shape) "
+            "this app reads — wallet data still comes from the Electrum or "
+            "bitcoind adapters."
         ),
         steps=(
             "Start with a synced Bitcoin Core node (see the minimal option).",
@@ -149,8 +152,9 @@ SETUP_OPTIONS: tuple[SetupOption, ...] = (
                 "the loopback port automatically)."
             ),
             (
-                "Point this app at the local instance once backend wiring ships "
-                "(TCK-P4-002) — no address ever leaves your machine afterwards."
+                "This local Esplora API serves PUBLIC fees/prices only — wallet "
+                "data (scans, watch, broadcast) still requires the Electrum or "
+                "bitcoind adapters."
             ),
         ),
         required_skill="advanced",
@@ -186,15 +190,14 @@ STATE_ADVICE: dict[NodeStateKind, NodeStateAdvice] = {
         headline="No local node detected",
         detail=(
             "This machine is not running a node this app could detect. Your "
-            "data is currently served by a public explorer."
+            "wallet data is currently served by a public wallet backend."
         ),
         # TCK-ONB-005: the old wording pointed at options "below" that are
         # never rendered — it now names what actually exists: the /setup
         # transcript command (ADR-0023) or keeping the default.
         next_step=(
-            "Run /setup in this app to choose your own Esplora-compatible "
-            "server (Umbrel/Start9/mempool.space self-hosted), or keep the "
-            "public default."
+            "Run /setup in this app to choose your own wallet backend — an "
+            "Electrum server or Bitcoin Core (Umbrel/Start9 self-hosted)."
         ),
     ),
     NodeStateKind.CORE_SYNCING: NodeStateAdvice(
@@ -218,7 +221,8 @@ STATE_ADVICE: dict[NodeStateKind, NodeStateAdvice] = {
         ),
         next_step=(
             "Add a self-hosted mempool/electrs instance for a block explorer "
-            "and the Esplora API the app uses."
+            "and a self-hosted public fee/price source; wallet data uses the "
+            "Core backend."
         ),
     ),
     NodeStateKind.CORE_AUTH_ISSUE: NodeStateAdvice(

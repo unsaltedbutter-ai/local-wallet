@@ -381,12 +381,12 @@ def test_setup_without_cli_flow_prints_pointer() -> None:
 
 def test_doctor_none_found_points_at_setup() -> None:
     """Requirement 3: the dangling "Pick a setup option below" is gone —
-    the NONE_FOUND guidance names the REAL options (the /setup command and
-    the public default it can decline)."""
+    the NONE_FOUND guidance names the REAL wallet-backend options (an
+    Electrum server or Bitcoin Core, TCK-DESCOPE-M4 re-scope)."""
     next_step = STATE_ADVICE[NodeStateKind.NONE_FOUND].next_step
     assert "/setup" in next_step
-    assert "Esplora" in next_step
-    assert "public default" in next_step
+    assert "Electrum" in next_step
+    assert "Bitcoin Core" in next_step
     assert "below" not in next_step  # the dangling pointer, pinned dead
 
 

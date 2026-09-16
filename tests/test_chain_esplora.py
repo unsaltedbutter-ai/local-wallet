@@ -1,4 +1,13 @@
-"""Tests for the Esplora chain client.
+"""Tests for the surviving PUBLIC-INFO surface of the Esplora chain client
+(TCK-DESCOPE-M4): ``get_json`` (the fee/price reads ``chain.publicinfo``
+rides), ``get_tip_height`` (with the TCK-BACKEND-004 shape tolerance and
+retry policy), the single-attempt ``broadcast_tx`` POST (TCK-PUBLICBCAST-001
+transport — the SEC-004 txid bind and DIAG-005 classification pins all
+still apply), construction/defaults/backoff, and the shared ``TxStatus``
+record. The wallet-data method tests (address txs/utxo, tx status, the
+``check_backend`` probe, ``balance_from_utxos``) retired with the deleted
+production paths; the wallet scan semantics they indirectly covered are
+pinned by the electrum/bitcoind suites and the wallet-shape double.
 
 All HTTP traffic is served by ``httpx.MockTransport`` — no real network.
 """
@@ -76,27 +85,19 @@ def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     return sleeps
 
 
-def test_get_address_txs_happy_path():
+def test_get_json_happy_path():
+    """The public fee endpoint the PublicInfoClient delegates to: verbatim
+    JSON passthrough, no query params, identifying UA."""
     server = ScriptedServer(httpx.Response(200, json=TXS_PAYLOAD))
     with server.client() as client:
-        result = client.get_address_txs(ADDRESS)
+        result = client.get_json("/v1/fees/recommended", "fees-recommended")
     assert result == TXS_PAYLOAD  # payload passes through verbatim
     request = server.requests[0]
     assert request.method == "GET"
     assert request.url.host == "mempool.space"
-    assert request.url.path == f"/api/address/{ADDRESS}/txs"
+    assert request.url.path == "/api/v1/fees/recommended"
     assert "?" not in str(request.url)  # no query params / API keys
     assert request.headers["User-Agent"].startswith("local-wallet/")
-
-
-def test_get_address_utxos_happy_path():
-    server = ScriptedServer(httpx.Response(200, json=UTXOS_PAYLOAD))
-    with server.client() as client:
-        result = client.get_address_utxos(ADDRESS)
-    assert result == UTXOS_PAYLOAD
-    request = server.requests[0]
-    assert request.method == "GET"
-    assert request.url.path == f"/api/address/{ADDRESS}/utxo"
 
 
 def test_get_tip_height_happy_path():
@@ -196,7 +197,7 @@ def test_retries_on_429_then_succeeds(monkeypatch: pytest.MonkeyPatch):
     sleeps = _record_sleeps(monkeypatch)
     server = ScriptedServer(httpx.Response(429), httpx.Response(200, json=TXS_PAYLOAD))
     with server.client() as client:
-        assert client.get_address_txs(ADDRESS) == TXS_PAYLOAD
+        assert client.get_json("/v1/fees/recommended", "fees-recommended") == TXS_PAYLOAD
     assert len(server.requests) == 2  # initial attempt + one retry
     assert len(sleeps) == 1  # backoff was scheduled between attempts
 
@@ -205,7 +206,7 @@ def test_retries_on_5xx_then_succeeds(monkeypatch: pytest.MonkeyPatch):
     _record_sleeps(monkeypatch)
     server = ScriptedServer(httpx.Response(503), httpx.Response(200, json=UTXOS_PAYLOAD))
     with server.client() as client:
-        assert client.get_address_utxos(ADDRESS) == UTXOS_PAYLOAD
+        assert client.get_json("/v1/prices", "prices") == UTXOS_PAYLOAD
     assert len(server.requests) == 2
 
 
@@ -223,11 +224,11 @@ def test_retry_exhaustion_on_429_raises_chain_error(monkeypatch: pytest.MonkeyPa
     sleeps = _record_sleeps(monkeypatch)
     server = ScriptedServer(httpx.Response(429))
     with server.client(max_retries=2) as client, pytest.raises(ChainError) as excinfo:
-        client.get_address_utxos(ADDRESS)
+        client.get_json("/v1/fees/recommended", "fees-recommended")
     message = str(excinfo.value)
     assert "429" in message  # final status code is preserved
     assert "after 2 retries" in message
-    assert ADDRESS not in message  # log-scrubbing invariant
+    assert "/v1/fees" not in message  # log-scrubbing: the URL never rides
     assert len(server.requests) == 3  # initial attempt + 2 retries
     assert len(sleeps) == 2
 
@@ -236,7 +237,7 @@ def test_retry_exhaustion_on_timeouts_raises_chain_error(monkeypatch: pytest.Mon
     _record_sleeps(monkeypatch)
     server = ScriptedServer(httpx.ReadTimeout("timed out"))
     with server.client(max_retries=2) as client, pytest.raises(ChainError) as excinfo:
-        client.get_address_txs(ADDRESS)
+        client.get_json("/v1/prices", "prices")
     message = str(excinfo.value)
     assert "network error (ReadTimeout)" in message
     assert "after 2 retries" in message
@@ -248,10 +249,10 @@ def test_other_4xx_raises_immediately_without_retry(monkeypatch: pytest.MonkeyPa
     sleeps = _record_sleeps(monkeypatch)
     server = ScriptedServer(httpx.Response(status))
     with server.client(max_retries=3) as client, pytest.raises(ChainError) as excinfo:
-        client.get_address_txs(ADDRESS)
+        client.get_json("/v1/prices", "prices")
     message = str(excinfo.value)
     assert f"status {status}" in message
-    assert ADDRESS not in message
+    assert "prices" in message  # the endpoint KIND names the failure
     assert len(server.requests) == 1  # no retries for plain 4xx
     assert sleeps == []
 
@@ -259,8 +260,7 @@ def test_other_4xx_raises_immediately_without_retry(monkeypatch: pytest.MonkeyPa
 @pytest.mark.parametrize(
     "invoke",
     [
-        lambda client: client.get_address_txs(ADDRESS),
-        lambda client: client.get_address_utxos(ADDRESS),
+        lambda client: client.get_json("/v1/fees/recommended", "fees-recommended"),
         lambda client: client.get_tip_height(),
     ],
 )
@@ -274,9 +274,6 @@ def test_malformed_json_raises_chain_error(invoke):
 @pytest.mark.parametrize(
     ("invoke", "payload"),
     [
-        (lambda client: client.get_address_txs(ADDRESS), {}),
-        (lambda client: client.get_address_txs(ADDRESS), ["not-an-object"]),
-        (lambda client: client.get_address_utxos(ADDRESS), {"utxos": []}),
         (lambda client: client.get_tip_height(), "870000"),  # string, not int
         (lambda client: client.get_tip_height(), 1.5),  # float, not int
         (lambda client: client.get_tip_height(), True),  # bool is not accepted
@@ -310,18 +307,6 @@ def test_request_time_invalid_url_ends_as_value_free_chain_error(
     assert "invalid base URL" in message
     assert "h:port" not in message  # value-free: the URL is never echoed
     assert sleeps == []  # not retried — every attempt would fail identically
-
-
-@pytest.mark.parametrize(
-    "bad_address",
-    ["", " ", "bc1q x", "addr/ect", "x" * 101, "bc1qé", None],
-)
-def test_invalid_address_argument_raises_without_requesting(bad_address):
-    server = ScriptedServer(httpx.Response(200, json=[]))
-    with server.client() as client, pytest.raises(ChainError) as excinfo:
-        client.get_address_utxos(bad_address)  # type: ignore[arg-type]
-    assert server.requests == []  # refused before any request is built
-    assert ADDRESS not in str(excinfo.value)  # argument never echoed
 
 
 def test_context_manager_closes_underlying_client():
@@ -533,90 +518,9 @@ def test_broadcast_tx_expected_txid_strips_witness_data():
         assert client.broadcast_tx(segwit.serialize().hex()) == txid
 
 
-# ------------------------------------------------ tx status (TCK-P3-004)
+# ------------------------------------------------ tx status record (shared type)
 
 STATUS_TXID = "d" * 64
-
-
-def test_get_tx_status_confirmed_happy_path():
-    payload = {
-        "confirmed": True,
-        "block_height": 870_000,
-        "block_hash": "0" * 64,
-        "block_time": 1_700_000_000,
-    }
-    server = ScriptedServer(httpx.Response(200, json=payload))
-    with server.client() as client:
-        status = client.get_tx_status(STATUS_TXID)
-    assert status == esplora_module.TxStatus(
-        txid=STATUS_TXID, confirmed=True, block_height=870_000, block_time=1_700_000_000
-    )
-    request = server.requests[0]
-    assert request.method == "GET"
-    assert request.url.path == f"/api/tx/{STATUS_TXID}/status"
-    assert "?" not in str(request.url)  # no query params / API keys
-
-
-def test_get_tx_status_unconfirmed_null_fields():
-    payload = {"confirmed": False, "block_height": None, "block_hash": None, "block_time": None}
-    server = ScriptedServer(httpx.Response(200, json=payload))
-    with server.client() as client:
-        status = client.get_tx_status(STATUS_TXID)
-    assert status == esplora_module.TxStatus(
-        txid=STATUS_TXID, confirmed=False, block_height=None, block_time=None
-    )
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        [],  # not an object
-        "confirmed",  # not an object
-        {},  # missing 'confirmed'
-        {"confirmed": "true"},  # non-boolean confirmed
-        {"confirmed": 1},  # non-boolean confirmed
-        {"confirmed": None},  # non-boolean confirmed
-        {"confirmed": True, "block_height": "870000"},  # non-int height
-        {"confirmed": True, "block_height": True},  # bool height
-        {"confirmed": True, "block_height": -1},  # negative height
-        {"confirmed": True, "block_height": 1.5},  # float height
-        {"confirmed": True, "block_time": "1700000000"},  # non-int time
-        {"confirmed": True, "block_time": -5},  # negative time
-    ],
-)
-def test_get_tx_status_malformed_shape_raises_single_request(payload):
-    server = ScriptedServer(httpx.Response(200, json=payload))
-    with server.client() as client, pytest.raises(ChainError):
-        client.get_tx_status(STATUS_TXID)
-    assert len(server.requests) == 1  # shape errors are not retried
-
-
-@pytest.mark.parametrize(
-    "bad_txid",
-    ["", "d" * 63, "d" * 65, "D" * 64, "../" + "d" * 61, "d" * 32 + " " + "d" * 31,
-     "á" * 64, "d" * 20 + ";" * 44, None, 123],
-)
-def test_get_tx_status_txid_guard_refuses_before_requesting(bad_txid):
-    """The strict lowercase-hex charset is the URL-path injection guard:
-    refused BEFORE the URL is constructed; the txid is never echoed."""
-    server = ScriptedServer(httpx.Response(200, json={"confirmed": False}))
-    with server.client() as client, pytest.raises(ChainError) as excinfo:
-        client.get_tx_status(bad_txid)  # type: ignore[arg-type]
-    assert server.requests == []  # no URL was ever built
-    message = str(excinfo.value)
-    assert "invalid txid argument" in message
-    if isinstance(bad_txid, str) and bad_txid:
-        assert bad_txid not in message  # value-free
-
-
-def test_get_tx_status_unknown_txid_404_is_value_free_single_request():
-    server = ScriptedServer(httpx.Response(404))
-    with server.client() as client, pytest.raises(ChainError) as excinfo:
-        client.get_tx_status(STATUS_TXID)
-    message = str(excinfo.value)
-    assert "status 404" in message
-    assert STATUS_TXID not in message  # log-scrubbing invariant
-    assert len(server.requests) == 1  # plain 4xx: no retry
 
 
 def test_tx_status_dataclass_is_frozen():
