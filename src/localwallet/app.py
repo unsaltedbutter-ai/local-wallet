@@ -213,7 +213,11 @@ from localwallet.protocol import (
 
 # TCK-CHAT-009 (a): the SIZE-threshold bound reads the contract's own
 # whole-wallet ceiling (import only — the protocol layer stays untouched).
-from localwallet.protocol.envelope import MAX_AMOUNT_SATS, MIN_AMOUNT_SATS
+from localwallet.protocol.envelope import (
+    MAX_AMOUNT_SATS,
+    MAX_FEE_RATE_SAT_VB,
+    MIN_AMOUNT_SATS,
+)
 from localwallet.signer.base import Signer, SignerError
 from localwallet.signer.file import FilePsbtSigner
 from localwallet.signer.hwi import DeviceError, HwiUsbSigner
@@ -2152,6 +2156,59 @@ _CONS_THRESHOLD_DEFAULT: Final[str] = (
     "the cut."
 )
 
+# --- TCK-FEE-007: the rate ask on a pended consolidation plan -------------
+#
+# USER BUG (2026-09-15): consolidation → "slower" → the model's open-ended
+# "what speed?" question → "0.75 sat/vbyte" → the SAME question again — the
+# explicit-rate answer has no consumer on the consolidation/self_transfer
+# requote path (the closed envelope carries NO rate key for a plan, so the
+# model can only re-ask; the UX-004 ceiling-ask consumption works for
+# create_tx precisely because ITS answer lands on create_tx's
+# ``fee_rate_sat_vb``). The fix is this conversation's own deterministic
+# ask, answered HERE in code: the speed word opens ONE ask, a sat/vB rate
+# answer re-quotes the pended plan at that literal rate through the landed
+# explicit-rate seam (TCK-FEE-004/FEE-006: MAX with the min-RELAY rail
+# only, a raise narrated, never a silent alteration, zero estimator
+# calls), any other word closes it (never-trap). The rate never rides an
+# envelope — it is dispatcher-stamped session state the handler consumes
+# once (the ``fiat_ask_currency`` / answered-ask precedent), so the closed
+# protocol stays byte-identical: a MODEL cannot author a plan rate.
+
+#: The ONE rate ask (UX-004's consumption pattern, plan twin): the answer
+#: grammar is the ask line itself — a rate in sat/vB; anything else sets
+#: the ask aside.
+_CONS_RATE_ASK: Final[str] = (
+    "What speed would you like for the transaction? Say a rate in sat/vB "
+    "and I'll re-quote this plan at that exact rate — any other words set "
+    "this aside."
+)
+#: One rate number: whole sats/vB (thousands separators tolerated — the
+#: CHAT-009 lesson) with AT MOST two decimals (the engine's centisat/vB
+#: unit; a third decimal cannot be honoured, so it is not an answer).
+_CONS_RATE_NUM_RE: Final = re.compile(
+    r"^(?:\d{1,3}(?:,\d{3}){0,4}|\d{1,5})(?:\.\d{1,2})?$"
+)
+#: The vB-unit markers — at least one MUST appear beside the number: a
+#: bare number or a sats-only unit is the THRESHOLD ask's shape and is
+#: never consumed as a rate (the disambiguation pinned both ways).
+_CONS_RATE_VB_MARKERS: Final[frozenset[str]] = frozenset(
+    {
+        "vb", "vbs", "vbyte", "vbytes",
+        "sat/vb", "sats/vb", "sat/vbs", "sats/vbs",
+        "sat/vbyte", "sats/vbyte", "sat/vbytes", "sats/vbytes",
+    }
+)
+#: Closed fillers a rate answer may carry beside the number and the marker
+#: ("0.75 sats per vbyte please"); anything outside markers ∪ fillers is
+#: not this grammar. "sat"/"sats" are fillers ONLY because a marker must
+#: also be present — "100000 sats" is not a rate.
+_CONS_RATE_FILLERS: Final[frozenset[str]] = frozenset(
+    {
+        "sat", "sats", "satoshi", "satoshis", "per", "byte", "bytes",
+        "rate", "fee", "of", "in", "a", "the", "please",
+    }
+)
+
 #: Fee-rung words consumed from the label residual when a rung phrase
 #: matched (the whole closed vocabularies of _CONS_SLOW_PHRASES /
 #: _CONS_FAST_PHRASES — a matched urgency is never a label word).
@@ -3020,16 +3077,23 @@ class _ConsAsk:
     """An OPEN consolidation-conversation ask. ``kind`` is ``"rollup"``
     (pick a label group), ``"count"`` ("1 coin or N?" over the group),
     ``"list"`` (the ascending coin list, answered by CHAT-001 registry
-    NUMBER), or ``"threshold"`` (TCK-CONS-003: "what size counts as
+    NUMBER), ``"threshold"`` (TCK-CONS-003: "what size counts as
     small?" — answered by ONE stated sats number; ``entries`` carry the
-    scoped pool when a label was in the line, empty = the whole wallet).
-    ``fee_target`` carries the rung the opener's words resolved so
-    every later intercept re-quotes it instead of silently defaulting (the
-    RBF-004 MAJOR lesson, applied to this conversation's multi-step asks:
-    the knob AND the label group persist across every intercept). ``choice``
-    /``picked`` are the ONE fields the deterministic intercept stamps when
-    the final answer dispatches — consolidate params carry a
-    threshold-only number the ENGINE computed, never a coin reference."""
+    scoped pool when a label was in the line, empty = the whole wallet),
+    or ``"rate"`` (TCK-FEE-007: a bare speed word while a consolidation
+    plan pends asks ONCE for a sat/vB rate — answered by a rate phrasing
+    (number + explicit vB unit, the two asks' grammars are disjoint and
+    pinned so), anything else closes it). ``fee_target`` carries the rung
+    the opener's words resolved so every later intercept re-quotes it
+    instead of silently defaulting (the RBF-004 MAJOR lesson, applied to
+    this conversation's multi-step asks: the knob AND the label group
+    persist across every intercept). ``choice``/``picked`` are the ONE
+    fields the deterministic intercept stamps when a final answer
+    dispatches — consolidate params carry a threshold-only number the
+    ENGINE computed, never a coin reference. ``rate_centisat_vb`` is the
+    TCK-FEE-007 dispatcher-stamped rebuild rate (set ONLY on the
+    code-stamped ``"final"`` ask the rate answer produces — never an
+    envelope key, never model-settable)."""
 
     kind: str
     rows: tuple[_ConsRow, ...] = ()
@@ -3039,6 +3103,7 @@ class _ConsAsk:
     choice: int | None = None
     picked: tuple[dict[str, object], ...] = ()
     wallet_id: int | None = None
+    rate_centisat_vb: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3055,10 +3120,18 @@ class _ConsPending:
     figure already verbatim from the staging handler's own read) so the
     ``tx_pending`` re-show renders THE SAME card the user was shown,
     sources and fee lines included (the ``_CpfpPending.display``
-    precedent; a re-show never re-registers and never re-fetches)."""
+    precedent; a re-show never re-registers and never re-fetches).
+
+    ``inputs`` (TCK-FEE-007) is the staged plan's OWN selected coin set
+    (outpoint/value/address dicts, verbatim from the handler's fresh
+    store read at staging time — code data, never printed): the rate-ask
+    answer rebuilds the plan over EXACTLY these coins, revalidated by
+    the handler against a fresh store read (the mid-conversation-recheck
+    discipline the answered-ask path already runs)."""
 
     tx_ref: str
     display: Mapping[str, object] = dataclass_field(default_factory=dict)
+    inputs: tuple[dict[str, object], ...] = ()
 
 
 def _cons_int(token: str) -> int | None:
@@ -3070,6 +3143,44 @@ def _cons_int(token: str) -> int | None:
         return int(token)
     except ValueError:
         return None
+
+
+def _cons_rate_answer(line: str) -> int | None:
+    """TCK-FEE-007: parse a rate-ask answer into integer CENTISAT/vB, or
+    ``None`` (not a rate — the caller closes the ask, never-trap). The
+    grammar is the ask's own sentence: ONE rate number (whole or at most
+    two decimals — the engine's centisat unit, thousands separators
+    tolerated) PLUS an explicit vB-unit word, bounded to the envelope
+    family's own 1..MAX_FEE_RATE_SAT_VB sat/vB span; a bare number or a
+    sats-only unit is the threshold ask's shape and is NOT consumed here
+    (the disambiguation, pinned both ways alongside the threshold
+    parser's mirror). The number is matched RAW (the CHAT-004 punctuation
+    lesson in reverse: stripping a token could fold ".75" into "75" — a
+    100× money misread — so a digit run bearing stray edge punctuation
+    is simply NOT an answer); the unit words may carry edge punctuation.
+    The user's number is taken VERBATIM — no ladder, no rounding, no
+    floor question: the min-RELAY-rail decision belongs to the landed
+    explicit seam in the handler (MAX, never silently altered), exactly
+    like create_tx's ceiling-ask answer."""
+    raw = [t for t in line.lower().split() if t]
+    nums = [t for t in raw if _CONS_RATE_NUM_RE.match(t)]
+    rest = [t.strip(punctuation) for t in raw if not _CONS_RATE_NUM_RE.match(t)]
+    rest = [t for t in rest if t]
+    if len(nums) != 1 or not rest:
+        return None
+    if any(t not in _CONS_RATE_VB_MARKERS | _CONS_RATE_FILLERS for t in rest):
+        return None
+    if not any(t in _CONS_RATE_VB_MARKERS for t in rest):
+        return None  # a number without a vB unit is not a rate answer
+    text = nums[0].replace(",", "")
+    whole, _, frac = text.partition(".")
+    try:
+        value_c = int(whole) * 100 + (int(frac.ljust(2, "0")) if frac else 0)
+    except ValueError:
+        return None  # pathological digit length: not an answer (CHAT-009)
+    if not 1 <= value_c <= MAX_FEE_RATE_SAT_VB * 100:
+        return None  # a rate outside the envelope family's span is no answer
+    return value_c
 
 
 def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
@@ -3084,6 +3195,10 @@ def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
     number, thousands separators tolerated, optional sats unit, bounded to
     the envelope's own MIN..MAX_AMOUNT_SATS — anything else is NOT an
     answer and CLOSES the ask, the never-trap);
+    ``"rate"`` (TCK-FEE-007) → the stated rate in integer centisat/vB
+    (:func:`_cons_rate_answer` — a number WITH an explicit vB unit; the
+    threshold grammar and this one are disjoint by construction, pinned
+    both ways);
     ``"list"`` → the chosen CHAT-001 registry NUMBER itself (never a row
     position — the council invariant), answering only when every digit in
     the line names one known number."""
@@ -3101,6 +3216,8 @@ def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
         if not MIN_AMOUNT_SATS <= value <= MAX_AMOUNT_SATS:
             return None  # a cut outside all of bitcoin is not an answer
         return value
+    if ask.kind == "rate":
+        return _cons_rate_answer(line)
     if ask.kind == "rollup":
         first = words[0]
         if first.isdigit():
@@ -3284,7 +3401,12 @@ def _run_consolidation_turn(
     ``rollup`` (pick a label) → ``count`` ("1 coin or N?") → optional
     ``list`` (ascending UTXO list, CHAT-001 registry number pick) →
     dispatch, plus the TCK-CONS-003 ``threshold`` ask ("what size counts
-    as small?" — ONE ask, a number answers, anything else closes). The
+    as small?" — ONE ask, a number answers, anything else closes), and —
+    while a CONSOLIDATION plan PENDING — the TCK-FEE-007 ``rate`` ask (a
+    bare speed word opens ONE "what speed?" ask; a sat/vB-rate answer
+    re-quotes the pended plan at exactly that rate through the handler's
+    dispatcher-token explicit seam — the answer the model route could
+    never consume; anything else closes it, never-trap). The
     final answer stamps ``choice``/``picked`` on the ask and
     CODE builds the ``self_transfer`` consolidate envelope (params carry
     ONLY the engine-computed threshold + the persisted fee rung — never a
@@ -3347,6 +3469,35 @@ def _run_consolidation_turn(
                 session, store, ask.entries, choice, ask.fee_target, line,
                 output_fn, table=table,
             )
+        if ask.kind == "rate":
+            # TCK-FEE-007: THE rate ask, consumed ONCE — the stated sat/vB
+            # rate (``choice`` = code-parsed integer centisat/vB; the model
+            # never sees the number and no envelope key can carry it)
+            # rebuilds the pended consolidation plan at exactly that rate
+            # through the handler's dispatcher-token explicit seam. The
+            # input set is the plan's OWN coins (the carried marker —
+            # revalidated against a fresh store read downstream); a plan
+            # that vanished while the ask stood open CLOSES the ask and
+            # releases the line (never-trap, the house discipline).
+            session.cons_ask = None
+            marker = session.cons_pending
+            if (
+                flow.state is not TxFlowStatus.CREATED
+                or flow.pending is None
+                or marker is None
+                or marker.tx_ref != flow.pending.tx_ref
+                or not marker.inputs
+            ):
+                return False
+            return _cons_finalize(
+                session,
+                marker.inputs,
+                None,
+                line,
+                output_fn,
+                table=table,
+                rate_centisat_vb=choice,
+            )
         if ask.kind == "rollup":
             row = ask.rows[choice - 1]
             if row.tag == "":
@@ -3390,6 +3541,26 @@ def _run_consolidation_turn(
                 )
             )
         return _cons_finalize(session, picked, ask.fee_target, line, output_fn, table=table)
+
+    # TCK-FEE-007: the consolidation plan is PENDING (CREATED) and the user
+    # says a bare speed word. The closed self_transfer envelope carries NO
+    # rate key, so on the model route "slower" opened an endless
+    # "what speed would you like?" loop (the answer could never be consumed).
+    # Open the ONE deterministic rate ask HERE (before the gate-territory
+    # guard below releases the turn) — answered in the ask block at the top
+    # of this function. Keyed to THIS staged consolidation (the pending ref
+    # is the cons_pending marker's): a send/bump/cpfp pending keeps its
+    # existing routes untouched.
+    if (
+        flow.state is TxFlowStatus.CREATED
+        and flow.pending is not None
+        and session.cons_pending is not None
+        and session.cons_pending.tx_ref == flow.pending.tx_ref
+        and _bump_speed_choice(line) is not None
+    ):
+        session.cons_ask = _ConsAsk(kind="rate")
+        output_fn(sanitize_tool_output(_CONS_RATE_ASK))
+        return True
 
     # --- the opener (BEFORE the model; conservative phrase match) ---
     if flow.state in (
@@ -3705,13 +3876,22 @@ def _cons_finalize(
     output_fn: Callable[[str], None],
     *,
     table: DispatchTable,
+    rate_centisat_vb: int | None = None,
 ) -> bool:
     """The answer that plans: stamp the dispatcher-owned coins on the ask
     (the envelope itself carries NO coin reference — only the engine's own
     threshold ``max(values)+1`` and the persisted rung) and dispatch
     straight to the ``self_transfer`` handler, whose fresh-store revalidation
     and flow guards remain the authority. Transcript-free like every
-    consolidation turn."""
+    consolidation turn.
+
+    ``rate_centisat_vb`` (TCK-FEE-007) is the answered rate ask's
+    code-parsed centisat/vB rate — stamped on the final ask as the
+    dispatcher-owned RATE-REQUOTE token (there is no envelope key for it:
+    the closed self_transfer params cannot carry a literal rate, and the
+    model can neither set nor read a session field). The handler bids that
+    literal rate through the explicit seam instead of consulting the
+    ladder; a normal plan leaves it ``None`` (rung/estimate unchanged)."""
     values = [int(str(c["value_sats"])) for c in coins]
     params_kwargs: dict[str, object] = {
         "mode": "consolidate",
@@ -3723,7 +3903,12 @@ def _cons_finalize(
     if fee_target is not None:
         params_kwargs["fee_target"] = fee_target
     session.cons_ask = _ConsAsk(
-        kind="final", entries=coins, picked=coins, choice=1, fee_target=fee_target
+        kind="final",
+        entries=coins,
+        picked=coins,
+        choice=1,
+        fee_target=fee_target,
+        rate_centisat_vb=rate_centisat_vb,
     )
     try:
         _dispatch_code_self_turn(
@@ -6353,7 +6538,11 @@ def _make_self_transfer_handler(
     - The fee bid rides the SAME estimator ladder as ``create_tx``
       (``fee_target`` rung; MEDIUM default when neither knob is given — no
       ``fee_rate_sat_vb`` exists on this intent; an internal reshuffle
-      never rides the explicit-rate override).
+      never rides a MODEL-authorable explicit-rate override). The ONE
+      explicit-rate path is TCK-FEE-007: the consolidation rate ask's
+      code-parsed answer, carried on the dispatcher-owned session stamp
+      (never an envelope key — the closed protocol is unchanged), and
+      clamped through the same relay-rail seam create_tx/bump_fee use.
     - **CPFP** (TCK-CPFP-002, the ``cpfp`` mode — a separate pipeline,
       documented at :func:`_cpfp`): unstick a stuck INBOUND payment by
       spending its unconfirmed coin in a fresh high-fee child paying ONE
@@ -6402,8 +6591,13 @@ def _make_self_transfer_handler(
       unchanged).
     - Anything already pending (flow ``CREATED``) → the ``tx_pending``
       refusal with the PENDING plan re-shown — self-transfer offers no
-      same-plan re-quote (a re-quote would re-derive fresh destination
-      indices; changing speed is cancel + re-ask, stated up front).
+      model-route re-quote (a re-quote would re-derive fresh destination
+      indices; changing speed is cancel + re-ask, stated up front). The
+      ONE exception (TCK-FEE-007) is the dispatcher-stamped rate-ask
+      answer, admitted by the session token at step 0.75 — the model
+      cannot produce it, and it replaces through the same
+      commit-only-on-success ``flow.create`` swap the create_tx re-quote
+      rides.
     - Empty wallet / nothing below the threshold / the split coin cannot
       fund ``fee + parts × dust`` → honest value-free refusals (the
       below-dust split rides the friendly InsufficientFunds-style
@@ -6972,14 +7166,37 @@ def _make_self_transfer_handler(
                 return {"error": "cpfp_unavailable", "detail": _CPFP_NOT_READY}
             return _cpfp(params)
 
+        # 0.75 TCK-FEE-007: the dispatcher-owned RATE-REQUOTE token — the
+        #     consolidation rate ask's code-parsed answer, stamped on the
+        #     session ask by the SAME statement that dispatches this
+        #     envelope (``_cons_finalize`` with a rate). The envelope
+        #     itself carries NO rate key (the closed protocol is
+        #     byte-identical; a model can neither set, read, nor reach
+        #     this token — cons_ask is session state only the deterministic
+        #     intercept writes). It admits exactly one exception to the
+        #     pending guard below: re-quoting THIS consolidation plan at
+        #     the stated rate through the landed explicit seam.
+        cons_rate_c: int | None = None
+        if (
+            params.mode == "consolidate"
+            and session is not None
+            and session.cons_ask is not None
+            and session.cons_ask.rate_centisat_vb is not None
+            and session.cons_ask.picked
+        ):
+            cons_rate_c = session.cons_ask.rate_centisat_vb
+
         # 1. Pending guard: a staged plan is never silently replaced by
         #    another destructive plan (no self-transfer re-quote; see the
-        #    docstring). Past-the-gate states stay refused (flow.create's
-        #    own FlowError backstops, same shape as create_tx). A staged
-        #    consolidation (TCK-CONS-001) re-shows WITH its plan-echo
-        #    marker (the same card it was confirmed on, never a bare
-        #    reshape the user did not read).
-        if flow.state is TxFlowStatus.CREATED:
+        #    docstring — the ONE exception is the TCK-FEE-007 rate token
+        #    above, whose rebuild rides flow.create's dispatcher-owned
+        #    CREATED→CREATED replace, commit-only-on-success, exactly like
+        #    the create_tx re-quote). Past-the-gate states stay refused
+        #    (flow.create's own FlowError backstops, same shape as
+        #    create_tx). A staged consolidation (TCK-CONS-001) re-shows
+        #    WITH its plan-echo marker (the same card it was confirmed on,
+        #    never a bare reshape the user did not read).
+        if flow.state is TxFlowStatus.CREATED and cons_rate_c is None:
             result = _tx_pending_result(
                 flow, seconds_since_last_block_fn=seconds_since_last_block_fn
             )
@@ -7003,6 +7220,10 @@ def _make_self_transfer_handler(
         #     ask (choice + picked, both code-stamped by the deterministic
         #     intercept — the model can neither set nor read them) steers
         #     the inputs; a FRESH envelope supersedes an unanswered ask.
+        #     TCK-FEE-007: the consumed stamp also carries the rate-ask
+        #     answer (``cons_rate_c`` read at step 0.75) — the picked set
+        #     is THIS rebuild's input authority, revalidated below against
+        #     a fresh store read exactly like a first answered plan.
         cons_picked: tuple[dict[str, object], ...] | None = None
         if session is not None and session.cons_ask is not None:
             prior_cons = session.cons_ask
@@ -7023,16 +7244,35 @@ def _make_self_transfer_handler(
         #    slow default makes the elevated-fee warning informative). Splits
         #    keep their MEDIUM default; an EXPLICIT user rung/rate still
         #    wins unchanged.
-        default_target = FeeTarget.SLOW if params.mode != "split" else FeeTarget.MEDIUM
-        target = FeeTarget(params.fee_target) if params.fee_target else default_target
-        try:
-            estimate = fee_estimator.estimate(target)
-        except ChainError as exc:
-            return {"error": "chain_unavailable", "detail": str(exc)}
-        fee_rate = estimate.rate_centisat_vb
-        split_floor_source = (
-            _policy_floor_source(fee_estimator, fee_rate) if estimate.clamped else None
-        )
+        #    TCK-FEE-007: a rate-ask answer (cons_rate_c, dispatcher-stamped)
+        #    rides the SAME explicit-rate seam create_tx/bump_fee use —
+        #    ``clamp_to_min_relay_floor`` floors it at the node's RELAY rail
+        #    ONLY (never the congestion/next-block policy floor, never a
+        #    silent sub-rail bid: MAX, not MIN; a raise is narrated once), NO
+        #    rung recorded (target=None), and NO extra chain call (the seam
+        #    answers from its one TTL-cached floor). Any failure of the
+        #    clamp degrades to the assumed 0.1 sat/vB rail INSIDE the seam.
+        if cons_rate_c is not None:
+            fee_rate, floor_raised = fee_estimator.clamp_to_min_relay_floor(
+                cons_rate_c
+            )
+            target: FeeTarget | None = None
+            estimate = None
+            split_floor_source = "relay" if floor_raised else None
+        else:
+            default_target = (
+                FeeTarget.SLOW if params.mode != "split" else FeeTarget.MEDIUM
+            )
+            target = FeeTarget(params.fee_target) if params.fee_target else default_target
+            try:
+                estimate = fee_estimator.estimate(target)
+            except ChainError as exc:
+                return {"error": "chain_unavailable", "detail": str(exc)}
+            fee_rate = estimate.rate_centisat_vb
+            floor_raised = estimate.clamped
+            split_floor_source = (
+                _policy_floor_source(fee_estimator, fee_rate) if estimate.clamped else None
+            )
 
         # 3. UTXO snapshot with the lazy first scan (same path as
         #    create_tx step 4).
@@ -7208,6 +7448,20 @@ def _make_self_transfer_handler(
         # 8. Stage (flow owns tx_ref identity) — self_payment_indices marks
         #    the record; the sign-time intent builder re-derives every
         #    payment script from these indices (independent re-proof).
+        #    TCK-FEE-007: on a rate re-quote this is the SAME
+        #    dispatcher-owned CREATED→CREATED replace the create_tx
+        #    re-quote rides (flow.create's replace semantics: new tx_ref,
+        #    fresh TTL, old ref inert, still exactly one pending — and
+        #    commit-only-on-success: every refusal above returned BEFORE
+        #    any staging, so a failed rebuild leaves the ORIGINAL pending
+        #    untouched). The rate this plan bids is the sealed number
+        #    compared against the superseded record's own — display-only
+        #    direction, verbatim from the two records (never user text).
+        requote_from_c = (
+            flow.pending.fee_rate_centisat_vb
+            if cons_rate_c is not None and flow.pending is not None
+            else None
+        )
         amount_total = sum(payment_values)
         try:
             pending = flow.create(
@@ -7218,7 +7472,7 @@ def _make_self_transfer_handler(
                 psbt_base64=psbt_base64,
                 inputs_count=len(inputs),
                 vsize=meta.vsize,
-                fee_target=target.value,
+                fee_target=target.value if target is not None else None,
                 change_sats=None,
                 self_payment_indices=tuple(d.index for d in destinations),
             )
@@ -7238,8 +7492,9 @@ def _make_self_transfer_handler(
             "fee_rate_centisat_vb": pending.fee_rate_centisat_vb,
             "fee_rate_display": format_sat_vb(pending.fee_rate_centisat_vb),
             # TCK-FEE-004: display-only min-relay narration (see create_tx);
-            # only when the clamp actually raised a plan rung.
-            **_fee_floor_note_fields(estimate.clamped, split_floor_source),
+            # only when the clamp actually raised a plan rung (or an
+            # explicit rate — the seam's flag, either bid shape).
+            **_fee_floor_note_fields(floor_raised, split_floor_source),
             "vsize": pending.vsize,
             "change_sats": None,
             "inputs_count": pending.inputs_count,
@@ -7262,13 +7517,26 @@ def _make_self_transfer_handler(
                 for d, amt in zip(destinations, payment_values, strict=True)
             ],
             # fee_target_defaulted is DELIBERATELY absent: a self-transfer
-            # card never pitches the one-shot speed offer (no re-quote path
-            # exists for a plan; a speed preference must be stated up front
-            # or reached by cancel + re-ask).
+            # card never pitches the one-shot speed offer (a speed
+            # preference must be stated up front or reached by cancel +
+            # re-ask; the TCK-FEE-007 rate ask is opened by the user's own
+            # speed WORD on a pended consolidation, never pitched here).
             **({} if eta is None else eta),
         }
         if other_side_count:
             result["self_other_side_count"] = other_side_count
+        if cons_rate_c is not None:
+            # TCK-FEE-007: the rate re-quote leads with the SAME
+            # card.requote_lead line the create_tx re-quote uses
+            # (_CARD_REQUOTE_LEAD*, display-only direction sealed from the
+            # two records' own rates — never from user text); the fresh
+            # plan card below then quotes the new fee/rate verbatim.
+            result["fee_requote"] = True
+            if requote_from_c is not None:
+                if fee_rate > requote_from_c:
+                    result["requote_direction"] = "faster"
+                elif fee_rate < requote_from_c:
+                    result["requote_direction"] = "slower"
         cons_display: dict[str, object] = {}
         if not split:
             # TCK-CHAT-002 — consolidation plan-preview extras (designer §3).
@@ -7319,7 +7587,25 @@ def _make_self_transfer_handler(
             # annotation off this same record.
             result["cons_merge"] = True
             if session is not None:
-                session.cons_pending = _ConsPending(pending.tx_ref, cons_display)
+                # TCK-FEE-007: carry the staged plan's OWN input coins (the
+                # engine's selection, THIS handler's fresh-store read — never
+                # user/model text) so a later rate-ask answer re-quotes
+                # EXACTLY this set. Same shape the answered-ask path consumes
+                # (txid/vout/value_sats/address), revalidated against a fresh
+                # store read on the rebuild.
+                session.cons_pending = _ConsPending(
+                    pending.tx_ref,
+                    cons_display,
+                    inputs=tuple(
+                        {
+                            "txid": u.txid,
+                            "vout": u.vout,
+                            "value_sats": u.value_sats,
+                            "address": u.address,
+                        }
+                        for u in input_rows
+                    ),
+                )
         return result
 
     return handler
@@ -20620,6 +20906,17 @@ def _print_self_transfer(
             _print_cpfp_plan(result, output_fn, session=session)
         return
     if error is None:
+        if result.get("fee_requote") is True:
+            # TCK-FEE-007: a rate re-quote leads with the SAME
+            # card.requote_lead the create_tx re-quote prints (§2.3), then
+            # the fresh plan card quotes the new fee/rate verbatim.
+            direction = result.get("requote_direction")
+            lead = (
+                _CARD_REQUOTE_LEAD.replace("{direction}", str(direction))
+                if isinstance(direction, str) and direction
+                else _CARD_REQUOTE_LEAD_SAME_RUNG
+            )
+            output_fn(sanitize_tool_output(lead))
         _print_self_plan(result, output_fn, session)
         return
     if error == "insufficient_funds":
