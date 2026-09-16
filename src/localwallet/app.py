@@ -620,6 +620,12 @@ MODEL_WARMUP_MAX_TOKENS: Final[int] = 16
 _MODEL_WARMUP_LOG_OK: Final[str] = "model warmup completed in {}ms"
 _MODEL_WARMUP_LOG_FAIL: Final[str] = "model warmup failed (ignored) in {}ms"
 
+#: The production drain bound for the warm-up thread's bounded join at
+#: shutdown (TCK-CLEANUP-001) — the same value TCK-WEB-029 uses to join the
+#: engine thread (``server._STOP_DRAIN_S``). Exit never hangs on the warm-up:
+#: past this bound the daemon is abandoned with the process.
+_STOP_DRAIN_S: Final[float] = 5.0
+
 #: TCK-WEB-008 follow-up (a): the watch key surfaced in GET /settings — a
 #: display-TRUNCATED entry by default, the full value on an explicit
 #: single-key read (``GET /settings?key=watch_key``). It is a PUBLIC
@@ -9794,7 +9800,15 @@ class ScanFlow:
             WatchKeyError,
             StoreError,
             sqlite3.Error,
-        ):
+        ) as exc:
+            # TCK-CLEANUP-001 (WEB-020 subclass): a planning failure (e.g. a
+            # broken store) sets /state's scan_error like every other scan
+            # failure — previously the resync caller answered the honest
+            # "busy" while the field stayed clean, so the browser gave no
+            # signal. The WEB-020 clear-on-start/completion semantics still
+            # hold: the next begin() clears it. Value-free (these layers'
+            # error contracts guarantee it), same shape as :meth:`_warn`.
+            self._scan_error = f"{exc!s}{_scan_failure_suffix(exc)}"
             return False
         self.set_startup(plan, rescan=rebuild)
         self._started = False  # let begin() submit the fresh plan once
@@ -10432,6 +10446,7 @@ class ModelPreloadFlow:
         self._commands: queue.Queue[Any] | None = None
         self._started = False
         self._warmed_up = False
+        self._warmup_thread: threading.Thread | None = None
 
     def attach(self, commands: queue.Queue[Any]) -> None:
         """Bind the pump's command queue (the workers deliver onto it)."""
@@ -10523,12 +10538,24 @@ class ModelPreloadFlow:
             return
         if not callable(getattr(self._runtime, "generate", None)):
             return  # duck-typed fake runtime with no generate hook
-        threading.Thread(
+        t = threading.Thread(
             target=self._warm,
             args=(commands,),
             name="model-warmup",
             daemon=True,
-        ).start()
+        )
+        t.start()  # publish AFTER start: an unpublished thread is a safe
+        self._warmup_thread = t  # abandonment path per stop()'s contract
+
+    def stop(self, timeout: float = _STOP_DRAIN_S) -> None:
+        """Bounded join of the warm-up thread at shutdown (TCK-CLEANUP-001):
+        exit never hangs on the warm-up generation. VALUE-FREE (nothing is
+        emitted, logged or returned); a still-running warm-up past ``timeout``
+        is a daemon and dies with the process. Safe to call when no warm-up
+        ever started (``_warmup_thread`` is ``None``) or repeatedly."""
+        thread = self._warmup_thread
+        if thread is not None:
+            thread.join(timeout)
 
     def _warm(self, commands: queue.Queue[Any]) -> None:  # warm-up thread
         """ONE tiny REAL generation. Best-effort: any exception is swallowed
@@ -13819,6 +13846,8 @@ def run(
     except KeyboardInterrupt:
         pass  # clean exit on Ctrl-C
     finally:
+        if preload_flow is not None:
+            preload_flow.stop()  # TCK-CLEANUP-001: bounded join of the warm-up
         wiring.worker.stop()  # join the chain worker before closing its client
         if wiring.client is not None:
             wiring.client.close()
@@ -15362,6 +15391,8 @@ def _run_web(
         pass  # clean exit on Ctrl-C (mirrors the CLI)
     finally:
         server.stop()
+        if preload is not None:
+            preload.stop()  # TCK-CLEANUP-001: bounded join of the warm-up
         # The launch port and token are EPHEMERAL per launch (ADR-0024 §6):
         # this instance is dead, so any tab left over from a previous launch
         # can never reconnect. Say so (value-free) so the user knows to use

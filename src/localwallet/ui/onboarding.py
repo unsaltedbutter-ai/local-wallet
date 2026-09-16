@@ -108,7 +108,6 @@ __all__ = [
     "SETUP_OVERWRITE",
     "SETUP_REVERTED",
     "SWITCHING_NOW",
-    "SWITCH_AFTER_SCAN",
     "URL_CRED_ASK",
     "URL_CRED_REJECTED",
     "URL_PROMPT",
@@ -355,13 +354,6 @@ EFFECTS_NEXT_LAUNCH: Final[str] = (
 SWITCHING_NOW: Final[str] = (
     "Switched — the app asks your new server from here on, and I'm "
     "reloading your wallet from it now (your coin tags stay put)."
-)
-
-#: The swap validated and stored but deferred behind the scan already in
-#: flight (the one concurrency rule: a swap never crosses a running fetch).
-SWITCH_AFTER_SCAN: Final[str] = (
-    "Saved — the app switches to your new server and reloads your wallet "
-    "the moment the scan in progress finishes (your coin tags stay put)."
 )
 
 #: Implementation-time copy (flagged in ADR-0023 §9 as awaiting a draft):
@@ -705,8 +697,10 @@ class OnboardingFlow:
     ADR-0018 amendment) is the app's hot-swap hook, invoked AFTER a stored
     write: it swaps the live chain client onto the new URL and fires the
     full rebuild resync IN-SESSION, returning the closed outcome
-    (``swapped``/``deferred``/``skipped``) that picks the conversation's
-    honesty line. ``None`` (a flow built without engine wiring — tests)
+    (``swapped``/``skipped`` — since TCK-SWAP-001 the install is immediate
+    even across an in-flight scan, so ``deferred`` no longer exists) that
+    picks the conversation's honesty line. ``None`` (a flow built without
+    engine wiring — tests)
     keeps the pre-amendment next-launch copy verbatim.
     """
 
@@ -960,8 +954,6 @@ class OnboardingFlow:
         )
         if outcome == "skipped":
             output_fn(EFFECTS_NEXT_LAUNCH)
-        elif outcome == "deferred":
-            output_fn(SWITCH_AFTER_SCAN)
         # "swapped": SETUP_REVERTED already says the app uses the public
         # server again — true NOW; the resync narrates its own completion.
         self._deferred = False
@@ -1123,9 +1115,13 @@ class OnboardingFlow:
             if self._backend_saved is not None
             else "skipped"
         )
-        if outcome in ("swapped", "deferred"):
+        # Since TCK-SWAP-001 a save INSTALLS immediately even across an
+        # in-flight scan, so the outcome is ``swapped`` (install + resync
+        # started) or ``skipped`` (env/config-file rung shadows the stored
+        # value) — never ``deferred``.
+        if outcome == "swapped":
             self._deferred = False
-            output_fn(SWITCHING_NOW if outcome == "swapped" else SWITCH_AFTER_SCAN)
+            output_fn(SWITCHING_NOW)
         else:
             output_fn(EFFECTS_NEXT_LAUNCH)
             if self._deferred:

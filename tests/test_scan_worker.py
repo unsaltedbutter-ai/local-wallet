@@ -1202,6 +1202,52 @@ def test_scan_error_clears_on_the_next_start_and_completion(wallet_store) -> Non
     assert narrated.count(_SCAN_FAIL_LINE) == 2  # both failures narrated
 
 
+def test_plan_step_failure_sets_scan_error_and_next_start_clears_it(
+    wallet_store, monkeypatch
+) -> None:
+    """TCK-CLEANUP-001 (the WEB-020 subclass): a PLANNING failure — the
+    store-read phase of the kick/resync/release tail (:meth:`_plan_arm_begin`)
+    — now sets the value-free ``scan_error`` field, the browser's only honest
+    signal for the "busy" stand-down that was previously silent. Same DIAG-001
+    class line and absent-when-clean rule as the existing scan_error pins, and
+    the WEB-020 clear-on-start semantics still hold: the NEXT successful start
+    clears it via ``begin()``."""
+    store, wallet, _wd = wallet_store
+    worker = app.ChainWorker(None)
+    flow = app.ScanFlow(store, wallet, worker, gap_limit=None)
+    flow.attach(queue.Queue())
+
+    def snap() -> dict[str, object]:
+        return app.build_state_snapshot(app.TxFlow(), app.SendSession(), None, flow)
+
+    def boom(*_a: object, **_k: object) -> object:
+        raise _SCAN_FAIL_EXC
+
+    real_plan = wallet_scan.plan_scan
+    try:
+        monkeypatch.setattr(wallet_scan, "plan_scan", boom)
+        # Planning fails: the kick stands down (False) but the field is SET.
+        assert flow.kick_scan() is False
+        assert flow.scan_error == _SCAN_FAIL_FIELD
+        assert snap()["scan_error"] == _SCAN_FAIL_FIELD
+        assert "://" not in repr(snap())  # value-free by construction
+        # The NEXT start (planning now succeeds) clears it on begin().
+        monkeypatch.setattr(wallet_scan, "plan_scan", real_plan)
+        monkeypatch.setattr(wallet_scan, "fetch_scan", lambda *a, **k: object())
+        monkeypatch.setattr(
+            wallet_scan,
+            "persist_scan",
+            lambda s, r: wallet_scan.ScanSummary(
+                wallet_id=1, gap_limit=20, tip_height=0, scanned_at="x", utxo_count=0
+            ),
+        )
+        assert flow.kick_scan() is True
+        assert flow.scan_error is None  # clear-on-start
+        assert "scan_error" not in snap()
+    finally:
+        worker.stop()
+
+
 def test_cli_router_failure_stays_console_log_only_no_double_line(
     tmp_path,
 ) -> None:

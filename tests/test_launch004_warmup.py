@@ -250,6 +250,52 @@ def test_engine_readiness_is_not_delayed_and_pump_stays_live(
 # --------------------------------------------------- 2. web beat order (hold)
 
 
+def test_warmup_stop_bounded_idempotent_and_none_thread_safe(tmp_path: Path) -> None:
+    """TCK-CLEANUP-001: :meth:`ModelPreloadFlow.stop` is a BOUNDED join —
+    a warm-up generation held open in ``generate()`` never hangs shutdown
+    (``stop(0.2)`` returns promptly and the daemon thread is still alive),
+    a second ``stop`` is an idempotent no-op, and once the stub RELEASES the
+    thread a later ``stop`` joins it cleanly. A flow that never started a
+    warm-up (``_warmup_thread is None``) stops safely. Value-free: nothing
+    is logged or returned."""
+    commands: queue.Queue[Any] = queue.Queue()
+    runtime = _WarmRuntime()
+    runtime.gen_release.clear()  # hold the warm-up call open inside generate()
+    flow = app.ModelPreloadFlow(
+        runtime, model_path=str(tmp_path / "m.gguf"), log_fn=lambda _s: None
+    )
+    flow._commands = commands
+    flow._start_warmup()  # the production spawn path — sets _warmup_thread
+    thread = flow._warmup_thread
+    assert thread is not None
+    _wait_for(lambda: runtime.gen_entered.is_set())  # thread IN FLIGHT
+
+    # Bounded: the held-open warm-up does NOT hang the shutdown join.
+    t0 = time.monotonic()
+    flow.stop(0.2)
+    assert time.monotonic() - t0 < 5.0  # returned promptly, not blocked
+    assert thread.is_alive()  # still blocked inside generate()
+
+    # Idempotent: a second bounded stop is a no-op, still no hang.
+    flow.stop(0.2)
+    assert thread.is_alive()
+
+    # Once the stub releases, the thread completes and a stop joins cleanly.
+    runtime.gen_release.set()
+    _wait_for(lambda: not thread.is_alive())
+    flow.stop(2.0)  # joined cleanly, no error
+    assert not thread.is_alive()
+    assert commands.qsize() == 1  # the _WarmupDone marker was delivered
+
+    # None-thread safe: a flow that never warmed up stops with no error.
+    flow2 = app.ModelPreloadFlow(
+        _WarmRuntime(), model_path=str(tmp_path / "m2.gguf"), log_fn=lambda _s: None
+    )
+    assert flow2._warmup_thread is None
+    flow2.stop()  # must not raise
+    flow2.stop(0.2)
+
+
 def test_web_beat_order_loaded_first_privacy_then_checking(tmp_path: Path) -> None:
     """The full LAUNCH-004 web surface, driven through the REAL
     :func:`start_engine` (the hold decision, the bind, the pump and the

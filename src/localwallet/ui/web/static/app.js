@@ -348,7 +348,6 @@ const LABELS = {
   sessionStale:
     "This page\u2019s session no longer matches the wallet — reload this page.",
   resyncNoteBusy: "Saved — a scan is already running; it will use the new value.",
-  resyncNoteDeferred: "Saved — the re-scan is queued behind the current scan.",
   resyncNoteSkipped:
     "Saved — your environment configuration outranks this one; it applies at next restart.",
   resyncNoteUnchanged: "Already up to date — no re-scan needed.",
@@ -438,7 +437,6 @@ function settingLabel(key) {
 const RESYNC_NOTES = new Map([
   ["started", LABELS.resyncNoteStarted],
   ["busy", LABELS.resyncNoteBusy],
-  ["deferred", LABELS.resyncNoteDeferred],
   ["skipped", LABELS.resyncNoteSkipped],
   ["unchanged", LABELS.resyncNoteUnchanged],
   ["unavailable", LABELS.resyncNoteUnavailable],
@@ -2999,7 +2997,7 @@ settingsListEl.addEventListener("click", async (event) => {
       }
       // (a swap may have moved the backend_kind NAME — TCK-DESCOPE-M3B:
       // the client no longer reads it, the kind badges are gone).
-      if (data.resync === "started" || data.resync === "deferred") {
+      if (data.resync === "started") {
         refreshState(); // the scan chip follows, from engine truth
       }
     } else if (response.status === 400 && data && data.status === "rejected") {
