@@ -1237,18 +1237,43 @@ _FIAT_ASK_WORDS: Final[Mapping[str, str]] = {
 }
 
 
+#: Currency SYMBOLS folded into the same closed set (TCK-FIAT-004: the
+#: user's "$45" send must convert at the USD rate even when the display
+#: ladder answers another currency). Deterministic rule, pinned by tests:
+#: a symbol GLYPH names its currency when it either stands alone as one
+#: whitespace token ("500 ¥") or rides inside a token that carries a DIGIT
+#: ("$45", "45€"). Symbols never appear inside bech32 address tokens, so
+#: an address can never name a currency. CAD/CHF/AUD have no sigil: their
+#: codes/words ride the table above.
+_FIAT_ASK_SYMBOLS: Final[Mapping[str, str]] = {
+    "$": "usd",
+    "£": "gbp",
+    "€": "eur",
+    "¥": "jpy",
+}
+
+
 def _detect_fiat_ask_currency(line: str) -> str | None:
     """Deterministic per-ask currency intercept (TCK-FIAT-003, MW-17:
     "what is my balance in Euros?" must answer in EUR even with the display
-    setting unset). Returns the single currency the utterance's tokens name,
-    or ``None`` (nothing named / more than one named = ambiguity, ride the
-    display ladder). Same whole-token matching as the other deterministic
-    utterance intercepts (the consolidation/cpfp word tables)."""
-    found = {
-        _FIAT_ASK_WORDS[token]
-        for token in (t.strip(punctuation) for t in line.lower().split())
-        if token in _FIAT_ASK_WORDS
-    }
+    setting unset; TCK-FIAT-004 extends the same intercept to symbols so
+    "send $45 to bc1q..." converts at the USD rate). Returns the single
+    currency the utterance's tokens name, or ``None`` (nothing named / more
+    than one named = ambiguity, ride the display ladder). Same whole-token
+    matching as the other deterministic utterance intercepts (the
+    consolidation/cpfp word tables)."""
+    found: set[str] = set()
+    for token in line.lower().split():
+        word = token.strip(punctuation)
+        if word in _FIAT_ASK_WORDS:
+            found.add(_FIAT_ASK_WORDS[word])
+        elif token in _FIAT_ASK_SYMBOLS:
+            found.add(_FIAT_ASK_SYMBOLS[token])
+        elif any(c.isdigit() for c in token):
+            for glyph, code in _FIAT_ASK_SYMBOLS.items():
+                if glyph in token:
+                    found.add(code)
+                    break
     if len(found) != 1:
         return None
     return found.pop()
@@ -17857,8 +17882,9 @@ def _run_turn(
       confirm that already passed.
     - Per-ask currency one-shot (TCK-FIAT-003, MW-17): before the model
       runs, :func:`_detect_fiat_ask_currency` matches a closed currency
-      WORD table against the user's own utterance and stamps the one-shot
-      on ``session.fiat_ask_currency`` for exactly the turn's handlers
+      word/symbol table (TCK-FIAT-004) against the user's own utterance
+      and stamps the one-shot on ``session.fiat_ask_currency`` for exactly
+      the turn's handlers
       (the oracle's display-currency reader consults it); cleared when the
       turn's dispatch ends — the ``display_currency`` setting is never
       touched, and an ambiguous/absent ask rides the ladder as before.

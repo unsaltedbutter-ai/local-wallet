@@ -139,8 +139,11 @@ class TestSummarization:
         # filter mappings and five filter few-shots grew the fixed system
         # prompt ~1.8K chars (~16.6K assembled ≈ ~6.9K tokens — inside the
         # 8K budget; the bound is session-length-independent, the summary
-        # + recent window cap it).
-        assert len(prompt) < 17400
+        # + recent window cap it). 17400 → 18000 by TCK-FIAT-004: the
+        # FIAT-send routing clause + one few-shot grew the fixed system
+        # prompt ~575 chars (14,932 ≈ ~7.2K tokens by the measured 3.7
+        # chars/token ratio — inside the 8K budget, same bound class).
+        assert len(prompt) < 18000
         assert "SESSION SUMMARY" in prompt
         assert "CONVERSATION SO FAR" in prompt
         # The recent window holds the last 20 turns verbatim.

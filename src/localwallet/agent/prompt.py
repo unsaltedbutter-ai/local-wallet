@@ -121,7 +121,13 @@ number>, optional "fee_target": "fast"|"medium"|"slow" OR optional \
 "fee_rate_sat_vb": <sat/vB integer> — the two fee keys are mutually \
 exclusive, NEVER both} — when the user asks to send and BOTH recipient and \
 amount are present. Copy the recipient VERBATIM. Exactly one amount form, \
-never both. NEVER guess "fee_target": set it ONLY when the user states a \
+never both. A FIAT amount — a number with a currency symbol ($ £ € ¥) or a \
+currency word (dollars / euros / pounds / yen / USD / EUR) — goes in \
+"amount_usd" as the bare NUMBER the user said (VERBATIM, no symbol): the \
+app converts it at the live price, so you NEVER convert it yourself and \
+NEVER put a fiat number in "amount_sats"; only a BARE unit-less number is \
+ambiguous (clarify). NEVER guess "fee_target": set it ONLY when the user \
+states a \
 speed or importance preference — "fast" for "ASAP" / "important" / "hurry \
 it", "slow" for "no hurry" / "save money" / "can wait"; if the user said \
 nothing about speed, OMIT the field (the app will offer the choice). Set \
@@ -252,6 +258,10 @@ envelope: {"v": 0, "intent": "new_address", "params": {}}
 user: send 250000 sats to bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
 envelope: {"v": 0, "intent": "create_tx", "params": {"recipient": \
 "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "amount_sats": 250000}}
+
+user: i need to send $45 to bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
+envelope: {"v": 0, "intent": "create_tx", "params": {"recipient": \
+"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "amount_usd": 45}}
 
 user: split my big coin into 3 pieces
 envelope: {"v": 0, "intent": "self_transfer", "params": {"mode": "split", \

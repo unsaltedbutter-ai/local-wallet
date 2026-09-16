@@ -219,7 +219,12 @@ def test_ambiguous_currency_words_ride_the_ladder() -> None:
         ("how much bitcoin do I have", None),
         ("balance in eurozone terms", None),  # token equality, not substring
         ("convert my usdt", None),
-        ("€20", None),  # a symbol is not a word in the closed table
+        # TCK-FIAT-004 deliberately REVERSED this expectation: a symbol is
+        # now in the closed set (symbol + digits, or a lone symbol token).
+        ("€20", "eur"),
+        ("send $45 to bc1q9t3d", "usd"),
+        ("45¥ please", "jpy"),
+        ("$5 and £4", None),  # two symbols named = ambiguity, ride ladder
         # a currency word INSIDE an address-like token never matches
         ("send to bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", None),
         ("send to bc1qexusdqq5xw7kv8f3t4", None),

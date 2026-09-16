@@ -1,0 +1,11 @@
+{
+  "id": "golden-078",
+  "prompt": "i need to send $45 to bc1qy3dvdjcfsm5mfjs0y6c9pk9s6uqmr3g6r2209e",
+  "expectation": {
+    "intent": "create_tx",
+    "params": {
+      "recipient": "bc1qy3dvdjcfsm5mfjs0y6c9pk9s6uqmr3g6r2209e",
+      "amount_usd": 45
+    }
+  }
+}
