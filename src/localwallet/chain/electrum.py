@@ -19,9 +19,12 @@ Method mapping (plan §1 table):
 * handshake per connection: ``server.version`` (2 params; result accepted
   as a list or a bare string) + ``server.features``, whose ``genesis_hash``
   MUST equal :data:`~localwallet.chain.esplora.MAINNET_GENESIS_HASH` —
-  mainnet-only is enforced HERE because M1 exposes no setup-time probe
-  for ``ssl://`` (ADR-0021; a testnet server is refused value-free on
-  every connection).
+   mainnet-only is enforced HERE because M1 exposes no setup-time probe
+   for ``ssl://`` (ADR-0021; a testnet server is refused value-free on
+   every connection). The optional, deprecated ``relayfee`` field is
+   RETAINED (numeric-or-None, fail-closed) for the broadcast-gate
+   capability :meth:`ElectrumClient.broadcast_gate_relay_centisat_vb`
+   (TCK-PUBLICBCAST-001 rider).
 * ``blockchain.scripthash.get_history`` + one
   ``blockchain.transaction.get(tx, verbose)`` per tx → ``get_address_txs``
   (the N+1 cost is the plan's accepted OQ-3 default; the gap window bounds
@@ -76,6 +79,7 @@ import math
 import socket
 import ssl
 import threading
+from decimal import ROUND_CEILING, Decimal
 from types import TracebackType
 from typing import Any, Final, Self
 from urllib.parse import urlsplit
@@ -144,6 +148,12 @@ _SAT_VB_PER_BTC_KB: Final[float] = 100_000.0
 #: _MAX_USD_PER_BTC; anything above 0.1 BTC/kB (10 000 sat/vB) is nonsense.
 _MAX_FEE_BTC_KB: Final[float] = 0.1
 
+#: TCK-PUBLICBCAST-001 rider, PINNED conversion: centisat/vB per BTC/kvB
+#: (1e8 sats/BTC × 1e2 cents/sat ÷ 1e3 vB/kvB). Vector: a 0.00001 BTC/kvB
+#: announcement → 100 centisat/vB = 1 sat/vB (the Core default expressed
+#: in the unit of ``getmempoolinfo.minrelaytxfee``).
+_CENTISAT_VB_PER_BTC_KVB: Final[int] = 10_000_000
+
 #: Block header field: 4-byte little-endian Unix time at byte offset 68.
 _HEADER_TIME_OFFSET: Final[int] = 68
 _HEADER_BYTES: Final[int] = 80
@@ -181,6 +191,25 @@ def _require_plain_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _validated_relayfee(raw: Any) -> int | float | None:
+    """Handshake validation of ``server.features``' deprecated ``relayfee``.
+
+    TCK-PUBLICBCAST-001 rider. Numeric (non-bool, finite) or ``None`` —
+    fail-closed and NEVER raising: a broken announcement must not break
+    the connection or the mainnet gate, it just means "this server cannot
+    name its floor". A non-finite float and a huge int (whose ``float()``
+    overflows) are both malformed announcements here.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    try:
+        if not math.isfinite(float(raw)):
+            return None
+    except OverflowError:
+        return None
+    return raw
 
 
 def _address_from_script_pubkey(spk: Any) -> str | None:
@@ -277,6 +306,11 @@ class ElectrumClient:
         self._buf = b""
         self._next_id = 0
         self._answered = False  # greeting tolerance, per connection
+        # Raw (handshake-validated) server.features relayfee, retained per
+        # connection for broadcast_gate_relay_centisat_vb (TCK-PUBLICBCAST-
+        # 001 rider). None until a handshake sees an announcement; GIL-
+        # atomic attribute read, refreshed on every (re-)handshake.
+        self._relayfee_raw: int | float | None = None
 
     # ------------------------------------------------------------- lifecycle
 
@@ -522,15 +556,53 @@ class ElectrumClient:
             raise ChainError(f"{_KIND_FEE_ESTIMATE} response is below 1 sat/vB granularity")
         return sat_vb
 
-    # TCK-FEE-004 min-relay floor capability: DELIBERATELY ABSENT. Checked —
-    # the Electrum protocol exposes no clean min-relay figure: server.features
-    # carries only hosts/genesis_hash/hash_function/server_version/
-    # protocol bounds/pruning (no fee field), and the legacy
-    # ``blockchain.relayfee`` is deprecated since protocol 1.4.2 with
-    # unit-ambiguous answers that servers vary on. We invent no dialect: the
-    # absence IS the honest answer, so :class:`localwallet.chain.fees.
-    # FeeEstimator` fails this backend's floor clamp closed to its assumed
-    # 1 sat/vB (the tx engine's own build gate already refuses lower).
+    # TCK-FEE-004 min-relay floor capability: still DELIBERATELY ABSENT
+    # under ITS OWN NAME. The fee estimator duck-types exactly
+    # ``min_relay_centisat_vb`` and this adapter does not define it — the
+    # estimator's floor for an electrum backend stays the assumed rail and
+    # the ambiguous deprecated announcement can never move a bid
+    # (estimator semantics unchanged). What the TCK-PUBLICBCAST-001 rider
+    # below adds is a NARROWLY-NAMED broadcast-gate capability answering
+    # the one question the gate asks about a refusal of an ALREADY-SIGNED
+    # transaction — a wrong answer there only arms (or fails to arm) one
+    # consent-gated, harmless offer. Never a dialect is invented: the
+    # figure is only ever what the server itself announced.
+
+    def broadcast_gate_relay_centisat_vb(self) -> int | None:
+        """Broadcast-gate capability (TCK-PUBLICBCAST-001 rider): the
+        server's announced min-relay floor in integer centisat/vB, or
+        ``None`` when this server honestly cannot say.
+
+        Source: the ``relayfee`` field of the ``server.features``
+        handshake (raw value retained per connection; validated numeric-
+        or-None there, fail-closed). Conversion is PINNED Decimal-exact:
+        the announcement is read as BTC/kvB (the unit of Core's
+        ``minrelaytxfee``; 0.00001 → 100 centisat/vB = 1 sat/vB), via
+        ``Decimal(str(relayfee)) × 10 000 000`` rounded UP (ROUND_CEILING
+        — a floor must never sit under what the server claims).
+
+        AMBIGUITY CAVEAT (why the estimator must not consume this — the
+        deliberate seam-name split from ``min_relay_centisat_vb``): the
+        field has been DEPRECATED since Electrum protocol 1.4.2; servers
+        vary — some report 0, some omit it, some announce in other units
+        (ElectrumX-era docs said exoshi/kB), and there is no version
+        field here to disambiguate. Absent / 0 / negative / malformed /
+        non-finite / above the shared 0.1 BTC/kvB payload guard all
+        answer ``None`` ("what it enforces is unknowable" — the gate's
+        fail-closed unclear rung). Zero network I/O: reads the retained
+        handshake value (fresh from every reconnect's re-handshake);
+        before the first connection the answer is ``None``.
+        """
+        if self._relayfee_raw is None:
+            return None
+        btc_per_kvb = Decimal(str(self._relayfee_raw))
+        if btc_per_kvb <= 0 or btc_per_kvb > _MAX_FEE_BTC_KB:
+            return None
+        return int(
+            (btc_per_kvb * _CENTISAT_VB_PER_BTC_KVB).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
 
     # ------------------------------------------------------------- internals
 
@@ -716,6 +788,11 @@ class ElectrumClient:
                 f"{_KIND_FEATURES} backend does not serve mainnet",
                 failure_class=NOT_MAINNET,
             )
+        # The deprecated relayfee announcement (TCK-PUBLICBCAST-001 rider):
+        # numeric-or-None, fail-closed, never a handshake refusal — an
+        # absent/0/malformed value only means the broadcast gate stays
+        # unclear (see broadcast_gate_relay_centisat_vb).
+        self._relayfee_raw = _validated_relayfee(features.get("relayfee"))
 
     def _raw_request(self, method: str, params: list[Any], kind: str) -> Any:
         """Send one request line, read lines until the matching answer.

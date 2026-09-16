@@ -162,7 +162,7 @@ from localwallet.chain.config import (
     BITCOIND_TLS_SCHEME,
     ELECTRUM_SCHEME,
 )
-from localwallet.chain.esplora import NETWORK_ERROR, RPC_ERROR
+from localwallet.chain.esplora import NETWORK_ERROR, RPC_ERROR, SERVER_REJECTED
 from localwallet.config import (
     COIN_SETTING_BOUNDS,
     COIN_SETTING_DEFAULTS,
@@ -1836,6 +1836,61 @@ _CPFP_PARENT_GONE: Final[str] = (
     "or replaced), so this child can never send; nothing to hurry anymore."
 )
 
+# --- public-broadcast fallback copy (TCK-PUBLICBCAST-001) --------------------
+#
+# A public broadcast hands the FULL signed transaction (its input
+# clustering — every address involved) to the public mempool.space
+# operator. Binding conditions, all four encoded below: the OFFER is ONE
+# deterministic line, emitted only after a rejection the engine can
+# positively classify as fee-floor-shaped (:func:`_fee_floor_shaped`);
+# nothing is ever POSTed without the user's own whitelisted affirmative
+# read from their RAW utterance before the model runs — the model can
+# neither trigger nor authorize this path (the same ConfirmGate
+# utterance-shape discipline as ADR-0013's confirm: an LLM "yes" is
+# structurally inert, there is no intent, no envelope, and no
+# model-reachable seam for it). The rejection reason is parsed
+# INTERNALLY from structured chain-layer fields; no reason text, address,
+# amount or txid ever enters any of these sentences.
+
+#: The offer — the ticket's sentence, one line, never automatic.
+_PUBLIC_BCAST_OFFER: Final[str] = (
+    "Your node refused it — broadcast via mempool.space instead? "
+    "Its operator will see this transaction."
+)
+#: Consent refused (nothing was sent; the signed record stays kept).
+_PUBLIC_BCAST_DENIED: Final[str] = (
+    "Not broadcast via mempool.space — nothing was sent; the signed "
+    "transaction is kept."
+)
+#: A mixed answer closes the offer (fail-closed; it is never re-served).
+_PUBLIC_BCAST_AMBIGUOUS: Final[str] = (
+    "That answer was mixed — the mempool.space offer is closed; the "
+    "signed transaction is kept."
+)
+#: Success companion line, printed ONLY on a broadcast that went out via
+#: the public path (binding condition 4 — the status-lag honesty starts
+#: at the moment of the broadcast itself).
+_PUBLIC_BCAST_SENT: Final[str] = (
+    "Broadcast via mempool.space — your own node may not see this "
+    "transaction until it gossips back; status answers can lag."
+)
+#: The unknown_tx answer for a publicly-broadcast txid the user's node
+#: has not yet re-acquired: honest lag naming the mechanism (gossip +
+#: watch poll), NOT the "may not be indexed" hedge, never a retry pitch.
+_PUBLIC_BCAST_STATUS_LAG: Final[str] = (
+    "Your node has not seen it yet — you broadcast via a public server, "
+    "so it may stay invisible there until it gossips back; the next "
+    "watch poll will pick it up."
+)
+#: Bitcoin Core's ``RPC_VERIFY_REJECTED`` — a PROTOCOL CONSTANT (the
+#: TCK-DIAG-002 rule: codes are constants, not server data, and may ride
+#: value-free surfaces). Core's ``sendrawtransaction`` answers EVERY
+#: policy-level rejection (fee under the node's floor, mempool conflict,
+#: bad inputs) with this ONE code — which is exactly why
+#: :func:`_fee_floor_shaped` must still prove the reason FAMILY from
+#: engine-retained facts and may never infer it from the code alone.
+_CORE_RPC_VERIFY_REJECTED: Final[int] = -25
+
 # --- consolidation conversation copy (TCK-CONS-001) -------------------------
 #
 # The roll-up and the asks are CODE-RENDERED, deterministic views of the
@@ -3349,6 +3404,26 @@ class SendSession:
     cons_ask: _ConsAsk | None = None
     cons_pending: _ConsPending | None = None
     fiat_ask_currency: str | None = None
+    #: TCK-PUBLICBCAST-001 binding condition 1 — the dispatcher-owned
+    #: public-broadcast state. ``public_offer_txref`` is the SIGNED
+    #: record's ``tx_ref`` an offer is currently ARMED for (set only by
+    #: the broadcast handler on a fee-floor-shaped refusal, cleared by
+    #: the deterministic consent intercept on ANY answer — a live offer
+    #: can never outlive one turn); ``public_offer_shown`` permanently
+    #: retires the offer for that record (ONE offer line, ever, per
+    #: signed tx — a failed retry does not re-ask). The model can
+    #: neither set, read, nor clear any of these (no envelope carries
+    #: them). ``public_bcast_once`` is the same-turn one-shot that tells
+    #: the broadcast handler to send via the public client (the
+    #: file_sign_export_once precedent — only the consent intercept
+    #: sets it, and it dispatches in the same ``finally`` that clears
+    #: it). ``public_bcast_txid`` names a broadcast that went out
+    #: publicly, so the tx_status answer can be honest about the gossip
+    #: lag (binding condition 4).
+    public_offer_txref: str | None = None
+    public_offer_shown: str | None = None
+    public_bcast_once: bool = False
+    public_bcast_txid: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3527,6 +3602,7 @@ def build_dispatch_table(
     kick_scan_fn: Callable[[], bool] | None = None,
     defer_scans: bool = False,
     output: _Output | None = None,
+    public_info: PublicInfoClient | None = None,
 ) -> DispatchTable:
     """Build the allowlist dispatch table for the running app.
 
@@ -3605,6 +3681,13 @@ def build_dispatch_table(
             ``broadcast_tx`` handler emits its value-free send-failure debug
             line through ``output.warning`` (console + launch log, NEVER the
             transcript/SSE narration). ``None`` (test seam) emits nothing.
+        public_info: The standalone PUBLIC-INFO client (TCK-PUBLICBCAST-001)
+            — the mempool.space transport the CONSENTED public-broadcast
+            fallback POSTs through. ``None`` (test tables and any wiring
+            that never grew the client) makes the offer itself unavailable:
+            the handler never arms it and a (impossible-by-construction)
+            one-shot dispatch refuses value-free — no public send can
+            happen silently anywhere else.
 
     Returns:
         A :class:`~localwallet.protocol.DispatchTable` covering the whole
@@ -3661,10 +3744,11 @@ def build_dispatch_table(
         ),
         IntentName.BROADCAST_TX: _make_broadcast_tx_handler(
             tx_flow, client, store, wallet_id, parsed,
-            session=send_session, output=output,
+            session=send_session, output=output, public_info=public_info,
         ),
         IntentName.TX_STATUS: _make_tx_status_handler(
-            client, tx_flow, scan_gate, store=store, wallet_id=wallet_id
+            client, tx_flow, scan_gate, store=store, wallet_id=wallet_id,
+            session=send_session,
         ),
         IntentName.NODE_STATUS: _make_node_status_handler(
             app_settings,
@@ -7668,6 +7752,70 @@ def _cpfp_parent_gone(
     return False
 
 
+def _fee_floor_shaped(
+    exc: BaseException, client: ChainClient, fee_rate_centisat_vb: int
+) -> bool:
+    """Can the engine POSITIVELY classify a broadcast refusal as fee-floor-
+    shaped? (TCK-PUBLICBCAST-001 binding condition 2 — the gate in front of
+    the mempool.space offer.) Conservative by construction: every rung that
+    cannot be proven returns ``False`` (fail-closed to NO offer). Only
+    structured chain-layer fields are read — the server's reason TEXT is
+    scrubbed inside ``chain/`` and is never (and cannot be) parsed here;
+    the "reason family" is proven from the transaction's OWN engine-retained
+    fee facts against the refusing backend's live advertised floor.
+
+    1. CLASS gate (the TCK-DIAG-005 taxonomy): a policy refusal — the
+       ``rpc-error`` envelope carrying Core's :data:`_CORE_RPC_VERIFY_REJECTED`
+       protocol constant, or the ``server-rejected`` rejection-as-answer
+       dialect. Everything else (transport classes, shape refusals, the
+       ``txid-bind-mismatch`` integrity event, an rpc-error with any other
+       or no code) is not a provable refusal.
+    2. CAPABILITY gate: the refusing backend must answer its OWN min-relay
+       floor today — the optional ``min_relay_centisat_vb`` seam
+       (TCK-FEE-004: present on bitcoind) or, for the electrum backend
+       (TCK-PUBLICBCAST-001 rider), the gate-only
+       ``broadcast_gate_relay_centisat_vb`` seam: the handshake-retained
+       ``server.features`` relayfee converted to a centisat/vB floor,
+       ``None`` when the deprecated/ambiguous field is absent, 0 or
+       malformed. That seam is DELIBERATELY not named like the estimator
+       capability (the estimator duck-types ``min_relay_centisat_vb``):
+       an ambiguous announcement may inform this consent-gated, harmless
+       offer decision, never a bid. A backend that cannot say what it
+       enforces — or answers ``None`` — is UNCLEAR → no offer. The
+       bitcoind read is ONE guarded call on an already-failed broadcast
+       (the documented single-recovery-GET pattern); the electrum read is
+       a zero-call handshake read. Any failure → unclear.
+    3. FAMILY gate: the signed transaction's own fee rate — the flow's
+       retained approved record, never a chain re-derivation — sits BELOW
+       that live floor. At/above the node's advertised floor, the floor
+       cannot explain the refusal: mempool-conflict (the ticket's named
+       example — likely already propagating) or any other reason stays
+       UNCLEAR → no offer.
+
+    Documented residual (harmless): a rejection can be MULTI-CAUSED — a
+    provably-low-fee tx that ALSO conflicts still arms the offer. The
+    public operator rejects the conflict too: the POST is single-attempt,
+    the flow stays SIGNED, nothing ever lands twice because of the offer.
+    """
+    fc = getattr(exc, "failure_class", None) or classify_failure(exc)
+    if fc != SERVER_REJECTED and not (
+        fc == RPC_ERROR and getattr(exc, "rpc_code", None) == _CORE_RPC_VERIFY_REJECTED
+    ):
+        return False
+    getter = getattr(client, "min_relay_centisat_vb", None) or getattr(
+        client, "broadcast_gate_relay_centisat_vb", None
+    )
+    if getter is None:
+        return False  # honest capability absence: what it enforces is unknowable
+    try:
+        floor_c = getter()
+    except Exception:  # noqa: BLE001 — containment: ANY failed floor answer is "unclear"
+        return False
+    if isinstance(floor_c, bool) or not isinstance(floor_c, int):
+        return False  # electrum's None (absent/0/malformed relayfee) lands here
+    return fee_rate_centisat_vb < floor_c
+
+
 def _make_broadcast_tx_handler(
     flow: TxFlow,
     client: ChainClient,
@@ -7677,6 +7825,7 @@ def _make_broadcast_tx_handler(
     *,
     session: SendSession | None = None,
     output: _Output | None = None,
+    public_info: PublicInfoClient | None = None,
 ) -> Handler:
     """Create the ``broadcast_tx`` handler: SIGNED record → chain backend → BROADCAST.
 
@@ -7732,6 +7881,25 @@ def _make_broadcast_tx_handler(
 
     Success result: ``{"status": "broadcast", "txid", "message":
     "tracking confirmations — ask 'status'"}``.
+
+    TCK-PUBLICBCAST-001 (public-broadcast fallback, dispatcher-owned):
+    when the send to the user's OWN node fails AND
+    :func:`_fee_floor_shaped` can positively prove the refusal is fee-
+    floor-shaped, the ``broadcast_failed`` result gains the value-free
+    ``public_bcast_offer`` marker (set AT MOST ONCE per signed record —
+    ``session.public_offer_shown``) and the renderer emits the single
+    deterministic offer line. A later SAME-turn consent (the ConfirmGate
+    utterance :func:`_run_turn` intercept reads from the user's raw
+    words — never the model) re-dispatches THIS handler with
+    ``session.public_bcast_once`` set: the SAME flow gate, the SAME
+    retained signed record and the SAME extraction run again, and ONLY
+    the send target swaps to ``public_info`` (the consented mempool.space
+    POST — single-attempt, SEC-004 txid bind, the chain layer's whole
+    money-path discipline inherited). A public send never re-arms the
+    offer; the SIGNED state and every dual-key gate are untouched (the
+    tx is already signed — the flow's state semantics, history row,
+    lineage and label inheritance are byte-identical to a node
+    broadcast, plus the honest status-lag narration).
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -7758,9 +7926,28 @@ def _make_broadcast_tx_handler(
                 "detail": "signed transaction could not be extracted for broadcast",
             }
 
-        # 3. Single-attempt POST (chain layer owns the no-retry policy).
+        # 3. Send: ONE attempt (the chain layer owns the no-retry policy).
+        #    TCK-PUBLICBCAST-001: the consented same-turn public one-shot
+        #    swaps only the SEND TARGET (mempool.space instead of the own
+        #    node) — the SAME retained signed record, the SAME extraction,
+        #    the SAME single-attempt + SEC-004 txid-bind discipline. The
+        #    one-shot is consumed at send time and can never arm a later
+        #    turn (a stale "yes" would just be a plain node broadcast,
+        #    which is what an ordinary model broadcast_tx envelope is).
+        via_public = session is not None and session.public_bcast_once
+        if session is not None:
+            session.public_bcast_once = False
+        if via_public and public_info is None:
+            # Fail-closed: the user consented to a PUBLIC send — with no
+            # public client wired we never silently broadcast via the node
+            # instead (the flow stays SIGNED; the value-free refusal).
+            return {
+                "error": "broadcast_refused",
+                "detail": "no public broadcast endpoint is configured",
+            }
+        sender: ChainClient | PublicInfoClient = public_info if via_public else client
         try:
-            txid = client.broadcast_tx(tx_hex)
+            txid = sender.broadcast_tx(tx_hex)
         except ChainError as exc:
             # TCK-DIAG-003: the console/log debug companion for the friendly
             # line below — value-free by construction (the DIAG-001 failure
@@ -7800,7 +7987,30 @@ def _make_broadcast_tx_handler(
                 and _cpfp_parent_gone(store, wallet_id, client, session.cpfp_pending)
             ):
                 return {"error": "cpfp_parent_gone", "detail": _CPFP_PARENT_GONE}
-            return {"error": "broadcast_failed", "detail": detail}
+            failed: dict[str, object] = {"error": "broadcast_failed", "detail": detail}
+            # TCK-PUBLICBCAST-001 condition 2: the deterministic offer arms
+            # ONLY on an own-node send that the engine can POSITIVELY
+            # classify fee-floor-shaped (fail-closed to no-offer otherwise),
+            # ONLY once per signed record (``public_offer_shown`` — a
+            # retried broadcast that fails again does not re-ask), and
+            # NEVER on a failed public send (the offer was already spent).
+            # The renderer turns the marker into the single offer line;
+            # the value-free bool carries nothing else.
+            if (
+                not via_public
+                and session is not None
+                and public_info is not None
+                and session.public_offer_shown != params.tx_ref
+            ):
+                approved = flow.confirmed
+                if (
+                    approved is not None
+                    and _fee_floor_shaped(exc, client, approved.fee_rate_centisat_vb)
+                ):
+                    session.public_offer_txref = params.tx_ref
+                    session.public_offer_shown = params.tx_ref
+                    failed["public_bcast_offer"] = True
+            return failed
 
         # 4. Record the transition, then the history row.
         try:
@@ -7813,6 +8023,18 @@ def _make_broadcast_tx_handler(
             "txid": txid,
             "message": "tracking confirmations — ask 'status'",
         }
+        if via_public:
+            # TCK-PUBLICBCAST-001 conditions 3+4: the state semantics are
+            # the unchanged SIGNED→BROADCAST transition above; the marker
+            # adds only HONEST NARRATION — the success line grows the
+            # status-lag companion, and the txid is remembered so later
+            # tx_status answers can say plainly that the user's own node
+            # may not have seen the transaction yet.
+            result["via_public"] = True
+            if session is not None:
+                session.public_bcast_txid = txid
+        if session is not None:
+            session.public_offer_txref = None  # the failure is spent — offer retired
         confirmed = flow.confirmed
         try:
             store.upsert_txs(
@@ -8077,6 +8299,7 @@ def _make_tx_status_handler(
     *,
     store: Store | None = None,
     wallet_id: int | None = None,
+    session: SendSession | None = None,
 ) -> Handler:
     """Create the ``tx_status`` handler: quoted txid → chain backend status.
 
@@ -8187,6 +8410,22 @@ def _make_tx_status_handler(
                 and params.txid == flow.txid
                 and "status 404" in detail
             ):
+                if (
+                    session is not None
+                    and session.public_bcast_txid == params.txid
+                ):
+                    # TCK-PUBLICBCAST-001 condition 4 (honest status): this
+                    # tx went out via the public fallback — the user's own
+                    # node genuinely has not seen it yet (it arrives only
+                    # when the transaction gossips back). Name the
+                    # mechanism and its bound (the watch poll picks it up);
+                    # never the "not indexed yet — try again" hedge for a
+                    # lag that is structural, and never "try again forever".
+                    return {
+                        "error": "unknown_tx",
+                        "detail": _PUBLIC_BCAST_STATUS_LAG,
+                        "public_lag": True,
+                    }
                 return {
                     "error": "unknown_tx",
                     "detail": (
@@ -14195,6 +14434,10 @@ class ChainBackendFlow:
         w.table[IntentName.BROADCAST_TX] = _make_broadcast_tx_handler(
             w.flow, client, w.store, w.wallet.id, w.parsed,
             session=w.session, output=w.output,
+            # TCK-PUBLICBCAST-001: the PUBLIC-INFO client is backend-
+            # independent by construction (never rebuilt on a swap) — the
+            # consented fallback keeps riding the ONE instance.
+            public_info=w.public_info,
         )
         w.table[IntentName.TX_STATUS] = _make_tx_status_handler(
             client,
@@ -14202,6 +14445,9 @@ class ChainBackendFlow:
             scan.gate if scan is not None else None,
             store=w.store,
             wallet_id=w.wallet.id,
+            # TCK-PUBLICBCAST-001 condition 4: the lag honesty reads the
+            # SAME session object across the swap.
+            session=w.session,
         )
         # TCK-TX-SELF-001: self_transfer rides the fee estimator (now the ONE
         # backend-independent shared instance); same scan_fn/gate threading
@@ -14657,6 +14903,7 @@ def _wire(
         kick_scan_fn=scan.kick_scan,
         defer_scans=web_mode,
         output=output,
+        public_info=public_info,
     )
     loop = AgentLoop(generate, table)
     wiring = _Wiring(
@@ -15971,6 +16218,42 @@ def _dispatch_code_bump_turn(
     never through history."""
     envelope = Envelope(v=0, intent=IntentName.BUMP_FEE, params=params)
     result = table[IntentName.BUMP_FEE](envelope)
+    _print_turn(
+        AgentTurnResult(
+            status=AgentTurnStatus.OK,
+            envelope=envelope,
+            result=result,
+            user_message=None,
+            turns_used=0,
+        ),
+        output_fn,
+        session=session,
+    )
+    return result
+
+
+def _dispatch_code_broadcast_turn(
+    session: SendSession,
+    line: str,
+    params: BroadcastTxParams,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+) -> dict[str, object]:
+    """Shared body of the TCK-PUBLICBCAST-001 consent intercept (the
+    :func:`_dispatch_code_bump_turn` transcript-free pattern): CODE builds
+    the ``broadcast_tx`` envelope from the dispatcher-owned signed
+    ``tx_ref`` — never a model- or user-supplied reference — and dispatches
+    straight to the SAME broadcast handler, whose flow gate (SIGNED +
+    exact ``tx_ref`` match) and single-send discipline remain the
+    authority. The caller has already set the one-shot that selects the
+    consented public target for exactly this dispatch. Transcript-free:
+    the consent word is not needed by (and must never animate) the model —
+    the flow's BROADCAST state reaches later turns through the dispatcher-
+    owned FACTS like any broadcast."""
+    del line  # recorded nowhere the model sees (see docstring)
+    envelope = Envelope(v=0, intent=IntentName.BROADCAST_TX, params=params)
+    result = table[IntentName.BROADCAST_TX](envelope)
     _print_turn(
         AgentTurnResult(
             status=AgentTurnStatus.OK,
@@ -17305,6 +17588,13 @@ def _run_turn(
       (the oracle's display-currency reader consults it); cleared when the
       turn's dispatch ends — the ``display_currency`` setting is never
       touched, and an ambiguous/absent ask rides the ladder as before.
+    - Public-broadcast consent (TCK-PUBLICBCAST-001): while the dispatcher
+      holds an ARMED mempool.space offer for the flow's exact signed
+      record, the user's raw utterance is classified by the SAME
+      ConfirmGate before the hardware/model intercepts — only a gate
+      CONFIRM dispatches the one-shot public send; an LLM envelope can
+      never reach this path (no intent exists for it). See the block in
+      the body.
     - FACTS (TCK-P2-004 SR fix, extended to the full lifecycle in
       TCK-P3-005): the flow's current state is injected as the turn's
       FACTS block (:func:`_flow_facts`) — the pending card while
@@ -17362,6 +17652,60 @@ def _run_turn(
         ):
             session.hw_sign_wanted = False
         return
+    # TCK-PUBLICBCAST-001 (binding condition 1): a LIVE mempool.space
+    # offer is answered ONLY here — BEFORE the gate and the model, by the
+    # SAME deterministic utterance classifier the confirm gate uses
+    # (ConfirmGate: exact whitelist phrases, filler-tolerant, any unknown
+    # word fails closed to no-decision). The model can neither trigger the
+    # offer (no intent exists), authorize it (its "yes" never reaches this
+    # matcher — only the user's raw utterance does), nor see it (the
+    # consumed turn never enters the transcript; tool results are not
+    # re-injected). CONFIRM → the one-shot consent dispatch to the SAME
+    # broadcast handler (its flow gate stays the authority, the retained
+    # signed record is the ONLY tx material, the dual-key gates are
+    # untouched). DENY/AMBIGUOUS → the offer is retired with one honest
+    # line. ANY other utterance closes the offer (never-trap) and falls
+    # through to the ordinary pipeline — a stale offer can never be
+    # collected by a later stray "yes". It outranks the hardware-word
+    # intercept for a decision word on purpose (SIGNED-scoped: the
+    # hardware SIGN route is CREATED/CONFIRMED-scoped; a bare "sign"
+    # answering a live offer is consent, not a device handoff for a
+    # tx that is already signed).
+    # Documented double-open corner (the CPFP-002 precedent): an armed
+    # offer outranks an open bump/cpfp/cons ask for a CONFIRM-whitelist
+    # word on this turn; a decision word is never an ask-shaped answer
+    # (numbers/label words), so the overlap is a deliberate-word choice.
+    if (
+        session.public_offer_txref is not None
+        and flow.state is TxFlowStatus.SIGNED
+        and flow.signed is not None
+        and flow.signed.tx_ref == session.public_offer_txref
+        and IntentName.BROADCAST_TX in table
+    ):
+        public_decision = ConfirmGate.classify(line)
+        offer_ref = session.public_offer_txref
+        session.public_offer_txref = None  # one offer, one answer — always spent
+        if public_decision is GateDecision.CONFIRM:
+            session.public_bcast_once = True
+            try:
+                _dispatch_code_broadcast_turn(
+                    session, line, BroadcastTxParams(tx_ref=offer_ref),
+                    output_fn, table=table,
+                )
+            finally:
+                # The one-shot rides ONLY this dispatch (the
+                # file_sign_export_once discipline): a refusal path that
+                # returned before consuming it must not arm a later turn.
+                session.public_bcast_once = False
+            return
+        if public_decision is GateDecision.DENY:
+            output_fn(sanitize_tool_output(_PUBLIC_BCAST_DENIED))
+            return
+        if public_decision is GateDecision.AMBIGUOUS:
+            output_fn(sanitize_tool_output(_PUBLIC_BCAST_AMBIGUOUS))
+            return
+        # NOT_A_DECISION: the offer simply closed; the utterance proceeds
+        # through the ordinary (model) pipeline unchanged.
     # TCK-HW-005 slices A + C: deterministic hardware utterance intercept —
     # BEFORE the gate and the model. The envelope-free narration comes
     # straight from the signer's value-free report or the EXISTING guidance
@@ -19225,6 +19569,14 @@ def _print_broadcast_tx(
             message += f" ({detail})"
         message += " — the signed transaction is kept; say 'broadcast' to retry."
         output_fn(sanitize_tool_output(message))
+        if result.get("public_bcast_offer") is True:
+            # TCK-PUBLICBCAST-001: the ONE deterministic offer line, printed
+            # by code after a fee-floor-shaped refusal the engine could
+            # positively classify (never automatic — the affirmative is the
+            # ConfirmGate word this turn's intercept reads from the user's
+            # raw utterance, never the model). Static sentence, value-free:
+            # no reason text, no txid, no amount.
+            output_fn(sanitize_tool_output(_PUBLIC_BCAST_OFFER))
         return
     if error is not None:
         output_fn(
@@ -19236,6 +19588,13 @@ def _print_broadcast_tx(
     if result.get("status") == "broadcast":
         txid = str(result.get("txid", ""))
         output_fn(sanitize_tool_output(f"Sent! txid {txid} — tracking…"))
+        if result.get("via_public") is True:
+            # TCK-PUBLICBCAST-001 (condition 4, honesty at the moment of
+            # the broadcast): a public send is real, but the user's OWN
+            # node has not seen it yet — the tracking that follows rides
+            # gossip back to that node, so status answers can lag. Said
+            # once, here, by code — never left for the model to imply.
+            output_fn(sanitize_tool_output(_PUBLIC_BCAST_SENT))
         # TCK-RBF-004 supersede narration (ONLY on a broadcast that linked
         # the lineage — commit-only-on-success): the same BIP-125 hedge
         # wording the plan card and the status answer carry.
@@ -19273,6 +19632,14 @@ def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], No
     """
     error = result.get("error")
     if error == "unknown_tx":
+        if result.get("public_lag") is True:
+            # TCK-PUBLICBCAST-001 condition 4: the dispatcher-owned lag
+            # sentence prints verbatim (the backend_unchosen pattern) —
+            # the eventual-consistency hedge would promise an index that
+            # is not what's happening: the tx rides toward this node via
+            # gossip, and the answer says so.
+            output_fn(sanitize_tool_output(_PUBLIC_BCAST_STATUS_LAG))
+            return
         output_fn(
             sanitize_tool_output(
                 "Transaction not found on the chain yet — it may not be indexed; "

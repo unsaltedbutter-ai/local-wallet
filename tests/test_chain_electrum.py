@@ -113,6 +113,10 @@ class _Close:
 
 CLOSE = _Close()
 
+#: Sentinel: the fixture's features answer carries NO relayfee member
+#: (the common real-world case for the TCK-PUBLICBCAST-001 rider tests).
+_NO_RELAYFEE = object()
+
 
 class ElectrumFixture:
     """Threaded TLS JSON-lines Electrum stub serving scripted answers.
@@ -123,7 +127,9 @@ class ElectrumFixture:
     a result value, ``("error", message)``, ``("raw", line)`` (send that
     raw line instead of the answer), or :data:`CLOSE`. ``server.version``
     and ``server.features`` default to a compliant mainnet handshake
-    (``features_error=True`` makes features answer with an error).
+    (``features_error=True`` makes features answer with an error;
+    ``relayfee=…`` attaches that deprecated field to the features answer —
+    TCK-PUBLICBCAST-001 rider).
     """
 
     def __init__(
@@ -134,6 +140,7 @@ class ElectrumFixture:
         genesis: str = MAINNET_GENESIS_HASH,
         version_result: Any = ("fixture-electrum", "1.4"),
         features_error: bool = False,
+        relayfee: Any = _NO_RELAYFEE,
         greeting: bytes | None = None,
         hang: tuple[str, ...] = (),
         notify: bool = False,
@@ -142,6 +149,7 @@ class ElectrumFixture:
         self.genesis = genesis
         self.version_result = version_result
         self.features_error = features_error
+        self.relayfee = relayfee
         self.greeting = greeting
         self.hang = hang
         self.notify = notify
@@ -232,7 +240,13 @@ class ElectrumFixture:
         if method == "server.features":
             if self.features_error:
                 return None, {"code": 1, "message": "no features here"}
-            return {"genesis_hash": self.genesis, "server_version": "fixture"}, None
+            features: dict[str, Any] = {
+                "genesis_hash": self.genesis,
+                "server_version": "fixture",
+            }
+            if self.relayfee is not _NO_RELAYFEE:
+                features["relayfee"] = self.relayfee
+            return features, None
         scripted = self.script.get(method)
         if scripted is None:
             self.unexpected.append(method)
@@ -361,6 +375,115 @@ class TestHandshake:
         server = electrum(features_error=True)
         with _client(server) as client, pytest.raises(ChainError, match="handshake-features"):
             client.get_tip_height()
+
+
+# ------------------------------------ broadcast-gate relayfee (PUBLICBCAST-001)
+
+
+class TestRelayfeeGateCapability:
+    """TCK-PUBLICBCAST-001 rider: the deprecated ``server.features``
+    ``relayfee`` is retained at the handshake and exposed ONLY as the
+    narrow ``broadcast_gate_relay_centisat_vb`` capability (the estimator's
+    duck-typed ``min_relay_centisat_vb`` name stays ABSENT — the ambiguous
+    field must never move a bid; estimator semantics unchanged)."""
+
+    def _handshaken(self, electrum: Any, **kwargs: Any) -> Any:
+        """A server + client that have actually run the handshake (the
+        feature read happens there), tip call as the trigger."""
+        server = electrum(
+            script={"blockchain.headers.subscribe": [{"height": TIP, "hex": _tip_header()}]},
+            **kwargs,
+        )
+        client = _client(server)
+        assert client.get_tip_height() == TIP  # forces connect + handshake
+        return client
+
+    def test_conversion_vector_pinned(self, electrum: Any) -> None:
+        """0.00001 BTC/kvB → 100 centisat/vB = 1 sat/vB (the PIN)."""
+        client = self._handshaken(electrum, relayfee=0.00001)
+        assert client.broadcast_gate_relay_centisat_vb() == 100
+
+    def test_floor_never_rounds_down(self, electrum: Any) -> None:
+        """0.00000001 BTC/kvB → 0.1 centisat/vB → CEILS to 1 (a floor must
+        never sit under what the server says it enforces)."""
+        client = self._handshaken(electrum, relayfee=0.00000001)
+        assert client.broadcast_gate_relay_centisat_vb() == 1
+
+    def test_absent_relayfee_answers_none(self, electrum: Any) -> None:
+        """The common real-world case (field omitted): honestly None."""
+        client = self._handshaken(electrum)
+        assert client.broadcast_gate_relay_centisat_vb() is None
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            0,  # the documented "some servers report 0" dialect
+            -1,  # negatives are not floors
+            "0.00001",  # strings are not numbers here (no unit guessing)
+            True,  # bool is not a number
+            float("nan"),  # non-finite JSON extension
+            0.2,  # above the shared 0.1 BTC/kvB broken-payload guard
+        ],
+    )
+    def test_malformed_or_absurd_relayfee_answers_none_client_still_works(
+        self, electrum: Any, raw: Any
+    ) -> None:
+        """Fail-CLOSED, not fail-the-connection: every broken announcement
+        yields None AND leaves the client fully functional."""
+        client = self._handshaken(electrum, relayfee=raw)
+        assert client.broadcast_gate_relay_centisat_vb() is None
+
+    def test_no_connection_yet_answers_none_without_connecting(
+        self, electrum: Any
+    ) -> None:
+        """Zero network I/O: the capability reads the RETAINED handshake
+        value — before the first connection the answer is None, and answering
+        it never opens a socket."""
+        server = electrum(relayfee=0.00001)  # never contacted by this test
+        client = _client(server)
+        assert client.broadcast_gate_relay_centisat_vb() is None
+        assert server.connects == 0
+
+    def test_estimator_capability_name_stays_absent(self, electrum: Any) -> None:
+        """The name-split pin (why the seam is NOT ``min_relay_centisat_vb``):
+        the fee estimator duck-types THAT name — an electrum client must
+        never satisfy it, whatever it announced. Estimator semantics for
+        this backend stay "assumed rail", unchanged."""
+        client = self._handshaken(electrum, relayfee=0.00001)
+        assert not hasattr(client, "min_relay_centisat_vb")
+
+    def test_gate_consumption_end_to_end(self, electrum: Any) -> None:
+        """The real wiring: a rejection-as-answer broadcast (the DIAG-005
+        site-E ``server-rejected`` dialect) against a relayfee-announcing
+        server is PROVEN fee-floor-shaped by app._fee_floor_shaped for a
+        tx under the floor, and unclear for one at/above it (family gate
+        unchanged)."""
+        refusal = "18: min relay fee not met, 130 < 141"
+        server = electrum(
+            script={"blockchain.transaction.broadcast": [refusal]}, relayfee=0.00001
+        )
+        with _client(server) as client:
+            with pytest.raises(ChainError) as excinfo:
+                client.broadcast_tx(TX_HEX)
+            exc = excinfo.value
+            assert exc.failure_class == SERVER_REJECTED
+            # floor = 100 centisat/vB: a 50-centisat tx is provably under it.
+            assert app_module._fee_floor_shaped(exc, client, 50) is True
+            # at/above the floor: the floor cannot explain the refusal.
+            assert app_module._fee_floor_shaped(exc, client, 100) is False
+            assert app_module._fee_floor_shaped(exc, client, 250) is False
+        # value-free belt: the refusal text never rode the exception.
+        assert "min relay fee" not in str(excinfo.value)
+
+    def test_gate_unclear_when_nothing_announced(self, electrum: Any) -> None:
+        """The feature's dead-case, resurrected by the rider ONLY when the
+        server speaks: with no announcement the same rejection classifies
+        UNCLEAR (fail-closed to no offer)."""
+        server = electrum(script={"blockchain.transaction.broadcast": ["rejected"]})
+        with _client(server) as client:
+            with pytest.raises(ChainError) as excinfo:
+                client.broadcast_tx(TX_HEX)
+            assert app_module._fee_floor_shaped(excinfo.value, client, 50) is False
 
 
 class TestEntryProbe:

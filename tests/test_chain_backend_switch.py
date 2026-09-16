@@ -173,7 +173,11 @@ def test_esplora_client_default_base_is_public_info_not_wallet(
 
 def test_public_info_client_reads_esplora_base_url() -> None:
     """``PublicInfoClient`` is pinned to the public-info base and exposes
-    exactly the fee/price read surface (no wallet methods)."""
+    the fee/price read surface only — NO wallet READ methods (no address/
+    utxo/history/tx_status). ``broadcast_tx`` is the ONE sanctioned write
+    (TCK-PUBLICBCAST-001: the consented public-broadcast fallback, POST
+    /api/tx), so it is deliberately NOT in the forbidden set; every WALLET
+    read still is (mempool.space never answers wallet queries)."""
     info = PublicInfoClient(
         Settings(esplora_base_url=PUBLIC_BASE),
         transport=httpx.MockTransport(lambda _r: httpx.Response(404, json=None)),
@@ -181,7 +185,7 @@ def test_public_info_client_reads_esplora_base_url() -> None:
     try:
         assert info.supports_price is True
         assert not hasattr(info, "get_address_txs")
-        assert not hasattr(info, "broadcast_tx")
+        assert not hasattr(info, "get_tx_status")
         assert not hasattr(info, "get_address_utxos")
     finally:
         info.close()

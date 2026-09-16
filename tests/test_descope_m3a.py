@@ -334,7 +334,11 @@ def test_fee_and_price_riders_are_the_public_fetcher(
 def test_public_info_fetcher_shape() -> None:
     """The trimmed read path: exactly what fees+prices consume (get_json,
     get_tip_height, supports_price) and NOTHING else — no address/scan/
-    broadcast/tx_status acceptance, no wallet methods (plan §0 table)."""
+    tx_status acceptance, no wallet READ methods (plan §0 table).
+    TCK-PUBLICBCAST-001 amends this pin: ``broadcast_tx`` is now the ONE
+    sanctioned WRITE (the consented public-broadcast fallback), so it is
+    removed from the forbidden set — but every wallet READ (the thing
+    DESCOPE-M3A actually scoped mempool.space out of) stays forbidden."""
     info = PublicInfoClient(Settings(), transport=httpx.MockTransport(_handler))
     try:
         assert info.supports_price is True
@@ -343,12 +347,15 @@ def test_public_info_fetcher_shape() -> None:
         for wallet_only in (
             "get_address_txs",
             "get_address_utxos",
-            "broadcast_tx",
             "get_tx_status",
             "get_tip_block",
             "estimate_fee",
         ):
             assert not hasattr(info, wallet_only), wallet_only
+        # The consented fallback write is present and ONLY a broadcast POST
+        # (not a wallet read path) — pin its existence so a future trim
+        # can't silently drop the public-broadcast seam.
+        assert callable(info.broadcast_tx)
     finally:
         info.close()
 

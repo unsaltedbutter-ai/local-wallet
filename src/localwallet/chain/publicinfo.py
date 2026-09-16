@@ -12,12 +12,26 @@ against since FEE-001/TCK-P2-001:
   recent-blocks floor's tip, self-contained: it rides THIS host, never the
   wallet backend),
 * ``GET {base}/v1/blocks/{tip}`` and ``GET {base}/v1/prices`` (via
-  :meth:`get_json`).
+  :meth:`get_json`),
+* ``POST {base}/tx`` (via :meth:`broadcast_tx` — the ONE write, only ever
+  reached through the app's consented public-broadcast fallback,
+  TCK-PUBLICBCAST-001).
 
-There are deliberately NO wallet methods here (no address/UTXO/history/
-broadcast/tx_status) and no wallet acceptance anywhere: the payloads carry
-no addresses, so a request discloses only the app's IP and timing to the
-public mempool.space operator (the honest ADR-0011 amendment note).
+There are deliberately NO wallet READ methods here (no address/UTXO/
+history/tx_status) and no wallet acceptance anywhere: the GET payloads
+carry no addresses, so a request discloses only the app's IP and timing
+to the public mempool.space operator (the honest ADR-0011 amendment note).
+
+ONE write is the sanctioned exception (TCK-PUBLICBCAST-001):
+:meth:`PublicInfoClient.broadcast_tx` — ``POST {base}/tx`` (the endpoint
+mempool.space's own broadcast form posts to), reached ONLY by the app's
+public-broadcast fallback AFTER the dispatcher's deterministic
+explicit-consent gate. Unlike the GETs, a broadcast discloses the FULL
+signed transaction (inputs, outputs — the input-clustering exposure) to
+the public operator; that disclosure is exactly what the consent sentence
+names. It is single-attempt with the SEC-004 txid bind — the inherited
+:class:`EsploraClient` semantics reused verbatim (see
+:meth:`EsploraClient.broadcast_tx`).
 
 The base defaults to :attr:`localwallet.config.Settings.esplora_base_url`
 (``https://mempool.space/api``, env/config-overridable via
@@ -41,11 +55,13 @@ __all__ = ["PublicInfoClient"]
 
 
 class PublicInfoClient:
-    """Read-only public fee/price fetcher over the mempool.space API.
+    """Public fee/price fetcher + the consented public-broadcast POST.
 
     Structurally satisfies exactly what ``chain.fees`` and ``chain.price``
     consume off the old combined client: ``get_json``, ``get_tip_height``
-    and the ``supports_price`` capability flag. Args mirror
+    and the ``supports_price`` capability flag — plus the single
+    TCK-PUBLICBCAST-001 write (:meth:`broadcast_tx`, which the fee/price
+    consumers never touch). Args mirror
     :class:`EsploraClient` so tests can inject a mock ``transport``.
 
     Raises:
@@ -84,6 +100,34 @@ class PublicInfoClient:
         ``/v1/blocks/{tip}`` — self-contained, never the wallet backend's
         tip)."""
         return self._client.get_tip_height()
+
+    def broadcast_tx(self, tx_hex: str) -> str:
+        """Broadcast a signed transaction to the PUBLIC mempool
+        (``POST {base}/tx``, TCK-PUBLICBCAST-001) — the ONE write.
+
+        Delegates verbatim to :meth:`EsploraClient.broadcast_tx`, which
+        owns the whole money-path discipline this inherits and must not
+        re-implement: tx-hex validation BEFORE anything is sent, the
+        single-attempt no-retry policy (a POST is not idempotent —
+        double-broadcast risk), the SEC-004 TXID BIND (the answer is
+        re-validated 64-lowercase-hex and bound to the expected txid
+        computed as ``sha256d`` of this transaction's serialization —
+        embit's witness-stripped ``Transaction.txid()`` — a well-formed
+        foreign txid is a value-free hard stop), and value-free errors
+        (no tx hex, no txid, no server text ever surface).
+
+        The caller (the app's broadcast-failure fallback) reaches this ONLY
+        through its deterministic explicit-consent gate — this client
+        carries no wallet state and no gate; it is the transport half of
+        that flow. The request hands the full transaction to the public
+        operator (the disclosure the consent sentence names verbatim).
+
+        Raises:
+            ChainError: everything :meth:`EsploraClient.broadcast_tx`
+                raises — malformed argument/answer, bind mismatch, any
+                non-2xx or transport failure of the single attempt.
+        """
+        return self._client.broadcast_tx(tx_hex)
 
     def close(self) -> None:
         """Close the underlying HTTP transport (bounded, local)."""
