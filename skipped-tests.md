@@ -1,5 +1,11 @@
 # skipped-tests.md — the 7 skipped tests: what they are, why they skip, fix-or-remove
 
+> **2026-09-15 verification run (orchestrator):** all five env-gated skips were run with their gates set.
+> #7 Sparrow dump ✅ · #6 HWI live enumerate ✅ · #5 bridge smoke ✅ (notible.local reachable) ·
+> #3/#4 live balance/AC-sheet ❌ FAILED — **valid tests, real product bug**: electrum.blockstream.info
+> rejects `verbose=True` (-32603 "verbose transactions are currently unsupported") → TCK-ELECTRUM-001.
+> #1/#2 were fixed earlier by TCK-TEST-001 (now in the passing baseline).
+
 Baseline context: **2897 passed / 7 skipped** (run 2026-09-11, this venv). All 7 skips are
 **env-gated by design** — the default suite stays hermetic (offline, no hardware, no
 multi-GB loads). Two of them, however, skip *unnecessarily* in this repo because their

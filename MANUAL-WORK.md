@@ -4,17 +4,29 @@
 > 🔥 = the item blocks the orchestrator's next step. Nothing here blocks code work unless noted.
 > All DONE items have been removed — this file is only what still needs you.
 
-## WHAT MATTERS NOW (priority order — refreshed 2026-09-15, post part-9 wave)
+## WHAT MATTERS NOW (priority order — refreshed 2026-09-15, post part-10 wave)
 
-1. 🔥 **MW-16 round 4 — re-test on your Start9 machine** (the overnight wave fixed nearly everything you reported — full checklist below).
+1. 🔥 **MW-16 round 4 — re-test on your Start9 machine** (the overnight wave fixed nearly everything you reported — full checklist below; the part-10 wave additionally fixed: the 1-sat/vB fee floor misreport, the "cannot cancel" dead-end, the 2-min-per-dot bitcoind scan, and the public-electrum suggested-server failure).
 2. **MW-17 — relaunch verification** (remaining open items below).
-3. **MW-15 — live send/fee run** (fee policy v2 + corrected rail + consolidation now bids SLOW).
+3. **MW-15 — live send/fee run** (fee policy v2 + corrected floor — your 0.35-sat/vB case now bids ≈0.36).
 4. **MW-9 — on-chain broadcast** (debug lines + the NEW mempool.space fallback offer).
 5. **MW-10/MW-11 — web UI matrix** (after MW-16).
 6. **MW-12 → MW-13 → MW-14 — publishing chain** (when ready).
 7. MW-8 — optional (.app packaging).
 
 ---
+
+## §AUTONOMOUS DECISIONS — ratification record (2026-09-15)
+
+Part-9 decisions (HANDOFF §0c6) reviewed by the user:
+
+- No label-removal surface (union-only) — **RATIFIED**. (Someday a label remove/change command may be wanted; noted, no ticket.)
+- coin_labels table retained write-frozen as history — **RATIFIED**.
+- Consolidation bids the SLOW rung by default — **RATIFIED**.
+- `.local` hosts classify YELLOW — **SUPERSEDED by user guidance**: resolve the hostname's IP and classify GREEN when it is on our LAN (`.local` or otherwise) → implemented via TCK-WEB-030. WEB-023's literal-IP classification stays as the fail-safe fallback.
+- PUBLICBCAST electrum relayfee coverage; HW-005 D1 pubkey-hex refinement; WEB-027 wallet_fingerprint rename; chaindouble test double — default-ratified per standing rule (not contested). Note: TCK-WEB-032 re-examines fingerprint parity with the user's live evidence (Sparrow AND the Jade both show 40DBB192 for their wallet).
+- The deleted details section's original numbering had a #3 between coin_labels and `.local` that is unrecoverable after the MANUAL-WORK cleanup — treated as default-ratified.
+- **FEE-006 floor decision (orchestrator, 2026-09-15, from your fee report):** the "1 sat/vB congestion floor" your reply quoted is mempool.space's whole-sat `minimumFee` field over-vetoing the policy bid — NOT the next-block floor. Decision: policy bids floor at MAX(relay rail, the projected next block's own bottom); `minimumFee` demoted to the fallback shape only; narration names the real source. Your 0.35-sat/vB case will bid ≈0.36 after this lands (TCK-FEE-006).
 
 ## MW-16 round 4 🔥 — full checklist (post part-9 wave, HEAD 003dbdd)
 
