@@ -354,14 +354,17 @@ class TxStatus:
     """Confirmation status of one transaction, quoted from the explorer.
 
     ``txid`` — the queried transaction id (verbatim; tool output, not an
-    error string). ``confirmed`` — strict boolean from the response.
-    ``block_height`` / ``block_time`` — the confirming block's height and
+    error string). ``confirmed`` — strict boolean from the response, or
+    ``None`` when the backend cannot say (e.g. a no-verbose Electrum
+    fallback producer); callers must treat ``None`` as "this backend
+    cannot answer" rather than "unconfirmed". ``block_height`` /
+    ``block_time`` — the confirming block's height and
     timestamp, or ``None`` while unconfirmed. All fields are shape-validated
     by the wallet adapters (Electrum/bitcoind) that return this record.
     """
 
     txid: str
-    confirmed: bool
+    confirmed: bool | None
     block_height: int | None
     block_time: int | None
 

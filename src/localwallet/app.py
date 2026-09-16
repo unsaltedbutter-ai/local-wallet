@@ -20246,7 +20246,9 @@ def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], No
     """Narrate a ``tx_status`` outcome (TCK-P3-005).
 
     Confirmed → "Confirmed at height N." (N verbatim from the chain
-    response); unconfirmed → "In mempool (unconfirmed).";
+    response); unconfirmed → "In mempool (unconfirmed)."; a backend that
+    could not report confirmation status (TCK-ELECTRUM-002: ``confirmed``
+    is ``None``) → the value-free hedge line, never "In mempool.";
     ``unknown_tx`` → the eventual-consistency note; ``backend_unchosen`` →
     :data:`NO_BACKEND_REFUSAL` verbatim (TCK-PRIVACY-001); other errors
     surface value-free via :func:`_error_line`.
@@ -20323,6 +20325,18 @@ def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], No
             else "Confirmed."
         )
         output_fn(sanitize_tool_output(message))
+        return
+    if result.get("confirmed") is None:
+        # TCK-ELECTRUM-002: a backend that could not report confirmation
+        # status (no-verbose server → all status fields honestly None)
+        # must NOT be narrated as unconfirmed. Value-free hedge, in the
+        # repo's voice; no digits, no txid echo beyond what narration shows.
+        output_fn(
+            sanitize_tool_output(
+                "The server did not report confirmation status for this "
+                "transaction — check an explorer if you need certainty."
+            )
+        )
         return
     output_fn(sanitize_tool_output("In mempool (unconfirmed)."))
 

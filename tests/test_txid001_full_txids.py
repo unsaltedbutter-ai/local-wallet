@@ -103,6 +103,21 @@ def test_tx_status_evicted_copy_quotes_full_txid() -> None:
     assert "at height 900002" in line
 
 
+def test_tx_status_unknown_confirmation_never_narrated_unconfirmed() -> None:
+    """TCK-ELECTRUM-002: a backend that could not report confirmation
+    status (``confirmed`` is ``None``) must not be narrated as unconfirmed —
+    the honest value-free hedge, never "In mempool (unconfirmed)."."""
+    (line,) = _narrate(
+        _print_tx_status,
+        {"confirmed": None, "block_height": None, "block_time": None},
+    )
+    assert line == (
+        "The server did not report confirmation status for this transaction "
+        "— check an explorer if you need certainty."
+    )
+    assert "unconfirmed" not in line
+
+
 # ------------------------------------------------------- history / utxos
 
 

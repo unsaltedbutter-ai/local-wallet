@@ -870,6 +870,302 @@ class TestVerboseFallback:
         # The refusal latched the capability even though the scan failed.
         assert client._verbose_txs_unsupported is True
 
+    def test_raw_expansion_over_bound_hex_rejected_value_free(
+        self, electrum: Any
+    ) -> None:
+        """TCK-ELECTRUM-001 F3 parity: on the history-expansion path a raw
+        response larger than the Esplora transport bound is refused BEFORE
+        embit decode — over-bound hex can contain anything, so the
+        ChainError is value-free and unlabeled (shape failure)."""
+        server = electrum(
+            script={
+                "blockchain.scripthash.get_history": lambda p: [
+                    {"tx_hash": _RAW_TXID, "height": 800_000}
+                ],
+                "blockchain.transaction.get": _rejects_verbose(
+                    {_RAW_TXID: "00" * 100_001}
+                ),
+            }
+        )
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.get_address_txs(ADDRS[0][0])
+        assert excinfo.value.failure_class is None
+        assert "implausibly large" in str(excinfo.value)
+
+
+# --------------------------------------- TCK-ELECTRUM-002 tx_status fallback
+
+
+class TestTxStatusVerboseFallback:
+    """The re-review follow-up: ``get_tx_status`` used to ALWAYS request
+    verbose and ignore the latch, so "did my transaction go through?"
+    hard-failed on the ELECTRUM-001 servers (electrum.blockstream.info,
+    electrs-esplora 0.4.1, error -32603) even though the scan path
+    degraded gracefully. It now rides the same latch/gate; what a raw
+    serialization cannot answer stays honestly ``None``."""
+
+    def test_rejection_falls_back_to_honest_none_and_latches(
+        self, electrum: Any
+    ) -> None:
+        server = electrum(
+            script={
+                "blockchain.transaction.get": _rejects_verbose({_RAW_TXID: _RAW_TX_HEX})
+            }
+        )
+        honest = TxStatus(
+            txid=_RAW_TXID, confirmed=None, block_height=None, block_time=None
+        )
+        with _client(server) as client:
+            assert client.get_tx_status(_RAW_TXID) == honest
+            assert client._verbose_txs_unsupported is True
+            # The latch stands: a SECOND lookup skips the verbose attempt.
+            assert client.get_tx_status(_RAW_TXID) == honest
+        expansions = [
+            p for m, p in server.requests if m == "blockchain.transaction.get"
+        ]
+        # Exactly ONE verbose attempt TOTAL for two lookups: the first
+        # rejection latches, the fallback answers from the non-verbose hex.
+        assert [p for p in expansions if len(p) > 1] == [[_RAW_TXID, True]]
+        assert len([p for p in expansions if len(p) == 1]) == 2
+
+    def test_raw_status_over_bound_hex_rejected_value_free(self) -> None:
+        """TCK-ELECTRUM-002 F3 (defense-in-depth): a raw response larger
+        than the Esplora transport bound is refused BEFORE embit decode —
+        the over-bound hex can contain anything, so the ChainError is
+        value-free and carries no class label (shape failure)."""
+        with pytest.raises(ChainError) as excinfo:
+            electrum_module.ElectrumClient._tx_status_from_raw(
+                _RAW_TXID, "00" * 100_001
+            )
+        assert excinfo.value.failure_class is None
+        assert "implausibly large" in str(excinfo.value)
+
+    def test_one_verbose_attempt_total_scan_then_status(self, electrum: Any) -> None:
+        """The latch is CLIENT-wide, not per-method: a scan that tripped it
+        leaves the later status lookup zero verbose attempts."""
+        server = electrum(
+            script={
+                "blockchain.scripthash.get_history": lambda p: [
+                    {"tx_hash": _RAW_TXID, "height": 800_000}
+                ],
+                "blockchain.transaction.get": _rejects_verbose({_RAW_TXID: _RAW_TX_HEX}),
+            }
+        )
+        with _client(server) as client:
+            client.get_address_txs(ADDRS[0][0])
+            assert client.get_tx_status(_RAW_TXID).confirmed is None
+        verbose = [
+            p
+            for m, p in server.requests
+            if m == "blockchain.transaction.get" and len(p) > 1
+        ]
+        assert verbose == [[_RAW_TXID, True]]  # the scan's single tripping attempt
+
+    def test_one_verbose_attempt_total_status_then_scan(self, electrum: Any) -> None:
+        """And the other order: the status call is the one that trips the
+        latch, so the later scan expansions skip verbose entirely."""
+        server = electrum(
+            script={
+                "blockchain.scripthash.get_history": lambda p: [
+                    {"tx_hash": _RAW_TXID, "height": 800_000}
+                ],
+                "blockchain.transaction.get": _rejects_verbose({_RAW_TXID: _RAW_TX_HEX}),
+            }
+        )
+        with _client(server) as client:
+            assert client.get_tx_status(_RAW_TXID).confirmed is None
+            client.get_address_txs(ADDRS[0][0])
+        verbose = [
+            p
+            for m, p in server.requests
+            if m == "blockchain.transaction.get" and len(p) > 1
+        ]
+        assert verbose == [[_RAW_TXID, True]]  # the status call's own attempt
+
+    def test_verbose_capable_status_is_byte_identical(self, electrum: Any) -> None:
+        """On a verbose-supporting server the request sequence, params and
+        answers are what they always were: every call 2-param, confirmed a
+        strict bool, block height/time ridden, no non-verbose request EVER
+        framed, the latch never opened."""
+        txid = "a" * 64
+        responses = [
+            tx_verbose(txid, height=800_000, block_time=1_700_000_000),
+            tx_verbose(txid),  # mempool: confirmations omitted
+        ]
+
+        def answer(params: list[Any]) -> Any:
+            if len(params) == 1:  # a fallback here would be the regression
+                server.unexpected.append("non-verbose status fetch")
+                return ("error", "must never be asked")
+            return responses.pop(0)
+
+        server = electrum(script={"blockchain.transaction.get": answer})
+        with _client(server) as client:
+            assert client.get_tx_status(txid) == TxStatus(
+                txid=txid, confirmed=True, block_height=800_000, block_time=1_700_000_000
+            )
+            assert client.get_tx_status(txid) == TxStatus(
+                txid=txid, confirmed=False, block_height=None, block_time=None
+            )
+            assert client._verbose_txs_unsupported is False
+        assert server.unexpected == []
+        assert all(
+            p == [txid, True]
+            for m, p in server.requests
+            if m == "blockchain.transaction.get"
+        )
+
+    def test_different_rpc_error_propagates_and_does_not_latch(
+        self, electrum: Any
+    ) -> None:
+        """The ELECTRUM-001 MAJOR rule stands on this call site too: ONLY
+        the -32603 code degrades. A different rpc error on the verbose
+        attempt propagates with its code and leaves the latch open — the
+        non-verbose fetch is never framed on its heels."""
+        server = electrum(
+            script={"blockchain.transaction.get": lambda p: ("error", "temporary", -1)}
+        )
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.get_tx_status(_RAW_TXID)
+        assert excinfo.value.failure_class == RPC_ERROR
+        assert excinfo.value.rpc_code == -1
+        assert client._verbose_txs_unsupported is False
+        assert all(
+            len(p) > 1
+            for m, p in server.requests
+            if m == "blockchain.transaction.get"
+        )
+
+    def test_unknown_tx_still_rejected_on_a_no_verbose_server(
+        self, electrum: Any
+    ) -> None:
+        """The fallback keeps the 404-parity signal: reaching the honest-
+        None answer means the server KNOWS the tx; an unknown one is still
+        rejected by the non-verbose call itself (server text never echoed)."""
+        server = electrum(
+            script={
+                "blockchain.transaction.get": lambda p: (
+                    ("error", "verbose unsupported", -32603)
+                    if len(p) > 1
+                    else ("error", "no such mempool or blockchain transaction", 1)
+                )
+            }
+        )
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.get_tx_status(_RAW_TXID)
+        assert str(excinfo.value) == "tx-status request rejected by the server"
+        assert excinfo.value.failure_class == RPC_ERROR
+        assert excinfo.value.rpc_code == 1
+
+    def test_nonverbose_transport_loss_keeps_the_retry_policy(
+        self, electrum: Any, record_sleeps: Any
+    ) -> None:
+        """The fallback fetch is an ordinary _rpc call: a transport loss
+        retries with the shared backoff + reconnect, never a fail-immediate
+        mislabel and never a swallowed success."""
+        attempts = {"nonverbose": 0}
+
+        def answer(params: list[Any]) -> Any:
+            if len(params) > 1:
+                return ("error", "verbose unsupported", -32603)
+            attempts["nonverbose"] += 1
+            if attempts["nonverbose"] == 1:  # first non-verbose attempt dies
+                return CLOSE
+            return _RAW_TX_HEX
+
+        server = electrum(script={"blockchain.transaction.get": answer})
+        with _client(server, max_retries=2) as client:
+            assert client.get_tx_status(_RAW_TXID).txid == _RAW_TXID
+        assert len(record_sleeps) == 1  # one backoff, like every transport retry
+        assert server.connects == 2  # reconnect-before-retry discipline
+
+    def test_exhausted_transport_on_fallback_surfaces_as_network_error(
+        self, electrum: Any, record_sleeps: Any
+    ) -> None:
+        """Budget out → the existing network-error surface; the fallback
+        never converts it into an honest-None success or an rpc-error
+        mislabel."""
+        server = electrum(
+            script={
+                "blockchain.transaction.get": lambda p: (
+                    ("error", "verbose unsupported", -32603)
+                    if len(p) > 1
+                    else CLOSE
+                )
+            }
+        )
+        with _client(server, max_retries=0) as client, pytest.raises(ChainError) as excinfo:
+            client.get_tx_status(_RAW_TXID)
+        assert str(excinfo.value) == "tx-status failed: network error (ConnectionResetError)"
+        assert excinfo.value.failure_class == CONNECT_REFUSED
+        assert record_sleeps == []  # budget 0: exactly one attempt, same as ever
+
+    def test_verbose_transport_loss_retries_without_degrading(
+        self, electrum: Any, record_sleeps: Any
+    ) -> None:
+        """A DIED connection on the verbose attempt is the transport class,
+        not a capability answer: it retries verbose per the budget (and the
+        succeeding verbose answer stays byte-identical) — the latch never
+        flips on a network loss."""
+
+        def answer(params: list[Any]) -> Any:
+            if len(params) > 1:
+                if verbose_attempts["n"] == 0:
+                    verbose_attempts["n"] += 1
+                    return CLOSE
+                return tx_verbose(
+                    _RAW_TXID, height=800_000, block_time=1_700_000_000
+                )
+            server.unexpected.append("non-verbose status fetch")
+            return ("error", "must never be asked")
+
+        verbose_attempts = {"n": 0}
+        server = electrum(script={"blockchain.transaction.get": answer})
+        with _client(server, max_retries=2) as client:
+            assert client.get_tx_status(_RAW_TXID) == TxStatus(
+                txid=_RAW_TXID,
+                confirmed=True,
+                block_height=800_000,
+                block_time=1_700_000_000,
+            )
+        assert server.unexpected == []
+        assert client._verbose_txs_unsupported is False
+        assert len(record_sleeps) == 1
+
+    @pytest.mark.parametrize(
+        "junk",
+        [
+            "not hex",  # not even hex
+            42,  # not a string at all
+            {"txid": "a" * 64},  # a server answering verbose-shaped anyway
+            TX_HEX,  # a PARSEABLE but FOREIGN transaction
+        ],
+    )
+    def test_unusable_raw_answer_fails_closed_value_free(
+        self, electrum: Any, junk: Any
+    ) -> None:
+        """The _tx_entry_from_raw discipline mirrored: the non-verbose
+        answer must DECODE and its own txid must re-bind to the requested
+        one. Junk is a value-free ChainError naming only the endpoint
+        kind — no txid, no hex, no host, no server code."""
+        server = electrum(
+            script={
+                "blockchain.transaction.get": lambda p: (
+                    junk if len(p) == 1 else ("error", "verbose unsupported", -32603)
+                )
+            }
+        )
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.get_tx_status(_RAW_TXID)
+        message = str(excinfo.value)
+        assert message.startswith("tx-status")
+        leaks = [_RAW_TXID, _RAW_TX_HEX, "127.0.0.1", "32603"]
+        if isinstance(junk, str):
+            leaks.append(junk)
+        assert all(leak not in message for leak in leaks if leak)
+        assert excinfo.value.failure_class is None  # shape failure, unlabeled
+        assert client._verbose_txs_unsupported is True  # the refusal was real
+
 
 class TestTranslation:
     def test_scripthash_convention(self, electrum: Any) -> None:

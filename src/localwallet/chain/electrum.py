@@ -35,6 +35,9 @@ Method mapping (plan §1 table):
   raw hex is decoded locally with embit — on that path ``block_time`` is
   absent and input addresses unmappable (the serialization carries no
   prevout scripts); consumers must tolerate both (TCK-ELECTRUM-001).
+  The SAME latch/gate also serves ``get_tx_status`` (TCK-ELECTRUM-002):
+  a non-verbose hex carries no confirmation data, so on that path
+  ``confirmed``/``block_height``/``block_time`` are all honest ``None``.
 * ``blockchain.scripthash.listunspent`` → ``get_address_utxos``
   (``confirmed`` = ``height > 0``, the electrs/ElectrumX mempool
   convention).
@@ -45,7 +48,9 @@ Method mapping (plan §1 table):
   endian bytes 68–72. The new-block notifications it arms are id-less
   lines this client skips — the watch poll still rides the ChainWorker's
   existing re-scan path, unchanged).
-* ``blockchain.transaction.get(tx, verbose)`` → ``get_tx_status``.
+* ``blockchain.transaction.get(tx, verbose)`` → ``get_tx_status``, with
+  the same TCK-ELECTRUM-001/002 latch-gated non-verbose fallback (all
+  status fields honestly ``None`` on that path — a raw hex cannot say).
 * ``blockchain.transaction.broadcast`` → ``broadcast_tx` with the SAME
   single-attempt semantics as Esplora (never retried; the expected txid is
   computed from the hex BEFORE sending and the answer is re-bound to it,
@@ -95,6 +100,7 @@ from embit.transaction import Transaction
 
 from localwallet.chain.config import ChainConfig
 from localwallet.chain.esplora import (
+    _MAX_TX_HEX_CHARS,
     _TXID_CHARSET,
     _TXID_LENGTH_CHARS,
     MAINNET_GENESIS_HASH,
@@ -539,42 +545,52 @@ class ElectrumClient:
         return reported
 
     def get_tx_status(self, txid: str) -> TxStatus:
-        """One transaction's confirmation status via verbose
+        """One transaction's confirmation status via
         ``blockchain.transaction.get``.
 
-        ``confirmed`` = ``confirmations > 0``; ``block_height``/``block_time``
-        come from ``blockheight``/``time`` when confirmed and are ``None``
-        otherwise (a mempool tx's first-seen ``time`` is deliberately NOT
-        reported as a block time). An unknown txid surfaces as the server's
-        error → :class:`ChainError` — the Esplora 404 parity; callers decide
-        what "unknown" means at the handler layer.
+        Verbose path (the pre-TCK-ELECTRUM-002 behavior, byte-identical
+        wherever the server supports verbose): ``confirmed`` =
+        ``confirmations > 0``; ``block_height``/``block_time`` come from
+        ``blockheight``/``time`` when confirmed and are ``None`` otherwise
+        (a mempool tx's first-seen ``time`` is deliberately NOT reported
+        as a block time). An unknown txid surfaces as the server's error →
+        :class:`ChainError` — the Esplora 404 parity; callers decide what
+        "unknown" means at the handler layer.
+
+        TCK-ELECTRUM-002 rides the SAME :attr:`_verbose_txs_unsupported`
+        latch/``_RPC_VERBOSE_UNSUPPORTED`` gate as the scan expansions:
+        when the latch is set (or this call's own verbose attempt is the
+        one the server rejects), the fetch goes NON-verbose and the hex
+        is verified locally — :meth:`_tx_status_from_raw`. A raw
+        serialization carries NO confirmation data, so on that path
+        ``confirmed``/``block_height``/``block_time`` are ALL honestly
+        ``None`` (the block_time precedent from TCK-ELECTRUM-001,
+        generalized — never a fabricated bool). The answer is still worth
+        having: reaching it means the server KNOWS the transaction (an
+        unknown txid is rejected there exactly as on the verbose path),
+        where pre-fix the whole lookup hard-failed on every no-verbose
+        server. Consumers must treat ``confirmed=None`` as "this backend
+        cannot answer that question".
         """
         _validate_txid(txid)
-        verbose = self._rpc("blockchain.transaction.get", [txid, True], _KIND_TX_STATUS)
-        if not isinstance(verbose, dict):
-            raise ChainError(f"{_KIND_TX_STATUS} response was not an object")
-        # ElectrumX/electrs OMIT 'confirmations' for mempool txs — absent
-        # means unconfirmed. A present-but-malformed value still fails closed.
-        if "confirmations" not in verbose:
-            confirmations = 0
-        else:
-            confirmations = _require_plain_int(verbose["confirmations"])
-            if confirmations is None or confirmations < 0:
-                raise ChainError(
-                    f"{_KIND_TX_STATUS} response has a missing or invalid 'confirmations'"
+        if not self._verbose_txs_unsupported:
+            try:
+                verbose = self._rpc(
+                    "blockchain.transaction.get", [txid, True], _KIND_TX_STATUS
                 )
-        confirmed = confirmations > 0
-        block_height: int | None = None
-        block_time: int | None = None
-        if confirmed:
-            block_height = _require_plain_int(verbose.get("blockheight"))
-            if block_height is None or block_height < 0:
-                raise ChainError(f"{_KIND_TX_STATUS} response has invalid 'blockheight'")
-            stamp = _require_plain_int(verbose.get("time"))
-            block_time = stamp if stamp is not None and stamp >= 0 else None
-        return TxStatus(
-            txid=txid, confirmed=confirmed, block_height=block_height, block_time=block_time
-        )
+            except ChainError as exc:
+                # The SAME latch gate as _expand_history_tx: ONLY the
+                # electrs-esplora -32603 verbose rejection degrades this
+                # call; any other rpc-error (or a transport-surfaced
+                # ChainError, whose rpc_code is None) keeps its existing
+                # semantics and re-raises untouched.
+                if exc.rpc_code != _RPC_VERBOSE_UNSUPPORTED:
+                    raise
+                self._verbose_txs_unsupported = True
+            else:
+                return self._tx_status_from_verbose(txid, verbose)
+        raw = self._rpc("blockchain.transaction.get", [txid], _KIND_TX_STATUS)
+        return self._tx_status_from_raw(txid, raw)
 
     def estimate_fee(self, target: FeeTarget) -> int:
         """Backend-native fee bid via ``blockchain.estimatefee`` → sat/vB.
@@ -746,6 +762,8 @@ class ElectrumClient:
         kind = _KIND_ADDRESS_TXS
         if not isinstance(raw, str):
             raise ChainError(f"{kind} raw transaction response was not a hex string")
+        if len(raw) > _MAX_TX_HEX_CHARS:
+            raise ChainError(f"{kind} raw transaction response was implausibly large")
         try:
             tx = Transaction.parse(bytes.fromhex(raw))
         except Exception as exc:  # containment: embit/hex errors vary
@@ -763,6 +781,69 @@ class ElectrumClient:
             ],
         }
         return cls._tx_entry(verbose, height, fee)
+
+    @staticmethod
+    def _tx_status_from_verbose(txid: str, verbose: Any) -> TxStatus:
+        """The pre-TCK-ELECTRUM-002 ``get_tx_status`` body, extracted
+        verbatim (the verbose-capable-server behavior stays byte-identical).
+        """
+        if not isinstance(verbose, dict):
+            raise ChainError(f"{_KIND_TX_STATUS} response was not an object")
+        # ElectrumX/electrs OMIT 'confirmations' for mempool txs — absent
+        # means unconfirmed. A present-but-malformed value still fails closed.
+        if "confirmations" not in verbose:
+            confirmations = 0
+        else:
+            confirmations = _require_plain_int(verbose["confirmations"])
+            if confirmations is None or confirmations < 0:
+                raise ChainError(
+                    f"{_KIND_TX_STATUS} response has a missing or invalid 'confirmations'"
+                )
+        confirmed = confirmations > 0
+        block_height: int | None = None
+        block_time: int | None = None
+        if confirmed:
+            block_height = _require_plain_int(verbose.get("blockheight"))
+            if block_height is None or block_height < 0:
+                raise ChainError(f"{_KIND_TX_STATUS} response has invalid 'blockheight'")
+            stamp = _require_plain_int(verbose.get("time"))
+            block_time = stamp if stamp is not None and stamp >= 0 else None
+        return TxStatus(
+            txid=txid, confirmed=confirmed, block_height=block_height, block_time=block_time
+        )
+
+    @staticmethod
+    def _tx_status_from_raw(txid: str, raw: Any) -> TxStatus:
+        """TCK-ELECTRUM-002: the status a no-verbose server can honestly
+        answer from one NON-verbose ``blockchain.transaction.get``.
+
+        Same discipline as :meth:`_tx_entry_from_raw`: fail-closed embit
+        decode, the decoded transaction's own txid re-bound to the
+        requested one before anything is trusted, value-free ChainErrors
+        (the hex can contain anything). What a raw serialization does not
+        carry stays ``None``, never invented: the hex holds no
+        confirmation data at all, so ``confirmed``/``block_height``/
+        ``block_time`` are all honest-absence here (the block_time
+        precedent generalized — ``TxStatus.confirmed`` is normally a
+        strict bool; ``None`` on this path means "the backend cannot
+        say", and callers must tolerate it). Reaching this return is
+        itself the information: the server knows the transaction (an
+        unknown txid was rejected by the call before we got here).
+        """
+        kind = _KIND_TX_STATUS
+        if not isinstance(raw, str):
+            raise ChainError(f"{kind} raw transaction response was not a hex string")
+        if len(raw) > _MAX_TX_HEX_CHARS:
+            raise ChainError(f"{kind} raw transaction response was implausibly large")
+        try:
+            tx = Transaction.parse(bytes.fromhex(raw))
+        except Exception as exc:  # containment: embit/hex errors vary
+            raise ChainError(f"{kind} raw transaction could not be decoded") from exc
+        if tx.txid().hex() != txid:
+            raise ChainError(f"{kind} raw transaction does not match the requested txid")
+        return TxStatus(
+            txid=txid, confirmed=None, block_height=None, block_time=None
+        )
 
     def _rpc(self, method: str, params: list[Any], kind: str, *, retries: int | None = None) -> Any:
         """One JSON-RPC call under the Esplora-consistent retry policy.
