@@ -28,7 +28,13 @@ Method mapping (plan §1 table):
 * ``blockchain.scripthash.get_history`` + one
   ``blockchain.transaction.get(tx, verbose)`` per tx → ``get_address_txs``
   (the N+1 cost is the plan's accepted OQ-3 default; the gap window bounds
-  it), history ``fee`` passes through when present (never fabricated).
+  it), history ``fee`` passes through when present (never fabricated). A
+  server that REJECTS the verbose expansion with a JSON-RPC error (some
+  electrs-esplora builds: "verbose transactions are currently unsupported")
+  is latched per client instance and served by the non-verbose call, whose
+  raw hex is decoded locally with embit — on that path ``block_time`` is
+  absent and input addresses unmappable (the serialization carries no
+  prevout scripts); consumers must tolerate both (TCK-ELECTRUM-001).
 * ``blockchain.scripthash.listunspent`` → ``get_address_utxos``
   (``confirmed`` = ``height > 0``, the electrs/ElectrumX mempool
   convention).
@@ -131,6 +137,12 @@ _KIND_TIP_BLOCK = "tip-block"
 _KIND_BROADCAST = "broadcast"
 _KIND_TX_STATUS = "tx-status"
 _KIND_FEE_ESTIMATE = "fee-estimate"
+
+#: electrs-esplora's JSON-RPC code for "verbose transactions are currently
+#: unsupported" (TCK-ELECTRUM-001). The verbose-capability latch flips ONLY
+#: on this code — any other rpc-error (transient per-tx failures, malformed
+#: envelopes with rpc_code None) re-raises and never degrades the client.
+_RPC_VERBOSE_UNSUPPORTED: Final[int] = -32603
 
 #: Our confirmation targets → Electrum ``estimatefee`` block targets
 #: (plan §1; advisory, servers vary).
@@ -311,6 +323,12 @@ class ElectrumClient:
         # 001 rider). None until a handshake sees an announcement; GIL-
         # atomic attribute read, refreshed on every (re-)handshake.
         self._relayfee_raw: int | float | None = None
+        # TCK-ELECTRUM-001 capability latch: True once THIS server has
+        # rejected a verbose ``blockchain.transaction.get`` with a JSON-RPC
+        # error — every later expansion goes straight to the non-verbose
+        # call + local decode. GIL-atomic attribute like ``_relayfee_raw``; at worst a
+        # concurrent first pair each attempt verbose once, never wrongly.
+        self._verbose_txs_unsupported = False
 
     # ------------------------------------------------------------- lifecycle
 
@@ -345,6 +363,23 @@ class ElectrumClient:
         ``scan._parse_tx_entry`` consumes. Ordering is oldest-first here vs
         newest-first on Esplora; every consumer is order-independent (the
         scan merges by txid), documented as tolerated.
+
+        TCK-ELECTRUM-001 verbose fallback: when the server answers the
+        verbose expansion with a JSON-RPC error (electrs-esplora builds
+        that do not implement verbose transactions), THAT tx is re-fetched
+        NON-verbose and its raw hex decoded locally with embit into the
+        same shape. On that path ``status.block_time`` is ABSENT (a raw
+        serialization carries no block time, the history entry carries no
+        timestamp — consumers must tolerate its absence, as
+        ``scan._parse_tx_entry`` already does) and ``vin`` entries carry no
+        ``prevout.scriptpubkey_address`` (the spending serialization does
+        not contain the previous outputs' scripts). ``fee`` semantics are
+        unchanged (history pass-through, never fabricated). The rejection
+        latches per client instance: later expansions skip the verbose
+        attempt entirely; a server that supports verbose is never touched
+        by the fallback (byte-identical behavior). Only the server-
+        rejection path falls back — transport failures keep the existing
+        retry policy.
         """
         history = self._rpc(
             "blockchain.scripthash.get_history",
@@ -368,13 +403,34 @@ class ElectrumClient:
                 # A malformed optional fee is dropped, not fatal: scan
                 # stores fee=None by design when absent (never fabricated).
                 raw_fee = None
-            verbose = self._rpc(
-                "blockchain.transaction.get",
-                [txid, True],
-                _KIND_ADDRESS_TXS,
-            )
-            entries.append(self._tx_entry(verbose, height, raw_fee))
+            entries.append(self._expand_history_tx(txid, height, raw_fee))
         return entries
+
+    def _expand_history_tx(
+        self, txid: str, height: int, fee: int | None
+    ) -> dict[str, Any]:
+        """One history entry → Esplora-shaped tx, verbose-first with the
+        TCK-ELECTRUM-001 local-decode fallback (see :meth:`get_address_txs`).
+        """
+        if not self._verbose_txs_unsupported:
+            try:
+                verbose = self._rpc(
+                    "blockchain.transaction.get", [txid, True], _KIND_ADDRESS_TXS
+                )
+            except ChainError as exc:
+                # ONLY a server rejection with the electrs-esplora "verbose
+                # unsupported" code (-32603) means "no verbose here". Any
+                # other rpc-error (transport-class or a different rpc_code,
+                # including a transient per-tx failure or an envelope with
+                # rpc_code None) keeps its existing semantics and re-raises
+                # untouched — it must not permanently degrade the client.
+                if exc.rpc_code != _RPC_VERBOSE_UNSUPPORTED:
+                    raise
+                self._verbose_txs_unsupported = True
+            else:
+                return self._tx_entry(verbose, height, fee)
+        raw = self._rpc("blockchain.transaction.get", [txid], _KIND_ADDRESS_TXS)
+        return self._tx_entry_from_raw(txid, raw, height, fee)
 
     def get_address_utxos(self, address: str) -> list[dict[str, Any]]:
         """Unspent outputs for ``address``, in the Esplora ``/utxo`` shape.
@@ -670,6 +726,43 @@ class ElectrumClient:
         entry["vin"] = inputs
         entry["vout"] = outputs
         return entry
+
+    @classmethod
+    def _tx_entry_from_raw(
+        cls, txid: str, raw: Any, height: int, fee: int | None
+    ) -> dict[str, Any]:
+        """TCK-ELECTRUM-001: one NON-verbose tx hex into the exact shape
+        :meth:`_tx_entry` produces — by synthesizing the verbose object
+        and translating through it (one shape path, pinned parity).
+
+        What a raw serialization cannot answer stays ABSENT, never
+        invented: no ``time`` member (so no ``status.block_time``) and no
+        prevout scripts (so ``vin`` entries carry no address, exactly the
+        shape _tx_entry yields for an unmappable/coinbase input). The
+        decoded transaction's own txid is re-bound to the requested one
+        before anything is trusted from the hex. Failures are value-free
+        ChainErrors (the hex can contain anything).
+        """
+        kind = _KIND_ADDRESS_TXS
+        if not isinstance(raw, str):
+            raise ChainError(f"{kind} raw transaction response was not a hex string")
+        try:
+            tx = Transaction.parse(bytes.fromhex(raw))
+        except Exception as exc:  # containment: embit/hex errors vary
+            raise ChainError(f"{kind} raw transaction could not be decoded") from exc
+        if tx.txid().hex() != txid:
+            raise ChainError(f"{kind} raw transaction does not match the requested txid")
+        verbose: dict[str, Any] = {
+            "txid": txid,
+            # No prevout script in the spending tx: the byte-identical
+            # shape _tx_entry yields for an unmappable input.
+            "vin": [{"prevout": {}} for _ in tx.vin],
+            "vout": [
+                {"scriptPubKey": {"hex": out.script_pubkey.data.hex()}}
+                for out in tx.vout
+            ],
+        }
+        return cls._tx_entry(verbose, height, fee)
 
     def _rpc(self, method: str, params: list[Any], kind: str, *, retries: int | None = None) -> Any:
         """One JSON-RPC call under the Esplora-consistent retry policy.

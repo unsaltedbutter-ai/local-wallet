@@ -259,7 +259,10 @@ class ElectrumFixture:
         if entry is CLOSE:
             return CLOSE, None
         if isinstance(entry, tuple) and entry and entry[0] == "error":
-            return None, {"code": 1, "message": entry[1]}
+            # ("error", message[, code]) — code defaults to 1; TCK-ELECTRUM-001
+            # scripts the real electrs rejection code -32603.
+            code = entry[2] if len(entry) > 2 else 1
+            return None, {"code": code, "message": entry[1]}
         return entry, None
 
     def _handle(self, conn: ssl.SSLSocket, message: dict[str, Any]) -> bool:
@@ -557,6 +560,315 @@ def tx_verbose(
         if block_time is not None:
             tx["time"] = block_time
     return tx
+
+
+# ------------------------------------------- TCK-ELECTRUM-001 verbose fallback
+
+#: A REAL raw (non-verbose) transaction for the local-decode fallback:
+#: version 2, one input, two outputs — one paying ADDRS[0][0] (mappable)
+#: and one OP_RETURN (unmappable → contributes nothing), locktime 0. Its
+#: embit-computed txid is what the fixture histories below carry, because
+#: the fallback RE-BINDS the decoded tx's own txid to the requested one.
+_RAW_SPK_HEX = _spk_hex(ADDRS[0][0])
+_RAW_TX_HEX = (
+    "0200000001"
+    + "11" * 32  # prevout txid (arbitrary)
+    + "01000000"  # prevout vout
+    + "00"  # empty scriptSig
+    + "feffffff"  # sequence
+    + "02"  # two outputs
+    + (1000).to_bytes(8, "little").hex()
+    + f"{len(bytes.fromhex(_RAW_SPK_HEX)):02x}" + _RAW_SPK_HEX
+    + (500).to_bytes(8, "little").hex()
+    + "016a"  # OP_RETURN
+    + "00000000"  # locktime
+)
+_RAW_TXID = Transaction.parse(bytes.fromhex(_RAW_TX_HEX)).txid().hex()
+
+
+def _rejects_verbose(raw_by_txid: dict[str, str]):
+    """Fixture answer: electrs-esplora 0.4.1 — verbose refused (-32603),
+    non-verbose answers the raw hex."""
+
+    def answer(params: list[Any]) -> Any:
+        if len(params) > 1:
+            return ("error", "verbose transactions are currently unsupported", -32603)
+        return raw_by_txid[params[0]]
+
+    return answer
+
+
+class TestVerboseFallback:
+    """The live finding: ``ssl://electrum.blockstream.info:50002`` answers
+    ``blockchain.transaction.get [txid, True]`` with JSON-RPC error -32603,
+    which used to fail the ENTIRE address scan on the first history entry.
+    The fallback re-fetches that one tx non-verbose and decodes locally.
+    """
+
+    def test_rejection_falls_back_locally_and_latches_capability(
+        self, electrum: Any
+    ) -> None:
+        server = electrum(
+            script={
+                "blockchain.scripthash.get_history": lambda p: [
+                    {"tx_hash": _RAW_TXID, "height": 800_000, "fee": 1_500},
+                    {"tx_hash": BROADCAST_TXID, "height": 0},  # mempool, NO fee
+                ],
+                "blockchain.transaction.get": _rejects_verbose(
+                    {_RAW_TXID: _RAW_TX_HEX, BROADCAST_TXID: TX_HEX}
+                ),
+            }
+        )
+        with _client(server) as client:
+            confirmed, mempool = client.get_address_txs(ADDRS[0][0])
+        # Exactly ONE verbose attempt across TWO entries: the first rejection
+        # latches the capability and later expansions skip it entirely.
+        expansions = [
+            p for m, p in server.requests if m == "blockchain.transaction.get"
+        ]
+        assert [p for p in expansions if len(p) > 1] == [[_RAW_TXID, True]]
+        assert len([p for p in expansions if len(p) == 1]) == 2
+        # The documented fallback shape: block_time ABSENT, input addresses
+        # unmappable (the serialization carries no prevout scripts — the
+        # byte-identical shape _tx_entry yields for an unmappable input).
+        assert confirmed == {
+            "txid": _RAW_TXID,
+            "status": {"confirmed": True, "block_height": 800_000},
+            "fee": 1_500,  # history pass-through: NOT computable from the hex
+            "vin": [{"prevout": {}}],
+            "vout": [{"scriptpubkey_address": ADDRS[0][0]}, {}],  # OP_RETURN → {}
+        }
+        assert mempool == {
+            "txid": BROADCAST_TXID,
+            "status": {"confirmed": False},
+            "vin": [{"prevout": {}}],
+            "vout": [{}],
+        }
+        # Fee never fabricated: the server sent none for the mempool entry.
+        assert "fee" not in mempool
+        # Verbose-shape parity: same field set, only block_time differs.
+        verbose_entry = ElectrumClient._tx_entry(
+            tx_verbose(
+                _RAW_TXID, vouts=(ADDRS[0][0],), height=800_000, block_time=1_700_000_000
+            ),
+            800_000,
+            1_500,
+        )
+        assert set(confirmed) == set(verbose_entry)
+        assert set(confirmed["status"]) == set(verbose_entry["status"]) - {"block_time"}
+        # And scan.py consumes the fallback entry, block_time=None (pinned
+        # NON-dependency of _parse_tx_entry).
+        parsed = wallet_scan._parse_tx_entry(confirmed)
+        assert parsed.height == 800_000
+        assert parsed.fee_sats == 1_500
+        assert parsed.block_time is None
+        assert parsed.receives == frozenset({ADDRS[0][0]})
+        assert parsed.spends == frozenset()
+        assert wallet_scan._parse_tx_entry(mempool).height is None
+
+    def test_verbose_capable_server_never_sees_the_fallback(
+        self, electrum: Any
+    ) -> None:
+        """Behavior on a verbose-supporting server is byte-identical to
+        today: every expansion keeps the 2-param call, block_time rides,
+        no non-verbose request is ever framed, the latch stays open."""
+        verbose = tx_verbose(
+            _RAW_TXID, vouts=(ADDRS[0][0],), height=800_000, block_time=1_700_000_000
+        )
+
+        def answer(params: list[Any]) -> Any:
+            if len(params) == 1:  # would be a regression: mark + refuse
+                server.unexpected.append("non-verbose expansion")
+                return ("error", "tx unavailable")
+            return verbose
+
+        server = electrum(
+            script={
+                "blockchain.scripthash.get_history": lambda p: [
+                    {"tx_hash": _RAW_TXID, "height": 800_000, "fee": 1_500}
+                ],
+                "blockchain.transaction.get": answer,
+            }
+        )
+        with _client(server) as client:
+            (entry,) = client.get_address_txs(ADDRS[0][0])
+        assert server.unexpected == []
+        assert all(
+            len(p) > 1 for m, p in server.requests if m == "blockchain.transaction.get"
+        )
+        assert client._verbose_txs_unsupported is False
+        assert entry == {
+            "txid": _RAW_TXID,
+            "status": {
+                "confirmed": True,
+                "block_height": 800_000,
+                "block_time": 1_700_000_000,
+            },
+            "fee": 1_500,
+            "vin": [{"prevout": {"scriptpubkey_address": _EXTERNAL}}],
+            "vout": [{"scriptpubkey_address": ADDRS[0][0]}],
+        }
+
+    def test_different_rpc_error_propagates_and_does_not_latch(
+        self, electrum: Any
+    ) -> None:
+        """MAJOR (review): the latch flips ONLY on the electrs -32603 code. A
+        verbose-CAPABLE server that answers a transient, DIFFERENT rpc error
+        (here code -1 "temporary") on one expansion must propagate that error
+        per the current per-tx semantics AND leave the latch open — a later
+        expansion still attempts verbose instead of silently degrading."""
+        verbose = tx_verbose(
+            _RAW_TXID, vouts=(ADDRS[0][0],), height=800_000, block_time=1_700_000_000
+        )
+        attempts = {"verbose": 0}
+
+        def answer(params: list[Any]) -> Any:
+            if len(params) == 1:
+                server.unexpected.append("non-verbose expansion")
+                return ("error", "tx unavailable")
+            attempts["verbose"] += 1
+            if attempts["verbose"] == 1:  # one transient per-tx failure...
+                return ("error", "temporary", -1)
+            return verbose  # ...then verbose is fine again
+
+        server = electrum(
+            script={
+                "blockchain.scripthash.get_history": lambda p: [
+                    {"tx_hash": _RAW_TXID, "height": 800_000, "fee": 1_500}
+                ],
+                "blockchain.transaction.get": answer,
+            }
+        )
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.get_address_txs(ADDRS[0][0])
+        # The transient rpc-error propagated, rpc_code intact.
+        assert excinfo.value.failure_class == RPC_ERROR
+        assert excinfo.value.rpc_code == -1
+        # The latch is still open.
+        assert client._verbose_txs_unsupported is False
+        # A LATER expansion still attempts verbose (and wins): the same scan
+        # succeeds with the verbose shape — no silent degradation.
+        (entry,) = client.get_address_txs(ADDRS[0][0])
+        assert server.unexpected == []
+        assert attempts["verbose"] == 2
+        assert entry["status"]["block_time"] == 1_700_000_000
+        assert client._verbose_txs_unsupported is False
+
+    def test_rpc_error_without_code_does_not_latch(self, electrum: Any) -> None:
+        """MAJOR (review): an error envelope whose code is absent/malformed
+        (rpc_code None) is NOT the "verbose unsupported" signal and must not
+        latch — it propagates unchanged, keeping the fallback from ever
+        switching the whole client into degraded mode on a broken server."""
+        server = electrum(
+            script={
+                "blockchain.scripthash.get_history": lambda p: [
+                    {"tx_hash": _RAW_TXID, "height": 800_000}
+                ],
+                "blockchain.transaction.get": lambda p: (
+                    # non-int code → the client's value-free extractor yields
+                    # rpc_code None (never a valid latch key)
+                    ("error", "malformed envelope", "not-an-int")
+                ),
+            }
+        )
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.get_address_txs(ADDRS[0][0])
+        assert excinfo.value.failure_class == RPC_ERROR
+        assert excinfo.value.rpc_code is None
+        assert client._verbose_txs_unsupported is False
+
+    def test_transport_loss_during_fallback_keeps_the_retry_policy(
+        self, electrum: Any, record_sleeps: Any
+    ) -> None:
+        """The fallback call is an ordinary _rpc call: a transport loss on
+        the non-verbose fetch retries per the shared budget (not swallowed,
+        not the server-error fail-immediate path), reconnecting first."""
+        attempts = {"nonverbose": 0}
+
+        def answer(params: list[Any]) -> Any:
+            if len(params) > 1:
+                return ("error", "verbose unsupported", -32603)
+            attempts["nonverbose"] += 1
+            if attempts["nonverbose"] == 1:  # first non-verbose attempt dies
+                return CLOSE
+            return _RAW_TX_HEX
+
+        server = electrum(
+            script={
+                "blockchain.scripthash.get_history": lambda p: [
+                    {"tx_hash": _RAW_TXID, "height": 800_000}
+                ],
+                "blockchain.transaction.get": answer,
+            }
+        )
+        with _client(server, max_retries=2) as client:
+            (entry,) = client.get_address_txs(ADDRS[0][0])
+        assert entry["txid"] == _RAW_TXID
+        assert len(record_sleeps) == 1  # one backoff, like every transport retry
+        assert server.connects == 2  # the reconnect-before-retry discipline
+
+    def test_exhausted_transport_during_fallback_surfaces_as_network_error(
+        self, electrum: Any, record_sleeps: Any
+    ) -> None:
+        """And when the budget runs out the transport failure surfaces with
+        its existing class — the fallback never converts it into a silent
+        success or an rpc-error mislabel."""
+        server = electrum(
+            script={
+                "blockchain.scripthash.get_history": lambda p: [
+                    {"tx_hash": _RAW_TXID, "height": 800_000}
+                ],
+                "blockchain.transaction.get": lambda p: (
+                    ("error", "verbose unsupported", -32603)
+                    if len(p) > 1
+                    else CLOSE
+                ),
+            }
+        )
+        with _client(server, max_retries=0) as client, pytest.raises(ChainError) as excinfo:
+            client.get_address_txs(ADDRS[0][0])
+        assert str(excinfo.value) == "address-txs failed: network error (ConnectionResetError)"
+        assert excinfo.value.failure_class == CONNECT_REFUSED
+        assert record_sleeps == []  # budget 0: exactly one attempt, same as ever
+
+    @pytest.mark.parametrize(
+        "junk",
+        [
+            "not hex",  # not even hex
+            42,  # not a string at all
+            {"txid": "a" * 64},  # a server answering verbose-shaped anyway
+            TX_HEX,  # a PARSEABLE but FOREIGN transaction
+        ],
+    )
+    def test_unusable_raw_answer_fails_closed_value_free(
+        self, electrum: Any, junk: Any
+    ) -> None:
+        """The fallback trusts nothing: the non-verbose answer must decode
+        AND its own txid must re-bind to the requested one. Junk is a
+        value-free ChainError naming only the endpoint kind."""
+        server = electrum(
+            script={
+                "blockchain.scripthash.get_history": lambda p: [
+                    {"tx_hash": _RAW_TXID, "height": 800_000}
+                ],
+                "blockchain.transaction.get": lambda p: (
+                    junk if len(p) == 1 else ("error", "verbose unsupported", -32603)
+                ),
+            }
+        )
+        with _client(server) as client, pytest.raises(ChainError) as excinfo:
+            client.get_address_txs(ADDRS[0][0])
+        message = str(excinfo.value)
+        assert message.startswith("address-txs")
+        leaks = [ADDRS[0][0], _sh(ADDRS[0][0]), _RAW_TX_HEX, "127.0.0.1", "32603"]
+        if isinstance(junk, str):
+            leaks.append(junk)
+        assert all(leak not in message for leak in leaks if leak)
+        # The refusal itself was handled (latched); what surfaces is the
+        # unlabeled shape failure, exactly like every other parser error.
+        assert excinfo.value.failure_class is None
+        # The refusal latched the capability even though the scan failed.
+        assert client._verbose_txs_unsupported is True
 
 
 class TestTranslation:
