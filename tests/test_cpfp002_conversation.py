@@ -428,7 +428,11 @@ def test_card_framing_and_council_hedge(world) -> None:
         "Heads up: this spends a payment that hasn't confirmed yet — if that "
         "payment is undone, this won't send" in lines
     )
-    assert any(f"Hurries: {STUCK_TXID}" in line for line in lines)
+    # TCK-TXID-002 RE-ADJUDICATION (was: full 64-hex per TXID-001): the
+    # card's Hurries row prints the COMPACT token; the full parent id
+    # rides the txid_refs payload / the cached /details render (pinned in
+    # test_txid001_full_txids.py). The RESULT keeps the full value.
+    assert any(f"Hurries: {STUCK_TXID[:8]}…" in line for line in lines)
     assert lines[0] == (
         'Pending — say "sign" to review it on your device, or "cancel" to discard.'
     )

@@ -586,7 +586,10 @@ def test_consent_yes_broadcasts_the_same_tx_publicly(live) -> None:
     assert session.public_offer_txref is None and session.public_bcast_once is False
     assert fake.calls == 0                # pre-model intercept consumed it
     joined = "\n".join(outputs)
-    assert f"Sent! txid {TXID_OK}" in joined
+    # TCK-TXID-002 RE-ADJUDICATION: the chat ack prints the COMPACT
+    # token (the full id rides the txid_refs payload; the engine STATE
+    # above keeps the full value — the status binding is unaffected).
+    assert f"Sent! txid {TXID_OK[:8]}…" in joined
     assert app._PUBLIC_BCAST_SENT in joined
     assert "mempool.space" in joined
     store.close()

@@ -1698,7 +1698,9 @@ NODE_STATUS_DETECTION_DISABLED: Final[str] = "disabled"
 #: is the designer-approved copy quoted VERBATIM from that doc's appendix
 #: block; every VALUE they carry comes verbatim from the handler result
 #: dict — the UI computes nothing (integer formatting of result values
-#: only; txids in these lines are FULL 64-hex, TCK-TXID-001)).
+#: only; txids in these lines print the TCK-TXID-002 COMPACT token — the
+#: clarification reworks TXID-001's everywhere-full rule: the full id
+#: rides the txid_refs chip payload, the direct ask and /details)).
 _CARD_ASK_LINE: Final[str] = (
     'Pending — say "sign" to review it on your device, or "cancel" to discard.'
 )
@@ -10248,19 +10250,118 @@ def _last_block_suffix(client: ChainClient) -> str | None:
     return f"last block ~{minutes} min ago"
 
 
+# --------------------------------------- txid display affordance (TCK-TXID-002)
+#
+# USER CLARIFICATION (2026-09-16, supersedes TCK-TXID-001 "full txids
+# everywhere in replies"): a 64-hex wall is not user-friendly. Transcript
+# lines reference a transaction through the COMPACT token below. The web
+# static half renders that token as the UTXO-006 [tx] COPY CHIP (the chip
+# click puts the FULL txid on the clipboard; the full value never rides
+# rendered text) riding the additive typed ``txid_refs`` event; the CLI (no
+# buttons) prints the compact token itself. The FULL id surfaces ONLY on
+# (a) the deterministic direct ask (:func:`_run_txid_ask_turn`), (b) the
+# ``/details`` full-card reprint, and (c) inside explorer URLs (TCK-CHAT-006
+# — href-only, untouched by this ticket). The client contract mirrors
+# UTXO-006 all-or-nothing gating: a compact token is a chip ONLY when the
+# bubble carries a matching ``txid_refs`` entry; without the payload the
+# raw text renders (never a half-chipped line, never a fabricated id).
+
+#: TCK-TXID-002 — PINNED CLI compact form: the FIRST EIGHT lowercase hex
+#: characters of the txid plus the ellipsis (``d2c5204c…``), substituted
+#: for the full value with every other byte of the surrounding copy
+#: unchanged. 8 hex is the pin (the ticket's example shape, shortened to
+#: stay scannable on multi-line surfaces — a history listing of 20 lines
+#: carries 20 hints, so the where-is-the-full-id guidance lives ONCE in
+#: :data:`_TRANSCRIPT_HELP`, not on every line).
+_TXID_COMPACT_HEX: Final[int] = 8
+
+
+def _txid_compact(txid: str) -> str:
+    """The compact display token for one txid (TCK-TXID-002).
+
+    A canonical store/chain txid (64 lowercase hex — the
+    :data:`_BUMP_HEX64_RE` shape) renders ``<first 8 hex>…``; the EMPTY
+    value keeps the honest ``<unknown>`` marker (the TXID-001 dedup fix —
+    never a lone ellipsis); any other shape passes through VERBATIM (a
+    legacy/hand-built surface's value must not be silently shortened to
+    a prefix that cannot be re-matched against the real id).
+    """
+    if not txid:
+        return "<unknown>"
+    if _BUMP_HEX64_RE.fullmatch(txid):
+        return f"{txid[:_TXID_COMPACT_HEX]}…"
+    return txid  # non-txid shape (legacy stubs) — verbatim, no registration
+
+
+class _TxidRefs:
+    """Per-surface collector of the typed ``txid_refs`` payload
+    (TCK-TXID-002; mirrors the UTXO-005/006 ``utxo_rows`` additive-stamp
+    precedent — the emitter only exists on the web pump, the CLI sink
+    ignores the kind, ``emitter=None`` direct calls render text-only).
+
+    :meth:`token` returns the compact token the CALLER prints and
+    registers the full value; :meth:`emit` stamps one
+    :data:`EVENT_TXID_REFS` event when (and ONLY when) at least one
+    canonical txid was registered.
+
+    Payload entry — one per DISTINCT txid in print order — keys mirroring
+    the UTXO-006 row vocabulary: ``{"compact": <the EXACT printed token>,
+    "txid": <FULL 64-hex>, "txid_copy_only": true}`` — ``txid`` is the
+    chip's CLIPBOARD payload only, never rendered text. A client renders
+    no chip when the payload is absent, malformed, or ambiguous (two
+    distinct txids under one compact token — a first-8-hex collision,
+    ~2^-32 and bounded by this dict: an entry is keyed by the FULL id, so
+    a collision ships two entries with one ``compact`` and the client's
+    all-or-nothing gate falls back to raw text).
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, dict[str, object]] = {}
+
+    def token(self, txid: object) -> str:
+        """The printed compact token for ``txid``, registering the payload
+        entry when the value is a canonical 64-hex id."""
+        text = txid if isinstance(txid, str) else ""
+        if _BUMP_HEX64_RE.fullmatch(text):
+            self._entries.setdefault(
+                text,
+                {
+                    "compact": f"{text[:_TXID_COMPACT_HEX]}…",
+                    "txid": text,
+                    "txid_copy_only": True,
+                },
+            )
+        return _txid_compact(text)
+
+    def emit(self, emitter: EventEmitter | None) -> None:
+        """Stamp the additive payload (no registrations / no emitter = no
+        event — the UTXO-005 absence rule: absent key = old answer)."""
+        if emitter is None or not self._entries:
+            return
+        emitter.emit(
+            EVENT_TXID_REFS,
+            json.dumps(list(self._entries.values()), separators=(",", ":")),
+        )
+
+
 def _narrate_incoming_event(
-    event: IncomingEvent, suffix: str | None = None, number: int | None = None
+    event: IncomingEvent,
+    suffix: str | None = None,
+    number: int | None = None,
+    refs: _TxidRefs | None = None,
 ) -> str:
     """Narrate one ``watch_incoming`` surfacing event (ADR-0019).
 
     Dispatcher-owned narration from dispatcher-owned facts (P2-004): every
     value (amount, address, height) is quoted verbatim from the event, which
     the poller built from tool output — the model is never in this loop, and
-    nothing is generated or "corrected". The txid is the FULL 64-hex value
-    verbatim (TCK-TXID-001: the transcript is copy material — truncation
-    would hand click-to-copy a fragment). This text is deliberately shown
-    to the USER in the UI — the required exception to the
-    no-addresses/amounts rule; it is never logged.
+    nothing is generated or "corrected". The txid prints as the COMPACT
+    token (TCK-TXID-002, reworking TXID-001: full hex walls are not
+    user-friendly — the web renders the token as the [tx] copy chip off
+    the typed payload, and the full id rides the direct ask / /details
+    instead). This text is deliberately shown to the USER in the UI — the
+    required exception to the no-addresses/amounts rule; it is never
+    logged.
 
     ``suffix`` — the value-free "last block ~N min ago" note computed ONCE
     per drain (:func:`_last_block_suffix`); appended verbatim when present.
@@ -10270,20 +10371,28 @@ def _narrate_incoming_event(
     number here — rendered ``at #N <address>``. ``None`` (no store seam /
     registration failure / address-less event) renders the pre-CHAT-001
     line UNCHANGED: the printer never fabricates a number.
+
+    ``refs`` (TCK-TXID-002): the drain's payload collector — the full id
+    is registered for the ``txid_refs`` stamp alongside printing the
+    compact token. ``None`` (direct callers/tests) still renders the
+    compact token, simply with no payload to register into.
     """
+    tx_part = (
+        refs.token(event.txid) if refs is not None else _txid_compact(event.txid)
+    )
     address_part = f"#{number} {event.address}" if number is not None else event.address
     if event.kind == "received":
         state = "confirmed" if event.confirmed else "in mempool"
         line = (
             f"Incoming: received {event.amount_sats} sats at {address_part} "
-            f"({state}, tx {event.txid})."
+            f"({state}, tx {tx_part})."
         )
     else:
         height = event.height
         height_part = f" (height {height})" if height is not None else ""
         line = (
             f"Confirmed: {event.amount_sats} sats at {address_part} "
-            f"now confirmed{height_part} (tx {event.txid})."
+            f"now confirmed{height_part} (tx {tx_part})."
         )
     if suffix:
         line = f"{line} · {suffix}"
@@ -10400,6 +10509,7 @@ def _drain_watch(
     *,
     client: ChainClient | None = None,
     store: Store | None = None,
+    emitter: EventEmitter | None = None,
 ) -> int:
     """Run one due watch cycle (if any) and narrate its events to the user.
 
@@ -10515,13 +10625,19 @@ def _drain_watch(
                 except (StoreError, sqlite3.Error):
                     continue
         for event in events:
-            output_fn(
-                sanitize_tool_output(
-                    _narrate_incoming_event(
-                        event, suffix, number=numbers.get(event.address or "")
-                    )
-                )
+            # TCK-TXID-002: the line prints the COMPACT token and the full
+            # id rides the additive ``txid_refs`` payload. The pump's
+            # ``_narrate_line`` closes EACH watch line's own turn, so the
+            # stamp rides the same event window BEFORE the line (turn
+            # renderers stamp AFTER their lines, before the closer — the
+            # client matches by token, never by order; see
+            # :data:`EVENT_TXID_REFS`). CLI (emitter=None sink) = text only.
+            refs = _TxidRefs()
+            line = _narrate_incoming_event(
+                event, suffix, number=numbers.get(event.address or ""), refs=refs
             )
+            refs.emit(emitter)
+            output_fn(sanitize_tool_output(line))
         return len(events)
     except (ChainError, wallet_scan.ScanError, StoreError, sqlite3.Error, WatchKeyError):
         # Fail open: a background-poll failure must never interrupt the chat.
@@ -10588,6 +10704,19 @@ EVENT_OWN_ADDRESS: Final[str] = "own_address"
 #: ``utxo_rows`` (absent → no emission); the CLI sink ignores the kind, so
 #: the terminal keeps its byte-identical text.
 EVENT_UTXO_ROWS: Final[str] = "utxo_rows"
+
+#: Additive typed ``txid_refs`` SSE event (TCK-TXID-002): the narration
+#: printers stamp a bare JSON array of :class:`_TxidRefs` payload entries
+#: ({"compact", "txid", "txid_copy_only"}) for the COMPACT txid tokens
+#: their lines printed — the chip's clipboard material (the full id never
+#: rides the text). Position within the bubble's event window follows the
+#: ``utxo_rows`` precedent (AFTER the narration lines, BEFORE the closer)
+#: for the turn renderers, and BEFORE the line for the watch drain (whose
+#: every line is one closed bubble — the pump's ``_narrate_line``); the
+#: client therefore associates entries with bubble lines by TOKEN MATCH
+#: within the same window, never by order. Absent payload = raw text
+#: (the UTXO-006 all-or-nothing rule); the CLI sink ignores the kind.
+EVENT_TXID_REFS: Final[str] = "txid_refs"
 
 #: Command token the web transport stamps on a typed ``/state`` snapshot
 #: request (TCK-WEB-003). Recognized ONLY as the ``command`` label of a
@@ -14766,7 +14895,9 @@ def _pump(
 
     while True:
         if not (scan is not None and scan.in_progress):
-            watch_count = _drain_watch(watcher, _narrate_line, client=client, store=store)
+            watch_count = _drain_watch(
+                watcher, _narrate_line, client=client, store=store, emitter=emitter
+            )
             if watch_count:
                 loop.record_event("watch_events", watch_count)
         if ready is not None:
@@ -17417,6 +17548,8 @@ def _repl(
 #: all deterministic transcript/channel intercepts, never model intents.
 _TRANSCRIPT_HELP: Final[str] = (
     "Commands: /details — reprint the pending transaction's full card; "
+    "\"what is the transaction id for utxo #N?\" (or \"...for the pending "
+    "transaction?\") — print that full id; "
     "/label — list or add address labels (your coins inherit them); "
     "/setup — choose which server answers the app about your addresses "
     "(your own Electrum server or Bitcoin Core node, or the consented "
@@ -19656,6 +19789,7 @@ def _run_coin_filter_turn(
     output_fn: Callable[[str], None],
     *,
     scan_gate: StartupScan | None = None,
+    emitter: EventEmitter | None = None,
 ) -> bool:
     """Consume a filtered COIN-listing ask; ``True`` = consumed (the line
     never reaches the model or the transcript — CHAT-005/LABEL-001's
@@ -20024,7 +20158,7 @@ def _run_coin_filter_turn(
     if label_like:
         result["label_like_fallback"] = True
     result.update(_pending_summary(kept, txs))
-    _print_utxos(result, output_fn)
+    _print_utxos(result, output_fn, emitter=emitter)
     return True
 
 
@@ -20969,6 +21103,147 @@ def _run_network_status_turn(
     return True
 
 
+# ---------------------------------------- direct transaction-id ask (TCK-TXID-002)
+#
+# The full-id escape hatch of the compact-transcript contract (the USER
+# CLARIFICATION 2026-09-16: full hex in ordinary lines is not
+# user-friendly; the FULL txid is printed ONLY on a DIRECT ask). Two
+# closed referents, both engine truth: a registry number ("what is the
+# transaction id for utxo #1?" — the CHAT-001 registry resolve the scoped
+# listings already run) and the session's pending transaction
+# ("transaction id for the pending transaction?" — the flow's OWN
+# broadcast record, the same flow-ownership binding as the
+# PUBLICBCAST-002 status-lag rule: while the flow holds the broadcast,
+# its chain-reported id IS the answer; a staged pre-broadcast plan has no
+# recorded id and the answer says so — never a computed guess).
+#
+# The answer prints the FULL 64-hex value ON PURPOSE: it rides the
+# transcript as text the client's standalone-token copy scan
+# (TXID-001's [0-9a-f]{64} matcher) already makes copyable — no chip
+# payload here (this IS the full value, not a reference to one).
+# Value-free by construction: ids and the user's own #N, never amounts,
+# addresses or labels.
+
+#: Id-phrase markers (lowercased substring match): the whole closed
+#: family of the clarification's wording ("transaction id", "tx id") plus
+#: the canonical single word "txid".
+_TXID_ASK_ID_PHRASES: Final[tuple[str, ...]] = ("transaction id", "tx id", "txid")
+#: The registry referent: exactly ONE "#N" token (multi-referent asks are
+#: NOT half-answered — they release to the ordinary pipeline).
+_TXID_ASK_NUMBER_RE: Final = re.compile(r"#(\d+)")
+#: The pending referent word (the flow-owned pending transaction — the
+#: same record the card's "Ref:" line names for cancel/reprint).
+_TXID_ASK_PENDING_WORD: Final[str] = "pending"
+
+_TXID_ASK_NONE_PENDING: Final[str] = "No transaction is pending."
+_TXID_ASK_NO_ID_YET: Final[str] = (
+    "The pending transaction has no transaction id yet — the id is "
+    "recorded when it broadcasts."
+)
+_TXID_ASK_NO_COINS: Final[str] = (
+    "Utxo #{number} has no unspent coins to name a transaction id for."
+)
+
+
+def _txid_ask(line: str) -> int | str | None:
+    """Deterministic direct-ask parse (TCK-TXID-002, BEFORE the model).
+
+    ``None`` — not an id ask (ordinary pipeline; never-trap). An ``int``
+    — the registry number of a "#N" referent. ``"pending"`` — the
+    session's pending transaction.
+
+    Releases (``None``) when the line carries a 64-hex TOKEN (an
+    explicit-id question keeps the tx_status route — the id is already in
+    the user's hand) and when it names no referent at all ("what is a
+    txid?" stays the model's honest knowledge chat). One #N only: a
+    multi-number ask is never half-answered.
+    """
+    lower = line.lower()
+    if _EXPLORER_TXID_RE.search(lower):
+        return None
+    if not any(phrase in lower for phrase in _TXID_ASK_ID_PHRASES):
+        return None
+    numbers = _TXID_ASK_NUMBER_RE.findall(line)
+    if len(numbers) == 1:
+        return int(numbers[0])
+    if numbers:
+        return None
+    if _TXID_ASK_PENDING_WORD in lower:
+        return "pending"
+    return None
+
+
+def _run_txid_ask_turn(
+    store: Store | None,
+    flow: TxFlow,
+    line: str,
+    output_fn: Callable[[str], None],
+) -> bool:
+    """Answer a direct transaction-id ask with the FULL txid (TCK-TXID-002);
+    ``True`` when consumed. A store surprise returns False (the ordinary
+    pipeline continues — sugar never crashes a turn)."""
+    referent = _txid_ask(line)
+    if referent is None or store is None:
+        return False
+    try:
+        wallet = store.get_active_wallet()
+        if wallet is None:
+            return False
+        if referent == "pending":
+            if flow.state is TxFlowStatus.BROADCAST and flow.txid is not None:
+                output_fn(
+                    sanitize_tool_output(
+                        f"Transaction id for the pending transaction: {flow.txid}"
+                    )
+                )
+            elif flow.state in (
+                TxFlowStatus.CREATED,
+                TxFlowStatus.CONFIRMED,
+                TxFlowStatus.SIGNED,
+            ):
+                output_fn(sanitize_tool_output(_TXID_ASK_NO_ID_YET))
+            else:
+                output_fn(sanitize_tool_output(_TXID_ASK_NONE_PENDING))
+            return True
+        number = referent  # the closed parse guarantees an int here
+        address = _resolve_address_ref(store, wallet.id, number)
+        if address is None:
+            output_fn(sanitize_tool_output(ADDRESS_REF_UNKNOWN))
+            return True
+        coins = sorted(
+            (
+                (u.txid, u.vout)
+                for u in store.get_utxos_for_wallet(wallet.id)
+                if u.address == address
+            ),
+            key=lambda coin: (coin[0], coin[1]),
+        )
+        if not coins:
+            output_fn(
+                sanitize_tool_output(_TXID_ASK_NO_COINS.format(number=number))
+            )
+            return True
+        if len(coins) == 1:
+            output_fn(
+                sanitize_tool_output(
+                    f"Transaction id for utxo #{number}: {coins[0][0]}"
+                )
+            )
+        else:
+            # One address, several coins: every coin's id, vout-named, in
+            # the deterministic (txid, vout) order (never a guess which
+            # one the user meant — the registry numbers the ADDRESS).
+            for txid, vout in coins:
+                output_fn(
+                    sanitize_tool_output(
+                        f"Transaction id for utxo #{number} (vout {vout}): {txid}"
+                    )
+                )
+        return True
+    except (StoreError, sqlite3.Error):
+        return False
+
+
 # --- TCK-UTXO-007: the pinned-coin send (deterministic, PRE-MODEL) ---------
 #
 # USER FEATURE (MW-16 round 4 item 10; UX council 2026-09-16, both critics
@@ -21690,7 +21965,7 @@ def _run_turn(
     # after the settings and network-status intercepts (their keys keep
     # priority) and before the bump speed-word route.
     if store is not None and _run_coin_filter_turn(
-        store, line, output_fn, scan_gate=scan_gate
+        store, line, output_fn, scan_gate=scan_gate, emitter=emitter
     ):
         return
     # TCK-HW-007: natural-language SHOW-ON-DEVICE ("show it to me on my
@@ -21708,6 +21983,18 @@ def _run_turn(
         session, line, output_fn,
         store=store, signer_selection=signer_selection, parsed=parsed,
     ):
+        return
+    # TCK-TXID-002: the DIRECT transaction-id ask ("what is the transaction
+    # id for utxo #1?" / "transaction id for the pending transaction?") —
+    # the full-id escape hatch of the compact-transcript contract (the
+    # clarification supersedes TXID-001's everywhere-full narration).
+    # READ-ONLY engine truth (registry resolve / the flow's own broadcast
+    # record), value-free answer, checked LAST among the deterministic
+    # intercepts (conversations, labels, settings, network status, the
+    # coin filter and show-on-device keep priority); a line carrying a
+    # 64-hex token keeps the tx_status route and anything the closed
+    # matcher cannot FULLY resolve falls through (never-trap).
+    if _run_txid_ask_turn(store, flow, line, output_fn):
         return
     speed = _bump_speed_choice(line)
     if speed is not None and IntentName.BUMP_FEE in table:
@@ -21903,9 +22190,11 @@ def _print_turn(
     """Print one agent turn according to its status and intent.
 
     Every printed value comes verbatim from the handler result dict —
-    the UI computes nothing (txids print FULL 64-hex per TCK-TXID-001:
-    the transcript is the user's own data and the click-to-copy token
-    scan needs the complete value; the value-free rule scrubs logs). All
+    the UI computes nothing (txids print as the TCK-TXID-002 COMPACT
+    token with the full value riding the additive ``txid_refs`` payload
+    / the direct ask / ``/details`` — the clarification supersedes
+    TXID-001's everywhere-full narration; the value-free rule scrubs
+    logs). All
     strings pass through
     :func:`~localwallet.agent.context.sanitize_tool_output` immediately
     before printing (SR-006: the envelope grammar permits ``\\uXXXX`` so
@@ -21935,7 +22224,7 @@ def _print_turn(
     elif envelope.intent is IntentName.GET_BALANCE:
         _print_balance(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.GET_HISTORY:
-        _print_history(turn.result or {}, output_fn)
+        _print_history(turn.result or {}, output_fn, emitter=emitter)
     elif envelope.intent is IntentName.GET_UTXOS:
         _print_utxos(turn.result or {}, output_fn, emitter=emitter)
     elif envelope.intent is IntentName.GET_ADDRESSES:
@@ -21947,17 +22236,21 @@ def _print_turn(
     elif envelope.intent is IntentName.CREATE_TX:
         _print_create_tx(turn.result or {}, output_fn, session=session)
     elif envelope.intent is IntentName.SELF_TRANSFER:
-        _print_self_transfer(turn.result or {}, output_fn, session=session)
+        _print_self_transfer(
+            turn.result or {}, output_fn, session=session, emitter=emitter
+        )
     elif envelope.intent is IntentName.BUMP_FEE:
-        _print_bump_fee(turn.result or {}, output_fn, session=session)
+        _print_bump_fee(turn.result or {}, output_fn, session=session, emitter=emitter)
     elif envelope.intent is IntentName.CONFIRM_TX:
         _print_confirm_tx(turn.result or {}, output_fn)
     elif envelope.intent is IntentName.SIGN_TX:
-        _print_sign_tx(turn.result or {}, output_fn)
+        _print_sign_tx(turn.result or {}, output_fn, emitter=emitter)
     elif envelope.intent is IntentName.BROADCAST_TX:
-        _print_broadcast_tx(turn.result or {}, output_fn, session=session)
+        _print_broadcast_tx(
+            turn.result or {}, output_fn, session=session, emitter=emitter
+        )
     elif envelope.intent is IntentName.TX_STATUS:
-        _print_tx_status(turn.result or {}, output_fn)
+        _print_tx_status(turn.result or {}, output_fn, emitter=emitter)
     elif envelope.intent is IntentName.NODE_STATUS:
         _print_node_status(turn.result or {}, output_fn)
     else:  # pragma: no cover — closed intent enum
@@ -22065,13 +22358,22 @@ def _print_freshness_note(
         output_fn(sanitize_tool_output(FRESHNESS_NOTE))
 
 
-def _print_history(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
-    """Print history lines: ``tx <txid> <direction> <height|unconfirmed>``.
+def _print_history(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    *,
+    emitter: EventEmitter | None = None,
+) -> None:
+    """Print history lines: ``tx <compact-txid> <direction> <height|unconfirmed>``.
 
     Address-free by contract (P1 narration): only txid/direction/height
-    are shown; values are verbatim from the handler result dict — the
-    txid FULL 64-hex (TCK-TXID-001: the transcript is copy material; the
-    value-free rule scrubs logs, not the user's own transaction ids). A
+    are shown; values are verbatim from the handler result dict. The
+    txid prints as the COMPACT token (TCK-TXID-002 reworking TXID-001's
+    everywhere-full rule — full hex walls are not user-friendly): the web
+    client renders the token as the [tx] copy chip off the additive
+    ``txid_refs`` payload stamped after these lines (the full id rides
+    that payload / the direct ask), the CLI prints the token itself, and
+    an ``<unknown>`` missing id stays honest and unchipable. A
     stale-flagged answer (ADR-0022) leads with the value-free loading note
     — an empty cache during the first scan must never read as a final
     "No transactions found."
@@ -22094,15 +22396,21 @@ def _print_history(result: Mapping[str, object], output_fn: Callable[[str], None
     if not isinstance(transactions, list) or not transactions:
         output_fn(sanitize_tool_output("No transactions found."))
         return
+    refs = _TxidRefs()
     for tx in transactions:
         if not isinstance(tx, dict):  # pragma: no cover — handler-shaped data
             continue
-        txid = str(tx.get("txid", ""))
-        txid_part = txid or "<unknown>"
         height = tx.get("height")
         height_label = str(height) if height is not None else "unconfirmed"
         direction = str(tx.get("direction", "?"))
-        output_fn(sanitize_tool_output(f"tx {txid_part} {direction} {height_label}"))
+        output_fn(
+            sanitize_tool_output(
+                f"tx {refs.token(str(tx.get('txid', '')))} {direction} {height_label}"
+            )
+        )
+    # TCK-UTXO-005/006 additive-stamp precedent: after the lines, before
+    # the closer (emitter=None / no canonical ids = no event).
+    refs.emit(emitter)
 
 
 def _print_utxos(
@@ -22147,6 +22455,19 @@ def _print_utxos(
     result WITHOUT the key (empty/error/legacy) emits nothing. Mirrors
     the HW-005 ``own_address`` additive-stamp precedent; the CLI sink
     (emitter=None) ignores the kind and stays byte-identical.
+
+    TCK-TXID-002 (reworking this line's TXID-001 full-txid rule): the
+    narration's ``tx`` segment prints the COMPACT token (pinned CLI form
+    :data:`_TXID_COMPACT_HEX`). When the result carries ``utxo_rows``, the
+    UTXO-006 row payload (full txid + ``txid_copy_only``, row shape
+    contract-FROZEN by this ticket) is the web chip and NO ``txid_refs``
+    event is stamped (the rows event stays last, byte-for-byte per the
+    005 emission pins); on the TEXT-fallback surfaces (pre-model filtered
+    listings, legacy no-rows results) the full ids ride an additive
+    ``txid_refs`` stamped instead, so the web client can still chip the
+    compact line. CLI (emitter=None) just prints the token; the full id
+    reaches the user via ``/details`` and the direct ask
+    (:func:`_run_txid_ask_turn`).
     """
     if result.get("error") is not None:
         if result.get("error") == _ADDRESS_REF_UNKNOWN:
@@ -22173,6 +22494,7 @@ def _print_utxos(
     if not isinstance(utxos, list) or not utxos:
         output_fn(sanitize_tool_output("No unspent outputs."))
         return
+    refs = _TxidRefs()
     for utxo in utxos:
         if not isinstance(utxo, dict):  # pragma: no cover — handler-shaped data
             continue
@@ -22193,8 +22515,13 @@ def _print_utxos(
         arrival_part = (
             f" · arrived {arrival}" if isinstance(arrival, str) and arrival else ""
         )
-        txid = str(utxo.get("txid", ""))
-        txid_part = txid or "<unknown>"
+        # TCK-TXID-002: the FALLBACK render's txid is the COMPACT token
+        # (this is the CLI line, and the web line a client renders only
+        # when ``utxo_rows`` is ABSENT — filtered listings/legacy). The
+        # full id rides the emitted ``txid_refs`` for that fallback chip.
+        # The UTXO-005 ``utxo_rows`` payload is UNCHANGED (still the full
+        # txid + ``txid_copy_only`` for the gated row chip).
+        txid_part = refs.token(str(utxo.get("txid", "")))
         output_fn(
             sanitize_tool_output(
                 f"{address_part}{utxo.get('value_sats', 0):,} sats · "
@@ -22210,6 +22537,14 @@ def _print_utxos(
             EVENT_UTXO_ROWS,
             json.dumps(result["utxo_rows"], separators=(",", ":")),
         )
+    elif "utxo_rows" not in result:
+        # TCK-TXID-002: the TEXT-fallback surfaces only (pre-model filtered
+        # listings, legacy results with no rows key) get the line-chip
+        # payload here. When ``utxo_rows`` ride, the UTXO-006 ROW chip is
+        # the txid affordance (row shape contract-frozen) and NO txid_refs
+        # is emitted — one chip mechanism per rendered surface, and the
+        # 005 "rows event is last" order pin stands.
+        refs.emit(emitter)
 
 
 def _print_pending_block(
@@ -22538,12 +22873,13 @@ def _print_bump_fee(
     output_fn: Callable[[str], None],
     *,
     session: SendSession | None = None,
+    emitter: EventEmitter | None = None,
 ) -> None:
     """Narrate a ``bump_fee`` outcome (TCK-RBF-004).
 
     Success → the replacement PLAN CARD: the gate ask line (byte-identical
     to the send card's — the dual-key wording is nobody's to change), the
-    two pinned rows (``Replaces: <old txid> — …only one of these two ever
+    two pinned rows (``Replaces: <txid> — …only one of these two ever
     will`` and ``Fee: <old> → <new> (paying <delta> extra)``, every figure
     verbatim from the handler result — the builder's numbers, the FEE-003
     rate text), To/Pay/From context, and the ``/details`` demotion tail
@@ -22561,6 +22897,13 @@ def _print_bump_fee(
     refusal renders its sanctioned floor number from the STRUCTURED keys
     (the ``insufficient_funds`` precedent — amounts are card material,
     never detail-string material).
+
+    TCK-TXID-002 (reworking this printer's TXID-001 everywhere-full rule):
+    every txid the chat card/option lines print is the COMPACT token with
+    the full id riding the additive ``txid_refs`` payload (the web [tx]
+    chip's clipboard material), and the cached ``card_render`` — the
+    ``/details`` full reprint — keeps the FULL value (the ticket's stated
+    full-id surfaces).
     """
     error = result.get("error")
     ask = result.get("ask")
@@ -22568,12 +22911,12 @@ def _print_bump_fee(
         options = result.get("options")
         count = len(options) if isinstance(options, list) else 0
         output_fn(sanitize_tool_output(_BUMP_TARGET_HEAD.format(count=count)))
+        refs = _TxidRefs()
         if isinstance(options, list):
             for entry in options:
                 if not isinstance(entry, dict):  # pragma: no cover — handler-shaped
                     continue
-                txid = str(entry.get("txid", ""))
-                txid_part = txid or "<unknown>"
+                txid_part = refs.token(str(entry.get("txid", "")))
                 amount = entry.get("amount_sats")
                 amount_part = (
                     f"{amount:,} sats"
@@ -22598,6 +22941,7 @@ def _print_bump_fee(
                         f"{rate_part} · {age_part}"
                     )
                 )
+        refs.emit(emitter)
         return
     if error is None and ask == "funding":
         output_fn(sanitize_tool_output(_BUMP_FUNDING_HEAD))
@@ -22666,8 +23010,10 @@ def _print_bump_fee(
     new_fee = _card_sats(result, "fee_sats")
     delta = _card_sats(result, "fee_delta_sats")
     lines: list[str] = [_CARD_ASK_LINE]
+    replaces_line = ""  # the FULL Replaces row (cache material); "" = absent
     if old_txid:
-        lines.append(_BUMP_REPLACES_LINE.format(old_txid=old_txid))
+        replaces_line = _BUMP_REPLACES_LINE.format(old_txid=old_txid)
+        lines.append(replaces_line)
     amount = _card_sats(result, "amount_sats")
     lines.append(f"To: {result.get('recipient', '')}")
     lines.append(f"Pay: {amount} sats" if amount is not None else "Pay: unavailable")
@@ -22690,10 +23036,19 @@ def _print_bump_fee(
     else:
         lines.append("From: your wallet (sources unavailable)")
     lines.append(_CARD_DETAILS_TAIL)
+    # TCK-TXID-002: the transcript Replaces row prints the COMPACT token
+    # (web [tx] chip off the txid_refs payload, CLI the token itself);
+    # ``lines`` keeps the FULL row, so the cached /details reprint still
+    # carries the full value (the ticket's sanctioned full-id surface).
+    refs = _TxidRefs()
+    replaces_compact = (
+        _BUMP_REPLACES_LINE.format(old_txid=refs.token(old_txid)) if old_txid else ""
+    )
     for line in lines:
-        output_fn(sanitize_tool_output(line))
+        output_fn(sanitize_tool_output(replaces_compact if line == replaces_line else line))
+    refs.emit(emitter)
     if session is not None:
-        full = lines[:-1]
+        full = lines[:-1]  # FULL rows — /details never sees a compaction
         expires = result.get("expires_in_s")
         if isinstance(expires, int) and not isinstance(expires, bool):
             full.append(f"Expires: ~{expires // 60} min")
@@ -22707,23 +23062,27 @@ def _print_bump_fee(
 
 
 def _print_cpfp_coin_ask(
-    result: Mapping[str, object], output_fn: Callable[[str], None]
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    *,
+    emitter: EventEmitter | None = None,
 ) -> None:
     """The indexed stuck-payment choice ask (TCK-CPFP-002 deliverable 1):
     amount + age + destination label, every field verbatim from the
     store's rows (an unrecorded age says so, never invented — the bump
     target-ask's shape and honesty). The never-trap wording rides the
-    head line itself."""
+    head line itself. TXID-002: the ``tx`` segment prints the COMPACT
+    token, the full id rides the additive ``txid_refs`` payload."""
     options = result.get("options")
     count = len(options) if isinstance(options, list) else 0
     output_fn(sanitize_tool_output(_CPFP_TARGET_HEAD.format(count=count)))
+    refs = _TxidRefs()
     if not isinstance(options, list):  # pragma: no cover — handler-shaped
         return
     for entry in options:
         if not isinstance(entry, dict):  # pragma: no cover — handler-shaped
             continue
-        txid = str(entry.get("txid", ""))
-        txid_part = txid or "<unknown>"
+        txid_part = refs.token(str(entry.get("txid", "")))
         amount = entry.get("value_sats")
         amount_part = (
             f"{amount:,} sats"
@@ -22744,6 +23103,7 @@ def _print_cpfp_coin_ask(
         if isinstance(label, str) and label:
             line += f" · labeled {label}"
         output_fn(sanitize_tool_output(line))
+    refs.emit(emitter)
 
 
 def _print_cpfp_options(
@@ -22789,6 +23149,7 @@ def _print_cpfp_plan(
     output_fn: Callable[[str], None],
     *,
     session: SendSession | None = None,
+    emitter: EventEmitter | None = None,
 ) -> None:
     """Render a staged cpfp CHILD plan card (TCK-CPFP-002 deliverable 3).
 
@@ -22807,8 +23168,10 @@ def _print_cpfp_plan(
     every other card."""
     lines: list[str] = [_CARD_ASK_LINE, _CPFP_CARD_HEAD, _CPFP_HEDGE_LINE]
     parent_txid = result.get("cpfp_parent_txid")
+    parent_line = ""  # the FULL Hurries row (cache material); "" = absent
     if isinstance(parent_txid, str) and parent_txid:
-        lines.append(_CPFP_PARENT_LINE.format(parent_txid=parent_txid))
+        parent_line = _CPFP_PARENT_LINE.format(parent_txid=parent_txid)
+        lines.append(parent_line)
     amount = _card_sats(result, "amount_sats")
     lines.append(f"Pay: {amount} sats — into 1 fresh coin of yours")
     fee_sats = _card_sats(result, "fee_sats")
@@ -22853,13 +23216,21 @@ def _print_cpfp_plan(
     else:
         lines.append("From: your wallet (sources unavailable)")
     lines.append(_CARD_DETAILS_TAIL)
+    # TCK-TXID-002: the transcript Hurries row prints the COMPACT token
+    # (chip off txid_refs / CLI token); ``lines`` keeps the FULL row so the
+    # cached /details reprint carries the full value.
+    refs = _TxidRefs()
+    parent_compact = ""
+    if isinstance(parent_txid, str) and parent_txid:
+        parent_compact = _CPFP_PARENT_LINE.format(parent_txid=refs.token(parent_txid))
     for line in lines:
-        output_fn(sanitize_tool_output(line))
+        output_fn(sanitize_tool_output(parent_compact if line == parent_line else line))
+    refs.emit(emitter)
     if session is not None:
         # The /details full render (the brief card demotes To/Expires/Ref
         # — the destinations are the plan's fresh receive address,
         # verbatim, printed only here; the model never sees any of it).
-        full = lines[:-1]
+        full = lines[:-1]  # FULL rows (incl. the full Hurries id)
         dests = result.get("self_destinations")
         if isinstance(dests, list):
             for entry in dests:
@@ -22891,6 +23262,7 @@ def _print_self_transfer(
     output_fn: Callable[[str], None],
     *,
     session: SendSession | None = None,
+    emitter: EventEmitter | None = None,
 ) -> None:
     """Narrate a ``self_transfer`` outcome (TCK-TX-SELF-001; the ``cpfp``
     mode's conversation branch is TCK-CPFP-002).
@@ -22913,11 +23285,11 @@ def _print_self_transfer(
         # child's plan card — the cpfp conversation's own render family.
         ask = result.get("ask")
         if ask == "coin":
-            _print_cpfp_coin_ask(result, output_fn)
+            _print_cpfp_coin_ask(result, output_fn, emitter=emitter)
         elif ask == "options":
             _print_cpfp_options(result, output_fn)
         else:
-            _print_cpfp_plan(result, output_fn, session=session)
+            _print_cpfp_plan(result, output_fn, session=session, emitter=emitter)
         return
     if error is None:
         if result.get("fee_requote") is True:
@@ -22979,7 +23351,7 @@ def _print_self_transfer(
             # card (the carried display fields + the flow record's own
             # numbers) — never the misleading generic reshape.
             output_fn(sanitize_tool_output(_GUIDANCE_STILL_PENDING))
-            _print_cpfp_plan(result, output_fn, session=session)
+            _print_cpfp_plan(result, output_fn, session=session, emitter=emitter)
             return
         if result.get("self_transfer") is True:
             output_fn(sanitize_tool_output(_GUIDANCE_STILL_PENDING))
@@ -23542,7 +23914,12 @@ def _print_confirm_tx(result: Mapping[str, object], output_fn: Callable[[str], N
     output_fn(sanitize_tool_output(_GENERIC_FAILURE))  # pragma: no cover — handler-shaped
 
 
-def _print_sign_tx(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+def _print_sign_tx(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    *,
+    emitter: EventEmitter | None = None,
+) -> None:
     """Narrate a ``sign_tx`` outcome (TCK-P3-005 device-handoff UX, §10).
 
     - ``signed_file_missing`` → the file-path handoff line: the export
@@ -23553,10 +23930,12 @@ def _print_sign_tx(result: Mapping[str, object], output_fn: Callable[[str], None
     - ``revalidation_failed`` → the hard-stop line with the value-free
       detail from the re-validation gate; the tx hex never appears.
     - ``sign_refused`` / other errors → value-free refusal/failure lines.
-    - success → "Signed and verified ✓ txid <txid>. Ready to broadcast —
-      say 'broadcast'." with the txid verbatim from the re-validated
-      result; the PSBT payload is never printed. For a file-signer import
-      without a checksum sidecar, the ADR-0014 integrity note is added.
+    - success → "Signed and verified ✓ txid <compact>. Ready to broadcast
+      — say 'broadcast'." with the txid as the TCK-TXID-002 COMPACT token
+      (full id rides the additive ``txid_refs`` payload for the web chip;
+      the direct ask prints the full value); the PSBT payload is never
+      printed. For a file-signer import without a checksum sidecar, the
+      ADR-0014 integrity note is added.
     """
     error = result.get("error")
     if error == "signed_file_missing":
@@ -23590,9 +23969,10 @@ def _print_sign_tx(result: Mapping[str, object], output_fn: Callable[[str], None
         )
         return
     if result.get("status") == "signed":
+        refs = _TxidRefs()
         output_fn(
             sanitize_tool_output(
-                f"Signed and verified ✓ txid {result.get('txid', '')}. "
+                f"Signed and verified ✓ txid {refs.token(str(result.get('txid', '')))}. "
                 f"Ready to broadcast — say 'broadcast'."
             )
         )
@@ -23602,6 +23982,7 @@ def _print_sign_tx(result: Mapping[str, object], output_fn: Callable[[str], None
                     "Note: the signed file had no checksum sidecar — integrity not verified."
                 )
             )
+        refs.emit(emitter)
         return
     output_fn(sanitize_tool_output(_GENERIC_FAILURE))  # pragma: no cover — handler-shaped
 
@@ -23611,15 +23992,19 @@ def _print_broadcast_tx(
     output_fn: Callable[[str], None],
     *,
     session: SendSession | None = None,
+    emitter: EventEmitter | None = None,
 ) -> None:
     """Narrate a ``broadcast_tx`` outcome (TCK-P3-005).
 
-    Success → "Sent! txid <txid> — tracking…" with the txid verbatim from
-    the chain response. ``broadcast_failed`` keeps the signed transaction
-    and says so (single-attempt POST policy: retrying is explicit).
-    Refusals and other errors surface value-free; a ``store_warning`` is
-    printed after the success line (bookkeeping failed, broadcast didn't).
-    The tx hex never appears in any line.
+    Success → "Sent! txid <compact> — tracking…" with the chain response's
+    txid as the TCK-TXID-002 COMPACT token (the full id rides the additive
+    ``txid_refs`` payload — the web [tx] chip's clipboard — and the direct
+    ask / ``/details`` reprint; ``session.last_broadcast_txid`` keeps the
+    FULL engine-truth value). ``broadcast_failed`` keeps the signed
+    transaction and says so (single-attempt POST policy: retrying is
+    explicit). Refusals and other errors surface value-free; a
+    ``store_warning`` is printed after the success line (bookkeeping
+    failed, broadcast didn't). The tx hex never appears in any line.
 
     A success also carries the TCK-UTXO-001 capture state (design doc §1.2):
     the txid becomes ``session.last_broadcast_txid`` (what ``/label last``
@@ -23667,7 +24052,10 @@ def _print_broadcast_tx(
         return
     if result.get("status") == "broadcast":
         txid = str(result.get("txid", ""))
-        output_fn(sanitize_tool_output(f"Sent! txid {txid} — tracking…"))
+        refs = _TxidRefs()
+        output_fn(sanitize_tool_output(
+            f"Sent! txid {refs.token(txid)} — tracking…"
+        ))
         if result.get("via_public") is True:
             # TCK-PUBLICBCAST-001 (condition 4, honesty at the moment of
             # the broadcast): a public send is real, but the user's OWN
@@ -23677,25 +24065,34 @@ def _print_broadcast_tx(
             output_fn(sanitize_tool_output(_PUBLIC_BCAST_SENT))
         # TCK-RBF-004 supersede narration (ONLY on a broadcast that linked
         # the lineage — commit-only-on-success): the same BIP-125 hedge
-        # wording the plan card and the status answer carry.
+        # wording the plan card and the status answer carry. TXID-002: the
+        # replaced id prints compact too (one refs payload covers both).
         replaces = result.get("replaces_txid")
         if isinstance(replaces, str) and replaces:
             output_fn(
-                sanitize_tool_output(_BUMP_SUPERSEDE_LINE.format(old_txid=replaces))
+                sanitize_tool_output(
+                    _BUMP_SUPERSEDE_LINE.format(old_txid=refs.token(replaces))
+                )
             )
         warning = result.get("store_warning")
         if isinstance(warning, str) and warning.strip():
             output_fn(sanitize_tool_output(f"warning: {warning}"))
         if session is not None and txid:
-            session.last_broadcast_txid = txid
+            session.last_broadcast_txid = txid  # FULL engine state
             if session.label_hint_txid != txid:
                 session.label_hint_txid = txid
                 output_fn(_LABEL_BROADCAST_HINT)
+        refs.emit(emitter)
         return
     output_fn(sanitize_tool_output(_GENERIC_FAILURE))  # pragma: no cover — handler-shaped
 
 
-def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], None]) -> None:
+def _print_tx_status(
+    result: Mapping[str, object],
+    output_fn: Callable[[str], None],
+    *,
+    emitter: EventEmitter | None = None,
+) -> None:
     """Narrate a ``tx_status`` outcome (TCK-P3-005).
 
     Confirmed → "Confirmed at height N." (N verbatim from the chain
@@ -23711,6 +24108,10 @@ def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], No
     txid>" with the replacement's height when the scan has proven it, the
     BIP-125 hedge otherwise; ``evicted`` → the honest bump-lost line with
     the confirmed original's txid and height. The UI computes nothing.
+    TXID-002 (reworking the everywhere-full TXID-001 adjudication of
+    these answers): the lineage txids print as COMPACT tokens, the full
+    ids ride the additive ``txid_refs`` payload for the web [tx] chip —
+    a direct ask ("transaction id …") is the surface that prints full.
     """
     error = result.get("error")
     if error == "unknown_tx":
@@ -23730,32 +24131,35 @@ def _print_tx_status(result: Mapping[str, object], output_fn: Callable[[str], No
         )
         return
     lineage = result.get("lineage")
+    refs = _TxidRefs()
     if lineage == "replaced":
         replaced_by = result.get("replaced_by")
         height = result.get("replacement_height")
         if height is not None:
             output_fn(
                 sanitize_tool_output(
-                    f"It was replaced by {replaced_by} — the replacement confirmed "
-                    f"at height {height}."
+                    f"It was replaced by {refs.token(replaced_by)} — the replacement "
+                    f"confirmed at height {height}."
                 )
             )
         else:
             output_fn(
                 sanitize_tool_output(
-                    f"It was replaced by {replaced_by} — the original may still "
-                    "confirm; only one of these two ever will."
+                    f"It was replaced by {refs.token(replaced_by)} — the original "
+                    "may still confirm; only one of these two ever will."
                 )
             )
+        refs.emit(emitter)
         return
     if lineage == "evicted":
         output_fn(
             sanitize_tool_output(
                 f"It never confirmed — it was the fee bump, and the original it "
-                f"replaced went through instead ({result.get('original_txid')} "
+                f"replaced went through instead ({refs.token(result.get('original_txid'))} "
                 f"at height {result.get('original_height')})."
             )
         )
+        refs.emit(emitter)
         return
     if error == "backend_unchosen":
         # TCK-PRIVACY-001: the dispatcher-owned refusal prints verbatim

@@ -1015,10 +1015,13 @@ def test_history_narration_lines_are_address_free() -> None:
     joined = "\n".join(outputs)
     lines = [line for line in outputs if line.startswith("tx ")]
     assert len(lines) == 5
+    # TCK-TXID-002 RE-ADJUDICATION (was: full 64-hex per TXID-001):
+    # history lines print the COMPACT token (full id rides the txid_refs
+    # payload / the direct ask). Address-free contract unchanged.
     unconfirmed = "ee" * 32
-    assert f"tx {unconfirmed} out unconfirmed" in joined
+    assert f"tx {unconfirmed[:8]}… out unconfirmed" in joined
     top_confirmed = f"{24:02x}" * 32
-    assert f"tx {top_confirmed} in 800024" in joined
+    assert f"tx {top_confirmed[:8]}… in 800024" in joined
     # P1 narration contract: no addresses in history output.
     for addr in derive_fixture_addresses(3):
         assert addr not in joined
@@ -2350,8 +2353,9 @@ def test_repl_history_narration_with_stub_phrase(
     tx_lines = [line for line in outputs if line.startswith("tx ")]
     assert len(tx_lines) == 20  # default limit honored
     # Unconfirmed first, then height DESC.
-    assert tx_lines[0] == f"tx {'ee' * 32} out unconfirmed"
-    assert tx_lines[1] == f"tx {f'{24:02x}' * 32} in 800024"
+    # TXID-002: compact tokens in the narration lines (see the pin above).
+    assert tx_lines[0] == f"tx {('ee' * 32)[:8]}… out unconfirmed"
+    assert tx_lines[1] == f"tx {(f'{24:02x}' * 32)[:8]}… in 800024"
     for addr in derive_fixture_addresses(3):
         assert addr not in joined
     assert wd.descriptor not in joined
@@ -5213,8 +5217,11 @@ def test_send_lifecycle_file_signer_full_happy_path(
     expected_txid = _extract_signed_tx(
         signed_files[0].read_text(encoding="utf-8").strip()
     ).txid().hex()
+    # TCK-TXID-002 RE-ADJUDICATION: the sign ack prints the COMPACT
+    # token; the full id rides the txid_refs payload (and stays in the
+    # FACTS the model quotes — engine-side, unchanged below).
     assert (
-        f"Signed and verified ✓ txid {expected_txid}. "
+        f"Signed and verified ✓ txid {expected_txid[:8]}…. "
         f"Ready to broadcast — say 'broadcast'." in joined
     )
     # No sidecar note: the simulated device file carries a matching sidecar.
@@ -5225,7 +5232,8 @@ def test_send_lifecycle_file_signer_full_happy_path(
     expected_hex = _extract_signed_tx(flow.signed.psbt_base64).serialize().hex()
     assert posts[0] == expected_hex
     expected_txid = _flow_txid(flow)
-    assert f"Sent! txid {expected_txid} — tracking…" in joined
+    # TXID-002: compact ack line; the flow STATE + FACTS keep the full id.
+    assert f"Sent! txid {expected_txid[:8]}… — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
     assert flow.txid == expected_txid
     # --- status: the model quoted broadcast_txid from the FACTS ---------
@@ -5233,7 +5241,8 @@ def test_send_lifecycle_file_signer_full_happy_path(
     assert f"broadcast_txid: {expected_txid}" in status_prompt
     assert "Confirmed at height 870001." in joined
     # --- history: the outbound row (store upsert after broadcast) -------
-    assert f"tx {expected_txid} out unconfirmed" in joined
+    # TXID-002: compact narration token (see the history pins above).
+    assert f"tx {expected_txid[:8]}… out unconfirmed" in joined
     store_path = tmp_path / "store.db"
     with Store(store_path) as store:
         wallet_row = store.get_wallet_by_name("default")
@@ -5299,7 +5308,8 @@ def test_send_lifecycle_hwi_signer_locked_retry_then_broadcast(
     assert "Signed and verified ✓ txid " in joined
     assert commands.sign_calls == 2  # the locked (chained) attempt + the retry
     assert commands.rec["closed"] is True  # device handle released both times
-    assert f"Sent! txid {_flow_txid(flow)} — tracking…" in joined
+    # TXID-002: compact ack token (full id rides the txid_refs payload).
+    assert f"Sent! txid {_flow_txid(flow)[:8]}… — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
     # The retry turn was model-free: four REPL utterances before 'exit',
     # the model saw three — and no prompt was ASKED about 'retry'
@@ -5350,7 +5360,8 @@ def test_retry_at_confirmed_resigns_deterministically_without_model(
     )
 
     joined = "\n".join(outputs)
-    assert f"Signed and verified ✓ txid {_flow_txid(flow)}." in joined
+    # TXID-002: compact token in the sign ack.
+    assert f"Signed and verified ✓ txid {_flow_txid(flow)[:8]}…." in joined
     assert flow.state is TxFlowStatus.BROADCAST
     # signtx ran twice: the failed chained handoff + the intercepted retry.
     assert commands.sign_calls == 2
@@ -5525,7 +5536,8 @@ def test_send_lifecycle_broadcast_5xx_stays_signed_retry_succeeds(
     )
     # Retry (the mock flips to success after the first POST): succeeds;
     # exactly one POST per attempt in total.
-    assert f"Sent! txid {_flow_txid(flow)} — tracking…" in joined
+    # TXID-002: compact token in the ack.
+    assert f"Sent! txid {_flow_txid(flow)[:8]}… — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
     assert len(state["broadcast_posts"]) == 2  # 1 per attempt, no retries
 

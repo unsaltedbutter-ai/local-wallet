@@ -959,7 +959,7 @@ def test_watch_narration_closes_its_own_turn(
     bubble — the same delimiter the startup lines already get. Driven through
     the pump's real watch path (``_drain_watch`` is handed the closing sink)."""
 
-    def fake_drain(_watcher, output_fn, *, client=None, store=None):  # one recovered line
+    def fake_drain(_watcher, output_fn, *, client=None, store=None, emitter=None):  # one recovered line
         output_fn("watch: recovered.")
         return 1
 
@@ -991,7 +991,7 @@ def test_watch_turn_end_invisible_to_cli_byte_identical(
     ignores the marker, so a between-turns watch line prints exactly as it
     did before WEB-011 (byte-identical)."""
 
-    def fake_drain(_watcher, output_fn, *, client=None, store=None):
+    def fake_drain(_watcher, output_fn, *, client=None, store=None, emitter=None):
         output_fn("Incoming: received 5000 sats at bc1qx (in mempool, tx abc…).")
         return 1
 

@@ -315,12 +315,17 @@ def test_ac2_full_lifecycle_file_signer_production_path(
     expected_txid = _extract_signed_tx(
         signed_files[0].read_text(encoding="utf-8").strip()
     ).txid().hex()
-    assert f"Signed and verified ✓ txid {expected_txid}." in joined
+    # TCK-TXID-002 RE-ADJUDICATION (was: full 64-hex per TXID-001): the
+    # transcript prints the COMPACT token; the full id rides the
+    # txid_refs payload / the direct ask / /details.
+    assert f"Signed and verified ✓ txid {expected_txid[:8]}…." in joined
     assert "integrity not verified" not in joined  # sidecar present
     # Broadcast: single POST with the re-validated tx; status confirmed.
     assert len(state["broadcast_posts"]) == 1
     expected_txid = _flow_txid(flow)
-    assert f"Sent! txid {expected_txid} — tracking…" in joined
+    # TXID-002: compact ack token (flow/FACTS state keeps the full id,
+    # asserted around this line).
+    assert f"Sent! txid {expected_txid[:8]}… — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
     assert f"Confirmed at height {STATUS_HEIGHT}." in joined
     # The status turn quoted broadcast_txid from the FACTS (production
@@ -341,7 +346,8 @@ def test_ac2_full_lifecycle_file_signer_production_path(
             ("d" * 64, None, "in"),
         ]
     # History narration shows the outbound row.
-    assert f"tx {expected_txid} out unconfirmed" in joined
+    # TXID-002: compact history narration token.
+    assert f"tx {expected_txid[:8]}… out unconfirmed" in joined
 
 
 # --------------------------------------------------------------------------
@@ -473,7 +479,8 @@ def test_ac3_device_absent_and_locked_guidance_then_retry(
     # the error phase (a failed sign preserves CONFIRMED; the next sign needs
     # it to proceed).
     assert "Signed and verified ✓" in joined
-    assert f"Sent! txid {_flow_txid(flow)} — tracking…" in joined
+    # TXID-002: compact ack token.
+    assert f"Sent! txid {_flow_txid(flow)[:8]}… — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
     # Exact state-machine sequence across the turns (preservation
     # invariant): the confirm turn's CHAINED handoff hit the error phase
@@ -562,7 +569,8 @@ def test_ac3_broadcast_5xx_then_retry(
         "transaction is kept; say 'broadcast' to retry." in joined
     )
     # Retry succeeds; exactly one POST per attempt in total.
-    assert f"Sent! txid {_flow_txid(flow)} — tracking…" in joined
+    # TXID-002: compact ack token.
+    assert f"Sent! txid {_flow_txid(flow)[:8]}… — tracking…" in joined
     assert flow.state is TxFlowStatus.BROADCAST
     assert len(state["broadcast_posts"]) == 2
 

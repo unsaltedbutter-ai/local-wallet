@@ -151,9 +151,15 @@ def test_three_block_boundary_exactness(tmp_path):
         # 3 blocks back surfaces, 4 blocks back is absorbed (strict >).
         session = _Session(store, _tx(1, height=TIP - 3))
         assert session.drain() == 1
+        # TCK-TXID-002 RE-ADJUDICATION (was: the line quoted the full
+        # 64-hex txid per TXID-001): the surfacing line now prints the
+        # COMPACT token (first 8 hex + ellipsis); the full id rides the
+        # txid_refs payload (web chip) / the direct ask. Absorption
+        # semantics — this ticket's subject — are untouched.
+        _txid1 = f"{1:064x}"
         assert session.outputs[0] == (
             f"Incoming: received 5001 sats at #1 {ADDR} "
-            f"(confirmed, tx {1:064x})."
+            f"(confirmed, tx {_txid1[:8]}…)."
         )
         session2 = _Session(store, _tx(2, height=TIP - 4))
         assert session2.drain() == 0
