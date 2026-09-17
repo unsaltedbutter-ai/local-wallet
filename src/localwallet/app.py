@@ -2422,8 +2422,10 @@ def _cons_timing_answer(
 #: the model — registry numbers are user data and the closed consolidate
 #: params cannot carry a coin reference, so this never becomes a prompt
 #: route; since TCK-CONS-003 the fully parsed "…smaller than N sats"
-#: threshold is intercepted here too, and only UNPARSED digit shapes
-#: keep the TX-SELF-001 model route).
+#: threshold is intercepted here too; since TCK-CONS-004 a bare TWO-OR-
+#: MORE-number list with no parseable comparator resolves as registry
+#: picks here, and only a single unparsed digit keeps the TX-SELF-001
+#: model route).
 _CONS_SMALL_WORDS: Final[frozenset[str]] = frozenset(
     {"small", "smaller", "smallest", "tiny", "little"}
 )
@@ -2444,8 +2446,10 @@ _CONS_UNLABELED_TERMS: Final[tuple[str, ...]] = ("unlabeled", "unlabelled")
 
 #: The opener's conservative phrase shape: a consolidation VERB plus a
 #: consolidation OBJECT word (or a ``#``-marked registry pick, whose ``#``
-#: IS the object word — TCK-CONS-003 (1)). Address-wordless, #-less bare
-#: digits that no comparator fully parses stay on the ordinary pipeline.
+#: IS the object word — TCK-CONS-003 (1); or a bare multi-number list,
+#: TCK-CONS-004, whose digits ARE the objects). A single address-wordless,
+#: #-less bare digit that no comparator fully parses stays on the ordinary
+#: pipeline.
 _CONS_VERBS: Final[frozenset[str]] = frozenset(
     {
         "consolidate",
@@ -2557,12 +2561,14 @@ def _consolidation_intent(
       NO stated size — the runner opens the ONE deterministic threshold ask
       (never a hardcoded size, never a silently applied setting);
     * ``numbers`` (TCK-CHAT-002, list bounded per TCK-CONS-003 (1)) are
-      REGISTRY NUMBERS — digits alongside an address word OR ANY ``#``-
+      REGISTRY NUMBERS — digits alongside an address word, ANY ``#``-
       marked digit ("consolidate #18 and #24 and #14" — the ``#`` IS the
-      address referent, no object word required). The caller resolves every
-      number against the stable CHAT-001 registry (miss = the value-free
-      clarify, never a guess) and restates every resolved FULL address
-      (glm #7);
+      address referent, no object word required), OR a bare TWO-OR-MORE-
+      number list no comparator claims (TCK-CONS-004: "consolidate 24 and
+      17" — a bare digit cannot be this grammar's size cut). The caller
+      resolves every number against the stable CHAT-001 registry (miss =
+      the value-free clarify, never a guess) and restates every resolved
+      FULL address (glm #7);
     * ``below`` (TCK-CONS-003 (2)) is an explicit size cut parsed by
       :func:`_cons_size_threshold` ("smaller than 100001 sats") — the model
       never authors it;
@@ -2591,7 +2597,24 @@ def _consolidation_intent(
     hash_marked = any(
         t.startswith("#") and t[1:].strip(punctuation).isdigit() for t in raw
     )
-    if not hash_marked and not any(w in _CONS_OBJECT_TERMS for w in words):
+    # TCK-CONS-004: in a consolidation line a bare digit can NEVER be a
+    # size cut — the deterministic comparator grammar requires a BELOW-word
+    # — so a TWO-OR-MORE-number list that no comparator claims is a
+    # registry pick ("consolidate 24 and 17"), and the list stands in for
+    # the object word at the phrase gate. A SINGLE bare digit keeps
+    # today's release (the pinned "consolidate my 3 favorite coins" model
+    # route); a pick-list AND a stated size cut stay ambiguous below.
+    try:
+        digits = {int(w) for w in words if w.isdigit()}
+    except ValueError:
+        return None  # pathological digit-length token: release (CHAT-009)
+    below, size_consumed = _cons_size_threshold(words)
+    registry = digits - ({below} if below is not None else set())
+    number_list = len(registry) >= 2
+    if (
+        not (hash_marked or number_list)
+        and not any(w in _CONS_OBJECT_TERMS for w in words)
+    ):
         return None
     joined = " ".join(words)
     fee: str | None = None
@@ -2606,14 +2629,10 @@ def _consolidation_intent(
     # urgent are urgencies, not refusals).
     if fee != "slow" and any(w in _BUMP_DENY_TOKENS for w in words):
         return None
-    try:
-        digits = {int(w) for w in words if w.isdigit()}
-    except ValueError:
-        return None  # pathological digit-length token: release (CHAT-009)
-    below, size_consumed = _cons_size_threshold(words)
-    registry = digits - ({below} if below is not None else set())
-    if registry and not (hash_marked or _digits_named_as_addresses(words)):
-        return None  # an address-wordless, #-less bare digit stays released
+    if registry and not (
+        hash_marked or number_list or _digits_named_as_addresses(words)
+    ):
+        return None  # a single address-wordless, #-less bare digit: released
     if registry and below is not None:
         return None  # a number list AND a size cut in one line: ambiguous
     if registry:
@@ -2652,10 +2671,11 @@ def _consolidation_intent(
 def _digits_named_as_addresses(words: list[str]) -> bool:
     """True when bare digits in a consolidation line are ADDRESS referents
     ("consolidate address 3 & 9"), not a size threshold ("under 100000
-    sats"): an explicit address word sits alongside them (the ``#`` mark is
-    the other naming route, checked by the caller — TCK-CONS-003 (1)). A
-    fully parsed ``<below-word> [than] NUMBER [sats]`` comparator is NOT
-    this case: its number is the size cut, consumed separately."""
+    sats"): an explicit address word sits alongside them (the ``#`` mark
+    and the bare multi-number list — TCK-CONS-003 (1), TCK-CONS-004 — are
+    the other naming routes, checked by the caller). A fully parsed
+    ``<below-word> [than] NUMBER [sats]`` comparator is NOT this case: its
+    number is the size cut, consumed separately."""
     return any(w in _CONS_ADDRESS_WORDS for w in words)
 
 
