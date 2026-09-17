@@ -166,7 +166,6 @@ def test_watch_key_gate_keeps_chat_open_under_node() -> None:
                       modelLoading: false };
       const inputEl = { disabled: false, placeholder: chatPlaceholder };
       const sendBtn = { disabled: false };
-      const quickbarEl = { hidden: true };
       const settingsPanelEl = { hidden: true }; // stays closed: NOTHING may open it
       let openCalls = 0, closeCalls = 0, renders = 0;
       const openSettings = () => { settingsPanelEl.hidden = false; openCalls++; };
@@ -1642,11 +1641,12 @@ def test_submit_401_and_stopped_tab_label_the_stale_session_under_node() -> None
 # (3) RECONNECT ANNOUNCEMENT: both live-region writes in listen() sit behind
 # the state.reconnecting transition guard; the "Connected" write doubles as
 # the out-of-state announcement.
-# (5) IN-FLIGHT DISABLE: both /action click listeners disable the clicked
+# (5) IN-FLIGHT DISABLE: the /action click listener disables the clicked
 # utterance button synchronously; applyState's repaint restores disabled on
-# EVERY action-bar and quickbar button (model/quick ones included — the
+# EVERY action-bar button (model/quick ones included — the
 # restore lands before the model-only continue); a failed POST also
 # refreshes snapshot truth (no turn_end will ever come for a dead line).
+# TCK-WEB-031 (d): the quickbar twin of the listener is gone with the bar.
 def test_web028_static_pins() -> None:
     code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
     # (1) the reconcile sits in applyState, gated on typed + idle + drained.
@@ -1675,17 +1675,15 @@ def test_web028_static_pins() -> None:
         r'\s*setStatus\("reconnecting"', listen
     )
     assert listen.count('setStatus(') == 4  # connecting/live/reconnecting/unauthorized only
-    # (5) disable-on-click in both listeners; restore on every repaint.
+    # (5) disable-on-click in the listener; restore on every repaint.
     actions = code[
-        code.index("actionsEl.addEventListener(") :
-        code.index("quickbarEl.addEventListener(")
-    ]
-    quick = code[
-        code.index("quickbarEl.addEventListener(") : code.index("let inputSeq = 0;")
+        code.index("actionsEl.addEventListener(") : code.index("let inputSeq = 0;")
     ]
     assert "btn.disabled = true;\n    submit(" in actions
-    assert re.search(r"btn\.disabled = true;[^\n]*\n  submit\(", quick)
-    assert apply.count("btn.disabled = false;") == 2  # action bar + quickbar
+    assert apply.count("btn.disabled = false;") == 1  # the one action bar
+    # TCK-WEB-031 (d): the quickbar listener is GONE with the bar — the
+    # actions slice runs straight to the settings section.
+    assert "quickbarEl" not in code
     # and the restore lands BEFORE the model-only continue (those buttons
     # get it too — never a permanently disabled control):
     assert apply.index("btn.disabled = false;") < apply.index('continue;')
@@ -1709,9 +1707,7 @@ def test_stuck_pending_bubble_reconciles_from_typed_idle_state_under_node() -> N
       });
       const flowBtn = mkBtn("confirm"); flowBtn.disabled = true;   // in flight
       const modelBtn = mkBtn("model-download", "model-only"); modelBtn.disabled = true;
-      const quickBtn = mkBtn("quick-balance"); quickBtn.disabled = true;
       const actionsEl = { querySelectorAll: () => [flowBtn, modelBtn] };
-      const quickbarEl = { querySelectorAll: () => [quickBtn] };
       const state = {
         queue: [], busy: true, backendName: "", privacyMode: "",
         trustSig: null, watchKeyNeeded: false, pendingBubble: {},
@@ -1723,6 +1719,7 @@ def test_stuck_pending_bubble_reconciles_from_typed_idle_state_under_node() -> N
       const applyWalletFpChip = () => {}; // TCK-WEB-027 chip painter (own harness)
       const applySuggestedServers = () => {}; // TCK-WEB-022 chips (own harness)
       const applyWatchKeyGate = () => {}; const applyModelPrompt = () => {};
+      const paintConnLiveChip = () => {}; // TCK-WEB-031 (b) live-chip repaint (own harness)
       const paintHwVerifyButtons = () => {}; // TCK-HW-005 chips (own harness)
       const paintSettingsDot = () => {}; const noteTrustFlip = () => {};
       const settingsPanelEl = { hidden: true };
@@ -1743,8 +1740,8 @@ def test_stuck_pending_bubble_reconciles_from_typed_idle_state_under_node() -> N
       applyState({ schema: "state/0", flow_state: "idle" });
       if (clears !== 0) throw new Error("state0-cleared");
       // TCK-WEB-028 (5): the same repaint restored EVERY in-flight-disabled
-      // button — flow, model-only (before its continue) and quickbar alike.
-      if (flowBtn.disabled || modelBtn.disabled || quickBtn.disabled)
+      // button — flow and model-only (before its continue) alike.
+      if (flowBtn.disabled || modelBtn.disabled)
         throw new Error("disabled-stuck");
       console.log("ok");
     """.replace("__APPLY__", apply)
@@ -1767,9 +1764,14 @@ def test_reconnect_announces_only_the_transition_under_node() -> None:
     listen = re.search(r"async function listen\(\) \{.*?\n\}", code, re.DOTALL).group(0)
     script = """
       const state = { stopped: false, lastEventId: 0, backoffMs: 500,
-                      everConnected: false, reconnecting: false };
+                      everConnected: false, reconnecting: false,
+                      backendName: "", backendHost: "" };
       const writes = [];
       const setStatus = (kind, label) => writes.push(kind + "|" + label);
+      // TCK-WEB-031 (b): listen() derives the live word from the typed pair
+      // via the PURE connLiveText (own matrix below); the default empty
+      // kind renders today's generic word, so the stub returns it.
+      const connLiveText = () => "Connected";
       const authHeaders = (h) => h;
       const location = { origin: "http://127.0.0.1:8243" };
       const refreshState = () => {};
@@ -2559,12 +2561,15 @@ def test_web030_top_badge_visibility_matrix_under_node() -> None:
 def test_web027_chip_markup_and_source_pins() -> None:
     index_html = (_STATIC / "index.html").read_text(encoding="utf-8")
     code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
-    # markup: a click-to-copy BUTTON beside the privacy chip (before the
-    # conn status), starting hidden, no role=status of its own (feedback
-    # rides the ONE shared #copy-status region), no inline handler/style.
+    # markup: the click-to-copy BUTTON is now the header TITLE (TCK-WEB-031
+    # (a): inside the first h1, before every chip), starting hidden, no
+    # role=status of its own (feedback rides the ONE shared #copy-status
+    # region), no inline handler/style.
     chip = '<button id="wallet-fp" class="chip wallet-fp" type="button" hidden></button>'
     assert chip in index_html
-    assert index_html.index('id="privacy-chip"') < index_html.index(chip)
+    assert index_html.index('<h1 class="brand">') < index_html.index(chip)
+    assert index_html.index(chip) < index_html.index('id="scan-chip"')
+    assert index_html.index(chip) < index_html.index('id="privacy-chip"')
     assert index_html.index(chip) < index_html.index('id="conn-status"')
     assert not re.search(r"\son[a-z]+=", index_html)  # global pin, restated
     # typed-only lifecycle: state/1 gate, regex gate, transition gate,
@@ -3567,3 +3572,126 @@ def test_utxo005_rows_render_toggle_and_fallback_under_node() -> None:
         .replace("__FUNCS__", funcs)
     )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# ============================================================== TCK-WEB-031
+# Header + status rework (USER DIRECTION 2026-09-15). (a) The header TITLE is
+# the WEB-027 fingerprint chip — "Wallet <hex>" (typed WALLET_FP_RE gate,
+# raw hex never painted unguarded), left-aligned; "Local Wallet" survives
+# ONLY in the document <title>. (b/f) The LIVE connection chip names the
+# backend for kinds electrum/bitcoind ("<Electrum|Bitcoind>: <host>" off the
+# typed backend_kind NAME + isBareHost-gated backend_host — engine truth),
+# and keeps today's generic "Connected" for kind none/awaiting/no-host;
+# repaints ride the state-diff discipline (live-only, change-only — no SSE
+# flicker). (c/d) The WEB-009 (h) quickbar is DEAD — nav, CSS, quickbarEl,
+# click handler, visibility logic and the WEB-028 twin-guard, all gone.
+# (e) The LAUNCH-002 model-free qa-balance "Show balance" button in
+# #actions SURVIVES untouched — a different surface.
+
+def test_web031_header_title_and_page_title_static_pins() -> None:
+    index_html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    # (a) the title: the chip button, verbatim markup, sits INSIDE the
+    # first h1 (left-aligned by the .bar's default flex start).
+    assert '<h1 class="brand"><button id="wallet-fp" class="chip wallet-fp" type="button" hidden></button></h1>' in index_html
+    assert index_html.index('<h1 class="brand">') < index_html.index("</header>")
+    # the title text is "Wallet <hex>": the word ships in LABELS and only
+    # ever reaches the DOM through the WALLET_FP_RE-gated painter.
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    assert 'walletFpWord: "Wallet",' in code
+    assert 'walletFpEl.textContent = fp ? walletFpChipText(fp) : "";' in code
+    assert "WALLET_FP_RE.test(raw)" in code  # hex never painted unguarded
+    # "Local Wallet" now lives ONLY in the document <title> (inside head):
+    assert "<title>Local Wallet</title>" in index_html
+    assert index_html.count("Local Wallet") == 1
+    assert index_html.index("Local Wallet") < index_html.index("</head>")
+
+
+def test_web031_quickbar_dead_qa_balance_alive_static_pins() -> None:
+    index_html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    # (c/d) orphan sweep — no live quickbar artifact survives in any file
+    # (historical PROSE in comments is fine; the scan is comment-stripped
+    # for the JS, identifier-level everywhere):
+    assert 'id="quickbar"' not in index_html
+    assert "quick-balance" not in index_html
+    assert "quickbarEl" not in code
+    assert 'getElementById("quickbar")' not in code
+    assert ".quickbar" not in css
+    # (e) the LAUNCH-002 model-free quick action SURVIVES, untouched:
+    assert 'data-action="qa-balance" data-utterance="/balance"' in index_html
+    assert ">Show balance</button>" in index_html
+    assert "quick-only" in index_html
+
+
+def test_web031_status_chip_static_pins() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    # the ticket's exact words ship as LABELS (the chip is textContent-fed):
+    assert 'connConnected: "Connected",' in code
+    assert 'connElectrum: "Electrum",' in code
+    assert 'connBitcoind: "Bitcoind",' in code
+    # the live write in listen() derives the word from the typed pair:
+    listen = code[code.index("async function listen()") : code.index("async function submit(")]
+    assert 'setStatus("live", connLiveText(state.backendName, state.backendHost));' in listen
+    # and the per-snapshot repaint rides applyState, AFTER the privacy pass
+    # that updates backendHost (never before — no stale-host paint):
+    apply = code[code.index("function applyState") : code.index("function noteTrustFlip")]
+    assert apply.index("applyPrivacyChip(snap);") < apply.index("paintConnLiveChip();")
+
+
+def test_web031_conn_live_text_matrix_and_repaint_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    leak = re.search(r"const PUBLIC_LEAK_SENTENCE =.*?;\n", code, re.DOTALL).group(0)
+    labels = re.search(r"const LABELS = \{.*?\n\};", code, re.DOTALL).group(0)
+    block = code[code.index("const BARE_HOST_RE"):code.index("const TRUST_BADGE_WORDS")]
+    script = """
+      const state = { backendName: "", backendHost: "" };
+      let statusWrites = 0;
+      const statusEl = {
+        dataset: { state: "live" }, _t: "Connected",
+        set textContent(v) { statusWrites++; this._t = v; },
+        get textContent() { return this._t; },
+      };
+      const setStatus = (kind, label) => {
+        statusEl.dataset.state = kind; statusEl.textContent = label;
+      };
+      __LABELS__
+      __BLOCK__
+      // (b) the two real kinds with a valid host name themselves:
+      if (connLiveText("electrum", "electrum.blockstream.info") !== "Electrum: electrum.blockstream.info") throw new Error("electrum");
+      if (connLiveText("bitcoind", "10.1.2.3") !== "Bitcoind: 10.1.2.3") throw new Error("bitcoind");
+      if (connLiveText("bitcoind", "[::1]") !== "Bitcoind: [::1]") throw new Error("v6");
+      // (f) kind none/unknown/absent, a missing/refused host: TODAY'S
+      // generic word — never a half-name like "Electrum: ", never a
+      // client-parsed URL.
+      for (const bad of [["none", "10.1.2.3"], ["", ""], ["mempool", "x"],
+                         ["electrum", ""], ["electrum", "http://u:p@host/"],
+                         ["bitcoind", "a b"], ["bitcoind", "p:8332/x"],
+                         ["future_kind", "host"], ["electrum", undefined]]) {
+        if (connLiveText(bad[0], bad[1]) !== "Connected") throw new Error("generic:" + bad);
+      }
+      // the repaint: live + a kind/host FLIP -> exactly ONE write; identical
+      // truth -> ZERO writes (the SSE/state-diff flicker guard); a
+      // NON-live chip (connecting/reconnecting/down) is listen()'s alone.
+      state.backendName = "electrum"; state.backendHost = "10.1.2.3";
+      paintConnLiveChip();
+      if (statusEl.textContent !== "Electrum: 10.1.2.3" || statusWrites !== 1) throw new Error("flip");
+      paintConnLiveChip(); paintConnLiveChip();
+      if (statusWrites !== 1) throw new Error("spam");
+      state.backendName = "none"; state.backendHost = "";
+      paintConnLiveChip();
+      if (statusEl.textContent !== "Connected" || statusWrites !== 2) throw new Error("back-generic");
+      statusEl.dataset.state = "reconnecting";
+      state.backendName = "bitcoind"; state.backendHost = "10.1.2.3";
+      paintConnLiveChip();
+      if (statusWrites !== 2) throw new Error("off-live-write");
+      console.log("ok");
+    """
+    script = script.replace("__LABELS__", leak + labels).replace("__BLOCK__", block)
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+

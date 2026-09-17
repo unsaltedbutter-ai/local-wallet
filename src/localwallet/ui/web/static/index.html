@@ -11,7 +11,22 @@
 </head>
 <body>
 <header class="bar">
-  <h1 class="brand">Local Wallet</h1>
+  <!-- TCK-WEB-031 (a) + TCK-WEB-027: the header TITLE IS the wallet-
+       fingerprint chip — "Wallet <fp>", LEFT-ALIGNED, in place of the old
+       static brand word (USER DIRECTION 2026-09-15: that string now lives
+       ONLY in the document <title> above). The button carries the
+       WEB-027 lifecycle verbatim, unchanged: text is driven ONLY by the
+       typed /state snapshot's wallet_fingerprint through the WALLET_FP_RE
+       gate in app.js (a raw/invalid value is treated ABSENT — the hex is
+       never painted unguarded, never client-derived from the zpub); an
+       unprovisioned wallet shows NO header title at all (hidden, nothing
+       fabricated), a typed omit clears it (watch-key replace), state/0
+       keeps the last value, one DOM write per transition. The WEB-032
+       clarifying hint line in the settings pane follows the same truth.
+       Click-to-copy stays on the title itself (keyboard-operable native
+       <button>; WEB-026 flashCopyResult + the value-bearing aria-label
+       "Copy wallet fingerprint <fp>" set by app.js — no inline handler). -->
+  <h1 class="brand"><button id="wallet-fp" class="chip wallet-fp" type="button" hidden></button></h1>
   <!-- TCK-WEB-005: honest scan status, driven ONLY by the typed /state snapshot's
        scan_state field (never inferred from dots). Hidden until a snapshot says so. -->
   <p id="scan-chip" class="chip" role="status" aria-live="polite" hidden></p>
@@ -32,34 +47,13 @@
        title). Color comes from data-privacy + styles.css selectors — no
        inline styles. -->
   <p id="privacy-chip" class="chip privacy" role="status" aria-live="polite" hidden>Privacy notice<span id="privacy-subline" class="privacy-subline"></span></p>
-  <!-- TCK-WEB-027: the wallet-fingerprint chip — a click-to-copy BUTTON
-       beside the privacy chip, driven ONLY by the typed /state snapshot's
-       additive wallet_fingerprint field (the engine-validated closed 8-hex
-       descriptor-origin ACCOUNT-key fingerprint — deliberately NOT the
-       device's master, unknowable watch-only, HW-002). ABSENT field =
-       hidden, never fabricated, never client-derived from the zpub; a
-       typed snapshot that omits the key CLEARS it (watch-key replace);
-       state/0 keeps the last value (the WEB-020/023 discipline — app.js
-       writes textContent/aria-label only on transition). Copy feedback
-       reuses the shared WEB-026 flashCopyResult path: ok/fail classes
-       here + the ONE #copy-status live region. -->
-  <button id="wallet-fp" class="chip wallet-fp" type="button" hidden></button>
   <p id="conn-status" class="status" role="status" aria-live="polite" data-state="connecting">Connecting…</p>
   <button id="settings-toggle" class="btn btn-ghost" type="button" aria-expanded="false" aria-controls="settings-panel">Settings</button>
 </header>
 
-<!-- TCK-WEB-009 (h): header balance action BELOW the top bar. Model-free
-     bypass action riding the pump's canonical slash utterance through
-     POST /action (the same full-pipeline path every button takes). Copy
-     pass 2 #14: ONE Balance button — the old BTC/USD pair sent the identical
-     "/balance" utterance (the engine offers no separate USD one and never
-     gets an invented endpoint); the card it renders carries BTC/sats + USD
-     + the rate timestamp. Hidden pre-provision; shown ONLY from the typed
-     /state snapshot (never inferred). -->
-<nav id="quickbar" class="quickbar" aria-label="Balance actions" hidden>
-  <button type="button" class="btn btn-secondary btn-small" data-action="quick-balance" data-utterance="/balance" title='Sends "/balance"'>Balance</button>
-</nav>
-
+<!-- TCK-WEB-009 (h) balance quickbar: REMOVED by TCK-WEB-031 (c) (USER
+     DIRECTION 2026-09-15 — balance stays available via chat "/balance" and
+     the model-free qa-balance quick action in #actions below). -->
 <!-- TCK-WEB-009 (a): the settings pane is the ONLY first-run surface — the
      separate "Connect your wallet" card is gone; its entry logic (POST
      /watchkey incl. the replace/confirm rung) lives in the pane's zpub

@@ -56,13 +56,13 @@ const chatPlaceholder = inputEl.placeholder;
 const sendBtn = document.getElementById("turn-send");
 const scrollerEl = document.getElementById("scroller");
 const actionsEl = document.getElementById("actions");
-const quickbarEl = document.getElementById("quickbar");
 const scanChipEl = document.getElementById("scan-chip");
 const scanErrorEl = document.getElementById("scan-error");
 const privacyChipEl = document.getElementById("privacy-chip");
 const privacySublineEl = document.getElementById("privacy-subline");
-// TCK-WEB-027: the header wallet-fingerprint click-to-copy chip (index.html
-// markup; hidden until a typed /state snapshot carries the closed field).
+// TCK-WEB-027 + TCK-WEB-031 (a): the header TITLE — a click-to-copy chip
+// button inside the h1 (index.html markup; hidden until a typed /state
+// snapshot carries the closed field).
 const walletFpEl = document.getElementById("wallet-fp");
 const settingsToggleEl = document.getElementById("settings-toggle");
 const settingsPanelEl = document.getElementById("settings-panel");
@@ -170,6 +170,14 @@ const LABELS = {
     "screen — and in wallet apps that imported directly from the device " +
     "(like Sparrow) — is its MASTER fingerprint: a public account key " +
     "can never reveal it.",
+  // TCK-WEB-031 (b/f): the LIVE connection chip names WHAT is connected —
+  // the ticket's exact strings "<Kind>: <host>" for the two real backend
+  // kinds, generic "Connected" for none/awaiting/no-host (pin f). The kind
+  // word rides the typed /state backend_kind NAME and the host the typed
+  // backend_host (engine truth, isBareHost-gated — never client-parsed).
+  connConnected: "Connected",
+  connElectrum: "Electrum",
+  connBitcoind: "Bitcoind",
   // settings panel (TCK-WEB-005)
   settingsLoading: "Loading…",
   settingsUnavailable: "Could not load settings — the wallet is busy or unreachable.",
@@ -1499,16 +1507,17 @@ function applyState(snap) {
     }
     btn.hidden = !visible.has(btn.dataset.action);
   }
-  for (const btn of quickbarEl.querySelectorAll("button")) {
-    btn.disabled = false; // TCK-WEB-028 (5): same restore for the header quicks
-  }
   paintHwVerifyButtons(); // TCK-HW-005: own-address chips (restore + gating)
   applyScanChip(snap);
   applyPrivacyChip(snap);
-  applyWalletFpChip(snap); // TCK-WEB-027: the header fingerprint chip
+  applyWalletFpChip(snap); // TCK-WEB-027: the header fingerprint title chip
   applySuggestedServers(snap); // TCK-WEB-022: the click-to-FILL chip group
   applyWatchKeyGate(snap);
   applyModelPrompt(snap);
+  paintConnLiveChip(); // TCK-WEB-031 (b): kind/host chip repaint (LAST —
+  // both backendName (above) and backendHost (applyPrivacyChip) carry THIS
+  // snapshot's truth by now; the noteTrustFlip reload trigger keeps its
+  // established final position).
   // TCK-WEB-021 (8): the settings-door dot (wallet/backend unset — drive
   // the eye to setup). (5): the pinned reload trigger, LAST, so both
   // signature halves (backendName above, privacyMode in applyPrivacyChip)
@@ -1598,8 +1607,9 @@ function paintChatPlaceholder() {
 // rides the TYPED snapshot (with the WEB-008 exception kept: a 200
 // ``accepted`` is the ENGINE'S OWN confirmation the key parsed, gated and
 // persisted, so the entry state DISMISSES on the spot — a terminal dismiss
-// is never re-shown by a stale snapshot). The header balance buttons stay
-// hidden until a wallet is provisioned (typed truth only).
+// is never re-shown by a stale snapshot). (TCK-WEB-031 (c): the old
+// WEB-009 (h) header balance quickbar rode this gate — it is removed; the
+// wallet-fingerprint header TITLE follows its own typed gate below.)
 function applyWatchKeyGate(snap) {
   const typed = !!snap && snap.schema === "state/1";
   let needs = typed && snap.needs_watch_key === true;
@@ -1608,9 +1618,6 @@ function applyWatchKeyGate(snap) {
   const wasNeeded = state.watchKeyNeeded;
   state.watchKeyNeeded = needs;
   paintChatPlaceholder();
-  // TCK-WEB-009 (h): the header quick buttons appear once a wallet is
-  // provisioned and never before (typed truth only — unknown = hidden).
-  quickbarEl.hidden = state.watchKeyPresent !== true;
   if (needs !== wasNeeded) renderSettings(); // flip the pane's zpub row
   if (needs && !wasNeeded && settingsPanelEl.hidden === false) focusWatchInput();
 }
@@ -1627,7 +1634,6 @@ function dismissWatchKeyForm(key) {
   state.watchKeyPresent = true;
   state.watchKeyNeeded = false;
   state.watchKeyReplaceOpen = false; // applied → the row returns collapsed (§1)
-  quickbarEl.hidden = false;
   renderSettings();
 }
 
@@ -1710,6 +1716,31 @@ function privacySublineText(mode, host) {
     return tpl.slice(0, at) + host + tpl.slice(at + "{host}".length);
   }
   return PRIVACY_SUBLINE[mode] || "";
+}
+
+// TCK-WEB-031 (b) PURE (node-pinned): the LIVE connection chip's label from
+// the last known typed pair (backend_kind NAME + backend_host). Only the
+// two real kinds WITH a valid host gain "<Kind>: <host>"; kind
+// none/awaiting/unknown/absent or a missing/refused host keeps today's
+// generic word (pin f — fail closed, never a half-name like "Electrum: ").
+function connLiveText(kind, host) {
+  const word =
+    kind === "electrum" ? LABELS.connElectrum
+      : kind === "bitcoind" ? LABELS.connBitcoind
+        : "";
+  return word && isBareHost(host) ? word + ": " + host : LABELS.connConnected;
+}
+
+// TCK-WEB-031 (b): repaint the live chip when a /state snapshot moves the
+// kind/host underneath it. Rides the existing state-diff discipline, so it
+// never flickers across SSE reconnects: it writes ONLY while the stream is
+// ALREADY live (connecting/reconnecting/unauthorized text belongs to
+// listen() alone) and ONLY on an actual label CHANGE (a state/0 or an
+// identical snapshot = zero DOM writes = zero live-region announcements).
+function paintConnLiveChip() {
+  if (statusEl.dataset.state !== "live") return;
+  const label = connLiveText(state.backendName, state.backendHost);
+  if (statusEl.textContent !== label) setStatus("live", label);
 }
 
 // TCK-WEB-013 (2): the chain row's trust badge — the SAME closed enum the
@@ -2026,7 +2057,7 @@ async function listen() {
       // TCK-WEB-028 (3): the OUT-of-reconnecting transition is the one
       // announcement — this text write is it.
       state.reconnecting = false;
-      setStatus("live", "Connected");
+      setStatus("live", connLiveText(state.backendName, state.backendHost));
       if (state.everConnected) refreshState(); // reconnect: buttons may have moved
       state.everConnected = true;
       await consumeStream(response.body);
@@ -2133,9 +2164,11 @@ formEl.addEventListener("submit", (event) => {
 // channel with the pump's canonical SLASH COMMANDS (/download, /later,
 // /balance, /receive, /address) — deterministic engine-side intercepts,
 // never model-classified. "Open settings" (no utterance) is client-only:
-// the panel is already local. TCK-WEB-009 (h): the header balance buttons
-// ride the same /action channel with /balance (the card it renders carries
-// the USD line — there is no separate USD utterance and none is invented).
+// the panel is already local. (TCK-WEB-031 (c/e): the header balance
+// quickbar rode a twin of this listener and is removed; the model-free
+// qa-balance "Show balance" button in THIS action bar keeps the same
+// /balance channel — the card it renders carries the USD line, there is no
+// separate USD utterance and none is invented.)
 actionsEl.addEventListener("click", (event) => {
   const btn = event.target.closest("button");
   if (!btn || state.stopped) return;
@@ -2151,13 +2184,6 @@ actionsEl.addEventListener("click", (event) => {
     btn.disabled = true;
     submit("/action", "utterance", btn.dataset.utterance);
   }
-});
-
-quickbarEl.addEventListener("click", (event) => {
-  const btn = event.target.closest("button");
-  if (!btn || state.stopped || !btn.dataset.utterance) return;
-  btn.disabled = true; // TCK-WEB-028 (5): same in-flight guard for the header quicks
-  submit("/action", "utterance", btn.dataset.utterance);
 });
 
 // ------------------------------------------------------------------ settings

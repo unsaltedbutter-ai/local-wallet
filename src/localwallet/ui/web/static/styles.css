@@ -240,19 +240,21 @@ body {
   font-size: var(--fs-xs);
   white-space: normal;
 }
-/* TCK-WEB-027: the wallet-fingerprint chip is a click-to-copy BUTTON —
-   .chip was written for <p>s, so the UA font/cursor get reset. NEUTRAL
-   surface ink (it is a public identifier, not a warning — the scan chip's
-   warn color would overstate it); the affordance is the pointer cursor +
-   the hover/focus border. The WEB-026 shared copy states ride the generic
+/* TCK-WEB-027 + TCK-WEB-031 (a): the wallet-fingerprint chip-button is now
+   the header TITLE (h1.brand, first flex item — LEFT-ALIGNED by the bar's
+   default start alignment). .chip was written for <p>s, so the UA font/
+   cursor get reset; the size/WEIGHT come from the h1 itself (font: inherit
+   — no font-size override: title scale, no new token). NEUTRAL surface ink
+   (it is a public identifier, not a warning — the scan chip's warn color
+   would overstate it); the affordance is the pointer cursor + the hover/
+   focus border. The WEB-026 shared copy states ride the generic
    .copy-ok/.copy-fail contract (floating ::after word = the non-color
    cue; position:relative is its anchor). white-space: nowrap keeps
    "Wallet f1a2b3c4" whole — at 320px the .bar's existing flex-wrap moves
-   the chip as ONE unit onto the next row: the value is never split and
+   the title as ONE unit onto the next row: the value is never split and
    the chip never grows the header's height on its own. */
 .wallet-fp {
   font: inherit;
-  font-size: var(--fs-xs);
   color: var(--c-text);
   cursor: pointer;
   position: relative;
@@ -1084,15 +1086,10 @@ body {
 /* (f): the Resync-now action sits on its own quiet line under the field. */
 .setting-resync-line { align-items: center; }
 
-/* (h): header quick balance buttons, one row below the top bar. */
-.quickbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--sp-2);
-  padding: var(--sp-2) var(--sp-4);
-  background: var(--c-bg);
-  border-bottom: 1px solid var(--c-border);
-}
+/* (h) TCK-WEB-009 header quick balance bar: REMOVED by TCK-WEB-031 (c)
+   (USER DIRECTION 2026-09-15) — the bar's rule, its nav and its app.js
+   wiring are gone; the row's horizontal spacing is reclaimed. Balance
+   stays reachable via chat "/balance" and the model-free quick action. */
 
 /* TCK-LAUNCH-002: inline model-download progress in the transcript (native
    <progress>; percent/bytes live in the label's textContent only). */
