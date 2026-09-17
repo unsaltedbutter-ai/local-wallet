@@ -132,6 +132,31 @@ python models/download_model.py --model qwen3-1.7b-instruct-Q4_K_M --write-hash
 python models/download_model.py --model phi-4-mini-instruct-Q4_K_M --write-hash
 ```
 
+## Embedding-routing probe candidate (TCK-PROMPT-003)
+
+Research adjudicated exactly one usable embedding model for the
+deterministic-intent-routing probe (TCK-PROMPT-003): Qwen's official
+**Qwen3-Embedding-0.6B-GGUF**, quant `Q8_0` (~639 MB, Apache-2.0, official
+GGUF). It is an **evaluation candidate only, NOT wired into the app** — it
+probes whether deterministic cosine intent routing beats the 59.4% LLM
+intent-routing control. It is a *pure embedding* model (no chat), used with
+`embedding=True`; pooling is LAST (from GGUF metadata — the probe fails loud
+if that is not the case).
+
+| Field | Value |
+|---|---|
+| Name | `qwen3-embedding-0.6B-Q8_0` |
+| HF repo | `Qwen/Qwen3-Embedding-0.6B-GGUF` (official, ungated) |
+| Quant | `Q8_0` |
+| Est. size | ~639 MB |
+| License | Apache-2.0 |
+
+Bootstrap (fills `sha256`/`size_bytes` in `manifest.json`):
+
+```bash
+python models/download_model.py --model qwen3-embedding-0.6B-Q8_0 --write-hash
+```
+
 ## SHA-256 bootstrap (first run)
 
 `sha256` is `null` for both entries **by design**: we do not commit hashes we
