@@ -5418,9 +5418,24 @@ def _utxo_render_rows(
       and ``value_btc``, computing nothing itself.
     - ``confirmed`` (bool) — verbatim store truth (True confirmed / False
       pending) — the icon source.
+    - ``arrival`` (str) — TCK-UTXO-006: the coin's arrival date, verbatim
+      from the input row (which the ``get_utxos`` handler fills from the
+      provenance join — :func:`_coin_receive_time` +
+      :func:`_arrival_label`: a confirmed coin's tx-row ``block_time``
+      date, an unconfirmed coin's ``first_seen`` date, else the literal
+      ``pending``). CLOSED shape: ``YYYY-MM-DD`` or ``"pending"``, values
+      store truth only — the renderer shows it verbatim and the engine
+      never fabricates a date. Absent exactly when the input row carries
+      no string (legacy surfaces keep the pre-006 row shape and render
+      without it).
     - ``address`` (str) — verbatim; the copy-address button's value.
       Absent exactly when ``number`` is.
     - ``txid`` (str) — verbatim FULL 64-hex; the copy-txid button's value.
+    - ``txid_copy_only`` (True) — TCK-UTXO-006: the row's txid is the
+      copy button's CLIPBOARD payload only; the typed row no longer
+      requires it as rendered text (the static half replaces the old
+      txid text with the compact copy button). Pre-006 rows lack the key
+      — a legacy renderer that printed the txid as text keeps doing that.
     - ``label`` (str) — PASSTHROUGH ONLY: present exactly when the input
       row already carries a non-empty ``label`` (the value copied
       verbatim). The ``get_utxos`` listing shows NO per-row label, so its
@@ -5445,10 +5460,16 @@ def _utxo_render_rows(
         row["value_sats"] = value_sats
         row["value_btc"] = _sats_to_btc_str(int(value_sats))  # int per the contract
         row["confirmed"] = utxo.get("confirmed")
+        arrival = utxo.get("arrival")
+        if isinstance(arrival, str) and arrival:
+            row["arrival"] = arrival  # verbatim passthrough (date | pending)
         address = utxo.get("address")
         if isinstance(address, str) and address:
             row["address"] = address
         row["txid"] = utxo.get("txid")
+        # TCK-UTXO-006: contract marker — the txid rides the row ONLY as
+        # the copy button's clipboard payload, never as rendered text.
+        row["txid_copy_only"] = True
         label = utxo.get("label")
         if isinstance(label, str) and label:
             row["label"] = label  # verbatim passthrough — never resolved here
@@ -5464,7 +5485,9 @@ def _make_get_utxos_handler(
     """Create the ``get_utxos`` handler closed over the store.
 
     Returns the cached UTXO snapshot verbatim (``txid``/``vout``/
-    ``address``/``value_sats``/``confirmed``) plus a count. Addresses
+    ``address``/``value_sats``/``confirmed``) plus a count, and (since
+    TCK-UTXO-006) the per-coin ``arrival`` date computed from the tx-row
+    join below. Addresses
     come from the store — i.e. from tool output via the scan — so the
     quote-verbatim rule is satisfied end to end. The result carries the
     tool-owned ``freshness`` key (ADR-0022 decision 6: cache-served
@@ -5521,6 +5544,20 @@ def _make_get_utxos_handler(
     text-only surfaces that build no handler result, so their bubbles
     ride the text fallback. Rows are tool output (values sanctioned in
     the RESULT, as in the narration) — never logged, never model context.
+
+    TCK-UTXO-006 (txid→copy + arrival date): every projected coin and its
+    row gains the additive ``arrival`` — the coin's arrival DATE from the
+    tx-row provenance join the handler ALREADY performs
+    (:func:`_coin_receive_time`: confirmed = the tx row's ``block_time``,
+    unconfirmed = its ``first_seen``; unresolvable = the literal
+    ``pending``, never a fabricated date; the UTC ``YYYY-MM-DD``
+    formatting is pure, in :func:`_arrival_label`), and every row gains
+    ``txid_copy_only: True`` — the row's txid is now the copy button's
+    clipboard payload only, no longer required as rendered text. No new
+    store or chain call: the join rides the ``get_txs_for_wallet`` read
+    the filters already use. Legacy consumers ignore both (additive);
+    the pre-model filtered listings build no rows and their projected
+    entries carry no ``arrival``, so their text stays byte-identical.
     """
 
     def handler(envelope: Envelope) -> dict[str, object]:
@@ -5530,6 +5567,10 @@ def _make_get_utxos_handler(
         try:
             records = store.get_utxos_for_wallet(wallet_id)
             txs = store.get_txs_for_wallet(wallet_id)
+            # The provenance join map (TCK-UX-003 precedent): the filters
+            # below AND the TCK-UTXO-006 arrival dates ride this one
+            # already-fetched tx listing — no extra store or chain call.
+            sources = {t.txid: t for t in txs}
             freshness = _freshness(store, wallet_id, scan_gate)
             scoped_address: str | None = None
             if params.address_number is not None:
@@ -5540,7 +5581,6 @@ def _make_get_utxos_handler(
                     return {"error": _ADDRESS_REF_UNKNOWN}
                 records = [r for r in records if r.address == scoped_address]
             if params.direction is not None or params.since is not None:
-                sources = {t.txid: t for t in txs}
                 if params.direction is not None:
                     records = [
                         r
@@ -5585,6 +5625,9 @@ def _make_get_utxos_handler(
                 "value_sats": r.value_sats,
                 "confirmed": bool(r.confirmed),
                 "number": numbers.get(r.address) if r.address else None,
+                # TCK-UTXO-006: the arrival date from the provenance join
+                # (store truth only; unresolvable = honest pending marker).
+                "arrival": _arrival_label(_coin_receive_time(r, sources.get(r.txid))),
             }
             for r in records
         ]
@@ -19756,6 +19799,24 @@ def _coin_receive_time(
     return source.block_time if coin.height is not None else source.first_seen
 
 
+_ARRIVAL_PENDING: Final[str] = "pending"
+
+
+def _arrival_label(epoch: int | None) -> str:
+    """TCK-UTXO-006: a coin's arrival DATE from a store-truth epoch — the
+    UTC calendar date (``%Y-%m-%d``, the :func:`_status_stamp` date
+    convention) formatted PURELY from the joined timestamp; this function
+    reads no clock. ``None`` — no tx row or no recorded time (the
+    :func:`_coin_receive_time` contract: confirmed = ``block_time``,
+    unconfirmed = ``first_seen``) — is the honest :data:`_ARRIVAL_PENDING`
+    marker; a date is never fabricated."""
+    return (
+        _ARRIVAL_PENDING
+        if epoch is None
+        else time.strftime("%Y-%m-%d", time.gmtime(epoch))
+    )
+
+
 def _parse_chat_age_bound(
     words: list[str], consumed: set[int], now: int
 ) -> tuple[str, int, str, frozenset[int]] | tuple[None, frozenset[int]]:
@@ -21426,6 +21487,14 @@ def _print_utxos(
     showed (store integer, ``:,`` — matching the row contract's
     ``value_sats`` display); every other byte is unchanged.
 
+    TCK-UTXO-006: the handler's coin entries carry the join-derived
+    ``arrival`` string, so its CLI line gains one `` · arrived <date |
+    pending>`` segment between the confirmed label and the ``tx`` tail
+    (value verbatim, copy static — the separator/icon convention). An
+    entry WITHOUT the key (the filtered listings' projections, legacy
+    results) prints byte-identically to the 005 line — the segment rides
+    the data, never a fabricated "pending".
+
     TCK-UTXO-005 static half: when the result carries ``utxo_rows`` the
     pump stamps it as an additive ``utxo_rows`` SSE event AFTER the coin
     narration lines above and BEFORE ``turn_end`` — the exact JSON of the
@@ -21470,12 +21539,22 @@ def _print_utxos(
         number_part = f"#{number} " if isinstance(number, int) else ""
         address_part = f"{number_part}{address} · " if address else ""
         confirmed_label = "confirmed" if utxo.get("confirmed") else "unconfirmed"
+        # TCK-UTXO-006: the arrival segment rides only when the entry
+        # carries the string (the get_utxos handler's join) — legacy and
+        # filtered-listing shapes print byte-identically to before. The
+        # value (a UTC date or "pending") is verbatim tool output; the
+        # copy around it is static.
+        arrival = utxo.get("arrival")
+        arrival_part = (
+            f" · arrived {arrival}" if isinstance(arrival, str) and arrival else ""
+        )
         txid = str(utxo.get("txid", ""))
         txid_part = txid or "<unknown>"
         output_fn(
             sanitize_tool_output(
                 f"{address_part}{utxo.get('value_sats', 0):,} sats · "
-                f"{confirmed_label} · tx {txid_part} vout {utxo.get('vout', 0)}"
+                f"{confirmed_label}{arrival_part} · tx {txid_part} "
+                f"vout {utxo.get('vout', 0)}"
             )
         )
     # TCK-UTXO-005 static half: ship the typed rows to the web client

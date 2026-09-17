@@ -765,7 +765,10 @@ class TestUtxosFilters:
         result = table[IntentName.GET_UTXOS](_env(IntentName.GET_UTXOS, {}))
         assert {"utxos", "count", "freshness"} <= set(result)
         assert all(
-            {"txid", "vout", "address", "value_sats", "confirmed", "number"}
+            # TCK-UTXO-006 additive: the entry gains the join-derived
+            # "arrival" date string; the CHAT-005 keys are untouched.
+            {"txid", "vout", "address", "value_sats", "confirmed", "number",
+             "arrival"}
             == set(u)
             for u in result["utxos"]
         )

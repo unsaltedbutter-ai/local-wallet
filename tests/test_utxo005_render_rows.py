@@ -150,8 +150,11 @@ class TestRowsShape:
         store, wid = _store_with_wallet()
         a0 = derive_fixture_addresses(1)[0]
         store.replace_utxos_for_wallet(wid, [_utxo(wid, "a" * 64, 0, a0, 100, 1)])
+        # TCK-UTXO-006 additive: arrival + txid_copy_only join the set
+        # (the row contract's exact keys re-pinned at full listing).
         assert set(_ask(store, wid)["utxo_rows"][0]) == {
-            "number", "value_sats", "value_btc", "confirmed", "address", "txid"
+            "number", "value_sats", "value_btc", "confirmed", "address", "txid",
+            "arrival", "txid_copy_only",
         }
 
 
@@ -276,7 +279,11 @@ class TestKeyAbsence:
         store, wid = _store_with_wallet()
         store.replace_utxos_for_wallet(wid, [_utxo(wid, "a" * 64, 0, None, 100, 1)])
         row = _ask(store, wid)["utxo_rows"][0]
-        assert set(row) == {"value_sats", "value_btc", "confirmed", "txid"}
+        # TCK-UTXO-006 additive: arrival/txid_copy_only ride every row too.
+        assert set(row) == {
+            "value_sats", "value_btc", "confirmed", "txid",
+            "arrival", "txid_copy_only",
+        }
 
 
 class TestSeparatorVerdict:
@@ -293,7 +300,13 @@ class TestSeparatorVerdict:
         )
         result = _ask(store, wid)
         (line,) = [ln for ln in _narrate(result) if " sats · " in ln]
-        assert line == f"#1 {a0} · 10,000,000 sats · confirmed · tx {'a' * 64} vout 0"
+        # TCK-UTXO-006 additive: the line gained the " · arrived <date|
+        # pending>" segment (no tx row seeded here -> the honest pending
+        # marker; the date cases are pinned in test_utxo006_arrival_rows).
+        assert line == (
+            f"#1 {a0} · 10,000,000 sats · confirmed · arrived pending · "
+            f"tx {'a' * 64} vout 0"
+        )
         # the row keeps the RAW integer (the client separates for display;
         # the text and the row are two renderings of one store truth).
         assert result["utxo_rows"][0]["value_sats"] == 10_000_000
@@ -305,7 +318,11 @@ class TestSeparatorVerdict:
             wid, [_utxo(wid, "f" * 64, 2, a0, 500, confirmed=0)]
         )
         (line,) = [ln for ln in _narrate(_ask(store, wid)) if " sats · " in ln]
-        assert line == f"#1 {a0} · 500 sats · unconfirmed · tx {'f' * 64} vout 2"
+        # TCK-UTXO-006 additive: the arrived segment (pending — no tx row).
+        assert line == (
+            f"#1 {a0} · 500 sats · unconfirmed · arrived pending · "
+            f"tx {'f' * 64} vout 2"
+        )
 
     def test_everything_else_byte_identical(self) -> None:
         # the pending block and the empty answer keep their pre-ticket
@@ -383,7 +400,11 @@ class TestStaticEmission:
         )
         result = _ask(store, wid)
         (line,) = [ln for ln in _narrate(result) if " sats · " in ln]
-        assert line == f"#1 {a0} · 500 sats · confirmed · tx {'a' * 64} vout 0"
+        # TCK-UTXO-006 additive: arrived pending (no tx row seeded).
+        assert line == (
+            f"#1 {a0} · 500 sats · confirmed · arrived pending · "
+            f"tx {'a' * 64} vout 0"
+        )
 
     def test_print_turn_model_path_emits_rows(self) -> None:
         # Mirror of the HW-005 model-path emission pin: the GET_UTXOS turn

@@ -605,7 +605,13 @@ def test_ac4_store_view_narration_inputs_match_truth(store: Store) -> None:
     # address (assigned at this first showing, sorted-address order by the
     # handler). The AC-4 store view is checked EX-NUMBER against fixture
     # truth; the numbers themselves are pinned in tests/test_chat001_*.
-    assert [{k: v for k, v in row.items() if k != "number"} for row in utxos["utxos"]] == [
+    # TCK-UTXO-006 adds the join-derived ``arrival`` string (derived, not
+    # a store column: EX it too — its date values are pinned against
+    # fixture block_time in tests/test_utxo006_arrival_rows.py).
+    assert [
+        {k: v for k, v in row.items() if k not in ("number", "arrival")}
+        for row in utxos["utxos"]
+    ] == [
         {
             "txid": TX_SPEND_SELF,
             "vout": 0,
