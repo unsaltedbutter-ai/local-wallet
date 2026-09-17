@@ -532,8 +532,12 @@ def test_print_replaced_terminal_quotes_store_values_verbatim() -> None:
             "replacement_height": 900_002,
         }
     )
+    # TCK-TXID-002 RE-ADJUDICATION (was: full 64-hex verbatim per
+    # TXID-001): the answer references the replacement through the
+    # compact token; the FULL value rides the txid_refs payload / the
+    # direct ask (height + surrounding copy unchanged, verbatim).
     assert lines == [
-        f"It was replaced by {REPL} — the replacement confirmed at height 900002."
+        f"It was replaced by {REPL[:8]}… — the replacement confirmed at height 900002."
     ]
 
 
@@ -547,9 +551,11 @@ def test_print_replaced_live_race_carries_the_bip125_hedge() -> None:
             "replacement_height": None,
         }
     )
+    # TXID-002: compact token in the line (see the pin above); the hedge
+    # copy itself is unchanged.
     assert lines == [
         (
-            f"It was replaced by {REPL} — the original may still confirm; "
+            f"It was replaced by {REPL[:8]}… — the original may still confirm; "
             "only one of these two ever will."
         )
     ]
@@ -565,10 +571,12 @@ def test_print_evicted_is_honest_about_the_lost_bump() -> None:
             "original_height": 900_001,
         }
     )
+    # TXID-002: the original's id prints compact (full rides the payload);
+    # the honesty (which tx lost the race, at what height) is unchanged.
     assert lines == [
         (
             "It never confirmed — it was the fee bump, and the original it replaced "
-            f"went through instead ({ORIG} at height 900001)."
+            f"went through instead ({ORIG[:8]}… at height 900001)."
         )
     ]
 

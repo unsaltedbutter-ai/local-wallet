@@ -83,6 +83,11 @@ const qrViewerEl = document.getElementById("qr-viewer");
 const qrImgEl = document.getElementById("qr-img");
 const qrCaptionEl = document.getElementById("qr-caption");
 const qrCloseEl = document.getElementById("qr-close");
+// TCK-UTXO-008: the coin-selection strip above the composer (count line =
+// the ONE live region; the fee line is static markup inside the section —
+// the whole strip toggles on hidden, so only these two are wired).
+const coinSelStripEl = document.getElementById("coin-select-strip");
+const coinSelCountEl = document.getElementById("coin-select-count");
 
 // The leak sentence, shared verbatim by the pane's public-consent subline
 // and the first-run beat (one string, so the two disclosures can never
@@ -400,6 +405,23 @@ const LABELS = {
   // never reaches text; the sibling copyTokenButton's value-bearing aria
   // name carries the full hash).
   utxoTxidChip: "[tx]",
+  // TCK-UTXO-008: the coin-selection checkboxes (click-to-FILL, never
+  // auto-submit). The checkbox's value-bearing name is coinSelectWord +
+  // the row's own "#N, <sats>" data; the reason strings ride title + the
+  // suffixed accessible name (retirement copy), never painted text.
+  // coinSelectedOver's ceiling literal is pinned to the engine's
+  // MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS by the render-contract test.
+  coinSelectWord: "Select coin",
+  coinSelectUnnamed: "Coin selection unavailable — this coin has no number",
+  coinSelectStale: "Coin selection unlocks once the first scan finishes",
+  coinSelectRetired: "Replaced by a newer coin listing",
+  coinSelectReplaced: "Wallet replaced — this listing is retired",
+  coinSelectTemplate: "send to",
+  coinSelectNone: "No coins selected",
+  coinSelectedOne: " coin selected",
+  coinSelectedMany: " coins selected",
+  coinSelectedOver:
+    " — the engine will refuse a send naming more than 256 coins; uncheck some",
 };
 
 // Which buttons the typed /state snapshot shows, per flow position. The
@@ -544,6 +566,20 @@ const state = {
   // engine list is a code-owned constant). Memory only, never logged.
   suggestedServers: [],
   suggestedServersSig: null,
+  // TCK-UTXO-008: the last TYPED snapshot's scan_state NAME (state/0 keeps
+  // it, the privacyMode discipline). "" / unknown / any not-done name reads
+  // STALE — the newest listing's checkboxes arm only when the freshness is
+  // verifiably not stale, never on a guess. Memory only.
+  scanState: "",
+  // TCK-UTXO-008: the NEWEST listing's armed checkboxes (row-data
+  // closures keyed on their dataset — never DOM position); null = nothing
+  // armed. The selection is a PURE function of these boxes' checked state,
+  // so a replay / a second tab renders and arms identically. Memory only.
+  coinSelBoxes: null,
+  // TCK-UTXO-008: the last count line WRITTEN to the strip's live region —
+  // the TRANSITION gate (every textContent write re-announces; the WEB-028
+  // reconnecting-tracker discipline). "" = nothing written yet.
+  coinSelShown: "",
   stateSeq: 0,
   watchKeyDismissed: false,
   watchKeyPresent: null, // null = unknown | true | false (typed state/1 only)
@@ -804,6 +840,10 @@ function lineText(line) {
       text += node.dataset.txid;
       continue;
     }
+    // TCK-UTXO-008: the selection checkbox is chrome (the .qr-btn precedent
+    // — explicit, belt-and-braces: an <input> carries no text anyway, but
+    // the seam CONTRACT says selection never enters copy/announce text).
+    if (node.nodeType === Node.ELEMENT_NODE && node.classList.contains("utxo-select")) continue;
     text += node.textContent;
   }
   return text;
@@ -1218,8 +1258,41 @@ function utxoTxidChip(txid) {
 function utxoRowElement(row) {
   const line = el("p", "turn-text utxo-row");
   const gated = row.txid_copy_only === true;
+  // TCK-UTXO-008: the selection checkbox leads EVERY row (the listing's
+  // head-of-line affordance). Built INERT — disabled, no listener: the
+  // arm pass unlocks exactly the newest listing's numbered rows once the
+  // typed freshness says so. A number-less (address-less) row is visibly
+  // UNSELECTABLE: permanently disabled, muted, reason in name + title.
+  // Real <input type="checkbox"> (a11y floor); value-bearing accessible
+  // name from the row's OWN data ("Select coin #3, 10,000 sats"). No
+  // separator text node rides with it (the flex gap spaces it) and
+  // lineText skips it — the selection chrome never enters copy text.
+  const box = el("input", "utxo-select");
+  box.type = "checkbox";
+  box.disabled = true;
   if (row.number !== undefined) {
-    line.appendChild(el("span", "utxo-number", "#" + row.number));
+    // TCK-UTXO-008 (WCAG 2.5.5): the row's "#N" text below IS this box's
+    // <label> (per-render unique id — a pairing key, never a data key); the
+    // value-bearing accessible name stays on the box itself.
+    coinSelIdSeq += 1;
+    box.id = "coin-sel-" + coinSelIdSeq;
+    const coinName =
+      LABELS.coinSelectWord + " #" + row.number + ", " +
+      formatSats(row.value_sats) + " sats";
+    box.dataset.coinNumber = String(row.number);
+    box.dataset.coinName = coinName;
+    box.setAttribute("aria-label", coinName);
+    box.title = LABELS.coinSelectStale; // cleared by the arm pass
+  } else {
+    box.dataset.coinName = LABELS.coinSelectUnnamed;
+    box.setAttribute("aria-label", LABELS.coinSelectUnnamed);
+    box.title = LABELS.coinSelectUnnamed;
+  }
+  line.appendChild(box);
+  if (row.number !== undefined) {
+    const num = el("label", "utxo-number", "#" + row.number);
+    num.htmlFor = box.id;
+    line.appendChild(num);
     line.appendChild(document.createTextNode(" "));
   }
   line.appendChild(utxoAmountButton(row));
@@ -1281,8 +1354,226 @@ function noteUtxoRows(raw) {
   // the narrated coin lines they replace come out.
   for (const row of rows) coins[0].before(utxoRowElement(row));
   for (const line of coins) line.remove();
+  // TCK-UTXO-008: the NEWEST listing owns the selection — arm these rows
+  // (retiring any older armed set) iff the typed freshness is not stale.
+  armCoinListing(turn);
   addCopyButton(turn); // WEB-010: (re-)arm the bubble copy over the row lines
   scrollToEnd();
+}
+
+// =========================================== coin selection (TCK-UTXO-008)
+// Click-to-FILL (WEB-022 precedent), NEVER auto-submit: checking coins writes
+// the UTXO-007 engine clause into the composer — "send to using #3 #7" seeded
+// into an empty box (amount + address left for the user to type), or the
+// clause appended to whatever send line the user already wrote. The user reads
+// and edits the composer and presses Send themselves; nothing is ever POSTed
+// from a checkbox. The clause shape is EXACTLY the engine's shipped grammar:
+// "using" + space-joined "#N" tokens (a lone "#N" parses; a lone bare number
+// does NOT — so every number here always carries the "#").
+// Granularity is the ADDRESS: "#N" is per-address, so checking any row flips
+// every sibling at the same #N. Lifetime is the NEWEST listing only: each new
+// utxo_rows render retires the previous set (disabled + muted + a reason on
+// focus) and clears the selection; a wallet replace does the same. Boxes are
+// keyed on their row DATA (number/sats/txid via dataset), never DOM position,
+// so a replay renders and arms identically and every other tab converges on
+// the same newest listing.
+const COIN_SELECT_CEILING = 256; // == engine MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS
+let coinSelIdSeq = 0;
+
+// Remove EVERY numbered using-clause the SHIPPED engine grammar
+// (`_send_pin_clause`) reads — not just the shape this builder writes. The
+// engine admits: optional object word (coin/coins/utxo/utxos), "#N" or bare
+// entries, "and" joiners ONLY between entries, trailing politeness fillers
+// (please/now/again/instead); case-insensitive, token punctuation stripped.
+// A run is a clause for the engine only when it carries a "#"-marked entry
+// or TWO-OR-MORE numbers (a lone bare digit stays the user's prose — the
+// engine skips it and finds the client's tail clause anyway). The engine
+// reads the FIRST such run, so strip-then-append on every selection change
+// keeps exactly ONE numbered clause alive: the client's own. Whitespace is
+// collapsed to a single space at each removal seam ONLY — the draft's own
+// spacing survives the flip.
+function stripCoinClauses(text) {
+  const isPunct = (c) => /[!-\/:-@\[-`{-~]/.test(c); // Python string.punctuation
+  const core = (t) => {
+    let a = 0;
+    let b = t.length;
+    while (a < b && isPunct(t[a])) a += 1;
+    while (b > a && isPunct(t[b - 1])) b -= 1;
+    return t.slice(a, b);
+  };
+  const entryKind = (t) =>
+    // 1 = "#"-marked, 0 = bare, null = not a registry-number entry.
+    t.startsWith("#")
+      ? /^\d+$/.test(core(t.slice(1))) ? 1 : null
+      : /^\d+$/.test(core(t)) ? 0 : null;
+  const ms = Array.from(text.matchAll(/\s+|\S+/g));
+  const slots = [];
+  ms.forEach((m, k) => { if (!/^\s/.test(m[0])) slots.push(k); });
+  const lowered = slots.map((k) => ms[k][0].toLowerCase());
+  const drop = new Set();
+  for (let i = 0; i < lowered.length; i += 1) {
+    if (lowered[i] !== "using") continue;
+    const consumed = new Set([i]);
+    let j = i + 1;
+    if (j < lowered.length && /^coins?$|^utxos?$/.test(core(lowered[j]))) {
+      consumed.add(j);
+      j += 1;
+    }
+    let numbers = 0;
+    let marked = false;
+    while (j < lowered.length) {
+      const e = entryKind(lowered[j]);
+      if (e === null && core(lowered[j]) === "and" &&
+          j + 1 < lowered.length && entryKind(lowered[j + 1]) !== null) {
+        consumed.add(j); // a joiner ONLY between two entries
+        j += 1;
+        continue;
+      }
+      if (e === null) {
+        if (numbers > 0 && /^please$|^now$|^again$|^instead$/.test(core(lowered[j]))) {
+          consumed.add(j); // trailing politeness
+          j += 1;
+          continue;
+        }
+        break;
+      }
+      numbers += 1;
+      if (e === 1) marked = true;
+      consumed.add(j);
+      j += 1;
+    }
+    if (numbers === 0 || (numbers === 1 && !marked)) continue; // not grammar
+    for (const t of consumed) drop.add(t);
+  }
+  if (drop.size === 0) return text;
+  const dropMs = new Set([...drop].map((t) => slots[t]));
+  const dropped = [...dropMs];
+  const kept = slots.filter((k) => !dropMs.has(k));
+  if (kept.length === 0) return "";
+  let out = dropped.some((k) => k < kept[0]) ? "" : text.slice(0, ms[kept[0]].index);
+  for (let p = 0; p < kept.length; p += 1) {
+    const m = ms[kept[p]];
+    out += m[0];
+    const end = m.index + m[0].length;
+    if (p + 1 === kept.length) {
+      out += dropped.some((k) => k > kept[p]) ? "" : text.slice(end);
+      break;
+    }
+    const next = kept[p + 1];
+    let seam = false;
+    for (let k = kept[p] + 1; k < next; k += 1) {
+      if (dropMs.has(k)) { seam = true; break; }
+    }
+    out += seam ? " " : text.slice(end, ms[next].index);
+  }
+  return out;
+}
+
+// The composer value for a checked set: the user's send line (clause stripped)
+// + " using #N #M …", or the editable "send to" seed when the box was empty.
+// An empty set retracts both the clause and, if untouched, the seed.
+function coinUtterance(numbers) {
+  // trim() edges only (the append seam); stripCoinClauses leaves the body's
+  // interior spacing untouched.
+  const body = stripCoinClauses(inputEl.value).trim();
+  if (numbers.length === 0) {
+    return body === LABELS.coinSelectTemplate ? "" : body;
+  }
+  const base = body === "" ? LABELS.coinSelectTemplate : body;
+  return base + " using " + numbers.map((n) => "#" + n).join(" ");
+}
+
+function checkedCoinNumbers() {
+  const set = new Set();
+  for (const box of state.coinSelBoxes || []) {
+    if (box.checked) set.add(Number(box.dataset.coinNumber));
+  }
+  return [...set].sort((a, b) => a - b);
+}
+
+// Count + ceiling honesty ONLY: the count of DISTINCT selected coin numbers
+// (duplicate-address siblings share one #N, and it is the numbers the engine
+// resolves against its ceiling — never rows), and (over the engine's ceiling)
+// the fact that the ENGINE will refuse. Qualitative fee word is static markup
+// in the strip. NO client-side fee estimate exists.
+function paintCoinStrip() {
+  const armed = state.coinSelBoxes !== null && state.coinSelBoxes.length > 0;
+  coinSelStripEl.hidden = !armed;
+  if (!armed) return;
+  const count = checkedCoinNumbers().length;
+  const over = count > COIN_SELECT_CEILING;
+  const word = count === 1 ? LABELS.coinSelectedOne : LABELS.coinSelectedMany;
+  const line =
+    count === 0
+      ? LABELS.coinSelectNone
+      : String(count) + word + (over ? LABELS.coinSelectedOver : "");
+  if (line !== state.coinSelShown) {
+    state.coinSelShown = line; // the ONE live-region write, on transition only
+    coinSelCountEl.textContent = line;
+  }
+}
+
+function recomposeCoinClause() {
+  inputEl.value = coinUtterance(checkedCoinNumbers());
+  paintCoinStrip();
+}
+
+// One checkbox flipped: mirror the whole address group (same #N) to the new
+// state, then recompose. No submit, no focus move (the user keeps working the
+// checkbox group; the composer visibly follows).
+function onCoinSelect(box) {
+  if (!state.coinSelBoxes || !state.coinSelBoxes.includes(box)) return; // retired
+  for (const other of state.coinSelBoxes) {
+    if (other.dataset.coinNumber === box.dataset.coinNumber) {
+      other.checked = box.checked; // sibling mark (address granularity)
+    }
+  }
+  recomposeCoinClause();
+}
+
+function markCoinBoxOff(box, reason) {
+  box.checked = false;
+  box.disabled = true;
+  box.classList.add("utxo-select-retired"); // muted, non-color (WCAG 1.4.1)
+  box.title = reason; // the reason, on focus/hover
+  box.setAttribute("aria-label", box.dataset.coinName + " — " + reason);
+}
+
+// Retire the whole currently-armed set (newest-listing / wallet-replace
+// lifetime) and pull any clause we wrote for it back out of the composer.
+// Nothing armed = nothing to do (strict no-op — no repaint, no composer touch).
+function retireCoinSelection(reason) {
+  const boxes = state.coinSelBoxes;
+  state.coinSelBoxes = null;
+  if (!boxes) return;
+  for (const box of boxes) markCoinBoxOff(box, reason);
+  inputEl.value = coinUtterance([]);
+  paintCoinStrip();
+}
+
+// Arm a freshly rendered listing: retire the previous one, then enable ONLY
+// the numbered boxes when the typed freshness is verifiably fresh
+// (scan_state "done"); otherwise they stay unselectable with the honest
+// reason. Selection always starts empty for a new listing.
+function armCoinListing(turn) {
+  retireCoinSelection(LABELS.coinSelectRetired);
+  const boxes = Array.from(turn.querySelectorAll(".utxo-select"));
+  const fresh = state.scanState === "done";
+  const armed = [];
+  for (const box of boxes) {
+    if (!box.dataset.coinNumber) continue; // number-less = permanently off
+    if (!fresh) {
+      markCoinBoxOff(box, LABELS.coinSelectStale);
+      continue;
+    }
+    box.disabled = false;
+    box.title = "";
+    box.setAttribute("aria-label", box.dataset.coinName); // value-bearing name
+    box.addEventListener("change", () => onCoinSelect(box));
+    armed.push(box);
+  }
+  state.coinSelBoxes = armed.length > 0 ? armed : null;
+  paintCoinStrip();
 }
 
 function ensureTurn() {
@@ -1711,6 +2002,10 @@ function dismissWatchKeyForm(key) {
 function applyScanChip(snap) {
   scanChipEl.hidden = true;
   if (!snap || snap.schema !== "state/1") return;
+  // TCK-UTXO-008: the checkbox arming gate reads ONLY this typed NAME
+  // (state/0 keeps the last known value — the early return above; never a
+  // guess from prose). Everything else in this function is unchanged.
+  state.scanState = typeof snap.scan_state === "string" ? snap.scan_state : "";
   const rawError = snap.scan_error; // read ONCE; absent/non-string = clean
   const scanError = typeof rawError === "string" ? rawError : "";
   if (scanError !== state.scanError) {
@@ -1997,6 +2292,11 @@ function applyWalletFpChip(snap) {
   const raw = snap.wallet_fingerprint;
   const fp = typeof raw === "string" && WALLET_FP_RE.test(raw) ? raw : "";
   if (fp === state.walletFingerprint) return;
+  // TCK-UTXO-008: a wallet transition (enter/replace/remove — any typed
+  // fingerprint CHANGE) retires the coin selection with it: the listed
+  // coins belonged to the OTHER wallet's truth. Strict no-op when nothing
+  // is armed.
+  retireCoinSelection(LABELS.coinSelectReplaced);
   state.walletFingerprint = fp;
   walletFpEl.textContent = fp ? walletFpChipText(fp) : "";
   walletFpEl.hidden = fp === "";

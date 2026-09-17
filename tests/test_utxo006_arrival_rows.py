@@ -150,9 +150,11 @@ class TestCliArrivalSegment:
         )
         _seed_tx(store, wid, "a" * 64, height=800_000, block_time=BLOCK_TIME)
         (line,) = [ln for ln in _narrate(_ask(store, wid)) if " sats · " in ln]
+        # TXID-002 RE-ADJUDICATION: the tx segment prints the COMPACT
+        # token; the arrival segment — this file's subject — rides verbatim.
         assert line == (
             f"#1 {a0} · 10,000,000 sats · confirmed · arrived 2023-11-14 · "
-            f"tx {'a' * 64} vout 0"
+            f"tx {'a' * 8}… vout 0"
         )
 
     def test_pending_marker_rides_the_line(self) -> None:
@@ -177,4 +179,6 @@ class TestCliArrivalSegment:
                         "address": None, "confirmed": True}], "count": 1},
             lines.append,
         )
-        assert f"2,500 sats · confirmed · tx {'a' * 64} vout 0" in lines
+        # TXID-002 RE-ADJUDICATION: compact tx token in the fallback
+        # line; the no-arrival shape still prints WITHOUT the segment.
+        assert f"2,500 sats · confirmed · tx {'a' * 8}… vout 0" in lines

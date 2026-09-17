@@ -95,6 +95,18 @@
 <p id="turn-status" class="visually-hidden" role="status" aria-live="polite"></p>
 
 <footer class="bar bar-compose">
+  <!-- TCK-UTXO-008: the coin-selection strip, directly above the composer.
+       Shown only while a FRESH newest listing arms its checkboxes; the count
+       line is the live region (app.js writes it on count TRANSITIONS only),
+       the fee line is static markup — honesty without numbers: the client
+       never estimates fees, and over the engine's 256-coin ceiling the count
+       line says the ENGINE will refuse. Checking coins FILLS the composer's
+       "using #N #M" clause (click-to-fill, WEB-022 discipline) — the strip
+       never submits anything. -->
+  <section id="coin-select-strip" class="coin-select-strip" aria-label="Coin selection" hidden>
+    <p id="coin-select-count" class="coin-select-count" role="status" aria-live="polite"></p>
+    <p class="coin-select-fee">Each extra coin adds to the fee.</p>
+  </section>
   <form id="turn-form" class="compose" autocomplete="off">
     <label class="visually-hidden" for="turn-text">Message</label>
     <input id="turn-text" name="text" type="text" placeholder="Ask your wallet…" maxlength="4096" required>

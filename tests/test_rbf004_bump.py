@@ -314,9 +314,18 @@ def test_change_first_hit_skips_the_ask(world) -> None:
     assert result["fee_delta_sats"] == FAST_FEE - SLOW_FEE
     lines: list[str] = []
     app._print_bump_fee(result, lines.append, session=world["session"])
+    # TCK-TXID-002 RE-ADJUDICATION (was: the chat line carried the full
+    # 64-hex per TXID-001): the transcript Replaces row prints the
+    # COMPACT token; the full id rides the txid_refs payload (web chip)
+    # and the cached /details render (pinned right below).
     assert (
-        f"Replaces: {txid} — the original may still confirm; only one of "
+        f"Replaces: {txid[:8]}… — the original may still confirm; only one of "
         "these two ever will" in lines
+    )
+    cached = next(line for line in world["session"].card_render if "Replaces:" in line)
+    assert cached == (
+        f"Replaces: {txid} — the original may still confirm; only one of "
+        "these two ever will"
     )
     assert "Fee: 141 sats → 423 sats (paying 282 sats extra)" in lines
     assert lines[0] == 'Pending — say "sign" to review it on your device, or "cancel" to discard.'
@@ -588,7 +597,9 @@ def test_supersede_narration_line(world) -> None:
     b2 = world["table"][IntentName.BROADCAST_TX](_env("broadcast_tx", {"tx_ref": ref}))
     lines: list[str] = []
     app._print_broadcast_tx(b2, lines.append, session=world["session"])
-    assert f"Replaces: {txid} — the original may still confirm; only one of these two ever will" in lines
+    # TXID-002: the supersede line prints the COMPACT token (full id
+    # rides the txid_refs payload — pinned in test_txid001_full_txids.py).
+    assert f"Replaces: {txid[:8]}… — the original may still confirm; only one of these two ever will" in lines
 
 
 def test_replacement_confirmed_end_state_quoted(world) -> None:

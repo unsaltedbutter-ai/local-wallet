@@ -304,8 +304,13 @@ class TestSeparatorVerdict:
         # pending>" segment (no tx row seeded here -> the honest pending
         # marker; the date cases are pinned in test_utxo006_arrival_rows).
         assert line == (
+            # TCK-TXID-002 RE-ADJUDICATION (was: full 64-hex per
+            # TXID-001): the narration's tx segment prints the COMPACT
+            # token; full ids ride utxo_rows (web rows, unchanged) /
+            # txid_refs (text fallback) / the direct ask. The separators
+            # — this pin's actual subject — are unchanged.
             f"#1 {a0} · 10,000,000 sats · confirmed · arrived pending · "
-            f"tx {'a' * 64} vout 0"
+            f"tx {'a' * 8}… vout 0"
         )
         # the row keeps the RAW integer (the client separates for display;
         # the text and the row are two renderings of one store truth).
@@ -320,8 +325,9 @@ class TestSeparatorVerdict:
         (line,) = [ln for ln in _narrate(_ask(store, wid)) if " sats · " in ln]
         # TCK-UTXO-006 additive: the arrived segment (pending — no tx row).
         assert line == (
+            # TXID-002: compact tx token (see the pin above).
             f"#1 {a0} · 500 sats · unconfirmed · arrived pending · "
-            f"tx {'f' * 64} vout 2"
+            f"tx {'f' * 8}… vout 2"
         )
 
     def test_everything_else_byte_identical(self) -> None:
@@ -401,9 +407,12 @@ class TestStaticEmission:
         result = _ask(store, wid)
         (line,) = [ln for ln in _narrate(result) if " sats · " in ln]
         # TCK-UTXO-006 additive: arrived pending (no tx row seeded).
+        # TXID-002: the CLI fallback line carries the COMPACT token (the
+        # byte-identity this pin guards is the ABSENCE of typed events —
+        # unchanged; the text shape is TXID-002's declared rework).
         assert line == (
             f"#1 {a0} · 500 sats · confirmed · arrived pending · "
-            f"tx {'a' * 64} vout 0"
+            f"tx {'a' * 8}… vout 0"
         )
 
     def test_print_turn_model_path_emits_rows(self) -> None:

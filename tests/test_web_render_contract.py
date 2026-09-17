@@ -2629,6 +2629,12 @@ def test_web027_chip_lifecycle_copy_and_label_copy_under_node() -> None:
     labels = re.search(r"const LABELS = \{.*?\n\};", code, re.DOTALL).group(0)
     leak = re.search(r"const PUBLIC_LEAK_SENTENCE =.*?;\n", code, re.DOTALL).group(0)
     block = code[code.index("const WALLET_FP_RE"):code.index("function handleEvent(id")]
+    # TCK-UTXO-008: the painter now retires the coin selection on a wallet
+    # transition — the SHIPPED retire runs (nothing-armed = strict no-op:
+    # state has no coinSelBoxes, so it returns before touching anything).
+    block += "\n" + re.search(
+        r"function retireCoinSelection\(reason\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
     script = (
         """
       const state = { walletFingerprint: "" };
@@ -3256,6 +3262,34 @@ def test_launch004_loading_indicator_lifecycle_under_node() -> None:
 # only (the global sink scan covers the new builders), CSP-clean (classes,
 # dataset and attributes only — never inline style).
 
+# TCK-UTXO-008 shared harness pieces: noteUtxoRows now ends in an
+# armCoinListing call, so every node harness that runs the SHIPPED rows path
+# must carry the coin-selection functions and the strip/composer element
+# stubs. In these pre-008 harnesses scan_state is undefined, so the arm pass
+# renders every numbered box retired-stale (a strict DOM no-op for their
+# assertions) — the stubs only need to exist, never to react.
+_COINSEL_FUNCS = (
+    "stripCoinClauses", "coinUtterance", "checkedCoinNumbers",
+    "paintCoinStrip", "recomposeCoinClause",
+    "onCoinSelect", "markCoinBoxOff", "retireCoinSelection",
+    "armCoinListing",
+)
+def _coin_sel_stub(code: str) -> str:
+    """Element/input stubs + the SHIPPED ceiling constant and id counter
+    (extracted verbatim, never re-typed) — paintCoinStrip reads
+    COIN_SELECT_CEILING and utxoRowElement bumps coinSelIdSeq for the
+    label↔box pairing; both are module-level bindings, not functions, so the
+    function-extraction misses them."""
+    ceiling = re.search(r"const COIN_SELECT_CEILING = \d+;", code).group(0)
+    seq = re.search(r"let coinSelIdSeq = 0;", code).group(0)
+    return (
+        "\n      const inputEl = { value: \"\" };\n"
+        "      const coinSelStripEl = { hidden: true };\n"
+        "      const coinSelCountEl = { hidden: true, textContent: \"\" };\n"
+        "      " + ceiling + "\n      " + seq + "\n"
+    )
+
+
 def test_utxo005_rows_static_pins() -> None:
     raw = (_STATIC / "app.js").read_text(encoding="utf-8")
     code = _strip_js_comments(raw)
@@ -3290,7 +3324,7 @@ def test_utxo005_rows_static_pins() -> None:
         r"function utxoRowElement\(row\) \{.*?\n\}", code, re.DOTALL
     ).group(0)
     for part in (
-        'el("span", "utxo-number", "#" + row.number)',
+        'el("label", "utxo-number", "#" + row.number)',  # 008: the #N IS the label
         "utxoAmountButton(row)",
         "utxoStateIcon(row.confirmed)",
         "copyTokenButton(row.address)",
@@ -3349,6 +3383,7 @@ def test_utxo005_rows_render_toggle_and_fallback_under_node() -> None:
             "utxoStateIcon", "utxoRowElement", "noteUtxoRows", "lineText",
             "bubbleText", "copyTokenButton",
         )
+        + _COINSEL_FUNCS  # TCK-UTXO-008: noteUtxoRows now arms (no-op stale)
     )
     script = """
       const ADDRESS_RE = __ADDR_RE__;
@@ -3430,6 +3465,7 @@ def test_utxo005_rows_render_toggle_and_fallback_under_node() -> None:
       let copyArms = 0;
       const addCopyButton = () => { copyArms++; };
       const scrollToEnd = () => {};
+      __COINSEL__
       __FUNCS__
       const addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
       const addr2 = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
@@ -3579,6 +3615,7 @@ def test_utxo005_rows_render_toggle_and_fallback_under_node() -> None:
         script.replace("__ADDR_RE__", addr_re)
         .replace("__TX_RE__", txid_re)
         .replace("__ARRIVAL_RE__", arrival_re)
+        .replace("__COINSEL__", _coin_sel_stub(code))
         .replace("__FUNCS__", funcs)
     )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
@@ -3668,6 +3705,7 @@ def test_utxo006_gated_rows_render_under_node() -> None:
             "utxoStateIcon", "utxoTxidChip", "utxoRowElement", "noteUtxoRows",
             "lineText", "bubbleText", "copyTokenButton",
         )
+        + _COINSEL_FUNCS  # TCK-UTXO-008: noteUtxoRows now arms (no-op stale)
     )
     # Same DOM-stub machinery as the 005 node check (the file's idiom), with
     # the LABELS the gated builders read.
@@ -3749,6 +3787,7 @@ def test_utxo006_gated_rows_render_under_node() -> None:
       const state = { openTurn: null };
       const addCopyButton = () => {};
       const scrollToEnd = () => {};
+      __COINSEL__
       __FUNCS__
       const addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
       const addr2 = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
@@ -3859,6 +3898,7 @@ def test_utxo006_gated_rows_render_under_node() -> None:
         script.replace("__ADDR_RE__", addr_re)
         .replace("__TX_RE__", txid_re)
         .replace("__ARRIVAL_RE__", arrival_re)
+        .replace("__COINSEL__", _coin_sel_stub(code))
         .replace("__FUNCS__", funcs)
     )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
@@ -3992,3 +4032,576 @@ def test_web031_conn_live_text_matrix_and_repaint_under_node() -> None:
     script = script.replace("__LABELS__", leak + labels).replace("__BLOCK__", block)
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
+
+
+# ============================================================== TCK-UTXO-008
+# Static half: coin-selection checkboxes (the UX-council BUILD contract, riding
+# the TCK-UTXO-007 engine grammar). Click-to-FILL (the WEB-022 precedent),
+# NEVER auto-submit: a flip composes the engine's "using #N #M …" clause INTO
+# the composer (seeded through the editable "send to" template when the box is
+# empty) — the user reads/edits the final text and presses Send themselves.
+# Granularity = ADDRESS (siblings at one #N mark together); lifetime = newest
+# listing (any newer utxo_rows render OR wallet replace retires the old set:
+# disabled + muted + reason on focus, selection cleared); arming only while the
+# typed freshness is not stale. Count + ceiling honesty only — NEVER a
+# client-side fee estimate. textContent-only + CSP; keyed on row data, never
+# DOM position (replay/multi-tab converge on the same newest listing).
+
+def test_utxo008_coin_select_static_pins() -> None:
+    raw = (_STATIC / "app.js").read_text(encoding="utf-8")
+    code = _strip_js_comments(raw)
+    html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+
+    def fn(name: str) -> str:
+        return re.search(
+            rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL
+        ).group(0)
+
+    # --- the checkbox: a REAL <input type="checkbox">, built inert, keyed on
+    #     row DATA (dataset), value-bearing name from the row's own fields. ---
+    builder = fn("utxoRowElement")
+    assert 'el("input", "utxo-select")' in builder
+    assert 'box.type = "checkbox";' in builder
+    assert "box.disabled = true;" in builder  # built INERT (arm pass enables)
+    assert "box.dataset.coinNumber = String(row.number);" in builder
+    assert "LABELS.coinSelectWord + " in builder  # "Select coin #N, <sats> sats"
+    assert "formatSats(row.value_sats)" in builder
+    assert "box.dataset.coinName = LABELS.coinSelectUnnamed;" in builder  # number-less
+    assert builder.index('"utxo-select"') < builder.index('"utxo-number"')  # leads the row
+    assert builder.index('"utxo-select"') < builder.index("utxoAmountButton")
+    assert "innerHTML" not in builder and "addEventListener" not in builder
+    # no separator text node rides the checkbox: the chrome never shifts the
+    # canonical copy/announce text (the flex gap spaces it visually instead).
+    assert 'line.appendChild(box);\n  if (row.number' in builder
+    # F4 (WCAG 2.5.5): the row's #N text IS a <label for> bound to the box's
+    # per-render id (a tap target bigger than the ~17px input; the CSS
+    # padding grows it and hands the gutter back). The value-bearing
+    # accessible name stays on the box.
+    assert 'el("label", "utxo-number", "#" + row.number)' in builder
+    assert 'box.id = "coin-sel-" + coinSelIdSeq;' in builder
+    assert "num.htmlFor = box.id;" in builder
+    assert 'box.setAttribute("aria-label", coinName);' in builder
+    assert "let coinSelIdSeq = 0;" in code
+    # lineText EXCLUDES the selection chrome (the .qr-btn / utxo-txid-btn
+    # chip-swap precedent — copied lines never gain checkbox text).
+    line_fn = fn("lineText")
+    assert 'contains("utxo-select")' in line_fn
+
+    # --- click-to-FILL, never auto-submit: no submit/fetch path exists in ANY
+    #     coin-selection function, and no requestSubmit call exists anywhere. ---
+    sel_blob = "".join(fn(name) for name in (
+        "stripCoinClauses", "coinUtterance", "checkedCoinNumbers",
+        "paintCoinStrip", "recomposeCoinClause",
+        "onCoinSelect", "markCoinBoxOff", "retireCoinSelection", "armCoinListing",
+    )) + code[code.index("const COIN_SELECT_CEILING"):code.index("function stripCoinClauses")]
+    for banned in ("submit(", "requestSubmit", "fetch(", "formEl"):
+        assert banned not in sel_blob, banned
+    assert "requestSubmit" not in code
+
+    # --- the composer fill shape: "using" + space-joined "#N" tokens ONLY
+    #     (a lone BARE number is not the engine's grammar — every number here
+    #     always carries the "#"); strip-then-append keeps EXACTLY ONE
+    #     numbered clause (the engine reads the first "using" run with numbers).
+    utter = fn("coinUtterance")
+    assert 'base + " using " + numbers.map((n) => "#" + n).join(" ")' in utter
+    assert 'body === LABELS.coinSelectTemplate ? "" : body;' in utter  # untouched seed retracts
+    # the STRIP mirrors the engine's FULL accepted vocabulary (F1): every
+    # shape _send_pin_clause reads as a numbered clause — object words, bare
+    # lists, "and" joiners, politeness fillers, "#"-marked OR two-or-more
+    # acceptance — must be stripped, or a hand-typed clause silently wins
+    # the first-run race against the client's own tail clause.
+    strip = fn("stripCoinClauses")
+    for shape in (
+        'lowered[i] !== "using"',
+        r"/^coins?$|^utxos?$/",
+        '=== "and"',
+        r"/^please$|^now$|^again$|^instead$/",
+        r'startsWith("#")',
+        r"/^\d+$/",
+        "numbers === 1 && !marked",
+    ):
+        assert shape in strip, shape
+    # F2: NO whole-draft whitespace rewrite — the collapse lives at the
+    # removal seam only (edge trim in coinUtterance is the append seam).
+    assert r"replace(/\s+/g" not in strip and r"replace(/\s+/g" not in utter
+    # the seed template is the ticket's exact editable frame ("send to" with
+    # the amount/address holes for the user).
+    assert 'coinSelectTemplate: "send to",' in code
+
+    # --- granularity = ADDRESS: a flip mirrors every box with the SAME #N. ---
+    on = fn("onCoinSelect")
+    assert "other.dataset.coinNumber === box.dataset.coinNumber" in on
+    assert "other.checked = box.checked;" in on
+
+    # --- lifetime = newest listing: the arm pass retires FIRST, arms only
+    #     when the typed freshness NAME is verifiably not stale, and a
+    #     retirement disables + mutes + puts the reason on focus (title + the
+    #     suffixed accessible name — never painted text). ---
+    arm = fn("armCoinListing")
+    assert "retireCoinSelection(LABELS.coinSelectRetired);" in arm
+    assert arm.index("retireCoinSelection") < arm.index("querySelectorAll")
+    assert 'const fresh = state.scanState === "done";' in arm
+    assert "if (!box.dataset.coinNumber) continue;" in arm
+    assert "box.disabled = false;" in arm
+    assert 'addEventListener("change", () => onCoinSelect(box));' in arm
+    ret = fn("retireCoinSelection")
+    assert "if (!boxes) return;" in ret  # nothing-armed = strict no-op
+    assert "inputEl.value = coinUtterance([]);" in ret  # the clause retracts
+    mark = fn("markCoinBoxOff")
+    assert "box.checked = false;" in mark and "box.disabled = true;" in mark
+    assert 'box.classList.add("utxo-select-retired")' in mark
+    assert "box.title = reason;" in mark
+    assert 'box.dataset.coinName + " \u2014 " + reason' in mark  # reason on focus
+    assert "box.textContent" not in mark  # the reason is NEVER painted text
+
+    # --- wallet replace retires beside the fingerprint transition (typed
+    #     truth, ONE call per change); the freshness NAME is recorded typed-
+    #     only inside the state/1 guard (state/0 keeps the last read). ---
+    fp = fn("applyWalletFpChip")
+    assert "retireCoinSelection(LABELS.coinSelectReplaced);" in fp
+    assert fp.index("if (fp === state.walletFingerprint) return;") < fp.index(
+        "retireCoinSelection(")
+    scan = fn("applyScanChip")
+    assert scan.index('if (!snap || snap.schema !== "state/1") return;') < scan.index(
+        'state.scanState = typeof snap.scan_state === "string" ? snap.scan_state : "";')
+    assert "coinSelBoxes: null," in code and 'scanState: "",' in code
+    assert 'coinSelShown: "",' in code
+
+    # --- count + ceiling honesty ONLY: the strip says the count of DISTINCT
+    #     coin numbers (F3: duplicate-address siblings share one #N, and the
+    #     engine's ceiling applies to the numbers it resolves — never rows),
+    #     and over the ceiling says the ENGINE will refuse; the fee word is
+    #     the static line. NO amount ever reaches the painter (no fee
+    #     estimate exists). ---
+    assert "const COIN_SELECT_CEILING = 256;" in code
+    paint = fn("paintCoinStrip")
+    assert "checkedCoinCount" not in code  # the row counter is gone
+    assert "const count = checkedCoinNumbers().length;" in paint
+    assert "value_sats" not in paint and "value_btc" not in paint
+    assert "if (line !== state.coinSelShown)" in paint  # TRANSITION-only write
+    labels = re.search(r"const LABELS = \{.*?\n\};", code, re.DOTALL).group(0)
+    over = re.search(r"coinSelectedOver:\s*\n?\s*\"([^\"]+)\"", labels).group(1)
+    assert "256" in over and "refuse" in over  # the refusal sentence names the ceiling
+    assert "coinSelectStale:" in labels and "coinSelectRetired:" in labels
+    assert "coinSelectReplaced:" in labels and "coinSelectUnnamed:" in labels
+
+    # --- markup: the strip sits ABOVE the composer, the count line is the ONE
+    #     live region, the fee line is static markup. No inline handler. ---
+    assert 'id="coin-select-strip"' in html and html.index("coin-select-strip") < html.index('id="turn-form"')
+    assert 'id="coin-select-count" class="coin-select-count" role="status" aria-live="polite"' in html
+    assert "Each extra coin adds to the fee." in html  # static, no estimate
+    assert not re.search(r"\son[a-z]+=", html)
+
+    # --- CSS: tokens only (the 005 tail no-hex pin already covers the zone;
+    #     restated), focus ring, the disabled unselectable register. ---
+    box = css[css.index(".utxo-select {"):][: css[css.index(".utxo-select {"):].index("}")]
+    assert "accent-color: var(--c-accent);" in box and "#" not in box
+    assert ".utxo-select:disabled {" in css and "cursor: not-allowed;" in css
+    assert ".utxo-select:focus-visible" in css and "outline: var(--focus-ring);" in css
+    # F4: the #N label's grown hit area (padding + gutter-returned negative
+    # margin), tokens only.
+    label_css = css[css.index("label.utxo-number {"):]
+    label_css = label_css[: label_css.index("}")]
+    assert "cursor: pointer;" in label_css and "padding: var(--sp-1)" in label_css
+    assert "calc(-1 * var(--sp-1))" in label_css and "#" not in label_css
+    strip_css = css[css.index(".coin-select-strip {"):]
+    strip_css = strip_css[: strip_css.index("}")]
+    assert "flex-wrap: wrap;" in strip_css and "#" not in strip_css
+    assert "#" not in css[css.index("TCK-UTXO-008"):]
+    assert "innerHTML" not in raw  # the file's own sink ban, restated for 008
+
+
+def test_utxo008_composed_fill_parses_with_the_engine() -> None:
+    """THE bridge pin (verify, don't guess): the SHIPPED composer-fill
+    functions run under node; every utterance they hand the user is fed back
+    through the SHIPPED engine's TCK-UTXO-007 parsers. The seed case parses
+    the clause and stages NOTHING unreadable; completed sends resolve exactly
+    the checked numbers; the composer never carries two numbered clauses."""
+    import shutil
+    import subprocess
+
+    from localwallet import app
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    leak = re.search(r"const PUBLIC_LEAK_SENTENCE =.*?;\n", code, re.DOTALL).group(0)
+    labels = re.search(r"const LABELS = \{.*?\n\};", code, re.DOTALL).group(0)
+    funcs = "\n".join(
+        re.search(rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL).group(0)
+        for name in ("stripCoinClauses", "coinUtterance")
+    )
+    addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+    script = (
+        """
+      __LABELS__
+      const inputEl = { value: __INIT__ };
+      __FUNCS__
+      const out = coinUtterance(__NUMS__);
+      process.stdout.write(JSON.stringify({ ut: out, tmpl: LABELS.coinSelectTemplate }));
+    """
+        .replace("__LABELS__", leak + labels)
+        .replace("__FUNCS__", funcs)
+    )
+
+    def compose(init: str, nums: list[int]) -> str:
+        s = script.replace("__INIT__", f'"{init}"').replace(
+            "__NUMS__", "[" + ", ".join(map(str, nums)) + "]"
+        )
+        return json.loads(
+            subprocess.run(["node", "-e", s], check=True,
+                           capture_output=True, text=True).stdout
+        )["ut"]
+
+    # (1) an empty box seeds the ticket's editable template + the clause.
+    seed = compose("", [3, 7])
+    assert seed == "send to using #3 #7"
+    numbers, rest = app._send_pin_clause(seed)
+    assert numbers == (3, 7) and rest == "send to"
+    assert app._parse_pin_send(rest) is None  # unfilled = unreadable, never stages
+    # (2) the user's half-typed line survives; the clause appends to its end.
+    full = compose(f"send 50000 sats to {addr}", [3, 7])
+    assert full == f"send 50000 sats to {addr} using #3 #7"
+    numbers, rest = app._send_pin_clause(full)
+    assert numbers == (3, 7)
+    assert app._parse_pin_send(rest) == (addr, 50_000)
+    # (3) a lone selection carries the "#" (a lone BARE digit is NOT the
+    #     engine's grammar — the client never composes one).
+    one = compose("", [4])
+    assert one == "send to using #4"
+    assert app._send_pin_clause(f"send 1 sats to {addr} using #4")[0] == (4,)
+    assert app._send_pin_clause(f"send 1 sats to {addr} using 4") is None
+    # (4) re-trim keeps EXACTLY ONE numbered clause: the old one is stripped
+    #     wherever it sits, the new list appended (the engine reads the first
+    #     numbered "using" — a stale survivor could silently pin the wrong set).
+    swap = compose(f"send 50000 sats to {addr} using #3 #7", [3, 7, 9])
+    assert swap == f"send 50000 sats to {addr} using #3 #7 #9"
+    assert swap.lower().count("using") == 1
+    assert app._send_pin_clause(swap)[0] == (3, 7, 9)
+    # (4b) F1: every ENGINE-VALID hand-typed clause shape — bare lists,
+    #      "and" joiners, object words, comma lists, politeness fillers —
+    #      is stripped too, so a checkbox flip leaves exactly ONE numbered
+    #      clause (the client's) and the shipped parser resolves it to the
+    #      checked set. The old client-only strip let these win the
+    #      first-run race and silently pinned the WRONG coins.
+    for hand in (
+        "using 3 7",
+        "using #3 and #7",
+        "using coin #3",
+        "using 3, 7 and 9 instead",
+        "using #3 and #7 please now",
+        "USING Coins #3, #7 Please",
+        "using #3 #7 using 5 6",
+        "using 5 and 6 with #3, #7 please",
+    ):
+        got = compose(f"send 5000 sats to {addr} {hand}", [5])
+        assert got.lower().count("using") == 1, (hand, got)
+        assert got.endswith(" using #5"), (hand, got)
+        numbers, rest = app._send_pin_clause(got)
+        assert numbers == (5,), (hand, numbers)
+        assert app._parse_pin_send(rest) == (addr, 5000), (hand, rest)
+    # a lone BARE digit run is not the engine's grammar: the draft keeps it
+    # verbatim and the engine still lands on the client's clause.
+    got = compose(f"send 5000 sats to {addr} using 4", [5])
+    assert got == f"send 5000 sats to {addr} using 4 using #5"
+    assert app._send_pin_clause(got)[0] == (5,)
+    # F2: the flip preserves the draft's interior whitespace (seam collapse
+    #     only — the user's spacing is not rewritten).
+    got = compose(f"send   5000 sats  to {addr} using #3", [5])
+    assert got == f"send   5000 sats  to {addr} using #5", got
+    # (5) deselecting everything retracts the clause — and the untouched seed
+    #     with it (the client leaves NO stray "send to" chrome behind).
+    assert compose("send to using #3", []) == ""
+    assert compose(f"send 50000 sats to {addr} using #3 #7", []) == (
+        f"send 50000 sats to {addr}"
+    )
+    # (6) the ceiling constant the client warns about IS the engine's.
+    assert app.MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS == 256
+
+
+def test_utxo008_coin_select_lifecycle_under_node() -> None:
+    """Node-executed behavioral pin over the SHIPPED builders: a fresh typed
+    listing ARMS (value-bearing names, enabled boxes, honest empty-state
+    strip); a flip fills the composer and marks its #N siblings; the count
+    line is written on TRANSITIONS only; copy/announce text stays chrome-
+    free; a duplicate emission no-ops; a newer listing retires the old set
+    (disabled + muted + reason) AND retracts its clause; a stale listing
+    never arms; and past the ceiling the strip says the ENGINE will refuse —
+    never a fee figure. Every assertion holds with fetch() exploding on
+    contact: the checkbox path NEVER submits."""
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    addr_re = re.search(r"const ADDRESS_RE = (/[^;]+);", code).group(1)
+    txid_re = re.search(r"const TXID_RE = (/[^;]+);", code).group(1)
+    arrival_re = re.search(r"const UTXO_ARRIVAL_RE = (/[^;]+);", code).group(1)
+    leak = re.search(r"const PUBLIC_LEAK_SENTENCE =.*?;\n", code, re.DOTALL).group(0)
+    labels = re.search(r"const LABELS = \{.*?\n\};", code, re.DOTALL).group(0)
+    funcs = "\n".join(
+        re.search(rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL).group(0)
+        for name in (
+            "el", "formatSats", "utxoRowIsWellFormed", "utxoAmountButton",
+            "utxoStateIcon", "utxoTxidChip", "utxoRowElement", "noteUtxoRows",
+            "lineText", "bubbleText", "copyTokenButton",
+        )
+        + _COINSEL_FUNCS
+    )
+    funcs = re.search(
+        r"const COIN_SELECT_CEILING = \d+;\s*\nlet coinSelIdSeq = 0;", code
+    ).group(0) + "\n" + funcs
+    script = """
+      const ADDRESS_RE = __ADDR_RE__;
+      const TXID_RE = __TX_RE__;
+      const UTXO_ARRIVAL_RE = __ARRIVAL_RE__;
+      __LABELS__
+      const mkNode = (tag, nodeType, text) => {
+        const node = {
+          tag, nodeType: nodeType || 1, className: "", textContent: text || "",
+          type: "", attrs: {}, dataset: {}, children: [], parent: null, handlers: {},
+          get childNodes() { return this.children; },
+          setAttribute(k, v) { this.attrs[k] = v; },
+          removeAttribute(k) { delete this.attrs[k]; },
+          appendChild(n) {
+            if (n.parent) {
+              const i = n.parent.children.indexOf(n);
+              if (i !== -1) n.parent.children.splice(i, 1);
+            }
+            n.parent = this; this.children.push(n); return n;
+          },
+          before(n) {
+            if (n.parent) {
+              const i = n.parent.children.indexOf(n);
+              if (i !== -1) n.parent.children.splice(i, 1);
+            }
+            const i = this.parent.children.indexOf(this);
+            n.parent = this.parent; this.parent.children.splice(i, 0, n);
+          },
+          remove() {
+            if (!this.parent) return;
+            const i = this.parent.children.indexOf(this);
+            this.parent.children.splice(i, 1);
+            this.parent = null;
+          },
+          addEventListener(kind, fn) { this.handlers[kind] = fn; },
+          querySelectorAll(sel) {
+            const need = /^\\.([a-z-]+)/.exec(sel)[1];
+            const skip = [...sel.matchAll(/:not\\(\\.([a-z-]+)\\)/g)].map((m) => m[1]);
+            const out = [];
+            const walk = (n) => {
+              for (const c of n.children) {
+                const cs = c.className.split(/\\s+/).filter(Boolean);
+                if (cs.includes(need) && !skip.some((x) => cs.includes(x))) out.push(c);
+                walk(c);
+              }
+            };
+            walk(this);
+            return out;
+          },
+          querySelector() { return null; },
+        };
+        Object.defineProperty(node, "classList", {
+          get() {
+            const self = this;
+            const set = () => new Set(self.className.split(/\\s+/).filter(Boolean));
+            return {
+              add(c) { const s = set(); s.add(c); self.className = [...s].join(" "); },
+              remove(c) { const s = set(); s.delete(c); self.className = [...s].join(" "); },
+              contains(c) { return set().has(c); },
+            };
+          },
+        });
+        return node;
+      };
+      globalThis.document = {
+        createElement: (t) => mkNode(t),
+        createTextNode: (d) => mkNode("#text", 3, d),
+      };
+      globalThis.Node = { ELEMENT_NODE: 1 };
+      globalThis.fetch = () => { throw new Error("auto-submit"); };
+      const clipboardWrite = async () => true;
+      const flashCopyResult = () => {};
+      const addCopyButton = () => {};
+      const scrollToEnd = () => {};
+      const inputEl = { value: "" };
+      const coinSelStripEl = { hidden: true };
+      const countWrites = [];
+      const coinSelCountEl = {
+        hidden: true, _t: "",
+        set textContent(v) { countWrites.push(v); this._t = v; },
+        get textContent() { return this._t; },
+      };
+      const state = { openTurn: null, scanState: "done", coinSelBoxes: null,
+                      coinSelShown: "" };
+      __FUNCS__
+      const addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+      const addr2 = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+      const t1 = "a".repeat(64), t2 = "b".repeat(64), t3 = "c".repeat(64),
+            t4 = "d".repeat(64), t5 = "e".repeat(64), t6 = "f".repeat(64);
+      const row = (over) => ({ value_sats: 1000, value_btc: "0.00001000",
+        confirmed: true, txid: t1, arrival: "pending", txid_copy_only: true,
+        address: addr, number: 1, ...over });
+      const rows1 = [
+        row({ number: 7, value_sats: 10000000, value_btc: "0.10000000", txid: t1,
+              arrival: "2026-09-15" }),
+        row({ number: 7, value_sats: 12345, value_btc: "0.00012345", address: addr,
+              confirmed: false, txid: t2, arrival: "pending" }),
+        row({ number: 3, value_sats: 5000, value_btc: "0.00005000", address: addr2,
+              txid: t3, arrival: "2026-09-16" }),
+        row({ value_sats: 100, txid: t4, }),
+      ];
+      delete rows1[3].number; delete rows1[3].address;
+      const mkLine = (text) => {
+        const p = document.createElement("p");
+        p.className = "turn-text";
+        p.appendChild(document.createTextNode(text));
+        return p;
+      };
+      // narrated coin lines the rows upgrade (the matcher's counterpart).
+      const narrate = (rows) => {
+        const turn = mkNode("li");
+        turn.appendChild(mkLine("Unspent outputs \\u2014 " + rows.length + " coins."));
+        for (const r of rows) {
+          turn.appendChild(mkLine((r.number === undefined ? "" : "#" + r.number + " ")
+            + r.address + " \\u00b7 " + formatSats(r.value_sats) + " sats \\u00b7 "
+            + (r.confirmed ? "confirmed" : "unconfirmed")
+            + " \\u00b7 tx " + r.txid + " vout 0"));
+        }
+        state.openTurn = turn;
+        return turn;
+      };
+      const parts = (line) => line.children.filter((c) => c.nodeType === 1);
+      const find = (line, cls) => parts(line).find((c) => c.classList.contains(cls));
+      const flip = (box, on) => { box.checked = on; box.handlers.change(); };
+      const main = async () => {
+        // ---- 1. a fresh listing arms: names, enabled boxes, honest zero ----
+        const turn = narrate(rows1);
+        noteUtxoRows(JSON.stringify(rows1));
+        const r = turn.children.slice(1, 5);
+        const b7a = find(r[0], "utxo-select"), b7b = find(r[1], "utxo-select");
+        const b3 = find(r[2], "utxo-select"), bX = find(r[3], "utxo-select");
+        if (b7a.disabled || b7b.disabled || b3.disabled) throw new Error("not-armed");
+        if (b7a.attrs["aria-label"] !== "Select coin #7, 10,000,000 sats")
+          throw new Error("name:" + b7a.attrs["aria-label"]);
+        if (b7a.title !== "" || b7a.type !== "checkbox") throw new Error("armed-shape");
+        // number-less = visibly UNSELECTABLE: permanently disabled + named so.
+        if (!bX.disabled || bX.attrs["aria-label"] !== LABELS.coinSelectUnnamed)
+          throw new Error("degenerate-selectable");
+        if (coinSelStripEl.hidden || coinSelCountEl.textContent !== LABELS.coinSelectNone)
+          throw new Error("strip-zero");
+        if (countWrites.length !== 1) throw new Error("zero-writes:" + countWrites.length);
+        // ---- 2. click-to-FILL: seed + clause + ADDRESS-sibling marking ----
+        flip(b7a, true);
+        if (!b7b.checked || b3.checked) throw new Error("sibling-mark");
+        if (inputEl.value !== "send to using #7") throw new Error("seed:" + inputEl.value);
+        // F3: BOTH rows flipped together (one #N, address granularity), yet
+        // the count is DISTINCT NUMBERS — one coin, not two rows.
+        if (coinSelCountEl.textContent !== "1 coin selected")
+          throw new Error("count:" + coinSelCountEl.textContent);
+        flip(b7a, true); // re-fire at the same count: NO new live-region write
+        if (countWrites.length !== 2) throw new Error("announce-spam");
+        // ---- 3. the user's own words survive; the clause rides the tail ----
+        inputEl.value = "send 50000 sats to " + addr;
+        flip(b3, true);
+        if (inputEl.value !== "send 50000 sats to " + addr + " using #3 #7")
+          throw new Error("tail:" + inputEl.value);
+        if (coinSelCountEl.textContent !== "2 coins selected")
+          throw new Error("count3:" + coinSelCountEl.textContent);
+        flip(b3, false);
+        if (inputEl.value !== "send 50000 sats to " + addr + " using #7")
+          throw new Error("retail:" + inputEl.value);
+        // a hand-typed stale clause is stripped (exactly ONE numbered run).
+        inputEl.value = "send 50000 sats to " + addr + " using #9";
+        flip(b3, true); // #9 is not in this listing; my clause must own the line
+        if ((inputEl.value.toLowerCase().match(/using/g) || []).length !== 1)
+          throw new Error("double-clause:" + inputEl.value);
+        if (!inputEl.value.endsWith("using #3 #7")) throw new Error("own:" + inputEl.value);
+        // ---- 4. copy/announce text: chrome-free, toggle-proof, verbatim ----
+        const canonical = bubbleText(turn);
+        if (canonical.includes("Select coin") || canonical.includes("[tx]") ||
+            canonical.includes("coins selected")) throw new Error("chrome-in-copy");
+        if (lineText(r[0]) !== "#7 10,000,000 sats 2026-09-15 " + addr + " " + t1)
+          throw new Error("row-text:" + lineText(r[0]));
+        // ---- 5. replay/duplicate: a strict no-op, selection untouched ----
+        const boxes0 = state.coinSelBoxes;
+        const writes0 = countWrites.length, value0 = inputEl.value;
+        noteUtxoRows(JSON.stringify(rows1));
+        if (state.coinSelBoxes !== boxes0 || countWrites.length !== writes0 ||
+            inputEl.value !== value0) throw new Error("duplicate-mutated");
+        // ---- 6. the newest listing wins: retire + clear + clause retracts --
+        inputEl.value = "send 5000 sats to " + addr + " using #3 #7";
+        const rows2 = [row({ number: 1, value_sats: 2000, txid: t5,
+                             arrival: "2026-09-17" })];
+        const turn2 = narrate(rows2);
+        noteUtxoRows(JSON.stringify(rows2));
+        if (!b7a.disabled || b7a.checked || b3.checked) throw new Error("live-old");
+        if (!b7a.classList.contains("utxo-select-retired")) throw new Error("unmuted");
+        if (b7a.title !== LABELS.coinSelectRetired) throw new Error("no-reason");
+        if (b7a.attrs["aria-label"] !==
+            "Select coin #7, 10,000,000 sats \\u2014 " + LABELS.coinSelectRetired)
+          throw new Error("reason-name:" + b7a.attrs["aria-label"]);
+        if (inputEl.value !== "send 5000 sats to " + addr)
+          throw new Error("clause-survived:" + inputEl.value);
+        const b1 = find(turn2.children[1], "utxo-select");
+        if (b1.disabled || coinSelCountEl.textContent !== LABELS.coinSelectNone)
+          throw new Error("new-listing-arm");
+        // ---- 7. staleness gates ARMING (typed NAME only): never selectable,
+        //           honest reason, nothing armed, strip gone. ----
+        state.scanState = "running";
+        const rows3 = [row({ number: 2, value_sats: 3000, txid: t6,
+                             arrival: "pending" })];
+        const turn3 = narrate(rows3);
+        noteUtxoRows(JSON.stringify(rows3));
+        if (!b1.disabled || !b1.classList.contains("utxo-select-retired"))
+          throw new Error("stale-retire");
+        const b2 = find(turn3.children[1], "utxo-select");
+        if (!b2.disabled || b2.title !== LABELS.coinSelectStale)
+          throw new Error("stale-armed");
+        if (state.coinSelBoxes !== null || !coinSelStripEl.hidden)
+          throw new Error("stale-state");
+        // ---- 8. ceiling honesty: >256 says the ENGINE refuses — and NO
+        //           fee figure ever appears (count + refusal sentence only).
+        state.scanState = "done";
+        const many = [];
+        for (let i = 1; i <= 258; i += 1)
+          many.push(row({ number: i, value_sats: i + 1, txid: "a".repeat(60)
+            + i.toString(16).padStart(4, "0").slice(-4) }));
+        const turn4 = narrate(many);
+        noteUtxoRows(JSON.stringify(many));
+        for (const box of state.coinSelBoxes) flip(box, true);
+        if (coinSelCountEl.textContent !==
+            "258 coins selected" + LABELS.coinSelectedOver)
+          throw new Error("ceiling:" + coinSelCountEl.textContent);
+        if (/sat\\/v|\\/vB|fee|estimat/i.test(coinSelCountEl.textContent))
+          throw new Error("fee-estimate");
+        // ---- 9. F3: rows are not numbers. 257 rows at 256 DISTINCT #N
+        //           (one twin at #7) sit AT the engine's ceiling — the old
+        //           row counter said "257" and claimed the engine refuses.
+        const twin = row({ number: 7, value_sats: 999, value_btc: "0.00000999",
+                           txid: "e".repeat(63) + "1", address: addr2,
+                           arrival: "2026-09-18" });
+        const dup = many.slice(0, 256).concat([twin]);
+        const turn5 = narrate(dup);
+        noteUtxoRows(JSON.stringify(dup));
+        if (state.coinSelBoxes.length !== 257) throw new Error("dup-arm");
+        for (const box of state.coinSelBoxes) box.checked = true;
+        recomposeCoinClause();
+        if (coinSelCountEl.textContent !== "256 coins selected")
+          throw new Error("dup-count:" + coinSelCountEl.textContent);
+        if (coinSelCountEl.textContent.includes(LABELS.coinSelectedOver))
+          throw new Error("dup-false-ceiling");
+        console.log("ok");
+      };
+      main().catch((e) => { console.error(e); process.exit(1); });
+    """
+    script = (
+        script.replace("__ADDR_RE__", addr_re)
+        .replace("__TX_RE__", txid_re)
+        .replace("__ARRIVAL_RE__", arrival_re)
+        .replace("__LABELS__", leak + labels)
+        .replace("__FUNCS__", funcs)
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)

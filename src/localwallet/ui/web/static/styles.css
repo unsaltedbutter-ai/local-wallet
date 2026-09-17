@@ -1337,3 +1337,74 @@ body {
   border-color: var(--c-danger);
   background: var(--c-danger-soft);
 }
+
+/* ====== TCK-UTXO-008: coin-selection checkboxes + strip ====== */
+
+/* The row leads with a real checkbox. It is a native control, so the checked
+   state carries a non-color checkmark cue (WCAG 1.4.1); accent-color tints it
+   on-brand and focus-visible gives the shared ring. margin:0 keeps the flex
+   baseline tidy (the .utxo-row gap supplies the spacing — no text node, so
+   the copied line stays verbatim). */
+.utxo-select {
+  margin: 0;
+  inline-size: 1.05rem;
+  block-size: 1.05rem;
+  accent-color: var(--c-accent);
+  cursor: pointer;
+  flex: none;
+}
+.utxo-select:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+/* Unarmed / number-less / retired boxes: visibly unselectable — muted and a
+   not-allowed cursor. The retired class also dims the row (the reason rides
+   title + the suffixed accessible name, set in app.js — never painted text). */
+.utxo-select:disabled {
+  accent-color: var(--c-text-muted);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+/* Retired (superseded listing / wallet replace): a shape cue, not a color —
+   the box reads struck-through beside its muted row. */
+.utxo-select-retired {
+  outline: 1px solid var(--c-border-strong);
+  outline-offset: 1px;
+}
+
+/* WCAG 2.5.5: the registry-number text IS the checkbox's label, so the tap
+   target is the number's padding box, not the ~17px input alone. The negative
+   margin hands the padding back to the row's flex gutters (the .utxo-row
+   column gap is the larger --sp-2, so the grown boxes never overlap each
+   other); layout is pixel-identical, the hit area is not. */
+label.utxo-number {
+  cursor: pointer;
+  padding: var(--sp-1) var(--sp-1);
+  margin: calc(-1 * var(--sp-1)) calc(-1 * var(--sp-1));
+  border-radius: var(--r-sm);
+}
+
+/* The selection strip sits above the composer, compact and calm. It only ever
+   shows a count + (over the ceiling) the engine-refusal note + the static fee
+   word — no fee estimate. Wraps cleanly at phone width (the WEB-021 pattern). */
+.coin-select-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-3);
+  margin: 0 var(--sp-1) var(--sp-1);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--c-settings-surface);
+  font-size: var(--fs-sm);
+}
+.coin-select-count {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  color: var(--c-text);
+}
+.coin-select-fee {
+  margin: 0;
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
+}
