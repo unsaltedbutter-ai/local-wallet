@@ -2011,14 +2011,19 @@ _PUBLIC_BCAST_STATUS_LAG: Final[str] = (
     "so it may stay invisible there until it gossips back; the next "
     "watch poll will pick it up."
 )
-#: Bitcoin Core's ``RPC_VERIFY_REJECTED`` — a PROTOCOL CONSTANT (the
-#: TCK-DIAG-002 rule: codes are constants, not server data, and may ride
-#: value-free surfaces). Core's ``sendrawtransaction`` answers EVERY
-#: policy-level rejection (fee under the node's floor, mempool conflict,
-#: bad inputs) with this ONE code — which is exactly why
-#: :func:`_fee_floor_shaped` must still prove the reason FAMILY from
-#: engine-retained facts and may never infer it from the code alone.
-_CORE_RPC_VERIFY_REJECTED: Final[int] = -25
+#: Bitcoin Core ``sendrawtransaction`` policy-rejection RPC codes — PROTOCOL
+#: CONSTANTS (the TCK-DIAG-002 rule: codes are constants, not server data, and
+#: may ride value-free surfaces). ``-25`` is ``RPC_VERIFY_ERROR`` (the generic
+#: verify-rejection wrapper) and ``-26`` is ``RPC_VERIFY_REJECTED`` — where a
+#: genuine fee-too-low / "min relay fee not met" refusal classically lands.
+#: This is NOT an exhaustive set and Core does NOT answer every policy-level
+#: rejection with one code: observed nodes emit other codes (the user's repro
+#: surfaced a POSITIVE ``code=2`` on an ``rpc-error`` envelope — see the
+#: TCK-PUBLICBCAST-004 pin). That is exactly why membership here is only a
+#: belt-and-braces CLASS gate: :func:`_fee_floor_shaped` must STILL prove the
+#: reason FAMILY from engine-retained fee facts against the node's live floor
+#: and may never infer a fee floor from the code alone.
+_CORE_RPC_POLICY_REJECT_CODES: Final[frozenset[int]] = frozenset({-25, -26})
 
 # --- consolidation conversation copy (TCK-CONS-001) -------------------------
 #
@@ -9078,11 +9083,16 @@ def _fee_floor_shaped(
     fee facts against the refusing backend's live advertised floor.
 
     1. CLASS gate (the TCK-DIAG-005 taxonomy): a policy refusal — the
-       ``rpc-error`` envelope carrying Core's :data:`_CORE_RPC_VERIFY_REJECTED`
-       protocol constant, or the ``server-rejected`` rejection-as-answer
+       ``rpc-error`` envelope carrying one of Core's
+       :data:`_CORE_RPC_POLICY_REJECT_CODES` protocol constants (the
+       ``-25``/``-26`` pair), or the ``server-rejected`` rejection-as-answer
        dialect. Everything else (transport classes, shape refusals, the
        ``txid-bind-mismatch`` integrity event, an rpc-error with any other
-       or no code) is not a provable refusal.
+       code — e.g. the user's positive ``code=2`` — or no code) is not a
+       provable refusal. The code set is only belt-and-braces: a rejection
+       that carries a known code but is NOT fee-floor-shaped (rung 3 fails)
+       still never arms the offer — the floor proof, not the code, is the
+       discriminator.
     2. CAPABILITY gate: the refusing backend must answer its OWN min-relay
        floor today — the optional ``min_relay_centisat_vb`` seam
        (TCK-FEE-004: present on bitcoind) or, for the electrum backend
@@ -9112,7 +9122,7 @@ def _fee_floor_shaped(
     """
     fc = getattr(exc, "failure_class", None) or classify_failure(exc)
     if fc != SERVER_REJECTED and not (
-        fc == RPC_ERROR and getattr(exc, "rpc_code", None) == _CORE_RPC_VERIFY_REJECTED
+        fc == RPC_ERROR and getattr(exc, "rpc_code", None) in _CORE_RPC_POLICY_REJECT_CODES
     ):
         return False
     getter = getattr(client, "min_relay_centisat_vb", None) or getattr(

@@ -57,6 +57,30 @@ FEE_FLOOR_REJECTION = ChainError(
     rpc_code=-25,
 )
 
+# TCK-PUBLICBCAST-004: the gate's known policy-code set is {-25, -26}. -26
+# (Core's RPC_VERIFY_REJECTED) is where a genuine "min relay fee not met"
+# refusal classically lands; -25 (RPC_VERIFY_ERROR) is the generic wrapper.
+# The user's real broadcast failure carried a POSITIVE ``code=2`` on an
+# rpc-error envelope — a code OUTSIDE the known set, so the belt-and-braces
+# class gate stays closed on it. The floor proof, not the code, is the real
+# discriminator, so the offer never arms on an unproven floor for ANY code.
+# Deviation record: code=2 is deliberately NOT added to the accepted set (an
+# arbitrary positive code is not a named Core policy constant). If the user's
+# repro was genuinely fee-too-low the offer arms only once their node reports
+# -25/-26 — the user should re-test per MANUAL-WORK MW-9.
+FEE_FLOOR_REJECTION_VERIFY = ChainError(
+    "transaction rejected",
+    failure_class=RPC_ERROR,
+    exc_name="RPCError",
+    rpc_code=-26,
+)
+POSITIVE_CODE_REJECTION = ChainError(
+    "broadcast request rejected by the server",
+    failure_class=RPC_ERROR,
+    exc_name="RPCError",
+    rpc_code=2,
+)
+
 
 # --------------------------------------------------------------------- A. chain
 
@@ -256,16 +280,26 @@ def _env(params: dict[str, Any]):
             ChainError("broadcast refused", failure_class=SERVER_REJECTED),
             100, True, 50, True,
         ),
+        # TCK-PUBLICBCAST-004: -26 (Core's real fee-too-low / VERIFY_REJECTED
+        # code) joins the known set — arms when the floor is proven.
+        (FEE_FLOOR_REJECTION_VERIFY, 100, True, 50, True),
         # at/above the node's advertised floor: the floor cannot explain the
-        # refusal — mempool-conflict-shaped → FAIL-CLOSED, no offer.
+        # refusal — mempool-conflict-shaped → FAIL-CLOSED, no offer. Proven
+        # for BOTH accepted codes (-25, -26): the class gate is belt-and-braces,
+        # the floor proof is the discriminator.
         (FEE_FLOOR_REJECTION, 100, True, 100, False),
         (FEE_FLOOR_REJECTION, 100, True, 200, False),
-        # other rpc codes / code-less rpc-error: not the VERIFY_REJECTED
-        # protocol constant → unclear → no offer.
+        (FEE_FLOOR_REJECTION_VERIFY, 100, True, 100, False),
+        (FEE_FLOOR_REJECTION_VERIFY, 100, True, 200, False),
+        # other rpc codes / code-less rpc-error: outside the known {-25,-26}
+        # set → unclear → no offer. Includes the user's observed positive
+        # code=2 (TCK-PUBLICBCAST-004) — still non-arming even with a proven
+        # floor, because an arbitrary positive code is not a named policy code.
         (
             ChainError("nope", failure_class=RPC_ERROR, rpc_code=-27),
             100, True, 50, False,
         ),
+        (POSITIVE_CODE_REJECTION, 100, True, 50, False),
         (ChainError("nope", failure_class=RPC_ERROR), 100, True, 50, False),
         # integrity + transport classes are not refusals at all.
         (
@@ -299,6 +333,47 @@ def test_offer_arms_only_on_fee_floor_shaped_refusal(
     assert (result.get("public_bcast_offer") is True) is expected
     assert (session.public_offer_txref == signed.tx_ref) is expected
     assert flow.state is TxFlowStatus.SIGNED  # kept-for-retry, always
+
+
+@pytest.mark.parametrize(
+    ("rpc_code", "fee_rate", "expected"),
+    [
+        # TCK-PUBLICBCAST-004 direct class-gate pin: BOTH known policy codes
+        # arm when the floor is proven (-25 generic wrapper, -26 the classic
+        # fee-too-low reject the user's node actually uses).
+        (-25, 50, True),
+        (-26, 50, True),
+        # Never arm when the floor is NOT proven, for ANY code (the proof is
+        # the discriminator; the class gate is only belt-and-braces).
+        (-25, 100, False),
+        (-26, 100, False),
+        (-26, 200, False),
+        # The user's observed positive code=2: outside the known set, so it
+        # stays non-arming even with a proven low fee (a positive code is not
+        # a named Core policy constant; see MANUAL-WORK MW-9 re-test note).
+        (2, 50, False),
+        # Non-numeric / absent rpc_code behavior is unchanged (not a code).
+        (None, 50, False),
+    ],
+)
+def test_fee_floor_shaped_class_gate_accepts_the_pair(rpc_code, fee_rate, expected) -> None:
+    """_fee_floor_shaped's class gate now accepts rpc_code in {-25, -26}
+    (TCK-PUBLICBCAST-004), while the live-floor FAMILY proof stays mandatory —
+    a known code with an unproven floor still returns False."""
+    exc = ChainError(
+        "rejected", failure_class=RPC_ERROR, exc_name="RPCError", rpc_code=rpc_code
+    )
+    client = _Node(floor=100, capable=True)  # node enforces 100 centisat/vB
+    assert app._fee_floor_shaped(exc, client, fee_rate) is expected
+
+
+def test_fee_floor_shaped_pair_still_needs_capability() -> None:
+    """The -26 code alone never arms on a backend that cannot state its floor
+    (honest capability absence → unclear → no offer), exactly as -25 already."""
+    exc = ChainError(
+        "rejected", failure_class=RPC_ERROR, exc_name="RPCError", rpc_code=-26
+    )
+    assert app._fee_floor_shaped(exc, _Node(capable=False), 50) is False
 
 
 def test_offer_unavailable_without_public_client(world) -> None:
