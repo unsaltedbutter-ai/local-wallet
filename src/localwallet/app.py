@@ -4131,7 +4131,10 @@ class SendSession:
     either (gate_decision precedent, ADR-0013). ``hw_sign_wanted`` latches
     "sign this flow on my device" until a device sign succeeds, an explicit
     file export runs, or the flow is cancelled — so a bare "retry" re-probes
-    the device instead of silently exporting. ``file_sign_export_once`` is
+    the device instead of silently exporting. TCK-HW-008(a): the handler
+    also stamps it when the DEFAULTED-file rung surfaces its device ask (a
+    signable device enumerated at sign time) so the ask's own "retry"
+    answer rides the established device path. ``file_sign_export_once`` is
     the one-shot explicit file fallback ("file"/"export" after the device
     ask).
 
@@ -4183,6 +4186,15 @@ class SendSession:
     last_broadcast_addresses: tuple[str, ...] = ()
     hw_sign_wanted: bool = False
     file_sign_export_once: bool = False
+    #: TCK-HW-008(c): this session has PROVEN a signable device (a
+    #: sign-time :meth:`HwiUsbSigner.sign_probe` read it ready, or it
+    #: served a fingerprint-bound address display in ``/verifyaddress``
+    #: /show-on-device). Code-stamped only (the model can neither set,
+    #: read, nor clear it — no envelope carries it); never cleared: it
+    #: is a session-lifetime fact, and its only consumer is the locked
+    #: sign-probe branch, which softens to the check-the-device line
+    #: when the definitive PIN claim contradicts recent evidence.
+    hw_signable_seen: bool = False
     bump_ask: _BumpAsk | None = None
     bump_pending: _BumpPending | None = None
     bump_bcast_txid: str | None = None
@@ -4252,12 +4264,21 @@ class SignerSelection:
       account-level wallet — ADR-0015 amendment #2); the HWI signer's
       post-open account-key bind is constructed from it together with the
       descriptor's account path — lazily, ONLY when the hwi kind is
-      selected, and per sign attempt (the signer objects are stateless).
+      selected, and per sign attempt (the signer objects are stateless);
+    - ``kind_defaulted`` (TCK-HW-008(a)) — ``True`` ONLY when the ladder
+      resolved the file signer as the ABSENCE default (neither
+      ``--signer`` nor :data:`SIGNER_ENV_VAR` named a kind). Explicit
+      config — any kind, any value — stays authoritative byte-identical
+      (HW-004); the defaulted-file rung alone may offer the device when
+      one signs in at ``sign_tx`` time. Direct constructions (tests, the
+      provisioning :func:`dataclasses.replace`) keep the ``False``
+      default: a selection handed over IS an explicit configuration.
     """
 
     kind: str
     dir_path: Path
     fingerprint_hex: str
+    kind_defaulted: bool = False
 
 
 def stub_generate(prompt: str, grammar_text: str | None) -> str:
@@ -4516,6 +4537,9 @@ def build_dispatch_table(
                 os.environ.get(SIGNER_DIR_ENV_VAR, "").strip() or DEFAULT_SIGNER_DIR
             ),
             fingerprint_hex=parsed.hd_key.my_fingerprint.hex(),
+            # TCK-HW-008(a): no valid explicit env rung = the ABSENCE
+            # default (see :attr:`SignerSelection.kind_defaulted`).
+            kind_defaulted=env_kind not in _SIGNER_KINDS,
         )
     # ONE oracle shared by create_tx (USD amount resolution) and
     # get_balance (best-effort fiat display, TCK-FIAT-001): the caches —
@@ -8658,6 +8682,36 @@ _HW_DEVICE_PREFER_NOTE: Final[str] = (
     "transfer — say 'file' while a transaction awaits signing to export instead)."
 )
 
+#: TCK-HW-008(a) (user live finding 2026-09-16): with the file signer as
+#: the ABSENCE default (no ``--signer``/``LOCALWALLET_SIGNER`` rung —
+#: :attr:`SignerSelection.kind_defaulted`), a bare "sign" while a signable
+#: device sits attached exported the PSBT file silently — the HW-004
+#: config-authoritative rule was never spoken into existence by the user.
+#: The default rung now OFFERS the device (same answers as the slice-C
+#: absent ask: the bare "retry" re-probes and signs on the device — the
+#: handler latches ``hw_sign_wanted`` when it surfaces this ask; the
+#: closed "file"/"export" matcher runs the unchanged export). Explicit
+#: file config never asks (byte-identical HW-004 export + conflict note).
+_HW_DEFAULT_FILE_ASK: Final[str] = (
+    "Your connected device can sign this — say 'retry' and I'll sign on "
+    "the device, or say 'file' and I can export the transaction file for "
+    "your SD card instead."
+)
+
+#: TCK-HW-008(c) (user live finding 2026-09-16, Coldcard): a sign-time
+#: probe can read a device locked at the instant (fingerprint not
+#: reportable) while the SAME device served signable work earlier the
+#: same session — an asleep/busy blip, not a lock. The definitive
+#: "Enter your PIN/passphrase" family is then the WRONG claim, so the
+#: locked branch answers with this less-definitive check-the-device line
+#: (value-free, names the established 'retry'; NEVER drives an unlock —
+#: the HW-001 discipline: unlock rides the chat command). A device never
+#: proven signable this session keeps the definitive family verbatim.
+_HW_CHECK_DEVICE: Final[str] = (
+    "Your device didn't answer just now — check that it's awake and "
+    "connected, then say 'retry'."
+)
+
 
 def _make_sign_tx_handler(
     flow: TxFlow,
@@ -8821,6 +8875,43 @@ def _make_sign_tx_handler(
                 except SignerError as exc:
                     return _out({"error": "import_failed", "detail": str(exc)})
             else:
+                # TCK-HW-008(a) DEFAULTED-FILE RUNG (user live finding
+                # 2026-09-16): when the file signer is the ABSENCE default
+                # (no explicit LOCALWALLET_SIGNER/--signer rung — the user
+                # never chose the airgap), a bare "sign" while a SIGNABLE
+                # device enumerates exported the PSBT file silently past
+                # the wallet the user is looking at. ONE bounded enumerate
+                # (the existing :meth:`HwiUsbSigner.sign_probe` capability
+                # — no new machinery): ready → surface the device-offering
+                # ASK instead of exporting, and latch ``hw_sign_wanted`` so
+                # the ask's own answers ride the ESTABLISHED device-ask
+                # mechanics (bare "retry" re-probes and signs on the
+                # device; the closed "file"/"export" matcher runs the
+                # unchanged export; never the LLM). Absent/locked and
+                # test fakes without a probe surface keep the export below
+                # byte-identical; an already-placed signed file imports
+                # untouched (checked above, before any probe); an EXPLICIT
+                # file config never reaches this rung (kind_defaulted
+                # False — HW-004's conflict-guidance path stays
+                # authoritative), and a user who answered "file"
+                # (file_once) exports without re-asking.
+                if (
+                    selection.kind_defaulted
+                    and not file_once
+                    and session is not None
+                    and selection.fingerprint_hex
+                ):
+                    ask_signer = HwiUsbSigner(
+                        selection.fingerprint_hex, _descriptor_account_path(parsed)
+                    )
+                    ask_probe = getattr(ask_signer, "sign_probe", None)
+                    if ask_probe is not None and ask_probe()[0] == "ready":
+                        session.hw_signable_seen = True
+                        session.hw_sign_wanted = True
+                        return _out({
+                            "error": "device_error",
+                            "guidance": _HW_DEFAULT_FILE_ASK,
+                        })
                 try:
                     exported = file_signer.export_unsigned(
                         confirmed.psbt_base64, confirmed.tx_ref
@@ -8860,10 +8951,28 @@ def _make_sign_tx_handler(
                 if state == "absent":
                     return _out({"error": "device_error", "guidance": _HW_SIGN_ASK})
                 if state == "locked":
+                    # TCK-HW-008(c) AMBIGUOUS LOCKED: the same device read
+                    # signable EARLIER THIS SESSION (a ready sign probe,
+                    # or a served fingerprint-bound display) — a locked
+                    # read now contradicts recent evidence and is most
+                    # likely an asleep/busy blip, so answer with the
+                    # less-definitive check-the-device line instead of
+                    # the definitive PIN claim. NEVER drives an unlock
+                    # here (HW-001: unlock rides the chat command). A
+                    # device never proven signable keeps the existing
+                    # locked-guidance family verbatim.
+                    if session is not None and session.hw_signable_seen:
+                        return _out({
+                            "error": "device_error",
+                            "guidance": _HW_CHECK_DEVICE,
+                        })
                     return _out({
                         "error": "device_error",
                         "guidance": "\n".join(probe_lines),
                     })
+                if state == "ready" and session is not None:
+                    # Signable NOW — the session's proof for (c).
+                    session.hw_signable_seen = True
             try:
                 signed_result = device_signer.sign_unsigned(confirmed.psbt_base64)
             except DeviceError as exc:
@@ -13755,6 +13864,7 @@ def _run_quick_action(
             signer_selection,
             parsed,
             output_fn,
+            session=session,
         )
         return True
     intent = _QUICK_ACTION_INTENTS.get(command)
@@ -13799,6 +13909,8 @@ def _verify_own_address(
     signer_selection: SignerSelection | None,
     parsed: ParsedKey | None,
     output_fn: Callable[[str], None],
+    *,
+    session: SendSession | None = None,
 ) -> None:
     """``/verifyaddress <branch> <index>`` — show OUR address on the device
     (TCK-HW-005 slice B; D2/D3/D4).
@@ -13912,6 +14024,13 @@ def _verify_own_address(
         # signer's internal wording.
         output_fn(sanitize_tool_output(_ACTION_UNAVAILABLE))
         return
+    if session is not None:
+        # TCK-HW-008(c): a bound client OPENED and served the display —
+        # the device PROVED itself signable this session (the account-key
+        # bind already ran). This is the session evidence the sign path's
+        # ambiguous-locked branch softens on (even a since-asleep device
+        # answered a display request minutes before a locked sign read).
+        session.hw_signable_seen = True
     if shown == believed:
         output_fn(
             sanitize_tool_output(
@@ -14965,6 +15084,14 @@ def run(
         (args.signer or os.environ.get(SIGNER_ENV_VAR, "")).strip().lower()
         or SIGNER_KIND_FILE
     )
+    # TCK-HW-008(a): the file kind resolved from NOTHING (no --signer, no
+    # env) is the ABSENCE default, not the user's choice — at sign time
+    # that rung offers a present device instead of exporting silently.
+    # An explicit rung (either source, any valid value) is config and
+    # stays authoritative byte-identical (HW-004).
+    signer_kind_defaulted = not (
+        args.signer or os.environ.get(SIGNER_ENV_VAR, "")
+    ).strip()
     if signer_kind not in _SIGNER_KINDS:
         output.error(
             f"Invalid signer selection: use --signer file|hwi or set "
@@ -14985,6 +15112,7 @@ def run(
             if descriptor is not None
             else ""
         ),
+        kind_defaulted=signer_kind_defaulted,
     )
 
     # Pre-flight (SR minor): if the remote debug bridge is opted into but no
@@ -17462,6 +17590,36 @@ _HW_CLASS_WORDS: Final[frozenset[str]] = frozenset(
 _HW_TOPIC_WORDS: Final[frozenset[str]] = _HW_CLASS_WORDS | frozenset(
     {"hardware", "device", "devices"}
 )
+#: TCK-HW-008(b): SPACED-BRAND collapse — "cold card" (two tokens) is the
+#: same brand as "coldcard" (one token); the single-token topic set missed
+#: the spaced spelling, so "sign on my cold card" / "show it on my cold
+#: card" fell through to the LLM. This closed bigram map is applied to the
+#: token list BEFORE topic matching in BOTH hardware matchers
+#: (:func:`_hardware_chat_verb` and :func:`_show_on_device_request`); the
+#: single-token forms match byte-identically (the collapse never fires
+#: without the exact adjacent pair).
+_HW_PHRASE_COLLAPSES: Final[dict[tuple[str, str], str]] = {
+    ("cold", "card"): "coldcard",
+}
+
+
+def _collapse_hw_phrases(words: list[str]) -> list[str]:
+    """Adjacency-collapse the spaced-brand bigrams (the map above)."""
+    collapsed: list[str] = []
+    i = 0
+    while i < len(words):
+        merged = (
+            _HW_PHRASE_COLLAPSES.get((words[i], words[i + 1]))
+            if i + 1 < len(words)
+            else None
+        )
+        if merged is None:
+            collapsed.append(words[i])
+            i += 1
+        else:
+            collapsed.append(merged)
+            i += 2
+    return collapsed
 _HW_UNLOCK_WORDS: Final[frozenset[str]] = frozenset(
     {"unlock", "unlocks", "unlocking"}
 )
@@ -17499,10 +17657,13 @@ def _hardware_chat_verb(line: str) -> str | None:
     word), "sign the transaction" (no topic), "can you see my balance",
     and "connect to my node" match nothing here and stay ordinary chat.
     """
-    words = {
+    ordered = [
         w.strip(punctuation).replace("'", "").replace("\u2019", "")
         for w in line.lower().split()
-    }
+    ]
+    # TCK-HW-008(b): spaced-brand collapse ("cold card" ≡ "coldcard");
+    # single-token forms match exactly as before.
+    words = set(_collapse_hw_phrases(ordered))
     if words.isdisjoint(_HW_TOPIC_WORDS):
         return None
     if words & _HW_UNLOCK_WORDS:
@@ -17709,7 +17870,14 @@ def _run_hardware_chat(
         for text in hwi.probe_and_report(attempt_unlock=False).lines:
             output_fn(sanitize_tool_output(text))
         return True
-    for text in hwi.probe_and_report(attempt_unlock=verb != "see").lines:
+    report = hwi.probe_and_report(attempt_unlock=verb != "see")
+    if report.wallet_match is True:
+        # TCK-HW-008(c): a driven unlock that OPENED a bound client and
+        # served THIS wallet's account key (the HW-006 probe-time
+        # wallet_match verdict) — the device PROVED itself signable this
+        # session; a later locked sign read gets the soft line.
+        session.hw_signable_seen = True
+    for text in report.lines:
         output_fn(sanitize_tool_output(text))
     return True
 
@@ -17804,7 +17972,11 @@ def _show_on_device_request(line: str) -> tuple[str, object] | None:
     (py ``int_max_str_digits``, the CHAT-009 lesson) releases.
     """
     raw = line.lower().split()
-    words = [w for w in (t.strip(punctuation) for t in raw) if w]
+    # TCK-HW-008(b): spaced-brand collapse before topic matching — the
+    # one shared helper; single-token forms byte-identical.
+    words = _collapse_hw_phrases(
+        [w for w in (t.strip(punctuation) for t in raw) if w]
+    )
     if not words or not set(words) & _HW_DISPLAY_WORDS:
         return None
     if not set(words) & _HW_TOPIC_WORDS:
@@ -17964,7 +18136,12 @@ def _run_show_on_device_turn(
         except (StoreError, sqlite3.Error):
             return False  # DB surprise: release the line to the pipeline
     _verify_own_address(
-        f"{coords[0]} {coords[1]}", store, signer_selection, parsed, output_fn
+        f"{coords[0]} {coords[1]}",
+        store,
+        signer_selection,
+        parsed,
+        output_fn,
+        session=session,
     )
     return True
 

@@ -57,3 +57,25 @@ def repl_engine_pump(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     monkeypatch.setattr(app, "_repl", harness_repl)
+
+
+@pytest.fixture(autouse=True)
+def hermetic_default_device_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TCK-HW-008(a): the DEFAULTED-file sign rung runs ONE bounded
+    enumerate at sign time (a present signable device turns a silent
+    export into the device-offering ask). A test suite must never read a
+    real USB bus — the default here is an EMPTY bus (probe says absent →
+    the unchanged file export), so every lifecycle pin keeps its bytes
+    whether or not the developer's Coldcard happens to be plugged in.
+    Tests that fake devices monkeypatch ``app.HwiUsbSigner`` themselves
+    (their setattr lands AFTER this fixture and wins; teardown unwinds
+    LIFO). Tests of the signer class ITSELF import it directly and are
+    untouched by this module-attribute patch.
+    """
+    from localwallet.signer.hwi import _MSG_NO_DEVICES
+
+    class _EmptyBusHwiSigner(app.HwiUsbSigner):
+        def sign_probe(self) -> tuple[str, tuple[str, ...]]:
+            return "absent", (_MSG_NO_DEVICES,)
+
+    monkeypatch.setattr(app, "HwiUsbSigner", _EmptyBusHwiSigner)
