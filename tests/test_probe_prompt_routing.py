@@ -51,3 +51,36 @@ def test_extract_intent_closed_set_and_garbage() -> None:
     assert PROBE._extract_intent('{"v":0,"intent":"get_balance","params":{}}') == "get_balance"
     assert PROBE._extract_intent('{"v":0,"intent":"not_a_real_intent","params":{}}') is None
     assert PROBE._extract_intent("not json at all") is None
+
+
+def test_resolve_model_arg_manifest_name() -> None:
+    """A --model manifest name resolves to the models/bin/<name>.gguf path."""
+    assert PROBE._resolve_model_arg("gemma-4-E2B-it-Q4_K_M") == str(
+        PROBE._MODELS_BIN / "gemma-4-E2B-it-Q4_K_M.gguf"
+    )
+
+
+def test_resolve_model_arg_explicit_path_passthrough() -> None:
+    """A --model value that is a path (or ends .gguf) is used verbatim."""
+    assert PROBE._resolve_model_arg("/tmp/whatever.gguf") == "/tmp/whatever.gguf"
+
+
+def test_resolve_model_arg_unknown_name_exits_2() -> None:
+    """Unknown --model name -> SystemExit (argparse-style CLI error)."""
+    try:
+        PROBE._resolve_model_arg("no-such-model")
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit for unknown --model name")
+
+
+def test_model_and_model_path_mutually_exclusive() -> None:
+    """--model and --model-path cannot both be given."""
+    try:
+        PROBE.main(["--model", "gemma-4-E2B-it-Q4_K_M",
+                    "--model-path", "/x.gguf"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit when both flags are passed")

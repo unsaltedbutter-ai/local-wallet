@@ -98,6 +98,40 @@ the table above) against the pinned unsloth `Q4_K_M` for E2B. This is tracked
 as a follow-up in ADR-0001 and the perf budget in ADR-0006. `Q4_K_M` may be
 swapped for `Q5_K_M`/`Q6_K`/`Q8_0` if evals demand it and hardware allows.
 
+## Bake-off candidates (TCK-PROMPT-002)
+
+Research (2026-09-16) shortlisted three stronger generative models for the
+prompt-routing bake-off (does any clear a MATERIAL gain over the 59.4% E2B
+control?). These are **evaluation candidates only, NOT the default pin** — the
+default remains `gemma-4-E2B-it-Q4_K_M`. None is wired into the app.
+
+> **Source note:** the exact repos named in the research
+> (`Qwen/Qwen3-4B-Instruct-GGUF`, `Qwen/Qwen3-1.7B-Instruct-GGUF`,
+> `microsoft/Phi-4-mini-instruct-GGUF`) are **gated** (HTTP 401) from this
+> environment and need a token. Each entry below points at an **ungated mirror
+> of the same quant** (`Q4_K_M`): the unsloth mirror for Qwen3-4B — note this is
+> the **2507 refresh** checkpoint (`Qwen3-4B-Instruct-2507`), a newer model than
+> the research-named `Qwen/Qwen3-4B-Instruct`, which is the variant the bake-off
+> actually measured (the repo already uses unsloth for Gemma), an ungated
+> community mirror for
+> Qwen3-1.7B-Instruct, and the unsloth mirror for Phi-4-mini-instruct.
+
+| Field | Qwen3-4B | Qwen3-1.7B | Phi-4-mini |
+|---|---|---|---|
+| Name | `qwen3-4b-instruct-Q4_K_M` | `qwen3-1.7b-instruct-Q4_K_M` | `phi-4-mini-instruct-Q4_K_M` |
+| HF repo | `unsloth/Qwen3-4B-Instruct-2507-GGUF` | `lm-kit/qwen-3-1.7b-instruct-gguf` | `unsloth/Phi-4-mini-instruct-GGUF` |
+| Quant | `Q4_K_M` | `Q4_K_M` | `Q4_K_M` |
+| Est. size | ~2.6 GB | ~1.5 GB | ~2.5 GB |
+| License | Apache-2.0 | Apache-2.0 | MIT |
+
+Bootstrap (fills `sha256`/`size_bytes` in `manifest.json`):
+
+```bash
+python models/download_model.py --model qwen3-4b-instruct-Q4_K_M --write-hash
+python models/download_model.py --model qwen3-1.7b-instruct-Q4_K_M --write-hash
+python models/download_model.py --model phi-4-mini-instruct-Q4_K_M --write-hash
+```
+
 ## SHA-256 bootstrap (first run)
 
 `sha256` is `null` for both entries **by design**: we do not commit hashes we

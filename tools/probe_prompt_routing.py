@@ -27,7 +27,8 @@ justifies the build).
 
 Usage:
   .venv/bin/python tools/probe_prompt_routing.py
-    (requires LOCALWALLET_MODEL_PATH or --model-path pointing at the pinned GGUF)
+    (requires LOCALWALLET_MODEL_PATH or --model-path pointing at the pinned GGUF;
+     or --model <manifest-name|gguf-path> to run a bake-off candidate)
 
 If the pinned GGUF model file is absent, this script STOPS and reports - it
 never downloads anything.
@@ -61,6 +62,12 @@ from localwallet.agent.context import render_facts, sanitize_tool_output
 from localwallet.agent.loop import AgentLoop, AgentTurnStatus
 from localwallet.agent.runtime import ModelRuntime
 from localwallet.protocol import IntentName
+
+#: Bake-off candidates (TCK-PROMPT-002). Values are manifest entry names; the
+#: resolved GGUF lives at ``models/bin/<name>.gguf`` (same layout the pinned
+#: downloader writes). Not shipped/defaulted anywhere.
+_MODELS_BIN = _REPO_ROOT / "models" / "bin"
+_MANIFEST_PATH = _REPO_ROOT / "models" / "manifest.json"
 
 #: Throwaway stage-1-style prompt (TCK-PROMPT-001 T1). Deliberately NOT the
 #: production prompt: preamble + output contract + REDUCED one-line-per-intent
@@ -169,6 +176,36 @@ def _extract_intent(raw: str) -> str | None:
     return intent if intent in _CLOSED else None
 
 
+def _resolve_model_arg(arg: str) -> str:
+    """Resolve a ``--model`` value to a GGUF path.
+
+    A value that names a file on disk (or carries a path separator / ``.gguf``
+    suffix) is used as-is; otherwise it is treated as a ``manifest.json`` entry
+    name and resolved to ``models/bin/<name>.gguf`` (the layout the pinned
+    downloader writes). Mirrors ``select_runtime``'s model-path precedence so
+    the override rides the same loading path. Raises ``SystemExit(2)`` on an
+    unknown manifest name.
+    """
+    p = Path(arg)
+    if p.is_file() or "/" in arg or "\\" in arg or arg.endswith(".gguf"):
+        return arg
+    try:
+        with _MANIFEST_PATH.open("r", encoding="utf-8") as fh:
+            entries = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot read {_MANIFEST_PATH}: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+    for entry in entries:
+        if entry.get("name") == arg:
+            return str(_MODELS_BIN / f"{arg}.gguf")
+    print(
+        f"error: --model '{arg}' is neither an existing GGUF path nor a "
+        f"manifest.json entry name.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
 def _mean_median(vals: list[float]) -> tuple[float, float]:
     """(mean, median) of a latency list; (0, 0) when empty."""
     if not vals:
@@ -196,11 +233,20 @@ def main(argv: list[str] | None = None) -> int:
         help=f"path to the pinned GGUF (overrides {_MODEL_PATH_ENV_VAR})",
     )
     parser.add_argument(
+        "--model",
+        default=None,
+        help="bake-off model: a manifest.json entry name (resolved to "
+             "models/bin/<name>.gguf) or an explicit GGUF path. Defaults to "
+             "the pinned model via --model-path / LOCALWALLET_MODEL_PATH.",
+    )
+    parser.add_argument(
         "--out",
         default=str(_OUT_PATH),
         help="where to write the results markdown (default: %(default)s)",
     )
     args = parser.parse_args(argv)
+    if args.model and args.model_path:
+        parser.error("--model and --model-path are mutually exclusive")
     # Line-buffer stdout so progress is visible when piped/detached.
     try:
         sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
@@ -211,7 +257,10 @@ def main(argv: list[str] | None = None) -> int:
     redteam = _load_cases(_REDTEAM_DIR)
     cases = golden + redteam
 
-    runtime, _notice = select_runtime(args.model_path)
+    model_path_arg = (
+        _resolve_model_arg(args.model) if args.model else args.model_path
+    )
+    runtime, _notice = select_runtime(model_path_arg)
     if not isinstance(runtime, ModelRuntime):
         print(
             f"error: a local GGUF model path is required "

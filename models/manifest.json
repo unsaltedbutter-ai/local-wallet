@@ -17,5 +17,23 @@
     "url": "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf",
     "sha256": null,
     "size_bytes": null
+  },
+  {
+    "name": "qwen3-4b-instruct-Q4_K_M",
+    "url": "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+    "sha256": "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
+    "size_bytes": "2497281120"
+  },
+  {
+    "name": "qwen3-1.7b-instruct-Q4_K_M",
+    "url": "https://huggingface.co/lm-kit/qwen-3-1.7b-instruct-gguf/resolve/main/Qwen3-1.7B-Q4_K_M.gguf",
+    "sha256": "b047d6617eba56dcfa3357566b06807f54b15816faf6182aabd12d7e2378e537",
+    "size_bytes": "1282439360"
+  },
+  {
+    "name": "phi-4-mini-instruct-Q4_K_M",
+    "url": "https://huggingface.co/unsloth/Phi-4-mini-instruct-GGUF/resolve/main/Phi-4-mini-instruct-Q4_K_M.gguf",
+    "sha256": "88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a",
+    "size_bytes": "2491874272"
   }
 ]
