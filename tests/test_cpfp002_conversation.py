@@ -877,6 +877,67 @@ def test_broadcast_parent_gone_from_chain_truth(world) -> None:
     assert lines == [app._CPFP_PARENT_GONE]
 
 
+def _parent_gone(world, exc: Exception) -> bool:
+    """Drive :func:`app._cpfp_parent_gone` with the stuck parent still
+    unconfirmed in the cache (so it consults the chain) and ``get_tx_status``
+    raising ``exc`` — the TCK-PUBLICBCAST-002 evidence shapes, at the
+    classifier itself."""
+    _stuck(world)
+    pending = app._CpfpPending(
+        tx_ref="ref",
+        parent_txid=STUCK_TXID,
+        inbound_txid=STUCK_TXID,
+        inbound_vout=0,
+        display={},
+    )
+    world["client"].get_tx_status = lambda txid: (_ for _ in ()).throw(exc)
+    return app._cpfp_parent_gone(
+        world["store"], world["wallet"].id, world["client"], pending
+    )
+
+
+def test_parent_gone_condemns_on_explicit_404_evidence(world) -> None:
+    """TCK-CPFP-003: the detector keys on the EXPLICIT not-found evidence
+    (HTTP_STATUS class + numeric ``http_status == 404``), never the message
+    dialect — a reworded error with NO "404" text (the shape both the
+    Esplora and Bitcoind adapters attach at an immediately-answered 404)
+    STILL condemns the parent as gone."""
+    assert _parent_gone(
+        world,
+        app.ChainError(
+            "the server answered that it has no record of that transaction",
+            failure_class=app.HTTP_STATUS,
+            http_status=404,
+        ),
+    ) is True
+
+
+def test_parent_gone_stays_transient_on_non_404_error(world) -> None:
+    """A retry-exhausted 5xx — the HTTP_STATUS class but NO explicit 404
+    field (an unreachable/flaky backend) — is not provable not-found: the
+    parent stays transient, never condemned."""
+    assert _parent_gone(
+        world,
+        app.ChainError(
+            "tx-status request failed after 3 retries: status 502",
+            failure_class=app.HTTP_STATUS,
+            exc_name="HTTPStatus",
+        ),
+    ) is False
+
+
+def test_parent_gone_stays_transient_when_dialect_only_says_404(world) -> None:
+    """The inverse reword: "status 404" TEXT on a foreign (non-not-found)
+    class is inert — fail-closed, exactly as PUBLICBCAST-002 pinned; the
+    feature must never be faked by dialect text alone."""
+    assert _parent_gone(
+        world,
+        app.ChainError(
+            "tx-status failed: status 404", failure_class=app.SERVER_REJECTED
+        ),
+    ) is False
+
+
 def test_broadcast_parent_confirmed_stays_transient(world) -> None:
     """The cache still shows the coin unconfirmed but the BACKEND reports
     it CONFIRMED (a stale cache, a live payment) → nothing is proven

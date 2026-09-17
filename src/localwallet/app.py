@@ -8852,10 +8852,13 @@ def _cpfp_parent_gone(
     try:
         client.get_tx_status(pending.parent_txid)
     except ChainError as exc:
-        # The RBF-005 pinned dialect: the Esplora/Bitcoind not-found
-        # surfaces as ``status 404``; other chain errors (transport, 5xx,
-        # an Electrum-dialect rejection) condemn nothing.
-        return "status 404" in str(exc)
+        # The provable not-found evidence (:func:`_is_not_found`,
+        # TCK-PUBLICBCAST-002 review): the HTTP_STATUS class AND the
+        # explicit numeric ``http_status == 404`` the adapters attach only
+        # at an immediately-answered non-auth 4xx — never the error-message
+        # dialect text. A retry-exhausted 5xx (class but no status field)
+        # and an Electrum-dialect rejection (foreign class) condemn nothing.
+        return _is_not_found(exc)
     except Exception:  # noqa: BLE001 — containment: an adapter surprise never condemns a parent
         return False
     return False
