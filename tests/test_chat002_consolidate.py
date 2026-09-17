@@ -195,7 +195,15 @@ def test_parsed_threshold_is_deterministic_unparsed_digit_is_not(world) -> None:
     assert world["session"].cons_ask is None
     # a 5000-digit token neither parses nor crashes:
     assert app._consolidation_intent("consolidate my coins under " + "1" * 5000) is None
-    assert app._consolidation_intent("consolidate my coins under 100000 btc") is None
+    # TCK-CHAT-010 (a) RE-ADJUDICATED PIN: a BTC-family unit word is now
+    # the shared size grammar (exact Decimal conversion, code-owned); the
+    # release family keeps only units OUTSIDE both admitted families.
+    assert app._consolidation_intent("consolidate my coins under 100000 btc") == (
+        None, None, False, (), 10_000_000_000_000, ""
+    )
+    # NOTE: a unit OUTSIDE both families beside an integer keeps the
+    # pre-ticket reading byte-identically (the integer cut stands, the odd
+    # word lands in the label residue — the old grammar's exact shape).
 
 
 # =========================================================================

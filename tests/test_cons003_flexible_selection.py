@@ -183,19 +183,65 @@ def test_explicit_threshold_cut_is_deterministic_strict_and_bounded(
 def test_threshold_grammar_releases_what_it_cannot_fully_parse(
     world,
 ) -> None:
-    """Non-sats units, out-of-envelope values and pathological digit tokens
-    all KEEP the ordinary pipeline (the CHAT-009 bound + release lesson) —
-    a half-read threshold is never a plan."""
-    assert app._consolidation_intent("consolidate utxos smaller than 100000 btc") is None
+    """Out-of-envelope values, units outside both families and pathological
+    digit tokens all KEEP the ordinary pipeline (the CHAT-009 bound +
+    release lesson) — a half-read threshold is never a plan."""
+    # A decimal WITHOUT a BTC-family unit is not a fully-parsed comparator
+    # — it keeps its pre-ticket shape byte-identically (the below-word
+    # reads fuzzy, the leftover never names a stored label, the runner
+    # falls through; it never becomes a plan):
+    assert app._consolidation_intent(
+        "consolidate utxos smaller than 0.5 sats"
+    ) == (None, None, True, (), None, "0.5")
+    assert app._consolidation_intent(
+        "consolidate utxos smaller than 0.01"
+    ) == (None, None, True, (), None, "0.01")
+    # A unit word outside both families beside an INTEGER keeps the old
+    # reading too (the cut stands, the odd word is label residue — the
+    # pre-ticket shape):
+    assert app._consolidation_intent(
+        "consolidate utxos smaller than 100000 bits"
+    ) == (None, None, False, (), 100_000, "bits")
     assert app._consolidation_intent("consolidate utxos larger than 100000 sats") is None
     # above all bitcoin:
     assert app._consolidation_intent("consolidate utxos below 99999999999999999 sats") is None
     assert app._consolidation_intent(
         "consolidate utxos smaller than " + "9" * 5000 + " sats"
     ) is None
+    # A line the comparator gate rejects outright (no object word) is the
+    # pure release, as always:
     _labeled(world)
-    _, fake, _ = _turn(world, "consolidate utxos smaller than 100000 btc")
-    assert len(fake.prompts) == 1  # released to the ordinary pipeline, as today
+    _, fake, _ = _turn(world, "consolidate my 3 favorite coins")
+    assert len(fake.prompts) == 1  # released to the ordinary pipeline
+    # A decimal WITHOUT a unit reads fuzzy instead (the pre-ticket shape,
+    # byte-identical): the line is the known "small" family, so the ONE
+    # threshold ask opens and the model is never consulted.
+    _, fake2, loop2 = _turn(world, "consolidate utxos smaller than 0.01")
+    assert fake2.prompts == [] and loop2.history == ()
+    ask = world["session"].cons_ask
+    assert ask is not None and ask.kind == "threshold"
+    world["session"].cons_ask = None
+
+
+def test_btc_unit_size_cut_is_accepted(world) -> None:
+    """TCK-CHAT-010 (a) RE-ADJUDICATED PIN: "smaller than 100000 btc" was
+    released (non-sats unit); the BTC family + decimals are now the shared
+    grammar — the exact Decimal conversion lands as the code-built cut,
+    the model never authors it."""
+    assert app._consolidation_intent(
+        "consolidate utxos smaller than 100000 btc"
+    ) == (None, None, False, (), 10_000_000_000_000, "")
+    assert app._consolidation_intent(
+        "consolidate utxos smaller than 0.01 bitcoin"
+    ) == (None, None, False, (), 1_000_000, "")
+    _labeled(world)
+    seen = _spy(world)
+    _outs, fake, loop = _turn(world, "consolidate utxos smaller than 0.1 btc")
+    assert fake.prompts == [] and loop.history == ()  # fully deterministic
+    assert seen[-1].params.model_dump() == {
+        "mode": "consolidate",
+        "below_size_sats": 10_000_000,  # 0.1 BTC, exact Decimal
+    }
 
 
 # =========================================================================

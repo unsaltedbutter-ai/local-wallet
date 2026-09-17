@@ -2518,17 +2518,20 @@ def _cons_size_threshold(
 ) -> tuple[int | None, frozenset[int]]:
     """TCK-CONS-003 (2): the explicit SIZE comparator of a consolidation
     line, parsed deterministically in the CHAT-009 shape —
-    ``<below-word> [than] <number> [sats unit]`` (thousands separators
-    tolerated, sats only; the envelope's own bounds gate the value).
-    Only the BELOW side is meaningful (a merge sweeps coins UNDER a cut —
-    an above-shaped line is not this grammar). Returns
-    ``(threshold, consumed_word_indexes)``; anything short of a FULLY
-    parsed comparator (no number, a non-sats unit, two stated cuts, a
-    pathological digit length per the CHAT-009 ``int_max_str_digits``
-    release, a value outside MIN..MAX_AMOUNT_SATS) is ``(None, frozenset())``
-    — the line keeps the ordinary pipeline, never a half-read threshold.
-    A below-word WITHOUT an adjacent number is deliberately NOT consumed:
-    it is the fuzzy "small" the threshold ask resolves (phrasing 3)."""
+    ``<below-word> [than] <number> [unit]`` (thousands separators
+    tolerated; TCK-CHAT-010 (a) mirrors the coin filter's extension: the
+    unit family is sats AND btc/bitcoin/coin/coins with exact Decimal
+    conversion, decimals admitted only beside a unit word; the envelope's
+    own bounds gate the value). Only the BELOW side is meaningful (a merge
+    sweeps coins UNDER a cut — an above-shaped line is not this grammar).
+    Returns ``(threshold, consumed_word_indexes)``; anything short of a
+    FULLY parsed comparator (no number, a unit outside the two families,
+    two stated cuts, a pathological digit length per the CHAT-009
+    ``int_max_str_digits`` release, a value outside MIN..MAX_AMOUNT_SATS)
+    is ``(None, frozenset())`` — the line keeps the ordinary pipeline,
+    never a half-read threshold. A below-word WITHOUT an adjacent number
+    is deliberately NOT consumed: it is the fuzzy "small" the threshold
+    ask resolves (phrasing 3)."""
     for i, word in enumerate(words):
         if word not in _CHAT_SIZE_BELOW:
             continue
@@ -2539,18 +2542,34 @@ def _cons_size_threshold(
             j += 1
         if j >= len(words) or not _CHAT_SIZE_NUM_RE.match(words[j]):
             continue  # the fuzzy reading (no number): not consumed here
-        digits = words[j].replace(",", "")
-        try:
-            value = int(digits)
-        except ValueError:
-            return None, frozenset()  # pathological digit length: release
-        if not MIN_AMOUNT_SATS <= value <= MAX_AMOUNT_SATS:
-            return None, frozenset()  # beyond all bitcoin (or sub-dust)
-        local.add(j)
-        if j + 1 < len(words) and words[j + 1] in _CHAT_SIZE_UNITS:
+        if "." in words[j] and (
+            j + 1 >= len(words)
+            or words[j + 1] not in _CHAT_SIZE_BTC_UNITS
+        ):
+            # A DECIMAL needs its BTC-family unit (the CHAT-010 extension);
+            # without one this is no fully-parsed comparator — and the
+            # token is deliberately left UNclaimed so the line keeps the
+            # pre-ticket shape (a bare digit like "consolidate 24 and 17"
+            # never rides the fuzzy-small ask).
+            continue
+        nxt = words[j + 1] if j + 1 < len(words) else ""
+        if nxt in _CHAT_SIZE_UNITS | _CHAT_SIZE_BTC_UNITS:
+            value = _parse_chat_size_sats(words[j], nxt)
+            if not MIN_AMOUNT_SATS <= value <= MAX_AMOUNT_SATS:
+                return None, frozenset()  # unparseable / beyond all bitcoin
             local.add(j + 1)
-        elif j + 1 < len(words) and words[j + 1] in ("btc", "bitcoin"):
-            return None, frozenset()  # a non-sats unit is not this grammar
+        else:
+            # The CHAT-009 grammar EXACTLY: a bare integer with any other
+            # (or no) trailing word is a plain sats cut (an unknown unit
+            # word beside it stays the old non-sats-unit release shape —
+            # it lands in the label residue exactly as before); a DECIMAL
+            # needs its unit word and is not this grammar without one.
+            if "." in words[j]:
+                return None, frozenset()
+            value = _cons_int(words[j].replace(",", ""))
+            if value is None or not MIN_AMOUNT_SATS <= value <= MAX_AMOUNT_SATS:
+                return None, frozenset()  # pathological / beyond all bitcoin
+        local.add(j)
         return value, frozenset(local)
     return None, frozenset()
 
@@ -2618,11 +2637,20 @@ def _consolidation_intent(
     # today's release (the pinned "consolidate my 3 favorite coins" model
     # route); a pick-list AND a stated size cut stay ambiguous below.
     try:
-        digits = {int(w) for w in words if w.isdigit()}
+        digits_indexes = {i for i, w in enumerate(words) if w.isdigit()}
+        # the int() probe doubles as the pathological digit-length guard
+        # (the CHAT-009 int_max_str_digits release lesson)
+        {int(w) for w in words if w.isdigit()}
     except ValueError:
-        return None  # pathological digit-length token: release (CHAT-009)
+        return None  # pathological digit-length token: release
     below, size_consumed = _cons_size_threshold(words)
-    registry = digits - ({below} if below is not None else set())
+    # The comparator's OWN token indexes leave the pick set: the digit-
+    # equality subtraction below only catches a sats cut whose value equals
+    # the token; a BTC-unit/decimal token (TCK-CHAT-010 (a)) converts to a
+    # DIFFERENT number ("100000 btc" → 10e12 sats), and the raw token must
+    # never resurface as a phantom registry pick.
+    registry = {int(words[i]) for i in digits_indexes - set(size_consumed)}
+    registry -= {below} if below is not None else set()
     number_list = len(registry) >= 2
     if (
         not (hash_marked or number_list)
@@ -3245,10 +3273,12 @@ def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
     ``"rollup"`` → the 1-based ROW (number or unique tag word);
     ``"count"`` → ``1`` (pick a single coin) or ``2`` (merge them all —
     "all"/the literal count digit);
-    ``"threshold"`` (TCK-CONS-003) → the stated sats size itself (one whole
-    number, thousands separators tolerated, optional sats unit, bounded to
-    the envelope's own MIN..MAX_AMOUNT_SATS — anything else is NOT an
-    answer and CLOSES the ask, the never-trap);
+    ``"threshold"`` (TCK-CONS-003, extended by TCK-CHAT-010 (a)) → the
+    stated size in whole sats (one number, thousands separators tolerated,
+    optional sats OR btc-family unit word — a decimal needs the unit word,
+    converted by the shared exact-Decimal helper — bounded to the
+    envelope's own MIN..MAX_AMOUNT_SATS; anything else is NOT an answer
+    and CLOSES the ask, the never-trap);
     ``"rate"`` (TCK-FEE-007/FEE-008) → the stated rate in integer
     centisat/vB (:func:`_cons_rate_answer` — a number with an explicit vB
     unit, or a BARE number/neutral fillers only, the FEE-008 acceptance:
@@ -3263,15 +3293,28 @@ def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
     if not words or any(w in _BUMP_DENY_TOKENS for w in words):
         return None
     if ask.kind == "threshold":
-        stated = [w for w in words if _CHAT_SIZE_NUM_RE.match(w)]
-        rest = [w for w in words if not _CHAT_SIZE_NUM_RE.match(w)]
-        if len(stated) != 1 or any(w not in _CHAT_SIZE_UNITS for w in rest):
+        # TCK-CHAT-010 (a): the same unit/decimal family the coin filter
+        # and the consolidation comparator accept — through the ONE shared
+        # size parse. A bare decimal (no unit word) is NOT an answer: it is
+        # the FEE-008 rate shape, and the rate/threshold disambiguation
+        # stays pinned both ways (this branch runs only under the
+        # threshold ask; a decimal with no unit still closes it honestly,
+        # never a silent 1e8-scale read).
+        number = next((w for w in words if _CHAT_SIZE_NUM_RE.match(w)), None)
+        if number is None or sum(1 for w in words if _CHAT_SIZE_NUM_RE.match(w)) != 1:
             return None
-        value = _cons_int(stated[0].replace(",", ""))
-        if value is None:
-            return None  # pathological digit length: close (CHAT-009 lesson)
+        rest = [w for w in words if w != number]
+        if any(
+            w not in _CHAT_SIZE_UNITS | _CHAT_SIZE_BTC_UNITS for w in rest
+        ) or (
+            any(w in _CHAT_SIZE_UNITS for w in rest)
+            and any(w in _CHAT_SIZE_BTC_UNITS for w in rest)
+        ):
+            return None  # a non-unit word (the old gate) or mixed units
+        unit = rest[0] if rest else ""
+        value = _parse_chat_size_sats(number, unit)
         if not MIN_AMOUNT_SATS <= value <= MAX_AMOUNT_SATS:
-            return None  # a cut outside all of bitcoin is not an answer
+            return None  # unparseable / a cut outside all of bitcoin
         return value
     if ask.kind == "rate":
         return _cons_rate_answer(line)
@@ -18861,8 +18904,10 @@ def _run_chat_settings_turn(
 # carry these asks and a new protocol param would make the MODEL author a
 # size/timestamp it never may):
 #   (a) SIZE — "show me my utxos smaller than 150000 sats" (thousands
-#       separators tolerated; sats only) filters the STORE's verbatim
-#       value_sats; the fuzzy "show me my large coins"/"small coins"
+#       separators tolerated) filters the STORE's verbatim value_sats;
+#       TCK-CHAT-010 (a) extended the unit family to sats + the BTC
+#       family with decimal-exact conversion through the shared
+#       settings converter; the fuzzy "show me my large coins"/"small coins"
 #       resolves to the user's OWN coin-size policy (the utxo_target_min/
 #       max settings ladder — the same §2.3 ladders the chat settings
 #       interceptor reads), never a hardcoded constant, and the answer
@@ -18962,15 +19007,62 @@ _CHAT_SIZE_BELOW: Final[frozenset[str]] = frozenset(
 _CHAT_SIZE_ABOVE: Final[frozenset[str]] = frozenset(
     {"large", "larger", "big", "bigger", "huge", "over", "above", "greater"}
 )
-#: The unit words a stated threshold may carry (closed; SATS only — a BTC
-#: or unknown unit next to the number is NOT this grammar, it falls through
-#: exactly like every other unresolvable shape).
+#: The unit words a stated threshold may carry (closed). TCK-CHAT-010 (a)
+#: added the BTC family (below); a word OUTSIDE both families is NOT this
+#: grammar and falls through exactly like every other unresolvable shape.
 _CHAT_SIZE_UNITS: Final[frozenset[str]] = frozenset(
     {"sat", "sats", "satoshi", "satoshis"}
 )
-#: One whole number, THOUSANDS SEPARATORS TOLERATED ("150,000" = 150000);
-#: no sign, no decimal point (fractional sats do not exist).
-_CHAT_SIZE_NUM_RE: Final = re.compile(r"^(?:\d{1,3}(?:,\d{3})+|\d+)$")
+#: One number, THOUSANDS SEPARATORS TOLERATED ("150,000" = 150000); no
+#: sign. TCK-CHAT-010 (a): a DECIMAL POINT IS NOW ADMITTED ("0.01") —
+#: fractional SATS still do not exist (the sats path stays digits-only)
+#: but a decimal beside a BTC-unit word is an exact Decimal conversion
+#: through the shared :func:`_chat_convert_value` (never a float product).
+_CHAT_SIZE_NUM_RE: Final = re.compile(
+    r"^(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?|\.\d+)$"
+)
+#: TCK-CHAT-010 (a): the BTC-family unit words a stated size threshold may
+#: now carry (case-insensitive through :func:`_chat_words`; "coin"/"coins"
+#: is the family's own object word — the size comparator has already
+#: claimed the line as a SIZE ask by the point the unit slot is read).
+_CHAT_SIZE_BTC_UNITS: Final[frozenset[str]] = frozenset(
+    {"btc", "bitcoin", "coin", "coins"}
+)
+
+
+def _parse_chat_size_sats(token: str, unit: str) -> int:
+    """TCK-CHAT-010 (a): the ONE shared size-threshold parse the coin
+    filter, the consolidation comparator and the threshold ask answer all
+    run — ``<number> [unit]`` → whole sats, or the ``-1`` release sentinel.
+    An integer token is sats with NO unit word or a sats-unit word (the
+    original CHAT-009 grammar, byte-identical), or BTC-exact with a
+    BTC-unit word; a DECIMAL token needs an explicit unit word (a bare
+    "smaller than 0.01" is ambiguous — released, never silently read as
+    sats or as BTC). The BTC leg REUSES :func:`_chat_convert_value` — the
+    settings ladder's exact-Decimal converter — rather than re-deriving
+    the scale (a sub-sat decimal answers with its own whole-sat refusal
+    sentinel, which every caller here reads as a release). Out-of-envelope
+    values are the CALLERS' bound check (the three sites use different
+    floors: 1, MIN_AMOUNT_SATS, MIN_AMOUNT_SATS)."""
+    if not _CHAT_SIZE_NUM_RE.match(token):
+        return -1
+    digits = token.replace(",", "")
+    if unit in _CHAT_SIZE_BTC_UNITS:
+        # the BTC leg (integer OR decimal token): REUSES the exact-Decimal
+        # settings converter — never a re-derived scale, never a float.
+        # "btc" is passed as the converter's unit token: this branch IS the
+        # unit decision (the settings family's own unit-word regex does
+        # not know the "bitcoin"/"coin" aliases this grammar added).
+        converted = _chat_convert_value(
+            UTXO_TARGET_MIN_SETTING, digits, "btc"
+        )
+        return converted if isinstance(converted, int) and converted > 0 else -1
+    if "," in digits or "." not in digits:
+        value = _cons_int(digits)  # the int_max_str_digits guard
+        if value is None:
+            return -1
+        return value if unit == "" or unit in _CHAT_SIZE_UNITS else -1
+    return -1  # decimal sats do not exist; a bare decimal is ambiguous
 #: The closed absolute-receive grammar: "in <year>" / "during <year>".
 #: Anything finer (month names, ranges, quarters, "last March") is
 #: UNRESOLVABLE here and falls through to the existing hedged behavior —
@@ -18980,10 +19072,85 @@ _CHAT_YEAR_RE: Final = re.compile(r"\b(?:in|during)\s+(\d{4})\b")
 #: (genesis-era nonsense releases the line).
 _CHAT_YEAR_MIN: Final[int] = 1900
 
+#: TCK-CHAT-010 (b): the GENERAL relative-age comparator — deliberately NOT
+#: a per-frame table: one duration number + one unit word + a direction
+#: mapped from the phrasing. One CLOSED exact-seconds table: minute/hour/
+#: day/week are exact; a month is the average calendar month (365.25 days
+#: /12 — an age window, not a billing period, so the CHAT-005 resolver's
+#: same-day clamp does not apply here); a year is 365.25 days. A duration
+#: beyond a decade is the CHAT-005 since-cap family — released, never
+#: fabricated.
+_CHAT_AGE_UNIT_SECONDS: Final[dict[str, int]] = {
+    "minute": 60,
+    "min": 60,
+    "hour": 3_600,
+    "day": 86_400,
+    "week": 7 * 86_400,
+    "wk": 7 * 86_400,
+    # a month is the average calendar month (365.25 days / 12, exact);
+    # a year is 365.25 days — the same closed exact-duration family.
+    "month": 2_629_800,
+    "year": 31_557_600,
+    "yr": 31_557_600,
+}
+#: The words a duration-unit slot accepts (the exact-seconds table plus
+#: the two derived units and the coin-family alias — the alias counts as
+#: a duration word ONLY beside an age-trigger word, see
+#: :func:`_parse_chat_age_bound`).
+_CHAT_AGE_DURATION_UNITS: Final[frozenset[str]] = (
+    frozenset(_CHAT_AGE_UNIT_SECONDS)
+    | {"month", "year", "coin", "coins"}
+)
+#: The envelope cap: the CHAT-005 since-family tops out at ≈ a decade per
+#: unit — a duration past that is released, never fabricated.
+_CHAT_AGE_MAX_SPAN_SECONDS: Final[int] = 10 * _CHAT_AGE_UNIT_SECONDS["year"]
+#: Bitcoin's own genesis block: no store-truth receive time precedes it,
+#: so a cutoff below this instant is a mis-parse (or a pre-history claim).
+_BITCOIN_GENESIS_UTC: Final[int] = 1_231_006_505
+#: Direction words. The SIZE words ("less"/"under"/"below"/"over"…) are
+#: deliberately NOT here — they reach the age reading only through the
+#: age-trigger gate below and are never claimed by this parser without one
+#: (so the size grammar keeps every line it used to keep).
+_CHAT_AGE_OLDER: Final[frozenset[str]] = frozenset({"older", "elder"})
+_CHAT_AGE_YOUNGER: Final[frozenset[str]] = frozenset(
+    {"newer", "younger", "recent"}
+)
+#: The bare number anchor needs a window word beside it ("in/for the last
+#: 2 days"); "than" anchors a stated comparator word.
+_CHAT_AGE_ANCHORS: Final[frozenset[str]] = frozenset({"last", "past", "since"})
+#: Words that make a duration phrase about AGE (a temporal unit beside the
+#: number is enough on its own; "coin(s)" only counts as a unit alias here,
+#: never naked — "smaller than 3 coins" stays the size grammar).
+_CHAT_AGE_TRIGGER_WORDS: Final[frozenset[str]] = frozenset(
+    {"old", "age", "ago"}
+) | _CHAT_AGE_OLDER | _CHAT_AGE_YOUNGER
+#: Fill words that are inert mid-age-phrase ("received IN THE past
+#: month"); the direction/anchor words of this grammar are NOT here.
+_CHAT_AGE_INERT_PRE: Final[frozenset[str]] = (
+    _CHAT_COIN_FILTER_FILLERS | {"a", "an"}
+) - (_CHAT_AGE_ANCHORS | _CHAT_AGE_OLDER | _CHAT_AGE_YOUNGER)
+#: Fuzzy hedge counts accepted CHEAPLY (the ticket's "a couple of weeks");
+#: "few"/"several"/"many" carry no number — they stay unparseable, released.
+_CHAT_AGE_HEDGE_COUNTS: Final[dict[str, int]] = {"couple": 2}
+
 #: Header lines (engine-owned framing; every number in them is the
 #: engine's OWN parse/ladder read, echoed once so the listing's scope is
 #: never a mystery — the coin rows themselves stay store-verbatim).
 _CHAT_COIN_SIZE_HEAD: Final[str] = "Coins {relation} {sats} sats:"
+#: TCK-CHAT-010 (a): a BTC-shaped ask answers with the engine's OWN exact
+#: Decimal conversion echoed in sats (the same scalar, the settings-read
+#: precedent — never the user's string re-quoted as if it were a store
+#: value, never a float product).
+_CHAT_COIN_SIZE_UNIT_HEAD: Final[str] = "Coins {relation} {sats} sats ({number} {unit}):"
+#: TCK-CHAT-010 (b): the relative-age window heads (the duration is the
+#: user's own number + the engine's closed unit word; the bound itself is
+#: applied against store-truth receive times).
+_CHAT_COIN_AGE_HEAD_YOUNGER: Final[str] = (
+    "Coins received within the last {count} {unit}:"
+)
+_CHAT_COIN_AGE_HEAD_OLDER: Final[str] = (
+    "Coins received more than {count} {unit} ago:"
+)
 _CHAT_COIN_LADDER_HEAD: Final[str] = (
     "Coins {relation} {sats} {unit} — {setting} ({rung}):"
 )
@@ -19012,18 +19179,30 @@ def _run_coin_filter_turn(
     :data:`_CHAT_COIN_WORDS` is required; no blocked word. Parsed
     conjunctively (AND-wise), resolved engine-side:
 
-    * SIZE — ``<below/above word> [than] <number> [sats]`` filters the
-      store's verbatim ``value_sats`` (strict ``<``/``>``, thousands
-      separators tolerated, sats only, bounded 1..MAX_AMOUNT_SATS —
-      anything past all of bitcoin is a mis-parse, not a query); the same
-      word WITHOUT a number resolves to the user's coin-size policy
-      (utxo_target_min/max over the §2.3 ladder; a malformed ladder prints
-      the settings' own honest refusal line).
+    * SIZE — ``<below/above word> [than] <number> [unit]`` filters the
+      store's verbatim ``value_sats`` (strict ``<``/``>``; thousands
+      separators tolerated; bounded 1..MAX_AMOUNT_SATS — anything past all
+      of bitcoin is a mis-parse, not a query). TCK-CHAT-010 (a): the unit
+      family is sats AND the BTC family (btc/bitcoin/coin/coins,
+      case-insensitive) and the number may be DECIMAL — converted through
+      the shared exact-Decimal :func:`_chat_convert_value` (never a float
+      product); a decimal with no unit word is ambiguous and releases.
+      The same word WITHOUT a number resolves to the user's coin-size
+      policy (utxo_target_min/max over the §2.3 ladder; a malformed ladder
+      prints the settings' own honest refusal line).
     * TIME — "new" lists the store's unconfirmed coins (the only
       store-honest "new"; confirmed coins' receive-times arrive through the
       CHAT-005 relative ``since`` route, which this interceptor deliberately
       does NOT take over); "in <year>" (or "during") closes the window to
       that calendar year through :func:`_coin_within_since`'s ``until``.
+      TCK-CHAT-010 (b) ADDS the general relative-age comparator
+      (:func:`_parse_chat_age_bound` — "less than 1 week old", "older than
+      a month", "in the last 2 days"): a duration count + unit word with a
+      direction mapped from the phrasing, bounded against each coin's
+      store-truth receive time (confirmed = block_time, unconfirmed = the
+      tx row's first_seen; an unresolvable time fails CLOSED) and
+      AND-composable with every other filter. The absolute windows above
+      parse byte-identically.
     * LABEL — whatever words the size/time parse leaves (the residual) is
       ONE label phrase, normalized through the shared
       :func:`_normalize_label_word` (via :func:`_label_query_form`) and
@@ -19072,12 +19251,36 @@ def _run_coin_filter_turn(
         or word in _CHAT_COIN_FILTER_POLITE
     }
 
+    # --- AGE (TCK-CHAT-010 (b)): a relative-duration comparator rides the
+    # store's own receive times (block_time for confirmed coins, the tx
+    # row's first_seen for unconfirmed — never a fabricated timestamp).
+    # ADDITIVE: CHAT-009's absolute windows below are untouched. Runs
+    # BEFORE the size loop so "less than 1 week old" (whose comparator is a
+    # size word) is read as TIME once, claimed, and never re-read as a
+    # second, hidden threshold. ---
+    now = int(time.time())  # the tool-owned seam (same as the year gate)
+    age: tuple[str, int] | None = None
+    age_phrase: tuple[int, str] | None = None
+    age_result = _parse_chat_age_bound(words, consumed, now)
+    if age_result[0] is None:
+        # a declined claim is still a claim (see the parser's contract)
+        consumed.update(age_result[1])
+    else:
+        direction, count, unit, age_claimed = age_result
+        consumed.update(age_claimed)
+        age = (direction, now - count * _chat_age_unit_seconds(unit))
+        age_phrase = (count, unit)
+
     # --- SIZE: comparator [than] NUMBER [unit], else the policy ladder ---
     below: int | None = None
     above: int | None = None
+    below_token = above_token = ""
     fuzzy_below = False
     fuzzy_above = False
+    stated_threshold = False
     for i, word in enumerate(words):
+        if i in consumed:
+            continue  # the age parse claimed this token (comparator/unit)
         side = (
             "below"
             if word in _CHAT_SIZE_BELOW
@@ -19093,24 +19296,29 @@ def _run_coin_filter_turn(
             consumed.add(j)
             j += 1
         if j < len(words) and _CHAT_SIZE_NUM_RE.match(words[j]):
-            digits = words[j].replace(",", "")
-            try:
-                value = int(digits)
-            except ValueError:
-                return False  # pathological digit-length token (> py int_max_str_digits): release
+            unit = (
+                words[j + 1]
+                if j + 1 < len(words) and words[j + 1] in _CHAT_SIZE_UNITS
+                | _CHAT_SIZE_BTC_UNITS
+                else ""
+            )
+            value = _parse_chat_size_sats(words[j], unit)
+            # TCK-CHAT-010 (a): the sats path keeps CHAT-009's 1-floor
+            # bound; a converted BTC value must land inside the sats floor
+            # too (a sub-1-sat BTC decimal is the whole-sat refusal shape,
+            # released like every other unparseable threshold).
             if not 1 <= value <= MAX_AMOUNT_SATS:
-                return False  # beyond all bitcoin (or zero): a mis-parse
+                return False  # a mis-parse / non-sats unit / beyond all bitcoin
             consumed.add(j)
-            if j + 1 < len(words) and words[j + 1] in _CHAT_SIZE_UNITS:
+            if unit:
                 consumed.add(j + 1)
-            elif j + 1 < len(words) and words[j + 1] in ("btc", "bitcoin", "coin"):
-                return False  # a non-sats unit is not this grammar
             if below is not None or above is not None:
                 return False  # two stated thresholds = ambiguous
+            stated_threshold = True
             if side == "below":
-                below = value
+                below, below_token = value, unit
             else:
-                above = value
+                above, above_token = value, unit
             continue
         if side == "below":
             fuzzy_below = True
@@ -19118,9 +19326,7 @@ def _run_coin_filter_turn(
             fuzzy_above = True
     if fuzzy_below and fuzzy_above:
         return False
-    if (fuzzy_below and (below is not None or above is not None)) or (
-        fuzzy_above and (below is not None or above is not None)
-    ):
+    if (fuzzy_below or fuzzy_above) and stated_threshold:
         # A policy word next to ANY stated number (same OR opposite side) is
         # ambiguous: the ladder resolves only a word WITHOUT a number (per
         # the docstring), so release it to the ordinary pipeline instead of
@@ -19133,7 +19339,7 @@ def _run_coin_filter_turn(
     year_match = _CHAT_YEAR_RE.search(line.lower())
     if year_match is not None:
         year = int(year_match.group(1))
-        current_year = time.gmtime(int(time.time())).tm_year
+        current_year = time.gmtime(now).tm_year
         if not _CHAT_YEAR_MIN <= year <= current_year:
             return False  # a future (or nonsense) window: never fabricated
         window = (
@@ -19166,6 +19372,7 @@ def _run_coin_filter_turn(
         and below is None
         and above is None
         and window is None
+        and age is None
         and not pending_only
         and not fuzzy_below
         and not fuzzy_above
@@ -19253,6 +19460,23 @@ def _run_coin_filter_turn(
             for r in kept
             if _coin_within_since(r, sources.get(r.txid), window[0], window[1])
         ]
+    if age is not None:
+        # TCK-CHAT-010 (b): the bound rides STORE TRUTH — a confirmed
+        # coin's block_time, an unconfirmed coin's tx-row first_seen (the
+        # same tx join the windows above use). A coin with no recorded
+        # receive time fails CLOSED (excluded): the store cannot vouch for
+        # how old it is, and "now" is never fabricated onto it.
+        direction, cutoff = age
+        sources = {t.txid: t for t in txs}
+        kept = [
+            r
+            for r in kept
+            if (t := _coin_receive_time(r, sources.get(r.txid))) is not None
+            # OLDER = received before the cutoff instant; YOUNGER (within
+            # the last X) = received at/after it. The two are disjoint and
+            # jointly total; the boundary instant belongs to "within".
+            and (t < cutoff if direction == "older" else t >= cutoff)
+        ]
     label_like = False
     if wanted:
         kept, label_like = _select_coins_by_label(
@@ -19273,15 +19497,20 @@ def _run_coin_filter_turn(
 
     heads = list(rungs)
     if below is not None:
-        heads.insert(
-            0, _CHAT_COIN_SIZE_HEAD.format(relation="under", sats=below)
-        )
+        heads.insert(0, _coin_size_head("under", below, below_token))
     if above is not None:
-        heads.insert(
-            0, _CHAT_COIN_SIZE_HEAD.format(relation="over", sats=above)
-        )
+        heads.insert(0, _coin_size_head("over", above, above_token))
     if year_phrase is not None:
         heads.append(_CHAT_COIN_YEAR_HEAD.format(year=year_phrase))
+    if age_phrase is not None:
+        count, unit = age_phrase
+        heads.append(
+            (
+                _CHAT_COIN_AGE_HEAD_YOUNGER
+                if age is not None and age[0] == "younger"
+                else _CHAT_COIN_AGE_HEAD_OLDER
+            ).format(count=count, unit=unit if count == 1 else f"{unit}s")
+        )
     for head_line in heads:
         output_fn(sanitize_tool_output(head_line))
     result: dict[str, object] = {
@@ -19304,6 +19533,236 @@ def _run_coin_filter_turn(
     result.update(_pending_summary(kept, txs))
     _print_utxos(result, output_fn)
     return True
+
+
+def _coin_size_head(relation: str, value: int, unit: str) -> str:
+    """TCK-CHAT-010 (a): the size head line — byte-identical to CHAT-009's
+    for a sats-shaped threshold (unit word "", sat, sats, satoshi,
+    satoshis: the sats number is echoed as the engine read it), and names
+    the engine's own exact Decimal conversion beside a BTC-unit ask
+    ("Coins over 1000000 sats (0.01 bitcoin):") so the listing's scope is
+    never a mystery. The {number}/{unit} pair is the engine's canonical
+    render of its OWN parse (the settings-read echo precedent), never the
+    user's string re-quoted as store truth."""
+    if unit in _CHAT_SIZE_BTC_UNITS:
+        number = Decimal(value) / _SATS_PER_BTC
+        return _CHAT_COIN_SIZE_UNIT_HEAD.format(
+            relation=relation,
+            sats=value,
+            number=format(number.normalize(), "f"),
+            unit="BTC" if unit == "btc" else unit,
+        )
+    return _CHAT_COIN_SIZE_HEAD.format(relation=relation, sats=value)
+
+
+def _coin_receive_time(
+    coin: UtxoRecord, source: TxRecord | None
+) -> int | None:
+    """TCK-CHAT-010 (b): a coin's receive instant from STORE TRUTH —
+    a confirmed coin's is its creating tx's ``block_time`` (the same join
+    CHAT-009's windows use); an unconfirmed coin's is its tx row's
+    ``first_seen`` capture. ``None`` = no store-honest instant (a row whose
+    time was never recorded) — callers fail CLOSED, the engine never
+    fabricates a timestamp from wall clock."""
+    if source is None:
+        return None
+    return source.block_time if coin.height is not None else source.first_seen
+
+
+def _parse_chat_age_bound(
+    words: list[str], consumed: set[int], now: int
+) -> tuple[str, int, str, frozenset[int]] | tuple[None, frozenset[int]]:
+    """TCK-CHAT-010 (b): the GENERAL relative-age comparator, parsed from
+    the user's own words — deliberately NOT a per-frame table: a duration
+    count + one unit word + a direction mapped from the phrasing.
+
+    Shape: ``[<comparator> [than] | last/past/since] [in/for/…] [couple
+    [of] | <N>] <duration-unit> [old]``. Units: minute(s)/min(s),
+    hour(s), day(s), week(s)/wk(s), month(s), year(s)/yr(s) — singular and
+    plural. A duration unit word ADJACENT to a whole-number count is what
+    anchors the scan, so a number never rides this parser without naming a
+    duration unit — the size grammar keeps every line it used to keep.
+    The unit slot also takes "coin(s)" (the "2 coins old" shape) but only
+    beside an age-trigger word ("old"/"age"/"ago"/a direction word), and
+    a size-family comparator is only claimed once the phrase has proven
+    temporal — with the claim RESTORED to the caller on every decline, so
+    the caller's size loop still sees the fuzzy reading of "smaller than 3
+    coins" and the two-threshold guard stays intact.
+
+    Direction: an older/younger word wins ("older than", "younger than");
+    else the last/past/since window word (possibly behind the comparator,
+    possibly after it — "younger than the last X" collapses to within-X)
+    means "within" → younger; else — and only once the phrase is proven
+    temporal — a size comparator maps by its own ordering of age
+    (less/lower/under/below → younger, larger/over/above/greater/higher →
+    older). "couple [of]" = 2, the ticket's cheap hedge; every other fuzzy
+    form ("few", "several") carries no number — unparseable, released.
+    Decimal durations have no honest frame — released. Months are the
+    average calendar month of the shared duration table; the whole span is
+    capped at the ≈-decade envelope the CHAT-005 since-family draws its
+    bounds from, and a cutoff below bitcoin's own genesis is a mis-parse.
+    The cutoff rides the tool-owned ``now``.
+
+    Returns ``(direction, count, unit, consumed_indexes)`` — the caller
+    folds count×unit against ``now`` and applies the bound to STORE-truth
+    receive times (:func:`_coin_receive_time`); no timestamp is ever
+    fabricated. On release it returns ``(None, size_word_indexes)``."""
+    match: tuple[int, int, int, str] | None = None  # (unit_i, count_i, count, unit)
+    for unit_i, word in enumerate(words):
+        unit = _chat_age_duration_unit(word)
+        if not unit:
+            continue
+        if unit_i in consumed and unit not in ("coin", "coins"):
+            continue  # a pre-consumed duration word is not a unit claim;
+        # the "coin(s)" alias rides the caller's coin-word fill (it IS the
+        # object word — "my coins less than 2 coins old" is the only shape
+        # that consumes it).
+        # The count sits DIRECTLY before the unit ("2 days", "couple
+        # [of] weeks" — the plural rides the same word); the walk-back
+        # below reads the comparator/window words over fillers. An
+        # article counts as ONE ("older than a month") — the walk-back
+        # re-skips it (inert-word skip), so it never double-claims.
+        if unit_i < 1:
+            continue
+        prev = words[unit_i - 1]
+        if unit_i - 1 in consumed and prev not in ("a", "an", "of"):
+            continue
+        if prev in ("a", "an") or prev == "past":
+            match = (unit_i, unit_i - 1, 1, unit)
+            break
+        if prev.isdigit():
+            count = _cons_int(words[unit_i - 1])
+            if count is None:  # pathological digit length: no count here
+                continue
+            match = (unit_i, unit_i - 1, count, unit)
+            break
+        if prev in _CHAT_AGE_HEDGE_COUNTS:
+            match = (unit_i, unit_i - 1, _CHAT_AGE_HEDGE_COUNTS[prev], unit)
+            break
+        if (
+            unit_i >= 2
+            and unit_i - 2 not in consumed
+            and prev == "of"
+            and words[unit_i - 2] in _CHAT_AGE_HEDGE_COUNTS
+        ):
+            match = (unit_i, unit_i - 2, _CHAT_AGE_HEDGE_COUNTS[words[unit_i - 2]], unit)
+            break
+    if match is None:
+        return None, frozenset()
+    unit_i, count_i, count, unit = match
+    temporal = (
+        unit in _CHAT_AGE_UNIT_SECONDS
+        or bool({w for i, w in enumerate(words) if i not in consumed}
+                & _CHAT_AGE_TRIGGER_WORDS)
+    )  # the "coin(s)" alias counts as a duration word only beside an age
+    # trigger word; the trigger scan reads the UNCONSUMED residue (a
+    # claimed word is the size loop's, not evidence for this phrase)
+    if not temporal:
+        # "…than 3 coins" with no age word anywhere: the SIZE reading —
+        # nothing consumed here, the caller's size loop re-reads the line.
+        return None, frozenset()
+    if unit in ("coin", "coins"):
+        # The ticket's "2 coins old" shape: the coin alias is adjudicated
+        # as a MONTH (the honest default the alias stands in for); the
+        # head line narrates the CHOSEN unit, never the raw alias.
+        unit = "month"
+    claimed: set[int] = {unit_i, count_i}
+    if count_i + 1 != unit_i:
+        claimed.add(count_i + 1)  # the "of" inside "a couple of weeks"
+    # A size word read but declined stays claimed for the CALLER (its own
+    # grammar must see the claim — the decline must not smuggle a fuzzy
+    # second threshold past the two-threshold guard); every other claim is
+    # local to this phrase and evaporates on a decline.
+    size_claimed: frozenset[int] = frozenset()
+    direction = ""
+    saw_anchor = False
+    # The walk starts before the count — or, when the count's head IS the
+    # window word ("IN THE PAST month": past = count 1), just after the
+    # unit, so the anchor gets its direction reading (a trailing "old"
+    # sits in the claimed set and walks through).
+    k = (
+        unit_i + 1
+        if (
+            count_i == unit_i - 1
+            and unit_i + 1 < len(words)
+            and words[count_i] in _CHAT_AGE_ANCHORS
+        )
+        else count_i - 1
+    )
+    while direction == "":
+        if k < 0:
+            break
+        w = words[k]
+        if k in claimed or (
+            k in consumed and w in _CHAT_AGE_INERT_PRE
+        ):
+            # a token of THIS phrase, or a pure filler the caller already
+            # consumed ("received IN THE past month"): walk through.
+            if k not in claimed:
+                claimed.add(k)
+            k -= 1
+            continue
+        if k in consumed:
+            break  # a structural token (coin noun / verb head / claimed
+            # comparator) ends the walk; pure fillers were skipped above
+        if w == "than" or w in _CHAT_AGE_INERT_PRE or w in _CHAT_COIN_FILTER_FILLERS:
+            # inert mid-phrase word ("received IN THE past month",
+            # "than", the article): skippable, claimed when the caller
+            # left it unconsumed. "past" is a fill word too but doubles
+            # as an anchor/direction word — it never skips.
+            claimed.add(k)
+            k -= 1
+            continue
+        if w in _CHAT_AGE_ANCHORS and w not in _CHAT_AGE_OLDER:
+            claimed.add(k)
+            saw_anchor = True
+            k -= 1
+            continue
+        if w in _CHAT_AGE_OLDER:
+            claimed.add(k)
+            direction = "older"
+        elif w in _CHAT_AGE_YOUNGER:
+            claimed.add(k)
+            direction = "younger"
+        elif w in _CHAT_SIZE_BELOW or w in _CHAT_SIZE_ABOVE:
+            claimed.add(k)
+            size_claimed = frozenset({k})
+            direction = "younger" if w in _CHAT_SIZE_BELOW else "older"
+        else:
+            return None, size_claimed  # foreign token: not this grammar
+    if direction == "":
+        if count_i == unit_i - 1 and words[count_i] in _CHAT_AGE_ANCHORS:
+            saw_anchor = True  # the unit's own head is the window word
+        if not saw_anchor:
+            return None, size_claimed  # bare "2 days old": no direction at all
+        direction = "younger"  # the last/past/since window word = "within"
+    # The trailing age word of "less than 1 week OLD" is part of the phrase.
+    if unit_i + 1 < len(words) and words[unit_i + 1] in _CHAT_AGE_TRIGGER_WORDS:
+        claimed.add(unit_i + 1)
+    cutoff = now - count * _chat_age_unit_seconds(unit)
+    if (
+        count * _chat_age_unit_seconds(unit) > _CHAT_AGE_MAX_SPAN_SECONDS
+        or cutoff < _BITCOIN_GENESIS_UTC
+    ):
+        return None, size_claimed  # past the decade envelope: never fabricated
+    return direction, count, unit, frozenset(claimed)
+
+
+def _chat_age_duration_unit(word: str) -> str:
+    """The duration-unit word behind a token ("days"→"day", "mins"→"min",
+    "wks"→"wk"), or "" when the word names no admitted duration. Whole-
+    word + trailing-s matching — no prefix tricks ("fortnight" is not
+    "day"+something, "minute" is not "min"+s)."""
+    if word in _CHAT_AGE_DURATION_UNITS:
+        return word
+    if word.endswith("s") and word[:-1] in _CHAT_AGE_DURATION_UNITS:
+        return word[:-1]
+    return ""
+
+
+def _chat_age_unit_seconds(unit: str) -> int:
+    """One duration unit in seconds from the closed table above."""
+    return _CHAT_AGE_UNIT_SECONDS[unit]
 
 
 # ---------------------------------------------------------------------------
