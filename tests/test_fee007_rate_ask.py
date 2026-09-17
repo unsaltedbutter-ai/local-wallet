@@ -25,9 +25,10 @@ byte-identical, so the model can never author a plan rate):
 
 The DISAMBIGUATION (pinned BOTH ways): a rate answer ("0.75 sat/vbyte")
 is never consumed as a size THRESHOLD, and a threshold answer ("100000"
-/ "100000 sats") is never consumed as a RATE — the two grammars are
-disjoint by construction (a rate REQUIRES an explicit vB unit; the
-threshold parser is whole-sats-only).
+/ "100000 sats") is never consumed as a RATE. TCK-FEE-008 re-adjudicated
+one leg — a BARE number to the open RATE ask IS a rate (the ask copy
+says "say a rate"; the grammars are now disjoint by the ask-KIND gate
+plus the sats-unit rule, not by the marker requirement alone).
 """
 
 from __future__ import annotations
@@ -162,8 +163,11 @@ def test_whole_sat_rate_is_never_consumed_as_a_threshold(world) -> None:
 
 @pytest.mark.parametrize("answer", ["100000", "100000 sats", "smaller than 100000"])
 def test_threshold_answer_is_never_consumed_as_a_rate(world, answer: str) -> None:
-    """A size answer to the RATE ask is not a rate (no vB unit) → CLOSES
-    the ask; the plan's bid is untouched."""
+    """A size answer to the RATE ask is not a rate → CLOSES the ask; the
+    plan's bid is untouched. (TCK-FEE-008 re-adjudicated the FIRST case's
+    reason, not its outcome: a bare number IS now the rate grammar, but
+    "100000" sits beyond the envelope's 1..MAX_FEE_RATE_SAT_VB span, so
+    it still releases — as do the sats-unit and multi-word shapes.)"""
     ref0, rate0 = _stage_two_coin_plan(world)
     _turn(world, "slower")
     assert world["session"].cons_ask.kind == "rate"
@@ -299,9 +303,13 @@ def test_env_carryover_from_a_non_rate_pending_is_unaffected(world) -> None:
         ("1,000 sat/vB", 100_000),
         ("0.75 sats per vbyte please", 75),
         ("the rate of 1.5 sat/vb", 150),
-        # not a rate (no vB marker — threshold/ambiguous shapes):
-        ("0.75", None),
-        ("100000 sats", None),
+        # TCK-FEE-008 RE-ADJUDICATION: the original ("0.75", None) release
+        # pin is retired by that ticket — a BARE number is a rate when the
+        # rate ask is the open one (kind-gated; the ask copy always said
+        # "say a rate", and rejecting "0.75" shipped it to the model):
+        ("0.75", 75),
+        # not a rate (threshold-shaped / ambiguous):
+        ("100000 sats", None),  # sats-unit word, no vB marker (FEE-008 keeps it)
         (".75 sat/vb", None),  # leading-dot number could misread as 75 → reject
         ("5 sat/vb and call it a day", None),  # words outside the closed grammar
         ("0.755 sat/vB", None),  # > 2 decimals

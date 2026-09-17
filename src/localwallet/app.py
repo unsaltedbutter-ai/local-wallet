@@ -2196,9 +2196,11 @@ _CONS_RATE_ASK: Final[str] = (
 _CONS_RATE_NUM_RE: Final = re.compile(
     r"^(?:\d{1,3}(?:,\d{3}){0,4}|\d{1,5})(?:\.\d{1,2})?$"
 )
-#: The vB-unit markers — at least one MUST appear beside the number: a
-#: bare number or a sats-only unit is the THRESHOLD ask's shape and is
-#: never consumed as a rate (the disambiguation pinned both ways).
+#: The vB-unit markers — the discriminator that keeps every sats-unit
+#: number in the rate grammar (TCK-FEE-008 relaxes the REQUIREMENT for a
+#: bare number, not for a sats-only unit: "1000 sats" is the THRESHOLD
+#: ask's shape and is never consumed as a rate, the disambiguation
+#: pinned both ways — the KIND gate on the open ask does the separating).
 _CONS_RATE_VB_MARKERS: Final[frozenset[str]] = frozenset(
     {
         "vb", "vbs", "vbyte", "vbytes",
@@ -2208,13 +2210,24 @@ _CONS_RATE_VB_MARKERS: Final[frozenset[str]] = frozenset(
 )
 #: Closed fillers a rate answer may carry beside the number and the marker
 #: ("0.75 sats per vbyte please"); anything outside markers ∪ fillers is
-#: not this grammar. "sat"/"sats" are fillers ONLY because a marker must
-#: also be present — "100000 sats" is not a rate.
+#: not this grammar. "sat"/"sats" are fillers ONLY beside a marker — a
+#: sats-unit word without one is the threshold shape (see
+#: _CONS_RATE_SAT_UNIT_FILLERS), so "1000 sats" is not a rate.
 _CONS_RATE_FILLERS: Final[frozenset[str]] = frozenset(
     {
         "sat", "sats", "satoshi", "satoshis", "per", "byte", "bytes",
         "rate", "fee", "of", "in", "a", "the", "please",
     }
+)
+#: The sats-unit fillers (subset of _CONS_RATE_FILLERS) that keep a
+#: marker-less number OUT of the rate grammar (TCK-FEE-008): a bare
+#: number ("0.75") or one wearing neutral fillers ("0.75 please", "the
+#: rate 0.75") answers an OPEN rate ask, but "0.75 sats" stays the
+#: threshold ask's shape and is never consumed as a rate — the
+#: disambiguation survives the bare-number acceptance because this parser
+#: runs ONLY under ``ask.kind == "rate"`` (never-trap closes otherwise).
+_CONS_RATE_SAT_UNIT_FILLERS: Final[frozenset[str]] = frozenset(
+    {"sat", "sats", "satoshi", "satoshis"}
 )
 
 #: Fee-rung words consumed from the label residual when a rung phrase
@@ -3110,8 +3123,9 @@ class _ConsAsk:
     scoped pool when a label was in the line, empty = the whole wallet),
     or ``"rate"`` (TCK-FEE-007: a bare speed word while a consolidation
     plan pends asks ONCE for a sat/vB rate — answered by a rate phrasing
-    (number + explicit vB unit, the two asks' grammars are disjoint and
-    pinned so), anything else closes it). ``fee_target`` carries the rung
+    (number + explicit vB unit, or the BARE number, TCK-FEE-008; the two
+    asks are separated by this kind gate plus the sats-unit rule, pinned
+    both ways), anything else closes it). ``fee_target`` carries the rung
     the opener's words resolved so every later intercept re-quotes it
     instead of silently defaulting (the RBF-004 MAJOR lesson, applied to
     this conversation's multi-step asks: the knob AND the label group
@@ -3174,18 +3188,25 @@ def _cons_int(token: str) -> int | None:
 
 
 def _cons_rate_answer(line: str) -> int | None:
-    """TCK-FEE-007: parse a rate-ask answer into integer CENTISAT/vB, or
-    ``None`` (not a rate — the caller closes the ask, never-trap). The
-    grammar is the ask's own sentence: ONE rate number (whole or at most
-    two decimals — the engine's centisat unit, thousands separators
-    tolerated) PLUS an explicit vB-unit word, bounded to the envelope
-    family's own 1..MAX_FEE_RATE_SAT_VB sat/vB span; a bare number or a
-    sats-only unit is the threshold ask's shape and is NOT consumed here
-    (the disambiguation, pinned both ways alongside the threshold
-    parser's mirror). The number is matched RAW (the CHAT-004 punctuation
-    lesson in reverse: stripping a token could fold ".75" into "75" — a
-    100× money misread — so a digit run bearing stray edge punctuation
-    is simply NOT an answer); the unit words may carry edge punctuation.
+    """TCK-FEE-007/FEE-008: parse a rate-ask answer into integer
+    CENTISAT/vB, or ``None`` (not a rate — the caller closes the ask,
+    never-trap). The grammar is the ask's own sentence: ONE rate number
+    (whole or at most two decimals — the engine's centisat unit,
+    thousands separators tolerated) bounded to the envelope family's own
+    1..MAX_FEE_RATE_SAT_VB sat/vB span, PLUS either an explicit vB-unit
+    word or NOTHING but neutral fillers — TCK-FEE-008 (debugger-verified:
+    the ask copy "Say a rate in sat/vB" over-promised when a bare "0.75"
+    was rejected as the model's balance-nonsense answer): a bare number
+    IS a rate when the RATE ask is the open one. The disambiguation
+    against the threshold ask survives on two legs, pinned both ways:
+    this parser runs ONLY under ``ask.kind == "rate"`` (a bare number to
+    a THRESHOLD ask goes to the threshold grammar, never here), and a
+    sats-UNIT word beside a marker-less number stays the threshold shape
+    ("1000 sats" is not a rate). The number is matched RAW (the CHAT-004
+    punctuation lesson in reverse: stripping a token could fold ".75"
+    into "75" — a 100× money misread — so a digit run bearing stray edge
+    punctuation is simply NOT an answer); the unit words may carry edge
+    punctuation.
     The user's number is taken VERBATIM — no ladder, no rounding, no
     floor question: the min-RELAY-rail decision belongs to the landed
     explicit seam in the handler (MAX, never silently altered), exactly
@@ -3194,12 +3215,17 @@ def _cons_rate_answer(line: str) -> int | None:
     nums = [t for t in raw if _CONS_RATE_NUM_RE.match(t)]
     rest = [t.strip(punctuation) for t in raw if not _CONS_RATE_NUM_RE.match(t)]
     rest = [t for t in rest if t]
-    if len(nums) != 1 or not rest:
+    if len(nums) != 1:
         return None
     if any(t not in _CONS_RATE_VB_MARKERS | _CONS_RATE_FILLERS for t in rest):
         return None
-    if not any(t in _CONS_RATE_VB_MARKERS for t in rest):
-        return None  # a number without a vB unit is not a rate answer
+    # No vB unit: TCK-FEE-008 accepts the bare form (empty residual) and
+    # neutral fillers only — a sats-unit word keeps it threshold-shaped,
+    # exactly as before this ticket.
+    if not any(t in _CONS_RATE_VB_MARKERS for t in rest) and any(
+        t in _CONS_RATE_SAT_UNIT_FILLERS for t in rest
+    ):
+        return None
     text = nums[0].replace(",", "")
     whole, _, frac = text.partition(".")
     try:
@@ -3223,10 +3249,13 @@ def _cons_answer(line: str, ask: _ConsAsk) -> int | None:
     number, thousands separators tolerated, optional sats unit, bounded to
     the envelope's own MIN..MAX_AMOUNT_SATS — anything else is NOT an
     answer and CLOSES the ask, the never-trap);
-    ``"rate"`` (TCK-FEE-007) → the stated rate in integer centisat/vB
-    (:func:`_cons_rate_answer` — a number WITH an explicit vB unit; the
-    threshold grammar and this one are disjoint by construction, pinned
-    both ways);
+    ``"rate"`` (TCK-FEE-007/FEE-008) → the stated rate in integer
+    centisat/vB (:func:`_cons_rate_answer` — a number with an explicit vB
+    unit, or a BARE number/neutral fillers only, the FEE-008 acceptance:
+    this branch runs only when the rate ask is THE open one, so the bare
+    shape that belongs to the threshold grammar over there is a rate
+    here; a sats-UNIT word is still never a rate — the disambiguation
+    stays pinned both ways);
     ``"list"`` → the chosen CHAT-001 registry NUMBER itself (never a row
     position — the council invariant), answering only when every digit in
     the line names one known number."""
