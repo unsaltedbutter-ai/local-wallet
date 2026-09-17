@@ -396,6 +396,10 @@ const LABELS = {
   // copy — the CSS glyph is the non-color cue; these words carry the meaning).
   utxoConfirmed: "confirmed",
   utxoPending: "pending in mempool",
+  // TCK-UTXO-006: the copy-only txid chip's whole painted label (the value
+  // never reaches text; the sibling copyTokenButton's value-bearing aria
+  // name carries the full hash).
+  utxoTxidChip: "[tx]",
 };
 
 // Which buttons the typed /state snapshot shows, per flow position. The
@@ -634,6 +638,10 @@ function authHeaders(extra) {
 // mainnet bech32: "bc1" + lowercase bech32 charset, total length 14..90.
 const ADDRESS_RE = /^bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}$/;
 const TXID_RE = /^[0-9a-f]{64}$/;
+// TCK-UTXO-006: the engine's CLOSED arrival shape — a UTC "YYYY-MM-DD" or the
+// literal "pending" — already a display string, so the client renders it
+// VERBATIM (zero date math, zero reformatting); anything else fails the gate.
+const UTXO_ARRIVAL_RE = /^(\d{4}-\d{2}-\d{2}|pending)$/;
 // Standalone-token scan: the \b guards (plus greedy-length + boundary
 // backtracking) reject a shape-valid token embedded in a longer word.
 const LINK_SCAN_RE =
@@ -786,6 +794,14 @@ function lineText(line) {
     // the dataset carries the engine's own figure, nothing is re-derived).
     if (node.nodeType === Node.ELEMENT_NODE && node.classList.contains("utxo-amount")) {
       text += node.dataset.satsText;
+      continue;
+    }
+    // TCK-UTXO-006: the copy-only txid chip PAINTS "[tx]" (selection chrome,
+    // same rule as the .qr-btn exclusion); the copied/announced text carries
+    // the FULL verbatim txid off the dataset instead — the row copy never
+    // changes shape with the gate.
+    if (node.nodeType === Node.ELEMENT_NODE && node.classList.contains("utxo-txid-btn")) {
+      text += node.dataset.txid;
       continue;
     }
     text += node.textContent;
@@ -1123,6 +1139,17 @@ function utxoRowIsWellFormed(row) {
   if (hasAddress && (typeof row.address !== "string" || !row.address)) return false;
   // label: optional passthrough; present means non-empty string.
   if (row.label !== undefined && (typeof row.label !== "string" || !row.label)) return false;
+  // TCK-UTXO-006 gate keys: BOTH present (a 006 row) or BOTH absent (a
+  // pre-006 payload — keeps today's text rendering). A 006 row's marker is
+  // the literal true and its arrival the engine's closed display string;
+  // anything else fails the whole payload (all-or-nothing, UTXO-005 pattern).
+  const hasArrival = row.arrival !== undefined;
+  const hasCopyOnly = row.txid_copy_only !== undefined;
+  if (hasArrival !== hasCopyOnly) return false;
+  if (hasArrival) {
+    if (typeof row.arrival !== "string" || !UTXO_ARRIVAL_RE.test(row.arrival)) return false;
+    if (row.txid_copy_only !== true) return false;
+  }
   return true;
 }
 
@@ -1154,29 +1181,59 @@ function utxoStateIcon(confirmed) {
   return span;
 }
 
-// The user-spec row: <#number> <amount toggle> <confirmed/pending icon>
-// <copy-address> <copy-txid> (label last, ONLY when the row carries one).
+// TCK-UTXO-006: on GATED rows the txid is clipboard-only — this compact chip
+// (qr-btn's register, "[tx]" label) replaces the verbatim-token button. The
+// full hash NEVER reaches painted text; it rides the dataset (lineText reads
+// it so the row's copy text keeps the verbatim txid) and the value-bearing
+// WEB-026 name ("Copy transaction id <full hash>", the sibling copyTokenButton
+// convention). The click is the SAME shared copy machinery as every other copy
+// control — clipboardWrite(txid) + flashCopyResult, no second copy path.
+function utxoTxidChip(txid) {
+  const btn = el("button", "utxo-txid-btn", LABELS.utxoTxidChip);
+  btn.type = "button";
+  btn.dataset.txid = txid;
+  btn.title = LABELS.clickToCopy;
+  const name = LABELS.copyTxid + " " + txid;
+  btn.setAttribute("aria-label", name);
+  btn.addEventListener("click", async () => {
+    flashCopyResult(btn, await clipboardWrite(txid), LABELS.clickToCopy, name);
+  });
+  return btn;
+}
+
+// The user-spec row: <#number> <amount toggle> [<arrival>] <confirmed/pending
+// icon> <copy-address> <copy-txid> (label last, ONLY when the row carries one).
 // The copy buttons ARE the WEB-014/026 machinery (verbatim token content,
 // value-bearing aria name, flashCopyResult + the shared #copy-status live
 // region) — no second copy path exists. The single-space text nodes between
 // parts survive in textContent (the copy text) even where flex collapses
 // them visually; the TEXTLESS icon span takes no seam of its own, so the
 // row copy is "#14 10,000,000 sats <addr> <txid>" — never a double space
-// around the glyph.
+// around the glyph. TCK-UTXO-006: a GATED row (both keys — well-formedness
+// already refused one-without-the-other, so the marker alone is the branch)
+// reads its arrival date right after the amount (verbatim; no client date
+// math) and swaps the verbatim txid button for the copy-only chip — the
+// copied line still carries the FULL txid (the chip's dataset), never "[tx]".
+// Pre-006 rows (neither key) keep today's render byte-identical.
 function utxoRowElement(row) {
   const line = el("p", "turn-text utxo-row");
+  const gated = row.txid_copy_only === true;
   if (row.number !== undefined) {
     line.appendChild(el("span", "utxo-number", "#" + row.number));
     line.appendChild(document.createTextNode(" "));
   }
   line.appendChild(utxoAmountButton(row));
+  if (gated) {
+    line.appendChild(document.createTextNode(" "));
+    line.appendChild(el("span", "utxo-arrival", row.arrival)); // VERBATIM
+  }
   line.appendChild(utxoStateIcon(row.confirmed));
   line.appendChild(document.createTextNode(" "));
   if (row.address !== undefined) {
     line.appendChild(copyTokenButton(row.address));
     line.appendChild(document.createTextNode(" "));
   }
-  line.appendChild(copyTokenButton(row.txid));
+  line.appendChild(gated ? utxoTxidChip(row.txid) : copyTokenButton(row.txid));
   if (row.label !== undefined) {
     line.appendChild(document.createTextNode(" "));
     line.appendChild(el("span", "utxo-label", row.label));

@@ -754,12 +754,13 @@ def test_linkify_client_shape_pins() -> None:
     assert "clipboardWrite(token)" in code
     assert "navigator.clipboard.writeText" in code
     assert '"Click to copy"' in raw
-    # WEB-010 ok/fail feedback pattern shared: one helper, three call sites —
-    # the token button, the bubble button, and (TCK-WEB-027) the header
-    # wallet-fingerprint chip. Any NEW copy affordance must ride the helper,
-    # never re-implement it — the count going up with a new flashCopyResult
-    # CALLER is the pin doing its job; an unshared copy path is the failure.
-    assert code.count("flashCopyResult(") == 4
+    # WEB-010 ok/fail feedback pattern shared: one helper, four call sites —
+    # the token button, the bubble button, the (TCK-WEB-027) header
+    # wallet-fingerprint chip, and the (TCK-UTXO-006) copy-only txid chip.
+    # Any NEW copy affordance must ride the helper, never re-implement it —
+    # the count going up with a new flashCopyResult CALLER is the pin doing
+    # its job; an unshared copy path is the failure.
+    assert code.count("flashCopyResult(") == 5
     assert code.count("1600") == 1  # the revert window lives in the helper only
     assert ".style" not in code and "setAttribute(\"style\"" not in code
     # only the two bubble painters call the token pass (appendText,
@@ -2567,7 +2568,9 @@ def test_web027_chip_markup_and_source_pins() -> None:
     # region), no inline handler/style.
     chip = '<button id="wallet-fp" class="chip wallet-fp" type="button" hidden></button>'
     assert chip in index_html
-    assert index_html.index('<h1 class="brand">') < index_html.index(chip)
+    # (TCK-UTXO-006 rider: the h1 now carries aria-label, so this pins the
+    # opening prefix, not the old full-tag string.)
+    assert index_html.index('<h1 class="brand"') < index_html.index(chip)
     assert index_html.index(chip) < index_html.index('id="scan-chip"')
     assert index_html.index(chip) < index_html.index('id="privacy-chip"')
     assert index_html.index(chip) < index_html.index('id="conn-status"')
@@ -3334,6 +3337,11 @@ def test_utxo005_rows_render_toggle_and_fallback_under_node() -> None:
     code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
     addr_re = re.search(r"const ADDRESS_RE = (/[^;]+);", code).group(1)
     txid_re = re.search(r"const TXID_RE = (/[^;]+);", code).group(1)
+    # TCK-UTXO-006: the well-formedness gate now TYPES the arrival/copy-only
+    # keys WHEN PRESENT; every row below carries NEITHER key (a pre-006
+    # payload), so this script's render stays byte-identical — the injected
+    # shipped regex is all the harness needs to keep running the gate.
+    arrival_re = re.search(r"const UTXO_ARRIVAL_RE = (/[^;]+);", code).group(1)
     funcs = "\n".join(
         re.search(rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL).group(0)
         for name in (
@@ -3345,6 +3353,7 @@ def test_utxo005_rows_render_toggle_and_fallback_under_node() -> None:
     script = """
       const ADDRESS_RE = __ADDR_RE__;
       const TXID_RE = __TX_RE__;
+      const UTXO_ARRIVAL_RE = __ARRIVAL_RE__;
       const LABELS = { clickToCopy: "Click to copy", copyAddress: "Copy address",
                        copyTxid: "Copy transaction id",
                        utxoConfirmed: "confirmed", utxoPending: "pending in mempool" };
@@ -3569,6 +3578,287 @@ def test_utxo005_rows_render_toggle_and_fallback_under_node() -> None:
     script = (
         script.replace("__ADDR_RE__", addr_re)
         .replace("__TX_RE__", txid_re)
+        .replace("__ARRIVAL_RE__", arrival_re)
+        .replace("__FUNCS__", funcs)
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# ============================================================== TCK-UTXO-006
+# Static half: the GATED row render. A row carrying BOTH new keys (the closed
+# arrival display string AND the literal ``txid_copy_only: true`` marker — one
+# without the other is a contract breach and fails the all-or-nothing typed
+# gate, keeping today's text) swaps the txid's verbatim-token button for the
+# clipboard-only chip: the FULL hash never reaches painted text (dataset +
+# value-bearing WEB-026 name only) and the engine's arrival string — a UTC
+# date or the literal "pending" — renders VERBATIM right after the amount
+# (zero client date math). lineText swaps the chip for its dataset txid, so
+# the row's copied/announced line keeps the verbatim hash and never gains the
+# "[tx]" chrome (the .qr-btn / checkbox precedent: selection chrome stays out
+# of copy text). Pre-006 rows (neither key) render exactly as the 005 pins
+# above still pin. The chip click rides the SHARED copy machinery
+# (clipboardWrite + flashCopyResult + the #copy-status live region) — no
+# second copy path. Rider (WEB-031 carried MINOR): the header h1 gains
+# aria-label="Local Wallet" so the heading announces on the unprovisioned
+# first run, when the fp chip inside it is hidden.
+
+def test_utxo006_gated_rows_static_pins() -> None:
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    css = (_STATIC / "styles.css").read_text(encoding="utf-8")
+    # the CLOSED arrival shape (engine display string; the client never
+    # reformats and never admits anything else through the gate).
+    assert r"const UTXO_ARRIVAL_RE = /^(\d{4}-\d{2}-\d{2}|pending)$/;" in code
+    # typed gate: the keys ride TOGETHER, the marker is the literal true, the
+    # arrival is the closed string (all-or-nothing via utxoRowIsWellFormed).
+    assert "if (hasArrival !== hasCopyOnly) return false;" in code
+    assert "!UTXO_ARRIVAL_RE.test(row.arrival)" in code
+    assert "if (row.txid_copy_only !== true) return false;" in code
+    # the row builder: one typed branch; arrival after the amount, before the
+    # state icon; the txid part is chip-OR-token, gated on the marker alone.
+    builder = re.search(
+        r"function utxoRowElement\(row\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert "const gated = row.txid_copy_only === true;" in builder
+    assert 'el("span", "utxo-arrival", row.arrival)' in builder  # VERBATIM
+    assert "utxoTxidChip(row.txid) : copyTokenButton(row.txid)" in builder
+    assert builder.index("utxoAmountButton") < builder.index('"utxo-arrival"')
+    assert builder.index('"utxo-arrival"') < builder.index("utxoStateIcon")
+    assert "innerHTML" not in builder and "addEventListener" not in builder
+    # the chip: label-only paint, value in the dataset + the sibling-verbatim
+    # value-bearing name, and the ONE shared copy machinery on click.
+    chip = re.search(
+        r"function utxoTxidChip\(txid\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert 'el("button", "utxo-txid-btn", LABELS.utxoTxidChip)' in chip
+    assert "btn.dataset.txid = txid;" in chip
+    assert 'const name = LABELS.copyTxid + " " + txid;' in chip
+    assert "clipboardWrite(txid)" in chip and "flashCopyResult(btn," in chip
+    assert "innerHTML" not in chip
+    assert 'utxoTxidChip: "[tx]",' in code
+    # the copy/announce seam reads the chip's dataset, never its chrome label.
+    line_fn = re.search(
+        r"function lineText\(line\) \{.*?\n\}", code, re.DOTALL
+    ).group(0)
+    assert 'contains("utxo-txid-btn")' in line_fn and "node.dataset.txid" in line_fn
+    # the stylesheet: tokens only (the 005 no-hex pin covers the tail), the
+    # chip anchors the shared ::after word, date rides the muted register.
+    arrival_block = css[css.index(".utxo-arrival {") :]
+    arrival_block = arrival_block[: arrival_block.index("}")]
+    assert "var(--c-text-muted)" in arrival_block
+    chip_block = css[css.index(".utxo-txid-btn {") :]
+    chip_block = chip_block[: chip_block.index("}")]
+    assert "position: relative;" in chip_block  # the WEB-026 ::after anchor
+    assert ".utxo-txid-btn.copy-ok" in css and ".utxo-txid-btn.copy-fail" in css
+
+
+def test_utxo006_gated_rows_render_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    addr_re = re.search(r"const ADDRESS_RE = (/[^;]+);", code).group(1)
+    txid_re = re.search(r"const TXID_RE = (/[^;]+);", code).group(1)
+    arrival_re = re.search(r"const UTXO_ARRIVAL_RE = (/[^;]+);", code).group(1)
+    funcs = "\n".join(
+        re.search(rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL).group(0)
+        for name in (
+            "el", "formatSats", "utxoRowIsWellFormed", "utxoAmountButton",
+            "utxoStateIcon", "utxoTxidChip", "utxoRowElement", "noteUtxoRows",
+            "lineText", "bubbleText", "copyTokenButton",
+        )
+    )
+    # Same DOM-stub machinery as the 005 node check (the file's idiom), with
+    # the LABELS the gated builders read.
+    script = """
+      const ADDRESS_RE = __ADDR_RE__;
+      const TXID_RE = __TX_RE__;
+      const UTXO_ARRIVAL_RE = __ARRIVAL_RE__;
+      const LABELS = { clickToCopy: "Click to copy", copyAddress: "Copy address",
+                       copyTxid: "Copy transaction id", utxoTxidChip: "[tx]",
+                       utxoConfirmed: "confirmed", utxoPending: "pending in mempool" };
+      const mkNode = (tag, nodeType, text) => {
+        const node = {
+          tag, nodeType: nodeType || 1, className: "", textContent: text || "",
+          type: "", attrs: {}, dataset: {}, children: [], parent: null, handlers: {},
+          get childNodes() { return this.children; },
+          setAttribute(k, v) { this.attrs[k] = v; },
+          appendChild(n) {
+            if (n.parent) {
+              const i = n.parent.children.indexOf(n);
+              if (i !== -1) n.parent.children.splice(i, 1);
+            }
+            n.parent = this; this.children.push(n); return n;
+          },
+          before(n) {
+            if (n.parent) {
+              const i = n.parent.children.indexOf(n);
+              if (i !== -1) n.parent.children.splice(i, 1);
+            }
+            const i = this.parent.children.indexOf(this);
+            n.parent = this.parent; this.parent.children.splice(i, 0, n);
+          },
+          remove() {
+            if (!this.parent) return;
+            const i = this.parent.children.indexOf(this);
+            this.parent.children.splice(i, 1);
+            this.parent = null;
+          },
+          addEventListener(kind, fn) { this.handlers[kind] = fn; },
+          querySelectorAll(sel) {
+            const need = /^\\.([a-z-]+)/.exec(sel)[1];
+            const skip = [...sel.matchAll(/:not\\(\\.([a-z-]+)\\)/g)].map((m) => m[1]);
+            const out = [];
+            const walk = (n) => {
+              for (const c of n.children) {
+                const cs = c.className.split(/\\s+/).filter(Boolean);
+                if (cs.includes(need) && !skip.some((x) => cs.includes(x))) out.push(c);
+                walk(c);
+              }
+            };
+            walk(this);
+            return out;
+          },
+          querySelector() { return null; },
+        };
+        Object.defineProperty(node, "classList", {
+          get() {
+            const self = this;
+            const set = () => new Set(self.className.split(/\\s+/).filter(Boolean));
+            return {
+              add(c) { const s = set(); s.add(c); self.className = [...s].join(" "); },
+              remove(c) { const s = set(); s.delete(c); self.className = [...s].join(" "); },
+              contains(c) { return set().has(c); },
+            };
+          },
+        });
+        return node;
+      };
+      globalThis.document = {
+        createElement: (t) => mkNode(t),
+        createTextNode: (d) => mkNode("#text", 3, d),
+      };
+      globalThis.Node = { ELEMENT_NODE: 1 };
+      const clip = [];
+      const clipboardWrite = async (t) => { clip.push(t); return true; };
+      const flashes = [];
+      const flashCopyResult = (ctrl, ok, baseTitle, baseAria) => {
+        flashes.push([ctrl, ok, baseTitle, baseAria]);
+      };
+      const state = { openTurn: null };
+      const addCopyButton = () => {};
+      const scrollToEnd = () => {};
+      __FUNCS__
+      const addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+      const addr2 = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+      const t1 = "a".repeat(64), t2 = "b".repeat(64), t3 = "c".repeat(64);
+      const rows = [
+        { number: 14, value_sats: 10000000, value_btc: "0.10000000",
+          confirmed: true, address: addr, txid: t1,
+          arrival: "2026-09-15", txid_copy_only: true },
+        { number: 2, value_sats: 12345, value_btc: "0.00012345",
+          confirmed: false, address: addr2, txid: t2,
+          arrival: "pending", txid_copy_only: true },
+        { number: 4, value_sats: 1, value_btc: "0.00000001", confirmed: false,
+          address: addr, txid: t3, arrival: "2026-09-16", txid_copy_only: true,
+          label: "'kyc', 'exchange'" },
+      ];
+      const mkLine = (text) => {
+        const p = document.createElement("p");
+        p.className = "turn-text";
+        p.appendChild(document.createTextNode(text));
+        return p;
+      };
+      const buildTurn = () => {
+        const turn = mkNode("li");
+        turn.appendChild(mkLine("Unspent outputs \u2014 3 coins."));
+        turn.appendChild(mkLine("#14 " + addr + " \u00b7 10,000,000 sats \u00b7 confirmed \u00b7 tx " + t1 + " vout 0"));
+        turn.appendChild(mkLine("#2 " + addr2 + " \u00b7 12,345 sats \u00b7 unconfirmed \u00b7 tx " + t2 + " vout 1"));
+        turn.appendChild(mkLine("#4 " + addr + " \u00b7 1 sats \u00b7 unconfirmed \u00b7 tx " + t3 + " vout 2"));
+        turn.appendChild(mkLine("Confirmation estimate: next block."));
+        state.openTurn = turn;
+        return turn;
+      };
+      const parts = (line) => line.children.filter((c) => c.nodeType === 1);
+      const find = (line, cls) => parts(line).find((c) => c.classList.contains(cls));
+      const links = (line) => parts(line).filter((c) => c.classList.contains("explorer-link"));
+      const untouched = (turn) =>
+        turn.children.length === 5 && parts(turn.children[1]).length === 0;
+      const main = async () => {
+        // ---- 1. the gated upgrade ----
+        const turn = buildTurn();
+        noteUtxoRows(JSON.stringify(rows));
+        if (turn.children.length !== 5) throw new Error("arity:" + turn.children.length);
+        const r = turn.children.slice(1, 4);
+        // arrival reads right after the amount, VERBATIM (date AND "pending").
+        const d1 = find(r[0], "utxo-arrival");
+        if (!d1 || d1.textContent !== "2026-09-15") throw new Error("arrival-date");
+        const d2 = find(r[1], "utxo-arrival");
+        if (!d2 || d2.textContent !== "pending") throw new Error("arrival-pending");
+        if (lineText(r[0]) !== "#14 10,000,000 sats 2026-09-15 " + addr + " " + t1)
+          throw new Error("row1-text:" + lineText(r[0]));
+        if (lineText(r[1]) !== "#2 12,345 sats pending " + addr2 + " " + t2)
+          throw new Error("row2-text:" + lineText(r[1]));
+        // the copy-only chip: label-only paint, value in name + dataset.
+        const chip1 = find(r[0], "utxo-txid-btn");
+        if (!chip1 || chip1.textContent !== "[tx]" || chip1.type !== "button")
+          throw new Error("chip-shape");
+        if (chip1.dataset.txid !== t1) throw new Error("chip-dataset");
+        if (chip1.attrs["aria-label"] !== "Copy transaction id " + t1)
+          throw new Error("chip-name");
+        // THE HASH IS NEVER PAINTED: no verbatim txid token button, no part
+        // whose text carries the hash (the address button alone remains).
+        if (links(r[0]).length !== 1) throw new Error("gated-token-buttons");
+        for (const row of r)
+          for (const p of parts(row))
+            if (p.textContent.includes(t1) || p.textContent.includes(t2) ||
+                p.textContent.includes(t3)) throw new Error("hash-painted");
+        // ---- 2. the click is the shared machinery, FULL hash to clipboard ----
+        await chip1.handlers.click();
+        if (clip[0] !== t1) throw new Error("clip:" + clip[0]);
+        const f = flashes[flashes.length - 1];
+        if (f[0] !== chip1 || f[1] !== true || f[2] !== "Click to copy" ||
+            f[3] !== "Copy transaction id " + t1) throw new Error("flash-wiring");
+        // ---- 3. copy text: canonical, hash-verbatim, chrome-free ----
+        const canonical = bubbleText(turn);
+        if (canonical.includes("[tx]") || !canonical.includes(t1) ||
+            !canonical.includes(t2)) throw new Error("copy-text:" + canonical);
+        find(r[0], "utxo-amount").handlers.click();  // toggle must not move it
+        if (bubbleText(turn) !== canonical) throw new Error("toggle-moved-copy-text");
+        // label still lands last (row 3).
+        const label = find(r[2], "utxo-label");
+        if (!label || r[2].children[r[2].children.length - 1] !== label)
+          throw new Error("label-last");
+        // ---- 4. the typed gate: one key without the other / a bad arrival
+        //           shape / marker falsey = contract breach, text stays ----
+        const mangle = [
+          (x) => { const c = { ...x }; delete c.txid_copy_only; return c; },
+          (x) => { const c = { ...x }; delete c.arrival; return c; },
+          (x) => ({ ...x, arrival: "yesterday" }),
+          (x) => ({ ...x, txid_copy_only: false }),
+        ];
+        for (const fn of mangle) {
+          const t = buildTurn();
+          noteUtxoRows(JSON.stringify(rows.map(fn)));
+          if (!untouched(t)) throw new Error("gate-rendered");
+        }
+        // ---- 5. render-once (replay idempotence): a duplicate emission of
+        //           the SAME gated rows is a strict no-op ----
+        const turn2 = buildTurn();
+        noteUtxoRows(JSON.stringify(rows));
+        const once = turn2.children.map((c) => c.className + "|" + lineText(c)).join("\\n");
+        noteUtxoRows(JSON.stringify(rows));
+        const twice = turn2.children.map((c) => c.className + "|" + lineText(c)).join("\\n");
+        if (once !== twice || turn2.children.length !== 5) throw new Error("replay-diff");
+        console.log("ok");
+      };
+      main().catch((e) => { console.error(e); process.exit(1); });
+    """
+    script = (
+        script.replace("__ADDR_RE__", addr_re)
+        .replace("__TX_RE__", txid_re)
+        .replace("__ARRIVAL_RE__", arrival_re)
         .replace("__FUNCS__", funcs)
     )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
@@ -3591,18 +3881,25 @@ def test_utxo005_rows_render_toggle_and_fallback_under_node() -> None:
 def test_web031_header_title_and_page_title_static_pins() -> None:
     index_html = (_STATIC / "index.html").read_text(encoding="utf-8")
     # (a) the title: the chip button, verbatim markup, sits INSIDE the
-    # first h1 (left-aligned by the .bar's default flex start).
-    assert '<h1 class="brand"><button id="wallet-fp" class="chip wallet-fp" type="button" hidden></button></h1>' in index_html
-    assert index_html.index('<h1 class="brand">') < index_html.index("</header>")
+    # first h1 (left-aligned by the .bar's default flex start). TCK-UTXO-006
+    # rider (the carried WEB-031 MINOR): the h1 carries aria-label="Local
+    # Wallet" so the heading still ANNOUNCES on the unprovisioned first run,
+    # when the fp chip inside it is hidden (a heading named only by a hidden
+    # child is a nameless heading).
+    assert '<h1 class="brand" aria-label="Local Wallet"><button id="wallet-fp" class="chip wallet-fp" type="button" hidden></button></h1>' in index_html
+    assert index_html.index('<h1 class="brand"') < index_html.index("</header>")
     # the title text is "Wallet <hex>": the word ships in LABELS and only
     # ever reaches the DOM through the WALLET_FP_RE-gated painter.
     code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
     assert 'walletFpWord: "Wallet",' in code
     assert 'walletFpEl.textContent = fp ? walletFpChipText(fp) : "";' in code
     assert "WALLET_FP_RE.test(raw)" in code  # hex never painted unguarded
-    # "Local Wallet" now lives ONLY in the document <title> (inside head):
+    # "Local Wallet" lives in the document <title> AND (TCK-UTXO-006 rider)
+    # the h1's ACCESSIBLE NAME only — never as painted heading text (the chip
+    # stays the visual title); both occurrences ride the static <head>/<body>
+    # markup, the first one before </head>.
     assert "<title>Local Wallet</title>" in index_html
-    assert index_html.count("Local Wallet") == 1
+    assert index_html.count("Local Wallet") == 2
     assert index_html.index("Local Wallet") < index_html.index("</head>")
 
 

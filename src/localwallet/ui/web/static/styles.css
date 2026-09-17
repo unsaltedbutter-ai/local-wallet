@@ -1292,3 +1292,48 @@ body {
 .utxo-label {
   color: var(--c-text-muted);
 }
+
+/* ====== TCK-UTXO-006: arrival date + copy-only txid chip ====== */
+
+/* The arrival rides the row right after the amount: engine's closed display
+   string rendered verbatim ("pending" included — no client date math), same
+   muted tabular register as the registry number. */
+.utxo-arrival {
+  color: var(--c-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The copy-only txid chip: the full hash is NEVER painted — a compact
+   "[tx]" button in the .qr-btn family (quiet surface chip, same resting
+   muted ink and hover lift). position:relative anchors the ONE shared
+   .copy-ok/.copy-fail ::after word (WEB-026), so the feedback matches the
+   sibling copy controls exactly: color + border/soft-background tint +
+   floating word (non-color cues, WCAG 1.4.1; fail holds, app.js). */
+.utxo-txid-btn {
+  position: relative;
+  font: inherit;
+  font-size: var(--fs-xs);
+  line-height: 1;
+  margin: 0;
+  padding: 0.15rem var(--sp-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  background: var(--c-surface);
+  color: var(--c-text-muted);
+  cursor: pointer;
+}
+.utxo-txid-btn:hover,
+.utxo-txid-btn:focus-visible {
+  color: var(--c-text);
+  background: var(--c-surface-2);
+}
+.utxo-txid-btn.copy-ok {
+  color: var(--c-copy-ok);
+  border-color: var(--c-copy-ok);
+  background: var(--c-accent-soft);
+}
+.utxo-txid-btn.copy-fail {
+  color: var(--c-danger);
+  border-color: var(--c-danger);
+  background: var(--c-danger-soft);
+}
