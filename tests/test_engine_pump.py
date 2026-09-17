@@ -1255,3 +1255,111 @@ def test_build_state_snapshot_fingerprint_is_the_only_source() -> None:
     # token-gated GET /state (pinned endpoint-wide in
     # test_web_server.test_every_endpoint_requires_token_and_replies_http_1_0).
 
+
+# ------------------------------------------- TCK-WEB-032 fp-provenance verdict
+#
+# USER REPORT: Sparrow and the hardware-device screen show the SAME 8-hex
+# value while our header chip shows a DIFFERENT one. The reported number is
+# the device's MASTER fingerprint (the HW-002 ledger recorded this user's
+# Jade master fp the same way); a device-sourced import (Sparrow's
+# "import from hardware wallet") receives it FROM THE DEVICE at import time
+# and stores it as its descriptor origin. Our provisioning path never talks
+# to a device at import and accepts ONLY the bare account key — every entry
+# (typed POST /watchkey :meth:`app.WatchKeyProvision.provision`, CLI
+# ``--zpub``/env, interactive onboarding) funnels through
+# :meth:`app.WalletDescriptor.from_key`, which bakes the origin from the
+# key's OWN fingerprint (descriptor.py). VERDICT (outcome b): device-screen
+# parity is NOT achievable on this path without fabricating a value
+# (forbidden, honesty invariant); the chip keeps the account fp and the
+# static hint gained one clarifying sentence. These pins assert fp VALUES
+# from the synthetic fixture seed behind the canonical ZPUB — never the
+# user's key material.
+
+#: The MASTER fingerprint of ``tests.test_e2e_skeleton.DESCRIPTOR_SEED`` —
+#: the seed behind the canonical fixture ``ZPUB``; its ACCOUNT key's own fp
+#: is the already-pinned ``FP_ZPUB``. Two known, deliberately DIFFERENT
+#: values: exactly the pair the chip-vs-device-screen report is about.
+FP_FIXTURE_MASTER = "c115c74e"
+
+
+def _fixture_master_fingerprint() -> str:
+    """The fixture seed's master fp, recomputed to keep the pin honest."""
+    from embit.bip32 import HDKey
+
+    from tests.test_e2e_skeleton import DESCRIPTOR_SEED
+
+    return HDKey.from_seed(DESCRIPTOR_SEED).my_fingerprint.hex()
+
+
+def _sparrow_shape_paste() -> str:
+    """The descriptor form a device-sourced import produces: the account
+    zpub with the REAL master fp as origin — checksummed with the very
+    helper the parser trusts."""
+    from embit.descriptor.checksum import checksum
+
+    body = f"wpkh([{FP_FIXTURE_MASTER}/84'/0'/0']{ZPUB}/{{0,1}}/*)"
+    return f"{body}#{checksum(body)}"
+
+
+def test_web032_bare_zpub_provenance_stores_the_account_fp(
+    tmp_path: Path,
+) -> None:
+    """Input shape (a) — bare zpub, the ONLY shape any entry accepts: the
+    stored descriptor origin, and therefore the /state chip value, is the
+    ACCOUNT-key fp — verifiably NOT the device master fp (pinned values)."""
+    assert _fixture_master_fingerprint() == FP_FIXTURE_MASTER
+    assert FP_FIXTURE_MASTER != FP_ZPUB  # the two numbers of the report
+    descriptor = app.WalletDescriptor.from_key(ZPUB)
+    assert descriptor.descriptor.startswith(f"wpkh([{FP_ZPUB}/84'/0'/0']")
+    store = Store(str(tmp_path / "prov.db"))
+    try:
+        wallet = store.create_wallet("default", descriptor.descriptor)
+        store.set_active_wallet(wallet.id)
+        assert app._active_wallet_fingerprint(store) == FP_ZPUB
+    finally:
+        store.close()
+
+
+def test_web032_descriptor_form_is_refused_at_the_provisioning_entries() -> None:
+    """Input shape (b) — the one shape that COULD carry the origin fp is
+    refused by the gated KEY parser every provisioning entry uses (typed
+    ``/watchkey`` → :meth:`from_key`; onboarding validates via
+    :func:`parse_wallet_key` before the same rung). The refusal is
+    value-free: no pasted material rides the error."""
+    from localwallet.wallet.descriptor import parse_wallet_key
+
+    paste = _sparrow_shape_paste()
+    for entry in (app.WalletDescriptor.from_key, parse_wallet_key):
+        with pytest.raises(app.WatchKeyError) as excinfo:
+            entry(paste)
+        message = str(excinfo.value)
+        assert ZPUB not in message and FP_FIXTURE_MASTER not in message
+
+
+def test_web032_rebuild_retains_a_supplied_origin_unverified() -> None:
+    """Input shape (b), second half — the retention machinery
+    (:meth:`from_descriptor_string`) exists ONLY for re-reading a stored
+    row, and it keeps any origin verbatim WITHOUT verifying it against
+    anything: even a fabricated ``deadbeef`` survives. That is why
+    widening the provisioning input to it (outcome a) would replace an
+    engine-computed chip value with an unverified paste — the honest
+    answer is (b). The signer-bound fp is pinned to stay key-derived.
+
+    And the machinery DOES preserve a real master fp when the string
+    carries one — so if a device-registration path ever supplies an
+    origin honestly (OQ18), nothing downstream drops it."""
+    retained = app.WalletDescriptor.from_descriptor_string(_sparrow_shape_paste())
+    assert retained.descriptor.startswith(f"wpkh([{FP_FIXTURE_MASTER}/")
+    # ... without ANY proof the origin is true — a junk origin survives too:
+    from embit.descriptor.checksum import checksum
+
+    junk_body = f"wpkh([deadbeef/84'/0'/0']{ZPUB}/{{0,1}}/*)"
+    junk = app.WalletDescriptor.from_descriptor_string(
+        f"{junk_body}#{checksum(junk_body)}"
+    )
+    assert junk.descriptor.startswith("wpkh([deadbeef/")
+    # Either way the wallet's trust fp comes from the KEY, never the paste
+    # (signer binding + PSBT derivations read ``parsed.hd_key``):
+    assert retained.parsed.hd_key.my_fingerprint.hex() == FP_ZPUB
+    assert junk.parsed.hd_key.my_fingerprint.hex() == FP_ZPUB
+

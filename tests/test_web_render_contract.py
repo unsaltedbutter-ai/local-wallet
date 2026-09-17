@@ -2682,8 +2682,18 @@ def test_web027_chip_lifecycle_copy_and_label_copy_under_node() -> None:
       const hint = walletFpHintText("f1a2b3c4");
       if (hint !== "First characters: f1a2b3c4 — your wallet's fingerprint. "
                  + "Your hardware wallet shows its own, different number "
-                 + "(the device fingerprint) — they won't match, and that's expected.") throw new Error("hint-copy");
+                 + "(the device fingerprint) — they won't match, and that's "
+                 + "expected. The number on your device's screen — and in "
+                 + "wallet apps that imported directly from the device "
+                 + "(like Sparrow) — is its MASTER fingerprint: a public "
+                 + "account key can never reveal it.") throw new Error("hint-copy");
       if (hint.includes("{fp}")) throw new Error("placeholder-leak");
+      // TCK-WEB-032 (verdict b): the clarifying sentence must NAME the
+      // device-screen number (MASTER fingerprint) — the whole line is
+      // pinned verbatim above; these guard the sentence's job in prose.
+      if (!hint.includes("MASTER fingerprint") || !hint.includes("screen")) {
+        throw new Error("web032-clarifier");
+      }
       if (walletFpChipText("abcdef01") !== "Wallet abcdef01") throw new Error("chip-text");
       // the ticket's exact replace-copy sentence ships in the confirm rung.
       if (!LABELS.watchKeyReplaceConfirm.includes(

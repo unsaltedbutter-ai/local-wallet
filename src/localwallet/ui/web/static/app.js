@@ -155,13 +155,21 @@ const LABELS = {
   // was FALSE (the chip carries the descriptor-origin ACCOUNT fp; the
   // device shows its MASTER — they DIFFER watch-only), so the copy says
   // exactly that. {fp} is substituted ONLY with the regex-gated value
-  // (the privacySublineText {host} discipline).
+  // (the privacySublineText {host} discipline). TCK-WEB-032 (verdict b:
+  // parity NOT achievable on a bare-zpub provisioning path — the device's
+  // master fp rides no input we accept and cannot be computed from an
+  // account key without fabricating a value): ONE clarifying sentence
+  // names which number the device screen — and device-sourced imports like
+  // Sparrow's — actually show.
   walletFpWord: "Wallet",
   walletFpCopyName: "Copy wallet fingerprint",
   walletFpHint:
     "First characters: {fp} — your wallet's fingerprint. Your hardware " +
     "wallet shows its own, different number (the device fingerprint) — " +
-    "they won't match, and that's expected.",
+    "they won't match, and that's expected. The number on your device's " +
+    "screen — and in wallet apps that imported directly from the device " +
+    "(like Sparrow) — is its MASTER fingerprint: a public account key " +
+    "can never reveal it.",
   // settings panel (TCK-WEB-005)
   settingsLoading: "Loading…",
   settingsUnavailable: "Could not load settings — the wallet is busy or unreachable.",
