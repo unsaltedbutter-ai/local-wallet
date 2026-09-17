@@ -101,6 +101,23 @@ same inputs, same output. Settings arguments are ``None`` = feature off =
 pre-amendment behavior (the handler threads the values resolved by
 :func:`localwallet.config.resolve_coin_selection_settings`).
 
+PINNED-POOL MODE (TCK-UTXO-007) — a caller-side convention, not a flag
+----------------------------------------------------------------------
+A "send from exactly these coins" selects over a CALLER-RESTRICTED pool:
+the handler passes the user's named coins as ``utxos`` and nothing else.
+There is no new parameter, because the algorithm already runs unchanged
+*within whatever set it is handed*: steps 1–5 and layers A–C partition,
+dust-skip, improve and fold ONLY among the coins in the input sequence,
+so a restricted input IS a pinned pool (pin the POOL, never the POLICY).
+The engine may still select a subset of the pool (the no-shattering and
+min-cost passes) or fold extra pool coins — every such deviation from the
+caller's checked set is the CALLER's to narrate (it holds the input list
+and diffs it against ``SelectionResult.selected``; the module stays a pure
+set-in/set-out function). :class:`InsufficientFundsError` naturally scopes
+to the pool: ``available`` is the sum of the coins handed in, so a pinned
+send that the named coins cannot fund reports the pinned-pool figure with
+no special-casing here.
+
 FINALIZE (exact integer accounting, no float money)
 ---------------------------------------------------
 Given a candidate set S of n inputs:

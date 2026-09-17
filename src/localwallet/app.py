@@ -204,11 +204,13 @@ from localwallet.protocol import (
     IntentName,
     NewAddressParams,
     NodeStatusParams,
+    OutcomeStatus,
     RespondParams,
     SelfTransferParams,
     SignTxParams,
     SincePeriod,
     TxStatusParams,
+    handle_raw,
 )
 
 # TCK-CHAT-009 (a): the SIZE-threshold bound reads the contract's own
@@ -4095,6 +4097,43 @@ def _cons_by_numbers(
     return _cons_finalize(session, picked, fee_target, line, output_fn, table=table)
 
 
+# --- TCK-UTXO-007: pinned-coin send state (dispatcher-owned, session-only) -
+
+
+@dataclass(frozen=True, slots=True)
+class _SendPinned:
+    """The TCK-UTXO-007 turn-scoped PIN TOKEN: the registry NUMBERS the
+    deterministic intercept read from the user's OWN utterance, keyed to
+    the wallet they were resolved against. Set only by the intercept,
+    consumed at the ``create_tx`` handler head — the closed envelope
+    carries NO coin reference and the model can neither set, read, nor
+    clear this (the ``gate_decision``/``fiat_ask_currency`` precedent).
+    The numbers, not outpoints: the handler re-resolves every one against
+    the FRESH registry row and the FRESH UTXO snapshot at staging time
+    (the CONS-003 authority rule — a coin spent elsewhere between the
+    listing and this dispatch stops the send, never a silent substitute)."""
+
+    wallet_id: int
+    numbers: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SendPinnedPending:
+    """The staged pinned send's marker (the ``_ConsPending`` twin): the
+    numbers stay the pool authority for exactly this ``tx_ref`` — a
+    pinned plan, once pinned, REBUILDS inside its pool (a later rung
+    change must never silently re-widen the coin set behind the user's
+    back; a gone coin stops the rebuild with the original card intact),
+    and ``display`` freezes the card material the ``tx_pending`` re-show
+    renders (the cons_pending/_CpfpPending display precedent — the re-show
+    IS the card the user was shown; never re-derived, never re-fetched)."""
+
+    tx_ref: str
+    wallet_id: int
+    numbers: tuple[int, ...]
+    display: Mapping[str, object] = dataclass_field(default_factory=dict)
+
+
 @dataclass
 class SendSession:
     """Per-turn send-flow context shared by the REPL and the handlers.
@@ -4182,6 +4221,15 @@ class SendSession:
     SETTING stays untouched (the file_export one-shot precedent,
     HW-005 slice C). The model can neither set, read, nor clear it — the
     envelope carries no currency.
+
+    ``send_pinned`` / ``send_pinned_pending`` (TCK-UTXO-007) are the
+    pinned-coin-send pair: the turn-scoped PIN TOKEN the deterministic
+    "… using #N #M" intercept stamps from the user's OWN words (the
+    closed ``create_tx`` envelope carries no coin reference — nothing else
+    can carry one), and the staged pinned send's marker (the re-quote
+    pool authority + the frozen card display for the pending re-show).
+    Code-owned end to end like the consolidation state: the model can
+    neither set, read, nor clear either.
     """
 
     gate_decision: GateDecision = GateDecision.NOT_A_DECISION
@@ -4208,6 +4256,8 @@ class SendSession:
     cons_ask: _ConsAsk | None = None
     cons_pending: _ConsPending | None = None
     fiat_ask_currency: str | None = None
+    send_pinned: _SendPinned | None = None
+    send_pinned_pending: _SendPinnedPending | None = None
     #: TCK-PUBLICBCAST-001 binding condition 1 — the dispatcher-owned
     #: public-broadcast state. ``public_offer_txref`` is the SIGNED
     #: record's ``tx_ref`` an offer is currently ARMED for (set only by
@@ -6315,11 +6365,22 @@ def _make_create_tx_handler(
        derivation is pure and the bump is the last write). Allocated
        rows are never removed (ADR-0009); the only split state —
        allocated row without bump — self-heals on that retry.
-    6. Selection + PSBT: the pure tx engine (:func:`select_coins`,
-       :func:`build_unsigned_psbt`) does all money math; the handler
-       only maps store rows into engine inputs. The change cost passed
-       to selection is computed from the change script's serialized
-       size (``9 + len(script)`` vB), never hardcoded.
+     6. Selection + PSBT: the pure tx engine (:func:`select_coins`,
+        :func:`build_unsigned_psbt`) does all money math; the handler
+        only maps store rows into engine inputs. The change cost passed
+        to selection is computed from the change script's serialized
+        size (``9 + len(script)`` vB), never hardcoded.
+        TCK-UTXO-007 (pinned sends): when the dispatcher-owned session
+        carries a PIN (the deterministic "… using #N #M" intercept's
+        turn token, or a re-quote of a staged pinned send — never an
+        envelope key, the closed schema carries no coin reference), the
+        named numbers re-resolve against the fresh registry + UTXO
+        snapshot FIRST (any gone coin is a value-free hard stop naming
+        the numbers, flow stays IDLE, nothing staged, no survivors-only
+        rebuild), and the selection universe becomes EXACTLY the named
+        coins — every policy layer above runs unchanged WITHIN that
+        pool (pin the pool, never the policy); step 7 attaches the
+        per-coin From enumeration the user confirms against.
     7. Staging: :meth:`TxFlow.create` stamps the flow-owned ``tx_ref``;
        the handler returns the confirmation-card dict verbatim from the
        pending record plus the rate/USD display fields.
@@ -6363,10 +6424,51 @@ def _make_create_tx_handler(
             and params.amount_sats is not None
             and params.amount_sats == staged.amount_sats
         )
+        # 1a. TCK-UTXO-007: CONSUME the dispatcher-owned PIN at the handler
+        #     head (the cons_ask step-1.5 discipline — every path after this
+        #     point leaves nothing open; a turn token that survives could
+        #     pin a LATER send, which is exactly the silent-substitution
+        #     failure this feature forbids). Two sources, in priority order:
+        #     the fresh turn token the "… using #N #M" intercept stamped
+        #     (dispatched in the same call stack, so only this dispatch can
+        #     ever see it), and — for a RE-QUOTE of a pinned pending — the
+        #     staged record's own marker: once pinned, always pinned (the
+        #     rung may change behind the user's back, the COIN SET may not;
+        #     a gone coin stops the rebuild BEFORE any staging, leaving the
+        #     original card intact — commit-only-on-success, unchanged).
+        #     Documented seam: this is the "optional pinned-utxos parameter"
+        #     of the create_tx handler PATH — it rides the session the
+        #     handler already closes over; the closed envelope NEVER carries
+        #     a coin reference (pinned rule, app.py CONS-003 note).
+        pin: _SendPinned | _SendPinnedPending | None = None
+        if session is not None:
+            if session.send_pinned is not None:
+                pin = session.send_pinned
+                session.send_pinned = None
+            elif (
+                requote
+                and staged is not None
+                and session.send_pinned_pending is not None
+                and session.send_pinned_pending.tx_ref == staged.tx_ref
+            ):
+                pin = session.send_pinned_pending
+
         if staged is not None and not requote:
-            return _tx_pending_result(
+            refused = _tx_pending_result(
                 flow, seconds_since_last_block_fn=seconds_since_last_block_fn
             )
+            # TCK-UTXO-007: the re-show of a PINNED pending IS the card the
+            # user was shown — the From enumeration rides the frozen display
+            # (the cons_pending display precedent); a re-show never
+            # re-resolves, re-fetches or reshuffles the enumeration.
+            if (
+                session is not None
+                and session.send_pinned_pending is not None
+                and flow.pending is not None
+                and session.send_pinned_pending.tx_ref == flow.pending.tx_ref
+            ):
+                refused.update(session.send_pinned_pending.display)
+            return refused
 
         # 1.5 TCK-RBF-004: a re-quote whose staged record is a fee-bump
         #     replacement is refused — the create_tx pipeline RE-SELECTS
@@ -6498,6 +6600,58 @@ def _make_create_tx_handler(
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
 
+        # 4.5 TCK-UTXO-007: PINNED-POOL re-resolution — the handler is the
+        #     authority (the CONS-003 rule, generalized to the send path):
+        #     every named NUMBER re-resolves here against the fresh registry
+        #     row and THIS fresh UTXO snapshot. A named coin no longer
+        #     spendable is a HARD STOP naming which numbers are gone — never
+        #     a silent substitute, never a survivors-only rebuild (partial
+        #     availability stops the same way). The named coins then REPLACE
+        #     the wallet snapshot as the selection universe: pin the POOL,
+        #     never the POLICY — every policy layer (KYC partition, dust
+        #     skip, single-coin improvement, fold) runs UNCHANGED within
+        #     the pool, and each deviation from the named set surfaces as a
+        #     card row at step 7 (the ceiling is TCK-TX-SELF-001's
+        #     documented input bound: a named pool over it is refused,
+        #     never truncated).
+        pinned_number_by_address: dict[str, int] = {}
+        pinned_pool: list[Any] | None = None
+        if pin is not None:
+            if pin.wallet_id != wallet_id:
+                return {
+                    "error": "pinned_coins_gone",
+                    "detail": _PINNED_COINS_GONE.format(
+                        numbers=_numbers_phrase(pin.numbers)
+                    ),
+                }
+            gone: list[int] = []
+            for n in pin.numbers:
+                try:
+                    record = store.get_address_by_number(wallet_id, n)
+                except (StoreError, sqlite3.Error) as exc:
+                    return _store_error(exc)
+                if record is None or not any(
+                    u.address == record.address for u in utxos
+                ):
+                    gone.append(n)
+                    continue
+                pinned_number_by_address[record.address] = n
+            if gone:
+                return {
+                    "error": "pinned_coins_gone",
+                    "detail": _PINNED_COINS_GONE.format(
+                        numbers=_numbers_phrase(gone)
+                    ),
+                }
+            pinned_pool = [
+                u for u in utxos if u.address in pinned_number_by_address
+            ]
+            if len(pinned_pool) > MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS:
+                return {
+                    "error": "pinned_pool_too_many",
+                    "detail": _PINNED_POOL_TOO_MANY,
+                }
+
         # Recipient output script (layer 3 already proved the address is a
         # mainnet witness-v0 P2WPKH bech32 string; containment anyway).
         try:
@@ -6530,7 +6684,9 @@ def _make_create_tx_handler(
             kyc_addresses = _kyc_side_addresses(store)
         except (StoreError, sqlite3.Error) as exc:
             return _store_error(exc)
-        selection_inputs: Sequence[Any] = utxos
+        selection_inputs: Sequence[Any] = (
+            pinned_pool if pinned_pool is not None else utxos
+        )
         if kyc_addresses:
             # Only the kyc-side coins are re-wrapped: attribute-absent means
             # other-side under the engine's duck-type contract. A coin with
@@ -6539,7 +6695,7 @@ def _make_create_tx_handler(
                 SimpleNamespace(**vars(utxo), kyc_side=True)
                 if utxo.address in kyc_addresses
                 else utxo
-                for utxo in utxos
+                for utxo in selection_inputs
             ]
         # 6b. Coin-selection settings (doc §2.3 ladder) resolved PER
         # SELECTION: BOTH remaining rungs are read fresh here — the stored
@@ -6574,11 +6730,20 @@ def _make_create_tx_handler(
         except InsufficientFundsError as exc:
             # needed/available are user-facing UI figures (ADR-0012):
             # structured keys for narration, never a log-bound detail.
-            return {
+            short: dict[str, object] = {
                 "error": "insufficient_funds",
                 "needed_sats": exc.needed,
                 "available_sats": exc.available,
             }
+            if pin is not None:
+                # TCK-UTXO-007: the SAME honest needed/available path,
+                # SCOPED to the pinned pool (available is the named set's
+                # total — the pool went in as the universe). The numbers
+                # ride as structured keys so the renderer says "the coins
+                # you named can't cover this" with the user's own handles
+                # (never an address, never a wallet-wide promise).
+                short["pinned_numbers"] = list(pin.numbers)
+            return short
         except SelectionError as exc:
             return {"error": "selection_failed", "detail": str(exc)}
 
@@ -6712,6 +6877,56 @@ def _make_create_tx_handler(
             **({} if eta is None else eta),
         }
         result.update(_fee_floor_note_fields(floor_raised, floor_source))
+        if pin is not None:
+            # TCK-UTXO-007 card contract (council precondition): the From
+            # line enumerates EVERY FINAL input of this run — one
+            # _CONS_SOURCE_ROW-shaped entry per spent coin — and every
+            # named coin NOT spent is enumerated alongside it (the skipped
+            # dust, the pure-pool preference's other side, the single-coin
+            # improvement, the fold re-shuffles). The user confirms THIS
+            # enumeration, never a bare count; the values are verbatim from
+            # the handler's own fresh store read, the numbers are the
+            # user's own registry handles. Display-only result keys (the
+            # UTXO-004 mix/fold material's channel — the card renders them;
+            # they join the tool result the user themselves supplied).
+            result["send_sources"] = [
+                {
+                    "number": pinned_number_by_address[str(u.address)],
+                    "address": u.address,
+                    "value_sats": u.value_sats,
+                }
+                for u in selection.selected
+            ]
+            _sel_keys = {(u.txid.lower(), u.vout) for u in selection.selected}
+            result["send_not_spent"] = [
+                {
+                    "number": pinned_number_by_address[str(u.address)],
+                    "address": u.address,
+                    "value_sats": u.value_sats,
+                }
+                for u in pinned_pool or ()
+                if (u.txid.lower(), u.vout) not in _sel_keys
+            ]
+            if session is not None:
+                # The staged record's pin marker (re-quote authority +
+                # frozen re-show display; the _ConsPending twin). Set only
+                # AFTER staging — this block runs post-flow.create, so a
+                # failed build never leaves a marker without a pending.
+                session.send_pinned_pending = _SendPinnedPending(
+                    tx_ref=pending.tx_ref,
+                    wallet_id=wallet_id,
+                    numbers=tuple(pin.numbers),
+                    display={
+                        key: result[key]
+                        for key in (
+                            "send_sources",
+                            "send_not_spent",
+                            "mixed",
+                            "folded_count",
+                        )
+                        if key in result
+                    },
+                )
         if rate is not None and currency != DEFAULT_DISPLAY_CURRENCY:
             # TCK-FIAT-002 currency-tagged card fields (same design as the
             # balance answer): ``fiat_total_minor`` = the send amount in the
@@ -18349,6 +18564,54 @@ def _dispatch_code_self_turn(
     return result
 
 
+def _dispatch_code_create_turn(
+    session: SendSession,
+    line: str,
+    raw_envelope: str,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+) -> dict[str, object] | None:
+    """Shared body of the TCK-UTXO-007 pinned-send dispatch (the
+    :func:`_dispatch_code_self_turn` pattern, but routed through the FULL
+    :func:`~localwallet.protocol.dispatcher.handle_raw` chokepoint): CODE
+    built the ``create_tx`` JSON from the USER'S OWN words, and it runs
+    the SAME three layers every model output passes — parse, pydantic
+    schema, and the LAYER-3 business rule (mainnet witness-v0 P2WPKH
+    recipient, ADR-0008/0021 — the reason this cannot be a direct
+    handler call like the self-transfer twins: there the params are
+    engine-derived, here the recipient is untrusted text) — then
+    dispatches to the UNCHANGED create_tx handler (its scan gate, pending
+    guard, pin re-resolution and dual-key staging are the authority). A
+    layer failure is the honest value-free refusal (nothing staged, no
+    address echo); the caller's ``finally`` clears the PIN the handler
+    never reached. Transcript-free like the consolidation dispatch: the
+    registry numbers are user coin data (§7.10) and the card renderer
+    prints the outcome verbatim — the model has nothing to add."""
+    del line  # recorded nowhere the model sees (see docstring)
+    outcome = handle_raw(raw_envelope, table)
+    envelope = outcome.envelope
+    if (
+        outcome.status is not OutcomeStatus.OK
+        or envelope is None
+        or outcome.result is None
+    ):
+        output_fn(sanitize_tool_output(_PINNED_REFUSED))
+        return None
+    _print_turn(
+        AgentTurnResult(
+            status=AgentTurnStatus.OK,
+            envelope=envelope,
+            result=outcome.result,
+            user_message=None,
+            turns_used=0,
+        ),
+        output_fn,
+        session=session,
+    )
+    return outcome.result
+
+
 # ---------------------------------------------------------------------------
 # TCK-LABEL-001: chat label-by-address intercept (deterministic, PRE-MODEL).
 # USER BUG (live, 2026-09-12): "label bc1q… as 'KYC'" → the narration claimed
@@ -20706,6 +20969,358 @@ def _run_network_status_turn(
     return True
 
 
+# --- TCK-UTXO-007: the pinned-coin send (deterministic, PRE-MODEL) ---------
+#
+# USER FEATURE (MW-16 round 4 item 10; UX council 2026-09-16, both critics
+# BUILD-WITH-CHANGES): "Send 500000 sats to bc1q… using #3 #7 #9" spends
+# from EXACTLY the named coins. The binding council contract, implemented
+# literally:
+#
+# * The coin set is parsed ONLY from the USER'S OWN utterance, before the
+#   model — the model never authors or edits the set and never sees this
+#   turn (the send is CODE-built through the same validation layers model
+#   output passes, dispatched transcript-free like the consolidation
+#   conversation). NO envelope key carries a coin reference (the pinned
+#   CONS-003 rule): the numbers ride the dispatcher-owned session PIN and
+#   the create_tx HANDLER re-resolves every one against FRESH store truth
+#   (registry + UTXO snapshot) at staging time.
+# * Deictic forms — "using the selected UTXOs", "using these UTXOs",
+#   "with these selected UTXOs" — are NOT intercepted (pinned release):
+#   the engine holds no client-side selection state to resolve them
+#   against (the council REJECTED inventing any), so they fall through
+#   to the model's own clarify, line unchanged.
+# * SEMANTICS: pin the POOL, never the POLICY — select_coins runs over
+#   exactly the named coins as the pool with every existing layer
+#   unchanged (KYC partition, dust skip, single-coin improvement, fold
+#   all run WITHIN the pool). Every deviation from the named set (skipped
+#   dust, folded coins, a subset the pure-pool preference picked) is
+#   ENUMERATED on the card; mixed pools are allowed but narrated (the
+#   UTXO-002 mix warning — consolidation's cross-pool REFUSAL is a
+#   different flow and is deliberately not imported; one rule, stated on
+#   the card).
+# * A named coin no longer spendable (or a named number the registry
+#   does not know) is a hard stop — never a silent substitute, never a
+#   survivors-only re-quote. The consolidate+spend-in-one shape falls
+#   OUT of pinning the pool (name several coins of one address; no
+#   separate combined verb exists).
+
+#: The send verbs this intercept admits (a pinned send is a SEND; the
+#: consolidation verbs are that conversation's own territory, and it runs
+#: ahead of this intercept anyway — see :func:`_run_turn`'s order notes).
+_PIN_VERBS: Final[frozenset[str]] = frozenset(
+    {
+        "send", "sends", "sending", "pay", "pays", "paying",
+        "transfer", "transfers", "transferring",
+        "move", "moves", "moving",
+    }
+)
+#: The object word a coin list may wear ("using coins #3 #7").
+_PIN_OBJECT_WORDS: Final[frozenset[str]] = frozenset(
+    {"coin", "coins", "utxo", "utxos"}
+)
+#: Closed politeness residue a clause may trail ("… using #3 and #7 please").
+_PIN_TAIL_FILLERS: Final[frozenset[str]] = frozenset(
+    {"please", "now", "again", "instead"}
+)
+#: The amount units this grammar admits: the sats family plus the explicit
+#: BTC words — deliberately NOT the size comparator's "coin(s)" alias (in
+#: a SEND line "coin" is the UTXO word: "send 1 coin to bc1q…" is an
+#: ambiguous amount, and ambiguity refuses, it never guesses).
+_PIN_AMOUNT_UNITS: Final[frozenset[str]] = frozenset(
+    {"sat", "sats", "satoshi", "satoshis", "btc", "bitcoin"}
+)
+#: Leading words that make the line a QUESTION about a send — a question
+#: must never stage money, and it must NOT be handed to the model either
+#: (the model would read the send and silently DROP the coin reference —
+#: the exact substitution this feature exists to prevent): refuse.
+_PIN_QUESTION_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "can", "could", "should", "would", "will", "shall", "do", "does",
+        "is", "are", "how", "what", "when", "where", "why", "who",
+    }
+)
+
+#: The gone/partial-availability hard stop (the ``_CONS_COIN_GONE`` shape,
+#: generalized): names WHICH numbers went unspendable (the user's own
+#: registry handles — never an address, never an amount), says nothing was
+#: staged, and the flow stays IDLE. Rides the handler result's detail —
+#: value-free by that layer's contract (handles are not wallet values).
+_PINNED_COINS_GONE: Final[str] = (
+    "The coins you named ({numbers}) are no longer yours to spend — "
+    "nothing was staged or sent."
+)
+#: The named-pool input ceiling — TCK-TX-SELF-001's documented constant,
+#: the same bound consolidate names; a named pool over it is REFUSED
+#: (never truncated, never silently down-selected).
+_PINNED_POOL_TOO_MANY: Final[str] = (
+    f"Too many named coins to spend in one transaction (the ceiling is "
+    f"{MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS}) — name fewer; nothing was staged."
+)
+#: The honest consume for a line that names coins the engine cannot pair
+#: with a FULLY readable send (a question shape, a missing or ambiguous
+#: amount unit, a missing or doubled recipient). Releasing such a line to
+#: the model would hand it a coin reference no envelope can carry — the
+#: reference would silently vanish, so the line is REFUSED instead,
+#: value-free, nothing staged.
+_PINNED_UNREADABLE: Final[str] = (
+    "I can pin named coins only to a send I can read exactly — say the "
+    "amount in sats or BTC, the address, and the coin numbers; nothing "
+    "was staged."
+)
+#: The envelope-refusal twin: the user's own amount/address failed the
+#: SAME layers every model output passes (a non-mainnet or malformed
+#: recipient, an out-of-range amount — ADR-0021 decides, values never
+#: echo).
+_PINNED_REFUSED: Final[str] = (
+    "That send did not check out against your mainnet wallet — nothing "
+    "was staged. Say the amount in sats or BTC and a mainnet address."
+)
+#: The insufficient-WITHIN-POOL honest line (renderer-composed from the
+#: structured needed/available keys — the ADR-0012 user-facing figures,
+#: scoped to the named pool because the pool was the selection universe;
+#: the numbers are the user's own handles).
+_PINNED_SHORT: Final[str] = (
+    "The coins you named ({numbers}) can't cover this — need {needed} "
+    "sats, they hold {available} sats."
+)
+#: The deviation block's header (the named-but-unspent enumeration under
+#: the From rows: skipped dust, the pure-pool preference's other side,
+#: the single-coin improvement's leftovers).
+_SEND_NOT_SPENT_HEADER: Final[str] = "Not spent from the coins you named:"
+#: The full (``/details``) render's enumeration header (the brief card's
+#: From line carries its own wording; the classic card names the block).
+_SEND_PIN_HEADER: Final[str] = "From the coins you named:"
+
+
+def _numbers_phrase(numbers: Sequence[int]) -> str:
+    """"#3, #7 and #9" — the user's own registry handles, deduped, ordered,
+    comma-joined with a final "and". Rendered only into code-owned copy
+    (card lines and refusals), never into a log-bound value."""
+    parts = [f"#{n}" for n in sorted(set(numbers))]
+    if not parts:  # pragma: no cover — callers guard non-empty
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def _send_pin_clause(line: str) -> tuple[tuple[int, ...], str] | None:
+    """Parse the ``using <coin-number list>`` clause out of the user's OWN
+    line and return ``(numbers, line-without-the-clause)``, or ``None``
+    (the line is not this grammar — ordinary pipeline, UNCHANGED). The
+    shape rides the CONS-003/CONS-004 pick vocabulary: ``using`` plus an
+    optional object word plus a list of ``#``-marked or bare registry
+    numbers joined by "and"/commas, closed by anything that is not
+    another entry or a trailing politeness filler. A ``#`` alone names a
+    coin (the registry's own referent mark); a BARE number is admitted
+    only inside a TWO-OR-MORE list (CONS-004's rule — a single bare digit
+    is not this grammar: the pinned "… my 3 favorite …" model route
+    stands). Deictic forms match NOTHING here — "the selected", "these"
+    etc. are not numbers, so those lines release to the model's clarify
+    (pinned council contract). A pathological digit token (the CHAT-009
+    ``int_max_str_digits`` lesson) is not this grammar either way.
+    Case-preserving: the remainder keeps the raw tokens (the recipient is
+    the user's own bech32 string; layers 2-3 decide validity later)."""
+    raw = line.split()
+    lowered = [t.lower() for t in raw]
+
+    def entry_at(j: int) -> tuple[int, bool] | None:
+        """(value, hash-marked) when token j is a registry-number entry."""
+        t = lowered[j]
+        core = t.strip(punctuation)
+        if t.startswith("#"):
+            marked_body = t[1:].strip(punctuation)
+            if marked_body.isdigit():
+                value = _cons_int(marked_body)
+                return None if value is None else (value, True)
+            return None
+        if core.isdigit():
+            value = _cons_int(core)
+            return None if value is None else (value, False)
+        return None
+
+    for i, word in enumerate(lowered):
+        if word != "using":
+            continue
+        consumed = {i}
+        j = i + 1
+        if j < len(lowered) and lowered[j].strip(punctuation) in _PIN_OBJECT_WORDS:
+            consumed.add(j)
+            j += 1
+        entries: list[tuple[int, bool]] = []
+        while j < len(raw):
+            cand = entry_at(j)
+            if cand is None and lowered[j].strip(punctuation) == "and" and (
+                j + 1 < len(raw) and entry_at(j + 1) is not None
+            ):
+                consumed.add(j)  # a joiner ONLY between two entries
+                j += 1
+                continue
+            if cand is None:
+                if entries and lowered[j].strip(punctuation) in _PIN_TAIL_FILLERS:
+                    consumed.add(j)  # trailing politeness
+                    j += 1
+                    continue
+                break
+            entries.append(cand)
+            consumed.add(j)
+            j += 1
+        if not entries:
+            continue
+        # A bare digit is a pick only inside a TWO-OR-MORE list (CONS-004);
+        # a single #-marked digit is a pick on its own ("using #3").
+        if len(entries) == 1 and not entries[0][1]:
+            continue
+        numbers = tuple(sorted({value for value, _ in entries}))
+        rest = " ".join(t for k, t in enumerate(raw) if k not in consumed)
+        return numbers, rest
+    return None
+
+
+def _parse_pin_send(rest: str) -> tuple[str, int] | None:
+    """Read the SEND out of the clause-free remainder, deterministically
+    and conservatively: EXACTLY ONE amount wearing an explicit unit word
+    (never a bare number — that reading is why the "coin(s)" alias stays
+    out of :data:`_PIN_AMOUNT_UNITS`), and EXACTLY ONE ``bc1…`` recipient
+    token (raw case preserved — the address is the user's own string and
+    validation layers, not this parser, decide it). Anything short of a
+    fully readable pair is ``None``: a half-parsed pinned send must never
+    reach the model (it cannot carry the coin reference), and must never
+    stage anything either — the caller refuses the line, value-free."""
+    raw = rest.split()
+    lowered = [t.strip(punctuation).lower() for t in raw]
+    amount_at: int | None = None
+    amounts = 0
+    recipient_at: int | None = None
+    recipients = 0
+    for i, word in enumerate(lowered):
+        if word.startswith("bc1") and len(word) > 10:
+            recipient_at = i
+            recipients += 1
+            continue
+        if (
+            _CHAT_SIZE_NUM_RE.match(word)
+            and i + 1 < len(lowered)
+            and lowered[i + 1] in _PIN_AMOUNT_UNITS
+        ):
+            if amount_at is None:
+                amount_at = i
+            amounts += 1
+    if amounts != 1 or recipients != 1 or amount_at is None:
+        return None
+    value = _parse_chat_size_sats(lowered[amount_at], lowered[amount_at + 1])
+    if value < 0 or not MIN_AMOUNT_SATS <= value <= MAX_AMOUNT_SATS:
+        return None
+    return raw[recipient_at].strip(punctuation), value
+
+
+def _run_pinned_send_turn(
+    session: SendSession,
+    store: Store,
+    flow: TxFlow,
+    line: str,
+    output_fn: Callable[[str], None],
+    *,
+    table: DispatchTable,
+) -> bool:
+    """Deterministic pinned-send intercept (BEFORE the model, after every
+    ask/conversation opener — their vocabularies keep priority; the gate
+    territory check is this function's own, like the consolidation
+    opener's). A line with no parseable ``using <numbers>`` clause is
+    released UNCHANGED (every deictic form lands here and falls through
+    to the model — pinned council contract). A line WITH one is fully
+    consumed: coins resolved against the registry (unknown number = the
+    EXISTING value-free :data:`ADDRESS_REF_UNKNOWN` clarify, nothing
+    staged, no nearest guess), amount + recipient read from the user's
+    own words, the CODE-built envelope run through the FULL
+    :func:`~localwallet.protocol.dispatcher.handle_raw` chokepoint
+    (layers 1-3 — the same every model output passes; a refusal says so,
+    values never echo), the numbers stamped as the dispatcher-owned
+    session PIN, and
+    the UNCHANGED create_tx handler dispatches (its step-4.5 fresh-store
+    re-resolution is the staging authority: a coin that went unspendable
+    between the listing and this dispatch hard-stops naming the numbers,
+    flow IDLE, nothing staged — never a silent substitute). Fee-rung
+    words survive (the RBF-004 lesson: "no hurry"/"fast" ride the
+    envelope's own knob); a deny token SUPPRESSES the intercept whole
+    (HW-005 slice-C rule — the ordinary gate/model path handles the
+    refusal); a QUESTION about such a send REFUSES with the honest line
+    (a question must never stage money, and releasing it would silently
+    drop the coin reference — the substitution this feature forbids)."""
+    if flow.state in (
+        TxFlowStatus.CREATED,
+        TxFlowStatus.CONFIRMED,
+        TxFlowStatus.SIGNED,
+    ):
+        return False  # gate territory (the pending card owns this turn)
+    if IntentName.CREATE_TX not in table:
+        return False  # pragma: no cover — the wired table always carries it
+    clause = _send_pin_clause(line)
+    if clause is None:
+        return False
+    numbers, rest = clause
+    words = [w for w in (t.strip(punctuation).lower() for t in rest.split()) if w]
+    if not any(w in _PIN_VERBS for w in words):
+        return False  # the clause rode a non-send line: released unchanged
+    joined = " ".join(words)
+    fee: str | None = None
+    if any(p in joined for p in _CONS_SLOW_PHRASES):
+        fee = "slow"
+    elif any(p in joined for p in _CONS_FAST_PHRASES):
+        fee = "fast"
+    if fee != "slow" and any(w in _BUMP_DENY_TOKENS for w in words):
+        return False  # deny suppression (the HW-005 slice-C opener rule)
+    if words and (words[0] in _PIN_QUESTION_WORDS or rest.rstrip().endswith("?")):
+        output_fn(sanitize_tool_output(_PINNED_UNREADABLE))
+        return True  # a question never stages money; never silently unpins
+    try:
+        wallet = store.get_active_wallet()
+        if wallet is None:
+            return False
+        resolved: list[int] = []
+        for n in numbers:
+            record = None
+            if n >= 1:  # registry numbers are 1-based; "#0" is a miss
+                record = store.get_address_by_number(wallet.id, n)
+            if record is None:
+                output_fn(sanitize_tool_output(ADDRESS_REF_UNKNOWN))
+                return True  # the EXISTING value-free clarify; nothing staged
+            resolved.append(n)
+    except (StoreError, sqlite3.Error):
+        return False  # sugar never crashes a turn; the ordinary pipeline runs
+    if len(resolved) > MAX_SELF_TRANSFER_CONSOLIDATE_INPUTS:
+        output_fn(sanitize_tool_output(_PINNED_POOL_TOO_MANY))
+        return True  # ≥1 coin per named address: certainly over the ceiling
+    parsed = _parse_pin_send(rest)
+    if parsed is None:
+        output_fn(sanitize_tool_output(_PINNED_UNREADABLE))
+        return True
+    recipient, amount_sats = parsed
+    params: dict[str, object] = {"recipient": recipient, "amount_sats": amount_sats}
+    if fee is not None:
+        params["fee_target"] = fee
+    session.send_pinned = _SendPinned(wallet_id=wallet.id, numbers=tuple(resolved))
+    try:
+        # handle_raw is the FULL chokepoint (parse → layer-2 schema →
+        # layer-3 business rule, mainnet-only recipient included —
+        # ADR-0008/0021) → allowlist dispatch; a layer failure prints the
+        # value-free refusal inside the helper and stages nothing (the
+        # PIN the handler never consumed is cleared by this finally).
+        _dispatch_code_create_turn(
+            session,
+            line,
+            json.dumps({"v": 0, "intent": "create_tx", "params": params}),
+            output_fn,
+            table=table,
+        )
+    finally:
+        # The handler consumes the PIN at its head; this covers every path
+        # that returned before it (the cons_ask/file_sign_export_once
+        # discipline — a stale stamp must never pin a LATER turn's send).
+        session.send_pinned = None
+    return True
+
+
 def _run_turn(
     loop: AgentLoop,
     flow: TxFlow,
@@ -20810,6 +21425,16 @@ def _run_turn(
       narration). After a DENY-cancel no pending exists and the facts
       stay empty; the gate decision above remains the only confirmation
       authority either way.
+    - Pinned-coin sends (TCK-UTXO-007): an explicit-number utterance
+      ("send 500000 sats to bc1q… using #3 #7 #9", the CONS-003/004
+      number-list grammar ported to the send path) is consumed BEFORE
+      the model by :func:`_run_pinned_send_turn` — the model never
+      authors or edits the set, the code-built envelope carries no coin
+      reference (the numbers ride the dispatcher-owned session PIN and
+      the create_tx handler re-resolves them against fresh store truth).
+      Deictic forms ("using the selected UTXOs", "with these UTXOs") are
+      NOT intercepted — they fall through to the model's own clarify,
+      line unchanged (pinned council contract).
     """
     # TCK-HW-002 (MW-4): deterministic re-sign interception — device-error
     # guidance tells the user to say 'retry'; routing that bare utterance
@@ -21125,6 +21750,22 @@ def _run_turn(
                     table=table,
                 )
                 return
+    # TCK-UTXO-007: the pinned-coin send ("send … to bc1q… using #3 #7 #9")
+    # — the deterministic PRE-MODEL intercept for the council's feature.
+    # Explicit-number forms are fully consumed here (the model never
+    # authors or edits the set — it never sees the turn; no envelope key
+    # carries a coin reference; the create_tx handler re-resolves every
+    # number against FRESH store truth at staging time). Deictic forms
+    # ("using the selected UTXOs" / "using these UTXOs" / "with these
+    # selected UTXOs") match NOTHING and fall through to the model's own
+    # clarify, line unchanged — the council REJECTED engine-resolving
+    # client-side selection state and there is none to resolve. Gate
+    # territory (a pending card owns this turn) stands down exactly like
+    # the consolidation opener; ask conversations above keep priority.
+    if store is not None and _run_pinned_send_turn(
+        session, store, flow, line, output_fn, table=table
+    ):
+        return
     session.gate_decision = (
         ConfirmGate.classify(line)
         if flow.state is TxFlowStatus.CREATED
@@ -21150,6 +21791,10 @@ def _run_turn(
         # the next flow).
         session.cons_ask = None
         session.cons_pending = None
+        # TCK-UTXO-007: and the pinned-send pair (the staged send's pool
+        # authority and enumeration display belonged to THIS flow).
+        session.send_pinned = None
+        session.send_pinned_pending = None
         # TCK-CANCEL-001: the cancel is CODE-owned and DONE — print the
         # cancellation line and leave the turn BEFORE the model runs. The
         # model sees no cancel turn: it cannot narrate over it and cannot
@@ -22385,12 +23030,36 @@ def _print_create_tx(
     """
     error = result.get("error")
     if error == "insufficient_funds":
+        numbers = result.get("pinned_numbers")
+        if isinstance(numbers, list) and numbers:
+            # TCK-UTXO-007: the SAME honest needed/available path, scoped
+            # to the PINNED pool and naming the user's own handles (the
+            # coins you named can't cover this — never a wallet-wide
+            # "have N" promise the named set does not support). Figures
+            # verbatim from the structured keys (ADR-0012).
+            output_fn(
+                sanitize_tool_output(
+                    _PINNED_SHORT.format(
+                        numbers=_numbers_phrase(numbers),
+                        needed=result.get("needed_sats", 0),
+                        available=result.get("available_sats", 0),
+                    )
+                )
+            )
+            return
         output_fn(
             sanitize_tool_output(
                 f"Insufficient funds: need {result.get('needed_sats', 0)} sats, "
                 f"have {result.get('available_sats', 0)} sats."
             )
         )
+        return
+    if error in ("pinned_coins_gone", "pinned_pool_too_many"):
+        # TCK-UTXO-007: the gone/ceiling HARD STOPS are the UX — the
+        # value-free, code-owned line (names WHICH registry numbers, never
+        # an address/amount), flow still IDLE, nothing staged, never a
+        # silent substitute or survivors-only rebuild.
+        output_fn(sanitize_tool_output(str(result.get("detail", "")).strip()))
         return
     if error == "tx_pending":
         notice = result.get("rate_notice")
@@ -22420,6 +23089,52 @@ def _print_create_tx(
         )
         output_fn(sanitize_tool_output(lead))
     _print_brief_card(result, output_fn, session)
+
+
+def _send_pin_rows(result: Mapping[str, object]) -> tuple[list[str], list[str]] | None:
+    """Render the TCK-UTXO-007 From enumeration blocks from the handler's
+    own ``send_sources`` / ``send_not_spent`` keys (every value verbatim
+    from the handler's fresh store read; the numbers are the user's own
+    registry handles). Returns ``(final-input rows, named-but-not-spent
+    rows)``, or ``None`` when there is no complete, valid final-input
+    enumeration — the fail-closed renderer never guesses a row and never
+    shows a PARTIAL enumeration as if it were complete (the council
+    precondition is that the user confirms EVERY final input, so a
+    malformed/absent block falls back to the ordinary wallet-generic From
+    line rather than a misleading subset)."""
+
+    def rows(key: str) -> list[str] | None:
+        entries = result.get(key)
+        if not isinstance(entries, list):
+            return None
+        out: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return None
+            number = entry.get("number")
+            address = entry.get("address")
+            value = entry.get("value_sats")
+            if (
+                isinstance(number, bool)
+                or not isinstance(number, int)
+                or not isinstance(address, str)
+                or not address
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+            ):
+                return None
+            out.append(
+                _CONS_SOURCE_ROW.format(number=number, address=address, sats=value)
+            )
+        return out
+
+    sources = rows("send_sources")
+    if not sources:
+        return None
+    not_spent = rows("send_not_spent")
+    if not_spent is None:
+        not_spent = []  # key absent/empty: nothing named-but-unspent
+    return sources, not_spent
 
 
 def _card_sats(result: Mapping[str, object], key: str) -> str | None:
@@ -22655,10 +23370,21 @@ def _print_brief_card(
         # the handler marked this bid floor-raised.
         output_fn(sanitize_tool_output(floor_note))
     sources = result.get("inputs_count")
+    # TCK-UTXO-007 (council precondition, binding): on a pinned send the
+    # From line enumerates EVERY final input — one "#N · full address ·
+    # sats" row per spent coin (the _CONS_SOURCE_ROW shape, values verbatim
+    # from the handler's fresh read) — and every named coin NOT spent
+    # (skipped dust, the pure-pool preference's other side, the
+    # single-coin improvement's leftovers) is enumerated under its own
+    # header. The user confirms THIS; the count/change/fold segments stay
+    # on the From line exactly as the ordinary card has them.
+    pin = _send_pin_rows(result)
     if isinstance(sources, int) and not isinstance(sources, bool):
-        from_line = f"From: your wallet ({sources:,} {'source' if sources == 1 else 'sources'})"
+        origin = "the coins you named" if pin is not None else "your wallet"
+        from_line = f"From: {origin} ({sources:,} {'source' if sources == 1 else 'sources'})"
     else:
         from_line = "From: your wallet (sources unavailable)"
+        pin = None
     change = _card_sats(result, "change_sats")
     if change is not None:
         from_line += f" · {change} sats come back as change"
@@ -22672,6 +23398,13 @@ def _print_brief_card(
     if isinstance(folded, int) and not isinstance(folded, bool) and folded > 0:
         from_line += f" · folding in {folded:,} small ones now to save fees later"
     output_fn(sanitize_tool_output(from_line))
+    if pin is not None:
+        for row in pin[0]:
+            output_fn(sanitize_tool_output(row))
+        if pin[1]:
+            output_fn(sanitize_tool_output(_SEND_NOT_SPENT_HEADER))
+            for row in pin[1]:
+                output_fn(sanitize_tool_output(row))
     if result.get("fee_target_defaulted"):
         output_fn(sanitize_tool_output(_CARD_OFFER_TAIL + _CARD_DETAILS_TAIL))
     else:
@@ -22748,6 +23481,18 @@ def _print_confirmation_card(
     change = result.get("change_sats")
     change_label = f"Change: {change} sats" if change is not None else "Change: none"
     output_fn(sanitize_tool_output(change_label))
+    # TCK-UTXO-007: the full (``/details``) render carries the SAME pinned
+    # enumeration the brief card the user confirms against shows (one
+    # rule, one card; the rows are verbatim handler material).
+    pin = _send_pin_rows(result)
+    if pin is not None:
+        output_fn(sanitize_tool_output(_SEND_PIN_HEADER))
+        for row in pin[0]:
+            output_fn(sanitize_tool_output(row))
+        if pin[1]:
+            output_fn(sanitize_tool_output(_SEND_NOT_SPENT_HEADER))
+            for row in pin[1]:
+                output_fn(sanitize_tool_output(row))
     if "expires_in_s" in result:
         output_fn(sanitize_tool_output(f"Expires: ~{int(result['expires_in_s']) // 60} min"))
     else:
