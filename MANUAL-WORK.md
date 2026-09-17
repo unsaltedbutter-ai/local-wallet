@@ -63,9 +63,25 @@ Decision rule for swapping models was fixed in advance: ≥ +15 accuracy points 
 5. **Bigger models (8B+)** — need either a latency-budget decision from you or GPU hardware; not probed.
 6. **More deterministic intercepts** instead of model routing (extend the CHAT-009/CONS-004 pattern) — orthogonal, already the recommended direction; every intercept is a prompt-independent guarantee.
 
+### GPU vs CPU inference — what runs where (2026-09-16)
+
+Engine: llama-cpp-python 0.3.35 (llama.cpp underneath). Whether inference uses a GPU depends on how the WHEEL WAS BUILT, not on our code:
+
+- **Mac mini (this machine): YES, the GPU is already used.** The standard macOS wheel ships with **Metal** enabled — compute runs on the Apple GPU via unified memory. Nothing to change.
+- **Linux (your Razer / Pop!_OS): CPU-only — EXPECTED with our pinned install.** The PyPI Linux wheel has no GPU support compiled in. To use the NVIDIA GPU, rebuild the wheel with CUDA (Pop!_OS ships the drivers; you need the toolkit for `nvcc`):
+  `sudo apt install nvidia-cuda-toolkit` then
+  `CMAKE_ARGS="-DGGML_CUDA=on" FORCE_CMAKE=1 .venv/bin/pip install llama-cpp-python==0.3.35 --force-reinstall --no-cache-dir`
+  AMD/other-GPU alternative: `CMAKE_ARGS="-DGGML_VULKAN=on" ...` (Vulkan build, works on NVIDIA and AMD, no CUDA toolkit needed).
+  With 4 GB+ VRAM the whole 3.1 GB q4 model fits on the GPU — expect roughly 3–10× faster tokens/sec, which turns 35-second turns into single digits. Worth doing on the Razer.
+- **Caveats (honest):** this is a LOCAL wheel rebuild — `install.sh` installs the PyPI wheel (CPU on Linux), so a GPU build is an opt-in override, and a future `pip install -e '.[dev]'` may silently revert it. ADR-0001 documents the standalone `llama.cpp` `llama-server` binary as the alternative runtime, which has ready-made CUDA/Vulkan release binaries — but our supported in-process path is the wheel rebuild above.
+
 **Standing recommendation:** keep the pinned model + single prompt; spend effort on deterministic intercepts (already happening — CONS-004/FEE-008/CHAT-010 this session); revisit models only if you'll accept slower turns (Qwen3-4B is downloaded and one command away: `tools/probe_prompt_routing.py --model qwen3-4b-instruct-Q4_K_M`).
 
 ## MW-16 round 4 🔥 — full checklist (post part-10 continuation, HEAD b700cc0)
+
+### Round-4 results (your 2026-09-16 report) — CONFIRMED working: Chat-managed settings ✅ Fiat-amount sends ✅ Receive+label in one line ✅ Trust badge colors ✅ Suggested server chips ✅ "What are fees like right now?" ✅ "block height?" ✅ Fee floor honesty ✅.
+
+Findings from the same report, all ticketed: **"Full txids" REWORKED per your clarification** — you do NOT want full txids displayed; you want a [tx] copy button (the UTXO list already got this in UTXO-006; the whole chat narration follows in TCK-TXID-002, full txid printed only when you ask "what is the transaction id for utxo #1"). **"open mempool for #1"** didn't deep-link to the coin → TCK-CHAT-011. **"Label #1 as ABC"** should resolve UTXO registry numbers w/ an ambiguity ask, and listings should show labels → TCK-LABEL-002. **Missing calculator button** next to our addresses (voice show-on-device works) → TCK-HW-010. **Broadcast on public electrum**: root-caused — `code=2` is electrs' blanket "bitcoind refused" wrapper AND electrs servers don't advertise `relayfee` (live-probe verified: `advertised: false`), so the mempool.space fallback CANNOT arm on electrum.blockstream.info by design, on two independent gates → TCK-PUBLICBCAST-005. **Header fingerprint chip**: verified with your actual zpub — hash160(account pubkey) = e7f51184… exactly what the chip shows; 40DBB192 is the Jade's MASTER fingerprint, mathematically unreachable from an account zpub (Sparrow knows it only because it imported from the device). The chip is correct; the clarifying sentence on the chip copy explains the two numbers.
 
 Previously fixed (rounds 1–3, re-verify only if something below touches them): electrum ✅ bitcoind ✅ TLS ✅ probe speed ✅ autodetect ✅ bitcoind block-height scan ✅ EUR display ✅ labels persist ✅ chat creds hand-off ✅ broadcast debug lines ✅ min-relay rail 0.1 sat/vB ✅.
 
