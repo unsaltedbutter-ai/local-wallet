@@ -1663,10 +1663,11 @@ function applyScanChip(snap) {
 const PRIVACY_SUBLINE = {
   public: LABELS.privacyPublic,
   own_node_local: LABELS.privacyOwnLocal,
-  // TCK-WEB-023: the FIFTH name — the private-range literal-IP mode. The
-  // value itself is the host-LESS hedge (the {host} template below rides
-  // privacySublineText); adding this key is what makes the shipped client
-  // show the chip GREEN for the mode instead of hiding it.
+  // TCK-WEB-023: the FIFTH name — the private-range literal-IP mode (widened
+  // by TCK-WEB-030 to literal-OR-resolved). The map key gates the NAME
+  // (unknown names still clear the mode); TCK-WEB-030 supersedes the old
+  // GREEN-chip behavior: the TOP badge is HIDDEN for this mode, while the
+  // name keeps feeding the pane badge / kind-pill tint below.
   own_node_private: LABELS.privacyOwnPrivate,
   own_node_remote: LABELS.privacyOwnRemote,
   awaiting_backend: LABELS.privacyAwaiting,
@@ -1821,7 +1822,14 @@ function applyPrivacyChip(snap) {
   const mode = state.privacyMode;
   paintTrustBadges(); // TCK-WEB-013 (2): the pane badge rides the same truth
   paintConsentRow(); // TCK-PRIVACY-001B: likewise the public-consent button
-  if (!mode) {
+  // TCK-WEB-030 (user direction 2026-09-15): own_node_private HIDES the top
+  // badge entirely — a private-LAN server (the engine's widened
+  // literal-OR-resolved classification) shows no chip. TOP BADGE ONLY: the
+  // mode NAME still lands in state.privacyMode, so the pane trust badge, the
+  // kind-pill tint and the settings hedge copy all keep their WEB-023
+  // behavior; state/0 persists the name (chip stays hidden mid-busy) and a
+  // later typed mode change re-shows the chip through the paint below.
+  if (!mode || mode === "own_node_private") {
     privacyChipEl.hidden = true;
     privacyChipEl.removeAttribute("data-privacy");
     if (privacySublineEl.textContent !== "") privacySublineEl.textContent = "";

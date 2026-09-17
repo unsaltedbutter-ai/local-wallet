@@ -2324,7 +2324,15 @@ def _web023_blocks() -> str:
       const state = { privacyMode: "", backendHost: "", backendName: "" };
       const privacyChipEl = {
         hidden: true, dataset: {}, removedAttrs: [],
-        removeAttribute(k) { this.removedAttrs.push(k); delete this.dataset[k]; },
+        removeAttribute(k) {
+          // real-DOM semantics: removing a data-* attribute clears the
+          // matching dataset key too (TCK-WEB-030 residue pin relies on it).
+          this.removedAttrs.push(k);
+          delete this.dataset[k];
+          if (k.startsWith("data-")) {
+            delete this.dataset[k.slice(5).replace(/-([a-z])/g, (m, c) => c.toUpperCase())];
+          }
+        },
       };
       let sublineWrites = 0;
       const privacySublineEl = {
@@ -2437,23 +2445,25 @@ def test_web023_chip_lifecycle_pill_repaint_under_node() -> None:
       // (backendName is stamped upstream by applyState — pinned in
       // test_settings_reload_is_pinned_to_the_trust_flip; this harness
       // stamps it the same way before the chip pass repaints the badges.)
-      // private mode + host + kind: GREEN chip, host hedge, green pill —
-      // chip, trust badge and pill ALL painted from the one snapshot.
+      // TCK-WEB-030: private mode + host + kind — the TOP chip is HIDDEN
+      // (no tint attr, no subline residue) while the pane trust badge and
+      // the kind pill still paint GREEN off the same snapshot.
       state.backendName = "electrum";
       applyPrivacyChip({ schema: "state/1", privacy_mode: "own_node_private",
                          backend_kind: "electrum", backend_host: "10.1.2.3" });
-      if (privacyChipEl.hidden) throw new Error("chip-hidden");
-      if (privacyChipEl.dataset.privacy !== "own_node_private") throw new Error("tint-attr");
-      if (!privacySublineEl.textContent.includes("10.1.2.3")
-          || !privacySublineEl.textContent.includes("run this server yourself")) throw new Error("subline");
+      if (!privacyChipEl.hidden) throw new Error("chip-shown-for-private");
+      if ("privacy" in privacyChipEl.dataset) throw new Error("tint-attr-residue");
+      if (privacySublineEl.textContent !== "") throw new Error("subline-residue");
       if (badgeStub.hidden || badgeStub.dataset.privacy !== "own_node_private") throw new Error("badge");
       if (pillStub.hidden || pillStub.className !== "kind-pill kind-pill-private"
           || pillStub.textContent !== "Electrum") throw new Error("pill");
-      // typed flip to REMOTE with the host key OMITTED: the stale private
-      // host is gone (omit-never-empty), the pill re-tints YELLOW.
+      // typed flip to REMOTE with the host key OMITTED: the chip REAPPEARS,
+      // the stale private host is gone (omit-never-empty), the pill
+      // re-tints YELLOW.
       state.backendName = "bitcoind";
       applyPrivacyChip({ schema: "state/1", privacy_mode: "own_node_remote",
                          backend_kind: "bitcoind" });
+      if (privacyChipEl.hidden) throw new Error("chip-not-restored");
       if (privacySublineEl.textContent.includes("10.1.2.3")) throw new Error("stale-host");
       if (privacySublineEl.textContent !== "Your node on another machine — private only if you trust it.") throw new Error("remote-fallback");
       if (pillStub.className !== "kind-pill kind-pill-public"
@@ -2463,15 +2473,24 @@ def test_web023_chip_lifecycle_pill_repaint_under_node() -> None:
       applyPrivacyChip({ schema: "state/0" });
       if (sublineWrites !== before) throw new Error("state0-repaint");
       if (privacySublineEl.textContent.includes("10.1.2.3")) throw new Error("state0-revive");
-      // kind none / awaiting mode: NO pill (both branches).
+      // kind none / awaiting mode: NO pill (both branches). TCK-WEB-030:
+      // re-entering PRIVATE hides the chip again AND the hidden state
+      // persists across state/0 (no blink-back, no subline re-write).
       state.backendName = "none";
       applyPrivacyChip({ schema: "state/1", privacy_mode: "own_node_private",
                          backend_kind: "none", backend_host: "10.1.2.3" });
       if (!pillStub.hidden) throw new Error("none-pill");
+      if (!privacyChipEl.hidden) throw new Error("private-chip-shown");
+      const beforeHidden = sublineWrites;
+      applyPrivacyChip({ schema: "state/0" });
+      if (sublineWrites !== beforeHidden) throw new Error("hidden-state0-rewrite");
+      if (!privacyChipEl.hidden) throw new Error("hidden-state0-reveal");
+      // a typed flip OUT of private re-shows the chip (awaiting = YELLOW).
       state.backendName = "electrum";
       applyPrivacyChip({ schema: "state/1", privacy_mode: "awaiting_backend",
                          backend_kind: "electrum", backend_host: "surprise" });
       if (!pillStub.hidden) throw new Error("awaiting-pill");
+      if (privacyChipEl.hidden || privacyChipEl.dataset.privacy !== "awaiting_backend") throw new Error("private-to-awaiting");
       if (privacySublineEl.textContent !== "No backend chosen yet.") throw new Error("awaiting-subline");
       // unknown mode NAME (newer engine): chip HIDES (existing discipline),
       // and the host it carried is dropped, never rendered anywhere.
@@ -2482,6 +2501,44 @@ def test_web023_chip_lifecycle_pill_repaint_under_node() -> None:
       if (privacySublineEl.textContent !== "") throw new Error("unknown-subline");
       if (privacyChipEl.removedAttrs.length === 0) throw new Error("attr-residue");
       if (!badgeStub.hidden || !pillStub.hidden) throw new Error("unknown-badges");
+      console.log("ok");
+    """
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+def test_web030_top_badge_visibility_matrix_under_node() -> None:
+    # TCK-WEB-030 (user direction 2026-09-15, TOP BADGE ONLY): the persistent
+    # privacy chip is HIDDEN for own_node_private and shown, tinted by the
+    # existing data-privacy NAME mapping, for every other closed mode. The
+    # mode NAME still rides state (pane badge/pills inherit WEB-023 colors).
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    script = (
+        _web023_blocks()
+        + """
+      state.backendName = "electrum";
+      const SHOWN = ["public", "own_node_local", "own_node_remote", "awaiting_backend"];
+      for (const mode of [...SHOWN, "own_node_private", "brand_new"]) {
+        applyPrivacyChip({ schema: "state/1", privacy_mode: mode,
+                           backend_kind: "electrum", backend_host: "10.1.2.3" });
+        const hidden = mode === "own_node_private" || mode === "brand_new";
+        if (privacyChipEl.hidden !== hidden) throw new Error("visible:" + mode);
+        const tinted = SHOWN.includes(mode);
+        if (("privacy" in privacyChipEl.dataset) !== tinted) throw new Error("attr:" + mode);
+        if (tinted && privacyChipEl.dataset.privacy !== mode) throw new Error("attr-value:" + mode);
+        // the pane trust badge keeps the WEB-023 mapping for ALL five names
+        // (unknown name → no badge) regardless of the top chip's visibility.
+        if (mode === "brand_new") {
+          if (!badgeStub.hidden) throw new Error("pane-badge-unknown");
+        } else {
+          if (badgeStub.hidden) throw new Error("pane-badge-hidden:" + mode);
+          if (badgeStub.dataset.privacy !== mode) throw new Error("pane-badge-attr:" + mode);
+        }
+      }
       console.log("ok");
     """
     )
