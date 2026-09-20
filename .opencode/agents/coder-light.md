@@ -1,7 +1,7 @@
 ---
 description: Implements routine/medium tickets — tests, fixtures, store/, node/, ui/ CLI, docs scaffolding, refactors.
 mode: subagent
-model: lspark/deepseek-v4-flash-0731
+model: dspark/aeon
 temperature: 0
 reasoningEffort: low
 steps: 60

@@ -4,7 +4,7 @@ description: >
   fails and someone needs to sit in the loop — read output, rerun,
   make a small change, try again. Not for planning or greenfield work.
 mode: subagent
-model: lspark/deepseek-v4-flash-0731
+model: dspark/aeon
 temperature: 0.2
 color: "#e67e22"
 steps: 40

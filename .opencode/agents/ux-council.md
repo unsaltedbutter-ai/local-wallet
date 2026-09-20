@@ -1,7 +1,7 @@
 ---
 description: Chair of the UX council. Dispatches two independent critic models over the web UI, then arbitrates their findings into one prioritized fix list. Does not review or implement itself.
 mode: primary
-model: lspark/deepseek-v4-flash-0731
+model: lspark/qwen3.8-flash-next
 temperature: 0.3
 reasoningEffort: high
 permission:

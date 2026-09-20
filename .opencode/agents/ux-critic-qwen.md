@@ -1,7 +1,7 @@
 ---
 description: Independent UX critic (qwen voice). Reviews the localhost web UI for workflow, hierarchy, and interaction problems. Findings only.
 mode: subagent
-model: cspark/qwen3.8-flash-next
+model: lspark/qwen3.8-flash-next
 temperature: 0.7
 reasoningEffort: medium
 steps: 30

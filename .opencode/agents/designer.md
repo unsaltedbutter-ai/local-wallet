@@ -1,7 +1,7 @@
 ---
 description: Writes and edits UX copy and docs — confirmation cards, error states, device-handoff strings — per PROJECT.md §10.
 mode: subagent
-model: lspark/deepseek-v4-flash-0731
+model: aspark/glm-5.3-flash
 temperature: 0.7
 reasoningEffort: low
 permission:

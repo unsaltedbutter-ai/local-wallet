@@ -1,7 +1,7 @@
 ---
 description: Builds and maintains the localhost web UI (index.html, styles.css, app.js) — vanilla ES modules + CSS, no framework/bundler, per ADR-0024. Use for all web page work.
 mode: subagent
-model: cspark/qwen3.8-flash-next
+model: lspark/qwen3.8-flash-next
 temperature: 0.8
 reasoningEffort: medium
 permission:

@@ -1,7 +1,7 @@
 ---
 description: Read-only correctness and maintainability review of a ticket's diff. Run before the orchestrator commits. Security is a separate agent — do not duplicate it.
 mode: subagent
-model: lspark/deepseek-v4-flash-0731
+model: aspark/glm-5.3-flash
 temperature: 0
 reasoningEffort: medium
 permission:

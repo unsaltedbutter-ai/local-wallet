@@ -23,6 +23,8 @@ permission:
     "security-review": allow
     "code-review": allow
     "code-review-qwen": allow
+    "adversary": allow
+    "arbiter": allow
     "explore": allow
     "general": allow
     "scout": allow
@@ -47,15 +49,20 @@ IMPORTANT: If you have a question that needs my input, use the `question` tool.
    changes, "designer" for UX copy and docs, "web-builder" for web UI page
    work (index.html/styles.css/app.js under src/localwallet/ui/web/); use
    "explore"/"general" for research and "scout" for dependency/upstream
-   library-internals questions (embit, hwi, pydantic behavior). Give the child
+   library-internals questions (embit, hwi, pydantic behavior). Use
+   "adversary" for tickets that create or extend hostile test fixtures
+   (prompt injection, malformed envelopes, injection utterances) under
+   tests/ — its model is refusal-free by design, which is the point for
+   writing attack data; its output is still untrusted input and its
+   fixtures go through the normal review gates like any ticket. Give the child
    the ticket text, file list, acceptance criteria, and "do not expand scope."
    If "coder-light" returns ESCALATE-TO-CODER, re-dispatch the ticket to
    "coder" unchanged.
 4. After each child returns: update TASKS.md, then dispatch the review gates
    IN ONE TURN (they are independent and read-only). Reviewer routing —
    the reviewer must never share a model family with the implementer:
-   - diffs from "coder" or "web-builder" (qwen family) → "code-review" (deepseek)
-   - diffs from "coder-light", "debugger", or "designer" (deepseek family) → "code-review-qwen" (qwen)
+   - diffs from "coder", "web-builder", "coder-light", or "debugger" (qwen/aeon family) → "code-review" (glm)
+   - diffs from "designer" (glm family) → "code-review-qwen" (qwen)
    - tickets touching chain/, protocol/, tx/, or signer/ → ALSO "security-review" (glm) in the same turn.
    Name the implementing agent in every review brief (the reviewer echoes
    reviewed-by/authored-by in its Families header — a header showing a
@@ -66,14 +73,22 @@ IMPORTANT: If you have a question that needs my input, use the `question` tool.
    yourself: "git add <files>" then
    "git commit -m 'TCK-<id>: <summary>'". Never commit with failing tests or
    a FIX-REQUIRED code review — send the findings back to the implementing
-   child for a scoped fix, then re-review once.
+   child for a scoped fix, then re-review once. If the re-review returns
+   FIX-REQUIRED again on the SAME finding and the implementer has refuted
+   it with concrete evidence, you may dispatch ONE "arbiter" pass (aeon —
+   a different architecture from both reviewers) limited to the contested
+   findings only. The arbiter's GATE is final for that finding: APPROVE
+   resumes the pipeline, FIX-REQUIRED loops back once more, then the
+   ticket fails per step 7. Do not use the arbiter for scope disputes,
+   style disagreements, or findings nobody contested.
 5. Independent tickets may run in parallel (multiple Task calls in one turn),
    but only with disjoint file lists — all subagents share this one working
    tree; there is no worktree isolation. Hard concurrency caps, counted per
-   provider in flight: aspark/glm ≤ 3 total (you, "security-review",
-   "ux-critic-glm"); lspark/deepseek ≤ 4 total ("coder-light", "debugger",
-   "designer", "code-review", "explore", "general"); cspark/qwen ≤ 4 total
-   ("coder", "web-builder", "code-review-qwen", "ux-critic-qwen"). If at a
+   provider in flight: aspark/glm ≤ 4 total (you, "security-review",
+   "designer", "code-review", "ux-critic-glm"); lspark/qwen ≤ 4 total
+   ("coder", "web-builder", "code-review-qwen", "ux-critic-qwen",
+   "explore", "general"); dspark/aeon ≤ 3 total ("coder-light",
+   "debugger", "adversary", "arbiter"). If at a
    cap, queue the ticket and launch it as slots free up — never exceed a cap.
    Do not substitute a different provider to dodge a cap: the review-routing
    rule in step 4 is more important than latency.

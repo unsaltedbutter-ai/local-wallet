@@ -1,7 +1,7 @@
 ---
 description: Implements complex/money-path tickets (protocol, wallet, tx, chain, signer). Use for hard code.
 mode: subagent
-model: cspark/qwen3.8-flash-next
+model: lspark/qwen3.8-flash-next
 temperature: 0
 reasoningEffort: xhigh
 ---
