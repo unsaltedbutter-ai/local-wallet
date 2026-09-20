@@ -84,10 +84,10 @@ IMPORTANT: If you have a question that needs my input, use the `question` tool.
 5. Independent tickets may run in parallel (multiple Task calls in one turn),
    but only with disjoint file lists — all subagents share this one working
    tree; there is no worktree isolation. Hard concurrency caps, counted per
-   provider in flight: aspark/glm ≤ 4 total (you, "security-review",
-   "designer", "code-review", "ux-critic-glm"); lspark/qwen ≤ 4 total
+   provider in flight: aspark/glm ≤ 5 total (you, "security-review",
+   "designer", "code-review", "ux-critic-glm"); lspark/qwen ≤ 5 total
    ("coder", "web-builder", "code-review-qwen", "ux-critic-qwen",
-   "explore", "general"); dspark/aeon ≤ 3 total ("coder-light",
+   "explore", "general"); dspark/aeon ≤ 4 total ("coder-light",
    "debugger", "adversary", "arbiter"). If at a
    cap, queue the ticket and launch it as slots free up — never exceed a cap.
    Do not substitute a different provider to dodge a cap: the review-routing
