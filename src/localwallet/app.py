@@ -102,7 +102,10 @@ from __future__ import annotations
 import argparse
 import base64
 import calendar
+import contextlib
 import hashlib
+import importlib.metadata
+import importlib.util
 import json
 import os
 import queue
@@ -113,7 +116,7 @@ import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from decimal import Decimal, InvalidOperation
@@ -128,6 +131,7 @@ from embit.script import address_to_scriptpubkey
 
 from localwallet.agent.context import sanitize_tool_output
 from localwallet.agent.loop import AgentLoop, AgentTurnResult, AgentTurnStatus
+from localwallet.agent.prompt import build_system_prompt
 from localwallet.agent.remote_runtime import (
     LLM_BASE_URL_ENV_VAR,
     LLM_MODEL_ENV_VAR,
@@ -189,6 +193,7 @@ from localwallet.config import (
 from localwallet.node import LocalNodeReport, NodeStatus, detect_local_nodes
 from localwallet.node.doctor import NodeDoctor
 from localwallet.protocol import (
+    INTENT_REGISTRY,
     BroadcastTxParams,
     BumpFeeParams,
     ClarifyParams,
@@ -12360,6 +12365,322 @@ class ModelPreloadFlow:
             return  # cannot hash → claims NOTHING (the loader surfaces it)
         commands.put(_IntegrityDone(ok=digest.hexdigest() == self._sha256.lower()))
 
+    @property
+    def model_path(self) -> str:
+        """The GGUF path this flow preloads + checksums (TCK-VER-001)."""
+        return self._model_path
+
+    @property
+    def pinned_sha256(self) -> str | None:
+        """The manifest pin the launch checksum verifies against — the
+        LAUNCH-003 checksum path's whole identity (``None`` = an arbitrary
+        env-rung file nothing pins; the app never invents a verdict —
+        TCK-VER-001 reports it honestly as "no checksum (unpinned path)")."""
+        return self._sha256
+
+
+# ------------------------------------------------ version report (TCK-VER-001)
+#
+# The user's verification questions ("is inference on GPU?", "does this build
+# have the [tx] chips?", "why did the fingerprint behave like THAT?") all
+# reduce to "am I running the right code?" — so the app states its identity
+# deterministically, three ways: the ``/version`` transcript command (a
+# deterministic UI feature, never a model intent — ADR-0020, same channel as
+# /details and /label), per-launch log lines written right after the runtime
+# selection (APP-LOG-001 discipline: narration goes to the transcript,
+# errors + VERSION go to the launch log), and ``tools/version_report.py``
+# for a paste-able block. All three print the identical lines from
+# :func:`version_report_lines` — same block, same model-truth resolution
+# (the launch log and the tool both resolve the env-missing rung to the
+# unpinned path, not to "none"); the ONE deliberate divergence is the
+# llama.cpp flags line, which the launch log defers ("not loaded (see
+# /version)") so startup never pays the wheel's GPU init while /version and
+# the tool force the import for a DEFINITIVE answer.
+#
+# The prompt line is the precise fingerprint: sha256 of
+# :func:`~localwallet.agent.prompt.build_system_prompt` output (first 12 hex)
+# plus the char count the 15,000-pin budget enforces. IT CHANGES WITH EVERY
+# PROMPT EDIT — a user pastes it, the orchestrator compares it against the
+# hash computed at any given HEAD.
+#
+# Value-free throughout: basenames only (never directory paths, so HOME
+# cannot ride), hashes, versions, booleans, counts — no keys, no addresses,
+# no amounts. The model digest is the MANIFEST PIN (the value the LAUNCH-003
+# launch checksum verifies the file against) — this report never re-hashes
+# the multi-GB file.
+
+#: The distribution name declared in pyproject.toml (metadata lookup).
+_DIST_NAME: Final[str] = "local-wallet"
+
+#: The llama.cpp wheel's distribution name (metadata lookup — its version).
+_LLAMA_DIST_NAME: Final[str] = "llama-cpp-python"
+
+
+def _dist_version(name: str, fallback: str = "unknown (no installed distribution)") -> str:
+    """An installed distribution's version, or the honest ``fallback`` (a
+    source run without installed metadata never fabricates one)."""
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return fallback
+
+
+def _build_commit() -> str:
+    """The commit this install was BUILT FROM, embedded by install.sh
+    (:file:`localwallet/_build_commit.py`) — never a runtime git call (no git
+    dependency is guaranteed in a running app). Absent stamp = an honest
+    "unknown (editable/source run)": the dev checkout's git state belongs to
+    the developer, and a report must never guess it. A stamp ending
+    ``-dirty`` says the checkout carried uncommitted edits at install time."""
+    try:
+        from localwallet import _build_commit as stamp  # generated by install.sh
+    except ImportError:
+        return "unknown (editable/source run)"
+    commit = getattr(stamp, "BUILD_COMMIT", "")
+    return commit if isinstance(commit, str) and commit else "unknown"
+
+
+def _is_editable_install() -> bool:
+    """True when local-wallet is installed EDITABLE (PEP 660 ``pip install
+    -e``). The reliable signal is the dist-info's ``direct_url.json`` carrying
+    ``dir_info.editable == true`` (a bare ``.pth`` is ambiguous — it can be a
+    plain path entry for a non-editable source install). Editable means the
+    commit stamp was written ONCE at install while the running source can
+    later advance — so the app line must say so rather than present a stale
+    stamp as the truth (see the ``(editable install — …)`` caveat in
+    :func:`version_report_lines`)."""
+    try:
+        dist = importlib.metadata.distribution(_DIST_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    try:
+        text = dist.read_text("direct_url.json")
+    except OSError:
+        return False
+    if not text:
+        return False
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return False
+    return bool(data.get("dir_info", {}).get("editable"))
+
+
+def _prompt_fingerprint() -> str:
+    """``sha256 <first-12-hex>, <N> chars`` of the full system prompt — the
+    precise prompt fingerprint of the running build (changes with every
+    prompt edit; the char count doubles as the 15,000-pin budget check)."""
+    text = build_system_prompt()
+    return (
+        f"sha256 {hashlib.sha256(text.encode('utf-8')).hexdigest()[:12]}, "
+        f"{len(text)} chars"
+    )
+
+
+def _session_model_truth(
+    preload: ModelPreloadFlow | None,
+    download: ModelDownloadFlow | None,
+    env_path: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """The session's LOCAL model as the launch actually resolved it:
+    ``(gguf_path, manifest_pin, not_downloaded_name)`` — the preload flow IS
+    the LAUNCH-003 checksum path (its pinned sha256, or ``None`` for an
+    arbitrary env-rung file); the download flow means the pinned default is
+    named but not on disk; ``env_path`` is the env rung's path when that rung
+    was selected but the file is missing (no preload flow exists — nothing is
+    checked, so the truth carries the path unpinned, resolving the same as
+    :func:`_ladder_model_truth`); all ``None`` = a stub/demo or remote-bridge
+    run with no local model at all."""
+    if preload is not None:
+        return preload.model_path, preload.pinned_sha256, None
+    if env_path is not None:
+        return env_path, None, None
+    if download is not None:
+        return None, None, download.model_name
+    return None, None, None
+
+
+def _ladder_model_truth() -> tuple[str | None, str | None, str | None]:
+    """Same triple for a launch that has not wired a session yet (the
+    per-launch log line, the CLI checker): re-resolves the EXACT selection
+    order :func:`run` uses — env rung first, then the manifest's pinned
+    default (present → path, absent → name)."""
+    env_model = os.environ.get(MODEL_PATH_ENV_VAR, "")  # RAW, mirroring run()
+    if env_model:
+        path = Path(env_model)
+        if path.is_file():
+            return env_model, _manifest_pin_for(path), None
+        return env_model, None, None
+    default = _resolve_default_model()
+    if default is None:
+        return None, None, None
+    if default[1].is_file():
+        return str(default[1]), _manifest_pin_for(default[1]), None
+    return None, None, default[0]
+
+
+def _model_line(model: tuple[str | None, str | None, str | None]) -> str:
+    """The model line: BASENAME only (a directory would smuggle HOME), plus
+    the checksum truth (manifest pin / honest unpinned / not-downloaded /
+    none)."""
+    path, pin, note = model
+    if path is not None:
+        line = f"model: {Path(path).name}"
+        if not Path(path).is_file():
+            line += " (file missing)"
+        return (
+            line + f", sha256 {pin[:12]} (manifest pin)"
+            if pin
+            else line + ", no checksum (unpinned path)"
+        )
+    if note is not None:
+        return f"model: {note} (pinned default not downloaded — demo stub runs)"
+    return "model: none (demo stub or remote-bridge run)"
+
+
+@contextlib.contextmanager
+def _silenced_native_fds() -> Iterator[None]:
+    """dup2 ``/dev/null`` over fds 1/2 for the block's duration — the
+    llama.cpp wheel's C library writes its device-init lines there
+    DIRECTLY on first import (sys-level redirection cannot reach it); the
+    same discipline as the preload build window (:class:`_PreloadStart`).
+    An fd-table failure (closed/pinned std fds — headless harnesses) makes
+    this a no-op rather than a crash.
+
+    Documented ceiling: dup2 is PROCESS-WIDE, so any other thread writing
+    to stdout/stderr during this window is transiently silenced too — the
+    window is short (one wheel import) and the launch thread alone uses it,
+    so that is accepted; a future concurrent-thread writer would need a
+    lock."""
+    devnull = keep_out = keep_err = None
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        keep_out = os.dup(1)
+        keep_err = os.dup(2)
+    except OSError:
+        # Partial failure (e.g. dup fails after open) must not leak the
+        # fds already taken — close every one we managed to open.
+        for fd in (devnull, keep_out, keep_err):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        yield
+        return
+    try:
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        try:
+            os.dup2(keep_out, 1)
+            os.dup2(keep_err, 2)
+        finally:
+            os.close(keep_out)
+            os.close(keep_err)
+            os.close(devnull)
+
+
+def _llama_flags(force: bool) -> str:
+    """The wheel's ``llama_print_system_info()`` C string (Metal/CUDA/CPU
+    build flags — what answers "is inference on GPU?" for this machine).
+    ``force`` (the /version command and the tool) imports the wheel to get a
+    DEFINITIVE answer; the launch-log line never does (it stays deterministic
+    at "not loaded (see /version)" so startup never pays the GPU-init cost and
+    the answer is identical whether or not the wheel happens to be loaded)."""
+    if not force:
+        return "not loaded (see /version)"
+    try:
+        # The wheel's device probe (the first import AND the system-info
+        # read itself) writes its lines at C level — the whole window rides
+        # the fd silencer, not just the (lazy by design, ADR-0001) import.
+        with _silenced_native_fds():
+            llama = sys.modules.get("llama_cpp") or importlib.import_module("llama_cpp")
+            raw = llama.llama_print_system_info()
+    except Exception:  # noqa: BLE001 — any import/binding failure reports itself
+        return "unavailable (llama.cpp not importable)"
+    text = raw.decode("ascii", "replace") if isinstance(raw, bytes) else str(raw or "")
+    return text.strip() or "no flags reported"
+
+
+def _llama_backends() -> tuple[bool, bool] | None:
+    """``(metal, cuda)`` — does the INSTALLED llama_cpp package ship the
+    backend dylibs? A find_spec glob (no import, no GPU init). ``None`` =
+    the package is not installed at all."""
+    try:
+        spec = importlib.util.find_spec("llama_cpp")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    pkg_dir = Path(next(iter(spec.submodule_search_locations)))
+    return (
+        any(pkg_dir.rglob("libggml-metal*")),
+        any(pkg_dir.rglob("libggml-cuda*")),
+    )
+
+
+def _scrub_home(text: str) -> str:
+    """Replace the home directory with ``~`` (LAUNCH-002 discipline — no
+    username-bearing paths in anything that leaves the process). The report
+    is path-free BY CONSTRUCTION (basenames only); this is the belt the
+    system-info C string is checked through."""
+    home = str(Path.home()).rstrip("/")
+    return text.replace(home, "~") if home else text
+
+
+def version_report_lines(
+    *,
+    model: tuple[str | None, str | None, str | None],
+    store: Store | None = None,
+    load_llama: bool = False,
+) -> list[str]:
+    """THE deterministic, value-free version block — every access path
+    (/version, the per-launch log, tools/version_report.py) prints these
+    identical lines. ``model`` is the truth triple from
+    :func:`_session_model_truth` (a live session) or :func:`_ladder_model_truth`
+    (launch/tool) — the two resolvers agree, including the env-missing rung
+    (both carry the unpinned path, never "none"); ``load_llama=True`` forces
+    the wheel import for the GPU flags (a user-facing report — /version and
+    the tool — answers the GPU question DEFINITIVELY; the launch-log line
+    never pays it, the ONE line that deliberately differs)."""
+    schema = "no store open"
+    if store is not None:
+        try:
+            schema = str(store.schema_version)
+        except (StoreError, sqlite3.Error):
+            schema = "unreadable"
+    llama = _dist_version(_LLAMA_DIST_NAME, fallback="")
+    backends = _llama_backends()
+    lines = [
+        (
+            f"app: local-wallet {_dist_version(_DIST_NAME, _APP_VERSION)} "
+            f"@ {_build_commit()}"
+            + (
+                " (editable install — stamp may be older than running source)"
+                if _is_editable_install()
+                else ""
+            )
+        ),
+        f"prompt: {_prompt_fingerprint()}",
+        _model_line(model),
+    ]
+    if not llama and backends is None:
+        lines.append("llama.cpp: not installed")
+        lines.append("backends: unknown (llama.cpp not installed)")
+    else:
+        lines.append(
+            f"llama.cpp: {llama or 'version unknown'}, flags: {_llama_flags(load_llama)}"
+        )
+        lines.append(
+            f"backends: metal={backends[0]}, cuda={backends[1]}"
+            if backends is not None
+            else "backends: unknown (package layout not found)"
+        )
+    lines.append(f"store: schema={schema}, intents={len(INTENT_REGISTRY)}")
+    return [_scrub_home(line) for line in lines]
+
 
 class _QuitSentinel:
     """Terminal command: stops the pump BETWEEN turns (never-cancel)."""
@@ -12833,6 +13154,10 @@ class EngineContext:
     #: transport arms it with :data:`PRELOAD_START` (CLI at pump entry, web
     #: after the URL/token launch lines — see :class:`_PreloadStart`).
     preload: ModelPreloadFlow | None = None
+    #: TCK-VER-001: the env rung's RAW path when THAT rung was selected but
+    #: the file is missing (no preload flow exists) — threaded so /version in
+    #: the session reports the same unpinned missing path as the launch log.
+    session_env_path: str | None = None
     #: TCK-APP-LOG-001: the mode-aware output router (web mode only). When
     #: present, :func:`start_engine` binds the engine emitter to it right
     #: after bootstrap so startup narration reaches the SSE stream (and
@@ -14121,6 +14446,7 @@ def start_engine(
                 provision=ctx.provision,
                 model=ctx.model,
                 preload=ctx.preload,
+                session_env_path=ctx.session_env_path,
                 backend=ctx.backend,
                 settings=ctx.settings,
                 hwi=ctx.hwi,
@@ -14597,6 +14923,7 @@ def _pump(
     provision: WatchKeyProvision | None = None,
     model: ModelDownloadFlow | None = None,
     preload: ModelPreloadFlow | None = None,
+    session_env_path: str | None = None,
     backend: ChainBackendFlow | None = None,
     settings: Settings | None = None,
     hwi: HwiUsbSigner | None = None,
@@ -15225,6 +15552,13 @@ def _pump(
                 session=session,
                 store=store,
                 onboarding=onboarding,
+                # TCK-VER-001: /version reports the SESSION's model truth
+                # (the LAUNCH-003 preload flow IS the resolved selection);
+                # session_env_path is the env rung's RAW path when selected
+                # but missing — so the report matches the launch log's ladder.
+                preload_flow=preload,
+                session_env_path=session_env_path,
+                model_flow=model,
             )
         elif onboarding is not None and onboarding.handle_line(line, output_fn):
             # TCK-ONB-003/005: consumed on the deterministic onboarding
@@ -15535,6 +15869,11 @@ def run(
     generate: ModelRuntime | GenerateFn | RemoteOpenAIRuntime
     model_flow: ModelDownloadFlow | None = None
     preload_flow: ModelPreloadFlow | None = None
+    # TCK-VER-001: the env rung's path when THAT rung was selected but the
+    # file is missing (no preload flow exists) — carried so the launch-log
+    # model truth matches the tool's ladder instead of the misleading
+    # "none (demo stub or remote-bridge run)".
+    session_env_path: str | None = None
     if generate_fn is not None:
         # Injected bare model callable (test seam) — used ahead of the
         # env/flag selection; flows through handle_raw like any runtime.
@@ -15554,6 +15893,7 @@ def run(
         # the app never invents a verdict against no pin. The hasattr guard
         # is the test seam that swaps in a faked runtime with no load hook.
         env_model = os.environ.get(MODEL_PATH_ENV_VAR, "")
+        session_env_path = env_model or None
         if env_model and Path(env_model).is_file() and hasattr(generate, "load"):
             preload_flow = ModelPreloadFlow(
                 generate,  # type: ignore[arg-type]  # env rung: always ModelRuntime
@@ -15606,6 +15946,18 @@ def run(
             generate = stub_generate
             output(NO_MODEL_DEMO_BANNER)
 
+    # TCK-VER-001: the version block rides the per-launch log (APP-LOG-001
+    # discipline — narration goes to the transcript, errors + VERSION go to
+    # the log), written HERE because this is where the session's model truth
+    # exists, and it covers BOTH modes (the web/CLI split is below). No
+    # store is open yet at this point → the schema line says so honestly;
+    # /version (and the tool) carry the full block. load_llama stays False:
+    # the launch line must never pay the wheel's GPU init.
+    for _vline in version_report_lines(
+        model=_session_model_truth(preload_flow, model_flow, env_path=session_env_path)
+    ):
+        log.write("INFO", f"version {_vline}")
+
     # TCK-CFG-001 preflight: resolve + validate LOCALWALLET_GAP_LIMIT
     # (fail-closed, value-free — the same spirit as the zpub config-error
     # path above). A malformed value refuses startup with exit 2 BEFORE any
@@ -15641,6 +15993,7 @@ def run(
             open_browser=open_browser,
             model=model_flow,
             preload=preload_flow,
+            session_env_path=session_env_path,
         )
 
     assert descriptor is not None  # CLI reaches here only with a key
@@ -15679,6 +16032,7 @@ def run(
             onboarding=wiring.onboarding,
             model=model_flow,
             preload=preload_flow,
+            session_env_path=session_env_path,
             backend=wiring.swap,
             hwi=wiring.hwi,
             fee_estimator=wiring.fee_estimator,
@@ -17027,6 +17381,7 @@ def _run_web(
     open_browser: bool = False,
     model: ModelDownloadFlow | None = None,
     preload: ModelPreloadFlow | None = None,
+    session_env_path: str | None = None,
 ) -> int:
     """The web launch (TCK-WEB-002, ADR-0024 §1/§3/§11; default UI and
     browser auto-open per the TCK-LAUNCH-001 amendment).
@@ -17113,6 +17468,7 @@ def _run_web(
                 provision=provision,
                 model=model,
                 preload=preload,
+                session_env_path=session_env_path,
                 output=output,
             )
         try:
@@ -17166,6 +17522,7 @@ def _run_web(
             provision=provision,
             model=model,
             preload=preload,
+            session_env_path=session_env_path,
             output=output,
             backend=wiring.swap,
             settings=wiring.settings,
@@ -17466,6 +17823,7 @@ def _repl(
     onboarding: OnboardingFlow | None = None,
     model: ModelDownloadFlow | None = None,
     preload: ModelPreloadFlow | None = None,
+    session_env_path: str | None = None,
     backend: ChainBackendFlow | None = None,
     hwi: HwiUsbSigner | None = None,
     fee_estimator: FeeEstimator | None = None,
@@ -17531,6 +17889,7 @@ def _repl(
             onboarding=onboarding,
             model=model,
             preload=preload,
+            session_env_path=session_env_path,
             backend=backend,
             hwi=hwi,
             fee_estimator=fee_estimator,
@@ -17556,6 +17915,7 @@ _TRANSCRIPT_HELP: Final[str] = (
     "public Electrum server); "
     "/export <path> — write a redacted session transcript; "
     "/scrub — clear the in-memory transcript; "
+    "/version — show exactly which build, prompt, and model are running; "
     "/balance, /receive, /address, /settings — model-free reads (work "
     "without the local LLM); /download, /later — answer the model card; "
     "/verifyaddress <branch> <index> — show that own address on your "
@@ -17678,9 +18038,12 @@ def _handle_transcript_command(
     session: SendSession | None = None,
     store: Store | None = None,
     onboarding: OnboardingFlow | None = None,
+    preload_flow: ModelPreloadFlow | None = None,
+    session_env_path: str | None = None,
+    model_flow: ModelDownloadFlow | None = None,
 ) -> None:
     """Handle an OQ14 transcript CLI command (``/details``, ``/label``,
-    ``/setup``, ``/export``, ``/scrub``, ``/help``).
+    ``/setup``, ``/export``, ``/scrub``, ``/version``, ``/help``).
 
     Deterministic UI features, NOT model intents (ADR-0020): no protocol,
     grammar, or prompt change. Output is short and plain. ``/details``
@@ -17730,6 +18093,19 @@ def _handle_transcript_command(
     if cmd == "/scrub":
         loop.scrub()
         output_fn("Transcript cleared.")
+        return
+    if cmd == "/version":
+        # TCK-VER-001: the deterministic version block (build commit, prompt
+        # fingerprint, model + manifest-pin checksum, GPU/backend flags,
+        # schema + intent pins) — same channel as /details, never a model
+        # intent, value-free by construction. ``load_llama`` True: a
+        # user-facing report answers "is inference on GPU?" DEFINITIVELY.
+        for line in version_report_lines(
+            model=_session_model_truth(preload_flow, model_flow, env_path=session_env_path),
+            store=store,
+            load_llama=True,
+        ):
+            output_fn(line)
         return
     if cmd == "/export":
         if len(parts) < 2 or not parts[1].strip():

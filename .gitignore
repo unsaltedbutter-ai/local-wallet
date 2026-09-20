@@ -36,3 +36,7 @@ psbt-transfer/
 
 # user config (CFG-003: repo-root config.json — never commit user settings)
 /config.json
+
+# build-time commit stamp (VER-001: written by install.sh, regenerated per
+# install — never tracked; its absence means an honest "source run")
+/src/localwallet/_build_commit.py

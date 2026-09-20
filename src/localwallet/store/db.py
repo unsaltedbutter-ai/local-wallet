@@ -474,6 +474,13 @@ class Store(AbstractContextManager["Store"]):
         """Active journal mode ('wal' for file DBs, None for :memory:)."""
         return self._wal_mode
 
+    @property
+    def schema_version(self) -> int:
+        """The live ``PRAGMA user_version`` stamp of THIS database (TCK-VER-001
+        version report). A typed read like every other accessor — no raw SQL
+        escapes store/."""
+        return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+
     def _migrate(self) -> None:
         """Bring the on-disk schema up to :data:`SCHEMA_VERSION` via
         ``PRAGMA user_version``-gated, incremental up-migrations.

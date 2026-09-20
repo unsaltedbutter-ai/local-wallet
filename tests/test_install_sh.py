@@ -184,3 +184,63 @@ def test_default_model_falls_back_to_first(tmp_path):
     res = _default_model(tmp_path)
     assert res.returncode == 0, res.stderr
     assert res.stdout == "first"
+
+
+# --------------------------------------------------------------------------- #
+# stamp_commit (TCK-VER-001: embed the install-time commit in the package)
+# --------------------------------------------------------------------------- #
+
+def _git(repo, *args):
+    return _run(
+        "git", "-C", str(repo),
+        "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+        *args,
+    )
+
+
+def _stamp(repo):
+    return _run(
+        "bash", "-c", 'source "$1"; REPO="$2"; stamp_commit', "sh",
+        INSTALL_SH, str(repo),
+    )
+
+
+def _stamp_file(repo):
+    return repo / "src" / "localwallet" / "_build_commit.py"
+
+
+def test_stamp_commit_embeds_head(tmp_path):
+    """A clean checkout stamps exactly the 12-hex HEAD commit — the value
+    the running app's version report reads (no runtime git dependency)."""
+    repo = tmp_path / "r"
+    (repo / "src" / "localwallet").mkdir(parents=True)
+    assert _git(repo, "init", "-q").returncode == 0
+    assert _git(repo, "commit", "-q", "--allow-empty", "-m", "c0").returncode == 0
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()[:12]
+    res = _stamp(repo)
+    assert res.returncode == 0, res.stderr
+    content = _stamp_file(repo).read_text(encoding="utf-8")
+    assert f'BUILD_COMMIT = "{head}"' in content
+
+
+def test_stamp_commit_marks_dirty_checkout(tmp_path):
+    """Uncommitted edits are honestly stamped -dirty (never a clean-looking
+    hash of code that was never committed)."""
+    repo = tmp_path / "r"
+    (repo / "src" / "localwallet").mkdir(parents=True)
+    assert _git(repo, "init", "-q").returncode == 0
+    assert _git(repo, "commit", "-q", "--allow-empty", "-m", "c0").returncode == 0
+    (repo / "edited.py").write_text("x", encoding="utf-8")  # porcelain nonempty
+    res = _stamp(repo)
+    assert res.returncode == 0, res.stderr
+    assert '-dirty"' in _stamp_file(repo).read_text(encoding="utf-8")
+
+
+def test_stamp_commit_without_git_is_silent(tmp_path):
+    """No git → no stamp (the app then reports the honest
+    'unknown (editable/source run)') — the installer never fabricates."""
+    repo = tmp_path / "nongit"
+    (repo / "src" / "localwallet").mkdir(parents=True)
+    res = _stamp(repo)
+    assert res.returncode == 0, res.stderr
+    assert not _stamp_file(repo).exists()

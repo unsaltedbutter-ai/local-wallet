@@ -113,6 +113,20 @@ install_pkg() {
   ( cd "$REPO" && "$UV" pip install --python "$REPO/.venv/bin/python" -e '.[dev]' )
 }
 
+# TCK-VER-001: embed the exact commit this install was BUILT FROM into the
+# package (src/localwallet/_build_commit.py — gitignored, regenerated every
+# install), because the running app has NO git dependency to ask at runtime.
+# Uncommitted edits are honestly stamped "-dirty"; no git / not a repo → no
+# stamp, and the app's version report says "unknown (editable/source run)"
+# rather than fabricating one.
+stamp_commit() {
+  local commit dirty
+  commit="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" || return 0
+  dirty="$(git -C "$REPO" status --porcelain 2>/dev/null)"
+  printf '"""Build commit embedded by install.sh (TCK-VER-001) — generated, gitignored."""\n\nBUILD_COMMIT = "%s%s"\n' \
+    "${commit:0:12}" "${dirty:+-dirty}" > "$REPO/src/localwallet/_build_commit.py"
+}
+
 # Resolves the default model name from the manifest (the "default": true entry,
 # falling back to the first entry). Emits just the name; exits non-zero if the
 # manifest is missing or unreadable.
@@ -219,6 +233,7 @@ main() {
   ensure_python
   ensure_repo
   install_pkg
+  stamp_commit
   maybe_model
   next_steps
 }
