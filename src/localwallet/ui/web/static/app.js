@@ -1329,12 +1329,16 @@ function noteTxidRefs(raw) {
 // scan, and the /details card renders its full values as elements).
 function chipTxidTokens(turn, refs) {
   // Token-boundary awareness: the shape gate pins every token to 8 hex +
-  // "…" (regex-inert characters, no escaping needed), and the hex
-  // lookarounds keep the swap from ever firing mid-word — a token substring
+  // "…" (regex-inert characters, no escaping needed), and the hex boundary
+  // checks keep the swap from ever firing mid-word — a token substring
   // inside a longer hex run (the FULL id starts with the same 8 hex!) never
-  // matches, only the standalone printed token does.
+  // matches, only the standalone printed token does. The LEFT boundary is a
+  // CONSUMED prefix group (^|non-hex) re-emitted as text, NOT a regex
+  // lookbehind: lookbehind throws SyntaxError at construction on engines
+  // pre-Safari-16.4, and that throw would ride the bare event catch into a
+  // replay-storm reconnect loop. Same semantics, fuzzer-verified.
   const re = new RegExp(
-    "(?<![0-9a-f])(" + Array.from(refs.keys()).join("|") + ")(?![0-9a-f])",
+    "(^|[^0-9a-f])(" + Array.from(refs.keys()).join("|") + ")(?![0-9a-f])",
     "g",
   );
   for (const line of turn.querySelectorAll(
@@ -1348,13 +1352,17 @@ function chipTxidTokens(turn, refs) {
       let m;
       re.lastIndex = 0;
       while ((m = re.exec(text)) !== null) {
-        if (m.index > last) {
-          pieces.push(document.createTextNode(text.slice(last, m.index)));
+        // m[1] is the consumed non-hex prefix ("" at string start): the token
+        // begins after it and the slice above re-emits it as plain text.
+        const start = m.index + m[1].length;
+        const token = m[2];
+        if (start > last) {
+          pieces.push(document.createTextNode(text.slice(last, start)));
         }
-        const chip = utxoTxidChip(refs.get(m[0]));
-        chip.dataset.copyText = m[0]; // copied text keeps the COMPACT token
+        const chip = utxoTxidChip(refs.get(token));
+        chip.dataset.copyText = token; // copied text keeps the COMPACT token
         pieces.push(chip);
-        last = m.index + m[0].length;
+        last = start + token.length;
       }
       if (pieces.length === 0) continue;
       if (last < text.length) pieces.push(document.createTextNode(text.slice(last)));

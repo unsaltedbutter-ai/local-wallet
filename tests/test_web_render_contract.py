@@ -4628,7 +4628,9 @@ def test_utxo008_coin_select_lifecycle_under_node() -> None:
 # The window is bubble-scoped, NOT order-scoped: watch-drain refs-BEFORE-line
 # (stashed, chipped as lines land) and turn-renderer refs-AFTER-lines
 # (immediate) chip identically; closeOpenTurn ends the window. Token matching
-# is boundary-aware (hex lookarounds — never a chip mid-hash or mid-word).
+# is boundary-aware (consumed non-hex prefix + hex lookahead — never a chip
+# mid-hash or mid-word; NO lookbehind, which throws pre-Safari-16.4 and would
+# turn one frame into a permanent replay-storm reconnect loop).
 # The rows upgrade keeps pairing on a COMPACT needle ("tx <8hex>…") — the
 # COUPLING FIX without which the shipped UTXO-006 row chip silently stops
 # swapping (pinned behaviorally by the 008 lifecycle harness, whose narration
@@ -4671,13 +4673,20 @@ def test_txid002_refs_chip_static_pins() -> None:
     # (the rows-present surface keeps the UTXO-006 row chip as its single
     # mechanism: the utxo-rows-absence rule, client half).
     chip = fn("chipTxidTokens")
-    assert "utxoTxidChip(refs.get(m[0]))" in chip
-    assert 'chip.dataset.copyText = m[0];' in chip
+    assert "utxoTxidChip(refs.get(token))" in chip
+    assert 'chip.dataset.copyText = token;' in chip
     assert "node.nodeType !== Node.TEXT_NODE" in chip
     assert ':not(.utxo-row)' in chip
     # TOKEN-BOUNDARY matching (the "tx d2c5204c… vout 1" inside-larger-text
-    # rule; a token substring of a longer hex run never matches):
-    assert r'"(?<![0-9a-f])(" + Array.from(refs.keys()).join("|") + ")(?![0-9a-f])"' in chip
+    # rule; a token substring of a longer hex run never matches). The LEFT
+    # boundary is a CONSUMED prefix group re-emitted as text — a lookbehind
+    # throws SyntaxError on pre-Safari-16.4 engines, and that throw would
+    # ride the bare event catch into a permanent replay-storm reconnect loop.
+    assert r'"(^|[^0-9a-f])(" + Array.from(refs.keys()).join("|") + ")(?![0-9a-f])"' in chip
+    assert 'const start = m.index + m[1].length;' in chip  # prefix skipped
+    assert "refs.get(m[0])" not in chip  # m[0] now CARRIES the prefix
+    # the file-wide lookbehind ban (the same wedge class, anywhere in app.js):
+    assert "(?<" not in raw
     # the bubble-scoped window, both orders + the per-bubble lifetime:
     note = fn("noteTxidRefs")
     assert "state.txidRefs = refs;" in note  # stash (refs-BEFORE-line)
@@ -4904,10 +4913,23 @@ def test_txid002_refs_chip_render_under_node() -> None:
         // (b) a direct-ask line: the FULL id stands alone (the WEB-014 scan
         //     made it the verbatim copy button) — refs can never touch it.
         landLine(t6, "Transaction id for utxo #1: " + TX);
+        // (c) LEFT edge of the consumed-prefix boundary: the token at the
+        //     string START and at the string END are real standalone tokens
+        //     (the (^|...) alternation's two arms); and a hex char AFTER
+        //     the ellipsis keeps the lookahead arm closed (mid-word right).
+        landLine(t6, TOK + " confirmed");            // start-of-string token
+        landLine(t6, "sent " + TOK);                  // end-of-string token
+        landLine(t6, "echo " + TOK + "ab not-a-token"); // right-hex-adjacent
         noteTxidRefs(JSON.stringify([entry(TOK, TX)]));
         const mid = t6.children[0], ask = t6.children[1];
+        const atStart = t6.children[2], atEnd = t6.children[3], rightHex = t6.children[4];
         if (chips(mid).length !== 0) throw new Error("mid-word-chip");
         if (chips(ask).length !== 0) throw new Error("details-chipped");
+        if (chips(atStart).length !== 1 || chips(atEnd).length !== 1)
+          throw new Error("edge-token-unchipped");
+        if (lineText(atStart) !== TOK + " confirmed" || lineText(atEnd) !== "sent " + TOK)
+          throw new Error("edge-token-text");
+        if (chips(rightHex).length !== 0) throw new Error("right-hex-chip");
         const tokBtn = parts(ask).find((c) => c.classList.contains("explorer-link"));
         if (!tokBtn || tokBtn.textContent !== TX) throw new Error("ask-token-btn");
         // ---- 7. multiple tokens, mixed gates + per-token independence ----
