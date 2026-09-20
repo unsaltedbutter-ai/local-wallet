@@ -360,11 +360,15 @@ def test_state_snapshot_request_is_answered_on_the_engine_thread(
     def spy_build(flow, session, watcher, scan=None, model=None, backend_kind=None,
                   preload=None, privacy_mode=None, backend_host=None,
                   wallet_fingerprint=None, suggested_servers=None,
-                  signer_kind=None):
+                  signer_kind=None, wallet_fingerprint_kind=None):
+        # TCK-FP-001 re-adjudication: the spy mirrors the builder's NEW
+        # kwarg (wallet_fingerprint_kind) — a pump that stopped passing it
+        # (or a builder that gained one the spy doesn't forward) fails here.
         build_threads.append(threading.get_ident())
         return real_build(flow, session, watcher, scan, model, backend_kind, preload,
                           privacy_mode, backend_host, wallet_fingerprint,
-                          suggested_servers, signer_kind=signer_kind)
+                          suggested_servers, signer_kind=signer_kind,
+                          wallet_fingerprint_kind=wallet_fingerprint_kind)
 
     monkeypatch.setattr(app, "build_state_snapshot", spy_build)
     events: list[EngineEvent] = []
@@ -1070,6 +1074,19 @@ FP_ZPUB_B = "85f9fd4d"
 
 _FP_SHAPE = re.compile(r"[0-9a-f]{8}")
 
+#: TCK-FP-001: an arbitrary closed-shape device-origin fp for the pins
+#: (never the fixture's real master — these rows test the READER).
+FP_JUNK = "abcdef01"
+
+
+def _fp001_paste(fp: str) -> str:
+    """The STORED descriptor string an origin-carrying provisioning paste
+    produces (canonical form: checksummed, apostrophe path)."""
+    from embit.descriptor.checksum import checksum
+
+    body = f"wpkh([{fp}/84'/0'/0']{ZPUB}/{{0,1}}/*)"
+    return f"{body}#{checksum(body)}"
+
 
 def _fingerprint_snapshot(bootstrap: Any) -> dict[str, object]:
     """One typed /state read through a real engine pump (the WEB-010 source
@@ -1116,7 +1133,9 @@ def test_state_snapshot_carries_wallet_fingerprint_from_known_descriptor(
 ) -> None:
     """Done-when 1+6: the additive /state field carries the 8-hex origin fp
     of the STORED descriptor, verbatim and lowercase — engine truth read
-    from the row built from the fixture zpub (pinned value, not recomputed)."""
+    from the row built from the fixture zpub (pinned value, not recomputed).
+    TCK-FP-001: the row was built from a BARE key, so the provenance kind
+    pin is "account" (the value stays exactly the WEB-027-pinned fp)."""
     snap = _fingerprint_snapshot(
         _store_bootstrap(
             tmp_path, ("default", app.WalletDescriptor.from_key(ZPUB).descriptor)
@@ -1125,33 +1144,44 @@ def test_state_snapshot_carries_wallet_fingerprint_from_known_descriptor(
     fp = snap["wallet_fingerprint"]
     assert fp == FP_ZPUB
     assert _FP_SHAPE.fullmatch(fp)
+    assert snap["wallet_fingerprint_kind"] == "account"
 
 
 def test_state_snapshot_omits_wallet_fingerprint_when_unprovisioned(
     tmp_path: Path,
 ) -> None:
     """Done-when 2: no store (first-run placeholder) or a store with no
-    active wallet → the field is ABSENT — never empty, never fabricated
-    (the ``privacy_mode``/``backend_host`` absent pattern)."""
-    assert "wallet_fingerprint" not in _fingerprint_snapshot(_bare_context())
-    assert "wallet_fingerprint" not in _fingerprint_snapshot(
-        _store_bootstrap(tmp_path)
-    )
+    active wallet → BOTH fingerprint fields are ABSENT — never empty, never
+    fabricated (the ``privacy_mode``/``backend_host`` absent pattern; the
+    TCK-FP-001 kind rides the value, never alone)."""
+    snap = _fingerprint_snapshot(_bare_context())
+    assert "wallet_fingerprint" not in snap and "wallet_fingerprint_kind" not in snap
+    snap = _fingerprint_snapshot(_store_bootstrap(tmp_path))
+    assert "wallet_fingerprint" not in snap and "wallet_fingerprint_kind" not in snap
 
 
 def test_wallet_fingerprint_reader_enforces_the_closed_shape(
     tmp_path: Path,
 ) -> None:
-    """Done-when 4: the regex IS the validator — the lowercase 8-hex origin
-    rides verbatim; uppercase, malformed, or descriptor-less rows yield
-    ``None`` (the /state field is then omitted by the builder), never
-    garbage and never a normalization."""
+    """Done-when 4 (TCK-FP-001 re-adjudication): the reader is STILL the
+    validator — now the WHOLE stored shape (origin lowercase-8-hex, real
+    mainnet key, standard template, checksum when present), not just the
+    regex. The closed origin fp rides verbatim with its provenance kind;
+    anything else yields ``None`` (both /state fields omitted), never
+    garbage and never a normalization. The old lines used a placeholder key
+    ``x`` that the pure-regex reader never looked at; the classifier parses
+    the key (it must, to derive the kind), so those rows now take the
+    honest fail-closed path — replaced here by real-key equivalents."""
     store = Store(str(tmp_path / "shape.db"))
     cases = (
-        ("wpkh([abcdef01/84'/0'/0']x/{0,1}/*)", "abcdef01"),
-        ("wpkh([DEADBEEF/84'/0'/0']x/{0,1}/*)", None),  # not lowercase
-        ("wpkh([deadbee/84'/0'/0']x/{0,1}/*)", None),  # 7 hex — too short
+        # closed-shape origin ≠ the key's own fp → master kind, verbatim:
+        (_fp001_paste(FP_JUNK), (FP_JUNK, "master")),
+        # the key's own fp as origin (bare-kind stamping) → account kind:
+        (_fp001_paste(FP_ZPUB), (FP_ZPUB, "account")),
+        (f"wpkh([DEADBEEF/84'/0'/0']{ZPUB}/{{0,1}}/*)", None),  # not lowercase
+        (f"wpkh([deadbee/84'/0'/0']{ZPUB}/{{0,1}}/*)", None),  # 7 hex — too short
         ("desc", None),  # no origin at all
+        ("wpkh([deadbeef/84'/0'/0']x/{0,1}/*)", None),  # placeholder key: unreadable
     )
     for i, (descriptor, expected) in enumerate(cases):
         wallet = store.create_wallet(f"w{i}", descriptor)
@@ -1226,9 +1256,14 @@ def test_watch_key_provision_and_replace_moves_the_fingerprint(
         provision=prov,
     )
     assert "wallet_fingerprint" not in pre.get()  # unprovisioned: omitted
-    assert post.get()["wallet_fingerprint"] == FP_ZPUB
+    post_snap = post.get()
+    assert post_snap["wallet_fingerprint"] == FP_ZPUB
+    # TCK-FP-001: both keys came from BARE zpubs — the kind stays "account"
+    # for the whole move (the value rule is WEB-027's, unchanged).
+    assert post_snap["wallet_fingerprint_kind"] == "account"
     snap = replaced.get()
     assert snap["wallet_fingerprint"] == FP_ZPUB_B  # follows the NEW key
+    assert snap["wallet_fingerprint_kind"] == "account"
     assert any(
         e.kind == EVENT_TEXT and e.payload == app._WATCHKEY_REPLACED_NOTE
         for e in events
@@ -1256,6 +1291,31 @@ def test_build_state_snapshot_fingerprint_is_the_only_source() -> None:
     # test_web_server.test_every_endpoint_requires_token_and_replies_http_1_0).
 
 
+def test_fp001_kind_rides_with_the_fingerprint_and_only_with_it() -> None:
+    """Done-when 2 (payload-shape pin): the additive
+    ``wallet_fingerprint_kind`` is emitted ONLY alongside a present
+    ``wallet_fingerprint`` — kind alone or a lone value both keep the old
+    contract (the WEB-027 client gate sees its unchanged 8-hex field
+    either way)."""
+    only_value = app.build_state_snapshot(
+        TxFlow(),
+        app.SendSession(),
+        None,
+        wallet_fingerprint=FP_ZPUB,
+        wallet_fingerprint_kind="account",
+    )
+    assert only_value["wallet_fingerprint_kind"] == "account"
+    legacy = app.build_state_snapshot(
+        TxFlow(), app.SendSession(), None, wallet_fingerprint=FP_ZPUB
+    )
+    assert "wallet_fingerprint_kind" not in legacy  # old pump: value alone
+    kindless = app.build_state_snapshot(
+        TxFlow(), app.SendSession(), None, wallet_fingerprint_kind="account"
+    )
+    assert "wallet_fingerprint_kind" not in kindless  # value absent → pair absent
+    assert "wallet_fingerprint" not in kindless
+
+
 # ------------------------------------------- TCK-WEB-032 fp-provenance verdict
 #
 # USER REPORT: Sparrow and the hardware-device screen show the SAME 8-hex
@@ -1263,15 +1323,17 @@ def test_build_state_snapshot_fingerprint_is_the_only_source() -> None:
 # the device's MASTER fingerprint (the HW-002 ledger recorded this user's
 # Jade master fp the same way); a device-sourced import (Sparrow's
 # "import from hardware wallet") receives it FROM THE DEVICE at import time
-# and stores it as its descriptor origin. Our provisioning path never talks
-# to a device at import and accepts ONLY the bare account key — every entry
-# (typed POST /watchkey :meth:`app.WatchKeyProvision.provision`, CLI
-# ``--zpub``/env, interactive onboarding) funnels through
-# :meth:`app.WalletDescriptor.from_key`, which bakes the origin from the
-# key's OWN fingerprint (descriptor.py). VERDICT (outcome b): device-screen
-# parity is NOT achievable on this path without fabricating a value
-# (forbidden, honesty invariant); the chip keeps the account fp and the
-# static hint gained one clarifying sentence. These pins assert fp VALUES
+# and stores it as its descriptor origin. — TCK-FP-001 RE-ADJUDICATION
+# (2026-09-20 user direction): the verdict's outcome (b) ("keep the
+# account fp, clarify the label") stood until provisioning input could
+# honestly CARRY the origin; it now does — every entry accepts the
+# device-export shapes ([fp/path]key and the full descriptor), the chip
+# shows the origin fp as kind "master" (Sparrow/Coldcard/Jade parity), and
+# the bare-key path keeps the account fp AS the account fp (kind
+# "account", the relabel the static half ships). What the verdict still
+# pins — and these tests still assert — is that NO master fp is ever
+# synthesized: the value is either the key's own (provable) or the user's
+# own paste, verbatim. These pins assert fp VALUES
 # from the synthetic fixture seed behind the canonical ZPUB — never the
 # user's key material.
 
@@ -1304,9 +1366,11 @@ def _sparrow_shape_paste() -> str:
 def test_web032_bare_zpub_provenance_stores_the_account_fp(
     tmp_path: Path,
 ) -> None:
-    """Input shape (a) — bare zpub, the ONLY shape any entry accepts: the
-    stored descriptor origin, and therefore the /state chip value, is the
-    ACCOUNT-key fp — verifiably NOT the device master fp (pinned values)."""
+    """Input shape (a) — bare zpub: the stored descriptor origin, and
+    therefore the /state chip value, is the ACCOUNT-key fp — verifiably NOT
+    the device master fp (pinned values). TCK-FP-001: the reader now names
+    this provenance out loud — kind ``"account"``; the VALUE is byte-for-byte
+    the WEB-027 pin (the bare-key behaviour change is ONLY the label)."""
     assert _fixture_master_fingerprint() == FP_FIXTURE_MASTER
     assert FP_FIXTURE_MASTER != FP_ZPUB  # the two numbers of the report
     descriptor = app.WalletDescriptor.from_key(ZPUB)
@@ -1315,39 +1379,48 @@ def test_web032_bare_zpub_provenance_stores_the_account_fp(
     try:
         wallet = store.create_wallet("default", descriptor.descriptor)
         store.set_active_wallet(wallet.id)
-        assert app._active_wallet_fingerprint(store) == FP_ZPUB
+        assert app._active_wallet_fingerprint(store) == (FP_ZPUB, "account")
     finally:
         store.close()
 
 
-def test_web032_descriptor_form_is_refused_at_the_provisioning_entries() -> None:
-    """Input shape (b) — the one shape that COULD carry the origin fp is
-    refused by the gated KEY parser every provisioning entry uses (typed
-    ``/watchkey`` → :meth:`from_key`; onboarding validates via
-    :func:`parse_wallet_key` before the same rung). The refusal is
-    value-free: no pasted material rides the error."""
+def test_web032_descriptor_form_now_accepted_at_from_key_key_parser_still_refuses() -> None:
+    """Input shape (b) — RE-ADJUDICATED by TCK-FP-001: the provisioning
+    entries (which all funnel through :meth:`from_key`) now ACCEPT the
+    origin-carrying and full-descriptor shapes and keep a supplied master
+    fp verbatim (kind "master", pinned end-to-end in
+    :func:`test_fp001_origin_paste_end_to_end`). The pure KEY parser
+    (:func:`parse_wallet_key`, the detect-only layer and the key half of
+    every shape) still refuses descriptor material — its contract is one
+    extended key — and every refusal stays value-free."""
     from localwallet.wallet.descriptor import parse_wallet_key
 
     paste = _sparrow_shape_paste()
-    for entry in (app.WalletDescriptor.from_key, parse_wallet_key):
-        with pytest.raises(app.WatchKeyError) as excinfo:
-            entry(paste)
-        message = str(excinfo.value)
-        assert ZPUB not in message and FP_FIXTURE_MASTER not in message
+    with pytest.raises(app.WatchKeyError) as excinfo:
+        parse_wallet_key(paste)
+    message = str(excinfo.value)
+    assert ZPUB not in message and FP_FIXTURE_MASTER not in message
+    accepted = app.WalletDescriptor.from_key(paste)
+    assert accepted.descriptor.startswith(f"wpkh([{FP_FIXTURE_MASTER}/")
 
 
 def test_web032_rebuild_retains_a_supplied_origin_unverified() -> None:
     """Input shape (b), second half — the retention machinery
-    (:meth:`from_descriptor_string`) exists ONLY for re-reading a stored
-    row, and it keeps any origin verbatim WITHOUT verifying it against
-    anything: even a fabricated ``deadbeef`` survives. That is why
-    widening the provisioning input to it (outcome a) would replace an
-    engine-computed chip value with an unverified paste — the honest
-    answer is (b). The signer-bound fp is pinned to stay key-derived.
+    (:meth:`from_descriptor_string`) keeps any well-shaped origin verbatim
+    WITHOUT verifying it against anything: even a fabricated ``deadbeef``
+    survives. TCK-FP-001 re-adjudication: that remains true BY DESIGN —
+    the origin is the user's OWN claim about their OWN device (the same
+    disclosure class as the zpub itself, which nobody verifies either);
+    honesty is carried by (1) the closed path check (the origin must at
+    least be a legal account path FOR THAT KEY — mismatched-path paste is
+    refused value-free, pinned in tests/test_wallet_descriptor.py), (2) the
+    kind label the chip ships, and (3) the no-synthesis rule (a bare key
+    never gains a master fp). The signer-bound fp is pinned to stay
+    key-derived.
 
     And the machinery DOES preserve a real master fp when the string
-    carries one — so if a device-registration path ever supplies an
-    origin honestly (OQ18), nothing downstream drops it."""
+    carries one — so a device-export provisioning input keeps the number
+    the user's hardware screen shows."""
     retained = app.WalletDescriptor.from_descriptor_string(_sparrow_shape_paste())
     assert retained.descriptor.startswith(f"wpkh([{FP_FIXTURE_MASTER}/")
     # ... without ANY proof the origin is true — a junk origin survives too:
@@ -1362,4 +1435,140 @@ def test_web032_rebuild_retains_a_supplied_origin_unverified() -> None:
     # (signer binding + PSBT derivations read ``parsed.hd_key``):
     assert retained.parsed.hd_key.my_fingerprint.hex() == FP_ZPUB
     assert junk.parsed.hd_key.my_fingerprint.hex() == FP_ZPUB
+
+
+# ================================= TCK-FP-001 engine: origin-carrying input
+#
+# Done-when 1–3 at the ENGINE level: every provisioning entry accepts the
+# device-export shapes; the /state chip carries the master fp (kind
+# "master") when the input did; the STORED descriptor string carries the
+# origin (restart survives); and the HW-002 signer binding is untouched.
+
+
+def test_fp001_origin_paste_end_to_end_moves_the_chip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Typed POST /watchkey with ``[master-fp/84'/0'/0']zpub…``: the NEXT
+    snapshot carries the DEVICE MASTER fp (verbatim) with kind "master" —
+    Sparrow/Coldcard/Jade parity — while the SIGNER selection keeps the
+    ACCOUNT-key fp (HW-002 binding: signer + PSBT origin patching read
+    ``parsed.hd_key.my_fingerprint``, which no origin override touches)."""
+    for var in (
+        app.ZPUB_ENV_VAR, app.CHAIN_BASE_URL_ENV_VAR, app.GAP_LIMIT_ENV_VAR,
+        app.SIGNER_ENV_VAR, app.SIGNER_DIR_ENV_VAR, app.WATCH_INTERVAL_ENV_VAR,
+        app.AUTO_SCAN_ENV_VAR,
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(app, "_build_chain_client", lambda settings, auth=None: None)
+    from localwallet.config import Settings
+
+    prov = app.WatchKeyProvision(
+        settings=Settings(store_path=str(tmp_path / "fp001.db"), watch_interval_s=0.0),
+        signer_selection=app.SignerSelection(
+            kind="file", dir_path=tmp_path / "psbt", fingerprint_hex="00000000"
+        ),
+        env_gap=None,
+        rescan=False,
+        flow=None,
+        generate=app.stub_generate,
+        node_detect_fn=None,
+        output_fn=lambda _s: None,
+    )
+    events: list[EngineEvent] = []
+    emitter = EventEmitter(events.append)
+    commands: queue.Queue[Any] = queue.Queue()
+
+    def _snap() -> queue.Queue[dict[str, object]]:
+        reply: queue.Queue[dict[str, object]] = queue.Queue()
+        commands.put(app.StateSnapshotRequest(app.STATE_SNAPSHOT_COMMAND, reply))
+        return reply
+
+    paste = f"[{FP_FIXTURE_MASTER}/84'/0'/0']{ZPUB}"
+    reply: queue.Queue[dict[str, object]] = queue.Queue()
+    commands.put(app.WatchKeyRequest(app.WATCHKEY_COMMAND, paste, reply))
+    snap = _snap()
+    commands.put(app.QUIT)
+    app._pump(
+        _make_loop(),
+        emitter.text,
+        commands,
+        flow=TxFlow(),
+        session=app.SendSession(),
+        table={},
+        emitter=emitter,
+        provision=prov,
+    )
+    assert reply.get()["status"] == "accepted"  # key NEVER rides back
+    snapshot = snap.get()
+    assert snapshot["wallet_fingerprint"] == FP_FIXTURE_MASTER
+    assert snapshot["wallet_fingerprint_kind"] == "master"
+    # HW-002 pin: the signer-bound fp comes from the wiring's ``parsed``
+    # key (provision rebuilds the selection with descriptor.parsed's own
+    # fingerprint; every signer/PSBT-origin consumer reads
+    # ``parsed.hd_key.my_fingerprint``) — the paste's origin never reaches
+    # the binding, for ANY input shape.
+    assert prov.wiring is not None
+    assert prov.wiring.parsed.hd_key.my_fingerprint.hex() == FP_ZPUB
+    if prov.wiring is not None:
+        prov.wiring.worker.stop()
+        prov.wiring.store.close()
+
+
+def test_fp001_origin_survives_restart_via_the_stored_row(tmp_path: Path) -> None:
+    """Store persistence mechanic: the origin rides the STORED descriptor
+    string (no extra column); a fresh Store over the same file — the restart
+    path whose rebuild is :meth:`from_descriptor_string` — yields the same
+    master chip value AND kind."""
+    wd = app.WalletDescriptor.from_key(f"[{FP_FIXTURE_MASTER}/84'/0'/0']{ZPUB}")
+    store = Store(str(tmp_path / "fp001.db"))
+    try:
+        wallet = store.create_wallet("default", wd.descriptor)
+        store.set_active_wallet(wallet.id)
+    finally:
+        store.close()
+    reopened = Store(str(tmp_path / "fp001.db"))
+    try:
+        assert app._active_wallet_fingerprint(reopened) == (
+            FP_FIXTURE_MASTER,
+            "master",
+        )
+        rebuilt = app._stored_watch_descriptor(tmp_path / "fp001.db")
+        assert rebuilt is not None
+        assert rebuilt.descriptor == wd.descriptor
+        assert rebuilt.parsed.hd_key.my_fingerprint.hex() == FP_ZPUB  # binding
+    finally:
+        reopened.close()
+
+
+def test_fp001_mismatched_paste_rejected_value_free_through_the_provision_entry(
+    tmp_path: Path,
+) -> None:
+    """The provision entry surfaces the descriptor layer's origin refusals
+    AS ``rejected`` replies: a path that cannot belong to the key (49' on a
+    zpub) and a bad fp are both refused without echoing any material."""
+    from tests.test_e2e_skeleton import XPRV
+
+    prov = app.WatchKeyProvision(
+        settings=None,  # never reached: every case refuses before wiring
+        signer_selection=app.SignerSelection(
+            kind="file", dir_path=tmp_path / "psbt", fingerprint_hex="00000000"
+        ),
+        env_gap=None,
+        rescan=False,
+        flow=None,
+        generate=app.stub_generate,
+        node_detect_fn=None,
+        output_fn=lambda _s: None,
+    )
+    for paste in (
+        f"[{FP_FIXTURE_MASTER}/49'/0'/0']{ZPUB}",  # wrong purpose for zpub
+        f"[{FP_FIXTURE_MASTER}/84'/1'/0']{ZPUB}",  # testnet coin in the path
+        f"[notahexxx/84'/0'/0']{ZPUB}",  # malformed fp
+        f"[{FP_FIXTURE_MASTER}/84'/0'/0']{XPRV}",  # watch-only refusal holds
+    ):
+        reply = prov.provision(paste)
+        assert reply["status"] == "rejected", paste
+        message = str(reply["error"])
+        assert ZPUB not in message and XPRV not in message
+        assert FP_FIXTURE_MASTER not in message and "notahexxx" not in message
 

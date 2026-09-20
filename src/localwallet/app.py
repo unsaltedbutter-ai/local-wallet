@@ -316,6 +316,7 @@ from localwallet.wallet.descriptor import (
     ParsedKey,
     WalletDescriptor,
     WatchKeyError,
+    descriptor_fingerprint,
 )
 
 if TYPE_CHECKING:  # circular at runtime: ui.web.server imports this module
@@ -13213,27 +13214,24 @@ class StateSnapshotRequest:
     reply: queue.Queue[dict[str, object]]
 
 
-#: TCK-WEB-027: the CLOSED shape of the ``/state`` ``wallet_fingerprint`` —
-#: the 8-hex ORIGIN fingerprint embedded in the active wallet's descriptor
-#: (``wpkh([f1a2b3c4/84'/0'/0']zpub…``). This is the wallet's ACCOUNT-key
-#: fingerprint, NOT the device's master fingerprint: this project's descriptor
-#: convention carries the account key's own fp as the origin
-#: (wallet/descriptor.py:355-357) and the master fp is unknowable watch-only
-#: (HW-002's root cause — the two DIFFER and the device screen shows the
-#: MASTER). The regex IS the validator: anything not exactly this closed,
-#: lowercase 8-hex shape is omitted, never garbage-shipped.
-_WALLET_FINGERPRINT_RE: Final = re.compile(r"\[([0-9a-f]{8})/")
-
-
-def _active_wallet_fingerprint(store: Store | None) -> str | None:
-    """The active wallet's 8-hex descriptor-origin fingerprint, or ``None``.
+def _active_wallet_fingerprint(store: Store | None) -> tuple[str, str] | None:
+    """The active wallet's ``(8-hex fingerprint, provenance kind)``, or ``None``.
 
     Engine truth: read from the STORED descriptor on the engine thread (the
-    same read :func:`_watch_key_entry` does), never computed by any client
-    and never derived from model output. ``None`` — so the /state field is
+    same read :func:`_watch_key_entry` does) through
+    :func:`localwallet.wallet.descriptor.descriptor_fingerprint` — the
+    CLOSED-shape validator and provenance classifier (TCK-WEB-027 moved the
+    shape gate there in TCK-FP-001; the kind is a pure function of the
+    stored string, so it survives restarts with no extra column).
+    ``kind`` is ``"master"`` when the origin carries a device-exported
+    fingerprint that is NOT the shown key's own (Sparrow/Coldcard parity —
+    the number the user's hardware screen shows) and ``"account"`` when the
+    value IS the account key's own ``hash160`` (bare-key input — the
+    honest case HW-002 proved: the master fp is unknowable from a bare
+    account key and NEVER synthesized). ``None`` — so the /state fields are
     OMITTED, never empty/fabricated — when there is no store (unprovisioned
     first-run placeholder), no active wallet, a store read error, or a
-    descriptor whose origin does not carry the closed 8-hex shape. Because
+    descriptor whose origin does not carry the closed shape. Because
     the value rides the descriptor, a watch-key REPLACE (the pump rebinds
     onto the new wiring's store/row) makes the next snapshot carry the NEW
     wallet's fingerprint with no extra plumbing. Value-free class: a public
@@ -13249,8 +13247,7 @@ def _active_wallet_fingerprint(store: Store | None) -> str | None:
         return None
     if wallet is None:
         return None
-    match = _WALLET_FINGERPRINT_RE.search(wallet.descriptor)
-    return match.group(1) if match is not None else None
+    return descriptor_fingerprint(wallet.descriptor)
 
 
 def build_state_snapshot(
@@ -13266,6 +13263,7 @@ def build_state_snapshot(
     wallet_fingerprint: str | None = None,
     suggested_servers: Sequence[Mapping[str, str]] | None = None,
     signer_kind: str | None = None,
+    wallet_fingerprint_kind: str | None = None,
 ) -> dict[str, object]:
     """The value-free ``/state`` snapshot, built ON the engine thread.
 
@@ -13296,14 +13294,19 @@ def build_state_snapshot(
     credential can ride it (the parser drops userinfo) and no third-
     party host is ever named (public/local/awaiting modes omit the
     field). — TCK-WEB-027 council fold — the wallet's 8-hex
-    ``wallet_fingerprint`` (the descriptor-origin ACCOUNT-key fingerprint
-    the pump reads from the stored descriptor; the closed shape is
-    validated in the reader, and a wallet-less or unparseable read OMITS
-    the field — never empty, never fabricated). It is the same
+    ``wallet_fingerprint`` (the descriptor-origin fingerprint the pump reads
+    from the stored descriptor; the closed shape is validated in the reader,
+    and a wallet-less or unparseable read OMITS the field — never empty,
+    never fabricated). It is the same
     user-owned-identifier disclosure class as the token-gated watch_key
-    settings entry and rides ONLY the token-gated /state; the field name
-    is deliberately NOT "master" — the device's master fingerprint is
-    unknowable watch-only (HW-002). — TCK-HW-005 slice B (D7): the
+    settings entry and rides ONLY the token-gated /state. TCK-FP-001: the
+    paired additive ``wallet_fingerprint_kind`` NAME closes the provenance
+    (a closed :data:`~localwallet.wallet.descriptor.FINGERPRINT_KINDS`):
+    ``"master"`` — the input carried an origin (Coldcard/Sparrow export),
+    so this is the device MASTER fp the user's hardware screen shows;
+    ``"account"`` — the value is the shown key's OWN hash160 (bare-key
+    input; the HW-002 truth stands: a bare account key can never reveal
+    the master fp and none is ever synthesized). — TCK-HW-005 slice B (D7): the
     configured signer backend CLASS (a closed ``SIGNER_KIND_*`` NAME the
     pump passes precomputed: never a path, never a fingerprint), so the
     static half knows whether a hardware wallet is configured at all. —
@@ -13374,7 +13377,18 @@ def build_state_snapshot(
         # provisioned or an unparseable read — absent means "nothing to
         # show", never an empty string and never a guess (the
         # ``backend_host``/``privacy_mode`` absent pattern).
+        # TCK-FP-001: the paired additive ``wallet_fingerprint_kind`` (CLOSED
+        # :data:`~localwallet.wallet.descriptor.FINGERPRINT_KINDS` NAME —
+        # "master" when the value is a device-exported origin the input
+        # carried (Sparrow/Coldcard/Jade parity for the header chip),
+        # "account" when it is verifiably the shown key's own hash160) rides
+        # ONLY alongside the fingerprint — the pair comes from the one
+        # descriptor read; kind without value is meaningless, value without
+        # kind is the legacy shape an old pump sends. The static half labels
+        # the chip from the kind (default = the account wording).
         snapshot["wallet_fingerprint"] = wallet_fingerprint
+        if wallet_fingerprint_kind is not None:
+            snapshot["wallet_fingerprint_kind"] = wallet_fingerprint_kind
     if suggested_servers:
         # TCK-WEB-022: additive under state/1 (same rule). The pump supplies
         # the CODE-OWNED vetted public-Electrum chips verbatim — the builder
@@ -15319,8 +15333,11 @@ def _pump(
             # outranks it too (no server to name while unresolved).
             # TCK-WEB-027 (council fold): one more additive precomputed
             # string — the wallet's CLOSED 8-hex fingerprint, read from the
-            # stored descriptor's ORIGIN (engine truth; the ACCOUNT-key fp,
-            # NOT the unknowable device-master fp — HW-002). No store /
+            # stored descriptor's ORIGIN (engine truth; TCK-FP-001: the
+            # device MASTER fp when the provisioning input carried an
+            # origin, else the ACCOUNT key's own fp — the provenance NAME
+            # rides beside it, never a guess — HW-002's no-synthesis rule
+            # stands). No store /
             # no active wallet / malformed shape → None → OMITTED, never
             # fabricated. A watch-key replace rebinds ``store`` onto the
             # new wiring before any later snapshot is served, so the field
@@ -15337,7 +15354,7 @@ def _pump(
                 if settings is not None and privacy_mode in _BACKEND_HOST_MODES
                 else None
             )
-            wallet_fingerprint = _active_wallet_fingerprint(store)
+            wallet_fp = _active_wallet_fingerprint(store)
             snapshot = build_state_snapshot(
                 flow,
                 session,
@@ -15348,7 +15365,7 @@ def _pump(
                 preload,
                 privacy_mode,
                 backend_host,
-                wallet_fingerprint,
+                wallet_fp[0] if wallet_fp is not None else None,
                 SUGGESTED_ELECTRUM_SERVERS,
                 # TCK-HW-005 slice B (D7): the configured signer CLASS
                 # NAME (file|hwi) — precomputed closed enum value, no
@@ -15356,6 +15373,10 @@ def _pump(
                 signer_kind=(
                     signer_selection.kind if signer_selection is not None else None
                 ),
+                # TCK-FP-001: the paired provenance NAME from the SAME
+                # single descriptor read — both or neither, never one
+                # without the other's truth.
+                wallet_fingerprint_kind=(wallet_fp[1] if wallet_fp is not None else None),
             )
             if provision is not None and provision.wiring is None:
                 snapshot["needs_watch_key"] = True

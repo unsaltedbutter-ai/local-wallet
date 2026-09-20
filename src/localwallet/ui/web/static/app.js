@@ -160,19 +160,24 @@ const LABELS = {
     "Your node at {host} — only private if you run this server yourself.",
   privacyAwaiting: "No backend chosen yet.",
   // TCK-WEB-027: the header wallet-fingerprint chip + the wallet-section
-  // hint. The chip's visible text is "Wallet <fp>" — the WHOLE 8-hex value
-  // verbatim, never truncated mid-hash (the WEB-026 naming rule). The hint
-  // ships the HW-002 honesty adjustment: the ticket's device-parity claim
-  // was FALSE (the chip carries the descriptor-origin ACCOUNT fp; the
-  // device shows its MASTER — they DIFFER watch-only), so the copy says
-  // exactly that. {fp} is substituted ONLY with the regex-gated value
-  // (the privacySublineText {host} discipline). TCK-WEB-032 (verdict b:
-  // parity NOT achievable on a bare-zpub provisioning path — the device's
-  // master fp rides no input we accept and cannot be computed from an
-  // account key without fabricating a value): ONE clarifying sentence
-  // names which number the device screen — and device-sourced imports like
-  // Sparrow's — actually show.
-  walletFpWord: "Wallet",
+  // hint. The chip shows the WHOLE 8-hex value verbatim, never truncated
+  // mid-hash (the WEB-026 naming rule); {fp} is substituted ONLY with the
+  // regex-gated value (the privacySublineText {host} discipline).
+  // TCK-FP-001 (SECURITY-REVIEW fix-required): the typed snapshot's
+  // wallet_fingerprint_kind makes the copy PROVENANCE-true per kind —
+  // "master" = the number came from the user's own provisioning input
+  // (device-export form; the user's claim, we never check it), so the chip
+  // stays "Wallet <fp>" and the hint tells the user to COMPARE it against
+  // the device screen (match = same wallet, mismatch = not). "account"
+  // (and the legacy pair-or-absent payload with NO kind) = hash160 of the
+  // account key we hold — provably ours, NEVER the device's number — so
+  // the chip renames to "Account <fp>" and keeps the WEB-032 clarifying
+  // hint (whose "won't match, that's expected" honesty is TRUE only here).
+  // The master copy must never claim verification ("verified" / "expected
+  // to match" are banned words on that path — the chip exists precisely so
+  // the USER does the anti-phishing comparison).
+  walletFpWord: "Wallet", // kind=master (the user's pasted device number)
+  walletFpWordAccount: "Account", // kind=account / legacy / unknown
   walletFpCopyName: "Copy wallet fingerprint",
   walletFpHint:
     "First characters: {fp} — your wallet's fingerprint. Your hardware " +
@@ -181,6 +186,13 @@ const LABELS = {
     "screen — and in wallet apps that imported directly from the device " +
     "(like Sparrow) — is its MASTER fingerprint: a public account key " +
     "can never reveal it.",
+  walletFpHintMaster:
+    "First characters: {fp} — the master fingerprint from the wallet info " +
+    "you pasted in at provisioning. Compare it with your hardware wallet's " +
+    "screen, which shows its own master fingerprint: the same number means " +
+    "you are looking at the same wallet; a different number means you are " +
+    "not. This is what you gave us — we cannot check it against the device " +
+    "ourselves.",
   // TCK-WEB-031 (b/f): the LIVE connection chip names WHAT is connected —
   // the ticket's exact strings "<Kind>: <host>" for the two real backend
   // kinds, generic "Connected" for none/awaiting/no-host (pin f). The kind
@@ -563,6 +575,12 @@ const state = {
   // state/0 (busy engine) keeps the last value. Never fabricated, never
   // logged, never derived client-side from the zpub.
   walletFingerprint: "",
+  // TCK-FP-001: the provenance kind PAIRED with the fingerprint above
+  // ("master" | "account"; typed closed set — unknown/missing reads
+  // "account", the legacy semantics). "" only while the chip is hidden
+  // (no fp, no kind). Same typed-only lifecycle as walletFingerprint;
+  // drives the chip word + which hint ships. Memory only, never logged.
+  walletFingerprintKind: "",
   // TCK-WEB-022: the last TYPED snapshot's vetted public-Electrum chip list
   // (engine-validated {url, label} entries; gated again here — see
   // readSuggestedServers). [] = no group (missing key on a typed snapshot
@@ -2412,16 +2430,24 @@ const WALLET_FP_RE = /^[0-9a-f]{8}$/;
 
 // PURE (node-pinned): the chip's visible text, its value-bearing accessible
 // name, and the settings hint line. Only regex-valid fps ever reach them.
-function walletFpChipText(fp) {
-  return LABELS.walletFpWord + " " + fp;
+// TCK-FP-001: chip WORD and hint TEMPLATE are pure functions of the typed
+// kind — anything that is not the closed value "master" (account, legacy
+// payload with no kind, junk) renders the account truth. That is the safe
+// direction: the account copy never over-claims.
+function walletFpWordFor(kind) {
+  return kind === "master" ? LABELS.walletFpWord : LABELS.walletFpWordAccount;
+}
+
+function walletFpChipText(fp, kind) {
+  return walletFpWordFor(kind) + " " + fp;
 }
 
 function walletFpCopyName(fp) {
   return LABELS.walletFpCopyName + " " + fp;
 }
 
-function walletFpHintText(fp) {
-  const tpl = LABELS.walletFpHint;
+function walletFpHintText(fp, kind) {
+  const tpl = kind === "master" ? LABELS.walletFpHintMaster : LABELS.walletFpHint;
   const at = tpl.indexOf("{fp}");
   return tpl.slice(0, at) + fp + tpl.slice(at + "{fp}".length);
 }
@@ -2437,14 +2463,22 @@ function applyWalletFpChip(snap) {
   if (!snap || snap.schema !== "state/1") return;
   const raw = snap.wallet_fingerprint;
   const fp = typeof raw === "string" && WALLET_FP_RE.test(raw) ? raw : "";
-  if (fp === state.walletFingerprint) return;
+  // TCK-FP-001 pair-or-absent: the kind rides ONLY with a valid fp (junk/
+  // missing/unknown kind → the account truth — never a guess at "master").
+  const kind = fp === "" ? "" : snap.wallet_fingerprint_kind === "master" ? "master" : "account";
+  // Transition gate: the kind can flip at the SAME fp (re-provisioning the
+  // same wallet through a different input form), and the copy MUST follow —
+  // so the write happens on an fp OR kind change, still one write per
+  // transition.
+  if (fp === state.walletFingerprint && kind === state.walletFingerprintKind) return;
   // TCK-UTXO-008: a wallet transition (enter/replace/remove — any typed
   // fingerprint CHANGE) retires the coin selection with it: the listed
   // coins belonged to the OTHER wallet's truth. Strict no-op when nothing
   // is armed.
   retireCoinSelection(LABELS.coinSelectReplaced);
   state.walletFingerprint = fp;
-  walletFpEl.textContent = fp ? walletFpChipText(fp) : "";
+  state.walletFingerprintKind = kind;
+  walletFpEl.textContent = fp ? walletFpChipText(fp, kind) : "";
   walletFpEl.hidden = fp === "";
   if (fp) {
     // WEB-026 naming rule: the NAME carries the whole value ("Copy wallet
@@ -2883,12 +2917,17 @@ function watchKeyRow(serverEntry) {
   line.appendChild(editBtn);
   li.appendChild(line);
   // TCK-WEB-027: the wallet section's fingerprint hint line — the same
-  // typed truth the header chip rides, plus the HW-002 honesty note (the
-  // device shows a DIFFERENT number; mismatch is expected). Typed-only:
-  // no known fingerprint, no line — never a guess at a value.
+  // typed truth the header chip rides. Typed-only: no known fingerprint,
+  // no line — never a guess at a value. TCK-FP-001: the line adapts to the
+  // typed KIND (master = compare-against-your-device copy; account/legacy =
+  // the HW-002 honesty note that the numbers DIFFER by construction).
   if (state.walletFingerprint) {
     li.appendChild(
-      el("p", "setting-hint", walletFpHintText(state.walletFingerprint)),
+      el(
+        "p",
+        "setting-hint",
+        walletFpHintText(state.walletFingerprint, state.walletFingerprintKind),
+      ),
     );
   }
   if (serverEntry && serverEntry.env_override === true) {

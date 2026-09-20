@@ -87,7 +87,7 @@ from localwallet.agent.session import redact_transcript
 from localwallet.node import LocalNodeReport, NodeStatus
 from localwallet.node.doctor import NodeDoctor, NodeStateKind
 from localwallet.store import Store, StoreError
-from localwallet.wallet.descriptor import WatchKeyError, parse_wallet_key
+from localwallet.wallet.descriptor import WalletDescriptor, WatchKeyError
 
 __all__ = [
     "ASK_WAITS_ACK",
@@ -631,8 +631,11 @@ def ask_watch_key(
     """Step 1: greeting + key ask on an interactive first launch.
 
     Returns the watch-key string once it parses through the SAME gated
-    parser as startup (mainnet-only, value-free errors, ADR-0021), or
-    ``None`` when the user exits (EOF/Ctrl-D or an exit word). Every input
+    descriptor path as startup consumes it (mainnet-only, value-free
+    errors, ADR-0021; TCK-FP-001: the origin-carrying and full-descriptor
+    shapes a hardware-wallet export produces validate here exactly as the
+    ``from_key`` consumer re-checks), or ``None`` when the user exits
+    (EOF/Ctrl-D or an exit word). Every input
     line is validated, so the caller never continues with a key startup
     would refuse.
     """
@@ -654,7 +657,12 @@ def ask_watch_key(
             output_fn(KEY_SEED_REFUSAL)
             continue
         try:
-            parse_wallet_key(text)
+            # THE consumer's own predicate (TCK-FP-001): startup re-parses
+            # the returned line through WalletDescriptor.from_key, so the
+            # ask validates with the very call that will consume the answer
+            # — no shape can pass the ask and fail startup (and none that
+            # startup would refuse can hang the ask).
+            WalletDescriptor.from_key(text)
         except WatchKeyError as exc:
             # Value-free by the descriptor layer's contract (never echoes
             # the key); same shape as startup's refusal line.

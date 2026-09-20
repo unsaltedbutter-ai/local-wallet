@@ -425,6 +425,31 @@ def test_key_ask_help_seed_and_private_key_refusals(tmp_path: Path, monkeypatch)
     assert "import" not in ob.KEY_HELP
 
 
+def test_fp001_ask_watch_key_validates_with_the_consumers_own_predicate() -> None:
+    """TCK-FP-001 (interactive onboarding entry): the ask now validates
+    through :meth:`WalletDescriptor.from_key` — the very call startup
+    re-checks the returned line with — so device-export shapes pass the ask
+    exactly when run() would accept them: the short ``[fp/path]key`` and
+    the full descriptor form are returned verbatim, a mismatched-path
+    origin is refused value-free (no paste echoed on the refusal line) and
+    the ask keeps looping."""
+    outputs: list[str] = []
+    emit = outputs.append
+
+    def ask(*lines: str) -> str | None:
+        it = iter(lines)
+        return ob.ask_watch_key(lambda _p: next(it), emit)
+
+    bad = f"[c0ffee00/49'/0'/0']{ZPUB}"  # 49' cannot belong to a zpub
+    good = f"[c0ffee00/84'/0'/0']{ZPUB}"
+    assert ask(bad, good) == good
+    joined = "\n".join(outputs)
+    assert "Watch key rejected:" in joined
+    assert ZPUB not in joined and "c0ffee00" not in joined  # value-free refusal
+    canonical = WalletDescriptor.from_key(good).descriptor
+    assert ask(canonical) == canonical  # full-descriptor form (reloaded paste)
+
+
 def test_headless_launch_never_blocks(tmp_path: Path, monkeypatch) -> None:
     """Scripted (non-interactive) launches skip the conversation silently:
     no key → today's exit-2 refusal; key → no ask, no narration."""

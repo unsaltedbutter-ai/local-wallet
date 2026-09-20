@@ -58,6 +58,7 @@ here.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Final
 
@@ -67,15 +68,30 @@ from embit.descriptor.checksum import checksum as _descriptor_checksum
 from embit.networks import NETWORKS as _NETWORKS
 
 __all__ = [
+    "FINGERPRINT_ACCOUNT",
+    "FINGERPRINT_KINDS",
+    "FINGERPRINT_MASTER",
     "MAINNET_COIN_TYPE",
     "ParsedKey",
     "PrefixInfo",
     "WalletDescriptor",
     "WatchKeyError",
+    "descriptor_fingerprint",
     "detect_script_type",
     "parse_wallet_key",
     "parse_watch_key",
 ]
+
+#: TCK-FP-001: the CLOSED provenance kinds of a wallet fingerprint read by
+#: :func:`descriptor_fingerprint`. ``"master"`` — the stored origin carries
+#: a fingerprint that is NOT the shown key's own (device-exported input,
+#: the Sparrow/Coldcard-parity case: the value is the device MASTER fp the
+#: user's hardware screen shows). ``"account"`` — the value IS the account
+#: key's own ``hash160(pubkey)[:4]`` (bare-key input, our stamping
+#: convention, or an origin-less descriptor). Never another value.
+FINGERPRINT_MASTER: Final = "master"
+FINGERPRINT_ACCOUNT: Final = "account"
+FINGERPRINT_KINDS: Final[tuple[str, str]] = (FINGERPRINT_MASTER, FINGERPRINT_ACCOUNT)
 
 #: Upper bound on accepted key length (base58 xpubs are ≤ ~111 chars;
 #: anything longer is refused before parsing, fail closed).
@@ -353,11 +369,13 @@ class WalletDescriptor:
         network: Always ``"main"`` (mainnet-only gate, ADR-0021).
         descriptor: Canonical checksummed descriptor string, e.g.
             ``wpkh([fp/84'/0'/0']zpub…/{0,1}/*)#checksum``. The origin
-            fingerprint is the supplied account key's own fingerprint
-            (``hash160(pubkey)[:4]``) — the master fingerprint is not
-            recoverable from an account-level key alone; device
-            registration (Phase 3) supplies and verifies the device xfp
-            per OQ18.
+            fingerprint is the device MASTER fingerprint when the
+            provisioning input carried an origin (TCK-FP-001 — Coldcard/
+            Sparrow export shapes, kept verbatim); for a bare account key
+            it is that key's own fingerprint (``hash160(pubkey)[:4]``) —
+            the master fp is not recoverable from an account-level key
+            alone, and this module NEVER synthesizes one
+            (see :func:`descriptor_fingerprint` for the provenance kinds).
     """
 
     parsed: ParsedKey
@@ -378,20 +396,72 @@ class WalletDescriptor:
 
     @classmethod
     def from_key(cls, key: str) -> WalletDescriptor:
-        """Parse a user-supplied extended public key into a wallet descriptor.
+        """Parse a user-supplied watch-key input into a wallet descriptor.
 
         Gated parse (mainnet-only, watch-only) followed by canonical
         descriptor construction with checksum and round-trip validation.
+        TCK-FP-001 widened the accepted SHAPES at every provisioning entry
+        (all of which route here) — the base58 key language has neither
+        ``[`` nor ``(`` and SLIP-132 keys never start with ``[``, so the
+        dispatch below is unambiguous:
+
+        - bare account key ``zpub…`` — origin stamped with the key's own
+          fingerprint (unchanged legacy behaviour, kind ``"account"``);
+        - origin-carrying key ``[fp/84'/0'/0']zpub…`` — the shape Coldcard
+          and friends print per-key; the origin fingerprint is stored
+          VERBATIM (lowercased) as kind ``"master"``;
+        - full descriptor ``wpkh([fp/84'/0'/0']zpub…/{0,1}/*)#cs`` — the
+          Coldcard/Sparrow export shape, routed to
+          :meth:`from_descriptor_string` (checksum verified when present,
+          origin preserved).
+
+        The path inside an origin MUST be the key's standard SLIP-132
+        account path (``84'/0'/0'`` for zpub, likewise 49/44; ``h``
+        notation accepted) — a mismatched path is refused value-free (the
+        origin could not honestly belong to that key). A PATHLESS origin
+        ``[fp]zpub…`` is refused: there is nothing to check the fp against.
 
         Raises:
             WatchKeyError: on any parse/gate failure (value-free).
         """
+        candidate = key.strip() if isinstance(key, str) else key
+        if isinstance(candidate, str) and candidate.startswith("["):
+            return cls._from_origin_key(candidate)
+        if isinstance(candidate, str) and "(" in candidate:
+            return cls.from_descriptor_string(candidate)
         parsed = parse_wallet_key(key)
         return cls(
             parsed=parsed,
             script_type=parsed.script_type,
             network=parsed.network,
             descriptor=_build_descriptor_string(parsed),
+        )
+
+    @classmethod
+    def _from_origin_key(cls, candidate: str) -> WalletDescriptor:
+        """Build from the origin-carrying form ``[fp/path]KEY``.
+
+        The origin is validated BEFORE any key work (8-hex fingerprint,
+        standard hardened account path for the key's script type — see
+        :func:`_validate_origin`), the key half goes through the SAME
+        gated parser as the bare form (mainnet-only, watch-only), and the
+        canonical descriptor is rebuilt with the supplied origin carried
+        verbatim. Whitespace anywhere in the form is refused (same paste
+        contract as the bare key).
+        """
+        if any(c.isspace() for c in candidate):
+            raise WatchKeyError("watch key must not contain whitespace")
+        closing = candidate.find("]")
+        if closing < 0:
+            raise WatchKeyError("malformed origin: expected [fp/path]KEY")
+        origin, key_string = candidate[1:closing], candidate[closing + 1 :]
+        parsed = parse_wallet_key(key_string)
+        fingerprint = _validate_origin(origin, parsed.script_type)
+        return cls(
+            parsed=parsed,
+            script_type=parsed.script_type,
+            network=parsed.network,
+            descriptor=_build_descriptor_string(parsed, fingerprint_override=fingerprint),
         )
 
     @classmethod
@@ -603,3 +673,44 @@ def _validate_descriptor_string(descriptor: str, parsed: ParsedKey) -> None:
     engine_key = engine_keys[0].key
     if engine_key.to_base58() != parsed.hd_key.to_base58():
         raise WatchKeyError("descriptor key does not match the parsed key")
+
+
+#: TCK-FP-001: the CLOSED stored-origin shape — lowercase 8-hex before the
+#: path (the TCK-WEB-027 validator, moved here with the reader; the writer
+#: normalizes, so an uppercase origin in a stored row means the row did not
+#: come from this module: refuse it, never normalize on read).
+_ORIGIN_FP_RE: Final = re.compile(r"\[([0-9a-f]{8})/")
+
+
+def descriptor_fingerprint(descriptor: str) -> tuple[str, str] | None:
+    """The ``(fingerprint, kind)`` a header chip may show for a descriptor.
+
+    Read-only classifier for the STORED descriptor string (TCK-FP-001);
+    the value never gets recomputed by any client:
+
+    - origin fp != the key's own fp → ``(origin fp, "master")`` — it came
+      from a device-exported origin (Sparrow/Coldcard parity: this is the
+      number the user's hardware screen shows);
+    - origin fp == the key's own fp, or no origin at all → the shown value
+      IS ``hash160(the shown key)[:4]`` → ``(that fp, "account")`` — the
+      honest bare-key case; the value was never synthesized as a master fp.
+    - Anything unreadable (bad checksum, foreign shape, non-lowercase
+      origin, unparsable key, non-string) → ``None`` — the chip is omitted,
+      fail closed, never garbage and never a normalization.
+    """
+    if not isinstance(descriptor, str):
+        return None
+    candidate = descriptor.strip()
+    try:
+        body, _ = _split_checksum(candidate)
+        _script_type, origin_fp, key_string = _template_parse(body)
+        account_fp = parse_wallet_key(key_string).hd_key.my_fingerprint.hex()
+    except Exception:  # noqa: BLE001 — containment: every WatchKeyError/embit shape error means "no chip" (value-free by this module's contract)
+        return None
+    if origin_fp is None:
+        return account_fp, FINGERPRINT_ACCOUNT
+    match = _ORIGIN_FP_RE.search(candidate)
+    if match is None or match.group(1) != origin_fp:
+        return None
+    kind = FINGERPRINT_ACCOUNT if origin_fp == account_fp else FINGERPRINT_MASTER
+    return origin_fp, kind

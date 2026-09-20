@@ -2550,9 +2550,12 @@ def test_web030_top_badge_visibility_matrix_under_node() -> None:
 
 # ============================================================== TCK-WEB-027
 # Wallet-fingerprint header chip (static half; the typed /state field and its
-# closed 8-hex shape are engine-pinned in test_engine_pump). The value is the
-# descriptor-origin ACCOUNT-key fingerprint — NEVER the device's master
-# (HW-002) — so every copy line keeps that honesty. Lifecycle is typed-state-
+# closed 8-hex shape are engine-pinned in test_engine_pump). TCK-FP-001: the
+# additive PAIRED wallet_fingerprint_kind ("master" | "account"; unknown /
+# missing = legacy = account semantics) drives the chip WORD and the hint
+# copy as a pure function of state — master = the user's own pasted claim,
+# compare-against-the-device copy (never a verification claim); account =
+# hash160 of the key we hold, the HW-002 honesty note. Lifecycle is typed-state-
 # only: present = shown VERBATIM, absent = hidden (never fabricated, never
 # client-derived), typed-omit = cleared, state/0 = keeps the last value;
 # one DOM write per transition. Click-to-copy rides the SHARED WEB-026
@@ -2575,21 +2578,27 @@ def test_web027_chip_markup_and_source_pins() -> None:
     assert index_html.index(chip) < index_html.index('id="privacy-chip"')
     assert index_html.index(chip) < index_html.index('id="conn-status"')
     assert not re.search(r"\son[a-z]+=", index_html)  # global pin, restated
-    # typed-only lifecycle: state/1 gate, regex gate, transition gate,
-    # verbatim textContent, hide-on-empty, name-bearing aria-label.
+    # typed-only lifecycle: state/1 gate, regex gate, transition gate (TCK-
+    # FP-001: the gate covers the fp OR its paired kind — a kind flip at the
+    # same fp must re-render the copy), verbatim textContent, hide-on-empty,
+    # name-bearing aria-label.
     fn = re.search(
         r"function applyWalletFpChip\(snap\) \{.*?\n\}", code, re.DOTALL
     ).group(0)
     assert 'snap.schema !== "state/1"' in fn
     assert "WALLET_FP_RE.test(raw)" in fn
-    assert "if (fp === state.walletFingerprint) return;" in fn  # one write/change
-    assert 'walletFpEl.textContent = fp ? walletFpChipText(fp) : "";' in fn
+    assert (
+        "if (fp === state.walletFingerprint && kind === state.walletFingerprintKind) return;"
+        in fn
+    )  # one write/change
+    assert 'walletFpEl.textContent = fp ? walletFpChipText(fp, kind) : "";' in fn
     assert 'walletFpEl.hidden = fp === "";' in fn
     assert "walletFpEl.setAttribute(\"aria-label\", walletFpCopyName(fp));" in fn
     assert "removeAttribute" in fn  # hidden chip carries no stale name
     assert ".style" not in fn and "innerHTML" not in fn
-    # exactly ONE reader of the wire key exists (the painter).
-    assert code.count("wallet_fingerprint") == 1
+    # exactly ONE reader of the wire keys exists (the painter): the fp and
+    # its TCK-FP-001 paired kind, both read ONLY in applyWalletFpChip.
+    assert code.count("wallet_fingerprint") == 2
     # wired into the snapshot path beside the other chips.
     assert "applyPrivacyChip(snap);\n  applyWalletFpChip(snap);" in code
     # click-to-copy rides the SHARED helper with the value read AT CLICK
@@ -2598,10 +2607,13 @@ def test_web027_chip_markup_and_source_pins() -> None:
                   code.index("function handleEvent(id")]
     assert "state.walletFingerprint" in wiring
     assert "flashCopyResult(walletFpEl, await clipboardWrite(fp)" in wiring
-    # settings wallet section: the hint line rides the same typed truth.
+    # settings wallet section: the hint line rides the same typed truth —
+    # TCK-FP-001: with the kind, so the pane hint adapts per provenance too.
     wk = code[code.index("function watchKeyRow"):code.index("function watchKeyInput")]
     assert "if (state.walletFingerprint) {" in wk
-    assert "walletFpHintText(state.walletFingerprint)" in wk
+    assert (
+        "walletFpHintText(state.walletFingerprint, state.walletFingerprintKind)" in wk
+    )
     assert 'el("p", "setting-hint"' in wk
     # CSS: token-only chip-button reset; nowrap = the 320px no-layout-shift
     # guarantee (the .bar's existing flex-wrap moves the whole chip, the
@@ -2637,7 +2649,7 @@ def test_web027_chip_lifecycle_copy_and_label_copy_under_node() -> None:
     ).group(0)
     script = (
         """
-      const state = { walletFingerprint: "" };
+      const state = { walletFingerprint: "", walletFingerprintKind: "" };
       let fpWrites = 0, paneRenders = 0;
       const walletFpEl = {
         hidden: true, _t: "", attrs: {}, title: "", handler: null,
@@ -2658,9 +2670,11 @@ def test_web027_chip_lifecycle_copy_and_label_copy_under_node() -> None:
       __LABELS__
       __BLOCK__
       // present -> shown VERBATIM, value-bearing name, ONE write.
+      // TCK-FP-001 legacy fallback: NO kind on the payload = account
+      // semantics = the "Account" chip word.
       applyWalletFpChip({ schema: "state/1", wallet_fingerprint: "f1a2b3c4" });
       if (walletFpEl.hidden) throw new Error("hidden-when-present");
-      if (walletFpEl.textContent !== "Wallet f1a2b3c4") throw new Error("text");
+      if (walletFpEl.textContent !== "Account f1a2b3c4") throw new Error("text");
       if (walletFpEl.attrs["aria-label"] !== "Copy wallet fingerprint f1a2b3c4") throw new Error("name");
       if (fpWrites !== 1) throw new Error("write-count");
       const w1 = fpWrites;
@@ -2671,6 +2685,24 @@ def test_web027_chip_lifecycle_copy_and_label_copy_under_node() -> None:
       applyWalletFpChip({ schema: "state/0" });
       applyWalletFpChip(null);
       if (fpWrites !== w1 || walletFpEl.hidden || state.walletFingerprint !== "f1a2b3c4") throw new Error("state0");
+      // TCK-FP-001: kind=master RENAMES the chip at the SAME fp (a kind
+      // flip is a transition — the copy must follow, pure function of state)
+      // while the value-bearing aria keeps its WEB-026 SHAPE.
+      applyWalletFpChip({ schema: "state/1", wallet_fingerprint: "f1a2b3c4",
+                         wallet_fingerprint_kind: "master" });
+      if (walletFpEl.textContent !== "Wallet f1a2b3c4") throw new Error("flip-master");
+      if (state.walletFingerprintKind !== "master") throw new Error("flip-kind");
+      if (walletFpEl.attrs["aria-label"] !== "Copy wallet fingerprint f1a2b3c4") throw new Error("flip-aria-shape");
+      // unknown kind -> the ACCOUNT truth (the safe, never-over-claiming
+      // direction — the closed set is master|account, junk is account).
+      applyWalletFpChip({ schema: "state/1", wallet_fingerprint: "f1a2b3c4",
+                         wallet_fingerprint_kind: "quantic" });
+      if (walletFpEl.textContent !== "Account f1a2b3c4") throw new Error("junk-kind");
+      // identical fp+kind re-applied -> zero further writes (the gate).
+      const w2 = fpWrites;
+      applyWalletFpChip({ schema: "state/1", wallet_fingerprint: "f1a2b3c4",
+                         wallet_fingerprint_kind: "account" });
+      if (fpWrites !== w2) throw new Error("kind-spam");
       // click-to-copy rides the SHARED helper with the whole value.
       await walletFpEl.handler();
       if (copied !== "f1a2b3c4") throw new Error("copy-value");
@@ -2693,6 +2725,8 @@ def test_web027_chip_lifecycle_copy_and_label_copy_under_node() -> None:
         if (!walletFpEl.hidden || walletFpEl.textContent !== "") throw new Error("junk:" + bad);
       }
       // the hint + chip + name texts render the WHOLE value, never truncated.
+      // kind omitted / "account" -> the existing WEB-032 clarifying hint
+      // (truthful ONLY on the account path — the numbers differ by design).
       const hint = walletFpHintText("f1a2b3c4");
       if (hint !== "First characters: f1a2b3c4 — your wallet's fingerprint. "
                  + "Your hardware wallet shows its own, different number "
@@ -2708,7 +2742,28 @@ def test_web027_chip_lifecycle_copy_and_label_copy_under_node() -> None:
       if (!hint.includes("MASTER fingerprint") || !hint.includes("screen")) {
         throw new Error("web032-clarifier");
       }
-      if (walletFpChipText("abcdef01") !== "Wallet abcdef01") throw new Error("chip-text");
+      if (walletFpHintText("f1a2b3c4", "account") !== hint) throw new Error("account-hint-kind");
+      // TCK-FP-001 (SECURITY-REVIEW fix-required): the master path ships its
+      // OWN compare-against-your-device copy, verbatim — and must NEVER
+      // render the false trust-anchor sentences or a verification claim.
+      const mHint = walletFpHintText("f1a2b3c4", "master");
+      if (mHint !== "First characters: f1a2b3c4 — the master fingerprint "
+                 + "from the wallet info you pasted in at provisioning. "
+                 + "Compare it with your hardware wallet's screen, which "
+                 + "shows its own master fingerprint: the same number means "
+                 + "you are looking at the same wallet; a different number "
+                 + "means you are not. This is what you gave us — we cannot "
+                 + "check it against the device ourselves.") throw new Error("master-hint-copy");
+      if (mHint.includes("{fp}")) throw new Error("master-placeholder-leak");
+      for (const banned of ["verified", "expected to match",
+                            "won't match", "can never reveal it"]) {
+        if (mHint.toLowerCase().includes(banned)) throw new Error("master-banned:" + banned);
+      }
+      // chip WORD per kind (master = the user's pasted device number keeps
+      // "Wallet"; account/legacy/unknown = the honest "Account").
+      if (walletFpChipText("abcdef01") !== "Account abcdef01") throw new Error("chip-text-legacy");
+      if (walletFpChipText("abcdef01", "account") !== "Account abcdef01") throw new Error("chip-text-account");
+      if (walletFpChipText("abcdef01", "master") !== "Wallet abcdef01") throw new Error("chip-text-master");
       // the ticket's exact replace-copy sentence ships in the confirm rung.
       if (!LABELS.watchKeyReplaceConfirm.includes(
           "The header's Wallet … number changes with the new key.")) throw new Error("replace-copy");
@@ -2718,6 +2773,12 @@ def test_web027_chip_lifecycle_copy_and_label_copy_under_node() -> None:
       if (paneRenders !== 1) throw new Error("pane-flip");
       applyWalletFpChip({ schema: "state/1", wallet_fingerprint: "abcdef01" });
       if (paneRenders !== 1) throw new Error("pane-spam");
+      // TCK-FP-001: a kind flip at the SAME fp re-renders the open pane too
+      // (the settings hint must never keep the other provenance's copy).
+      applyWalletFpChip({ schema: "state/1", wallet_fingerprint: "abcdef01",
+                         wallet_fingerprint_kind: "master" });
+      if (paneRenders !== 2) throw new Error("pane-kind-flip");
+      if (walletFpEl.textContent !== "Wallet abcdef01") throw new Error("pane-kind-chip");
       console.log("ok");
     """
         .replace("__LABELS__", leak + labels)
@@ -3930,11 +3991,14 @@ def test_web031_header_title_and_page_title_static_pins() -> None:
     # child is a nameless heading).
     assert '<h1 class="brand" aria-label="Local Wallet"><button id="wallet-fp" class="chip wallet-fp" type="button" hidden></button></h1>' in index_html
     assert index_html.index('<h1 class="brand"') < index_html.index("</header>")
-    # the title text is "Wallet <hex>": the word ships in LABELS and only
-    # ever reaches the DOM through the WALLET_FP_RE-gated painter.
+    # the title text is "<Wallet|Account> <hex>" (TCK-FP-001: the WORD is
+    # the typed provenance kind — master claims "Wallet", account/legacy
+    # honestly claims "Account"): both words ship in LABELS and only ever
+    # reach the DOM through the WALLET_FP_RE-gated painter.
     code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
     assert 'walletFpWord: "Wallet",' in code
-    assert 'walletFpEl.textContent = fp ? walletFpChipText(fp) : "";' in code
+    assert 'walletFpWordAccount: "Account",' in code
+    assert 'walletFpEl.textContent = fp ? walletFpChipText(fp, kind) : "";' in code
     assert "WALLET_FP_RE.test(raw)" in code  # hex never painted unguarded
     # "Local Wallet" lives in the document <title> AND (TCK-UTXO-006 rider)
     # the h1's ACCESSIBLE NAME only — never as painted heading text (the chip
@@ -4158,12 +4222,15 @@ def test_utxo008_coin_select_static_pins() -> None:
     assert "box.textContent" not in mark  # the reason is NEVER painted text
 
     # --- wallet replace retires beside the fingerprint transition (typed
-    #     truth, ONE call per change); the freshness NAME is recorded typed-
-    #     only inside the state/1 guard (state/0 keeps the last read). ---
+    #     truth, ONE call per change — TCK-FP-001: the gate is fp OR its
+    #     paired kind, and retirement still rides strictly behind it); the
+    #     freshness NAME is recorded typed-only inside the state/1 guard
+    #     (state/0 keeps the last read). ---
     fp = fn("applyWalletFpChip")
     assert "retireCoinSelection(LABELS.coinSelectReplaced);" in fp
-    assert fp.index("if (fp === state.walletFingerprint) return;") < fp.index(
-        "retireCoinSelection(")
+    assert fp.index(
+        "if (fp === state.walletFingerprint && kind === state.walletFingerprintKind) return;"
+    ) < fp.index("retireCoinSelection(")
     scan = fn("applyScanChip")
     assert scan.index('if (!snap || snap.schema !== "state/1") return;') < scan.index(
         'state.scanState = typeof snap.scan_state === "string" ? snap.scan_state : "";')

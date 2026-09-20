@@ -17,6 +17,7 @@ to pin the watch-only refusal).
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import Final
@@ -33,6 +34,9 @@ from embit.descriptor.checksum import add_checksum
 from embit.networks import NETWORKS as NET
 
 from localwallet.wallet.descriptor import (
+    FINGERPRINT_ACCOUNT,
+    FINGERPRINT_KINDS,
+    FINGERPRINT_MASTER,
     MAINNET_COIN_TYPE,
     ParsedKey,
     PrefixInfo,
@@ -40,6 +44,7 @@ from localwallet.wallet.descriptor import (
     WatchKeyError,
     _build_descriptor_string,
     _validate_descriptor_string,
+    descriptor_fingerprint,
     detect_script_type,
     parse_wallet_key,
     parse_watch_key,
@@ -370,3 +375,225 @@ def test_hand_built_parsed_key_unknown_script_type_raises_watch_key_error() -> N
     wd = WalletDescriptor.from_key(ZPUB)
     with pytest.raises(WatchKeyError, match="unsupported script type"):
         _validate_descriptor_string(wd.descriptor, bad)
+
+
+# ============================ TCK-FP-001: origin-carrying provisioning input
+#
+# USER DIRECTION (2026-09-20): accept the device-export SHAPES so the chip
+# can show the master fingerprint Sparrow/Coldcard/Jade display — ONLY when
+# the INPUT carries the origin; a bare key keeps its account fp (kind
+# "account"), and a master fp is NEVER synthesized (honesty invariant).
+# Accepted shapes at from_key (every provisioning entry funnels through it):
+#   [fp/84'/0'/0']zpub…  (origin-carrying key)   and  the full-descriptor
+#   wpkh([fp/…]zpub…/{0,1}/*) form (Coldcard/Sparrow export), routed to
+#   from_descriptor_string. Pathless origins ([fp]zpub…) are REFUSED: BIP-380
+#   makes them legal on a key, but with no path there is nothing to check
+#   the claim against, so accepting them would be a value-fabrication door.
+
+#: The fixture zpub's OWN account fingerprint (the "account"-kind value).
+FP_ACCOUNT_ZPUB: Final = HDKey.from_string(ZPUB).my_fingerprint.hex()
+#: A stand-in DEVICE MASTER fp — the fixture-seed master of
+#: tests/test_engine_pump.py's WEB-032 block; deliberately != the account fp.
+FP_DEVICE: Final = "c115c74e"
+
+
+def _origin_key(origin_path: str, key: str = ZPUB, fp: str = FP_DEVICE) -> str:
+    return f"[{fp}/{origin_path}]{key}"
+
+
+def test_fp001_bare_zpub_semantics_unchanged() -> None:
+    """Done-when 1a: the bare-key form keeps its exact pre-ticket behaviour —
+    origin stamped with the key's own fp; the reader classifies it
+    (account-fp, "account")."""
+    wd = WalletDescriptor.from_key(ZPUB)
+    assert wd.descriptor.startswith(f"wpkh([{FP_ACCOUNT_ZPUB}/84'/0'/0']")
+    assert descriptor_fingerprint(wd.descriptor) == (FP_ACCOUNT_ZPUB, FINGERPRINT_ACCOUNT)
+
+
+def test_fp001_origin_key_form_keeps_the_fp_verbatim() -> None:
+    """Done-when 1b: ``[fp/84'/0'/0']zpub…`` is accepted; the given fp rides
+    the canonical descriptor verbatim (kind "master"); the KEY half is the
+    very key the bare form parses — parsed.hd_key untouched, so every
+    signer/PSBT consumer of ``my_fingerprint`` is structurally unaffected."""
+    assert FP_DEVICE != FP_ACCOUNT_ZPUB
+    wd = WalletDescriptor.from_key(_origin_key("84'/0'/0'"))
+    assert wd.descriptor.startswith(f"wpkh([{FP_DEVICE}/84'/0'/0']")
+    assert f"{ZPUB}/{{0,1}}/*)" in wd.descriptor
+    assert wd.parsed.hd_key.to_base58() == ZPUB
+    assert wd.parsed.hd_key.my_fingerprint.hex() == FP_ACCOUNT_ZPUB
+    assert descriptor_fingerprint(wd.descriptor) == (FP_DEVICE, FINGERPRINT_MASTER)
+
+
+def test_fp001_h_notation_and_uppercase_fp() -> None:
+    """Both hardened notations are the same origin (``84h`` is embit/Coldcard
+    spelling); an uppercase fingerprint stores canonically lowercase (the
+    WRITER normalizes — the READER on stored rows never does, see matrix)."""
+    wd = WalletDescriptor.from_key(_origin_key("84h/0h/0h"))
+    assert wd.descriptor.startswith(f"wpkh([{FP_DEVICE}/84'/0'/0']")
+    upper = WalletDescriptor.from_key(f"[{FP_DEVICE.upper()}/84'/0'/0']{ZPUB}")
+    assert upper.descriptor.startswith(f"wpkh([{FP_DEVICE}/84'/0'/0']")
+    assert descriptor_fingerprint(upper.descriptor) == (FP_DEVICE, FINGERPRINT_MASTER)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["49'/0'/0'", "44'/0'/0'", "84'/1'/0'", "84'/0'/1'", "84'/0'/0", "0'/0'/0'"],
+)
+def test_fp001_mismatched_origin_path_refused_value_free(path: str) -> None:
+    """Done-when 1c: the path MUST be the key's own SLIP-132 account path —
+    purpose mismatch, testnet coin, non-account index, unhardened, or wrong
+    purpose outright: refused, and the refusal echoes NO pasted material."""
+    paste = _origin_key(path)
+    with pytest.raises(WatchKeyError) as excinfo:
+        WalletDescriptor.from_key(paste)
+    message = str(excinfo.value)
+    assert ZPUB not in message and FP_DEVICE not in message
+
+
+def test_fp001_pathless_and_malformed_origins_refused_value_free() -> None:
+    """Done-when 1d: ``[fp]zpub…`` (no path to check) and malformed
+    fingerprints (wrong length, non-hex) are refused value-free; so is any
+    bracket shape without a closing ``]``."""
+    bad_inputs = [
+        f"[{FP_DEVICE}]{ZPUB}",
+        _origin_key("84'/0'/0'", fp="deadbee"),  # 7 hex
+        _origin_key("84'/0'/0'", fp="abcdef001"),  # 9 hex
+        _origin_key("84'/0'/0'", fp="zzzzzzzz"),  # non-hex
+        f"{FP_DEVICE}/84'/0'/0']{ZPUB}",  # no opening bracket lands in the key parser
+        f"[{FP_DEVICE}/84'/0'/0'{ZPUB}",  # no closing bracket
+    ]
+    for paste in bad_inputs:
+        with pytest.raises(WatchKeyError) as excinfo:
+            WalletDescriptor.from_key(paste)
+        message = str(excinfo.value)
+        assert ZPUB not in message and FP_DEVICE not in message
+
+
+def test_fp001_whitespace_in_origin_form_refused() -> None:
+    """The paste contract of the bare key (internal whitespace = refusal)
+    extends to the bracketed form — a stripped key half would otherwise
+    sneak whitespace through the base58 gate."""
+    for paste in (
+        f"[{FP_DEVICE}/84'/0'/0'] {ZPUB}",
+        f"[{FP_DEVICE}/84'/0'/ 0']{ZPUB}",
+    ):
+        with pytest.raises(WatchKeyError) as excinfo:
+            WalletDescriptor.from_key(paste)
+        assert ZPUB not in str(excinfo.value)
+
+
+def test_fp001_gates_hold_on_the_origin_form() -> None:
+    """ADR-0021 + watch-only apply to the key half of an origin-carrying
+    paste exactly as to a bare one: vpub refused, xprv refused — value-free
+    either way."""
+    for key in (VPUB, XPRV):
+        with pytest.raises(WatchKeyError) as excinfo:
+            WalletDescriptor.from_key(f"[{FP_DEVICE}/84'/0'/0']{key}")
+        message = str(excinfo.value)
+        assert key not in message and FP_DEVICE not in message
+
+
+def test_fp001_full_descriptor_form_accepted_at_from_key() -> None:
+    """Parse-shape decision: the Coldcard/Sparrow EXPORT shape is accepted
+    at from_key too (routed to the strict from_descriptor_string — checksum
+    verified when present, embit ``<0;1>``/``84h`` spelling included); the
+    origin-less descriptor form classifies as "account"."""
+    from embit.descriptor.checksum import checksum
+
+    body = f"wpkh([{FP_DEVICE}/84'/0'/0']{ZPUB}/{{0,1}}/*)"
+    for paste in (
+        body,
+        f"{body}#{checksum(body)}",
+        f"wpkh([{FP_DEVICE}/84h/0h/0h]{ZPUB}/<0;1>/*)",
+    ):
+        wd = WalletDescriptor.from_key(paste)
+        assert wd.descriptor.startswith(f"wpkh([{FP_DEVICE}/")
+        assert descriptor_fingerprint(wd.descriptor) == (FP_DEVICE, FINGERPRINT_MASTER)
+    plain = f"wpkh({ZPUB}/{{0,1}}/*)"
+    wd = WalletDescriptor.from_key(plain)
+    assert wd.descriptor.startswith(f"wpkh([{FP_ACCOUNT_ZPUB}/")
+    assert descriptor_fingerprint(wd.descriptor) == (FP_ACCOUNT_ZPUB, FINGERPRINT_ACCOUNT)
+
+
+def test_fp001_bip49_descriptor_form() -> None:
+    """Non-segwit-native shapes ride the same rules: ypub with its OWN
+    purpose (49') in the sh(wpkh(…)) wrapper — and a wrong purpose for the
+    key is refused in the descriptor form too."""
+    from embit.descriptor.checksum import checksum
+
+    body = f"sh(wpkh([{FP_DEVICE}/49'/0'/0']{YPUB}/{{0,1}}/*))"
+    wd = WalletDescriptor.from_key(f"{body}#{checksum(body)}")
+    assert wd.descriptor.startswith(f"sh(wpkh([{FP_DEVICE}/49'/0'/0']")
+    assert descriptor_fingerprint(wd.descriptor) == (FP_DEVICE, FINGERPRINT_MASTER)
+    wrong = f"sh(wpkh([{FP_DEVICE}/84'/0'/0']{YPUB}/{{0,1}}/*))"
+    with pytest.raises(WatchKeyError) as excinfo:
+        WalletDescriptor.from_key(wrong)
+    assert YPUB not in str(excinfo.value)
+
+
+def test_fp001_descriptor_form_refusals_stay_value_free() -> None:
+    """Garbage that reaches the descriptor branch (tampered checksum, wrong
+    wrapper for the key) is refused with the layer's value-free messages."""
+    from embit.descriptor.checksum import checksum
+
+    body = f"wpkh([{FP_DEVICE}/84'/0'/0']{ZPUB}/{{0,1}}/*)"
+    good = f"{body}#{checksum(body)}"
+    tampered = good[:-1] + ("x" if good[-1] != "x" else "y")
+    wrong_wrapper = f"pkh([{FP_DEVICE}/84'/0'/0']{ZPUB}/{{0,1}}/*)"
+    for paste in (tampered, wrong_wrapper, "wpkh(garbage/{0,1}/*)", "wpkh(()"):
+        with pytest.raises(WatchKeyError) as excinfo:
+            WalletDescriptor.from_key(paste)
+        assert ZPUB not in str(excinfo.value) and FP_DEVICE not in str(excinfo.value)
+
+
+def test_fp001_round_trip_through_the_stored_string() -> None:
+    """Persistence mechanic: the STORED descriptor string carries the
+    origin, so a restart that re-reads the row (from_descriptor_string)
+    rebuilds the identical string — the master chip value and its kind
+    survive with no extra column."""
+    wd = WalletDescriptor.from_key(_origin_key("84'/0'/0'"))
+    rebuilt = WalletDescriptor.from_descriptor_string(wd.descriptor)
+    assert rebuilt.descriptor == wd.descriptor
+    assert descriptor_fingerprint(rebuilt.descriptor) == (FP_DEVICE, FINGERPRINT_MASTER)
+    assert rebuilt.parsed.hd_key.my_fingerprint.hex() == FP_ACCOUNT_ZPUB
+
+
+def _desc_with_origin(key: str, fp: str) -> str:
+    from embit.descriptor.checksum import checksum
+
+    body = f"wpkh([{fp}/84'/0'/0']{key}/{{0,1}}/*)"
+    return f"{body}#{checksum(body)}"
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        # bare-key row (account fp stamped) and the origin-less form both
+        # classify (own fp, "account"):
+        (WalletDescriptor.from_key(ZPUB).descriptor, (FP_ACCOUNT_ZPUB, FINGERPRINT_ACCOUNT)),
+        (f"wpkh({ZPUB}/{{0,1}}/*)", (FP_ACCOUNT_ZPUB, FINGERPRINT_ACCOUNT)),
+        # honest device origin:
+        (WalletDescriptor.from_key(_origin_key("84'/0'/0'")).descriptor,
+         (FP_DEVICE, FINGERPRINT_MASTER)),
+        # the coincidence case: an origin EQUAL to the key's own fp is
+        # indistinguishable from stamping — classified "account" (the value
+        # is provably the key's own, which is exactly what the label means):
+        (_desc_with_origin(ZPUB, FP_ACCOUNT_ZPUB), (FP_ACCOUNT_ZPUB, FINGERPRINT_ACCOUNT)),
+        # fail-closed reads — None, never garbage, never a normalization:
+        (_desc_with_origin(ZPUB, FP_DEVICE.upper()), None),  # stored uppercase
+        (_desc_with_origin(ZPUB, FP_DEVICE) + "#badbad00", None),  # bad checksum
+        ("desc", None),
+        ("", None),
+        (None, None),  # type: ignore[arg-type]
+        (f"wpkh([{FP_DEVICE}/84'/0'/0']notabase58key/{{0,1}}/*)", None),
+    ],
+)
+def test_fp001_descriptor_fingerprint_matrix(stored: str, expected: object) -> None:
+    """Done-when 2+3 classifier matrix: the kind is a PURE function of the
+    stored string (no DB column needed); the closed enum holds."""
+    got = descriptor_fingerprint(stored)
+    assert got == expected
+    if got is not None:
+        fp, kind = got
+        assert kind in FINGERPRINT_KINDS
+        assert re.fullmatch(r"[0-9a-f]{8}", fp)

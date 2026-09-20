@@ -155,6 +155,48 @@ def test_cli_flag_overrides_web_env(
     assert not any(line.startswith("Web UI:") for line in outputs)
 
 
+def test_fp001_zpub_flag_and_env_accept_the_device_export_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TCK-FP-001 (CLI entry): the flag and env rungs (ONE merged parse
+    site) consume the Coldcard-style origin-carrying paste — the launch
+    proceeds and the PERSISTED row carries the supplied master fp verbatim;
+    the restart read over the reopened store classifies it (fp, "master") —
+    persistence is the descriptor string itself, no extra column."""
+    from localwallet.wallet.descriptor import descriptor_fingerprint
+
+    code = app.main(
+        ["--stub-llm", "--zpub", f"[c115c74e/84'/0'/0']{ZPUB}", "--cli"],
+        input_fn=lambda _p: "exit",
+        output_fn=lambda _s: None,
+    )
+    assert code == 0
+    store = Store(str(tmp_path / "launch.db"))
+    try:
+        wallet = store.get_active_wallet()
+    finally:
+        store.close()
+    assert wallet is not None
+    assert wallet.descriptor.startswith("wpkh([c115c74e/84'/0'/0']")
+    assert descriptor_fingerprint(wallet.descriptor) == ("c115c74e", "master")
+
+    # env rung (fresh store — the second launch must not collide with the
+    # first wallet row):
+    monkeypatch.setenv("LOCALWALLET_STORE_PATH", str(tmp_path / "launch2.db"))
+    monkeypatch.setenv(app.ZPUB_ENV_VAR, f"[d4ed4eed/84'/0'/0']{ZPUB}")
+    code = app.main(
+        ["--stub-llm", "--cli"], input_fn=lambda _p: "exit", output_fn=lambda _s: None
+    )
+    assert code == 0
+    store = Store(str(tmp_path / "launch2.db"))
+    try:
+        wallet = store.get_active_wallet()
+    finally:
+        store.close()
+    assert wallet is not None
+    assert descriptor_fingerprint(wallet.descriptor) == ("d4ed4eed", "master")
+
+
 def test_web_flag_overrides_cli_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
