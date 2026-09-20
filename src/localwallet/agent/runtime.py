@@ -22,6 +22,21 @@ agent never touches llama.cpp directly. Design points:
 - **No logging.** Library code never logs (and never logs model paths or
   user text).
 
+GPU offload (TCK-GPU-001, ADR-0001 amendment): ``Llama.__init__`` defaults
+``n_gpu_layers=0`` (CPU) EVEN in Metal/CUDA builds, so the offload decision
+is made here at load time — full offload (``n_gpu_layers=-1``) when a GPU
+backend dylib ships in the installed wheel (:func:`llama_backends`, THE
+shared detection source — ``app.py``'s ``/version`` backends line delegates
+to the same function, so the version report and this decision can never
+drift), CPU otherwise. The ``LOCALWALLET_N_GPU_LAYERS`` rung (env > config
+file, parsed fail-closed and value-free in ``config.py``) lets the operator
+force CPU (``0``) or a partial count for small-VRAM GPUs. A GPU-offloaded
+load that raises is retried ONCE at CPU and the emitted one-line verdict
+says so honestly — never a silent degrade. The verdict line is handed to
+the optional ``decision_fn`` (the app prints it to stdout/launch log at
+model load); stub and remote runtimes produce no line at all (honest
+absence). This is a performance/visibility knob, NOT a money surface.
+
 Sampling defaults follow PROJECT.md §7.1 (Gemma 4 model-card defaults:
 top_p 0.95, top_k 64) with a v0 context budget of 8K (ADR-0006).
 Temperature is 0.2 rather than the model-card 1.0: grammar-constrained
@@ -31,6 +46,7 @@ flakiness (live evidence: escalation on a prompt that passes 5/5 isolated).
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import threading
 from collections.abc import Callable
@@ -38,8 +54,10 @@ from pathlib import Path
 from typing import Final
 
 from localwallet.agent.grammar import GRAMMAR_PATH
+from localwallet.config import N_GPU_LAYERS_ENV_VAR, n_gpu_layers_setting
 
 __all__ = [
+    "CPU_NO_BACKEND_LINE",
     "DEFAULT_MAX_TOKENS",
     "DEFAULT_N_CTX",
     "DEFAULT_TEMPERATURE",
@@ -50,6 +68,9 @@ __all__ = [
     "GenerateFn",
     "ModelRuntime",
     "ModelRuntimeError",
+    "gpu_fallback_line",
+    "gpu_offload_decision",
+    "llama_backends",
     "load_grammar_text",
 ]
 
@@ -98,9 +119,10 @@ class ModelRuntimeError(RuntimeError):
     """The model runtime could not produce a completion.
 
     Raised for: the ``llama-cpp-python`` wheel being absent, a missing or
-    unset model path, a model file that does not exist, or a llama.cpp
-    runtime failure. Messages name configuration values (such as the model
-    path) so the user can fix them; nothing is logged anywhere.
+    unset model path, a model file that does not exist, a malformed
+    ``LOCALWALLET_N_GPU_LAYERS`` rung (fail closed, value-free), or a
+    llama.cpp runtime failure. Messages name configuration values (such as
+    the model path) so the user can fix them; nothing is logged anywhere.
     """
 
 
@@ -117,6 +139,71 @@ def load_grammar_text() -> str:
             (a packaging bug, not a runtime condition).
     """
     return GRAMMAR_PATH.read_text(encoding="utf-8")
+
+
+def llama_backends() -> tuple[bool, bool] | None:
+    """``(metal, cuda)`` — does the INSTALLED llama_cpp package ship the
+    backend dylibs? A find_spec glob (no import, no GPU init). ``None`` =
+    the package is not installed at all.
+
+    TCK-GPU-001: THE shared backend-detection source — ``app.py``'s
+    ``/version`` "backends:" line delegates here, so the version report and
+    this runtime's GPU offload decision can never drift."""
+    try:
+        spec = importlib.util.find_spec("llama_cpp")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    pkg_dir = Path(next(iter(spec.submodule_search_locations)))
+    return (
+        any(pkg_dir.rglob("libggml-metal*")),
+        any(pkg_dir.rglob("libggml-cuda*")),
+    )
+
+
+#: The one-line launch verdicts (TCK-GPU-001), emitted by the app at model
+#: load to stdout (CLI) + the per-launch log (both modes). Value-free by
+#: construction: fixed words, a backend NAME, and (partial only) the layer
+#: count the OPERATOR configured via env — no paths, no llama.cpp messages.
+
+CPU_NO_BACKEND_LINE: Final[str] = (
+    "inference: CPU — reason: no GPU backend in this llama.cpp build"
+)
+
+
+def gpu_offload_decision(
+    override: int | None, backends: tuple[bool, bool] | None
+) -> tuple[int, str]:
+    """The GPU offload policy (TCK-GPU-001, ADR-0001 amendment): decide
+    ``n_gpu_layers`` AND the honest one-line verdict.
+
+    Args:
+        override: the ``LOCALWALLET_N_GPU_LAYERS`` rung (already parsed:
+            ``None`` unset, ``-1`` all, ``0`` CPU, ``1..`` partial).
+        backends: :func:`llama_backends` output (``None`` = no wheel).
+
+    Returns ``(n_gpu_layers, line)``: full offload (``-1``) where a backend
+    ships and the rung does not say otherwise; CPU (``0``) when no backend
+    exists (the rung is then meaningless and the line says why).
+    """
+    if backends is None or not any(backends):
+        return 0, CPU_NO_BACKEND_LINE
+    name = "Metal" if backends[0] else "CUDA"
+    if override == 0:
+        return 0, (
+            f"inference: CPU — reason: disabled via {N_GPU_LAYERS_ENV_VAR}=0"
+        )
+    if override is not None and override > 0:
+        return override, f"inference: GPU ({name}) — partial: {override} layers (env)"
+    return -1, f"inference: GPU ({name}) — all layers offloaded"
+
+
+def gpu_fallback_line(exc: BaseException) -> str:
+    """The honest CPU-fallback verdict after a GPU-offloaded load raised
+    (TCK-GPU-001): the exception CLASS NAME only — llama.cpp messages can
+    carry paths, the name never does (value-free)."""
+    return f"inference: CPU — reason: GPU load failed: {type(exc).__name__}"
 
 
 class ModelRuntime:
@@ -140,6 +227,11 @@ class ModelRuntime:
         generate_fn: Optional injection seam
             (``generate_fn(prompt, grammar_text) -> str``). When provided,
             llama.cpp is never imported and the model path is irrelevant.
+        decision_fn: Optional observer for the ONE-line GPU/CPU launch
+            verdict (TCK-GPU-001): called once per real model load with the
+            decision line (see :func:`gpu_offload_decision`). Never called
+            for a stub/``generate_fn`` runtime (honest absence); the app
+            wires it to its stdout/launch-log channel.
     """
 
     def __init__(
@@ -152,6 +244,7 @@ class ModelRuntime:
         top_k: int = DEFAULT_TOP_K,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         generate_fn: GenerateFn | None = None,
+        decision_fn: Callable[[str], None] | None = None,
     ) -> None:
         self.model_path = model_path
         self.n_ctx = n_ctx
@@ -160,6 +253,10 @@ class ModelRuntime:
         self.top_k = top_k
         self.max_tokens = max_tokens
         self._generate_fn = generate_fn
+        self._decision_fn = decision_fn
+        #: The GPU/CPU verdict line of the completed load (TCK-GPU-001);
+        #: ``None`` until a real model has loaded.
+        self.inference_line: str | None = None
         self._llama: object | None = None
         # TCK-LAUNCH-003: guards model construction so a background preload
         # (:meth:`load`) and the engine thread's first :meth:`generate`
@@ -302,6 +399,11 @@ class ModelRuntime:
         the first query rides: a concurrent in-flight load releases the
         lock when it finishes (successfully or not), so the waiter then
         either uses the loaded model or constructs it itself.
+
+        TCK-GPU-001: the build passes an EXPLICIT ``n_gpu_layers`` (the
+        wheel's own default is CPU — see the module docstring), retries a
+        failed GPU-offload load ONCE at CPU, and hands the one-line verdict
+        to ``decision_fn`` (if wired) after a successful load.
         """
         llama = self._llama
         if llama is not None:
@@ -332,7 +434,44 @@ class ModelRuntime:
             if not Path(model_path).is_file():
                 raise ModelRuntimeError(f"model file not found: {model_path}")
 
-            self._llama = Llama(model_path=model_path, n_ctx=self.n_ctx, verbose=False)
+            # TCK-GPU-001: llama-cpp-python defaults n_gpu_layers to 0 (CPU)
+            # EVEN in Metal/CUDA builds — decide the offload explicitly.
+            try:
+                override = n_gpu_layers_setting()
+            except ValueError as exc:
+                # Fail-closed: a malformed rung never silently loads under
+                # the auto policy (startup's Settings.from_env preflight
+                # normally refuses first; this is the belt for lazy
+                # construction). The message is value-free by construction.
+                raise ModelRuntimeError(str(exc)) from exc
+            n_gpu_layers, line = gpu_offload_decision(override, llama_backends())
+            try:
+                self._llama = Llama(
+                    model_path=model_path,
+                    n_ctx=self.n_ctx,
+                    n_gpu_layers=n_gpu_layers,
+                    verbose=False,
+                )
+            except Exception as exc:
+                # llama.cpp load failures are any-Exception-shaped (ctypes
+                # errors, OSError, ValueError, its own types); this handler
+                # re-raises or retries — nothing is swallowed, and the
+                # exception CLASS NAME is all any line ever surfaces.
+                if n_gpu_layers == 0:
+                    raise  # a CPU load's refusal is a refusal — the retry is GPU-only
+                # Driver/Metal edge: ONE bounded retry at CPU, and the
+                # verdict flips to the honest fallback line — never a
+                # silent degrade (TCK-GPU-001).
+                line = gpu_fallback_line(exc)
+                self._llama = Llama(
+                    model_path=model_path,
+                    n_ctx=self.n_ctx,
+                    n_gpu_layers=0,
+                    verbose=False,
+                )
+            self.inference_line = line
+            if self._decision_fn is not None:
+                self._decision_fn(line)
             self._grammar_cls = LlamaGrammar
             return self._llama
         finally:

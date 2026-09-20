@@ -149,3 +149,43 @@ gains `FILE_MODULE_EXCEPTIONS` — ONE file (`app.py`), ONE module
 module is exempt there (a test pins that an injected `urllib` import in
 `app.py` still fails the lint); the child is a separate process running the
 repo's own build-time tool, which the lint has always excluded by design.
+
+## Amendment (2026-09-20, TCK-GPU-001) — GPU offload policy: full-offload default where a backend exists
+
+**Root cause (user report, M2 Max at 100% CPU):** `llama-cpp-python`
+0.3.35's `Llama.__init__` defaults `n_gpu_layers=0` — CPU — even when the
+wheel was compiled with Metal/CUDA, and our runtime never passed the
+parameter, so *every* install ran CPU-only regardless of backend. Fix: at
+model load the runtime decides `n_gpu_layers` explicitly — **-1 (all layers
+offloaded) when a GPU backend dylib ships in the installed package, 0
+(CPU) otherwise**, on Linux, macOS and Windows alike.
+
+**Detection (one source):** `agent/runtime.llama_backends()` — a
+find_spec glob for `libggml-metal*` / `libggml-cuda*` in the installed
+`llama_cpp` package directory (no import, no GPU init, no network). TCK-VER-001's
+`/version` "backends:" line now delegates to the same function, so the
+version report and the offload decision can never drift.
+
+**Env rung:** `LOCALWALLET_N_GPU_LAYERS` (or the `n_gpu_layers` config-file
+key — the standard env > file ladder, parsed fail-closed and value-free in
+`config.py` alongside the gap-limit pattern): `-1` = all layers (the auto
+policy), `0` = force CPU, `1..999` = partial offload for small-VRAM GPUs.
+Malformed = startup refusal (exit 2); the load path re-checks as the belt
+for lazy construction.
+
+**Honesty surface:** at every real model load exactly ONE value-free verdict
+line is emitted — stdout (CLI) and the per-launch log (both modes, the
+APP-LOG-001 diagnostics channel): `inference: GPU (Metal|CUDA) — all layers
+offloaded` / `inference: GPU (<backend>) — partial: N layers (env)` /
+`inference: CPU — reason: <no GPU backend in this llama.cpp build |
+disabled via LOCALWALLET_N_GPU_LAYERS=0 | GPU load failed: <error class>>`.
+Stub/remote runtimes print NO line (honest absence). A GPU-offloaded load
+that raises (driver/Metal edge) is retried **exactly once** at `0` and the
+line names the failure class — never a silent degrade; a CPU load's failure
+is simply a failure. Device names are not echoed: llama.cpp reports them at
+C level only while the wheel's stdout silencer is armed during init, so
+there is no cheap non-forcing capture path (kept value-free by design).
+
+**Not a money surface:** this is a performance/visibility knob. It never
+touches envelopes, validation, or transaction data; the agent's
+trust-boundary stack (GBNF → pydantic → rules → allowlist) is unchanged.

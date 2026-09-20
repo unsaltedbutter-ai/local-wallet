@@ -271,6 +271,72 @@ def _load_config_file(path: Path, known: tuple) -> dict[str, object]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# GPU offload override (TCK-GPU-001, ADR-0001 amendment): how many model
+# layers the llama.cpp runtime offloads to the GPU. llama-cpp-python's
+# ``Llama`` defaults n_gpu_layers=0 (CPU) even in Metal/CUDA builds, so the
+# runtime decides at load: full offload (-1) where a backend dylib ships,
+# 0 otherwise — and this env rung (or the config-file key) lets the operator
+# retune (0 forces CPU; a partial count suits small-VRAM GPUs). THE single
+# source for the name/bounds/parser — ``agent/runtime.py`` reads it here and
+# ``Settings.from_env`` validates it, so a malformed value is a startup
+# refusal and can never reach the load path.
+# ---------------------------------------------------------------------------
+
+N_GPU_LAYERS_ENV_VAR: Final[str] = "LOCALWALLET_N_GPU_LAYERS"
+
+#: -1 = offload ALL layers; 0 = CPU only; 1..999 = partial offload.
+N_GPU_LAYERS_MIN: Final[int] = -1
+N_GPU_LAYERS_MAX: Final[int] = 999
+
+#: The one value-free refusal message (names the env var + bounds only).
+_N_GPU_LAYERS_MSG: Final[str] = (
+    f"{N_GPU_LAYERS_ENV_VAR} must be -1 or an integer between "
+    f"0 and {N_GPU_LAYERS_MAX}"
+)
+
+
+def resolve_n_gpu_layers(env_value: str | None) -> int | None:
+    """Parse the GPU-offload rung (TCK-GPU-001).
+
+    The gap_limit pattern: ``None``, empty and whitespace-only mean UNSET;
+    a present rung must be a plain (optionally negative) ASCII decimal
+    integer within :data:`N_GPU_LAYERS_MIN`..:data:`N_GPU_LAYERS_MAX`.
+    Anything else raises :class:`ValueError` with a VALUE-FREE message
+    naming only the env var and the bounds (ADR-0009 spirit: a corrupt
+    setting never silently reverts policy — startup refuses).
+    """
+    raw = (env_value or "").strip()
+    if not raw:
+        return None
+    negative = raw.startswith("-")
+    digits = raw[1:] if negative else raw
+    if not digits.isascii() or not digits.isdigit():
+        raise ValueError(_N_GPU_LAYERS_MSG)
+    value = -int(digits) if negative else int(digits)
+    if not N_GPU_LAYERS_MIN <= value <= N_GPU_LAYERS_MAX:
+        raise ValueError(_N_GPU_LAYERS_MSG)
+    return value
+
+
+def n_gpu_layers_setting() -> int | None:
+    """The GPU-offload rung read at CALL time (TCK-GPU-001): env >
+    config file > ``None`` — the same ladder as every keyed setting, read
+    fresh (the model-load site mirrors ``MODEL_PATH_ENV_VAR``'s call-time
+    discipline; no rung means None: the runtime's auto policy decides).
+
+    Raises :class:`ValueError` (value-free) on a malformed rung; the lazy
+    load path surfaces it as a hard model-load refusal (startup normally
+    refuses earlier, inside :meth:`Settings.from_env`).
+    """
+    raw = os.environ.get(N_GPU_LAYERS_ENV_VAR)
+    if raw is not None and raw.strip():
+        return resolve_n_gpu_layers(raw)
+    file_values = _load_config_file(config_file_path(), fields(Settings))
+    rung = file_values.get("n_gpu_layers")
+    return resolve_n_gpu_layers(rung if isinstance(rung, str) else None)
+
+
 #: The EXPLICIT PUBLIC ELECTRUM server (TCK-DESCOPE-M3A; ADR-0003/0023
 #: amendments): "public" is no longer a silent mempool.space default — it is
 #: this named server, reachable + mainnet-verified 2026-09-11, chosen only
@@ -391,6 +457,16 @@ class Settings:
     # credential; nothing about it weakens with a known port). The value
     # never enters logs/errors (the app's port-failure line is value-free).
     web_port: int = 0
+    #: GPU offload override (TCK-GPU-001, ADR-0001 amendment): the same
+    #: gap-limit shape — DECIMAL STRING (``LOCALWALLET_N_GPU_LAYERS`` or the
+    #: ``n_gpu_layers`` config-file key), empty = UNSET (the runtime's auto
+    #: policy: full offload where a GPU backend ships, else CPU). Valid
+    #: values: -1 (all layers), 0 (force CPU), 1..999 (partial, for small-
+    #: VRAM GPUs). Malformed is a fail-closed, value-free startup refusal
+    #: (validated inside :meth:`from_env`, below). Not a money surface —
+    #: a performance knob; read at CALL time by ``agent/runtime.py`` via
+    #: :func:`n_gpu_layers_setting`.
+    n_gpu_layers: str = ""
 
     @classmethod
     def from_env(
@@ -412,7 +488,7 @@ class Settings:
         ``LOCALWALLET_UTXO_TARGET_MAX_SATS``,
         ``LOCALWALLET_CONSOLIDATE_BELOW_SAT_VB``,
         ``LOCALWALLET_DISPLAY_CURRENCY``,
-        ``LOCALWALLET_WEB_PORT``.
+        ``LOCALWALLET_WEB_PORT``, ``LOCALWALLET_N_GPU_LAYERS``.
         Unknown variables are ignored.
 
         Boolean fields accept ``0``/``1`` or ``true``/``false``/``yes``/``no``
@@ -462,6 +538,12 @@ class Settings:
             env_name = f"LOCALWALLET_{name.upper()}"
             if os.environ.get(env_name) is None:
                 values[name] = value
+        # TCK-GPU-001: the GPU-offload rung is fail-closed at startup (the
+        # gap-limit pattern): a malformed env/file value refuses the launch
+        # value-free instead of silently falling back to the auto policy.
+        # The result is not read here — the load path re-reads the ladder
+        # at call time via :func:`n_gpu_layers_setting`.
+        resolve_n_gpu_layers(values.get("n_gpu_layers"))
         return cls(**values)
 
 

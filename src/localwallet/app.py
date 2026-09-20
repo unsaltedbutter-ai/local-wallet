@@ -138,7 +138,12 @@ from localwallet.agent.remote_runtime import (
     RemoteOpenAIRuntime,
     debug_notice,
 )
-from localwallet.agent.runtime import MODEL_PATH_ENV_VAR, GenerateFn, ModelRuntime
+from localwallet.agent.runtime import (
+    MODEL_PATH_ENV_VAR,
+    GenerateFn,
+    ModelRuntime,
+    llama_backends,
+)
 from localwallet.chain import (
     BitcoindClient,
     ChainClient,
@@ -12607,18 +12612,12 @@ def _llama_flags(force: bool) -> str:
 def _llama_backends() -> tuple[bool, bool] | None:
     """``(metal, cuda)`` — does the INSTALLED llama_cpp package ship the
     backend dylibs? A find_spec glob (no import, no GPU init). ``None`` =
-    the package is not installed at all."""
-    try:
-        spec = importlib.util.find_spec("llama_cpp")
-    except (ImportError, ValueError):
-        return None
-    if spec is None or not spec.submodule_search_locations:
-        return None
-    pkg_dir = Path(next(iter(spec.submodule_search_locations)))
-    return (
-        any(pkg_dir.rglob("libggml-metal*")),
-        any(pkg_dir.rglob("libggml-cuda*")),
-    )
+    the package is not installed at all.
+
+    TCK-GPU-001: thin delegation to the runtime's :func:`llama_backends` —
+    ONE shared detection source, so the ``/version`` backends line and the
+    runtime's GPU-offload decision can never drift."""
+    return llama_backends()
 
 
 def _scrub_home(text: str) -> str:
@@ -15884,7 +15883,12 @@ def run(
         generate = RemoteOpenAIRuntime()
         output_fn(debug_notice(remote_base_url, remote_model))
     elif os.environ.get(MODEL_PATH_ENV_VAR):
-        generate = ModelRuntime()
+        # TCK-GPU-001: the GPU/CPU verdict line (stdout in CLI, launch log
+        # in both modes — APP-LOG-001's diagnostics channel) is emitted by
+        # the runtime at the moment of the real load, via this hook. The
+        # stub/remote runtimes below deliberately wire nothing: honest
+        # absence.
+        generate = ModelRuntime(decision_fn=output.warning)
         # TCK-LAUNCH-003 (user direction 11): a REAL local model at the env
         # rung preloads on a background thread at engine start so the FIRST
         # query stops paying the multi-GB build. Only when the file is
@@ -15924,7 +15928,9 @@ def run(
         #                           offer to download).
         default = _resolve_default_model()
         if default is not None and default[1].is_file():
-            generate = ModelRuntime(model_path=str(default[1]))
+            generate = ModelRuntime(
+                model_path=str(default[1]), decision_fn=output.warning
+            )  # TCK-GPU-001 verdict line (see the env rung above)
             # TCK-LAUNCH-003: the normal, expected launch. The GGUF loads
             # on a background thread NOW (user direction 11) and its bytes
             # are checksummed CONCURRENTLY against the manifest pin (user
