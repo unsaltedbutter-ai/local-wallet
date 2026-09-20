@@ -63,6 +63,14 @@ Decision rule for swapping models was fixed in advance: ≥ +15 accuracy points 
 5. **Bigger models (8B+)** — need either a latency-budget decision from you or GPU hardware; not probed.
 6. **More deterministic intercepts** instead of model routing (extend the CHAT-009/CONS-004 pattern) — orthogonal, already the recommended direction; every intercept is a prompt-independent guarantee.
 
+### Fingerprint chip — FINAL RESOLUTION (2026-09-20, TCK-FP-001)
+
+You were right that there was a spec path. Sourced research (BIP-32 §Key identifiers, BIP-380 optional origin, Sparrow's own source, Coldcard docs, Jade firmware): the number devices show is the MASTER fingerprint (hash160 of the BIP-32 master key) — provably unreachable from an account zpub; and for a BARE zpub Sparrow itself shows the PLACEHOLDER `00000000`, never an account-key hash. **The fix is the input format:** paste what Coldcard/Sparrow device-export gives you — `[40dbb192/84'/0'/0']zpub6s…` (or the full descriptor) — and the app now accepts it at provisioning, stores the origin, and the header chip shows the number that MATCHES your device screen. A bare zpub keeps showing the key-derived number, now honestly labeled "Account" (the chip copy per kind explains both). The unverified-paste caveat is on the chip itself — the device-screen comparison is the verification.
+
+### GPU vs CPU — FIXED (2026-09-20, TCK-GPU-001)
+
+The root cause of your 1000%-CPU reports: llama-cpp-python's `n_gpu_layers` DEFAULTS TO 0 (CPU) and our runtime never overrode it — every install ever shipped ran CPU-only even with Metal present. Now: full GPU offload wherever a backend exists (Metal on macOS, CUDA on Linux/Windows; `LOCALWALLET_N_GPU_LAYERS` env to tune/force CPU), one bounded CPU fallback if a GPU load fails, and an honest launch line ("inference: GPU (Metal) — all layers offloaded" / "inference: CPU — reason: …"). Measured on the pinned model: 36/36 layers offloaded to the Apple GPU. Original guidance below retained for the env-var details.
+
 ### GPU vs CPU inference — what runs where (2026-09-16)
 
 Engine: llama-cpp-python 0.3.35 (llama.cpp underneath). Whether inference uses a GPU depends on how the WHEEL WAS BUILT, not on our code:
