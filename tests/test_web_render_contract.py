@@ -3279,14 +3279,16 @@ def _coin_sel_stub(code: str) -> str:
     (extracted verbatim, never re-typed) — paintCoinStrip reads
     COIN_SELECT_CEILING and utxoRowElement bumps coinSelIdSeq for the
     label↔box pairing; both are module-level bindings, not functions, so the
-    function-extraction misses them."""
+    function-extraction misses them. TCK-TXID-002: TXID_COMPACT_HEX joins
+    the same class (the noteUtxoRows needle shortens row.txid with it)."""
     ceiling = re.search(r"const COIN_SELECT_CEILING = \d+;", code).group(0)
     seq = re.search(r"let coinSelIdSeq = 0;", code).group(0)
+    compact = re.search(r"const TXID_COMPACT_HEX = \d+;", code).group(0)
     return (
         "\n      const inputEl = { value: \"\" };\n"
         "      const coinSelStripEl = { hidden: true };\n"
         "      const coinSelCountEl = { hidden: true, textContent: \"\" };\n"
-        "      " + ceiling + "\n      " + seq + "\n"
+        "      " + ceiling + "\n      " + seq + "\n      " + compact + "\n"
     )
 
 
@@ -4352,6 +4354,8 @@ def test_utxo008_coin_select_lifecycle_under_node() -> None:
     )
     funcs = re.search(
         r"const COIN_SELECT_CEILING = \d+;\s*\nlet coinSelIdSeq = 0;", code
+    ).group(0) + "\n" + re.search(
+        r"const TXID_COMPACT_HEX = \d+;", code  # TCK-TXID-002 needle const
     ).group(0) + "\n" + funcs
     script = """
       const ADDRESS_RE = __ADDR_RE__;
@@ -4461,6 +4465,9 @@ def test_utxo008_coin_select_lifecycle_under_node() -> None:
         return p;
       };
       // narrated coin lines the rows upgrade (the matcher's counterpart).
+      // TCK-TXID-002: the SHIPPED renderer prints the COMPACT token here
+      // ("tx <8hex>…") — the needle fix must keep the row swap landing on
+      // these lines (the full-id alternative is pinned in the refs test).
       const narrate = (rows) => {
         const turn = mkNode("li");
         turn.appendChild(mkLine("Unspent outputs \\u2014 " + rows.length + " coins."));
@@ -4468,7 +4475,7 @@ def test_utxo008_coin_select_lifecycle_under_node() -> None:
           turn.appendChild(mkLine((r.number === undefined ? "" : "#" + r.number + " ")
             + r.address + " \\u00b7 " + formatSats(r.value_sats) + " sats \\u00b7 "
             + (r.confirmed ? "confirmed" : "unconfirmed")
-            + " \\u00b7 tx " + r.txid + " vout 0"));
+            + " \\u00b7 tx " + r.txid.slice(0, 8) + "\\u2026 vout 0"));
         }
         state.openTurn = turn;
         return turn;
@@ -4602,6 +4609,339 @@ def test_utxo008_coin_select_lifecycle_under_node() -> None:
         .replace("__TX_RE__", txid_re)
         .replace("__ARRIVAL_RE__", arrival_re)
         .replace("__LABELS__", leak + labels)
+        .replace("__FUNCS__", funcs)
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+# ============================================================== TCK-TXID-002
+# STATIC half: the compact narration token + the additive ``txid_refs`` chip.
+# Chat narration prints "d2c5204c…" (8 hex + ellipsis, pinned engine-side) and
+# the full id rides a typed payload. The client swaps a token for the SHARED
+# UTXO-006 [tx] copy chip (utxoTxidChip — clipboardWrite + flashCopyResult +
+# value-bearing WEB-026 name, no second copy path), ALL-OR-NOTHING PER TOKEN:
+# a chip ONLY when the bubble window carries exactly one valid entry for the
+# token (shape-gated compact, canonical 64-hex txid STARTING WITH the token,
+# marker literally true). Absent/garbage/collision ⇒ raw text, zero chips.
+# The full hash NEVER reaches painted text and never enters copy text (the
+# chip's lineText swap-in is the compact token — clipboard-only full id).
+# The window is bubble-scoped, NOT order-scoped: watch-drain refs-BEFORE-line
+# (stashed, chipped as lines land) and turn-renderer refs-AFTER-lines
+# (immediate) chip identically; closeOpenTurn ends the window. Token matching
+# is boundary-aware (hex lookarounds — never a chip mid-hash or mid-word).
+# The rows upgrade keeps pairing on a COMPACT needle ("tx <8hex>…") — the
+# COUPLING FIX without which the shipped UTXO-006 row chip silently stops
+# swapping (pinned behaviorally by the 008 lifecycle harness, whose narration
+# now prints the compact shape).
+
+def test_txid002_refs_chip_static_pins() -> None:
+    from localwallet import app
+
+    raw = (_STATIC / "app.js").read_text(encoding="utf-8")
+    code = _strip_js_comments(raw)
+
+    def fn(name: str) -> str:
+        return re.search(
+            rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL
+        ).group(0)
+
+    # bus branch rides the SAME handleEvent dispatch as utxo_rows/own_address.
+    assert 'kind === "txid_refs") noteTxidRefs(data)' in code
+    # the CLOSED token shape + the engine-ceiling bridge (the COIN_SELECT_
+    # CEILING precedent: the client constant IS the engine's).
+    assert r"const TXID_COMPACT_RE = /^[0-9a-f]{8}\u2026$/;" in code
+    hexes = re.search(r"const TXID_COMPACT_HEX = (\d+);", code).group(1)
+    assert int(hexes) == app._TXID_COMPACT_HEX
+    # per-entry validation: token shape, the typed marker, canonical txid,
+    # and the token-prefix honesty gate — an entry failing ANY of them
+    # registers nothing (raw text); duplicates resolve to null (collision).
+    gate = fn("parseTxidRefs")
+    assert "!TXID_COMPACT_RE.test(token)) continue;" in gate
+    assert "if (entry.txid_copy_only !== true) continue;" in gate
+    assert "!TXID_RE.test(txid)) continue;" in gate
+    assert "if (!txid.startsWith(token.slice(0, TXID_COMPACT_HEX))) continue;" in gate
+    assert "seen.set(token, null);" in gate  # ambiguous -> never chipped
+    assert "if (txid) unique.set(token, txid);" in gate
+    assert "innerHTML" not in gate
+    # the chip builder: the SHARED utxoTxidChip only (no second copy path —
+    # the flashCopyResult call-count pin covers it), the copyText swap keeps
+    # the COMPACT token in copied/announced text, and the walk touches plain
+    # TEXT NODES ONLY (an existing copy button — a direct-ask /details FULL
+    # id — is never dug into), on narration lines that EXCLUDE .utxo-row
+    # (the rows-present surface keeps the UTXO-006 row chip as its single
+    # mechanism: the utxo-rows-absence rule, client half).
+    chip = fn("chipTxidTokens")
+    assert "utxoTxidChip(refs.get(m[0]))" in chip
+    assert 'chip.dataset.copyText = m[0];' in chip
+    assert "node.nodeType !== Node.TEXT_NODE" in chip
+    assert ':not(.utxo-row)' in chip
+    # TOKEN-BOUNDARY matching (the "tx d2c5204c… vout 1" inside-larger-text
+    # rule; a token substring of a longer hex run never matches):
+    assert r'"(?<![0-9a-f])(" + Array.from(refs.keys()).join("|") + ")(?![0-9a-f])"' in chip
+    # the bubble-scoped window, both orders + the per-bubble lifetime:
+    note = fn("noteTxidRefs")
+    assert "state.txidRefs = refs;" in note  # stash (refs-BEFORE-line)
+    assert "if (state.openTurn) chipTxidTokens(state.openTurn, refs);" in note
+    at = fn("appendText")
+    assert "if (state.txidRefs) chipTxidTokens(turn, state.txidRefs);" in at
+    assert at.index("turn.appendChild(line);") < at.index("chipTxidTokens(turn")
+    close = fn("closeOpenTurn")
+    assert "state.txidRefs = null;" in close
+    assert "txidRefs: null," in code
+    # lineText: an in-bubble chip copies the COMPACT token (the row chip,
+    # which carries no copyText, keeps the 006 verbatim-full-hash contract).
+    line_fn = fn("lineText")
+    assert "node.dataset.copyText || node.dataset.txid" in line_fn
+    # THE COUPLING FIX: the rows-upgrade needle accepts the compact "tx <8hex>…"
+    # line the shipped renderer now prints (full-id kept for legacy shapes).
+    rows = fn("noteUtxoRows")
+    assert 'const txCompact =' in rows
+    assert r'row.txid.slice(0, TXID_COMPACT_HEX) + "\u2026"' in rows
+    assert "text.includes(txFull) || text.includes(txCompact)" in rows
+    # textContent-only (the file-wide sink scan above is the real guard; the
+    # pin is restated for this ticket's new builders):
+    assert "innerHTML" not in raw and "insertAdjacentHTML" not in raw
+
+
+def test_txid002_refs_chip_render_under_node() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    code = _strip_js_comments((_STATIC / "app.js").read_text(encoding="utf-8"))
+    addr_re = re.search(r"const ADDRESS_RE = (/[^;]+);", code).group(1)
+    txid_re = re.search(r"const TXID_RE = (/[^;]+);", code).group(1)
+    compact_re = re.search(r"const TXID_COMPACT_RE = (/[^;]+);", code).group(1)
+    compact_hex = re.search(r"const TXID_COMPACT_HEX = \d+;", code).group(0)
+    link_re = re.search(r"const LINK_SCAN_RE =\s*\n\s*(/[^;]+);", code).group(1)
+    funcs = "\n".join(
+        re.search(rf"function {name}\([^)]*\) \{{.*?\n\}}", code, re.DOTALL).group(0)
+        for name in (
+            "el", "parseTxidRefs", "noteTxidRefs", "chipTxidTokens",
+            "utxoTxidChip", "appendBubbleText", "copyTokenButton",
+            "lineText", "bubbleText", "closeOpenTurn",
+        )
+    )
+    script = """
+      const ADDRESS_RE = __ADDR_RE__;
+      const TXID_RE = __TX_RE__;
+      const TXID_COMPACT_RE = __COMPACT_RE__;
+      __COMPACT_HEX__
+      const LINK_SCAN_RE = __LINK_RE__;
+      const EXPLORER_LINK_LINE_RE = /^\\/$/; // no link lines in this fixture
+      const LABELS = { clickToCopy: "Click to copy", copyAddress: "Copy address",
+                       copyTxid: "Copy transaction id", utxoTxidChip: "[tx]" };
+      const mkNode = (tag, nodeType, text) => {
+        const node = {
+          tag, nodeType: nodeType || 1, className: "", textContent: text || "",
+          type: "", attrs: {}, dataset: {}, children: [], parent: null, handlers: {},
+          get childNodes() { return this.children; },
+          setAttribute(k, v) { this.attrs[k] = v; },
+          appendChild(n) {
+            if (n.parent) {
+              const i = n.parent.children.indexOf(n);
+              if (i !== -1) n.parent.children.splice(i, 1);
+            }
+            n.parent = this; this.children.push(n); return n;
+          },
+          before(n) {
+            if (n.parent) {
+              const i = n.parent.children.indexOf(n);
+              if (i !== -1) n.parent.children.splice(i, 1);
+            }
+            const i = this.parent.children.indexOf(this);
+            n.parent = this.parent; this.parent.children.splice(i, 0, n);
+          },
+          remove() {
+            if (!this.parent) return;
+            const i = this.parent.children.indexOf(this);
+            this.parent.children.splice(i, 1);
+            this.parent = null;
+          },
+          addEventListener(kind, fn) { this.handlers[kind] = fn; },
+          querySelectorAll(sel) {
+            const need = /^\\.([a-z-]+)/.exec(sel)[1];
+            const skip = [...sel.matchAll(/:not\\(\\.([a-z-]+)\\)/g)].map((m) => m[1]);
+            const out = [];
+            const walk = (n) => {
+              for (const c of n.children) {
+                const cs = c.className.split(/\\s+/).filter(Boolean);
+                if (cs.includes(need) && !skip.some((x) => cs.includes(x))) out.push(c);
+                walk(c);
+              }
+            };
+            walk(this);
+            return out;
+          },
+          querySelector() { return null; },
+        };
+        Object.defineProperty(node, "classList", {
+          get() {
+            const self = this;
+            const set = () => new Set(self.className.split(/\\s+/).filter(Boolean));
+            return {
+              add(c) { const s = set(); s.add(c); self.className = [...s].join(" "); },
+              remove(c) { const s = set(); s.delete(c); self.className = [...s].join(" "); },
+              contains(c) { return set().has(c); },
+            };
+          },
+        });
+        return node;
+      };
+      globalThis.document = {
+        createElement: (t) => mkNode(t),
+        createTextNode: (d) => mkNode("#text", 3, d),
+      };
+      globalThis.Node = { ELEMENT_NODE: 1, TEXT_NODE: 3 };
+      const clip = [];
+      const clipboardWrite = async (t) => { clip.push(t); return true; };
+      const flashes = [];
+      const flashCopyResult = (ctrl, ok) => { flashes.push([ctrl, ok]); };
+      const state = { openTurn: null, txidRefs: null, progressLine: null };
+      const txidRefsMap = (m) => { state.txidRefs = m; }; // (no-op guard)
+      __FUNCS__
+      // appendText's stashed-map branch, verbatim from the shipped seam:
+      const landLine = (turn, text) => {
+        const line = document.createElement("p");
+        line.className = "turn-text";
+        appendBubbleText(line, text);
+        turn.appendChild(line);
+        if (state.txidRefs) chipTxidTokens(turn, state.txidRefs);
+        return line;
+      };
+      const TX = "d2c5204c3420" + "ab".repeat(26);
+      const OTHER = "d2c5204c9999" + "cd".repeat(26); // a REAL first-8 collision
+      const TOK = "d2c5204c\u2026";
+      const entry = (t, x) => ({ compact: t, txid: x, txid_copy_only: true });
+      const parts = (line) => line.children.filter((c) => c.nodeType === 1);
+      const chips = (line) => parts(line).filter((c) => c.classList.contains("utxo-txid-btn"));
+      const newTurn = () => { const t = mkNode("li"); state.openTurn = t; return t; };
+      const noHashPainted = (turn) => {
+        for (const line of turn.children)
+          for (const n of line.children)
+            if (n.nodeType === 3 && n.textContent.includes(TX))
+              throw new Error("hash-painted");
+      };
+      const main = async () => {
+        // ---- 1. refs-AFTER-lines (turn renderers) + the unique-match chip ----
+        const t1 = newTurn();
+        const l1 = landLine(t1, "Broadcast. tx " + TOK + " vout 1");
+        noteTxidRefs(JSON.stringify([entry(TOK, TX)]));
+        const chip = chips(l1)[0];
+        if (chips(l1).length !== 1 || !chip || chip.textContent !== "[tx]")
+          throw new Error("chip-count");
+        if (chip.dataset.txid !== TX || chip.dataset.copyText !== TOK)
+          throw new Error("chip-data");
+        if (chip.attrs["aria-label"] !== "Copy transaction id " + TX)
+          throw new Error("chip-name");
+        noHashPainted(t1); // the FULL id is dataset + name only
+        // copy/announce text keeps the COMPACT token, chrome-free:
+        if (lineText(l1) !== "Broadcast. tx " + TOK + " vout 1")
+          throw new Error("lineText:" + lineText(l1));
+        if (bubbleText(t1).includes("[tx]")) throw new Error("chrome-in-copy");
+        // the click rides the SHARED machinery with the FULL id:
+        await chip.handlers.click();
+        if (clip[0] !== TX || flashes[0][0] !== chip || flashes[0][1] !== true)
+          throw new Error("chip-click");
+        // ---- 2. replay idempotence: a duplicate application is a no-op ----
+        noteTxidRefs(JSON.stringify([entry(TOK, TX)]));
+        chipTxidTokens(t1, state.txidRefs);
+        if (chips(l1).length !== 1 || lineText(l1) !== "Broadcast. tx " + TOK + " vout 1")
+          throw new Error("replay-double");
+        // ---- 3. refs-BEFORE-line (the watch drain): stash, chip on land ----
+        state.openTurn = null;
+        noteTxidRefs(JSON.stringify([entry(TOK, TX)])); // stashed, nothing open
+        if (!state.txidRefs) throw new Error("not-stashed");
+        const t2 = newTurn();
+        const l2 = landLine(t2, "Received 5001 sats at #1 (in mempool, tx " + TOK + ").");
+        if (chips(l2).length !== 1) throw new Error("refs-before-line");
+        if (lineText(l2) !== "Received 5001 sats at #1 (in mempool, tx " + TOK + ").")
+          throw new Error("before-line-text");
+        // the window is ONE bubble: closeOpenTurn drops the stash, so a
+        // later bubble's identical token stays raw text (no leak).
+        closeOpenTurn();
+        if (state.txidRefs !== null) throw new Error("window-leak");
+        const t3 = newTurn();
+        const l3 = landLine(t3, "tx " + TOK + " confirmed");
+        if (chips(l3).length !== 0) throw new Error("window-survived");
+        // ---- 4. collision: two entries, one token => raw text, ZERO chips ----
+        const t4 = newTurn();
+        const l4 = landLine(t4, "sent, tx " + TOK + " vout 0");
+        noteTxidRefs(JSON.stringify([entry(TOK, TX), entry(TOK, OTHER)]));
+        if (chips(l4).length !== 0 || lineText(l4) !== "sent, tx " + TOK + " vout 0")
+          throw new Error("collision-chipped");
+        // ---- 5. garbage/absent payloads register NOTHING (raw text) ----
+        const bad = [
+          "not json",
+          JSON.stringify({ compact: TOK }), // not an array
+          JSON.stringify([]),
+          JSON.stringify([null, 7]),
+          JSON.stringify([entry("d2c5204c", TX)]),          // no ellipsis
+          JSON.stringify([entry("D2C5204C\u2026", TX)]),    // upper
+          JSON.stringify([entry("d2c5204…", TX)]),           // 7 hex
+          JSON.stringify([entry(TOK, TX.slice(0, 63))]),     // 63-hex txid
+          JSON.stringify([entry(TOK, TX.toUpperCase())]),   // non-canonical
+          JSON.stringify([entry("ffffffff\u2026", TX)]),     // txid not the token
+          JSON.stringify([{ compact: TOK, txid: TX }]),     // marker absent
+          JSON.stringify([{ compact: TOK, txid: TX, txid_copy_only: false }]),
+        ];
+        for (const raw of bad) {
+          const t = newTurn();
+          const l = landLine(t, "tx " + TOK + " vout 2");
+          noteTxidRefs(raw);
+          if (chips(l).length !== 0) throw new Error("garbage-chipped:" + raw);
+        }
+        // absent payload = the whole bubble renders raw (no event at all).
+        const tRaw = newTurn();
+        const lRaw = landLine(tRaw, "tx " + TOK + " vout 3");
+        if (chips(lRaw).length !== 0) throw new Error("absent-payload-chipped");
+        // ---- 6. token-boundary awareness ----
+        const t6 = newTurn();
+        // (a) mid-hex: the token as a SUBSTRING of a longer hex run is not
+        //     the printed token — never a chip ("don't chip mid-word");
+        landLine(t6, "echo a3d2c5204c\u2026 not-a-token");
+        // (b) a direct-ask line: the FULL id stands alone (the WEB-014 scan
+        //     made it the verbatim copy button) — refs can never touch it.
+        landLine(t6, "Transaction id for utxo #1: " + TX);
+        noteTxidRefs(JSON.stringify([entry(TOK, TX)]));
+        const mid = t6.children[0], ask = t6.children[1];
+        if (chips(mid).length !== 0) throw new Error("mid-word-chip");
+        if (chips(ask).length !== 0) throw new Error("details-chipped");
+        const tokBtn = parts(ask).find((c) => c.classList.contains("explorer-link"));
+        if (!tokBtn || tokBtn.textContent !== TX) throw new Error("ask-token-btn");
+        // ---- 7. multiple tokens, mixed gates + per-token independence ----
+        const STAY = "0".repeat(64); // collides with nothing but is ABSENT here
+        const t7 = newTurn();
+        const l7 = landLine(t7, "tx " + TOK + " and tx ffffffff\u2026 and tx 00000000\u2026");
+        noteTxidRefs(JSON.stringify([
+          entry(TOK, TX), entry("ffffffff\u2026", OTHER), entry("ffffffff\u2026", TX),
+        ]));
+        if (chips(l7).length !== 1) throw new Error("mix-count");
+        const painted = lineText(l7);
+        if (painted !== "tx " + TOK + " and tx ffffffff\u2026 and tx 00000000\u2026")
+          throw new Error("mix-text:" + painted);
+        if (chips(l7)[0].dataset.txid !== TX) throw new Error("mix-value");
+        // ---- 8. utxo-rows-absence rule, client half: a .utxo-row line (the
+        //           rows surface's own render) is never re-chipped, even with
+        //           a live map (the row chip stays that surface's mechanism).
+        const t8 = newTurn();
+        const rowLine = document.createElement("p");
+        rowLine.className = "turn-text utxo-row";
+        rowLine.appendChild(document.createTextNode("tx " + TOK));
+        t8.appendChild(rowLine);
+        noteTxidRefs(JSON.stringify([entry(TOK, TX)]));
+        if (chips(rowLine).length !== 0) throw new Error("row-rechipped");
+        console.log("ok");
+      };
+      main().catch((e) => { console.error(e); process.exit(1); });
+    """
+    script = (
+        script.replace("__ADDR_RE__", addr_re)
+        .replace("__TX_RE__", txid_re)
+        .replace("__COMPACT_RE__", compact_re)
+        .replace("__COMPACT_HEX__", compact_hex)
+        .replace("__LINK_RE__", link_re)
         .replace("__FUNCS__", funcs)
     )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)

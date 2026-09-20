@@ -41,6 +41,12 @@
 // canonical ``/verifyaddress <branch> <index>`` utterance through the same
 // POST /action full-turn path. Hidden unless the typed /state signer_kind
 // is "hwi" (file signer / absent = no device to show on).
+// TCK-TXID-002 static half: narration lines print the COMPACT txid token
+// (first 8 lowercase hex + ellipsis) and the full id rides the additive
+// ``txid_refs`` event; within the open bubble the client swaps each uniquely
+// matched token for the UTXO-006 [tx] copy chip — all-or-nothing per token,
+// the full hash never painted, both stamp orders (watch drain refs-before-
+// line, turn renderers refs-after-lines) chip identically.
 
 const island = window.__LOCALWALLET__;
 const token = island && typeof island.token === "string" ? island.token : "";
@@ -580,6 +586,13 @@ const state = {
   // the TRANSITION gate (every textContent write re-announces; the WEB-028
   // reconnecting-tracker discipline). "" = nothing written yet.
   coinSelShown: "",
+  // TCK-TXID-002: the VALIDATED compact-token→full-id Map for the CURRENT
+  // bubble window (null = nothing pending). The watch drain stamps refs
+  // BEFORE its line (the map stashes, appendText chips as lines land); the
+  // turn renderers stamp AFTER their lines (noteTxidRefs chips the open
+  // turn immediately and stashes the same map for any later line). The
+  // window is exactly one bubble: closeOpenTurn drops it. Memory only.
+  txidRefs: null,
   stateSeq: 0,
   watchKeyDismissed: false,
   watchKeyPresent: null, // null = unknown | true | false (typed state/1 only)
@@ -674,6 +687,11 @@ function authHeaders(extra) {
 // mainnet bech32: "bc1" + lowercase bech32 charset, total length 14..90.
 const ADDRESS_RE = /^bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}$/;
 const TXID_RE = /^[0-9a-f]{64}$/;
+// TCK-TXID-002: the engine's PINNED compact narration token — first 8
+// lowercase hex + the ellipsis (the same shape the CLI prints). An entry
+// whose ``compact`` fails this shape is garbage and registers no chip.
+const TXID_COMPACT_RE = /^[0-9a-f]{8}\u2026$/;
+const TXID_COMPACT_HEX = 8; // == engine _TXID_COMPACT_HEX (render-contract pin)
 // TCK-UTXO-006: the engine's CLOSED arrival shape — a UTC "YYYY-MM-DD" or the
 // literal "pending" — already a display string, so the client renders it
 // VERBATIM (zero date math, zero reformatting); anything else fails the gate.
@@ -836,8 +854,12 @@ function lineText(line) {
     // same rule as the .qr-btn exclusion); the copied/announced text carries
     // the FULL verbatim txid off the dataset instead — the row copy never
     // changes shape with the gate.
+    // TCK-TXID-002: an in-bubble refs chip swaps a COMPACT token; its copied
+    // text keeps the COMPACT token (dataset.copyText — the full id is
+    // clipboard-only there), while a row chip (no copyText) keeps 006's
+    // verbatim-full-hash copy contract untouched.
     if (node.nodeType === Node.ELEMENT_NODE && node.classList.contains("utxo-txid-btn")) {
-      text += node.dataset.txid;
+      text += node.dataset.copyText || node.dataset.txid;
       continue;
     }
     // TCK-UTXO-008: the selection checkbox is chrome (the .qr-btn precedent
@@ -1241,6 +1263,107 @@ function utxoTxidChip(txid) {
   return btn;
 }
 
+// ============================================ compact txid chips (TCK-TXID-002)
+// Narration lines print the COMPACT token (8 lowercase hex + "…") and the
+// full id rides the additive typed ``txid_refs`` payload — a JSON array of
+// {compact, txid, txid_copy_only: true}, engine-deduped by FULL id. The
+// client swaps a token for the UTXO-006 [tx] copy chip (the SHARED
+// clipboardWrite + flashCopyResult machinery, dataset value + value-bearing
+// WEB-026 name — no second copy path), ALL-OR-NOTHING PER TOKEN: the chip
+// lands ONLY when the bubble window carries exactly one VALID entry for the
+// token (compact shape-gated, txid canonical 64-hex AND starting with the
+// token, marker literally true). Absent payload / garbage entry / a
+// first-8-hex collision (two entries, one token) ⇒ the token stays raw
+// text, zero chips — never a half-chipped line, never a fabricated id. The
+// FULL hash never reaches painted text (dataset + accessible name only),
+// and the chip's lineText/bubbleText swap-in is the COMPACT token
+// (dataset.copyText), so copied/announced text keeps the printed shape —
+// chrome-free, the full id is clipboard-only.
+// WINDOW rule (pinned engine-side): match by TOKEN within the BUBBLE, never
+// by order — the watch drain stamps refs BEFORE its line, the turn
+// renderers AFTER their lines. One seam serves both: an event with an open
+// bubble chips it immediately AND stashes the map; appendText re-applies
+// the map to every line as it lands (a re-application is a natural no-op —
+// the swapped token no longer exists in any text node). The window is
+// exactly one bubble: closeOpenTurn drops the stash. Replay rides the
+// handleEvent id guard (like every surface) plus that inherent no-op.
+// Direct-ask and /details lines print the FULL id — never a compact token,
+// never a refs entry — so this pass can never touch them; the existing
+// standalone-token copy scan (WEB-014) is their affordance, unchanged.
+
+function parseTxidRefs(raw) {
+  let arr;
+  try {
+    arr = JSON.parse(raw);
+  } catch {
+    return null; // non-JSON payload: ignore, never render raw
+  }
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  const seen = new Map(); // token -> txid | null (null = ambiguous collision)
+  for (const entry of arr) {
+    if (!entry || typeof entry !== "object") continue;
+    const token = entry.compact;
+    if (typeof token !== "string" || !TXID_COMPACT_RE.test(token)) continue;
+    if (entry.txid_copy_only !== true) continue;
+    const txid = entry.txid;
+    if (typeof txid !== "string" || !TXID_RE.test(txid)) continue;
+    if (!txid.startsWith(token.slice(0, TXID_COMPACT_HEX))) continue;
+    if (seen.has(token) && seen.get(token) !== txid) seen.set(token, null);
+    else if (!seen.has(token)) seen.set(token, txid);
+  }
+  const unique = new Map();
+  for (const [token, txid] of seen) if (txid) unique.set(token, txid);
+  return unique.size > 0 ? unique : null;
+}
+
+function noteTxidRefs(raw) {
+  const refs = parseTxidRefs(raw);
+  if (!refs) return; // absent/garbage/all-ambiguous: raw text everywhere
+  state.txidRefs = refs;
+  if (state.openTurn) chipTxidTokens(state.openTurn, refs); // refs-after-lines
+}
+
+// Swap every UNIQUELY-matched compact token in the turn's plain narration
+// lines. Text-node children ONLY: an existing token button/anchor is never
+// dug into (the direct-ask full id stays verbatim text through the WEB-014
+// scan, and the /details card renders its full values as elements).
+function chipTxidTokens(turn, refs) {
+  // Token-boundary awareness: the shape gate pins every token to 8 hex +
+  // "…" (regex-inert characters, no escaping needed), and the hex
+  // lookarounds keep the swap from ever firing mid-word — a token substring
+  // inside a longer hex run (the FULL id starts with the same 8 hex!) never
+  // matches, only the standalone printed token does.
+  const re = new RegExp(
+    "(?<![0-9a-f])(" + Array.from(refs.keys()).join("|") + ")(?![0-9a-f])",
+    "g",
+  );
+  for (const line of turn.querySelectorAll(
+    ".turn-text:not(.turn-progress):not(.turn-model):not(.utxo-row)",
+  )) {
+    for (const node of Array.from(line.childNodes)) {
+      if (node.nodeType !== Node.TEXT_NODE) continue;
+      const text = node.textContent;
+      const pieces = [];
+      let last = 0;
+      let m;
+      re.lastIndex = 0;
+      while ((m = re.exec(text)) !== null) {
+        if (m.index > last) {
+          pieces.push(document.createTextNode(text.slice(last, m.index)));
+        }
+        const chip = utxoTxidChip(refs.get(m[0]));
+        chip.dataset.copyText = m[0]; // copied text keeps the COMPACT token
+        pieces.push(chip);
+        last = m.index + m[0].length;
+      }
+      if (pieces.length === 0) continue;
+      if (last < text.length) pieces.push(document.createTextNode(text.slice(last)));
+      for (const piece of pieces) node.before(piece);
+      node.remove();
+    }
+  }
+}
+
 // The user-spec row: <#number> <amount toggle> [<arrival>] <confirmed/pending
 // icon> <copy-address> <copy-txid> (label last, ONLY when the row carries one).
 // The copy buttons ARE the WEB-014/026 machinery (verbatim token content,
@@ -1338,12 +1461,19 @@ function noteUtxoRows(raw) {
   const coins = [];
   for (const row of rows) {
     const sats = formatSats(row.value_sats) + " sats";
-    const txNeedle = "tx " + row.txid;
+    // TCK-TXID-002 COUPLING FIX: the narration's tx segment is now the
+    // COMPACT token, so the full-id needle alone silently stopped swapping
+    // the rows (the UTXO-006 row chip never landed). Accept EITHER the full
+    // id (pre-002/other surfaces) or the compact "tx <8hex>…" the shipped
+    // renderer prints; the row's #N + sats still key the pair.
+    const txFull = "tx " + row.txid;
+    const txCompact =
+      "tx " + row.txid.slice(0, TXID_COMPACT_HEX) + "\u2026";
     const at = lines.findIndex((line) => {
       const text = lineText(line);
       return (
         (row.number === undefined || text.startsWith("#" + row.number + " ")) &&
-        text.includes(sats) && text.includes(txNeedle)
+        text.includes(sats) && (text.includes(txFull) || text.includes(txCompact))
       );
     });
     if (at === -1) return; // partial coverage: keep the whole text fallback
@@ -1593,6 +1723,10 @@ function appendText(text) {
   const line = el("p", "turn-text");
   appendBubbleText(line, text); // TCK-WEB-014: click-to-copy token buttons
   turn.appendChild(line);
+  // TCK-TXID-002: the refs-BEFORE-line window (the watch drain) — a stashed
+  // bubble map chips every line as it lands (idempotent: an already-chipped
+  // token is no longer in any plain text node).
+  if (state.txidRefs) chipTxidTokens(turn, state.txidRefs);
   addCopyButton(turn); // first copyable line of this engine turn
   state.progressLine = null;
   state.downloadLine = null; // the next tick starts a fresh inline bar
@@ -1672,6 +1806,10 @@ function humanBytes(bytes) {
 function closeOpenTurn() {
   state.openTurn = null;
   state.progressLine = null;
+  // TCK-TXID-002: the refs window is EXACTLY one bubble — a stashed map can
+  // never leak into the next turn (a lost chip is raw text, never a chip on
+  // the wrong line).
+  state.txidRefs = null;
 }
 
 function appendSystem(text) {
@@ -2339,6 +2477,7 @@ function handleEvent(id, kind, data) {
   else if (kind === "user_text") renderUserText(data);
   else if (kind === "own_address") noteOwnAddress(data); // TCK-HW-005 static
   else if (kind === "utxo_rows") noteUtxoRows(data); // TCK-UTXO-005 static
+  else if (kind === "txid_refs") noteTxidRefs(data); // TCK-TXID-002 static
   else if (kind === "turn_end") noteTurnEnd();
   else if (kind === "resync") {
     // too_far_behind: the cursor predates the server ring, so part of the
